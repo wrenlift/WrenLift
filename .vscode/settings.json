@@ -1,0 +1,4 @@
+{
+    "rust.jobs": 2,
+    "rust.build_on_save": true
+}
