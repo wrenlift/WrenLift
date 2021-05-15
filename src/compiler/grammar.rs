@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use compiler::Compiler;
-use scanner::{Signature, SignatureType, Precedence, Token, TokenType};
+use crate::compiler::wren_parser::Parser;
+use crate::compiler::scanner::{Signature, SignatureType, Precedence, Token, TokenType};
 
-pub fn InfixOp(compiler: Compiler, canAssign: bool){
+pub fn InfixOp(parser: Parser, canAssign: bool){
     // let rule = compiler.getRule(compiler.parser.previous.type);
 
     // // An infix operator cannot end an expression.
@@ -35,7 +35,7 @@ pub fn InfixOp(compiler: Compiler, canAssign: bool){
 }
 
 /// Compiles a method signature for an infix operator.
-pub fn InfixSignature(compiler: Compiler,  signature: &mut Signature) -> Option<Signature> {
+pub fn InfixSignature(parser: Parser,  signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
     // Add the RHS parameter.
     signature.sigType = SignatureType::Method;
     signature.arity = 1;
@@ -47,7 +47,7 @@ pub fn InfixSignature(compiler: Compiler,  signature: &mut Signature) -> Option<
 }
 
 /// Unary operators like `-foo`.
-pub fn UnaryOp(compiler: Compiler, canAssign: bool) {
+pub fn UnaryOp(parser: Parser, canAssign: bool) {
     // let rule = compiler.getRule(compiler.parser.previous.type);
     // compiler.ignoreNewlines();
     // // Compile the argument.
@@ -57,7 +57,7 @@ pub fn UnaryOp(compiler: Compiler, canAssign: bool) {
 }
 
 /// Compiles a method signature for an unary operator (i.e. "!").
-pub fn UnarySignature(compiler: Compiler,  signature: &mut Signature)  -> Option<Signature> {
+pub fn UnarySignature(parser: Parser,  signature: &'static mut Signature<'static>)  -> Option<&'static mut Signature<'static>> {
     // Do nothing. The name is already complete.
 	signature.sigType = SignatureType::Getter;
 	Some(signature)
@@ -65,7 +65,7 @@ pub fn UnarySignature(compiler: Compiler,  signature: &mut Signature)  -> Option
 
 /// Compiles a method signature for an operator that can either be unary or
 /// infix (i.e. "-").
-pub fn MixedSignature(compiler: Compiler, signature: &mut Signature) -> Option<Signature> {
+pub fn MixedSignature(parser: Parser, signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
     signature.sigType = SignatureType::Getter;
     // If there is a parameter, it's an infix operator, otherwise it's unary.
     // if (compiler.match(TokenType::LeftParen)) {
@@ -80,19 +80,19 @@ pub fn MixedSignature(compiler: Compiler, signature: &mut Signature) -> Option<S
     Some(signature)
 }
 
-fn maybeSetter(compiler: Compiler, signature:  &mut Signature) -> Option<Signature> {
-    None
+fn maybeSetter(parser: Parser, signature:  &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
+    Some(signature)
 }
 
 
-pub fn Grouping(compiler: Compiler, canAssign: bool){
+pub fn Grouping(parser: Parser, canAssign: bool){
     // compiler.expression();
     // compiler.consume(TokenType::RightParen, "Expect ')' after expression.");
 }
 
-pub fn List(compiler: Compiler, canAssign: bool){}
+pub fn List(parser: Parser, canAssign: bool){}
 
-pub fn SubscriptSignature(compiler: Compiler,  signature: &mut Signature) -> Option<Signature> {
+pub fn SubscriptSignature(parser: Parser,  signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
         signature.sigType = SignatureType::Subscript;
 
 		// The signature currently has "[" as its name since that was the token that
@@ -100,55 +100,57 @@ pub fn SubscriptSignature(compiler: Compiler,  signature: &mut Signature) -> Opt
 		signature.length = 0;
 
 		// Parse the parameters inside the subscript.
-		signature = finishParameterList(compiler, signature);
-		// compiler.consume(TokenType::RighBracket, "Expect ']' after parameters.");
+		if let Some(sig) = finishParameterList(parser, signature) {
+            signature = sig;
+        }
+		parser.consume(TokenType::RightBracket, "Expect ']' after parameters.");
 
-		maybeSetter(compiler, signature);
-		signature;
+		maybeSetter(parser, signature);
+		Some(signature)
 }
 
 
-pub fn ConstructorSignature(compiler: Compiler, signature: &mut  Signature) -> Option<Signature> {
+pub fn ConstructorSignature(parser: Parser, signature: &'static mut  Signature<'static>) -> Option<&'static mut Signature<'static>> {
     Some(signature)
 }
 
 
-fn finishParameterList(compiler: Compiler,  signature: &mut Signature) -> Option<Signature> {
+fn finishParameterList(parser: Parser,  signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
     Some(signature)
 }
 
 
-pub fn Subscript(compiler: Compiler, canAssign: bool){}
+pub fn Subscript(parser: Parser, canAssign: bool){}
 
-pub fn Map(compiler: Compiler, canAssign: bool){}
+pub fn Map(parser: Parser, canAssign: bool){}
 
-pub fn Call(compiler: Compiler, canAssign: bool){}
+pub fn Call(parser: Parser, canAssign: bool){}
 
-pub fn Or(compiler: Compiler, canAssign: bool){}
+pub fn Or(parser: Parser, canAssign: bool){}
 
-pub fn And(compiler: Compiler, canAssign: bool){}
+pub fn And(parser: Parser, canAssign: bool){}
 
-pub fn Conditional(compiler: Compiler, canAssign: bool){}
+pub fn Conditional(parser: Parser, canAssign: bool){}
 
-pub fn Boolean(compiler: Compiler, canAssign: bool){}
+pub fn Boolean(parser: Parser, canAssign: bool){}
 
-pub fn Null(compiler: Compiler, canAssign: bool){}
+pub fn Null(parser: Parser, canAssign: bool){}
 
-pub fn Super(compiler: Compiler, canAssign: bool){}
+pub fn Super(parser: Parser, canAssign: bool){}
 
-pub fn This(compiler: Compiler, canAssign: bool){}
+pub fn This(parser: Parser, canAssign: bool){}
 
-pub fn Field(compiler: Compiler, canAssign: bool) {}
+pub fn Field(parser: Parser, canAssign: bool) {}
 
-pub fn StaticField(compiler: Compiler, canAssign: bool) {}
+pub fn StaticField(parser: Parser, canAssign: bool) {}
 
-pub fn Name(compiler: Compiler, canAssign: bool) {}
+pub fn Name(parser: Parser, canAssign: bool) {}
 
 
-pub fn NamedSignature(compiler: Compiler, signature: &mut Signature) -> Option<Signature> {
+pub fn NamedSignature(parser: Parser, signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
     Some(signature)
 }
 
-pub fn Literal(compiler: Compiler, canAssign: bool) {}
+pub fn Literal(parser: Parser, canAssign: bool) {}
 
-pub fn StringInterpolation(compiler: Compiler, canAssign: bool) {}
+pub fn StringInterpolation(parser: Parser, canAssign: bool) {}

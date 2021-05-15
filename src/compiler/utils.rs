@@ -12,13 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub fn wren_utf8_encode_num_bytes(value: i8) -> u8 {
-    assert_eq!(value >= 0, "Cannot encode a negative value.");
+pub fn wren_utf8_encode_num_bytes(value: u8) -> u8 {
+    assert!(value >= 0, "Cannot encode a negative value.");
 
-    if (value <= 0x7f) 1
-    if (value <= 0x7ff) 2
-    if (value <= 0xffff) 3
-    if (value <= 0x10ffff) 4
-
-    0
+    if value <= 0x7f {
+        1 as u8
+    } 
+    else if value <= 0x7ff {
+        2 as u8
+    }
+    else if value <= 0xffff {
+        3 as u8
+    }
+    else if value <= 0x10ffff {
+        4 as u8
+    }
+    else {
+        0
+    }
 }
