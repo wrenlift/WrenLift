@@ -11,7 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
+#![feature(toowned_clone_into)]
+#![feature(char_indices_offset)]
 #![feature(iter_advance_by)]
 #[macro_use]
 extern crate lazy_static;
@@ -20,18 +21,16 @@ use std::cell::Cell;
 
 mod compiler;
 
-// use compiler::wren_compiler::Compiler;
-use compiler::wren_parser::Parser;
+use compiler::wren_compiler::Compiler;
+use compiler::scanner::Lexer;
 
 
 fn build<'a> () {
     let source = "var isDone = false || true System.print(1 != 2 ? \"math is sane\" : \"math is not sane!\")";
-    let mut _parser = Parser::new(source, Some("main"));
-    _parser.next_token();
-    // let _compiler = Compiler::new(_parser, None);
-    //compiler::wren_parser::next_token(.as_mut());
+    
+    let compiler = Compiler::new(source);
 
-    // _compiler.print();
+    println!("{:#?}", compiler.tokens);
 }
 
  

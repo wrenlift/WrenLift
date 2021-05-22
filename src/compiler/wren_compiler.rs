@@ -13,16 +13,32 @@
 // limitations under the License.
 
 // use crate::compiler::wren_parser::{Parser};
-// use crate::compiler::scanner::{TokenType, Token};
+use crate::compiler::scanner::{TokenType, Token, Lexer};
 
 // use std::cell::Cell;
 
 
-// pub struct Compiler<'a> {
-//     pub parser: Parser<'static>,
-//     pub scope_depth: i32,
-//     pub parent: Option<Box<Compiler<'a>>>,
-// }
+pub struct Compiler {
+    pub tokens: Vec<Token>
+}
+
+impl Compiler {
+    pub fn new(source: &'static str) -> Self {
+        let mut lexer = Lexer::new(source);
+        let mut toks = Vec::new();
+
+        while lexer.next_token() {
+                toks.push(lexer.current.take().unwrap());
+        }
+        
+
+       let ret =  Compiler {
+            tokens:  toks,
+        };
+
+        ret
+    }
+}
 
 // impl<'a> Compiler<'a> {
 //     pub fn new(_parser: Parser<'static>, _parent:Option<Box<Compiler<'a>>>) -> Self {

@@ -93,19 +93,19 @@ pub fn Grouping(parser: Parser, canAssign: bool){
 pub fn List(parser: Parser, canAssign: bool){}
 
 pub fn SubscriptSignature(parser: Parser,  signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
-        signature.sigType = SignatureType::Subscript;
+        // signature.sigType = SignatureType::Subscript;
 
-		// The signature currently has "[" as its name since that was the token that
-		// matched it. Clear that out.
-		signature.length = 0;
+		// // The signature currently has "[" as its name since that was the token that
+		// // matched it. Clear that out.
+		// signature.length = 0;
 
-		// Parse the parameters inside the subscript.
-		if let Some(sig) = finishParameterList(parser, signature) {
-            signature = sig;
-        }
-		parser.consume(TokenType::RightBracket, "Expect ']' after parameters.");
+		// // Parse the parameters inside the subscript.
+		// if let Some(sig) = finishParameterList(parser, signature) {
+        //     signature = sig;
+        // }
+		// parser.consume(TokenType::RightBracket, "Expect ']' after parameters.");
 
-		maybeSetter(parser, signature);
+		// maybeSetter(parser, signature);
 		Some(signature)
 }
 
