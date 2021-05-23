@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::compiler::wren_parser::Parser;
-use crate::compiler::scanner::{Signature, SignatureType, Precedence, Token, TokenType};
+use crate::compiler::scanner::{Signature, SignatureType, Precedence, Tokens, TokenType};
 
 pub fn InfixOp(parser: Parser, canAssign: bool){
     // let rule = compiler.getRule(compiler.parser.previous.type);

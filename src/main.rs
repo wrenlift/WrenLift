@@ -26,8 +26,8 @@ use compiler::scanner::Lexer;
 
 
 fn build<'a> () {
-    let source = "var isDone = false || true System.print(1 != 2 ? \"math is sane\" : \"math is not sane!\")";
-    
+    let source = r#"var isDone = false || true 
+    System.print(1 != 2 ? "math is sane" : "math is not sane!")"#;
     let compiler = Compiler::new(source);
 
     println!("{:#?}", compiler.tokens);

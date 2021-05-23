@@ -20,7 +20,7 @@ use std::str;
 use crate::compiler::utils;
 use std::cell::Cell;
 
-use crate::compiler::scanner::{Token, TokenType, Keywords};
+use crate::compiler::scanner::{Tokens, TokenType, KEYWORDS};
 
 pub const MAX_INTERPOLATION_NESTING: usize = 8;
 

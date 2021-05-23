@@ -134,18 +134,43 @@ pub enum TokenType {
     Eof(GrammarRule),
 }
 
+impl TokenType {
+    fn get_kwd(&self) -> &'static str {
+        match self {
+            TokenType::Eof(_) => {
+                return "";
+            },
+            TokenType::Break(s,_) 
+            | TokenType::Class(s,_)
+            | TokenType::Construct(s,_)
+            | TokenType::Else(s,_)
+            | TokenType::False(s,_)
+            | TokenType::True(s,_)
+            | TokenType::For(s,_)
+            | TokenType::Foreign(s,_)
+            | TokenType::While(s,_)
+            | TokenType::If(s,_)
+            | TokenType::Import(s,_)
+            | TokenType::Static(s,_)
+            | TokenType::Super(s,_)
+            | TokenType::In(s,_)
+            | TokenType::Is(s,_)
+            | TokenType::This(s,_)
+            | TokenType::Null(s,_)
+            | TokenType::Var(s,_)
+             => {
+                s
+            }
+            _ => {
+               return  "";
+            }
+        }
+    }
+}
+
 
 type GrammarFn = fn(parser: Parser, canAssign: bool);
 type SignatureFn = fn(parser: Parser, signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>>;
-
-
-fn grammarDefault(parser: Parser, canAssign: bool){
-    // do nothing
-}
-
-fn signatureDefault(parser: Parser, signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>> {
-    None
-}
 
 
 
@@ -159,52 +184,19 @@ pub struct GrammarRule {
     name: Option<&'static str>,
 }
 
-
-#[derive(Debug, Clone)]
-pub struct Token{
-    pub token_type: Option<TokenType>,
-    pub chars: Box<str>,
-    pub line: usize
+#[derive(Debug, Clone, Copy)]
+pub enum Tokens<'a> {
+    Token(
+        TokenType,
+        &'a str,
+        usize
+    )
 }
-
-
-// impl Display for Token {
-//     fn fmt(&self, f: &mut Formatter) -> Result {
-//         write!(f, "Token {{ 
-//             token_type: {:?},
-//             chars: {:?},
-//             line: {}
-//          }}", self.token_type, self.chars, self.line)
-//     }
-// }
-
-// impl Token {
-//     pub fn new() -> Self {
-//         Self {
-//             line: 0,
-//             token_type: None,
-//             chars: None
-//         }
-//     }
-// }
-
-// #[derive(Debug, Clone)]
-// pub struct Keyword {
-//    // pub identifier:Option<&'static str>,
-//    // pub length:usize,
-//     pub tokenType:TokenType
-// }
-
-// impl<'a> Display for Keyword {
-//     fn fmt(&self, f: &mut Formatter) -> Result {
-//         write!(f, "{:#?}", self)
-//     }
-// }
 
 
 
 lazy_static! {
-pub static ref Keywords: [TokenType; 20] = [
+pub static ref KEYWORDS: [TokenType; 20] = [
     TokenType::Break("break", GrammarRule::unused()),
     TokenType::Class("class", GrammarRule::unused()),
     TokenType::Construct("construct", GrammarRule{ name: None, prefix: None, infix: None,  method: Some(grammar::ConstructorSignature), precedence: Some(Precedence::PrecNone) }),
@@ -226,7 +218,7 @@ pub static ref Keywords: [TokenType; 20] = [
     TokenType::While("while",GrammarRule::unused()),
     TokenType::Eof(GrammarRule::unused()),
 ];
-pub static ref GrammarRules: [TokenType; 62] = [
+pub static ref GRAMMAR_RULES: [TokenType; 63] = [
     TokenType::LeftParen(GrammarRule::prefix(Some(grammar::Grouping))),
     TokenType::RightParen(GrammarRule::unused()),
     TokenType::LeftBracket(GrammarRule { name: None, prefix: Some(grammar::List), infix: Some(grammar::Subscript), method: Some(grammar::SubscriptSignature), precedence: Some(Precedence::PrecCall) }),
@@ -289,15 +281,16 @@ pub static ref GrammarRules: [TokenType; 62] = [
     TokenType::Var("var", GrammarRule::unused()),       
     TokenType::While("while",GrammarRule::unused()),
     TokenType::Eof(GrammarRule::unused()),
+    TokenType::Hash(GrammarRule::unused()),
 ];
 }
 
 pub struct Lexer<'a> {
     input: std::iter::Peekable<std::str::CharIndices<'a>>,
     input_copy: &'a str,
-    pub current: Option<Token>,
-    previous: Option<Token>,
-    next: Option<Token>,
+    pub current: Option<Tokens<'a>>,
+    previous: Option<Tokens<'a>>,
+    next: Option<Tokens<'a>>,
     num_parens: usize,
     parens:Vec<usize>,
     token_offset: usize,
@@ -326,9 +319,12 @@ impl<'a> Lexer<'a> {
         if let Some(&(_, c)) =  self.input.peek() {
             if c == '\n' {
                 self.current_line += 1;
+                println!("current_line {}", self.current_line);
             }
-
-            return self.input.next();
+            if let Some((pos, next)) = self.input.next() {
+                self.char_offset = pos + 1;
+                return Some((pos, next));
+            }
         }
         None
     }
@@ -344,14 +340,13 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        self.input.nth(self.char_offset + 1)
+        self.input_copy.char_indices().nth(self.char_offset + 1)
     }
 
     fn skip_line_comment(&mut self) {
         if let Some(&(_, c1)) = self.peek() {
             if c1 != '\n' && c1 != '\0' {
                 self.next();
-                self.char_offset += 1;
             }
         }
     }
@@ -391,25 +386,32 @@ impl<'a> Lexer<'a> {
                 
                 // Regular comment character.
                 self.next();
-                self.char_offset +=1;
-
             }
         }
     }
 
     fn make_token(&mut self, tok:TokenType) {
-        let bs = self.input_copy[self.token_offset..self.char_offset].to_owned().into_boxed_str();
-        let _tok = Token {
-            token_type: Some(tok),
-            chars: bs,
-            line: self.current_line,
-        };
+
+        let _tok = Tokens::Token(
+            tok,
+            &self.input_copy[self.token_offset..self.char_offset],
+            self.current_line,
+        );
         self.current = Some(_tok);
         
 
         // Make line tokens appear on the line containing the "\n".
         if let TokenType::Line(_) = tok {
-            self.current_line -= 1;
+            match self.next {
+                Some(Tokens::Token(token_type, chars, line)) => {
+                    self.next = Some(Tokens::Token(
+                        token_type,
+                        chars,
+                        line - 1
+                    ));
+                }
+                None => {}
+            }
         }
     }
 
@@ -417,8 +419,8 @@ impl<'a> Lexer<'a> {
     /// Reads the next character, which should be a hex digit (0-9, a-f, or A-F) and
     /// returns its numeric value. If the character isn't a hex digit, returns -1.
     fn read_hex_digit(&mut self) -> i32 {
-        if let Some(&(pos, _c)) = self.peek() {
-            self.char_offset = pos;
+        if let Some(&(_, _c)) = self.peek() {
+            
             if '\n' == _c {
                 self.current_line += 1;
             }
@@ -443,9 +445,9 @@ impl<'a> Lexer<'a> {
         -1
     }
 
-    pub fn read_hex_number(&'a mut self) {
+    pub fn read_hex_number(&mut self) {
         // Skip past the `x` used to denote a hexadecimal literal.
-        if let Some((pos, _)) = self.next() {
+        if let Some((_, _)) = self.next() {
             self.current_line += 1;
         }
         
@@ -458,21 +460,26 @@ impl<'a> Lexer<'a> {
     }
 
     fn match_char(&mut self, c:char) -> bool {
-        if let Some(&(_, _c)) = self.peek() {
-            if c != _c {
+        match self.peek() {
+            Some(&(_, _c)) => {
+                if c != _c {
+                    return false;
+                } else {
+                    self.next();
+                    return true;
+                } 
+            },
+            None => {
                 return false;
             }
         }
-        self.next();
-        self.char_offset += 1;
-        true
     }
 
-    fn make_number(&'a mut self) {
+    fn make_number(&mut self) {
 
         // Todo: store number value
 
-        self.make_token(GrammarRules[36]);
+        self.make_token(GRAMMAR_RULES[36]);
     }
 
     fn two_char_token(&mut self, c: char, two: TokenType, one: TokenType){
@@ -481,6 +488,92 @@ impl<'a> Lexer<'a> {
         } else  {
             self.make_token(one);
         }
+    }
+
+    /// Finishes lexing an identifier. Handles reserved words.
+    fn read_name(&mut self, token_type: TokenType, first_char: char) {
+        let mut _token_type = token_type;
+        loop {
+            if let Some(&(_, c)) = self.peek() {
+                if is_name(c) || is_digit(c) {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        
+
+        
+   
+        for kwd in KEYWORDS.into_iter() {
+            let _word = std::str::from_utf8(&self.input_copy[self.token_offset..self.char_offset].as_bytes());
+            let w = kwd.get_kwd();
+            
+            if w == String::from(_word.unwrap()) {
+                _token_type = *kwd;
+                break;
+            }
+        }
+
+      
+        self.make_token(_token_type);
+    }
+
+    fn read_number(&mut self) {
+        loop {
+            if let Some(&(_, ch)) = self.peek() {
+                if is_digit(ch) {
+                    self.next();
+                } else {
+                    break;
+                }
+            } 
+        }
+       
+        // See if it has a floating point. Make sure there is a digit after the "."
+        // so we don't get confused by method calls on number literals.
+        if let Some(&(_, ch)) = self.peek() {
+            if let Some((_, ch2)) = self.peek_next() {
+                if ch == '.' && is_digit(ch2) {
+                    self.next();
+                    loop {
+                        if let Some(&(_, ch)) = self.peek() {
+                            if is_digit(ch) {
+                                self.next();
+                            } else {
+                                break;
+                            }
+                        } 
+                    }
+                    
+                }
+            }
+        }
+        // // See if the number is in scientific notation. 
+        if self.match_char('e') || self.match_char('E') {
+            // Allow a single positive/negative exponent symbol.
+            if !self.match_char('+') {
+                self.match_char('-');
+            } 
+            if let Some(&(_, ch)) = self.peek() {
+                if !is_digit(ch) {
+                    lex_error(self.current_line,"Unterminated scientific notation.".to_owned());
+                }
+            }
+            
+            loop {
+                if let Some(&(_, ch)) = self.peek() {
+                    if is_digit(ch) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                } 
+            }
+            
+        }
+        self.make_number();
     }
 
     fn read_hex_escape(&mut self, digits: usize, description: String) -> u8 {
@@ -523,33 +616,30 @@ impl<'a> Lexer<'a> {
     // Finishes lexing a string literal.
     fn read_string(&mut self) {
         let mut string = String::new();
-        let mut tokenType = GrammarRules[37];
-
+        let mut token_type = GRAMMAR_RULES[37];
         loop {
-            if let Some(&(pos, c)) = self.peek() {
-                let eof = '\0';
+            if let Some((_, c)) = self.next() {
                 if c == '"' {
-                    self.next();
-                    self.char_offset = pos;
                     break;
                 }
-                if c == eof {
+                if c == '\0' {
                     lex_error(self.current_line, String::from("Unterminated string."));
                     // Don't consume it if it isn't expected. Keeps us from reading past the
 				    // end of an unterminated string.
+                    self.char_offset -= 1;
                     break;
                 }
                 if c == '%' {
                     if self.num_parens < MAX_INTERPOLATION_NESTING {
                         // TODO: Allow format string.
-                        if let Some((pos, _c)) = self.next() {
-                            self.char_offset = pos;
+                        if let Some((_, _c)) = self.next() {
+                            
                             if _c != '(' {
                                 lex_error(self.current_line, String::from("Expect '(' after '%'."));
                             }
                             self.num_parens += 1;
                             self.parens[self.num_parens] = 1;
-                            tokenType = GrammarRules[38];
+                            token_type = GRAMMAR_RULES[38];
                             break;
                         }
                     }
@@ -557,38 +647,38 @@ impl<'a> Lexer<'a> {
                 }
 
                 if c == '\\' {
-                    if let Some((pos, ch)) = self.next() {
-                        self.char_offset = pos;
+                    if let Some((_, ch)) = self.next() {
+                        
                         match ch {
-                            '"' => string.push('"'),
-                            '\\' => string.push('\\'),
-                            '%' => string.push('%'),
-                            '0' => string.push('\0'),
-                            'a' => string.push_str("\x07"),
-                            'b' => string.push_str("\x08"),
-                            'e' => string.push_str("\x1B"),
-                            'f' => string.push_str("\x0C"),
-                            'n' => string.push('\n'),
-                            'r' => string.push('\r'),
-                            't' => string.push('\t'),
-                            'u' => self.read_unicode_escape(&mut string, 4),
-                            'U' => self.read_unicode_escape(&mut string, 8),
-                            'v' => string.push_str("\x0B"),
-                            'x' => string.push(self.read_hex_escape(2, String::from("byte")) as char),
-                            _ => lex_error(self.current_line, format!("invalid escape character {}", self.input.nth(self.char_offset-1).unwrap().1))
+                            '"' => {string.push('"'); break;}
+                            '\\' => {string.push('\\'); break;}
+                            '%' => {string.push('%'); break;}
+                            '0' => {string.push('\0'); break;}
+                            'a' => {string.push_str("\x07"); break;}
+                            'b' => {string.push_str("\x08"); break;}
+                            'e' => {string.push_str("\x1B"); break;}
+                            'f' => {string.push_str("\x0C"); break;}
+                            'n' => {string.push('\n'); break;}
+                            'r' => {string.push('\r'); break;}
+                            't' => {string.push('\t'); break;}
+                            'u' => {self.read_unicode_escape(&mut string, 4); break;}
+                            'U' => {self.read_unicode_escape(&mut string, 8); break;}
+                            'v' => {string.push_str("\x0B"); break;}
+                            'x' => {string.push(self.read_hex_escape(2, String::from("byte")) as char); break;}
+                            _ => {lex_error(self.current_line, format!("invalid escape character {}", self.input.nth(self.char_offset-1).unwrap().1)); break;}
                         }
-                        break;
                     }
                 } {
                     string.push(c);
                 }
-
+            } else {
+                break;
             }
-
+            
         }
-
+        string.clear();
         // Todo: store string literal
-        self.make_token(tokenType);
+        self.make_token(token_type);
 
     }
 
@@ -596,171 +686,262 @@ impl<'a> Lexer<'a> {
         self.previous = self.current.clone();
         self.current = self.next.clone();
 
-        if let Some(token) = self.next.clone() {
-            match token.token_type {
-                Some(TokenType::Eof(_)) => {
+        if let Some(Tokens::Token(token_type, chars, line)) = self.next.clone() {
+            match token_type {
+                TokenType::Eof(_) => {
                     return true;
                 }
-                None => {}
                 _ => {}
             }
         }
 
-        if let Some(token) = self.current.clone() {
-            match token.token_type {
-                Some(TokenType::Eof(_)) => {
+        if let Some(Tokens::Token(token_type, chars, line)) = self.current.clone() {
+            match token_type {
+                TokenType::Eof(_) => {
                     return true;
                 }
-                None => {}
                 _ => {}
             }
         }
 
-    
-        match self.peek() {
-            Some(&(_pos, ch)) => {
-                while ch != '\0' {
+        loop {
+            match self.peek() {
+                Some(&(_pos, ch)) => {
                     self.token_offset = self.char_offset;
-                    match self.next() {
-                        Some((pos, '(')) => {
-                            self.char_offset = pos;
-                            // If we are inside an interpolated expression, count the unmatched "(".
-                            if self.num_parens > 0 {
-                                self.parens[(self.num_parens - 1) as usize] += 1;
-                            }
-                            self.make_token(GrammarRules[0]);
-                            return true;
-                        },
-                        Some((pos, ')')) => {
-                            self.char_offset = pos;
-                            // If we are inside an interpolated expression, count the ")".
-                            if self.num_parens > 0 {
-                                self.parens[(self.num_parens - 1) as usize] -= 1;
-                                if self.parens[(self.num_parens - 1) as usize] == 0 {
-                                    // This is the final ")", so the interpolation expression has ended.
-                                    // This ")" now begins the next section of the template string.
-                                    self.num_parens -= 1;
-                                    self.read_string();
-                                    return true;
+                        let c = self.next();
+                        match c {
+                            Some((_, '(')) => {
+                                // If we are inside an interpolated expression, count the unmatched "(".
+                                if self.num_parens > 0 {
+                                    self.parens[(self.num_parens - 1) as usize] += 1;
                                 }
-                            }
-                            self.make_token(GrammarRules[1]);
-                            return true;
-                        },
-                        Some((pos, '[')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[2]);
-                            return true;
-                        }
-                        Some((pos, ']')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[3]);
-                            return true;
-                        }
-                        Some((pos, '{')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[4]);
-                            return true;
-                        }
-                        Some((pos, '}')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[5]);
-                            return true;
-                        }
-                        Some((pos, ':')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[6]);
-                            return true;
-                        }
-                        Some((pos, ',')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[10]);
-                            return true;
-                        }
-                        Some((pos, '*')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[11]);
-                            return true;
-                        }
-                        Some((pos, '%')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[13]);
-                            return true;
-                        }
-                        Some((pos, '+')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[14]);
-                            return true;
-                        }
-                        Some((pos, '-')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[15]);
-                            return true;
-                        }
-                        Some((pos, '^')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[20]);
-                            return true;
-                        }
-                        Some((pos, '~')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[24]);
-                            return true;
-                        }
-                        Some((pos, '?')) => {
-                            self.char_offset = pos;
-                            self.make_token(GrammarRules[25]);
-                            return true;
-                        }
-                        Some((pos, '|')) => {
-                            self.char_offset = pos;
-                            self.two_char_token('|', GrammarRules[19], GrammarRules[18]);
-                            return true;
-                        }
-                        Some((pos, '&')) => {
-                            self.char_offset = pos;
-                            self.two_char_token('&', GrammarRules[22], GrammarRules[21]);
-                            return true;
-                        }
-                        Some((pos, '!')) => {
-                            self.char_offset = pos;
-                            self.two_char_token('!', GrammarRules[32], GrammarRules[23]);
-                            return true;
-                        }
-                        Some((pos, '.')) => {
-                            self.char_offset = pos;
-                            if self.match_char('.') {
-                                self.two_char_token('.', GrammarRules[9], GrammarRules[8]);
+                                self.make_token(GRAMMAR_RULES[0]);
+                                return true;
+                            },
+                            Some((_, ')')) => {
+                                // If we are inside an interpolated expression, count the ")".
+                                if self.num_parens > 0 {
+                                    self.parens[(self.num_parens - 1) as usize] -= 1;
+                                    if self.parens[(self.num_parens - 1) as usize] == 0 {
+                                        // This is the final ")", so the interpolation expression has ended.
+                                        // This ")" now begins the next section of the template string.
+                                        self.num_parens -= 1;
+                                        self.read_string();
+                                        return true;
+                                    }
+                                }
+                                self.make_token(GRAMMAR_RULES[1]);
+                                return true;
+                            },
+                            Some((_, '[')) => {
+                                self.make_token(GRAMMAR_RULES[2]);
                                 return true;
                             }
-                            self.make_token(GrammarRules[7]);
-                            return true;
-                        }
-                        Some((pos, '/')) => {
-                            self.char_offset = pos;
-                            if self.match_char('/') {
-                                self.skip_line_comment();
+                            Some((_, ']')) => {
+                                self.make_token(GRAMMAR_RULES[3]);
+                                return true;
+                            }
+                            Some((_, '{')) => {
+                                self.make_token(GRAMMAR_RULES[4]);
+                                return true;
+                            }
+                            Some((_, '}')) => {
+                                self.make_token(GRAMMAR_RULES[5]);
+                                return true;
+                            }
+                            Some((_, ':')) => {
+                                self.make_token(GRAMMAR_RULES[6]);
+                                return true;
+                            }
+                            Some((_, ',')) => {
+                                self.make_token(GRAMMAR_RULES[10]);
+                                return true;
+                            }
+                            Some((_, '*')) => {
+                                self.make_token(GRAMMAR_RULES[11]);
+                                return true;
+                            }
+                            Some((_, '%')) => {
+                                self.make_token(GRAMMAR_RULES[13]);
+                                return true;
+                            }
+                            Some((_, '#')) => {
+                                // Ignore shebang on the first line.
+                                if let Some(&(_, ch)) = self.peek() {
+                                    if let Some((_, ch2)) = self.peek_next() {
+                                        if self.current_line == 1 && ch == '!' && ch2 == '/' {
+                                            self.skip_line_comment();
+                                            break;
+                                        }
+                                    }
+                                }
+                                self.make_token(GRAMMAR_RULES[62]);
+                                return true;
+                            }
+                            Some((_, '+')) => {
+                                self.make_token(GRAMMAR_RULES[14]);
+                                return true;
+                            }
+                            Some((_, '-')) => {
+                                self.make_token(GRAMMAR_RULES[15]);
+                                return true;
+                            }
+                            Some((_, '^')) => {
+                                self.make_token(GRAMMAR_RULES[20]);
+                                return true;
+                            }
+                            Some((_, '~')) => {
+                                self.make_token(GRAMMAR_RULES[24]);
+                                return true;
+                            }
+                            Some((_, '?')) => {
+                                self.make_token(GRAMMAR_RULES[25]);
+                                return true;
+                            }
+                            Some((_, '|')) => {
+                                self.two_char_token('|', GRAMMAR_RULES[19], GRAMMAR_RULES[18]);
+                                return true;
+                            }
+                            Some((_, '&')) => {
+                                self.two_char_token('&', GRAMMAR_RULES[22], GRAMMAR_RULES[21]);
+                                return true;
+                            }
+                            Some((_, '!')) => {
+                                // println!("{}", ch);
+                                self.two_char_token('!', GRAMMAR_RULES[32], GRAMMAR_RULES[23]);
+                                return true;
+                            }
+                            Some((_, '=')) => {
+                                self.two_char_token('=', GRAMMAR_RULES[31], GRAMMAR_RULES[26]);
+                                return true;
+                            }
+                            Some((_, '.')) => {
+                                if self.match_char('.') {
+                                    self.two_char_token('.', GRAMMAR_RULES[9], GRAMMAR_RULES[8]);
+                                    return true;
+                                }
+                                self.make_token(GRAMMAR_RULES[7]);
+                                
+                                return true;
+                            }
+                            Some((_, '/')) => {
+                                if self.match_char('/') {
+                                    self.skip_line_comment();
+                                    continue;
+                                }
+                                if self.match_char('*') {
+                                    self.skip_block_comment();
+                                    continue;
+                                }
+                                self.make_token(GRAMMAR_RULES[12]);
+                                return true;
+                            }
+                            Some((_, '<')) => {
+                                if self.match_char('<') {
+                                    self.make_token(GRAMMAR_RULES[16]);
+                                } else {
+                                    self.two_char_token('=', GRAMMAR_RULES[29], GRAMMAR_RULES[27])
+                                }
+
+                                return true;
+                            }
+                            Some((_, '>')) => {
+                                if self.match_char('>') {
+                                    self.make_token(GRAMMAR_RULES[17]);
+                                } else {
+                                    self.two_char_token('=', GRAMMAR_RULES[30], GRAMMAR_RULES[28])
+                                }
+
+                                return true;
+                            }
+                            Some((_, '\n')) => {
+                                self.make_token(GRAMMAR_RULES[39]);
+                                return true;
+                            }
+                            Some((_, ' ')) | Some((_, '\r')) | Some((_, '\t'))  => {
+                                'inner1: loop {
+                                    if let Some(&(_, ch)) = self.peek() {
+                                        if ch == ' ' || ch == '\r' || ch == '\t'{
+                                            self.next();
+                                        } else {
+                                            break 'inner1;
+                                        }
+                                    }
+                                }
                                 continue;
                             }
-                            if self.match_char('*') {
-                                self.skip_block_comment();
-                                continue;
+                            Some((_, '"')) => {
+                                if let Some(&(_, ch1)) = self.peek() {
+                                    if let Some((_, ch2)) = self.peek_next() {
+                                        if ch1 == '"' && ch2 == '"'{
+                                            return true;
+                                        } 
+                                    }
+                                }
+                                self.read_string();
+                                return true;
                             }
-                            self.make_token(GrammarRules[12]);
-                            return true;
+                            Some((_, '_')) => {
+                                if let Some(&(_, ch)) = self.peek() {
+                                    self.read_name(if ch == '_' {GRAMMAR_RULES[34]} else {GRAMMAR_RULES[33]}, ch);
+                                }
+                                return true;
+                            }
+                            Some((_, '0')) => {
+                                if let Some(&(_, ch)) = self.peek() {
+                                    if ch == 'x' {
+                                        self.read_hex_number();
+                                        return true;
+                                    }
+                                }
+                                self.read_number();
+                                return true;
+                            }
+                            _ => {
+                                match ch {
+                                    '0'..='9' |
+                                    'a'..='z' | 'A'..='Z' => {
+                                        if is_name(ch) {
+                                            self.read_name(GRAMMAR_RULES[35], ch);
+                                        } else if is_digit(ch) {
+                                            self.read_number();
+                                        } 
+                                        return true;
+                                    }
+                                    _ => {
+                                        if (ch as u8) >= 32 && (ch as u8) <= 126 {
+                                            lex_error(self.current_line, format!("Invalid character {}.", ch));
+                                        } else {
+                                            // Don't show non-ASCII values since we didn't UTF-8 decode the
+                                            // bytes. Since there are no non-ASCII byte values that are
+                                            // meaningful code units in Wren, the lexer works on raw bytes,
+                                            // even though the source code and console output are UTF-8.
+                                            lex_error(self.current_line, format!("Invalid character {:#x}.", ch as u8));
+                                        }
+                                   
+                                        self.current = Some(Tokens::Token(
+                                            GRAMMAR_RULES[40],
+                                            "",
+                                            self.current_line
+                                        ));
+                                        return true;
+                                    }
+                                }
+                            
+                                
+                            }
                         }
-                        None => {
-                            return false;
-                        }
-                        _ => {}
-                    }
                 }
-            }
-            None => {
-                return false;
+                None => {
+                  return false;  
+                }
+                
             }
         }
-        
+
+        // If we get here, we're out of source, so just make EOF tokens.
+        self.token_offset = self.char_offset;
+        self.make_token(GRAMMAR_RULES[61]);
         return false;
     }
 

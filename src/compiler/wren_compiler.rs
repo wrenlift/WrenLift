@@ -13,24 +13,26 @@
 // limitations under the License.
 
 // use crate::compiler::wren_parser::{Parser};
-use crate::compiler::scanner::{TokenType, Token, Lexer};
+use crate::compiler::scanner::{Tokens, Lexer};
 
 // use std::cell::Cell;
 
 
-pub struct Compiler {
-    pub tokens: Vec<Token>
+pub struct Compiler<'a> {
+    pub tokens: Vec<Tokens<'a>>
 }
 
-impl Compiler {
+impl<'a> Compiler<'a> {
     pub fn new(source: &'static str) -> Self {
         let mut lexer = Lexer::new(source);
         let mut toks = Vec::new();
 
         while lexer.next_token() {
-                toks.push(lexer.current.take().unwrap());
+                if let Some(tok) = lexer.current.take() {
+                    toks.push(tok);
+                }
+                
         }
-        
 
        let ret =  Compiler {
             tokens:  toks,
