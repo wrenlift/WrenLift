@@ -11,13 +11,13 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#![feature(destructuring_assignment)]
 #![feature(toowned_clone_into)]
 #![feature(char_indices_offset)]
 #![feature(iter_advance_by)]
 #[macro_use]
 extern crate lazy_static;
 
-use std::cell::Cell;
 
 mod compiler;
 
@@ -30,7 +30,7 @@ fn build<'a> () {
     System.print(1 != 2 ? "math is sane" : "math is not sane!")"#;
     let compiler = Compiler::new(source);
 
-    println!("{:#?}", compiler.tokens);
+    // println!("{:#?}", compiler.tokens);
 }
 
  

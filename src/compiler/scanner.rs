@@ -13,7 +13,8 @@
 // limitations under the License.
 // use crate::lazy_static;
 use crate::compiler::wren_parser::{Parser, lex_error, is_digit, is_name, MAX_INTERPOLATION_NESTING};
-use crate::compiler::grammar;
+use crate::compiler::grammar::{Grammar};
+use crate::compiler::wren_compiler::Compiler;
 use std::fmt::{Display, Formatter, Result};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -21,11 +22,12 @@ use std::iter::Peekable;
 use std::str::Chars;
 use std::char;
 use crate::compiler::utils::{ wren_utf8_encode_num_bytes };
+use core::mem::transmute;
 
 
 const MAX_PARAMETERS: u32 = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub enum Precedence {
     PrecNone = 0,
     PrecLowest,
@@ -49,70 +51,70 @@ pub enum Precedence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenType {
-    LeftParen(GrammarRule),
-    RightParen(GrammarRule),
-    LeftBracket(GrammarRule),
-    RightBracket(GrammarRule),
-    LeftBrace(GrammarRule),
-    RightBrace( GrammarRule),
-    Colon(GrammarRule),
-    Dot(GrammarRule),
-    DotDot(GrammarRule),
-    DotDotDot(GrammarRule),
-    Comma(GrammarRule),
-    Star(GrammarRule),
-    Slash(GrammarRule),
-    Percent(GrammarRule),
-    Plus(GrammarRule),
-    Minus(GrammarRule),
-    LtLt(GrammarRule),
-    GtGt(GrammarRule),
-    Pipe(GrammarRule),
-    PipePipe(GrammarRule),
-    Caret(GrammarRule),
-    Amp(GrammarRule),
-    AmpAmp(GrammarRule),
-    Bang(GrammarRule),
-    Tilde(GrammarRule),
-    Question(GrammarRule),
-    Eq(GrammarRule),
-    Lt(GrammarRule),
-    Gt(GrammarRule),
-    LtEq(GrammarRule),
-    GtEq(GrammarRule),
-    EqEq(GrammarRule),
-    BangEq(GrammarRule),
-    Hash(GrammarRule),
+pub enum TokenType<'a> {
+    LeftParen(GrammarRule<'a>),
+    RightParen(GrammarRule<'a>),
+    LeftBracket(GrammarRule<'a>),
+    RightBracket(GrammarRule<'a>),
+    LeftBrace(GrammarRule<'a>),
+    RightBrace( GrammarRule<'a>),
+    Colon(GrammarRule<'a>),
+    Dot(GrammarRule<'a>),
+    DotDot(GrammarRule<'a>),
+    DotDotDot(GrammarRule<'a>),
+    Comma(GrammarRule<'a>),
+    Star(GrammarRule<'a>),
+    Slash(GrammarRule<'a>),
+    Percent(GrammarRule<'a>),
+    Plus(GrammarRule<'a>),
+    Minus(GrammarRule<'a>),
+    LtLt(GrammarRule<'a>),
+    GtGt(GrammarRule<'a>),
+    Pipe(GrammarRule<'a>),
+    PipePipe(GrammarRule<'a>),
+    Caret(GrammarRule<'a>),
+    Amp(GrammarRule<'a>),
+    AmpAmp(GrammarRule<'a>),
+    Bang(GrammarRule<'a>),
+    Tilde(GrammarRule<'a>),
+    Question(GrammarRule<'a>),
+    Eq(GrammarRule<'a>),
+    Lt(GrammarRule<'a>),
+    Gt(GrammarRule<'a>),
+    LtEq(GrammarRule<'a>),
+    GtEq(GrammarRule<'a>),
+    EqEq(GrammarRule<'a>),
+    BangEq(GrammarRule<'a>),
+    Hash(GrammarRule<'a>),
   
-    Break(&'static str, GrammarRule),
-    Class(&'static str, GrammarRule),
-    Construct(&'static str, GrammarRule),
-    Else(&'static str, GrammarRule),
-    False(&'static str, GrammarRule),
-    For(&'static str, GrammarRule),
-    Foreign(&'static str, GrammarRule),
-    If(&'static str, GrammarRule),
-    Import(&'static str, GrammarRule),
-    In(&'static str, GrammarRule),
-    Is(&'static str, GrammarRule),
-    Null(&'static str, GrammarRule),
-    Return(&'static str, GrammarRule),
-    Static(&'static str, GrammarRule),
-    Super(&'static str, GrammarRule),
-    This(&'static str, GrammarRule),
-    True(&'static str, GrammarRule),
-    Var(&'static str, GrammarRule),
-    While(&'static str, GrammarRule),
+    Break(&'static str, GrammarRule<'a>),
+    Class(&'static str, GrammarRule<'a>),
+    Construct(&'static str, GrammarRule<'a>),
+    Else(&'static str, GrammarRule<'a>),
+    False(&'static str, GrammarRule<'a>),
+    For(&'static str, GrammarRule<'a>),
+    Foreign(&'static str, GrammarRule<'a>),
+    If(&'static str, GrammarRule<'a>),
+    Import(&'static str, GrammarRule<'a>),
+    In(&'static str, GrammarRule<'a>),
+    Is(&'static str, GrammarRule<'a>),
+    Null(&'static str, GrammarRule<'a>),
+    Return(&'static str, GrammarRule<'a>),
+    Static(&'static str, GrammarRule<'a>),
+    Super(&'static str, GrammarRule<'a>),
+    This(&'static str, GrammarRule<'a>),
+    True(&'static str, GrammarRule<'a>),
+    Var(&'static str, GrammarRule<'a>),
+    While(&'static str, GrammarRule<'a>),
   
-    Field(GrammarRule),
-    StaticField(GrammarRule),
-    Name(GrammarRule),
-    Number(GrammarRule),
+    Field(GrammarRule<'a>),
+    StaticField(GrammarRule<'a>),
+    Name(GrammarRule<'a>),
+    Number(GrammarRule<'a>),
     
     // A string literal without any interpolation or the last section of a
     // string following the last interpolated expression.
-    String(GrammarRule),
+    String(GrammarRule<'a>),
     
     // A portion of a string literal preceding an interpolated expression. This
     // string:
@@ -126,16 +128,89 @@ pub enum TokenType {
     //     TokenType::Interpolation " c "
     //     TokenType::Name         d
     //     TokenType::String       " e"
-    Interpolation(GrammarRule),
+    Interpolation(GrammarRule<'a>),
   
-    Line(GrammarRule),
+    Line(GrammarRule<'a>),
   
-    Error(GrammarRule),
-    Eof(GrammarRule),
+    Error(GrammarRule<'a>),
+    Eof(GrammarRule<'a>),
 }
 
-impl TokenType {
-    fn get_kwd(&self) -> &'static str {
+impl<'a> TokenType<'a> {
+    pub fn get_rule(self) -> GrammarRule<'a> {
+        match self {
+            TokenType::Break(_,r) 
+            | TokenType::Class(_,r)
+            | TokenType::Construct(_,r)
+            | TokenType::Else(_,r)
+            | TokenType::False(_,r)
+            | TokenType::True(_,r)
+            | TokenType::For(_,r)
+            | TokenType::Foreign(_,r)
+            | TokenType::While(_,r)
+            | TokenType::If(_,r)
+            | TokenType::Import(_,r)
+            | TokenType::Static(_,r)
+            | TokenType::Super(_,r)
+            | TokenType::In(_,r)
+            | TokenType::Is(_,r)
+            | TokenType::This(_,r)
+            | TokenType::Null(_,r)
+            | TokenType::Var(_,r)
+            | TokenType::Return(_,r)
+             => {
+                r
+            },
+            TokenType::Eof(r) 
+            | TokenType::Hash(r)
+            | TokenType::LeftParen(r) | 
+            TokenType::RightParen(r) | 
+            TokenType::LeftBracket(r) |
+            TokenType::RightBracket(r) | 
+            TokenType::LeftBrace(r) | 
+            TokenType::RightBrace(r) | 
+            TokenType::Colon(r) | 
+            TokenType::Dot(r) |
+            TokenType::DotDot(r) |
+            TokenType::DotDotDot(r) |
+            TokenType::Comma(r) |
+            TokenType::Star(r) |
+            TokenType::Slash(r) |
+            TokenType::Percent(r) | 
+            TokenType::Plus(r) | 
+            TokenType::Minus(r) | 
+            TokenType::LtLt(r) | 
+            TokenType::GtGt(r) | 
+            TokenType::Pipe(r) | 
+            TokenType::PipePipe(r) | 
+            TokenType::Caret(r) | 
+            TokenType::Amp(r) | 
+            TokenType::AmpAmp(r) | 
+            TokenType::Bang(r) | 
+            TokenType::Tilde(r) | 
+            TokenType::Question(r) | 
+            TokenType::Eq(r) | 
+            TokenType::Lt(r) | 
+            TokenType::Gt(r) | 
+            TokenType::LtEq(r) | 
+            TokenType::GtEq(r) | 
+            TokenType::EqEq(r) | 
+            TokenType::BangEq(r) | 
+            TokenType::Field(r) | 
+            TokenType::StaticField(r) | 
+            TokenType::Name(r) |
+            TokenType::Number(r) | 
+            TokenType::String(r) |
+            TokenType::Interpolation(r) |
+            TokenType::Line(r) |
+            TokenType::Error(r)
+            => {
+                r
+            }
+        }
+    }
+
+    pub fn get_kwd(&self) -> &'a str {
         match self {
             TokenType::Eof(_) => {
                 return "";
@@ -158,6 +233,7 @@ impl TokenType {
             | TokenType::This(s,_)
             | TokenType::Null(s,_)
             | TokenType::Var(s,_)
+            | TokenType::Return(s,_)
              => {
                 s
             }
@@ -169,25 +245,95 @@ impl TokenType {
 }
 
 
-type GrammarFn = fn(parser: Parser, canAssign: bool);
-type SignatureFn = fn(parser: Parser, signature: &'static mut Signature<'static>) -> Option<&'static mut Signature<'static>>;
+pub type GrammarFn<'a> = fn(compiler: &'a mut Compiler<'a>, canAssign: bool);
+pub type SignatureFn<'a> = fn(parser: Parser, signature: &'a mut Signature<'a>) -> Option<&'a mut Signature<'a>>;
 
 
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GrammarRule {
-    prefix: Option<GrammarFn>,
-    infix: Option<GrammarFn>,
-    method: Option<SignatureFn>,
-    precedence: Option<Precedence>,
-    name: Option<&'static str>,
+pub struct GrammarRule<'a>{
+    pub prefix: Option<GrammarFn<'a>>,
+    pub infix: Option<GrammarFn<'a>>,
+    pub method: Option<SignatureFn<'a>>,
+    pub precedence: Option<Precedence>,
+    pub name: Option<&'static str>,
 }
+
+impl<'a> GrammarRule<'a> {
+    #[inline]
+    pub fn unused() -> Self {
+        Self { 
+            precedence: Some(Precedence::PrecNone),
+            infix: None,
+            method: None,
+            name: None,
+            prefix: None,
+        }
+    }
+
+    #[inline]
+    pub fn prefix(fun: Option<GrammarFn<'a>>) -> Self {
+        Self {
+            prefix: fun,
+            method: None,
+            infix: None,
+            name: None,
+            precedence: Some(Precedence::PrecNone),
+        }
+    }
+
+    #[inline]
+    pub fn infix(pre: Option<Precedence>, fun: Option<GrammarFn<'a>>) -> Self {
+        Self {
+            infix: fun,
+            precedence: pre,
+            prefix: None,
+            name: None, 
+            method: None,
+        }
+    }
+
+    #[inline]
+    pub fn infix_operator(pre: Option<Precedence>, name: &'static str) -> Self {
+        Self {
+            name: Some(name),
+            infix: Some(Grammar::InfixOp),
+            method: Some(Grammar::InfixSignature),
+            prefix: None,
+            precedence: pre,
+        }
+    }
+
+    #[inline]
+    pub fn prefix_operator(name: &'static str) -> Self {
+        Self {
+            name: Some(name),
+            prefix: Some(Grammar::UnaryOp),
+            method: Some(Grammar::UnarySignature),
+            precedence: Some(Precedence::PrecNone),
+            infix: None,
+        }
+    }
+
+    #[inline]
+    pub fn operator(name: &'static str) -> Self {
+        Self {
+            name: Some(name),
+            prefix: Some(Grammar::UnaryOp),
+            infix: Some(Grammar::InfixOp),
+            method: Some(Grammar::MixedSignature),
+            precedence: Some(Precedence::PrecTerm),
+        }
+    }
+
+}
+
 
 #[derive(Debug, Clone, Copy)]
 pub enum Tokens<'a> {
     Token(
-        TokenType,
+        TokenType<'a>,
         &'a str,
         usize
     )
@@ -196,37 +342,37 @@ pub enum Tokens<'a> {
 
 
 lazy_static! {
-pub static ref KEYWORDS: [TokenType; 20] = [
+pub static ref KEYWORDS: [TokenType<'static>; 20] = [
     TokenType::Break("break", GrammarRule::unused()),
     TokenType::Class("class", GrammarRule::unused()),
-    TokenType::Construct("construct", GrammarRule{ name: None, prefix: None, infix: None,  method: Some(grammar::ConstructorSignature), precedence: Some(Precedence::PrecNone) }),
+    TokenType::Construct("construct", GrammarRule{ name: None, prefix: None, infix: None,  method: Some(Grammar::ConstructorSignature), precedence: Some(Precedence::PrecNone) }),
     TokenType::Else("else", GrammarRule::unused()),
-    TokenType::False("false", GrammarRule::prefix(Some(grammar::Boolean))),
+    TokenType::False("false", GrammarRule::prefix(Some(Grammar::Boolean))),
     TokenType::For("for", GrammarRule::unused()),
     TokenType::Foreign("foreign", GrammarRule::unused()),
     TokenType::If("if", GrammarRule::unused()),
     TokenType::Import("import", GrammarRule::unused()),
     TokenType::In("in", GrammarRule::unused()),
     TokenType::Is("is", GrammarRule::infix_operator(Some(Precedence::PrecIs), "is")),
-    TokenType::Null("null", GrammarRule::prefix(Some(grammar::Null))),
+    TokenType::Null("null", GrammarRule::prefix(Some(Grammar::Null))),
     TokenType::Return("return", GrammarRule::unused()),   
     TokenType::Static("static", GrammarRule::unused()),  
-    TokenType::Super("super", GrammarRule::prefix(Some(grammar::Super))),    
-    TokenType::This("this", GrammarRule::prefix(Some(grammar::This))),     
-    TokenType::True("true", GrammarRule::prefix(Some(grammar::Boolean))),      
+    TokenType::Super("super", GrammarRule::prefix(Some(Grammar::Super))),    
+    TokenType::This("this", GrammarRule::prefix(Some(Grammar::This))),     
+    TokenType::True("true", GrammarRule::prefix(Some(Grammar::Boolean))),      
     TokenType::Var("var", GrammarRule::unused()),       
     TokenType::While("while",GrammarRule::unused()),
     TokenType::Eof(GrammarRule::unused()),
 ];
-pub static ref GRAMMAR_RULES: [TokenType; 63] = [
-    TokenType::LeftParen(GrammarRule::prefix(Some(grammar::Grouping))),
+pub static ref GRAMMAR_RULES: [TokenType<'static>; 62] = [
+    TokenType::LeftParen(GrammarRule::prefix(Some(Grammar::Grouping))),
     TokenType::RightParen(GrammarRule::unused()),
-    TokenType::LeftBracket(GrammarRule { name: None, prefix: Some(grammar::List), infix: Some(grammar::Subscript), method: Some(grammar::SubscriptSignature), precedence: Some(Precedence::PrecCall) }),
+    TokenType::LeftBracket(GrammarRule { name: None, prefix: Some(Grammar::List), infix: Some(Grammar::Subscript), method: Some(Grammar::SubscriptSignature), precedence: Some(Precedence::PrecCall) }),
     TokenType::RightBracket(GrammarRule::unused()),
-    TokenType::LeftBrace(GrammarRule::prefix(Some(grammar::Map))),
+    TokenType::LeftBrace(GrammarRule::prefix(Some(Grammar::Map))),
     TokenType::RightBrace(GrammarRule::unused()),
     TokenType::Colon(GrammarRule::unused()),
-    TokenType::Dot(GrammarRule::infix(Some(Precedence::PrecCall), Some(grammar::Call))),
+    TokenType::Dot(GrammarRule::infix(Some(Precedence::PrecCall), Some(Grammar::Call))),
     TokenType::DotDot(GrammarRule::infix_operator(Some(Precedence::PrecRange), "..")),
     TokenType::DotDotDot(GrammarRule::infix_operator(Some(Precedence::PrecRange), "...")),
     TokenType::Comma(GrammarRule::unused()),
@@ -238,13 +384,13 @@ pub static ref GRAMMAR_RULES: [TokenType; 63] = [
     TokenType::LtLt(GrammarRule::infix_operator(Some(Precedence::PrecBitwiseShift), "<<")),
     TokenType::GtGt(GrammarRule::infix_operator(Some(Precedence::PrecBitwiseShift), ">>")),
     TokenType::Pipe(GrammarRule::infix_operator(Some(Precedence::PrecBitwiseOr), "|")),
-    TokenType::PipePipe(GrammarRule::infix(Some(Precedence::PrecLogicalOr), Some(grammar::Or))),
+    TokenType::PipePipe(GrammarRule::infix(Some(Precedence::PrecLogicalOr), Some(Grammar::Or))),
     TokenType::Caret(GrammarRule::infix_operator(Some(Precedence::PrecBitwiseXor), "^")),
     TokenType::Amp(GrammarRule::infix_operator(Some(Precedence::PrecBitwiseAnd), "&")),
-    TokenType::AmpAmp(GrammarRule::infix(Some(Precedence::PrecLogicalAnd), Some(grammar::And))),
+    TokenType::AmpAmp(GrammarRule::infix(Some(Precedence::PrecLogicalAnd), Some(Grammar::And))),
     TokenType::Bang(GrammarRule::prefix_operator("!")),
     TokenType::Tilde(GrammarRule::prefix_operator("~")),
-    TokenType::Question(GrammarRule::infix(Some(Precedence::PrecAssignment), Some(grammar::Conditional))),
+    TokenType::Question(GrammarRule::infix(Some(Precedence::PrecAssignment), Some(Grammar::Conditional))),
     TokenType::Eq(GrammarRule::unused()),
     TokenType::Lt(GrammarRule::infix_operator(Some(Precedence::PrecComparison), "<")),
     TokenType::Gt(GrammarRule::infix_operator(Some(Precedence::PrecComparison), ">")),
@@ -252,35 +398,34 @@ pub static ref GRAMMAR_RULES: [TokenType; 63] = [
     TokenType::GtEq(GrammarRule::infix_operator(Some(Precedence::PrecComparison), "=>")),
     TokenType::EqEq(GrammarRule::infix_operator(Some(Precedence::PrecEquality), "==")),
     TokenType::BangEq(GrammarRule::infix_operator(Some(Precedence::PrecEquality), "!=")),
-    TokenType::Field(GrammarRule::prefix(Some(grammar::Field))),
-    TokenType::StaticField(GrammarRule::prefix(Some(grammar::StaticField))),
-    TokenType::Name(GrammarRule{ name: None, infix: None, prefix: Some(grammar::Name), method: Some(grammar::NamedSignature), precedence: Some(Precedence::PrecNone) }),
-    TokenType::Number(GrammarRule::prefix(Some(grammar::Literal))),
-    TokenType::String(GrammarRule::prefix(Some(grammar::Literal))),
-    TokenType::Interpolation(GrammarRule::prefix(Some(grammar::StringInterpolation))),
+    TokenType::Field(GrammarRule::prefix(Some(Grammar::Field))),
+    TokenType::StaticField(GrammarRule::prefix(Some(Grammar::StaticField))),
+    TokenType::Name(GrammarRule{ name: None, infix: None, prefix: Some(Grammar::Name), method: Some(Grammar::NamedSignature), precedence: Some(Precedence::PrecNone) }),
+    TokenType::Number(GrammarRule::prefix(Some(Grammar::Literal))),
+    TokenType::String(GrammarRule::prefix(Some(Grammar::Literal))),
+    TokenType::Interpolation(GrammarRule::prefix(Some(Grammar::StringInterpolation))),
     TokenType::Line(GrammarRule::unused()),
     TokenType::Error(GrammarRule::unused()),
     TokenType::Eof(GrammarRule::unused()),
     TokenType::Break("break", GrammarRule::unused()),
     TokenType::Class("class", GrammarRule::unused()),
-    TokenType::Construct("construct", GrammarRule{ name: None, prefix: None, infix: None,  method: Some(grammar::ConstructorSignature), precedence: Some(Precedence::PrecNone) }),
+    TokenType::Construct("construct", GrammarRule{ name: None, prefix: None, infix: None,  method: Some(Grammar::ConstructorSignature), precedence: Some(Precedence::PrecNone) }),
     TokenType::Else("else", GrammarRule::unused()),
-    TokenType::False("false", GrammarRule::prefix(Some(grammar::Boolean))),
+    TokenType::False("false", GrammarRule::prefix(Some(Grammar::Boolean))),
     TokenType::For("for", GrammarRule::unused()),
     TokenType::Foreign("foreign", GrammarRule::unused()),
     TokenType::If("if", GrammarRule::unused()),
     TokenType::Import("import", GrammarRule::unused()),
     TokenType::In("in", GrammarRule::unused()),
     TokenType::Is("is", GrammarRule::infix_operator(Some(Precedence::PrecIs), "is")),
-    TokenType::Null("null", GrammarRule::prefix(Some(grammar::Null))),
+    TokenType::Null("null", GrammarRule::prefix(Some(Grammar::Null))),
     TokenType::Return("return", GrammarRule::unused()),   
     TokenType::Static("static", GrammarRule::unused()),  
-    TokenType::Super("super", GrammarRule::prefix(Some(grammar::Super))),    
-    TokenType::This("this", GrammarRule::prefix(Some(grammar::This))),     
-    TokenType::True("true", GrammarRule::prefix(Some(grammar::Boolean))),      
+    TokenType::Super("super", GrammarRule::prefix(Some(Grammar::Super))),    
+    TokenType::This("this", GrammarRule::prefix(Some(Grammar::This))),     
+    TokenType::True("true", GrammarRule::prefix(Some(Grammar::Boolean))),      
     TokenType::Var("var", GrammarRule::unused()),       
     TokenType::While("while",GrammarRule::unused()),
-    TokenType::Eof(GrammarRule::unused()),
     TokenType::Hash(GrammarRule::unused()),
 ];
 }
@@ -289,8 +434,8 @@ pub struct Lexer<'a> {
     input: std::iter::Peekable<std::str::CharIndices<'a>>,
     input_copy: &'a str,
     pub current: Option<Tokens<'a>>,
-    previous: Option<Tokens<'a>>,
-    next: Option<Tokens<'a>>,
+    pub previous: Option<Tokens<'a>>,
+    pub next: Option<Tokens<'a>>,
     num_parens: usize,
     parens:Vec<usize>,
     token_offset: usize,
@@ -319,7 +464,6 @@ impl<'a> Lexer<'a> {
         if let Some(&(_, c)) =  self.input.peek() {
             if c == '\n' {
                 self.current_line += 1;
-                println!("current_line {}", self.current_line);
             }
             if let Some((pos, next)) = self.input.next() {
                 self.char_offset = pos + 1;
@@ -327,6 +471,10 @@ impl<'a> Lexer<'a> {
             }
         }
         None
+    }
+
+    pub fn previous(&'a self) -> Option<Tokens<'a>> {
+        self.previous
     }
 
     fn peek(&mut self) -> Option<&(usize, char)> {
@@ -390,14 +538,14 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn make_token(&mut self, tok:TokenType) {
-
-        let _tok = Tokens::Token(
+    fn make_token(&mut self, tok:TokenType<'a>) {
+        let toks:Tokens<'a> = Tokens::Token(
             tok,
             &self.input_copy[self.token_offset..self.char_offset],
             self.current_line,
         );
-        self.current = Some(_tok);
+
+        self.current = Some(toks);
         
 
         // Make line tokens appear on the line containing the "\n".
@@ -479,10 +627,10 @@ impl<'a> Lexer<'a> {
 
         // Todo: store number value
 
-        self.make_token(GRAMMAR_RULES[36]);
+        unsafe {self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[36]))};
     }
 
-    fn two_char_token(&mut self, c: char, two: TokenType, one: TokenType){
+    fn two_char_token(&mut self, c: char, two: TokenType<'a>, one: TokenType<'a>){
         if self.match_char(c) {
             self.make_token(two);
         } else  {
@@ -491,7 +639,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// Finishes lexing an identifier. Handles reserved words.
-    fn read_name(&mut self, token_type: TokenType, first_char: char) {
+    fn read_name(&mut self, token_type: TokenType<'a>, first_char: char) {
         let mut _token_type = token_type;
         loop {
             if let Some(&(_, c)) = self.peek() {
@@ -504,17 +652,21 @@ impl<'a> Lexer<'a> {
         }
         
 
-        
-   
-        for kwd in KEYWORDS.into_iter() {
-            let _word = std::str::from_utf8(&self.input_copy[self.token_offset..self.char_offset].as_bytes());
-            let w = kwd.get_kwd();
-            
-            if w == String::from(_word.unwrap()) {
-                _token_type = *kwd;
-                break;
+
+       
+            for kwd in KEYWORDS.into_iter() {
+                let _word = std::str::from_utf8(&self.input_copy[self.token_offset..self.char_offset].as_bytes());
+                let w = kwd.get_kwd();
+                
+                if w == String::from(_word.unwrap()) {
+                    unsafe{
+
+                        _token_type = transmute::<TokenType<'static>, TokenType<'a>>(*kwd);
+                    }
+                    break;
+                }
             }
-        }
+        
 
       
         self.make_token(_token_type);
@@ -614,9 +766,10 @@ impl<'a> Lexer<'a> {
     }
 
     // Finishes lexing a string literal.
-    fn read_string(&mut self) {
+    unsafe fn read_string(&mut self) {
         let mut string = String::new();
-        let mut token_type = GRAMMAR_RULES[37];
+        let mut token_type = transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[37]);
+        
         loop {
             if let Some((_, c)) = self.next() {
                 if c == '"' {
@@ -639,7 +792,7 @@ impl<'a> Lexer<'a> {
                             }
                             self.num_parens += 1;
                             self.parens[self.num_parens] = 1;
-                            token_type = GRAMMAR_RULES[38];
+                            token_type = transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[38]);
                             break;
                         }
                     }
@@ -682,7 +835,7 @@ impl<'a> Lexer<'a> {
 
     }
 
-    pub fn next_token(&mut self) -> bool {
+    pub unsafe fn next_token(&mut self) -> bool {
         self.previous = self.current.clone();
         self.current = self.next.clone();
 
@@ -715,7 +868,7 @@ impl<'a> Lexer<'a> {
                                 if self.num_parens > 0 {
                                     self.parens[(self.num_parens - 1) as usize] += 1;
                                 }
-                                self.make_token(GRAMMAR_RULES[0]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[0]));
                                 return true;
                             },
                             Some((_, ')')) => {
@@ -730,39 +883,39 @@ impl<'a> Lexer<'a> {
                                         return true;
                                     }
                                 }
-                                self.make_token(GRAMMAR_RULES[1]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[1]));
                                 return true;
                             },
                             Some((_, '[')) => {
-                                self.make_token(GRAMMAR_RULES[2]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[2]));
                                 return true;
                             }
                             Some((_, ']')) => {
-                                self.make_token(GRAMMAR_RULES[3]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[3]));
                                 return true;
                             }
                             Some((_, '{')) => {
-                                self.make_token(GRAMMAR_RULES[4]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[4]));
                                 return true;
                             }
                             Some((_, '}')) => {
-                                self.make_token(GRAMMAR_RULES[5]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[5]));
                                 return true;
                             }
                             Some((_, ':')) => {
-                                self.make_token(GRAMMAR_RULES[6]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[6]));
                                 return true;
                             }
                             Some((_, ',')) => {
-                                self.make_token(GRAMMAR_RULES[10]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[10]));
                                 return true;
                             }
                             Some((_, '*')) => {
-                                self.make_token(GRAMMAR_RULES[11]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[11]));
                                 return true;
                             }
                             Some((_, '%')) => {
-                                self.make_token(GRAMMAR_RULES[13]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[13]));
                                 return true;
                             }
                             Some((_, '#')) => {
@@ -775,52 +928,52 @@ impl<'a> Lexer<'a> {
                                         }
                                     }
                                 }
-                                self.make_token(GRAMMAR_RULES[62]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[61]));
                                 return true;
                             }
                             Some((_, '+')) => {
-                                self.make_token(GRAMMAR_RULES[14]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[14]));
                                 return true;
                             }
                             Some((_, '-')) => {
-                                self.make_token(GRAMMAR_RULES[15]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[15]));
                                 return true;
                             }
                             Some((_, '^')) => {
-                                self.make_token(GRAMMAR_RULES[20]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[20]));
                                 return true;
                             }
                             Some((_, '~')) => {
-                                self.make_token(GRAMMAR_RULES[24]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[24]));
                                 return true;
                             }
                             Some((_, '?')) => {
-                                self.make_token(GRAMMAR_RULES[25]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[25]));
                                 return true;
                             }
                             Some((_, '|')) => {
-                                self.two_char_token('|', GRAMMAR_RULES[19], GRAMMAR_RULES[18]);
+                                self.two_char_token('|', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[19]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[18]));
                                 return true;
                             }
                             Some((_, '&')) => {
-                                self.two_char_token('&', GRAMMAR_RULES[22], GRAMMAR_RULES[21]);
+                                self.two_char_token('&', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[22]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[21]));
                                 return true;
                             }
                             Some((_, '!')) => {
                                 // println!("{}", ch);
-                                self.two_char_token('!', GRAMMAR_RULES[32], GRAMMAR_RULES[23]);
+                                self.two_char_token('!', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[32]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[23]));
                                 return true;
                             }
                             Some((_, '=')) => {
-                                self.two_char_token('=', GRAMMAR_RULES[31], GRAMMAR_RULES[26]);
+                                self.two_char_token('=', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[31]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[26]));
                                 return true;
                             }
                             Some((_, '.')) => {
                                 if self.match_char('.') {
-                                    self.two_char_token('.', GRAMMAR_RULES[9], GRAMMAR_RULES[8]);
+                                    self.two_char_token('.', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[9]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[8]));
                                     return true;
                                 }
-                                self.make_token(GRAMMAR_RULES[7]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[7]));
                                 
                                 return true;
                             }
@@ -833,29 +986,29 @@ impl<'a> Lexer<'a> {
                                     self.skip_block_comment();
                                     continue;
                                 }
-                                self.make_token(GRAMMAR_RULES[12]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[12]));
                                 return true;
                             }
                             Some((_, '<')) => {
                                 if self.match_char('<') {
-                                    self.make_token(GRAMMAR_RULES[16]);
+                                    self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[16]));
                                 } else {
-                                    self.two_char_token('=', GRAMMAR_RULES[29], GRAMMAR_RULES[27])
+                                    self.two_char_token('=', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[29]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[27]));
                                 }
 
                                 return true;
                             }
                             Some((_, '>')) => {
                                 if self.match_char('>') {
-                                    self.make_token(GRAMMAR_RULES[17]);
+                                    self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[17]));
                                 } else {
-                                    self.two_char_token('=', GRAMMAR_RULES[30], GRAMMAR_RULES[28])
+                                    self.two_char_token('=', transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[30]), transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[28]));
                                 }
 
                                 return true;
                             }
                             Some((_, '\n')) => {
-                                self.make_token(GRAMMAR_RULES[39]);
+                                self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[39]));
                                 return true;
                             }
                             Some((_, ' ')) | Some((_, '\r')) | Some((_, '\t'))  => {
@@ -883,7 +1036,7 @@ impl<'a> Lexer<'a> {
                             }
                             Some((_, '_')) => {
                                 if let Some(&(_, ch)) = self.peek() {
-                                    self.read_name(if ch == '_' {GRAMMAR_RULES[34]} else {GRAMMAR_RULES[33]}, ch);
+                                    self.read_name(if ch == '_' {transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[34])} else {transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[33])}, ch);
                                 }
                                 return true;
                             }
@@ -902,7 +1055,7 @@ impl<'a> Lexer<'a> {
                                     '0'..='9' |
                                     'a'..='z' | 'A'..='Z' => {
                                         if is_name(ch) {
-                                            self.read_name(GRAMMAR_RULES[35], ch);
+                                            self.read_name(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[35]), ch);
                                         } else if is_digit(ch) {
                                             self.read_number();
                                         } 
@@ -920,7 +1073,7 @@ impl<'a> Lexer<'a> {
                                         }
                                    
                                         self.current = Some(Tokens::Token(
-                                            GRAMMAR_RULES[40],
+                                            transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[40]),
                                             "",
                                             self.current_line
                                         ));
@@ -941,7 +1094,7 @@ impl<'a> Lexer<'a> {
 
         // If we get here, we're out of source, so just make EOF tokens.
         self.token_offset = self.char_offset;
-        self.make_token(GRAMMAR_RULES[61]);
+        self.make_token(transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[61]));
         return false;
     }
 
@@ -1025,74 +1178,6 @@ impl<'a> Display for Signature<'a> {
 
 
 
-impl GrammarRule {
-    #[inline]
-    pub fn unused() -> Self {
-        Self { 
-            precedence: Some(Precedence::PrecNone),
-            infix: None,
-            method: None,
-            name: None,
-            prefix: None,
-        }
-    }
-
-    #[inline]
-    pub fn prefix(fun: Option<GrammarFn>) -> Self {
-        Self {
-            prefix: fun,
-            method: None,
-            infix: None,
-            name: None,
-            precedence: Some(Precedence::PrecNone),
-        }
-    }
-
-    #[inline]
-    pub fn infix(pre: Option<Precedence>, fun: Option<GrammarFn>) -> Self {
-        Self {
-            infix: fun,
-            precedence: pre,
-            prefix: None,
-            name: None, 
-            method: None,
-        }
-    }
-
-    #[inline]
-    pub fn infix_operator(pre: Option<Precedence>, name: &'static str) -> Self {
-        Self {
-            name: Some(name),
-            infix: Some(grammar::InfixOp),
-            method: Some(grammar::InfixSignature),
-            prefix: None,
-            precedence: pre,
-        }
-    }
-
-    #[inline]
-    pub fn prefix_operator(name: &'static str) -> Self {
-        Self {
-            name: Some(name),
-            prefix: Some(grammar::UnaryOp),
-            method: Some(grammar::UnarySignature),
-            precedence: Some(Precedence::PrecNone),
-            infix: None,
-        }
-    }
-
-    #[inline]
-    pub fn operator(name: &'static str) -> Self {
-        Self {
-            name: Some(name),
-            prefix: Some(grammar::UnaryOp),
-            infix: Some(grammar::InfixOp),
-            method: Some(grammar::MixedSignature),
-            precedence: Some(Precedence::PrecTerm),
-        }
-    }
-
-}
 
 
 
