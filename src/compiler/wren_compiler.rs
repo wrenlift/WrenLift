@@ -13,14 +13,18 @@
 // limitations under the License.
 
 // use crate::compiler::wren_parser::{Parser};
-use crate::compiler::scanner::{Tokens, TokenType, Lexer, GrammarFn, GrammarRule, Precedence};
+use crate::compiler::scanner::{Tokens, TokenType, Lexer, GrammarFn, GrammarRule, Precedence, KEYWORDS, GRAMMAR_RULES};
+use crate::compiler::grammar::{Grammar};
 use core::mem::transmute;
 // use std::cell::Cell;
 
 
+pub const MAX_VARIABLE_NAME: usize = 64;
+
 pub struct Compiler<'a> {
     pub tokens: Vec<Tokens<'a>>,
     lexer: Lexer<'a>,
+    pub scope_depth: i32,
 }
 
 impl<'a> Compiler<'a> {
@@ -28,6 +32,7 @@ impl<'a> Compiler<'a> {
        let ret =  Compiler {
             tokens:   Vec::new(),
             lexer: Lexer::new(source),
+            scope_depth: -1
         };
 
         ret
@@ -145,135 +150,113 @@ impl<'a> Compiler<'a> {
         }
         
     }
-}
 
-// impl<'a> Compiler<'a> {
-//     pub fn new(_parser: Parser<'static>, _parent:Option<Box<Compiler<'a>>>) -> Self {
-//         let mut scopeDepth = -1 as i32;
-//         match _parent {
-//             Some(_) => scopeDepth = 0,
-//             None => {}
-//         }
+    pub fn expression(&mut self)  {
+        unsafe { self.parse_precedence(Precedence::PrecLowest);}
+    }
+
+    /// Compiles a "definition". These are the statements that bind new variables.
+    /// They can only appear at the top level of a block and are prohibited in places
+    /// like the non-curly body of an if or while.
+    pub unsafe fn definition(&'a mut self) {
+        let class_type = transmute::<TokenType<'static>, TokenType<'a>>(KEYWORDS[1]);
+        let foreign_type = transmute::<TokenType<'static>, TokenType<'a>>(KEYWORDS[6]);
+        let import_type = transmute::<TokenType<'static>, TokenType<'a>>(KEYWORDS[8]);
+        let var_type = transmute::<TokenType<'static>, TokenType<'a>>(KEYWORDS[17]);
+        if self.match_token(class_type) {
+            self.classDefinition(false);
+        } else if self.match_token(foreign_type) {
+            self.consume(class_type, String::from("Expect 'class' after 'foreign'."));
+            self.classDefinition(true);
+        } else if self.match_token(import_type) {
+            self.import();
+        } else if self.match_token(var_type) {
+            self.variableDefinition();
+        } else {
+            self.statement();
+        }
+    }
+
+    /// Compiles a class definition. Assumes the "class" token has already been
+    /// consumed (along with a possibly preceding "foreign" token).
+    pub fn classDefinition(&self, is_foreign:bool) {
+        // 1. Create a variable to store the class in.
+        // Todo
+        // 2. Create shared class name value
+        // Todo
+        // 3. Create class name string to track method duplicates
+        // Todo
+        // 4. Make a string constant for the name.
+        // Todo
+        // 5. Load the superclass (if there is one) OR Implicitly inherit from Object (if there's no superclass)
+    }
+
+    /// Compiles a "var" variable definition statement.
+    pub unsafe fn variableDefinition(&'a mut self) {
+        // Grab its name, but don't declare it yet. A (local) variable shouldn't be
+        // in scope in its own initializer.
+        let name_type = transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[35]);
+        self.consume(name_type, String::from("Expect variable name."));
+        let name_token = self.lexer.previous;
+
+        let assign_type = transmute::<TokenType<'static>, TokenType<'a>>(GRAMMAR_RULES[26]);
+
+        // Compile the initializer.
+        if self.match_token(assign_type) {
+            self.ignore_new_lines();
+            self.expression();
+        } else {
+            // Default initialize it to null.
+            Grammar::Null(transmute::<&mut Compiler<'a>, &'a  mut Compiler<'a>>(self), false);
+        }
+        // Now put it in scope.
+        let symbol = self.declare_variable(name_token);
+        self.define_variable(symbol);
+    }   
+
+    pub fn import(&self){}
+
+    pub fn statement(&self){
+
+    }
+
+    /// Stores a variable with the previously defined symbol in the current scope.
+    pub fn define_variable(&self, symbol: i32) {
+        // Store the variable. If it's a local, the result of the initializer is
+		// in the correct slot on the stack already so we're done.
+        if self.scope_depth >= 0 {
+            return;
+        }
+
+        // It's a module-level variable, so store the value in the module slot and
+        // then discard the temporary for the initializer.
+        // STORE_MODULE_VAR(symbol)
+        // POP STACK
+    }
+
+    pub unsafe fn declare_variable(&self, token:Option<Tokens<'a>>) -> i32 {
+        let mut _token = self.lexer.previous.unwrap();
+        if let Some(tok) = token {
+            _token = tok;
+        }
+        let mut length = 0;
+
+        match _token {
+            Tokens::Token(_, s, _) => {
+                length = s.len();
+            }
+        }
         
-//         let ret = Self {
-//             parser: _parser,
-//             scope_depth: scopeDepth,
-//             parent: if let Some(p) = _parent { Some(p) } else {None},
-//         };
+        if length > MAX_VARIABLE_NAME {
+			self.error(String::from("Variable name cannot be longer than ${MAX_VARIABLE_NAME} characters."));
+		}
 
-//         ret
-//     }
+        // add local variable to stack
 
-//     pub fn print(&'a self) {
-//         println!("{:#?}", &self.parser.tokens);
-//     }
+        0
+    }
 
-//     fn error(&self, message: &str) {
-
-//     }
-
-//     /// Returns the type of the current token.
-//     fn peek(&'a mut self) -> Option<TokenType> {
-//         if let Some(tok) = self.parser.current.get() {
-//             tok.token_type
-//         } else {
-//             None
-//         }
-
-//     }
-//     fn as_ref(&'a self) -> &'a Compiler<'a>  {
-//         let ret = Cell::new(self);
-//         ret.get()
-//     }
-
-//     fn next_token(&'static self) {
-//         self.parser.next_token();
-//     }
-
-//     /// Returns the type of the next token.
-//     fn peek_next(&'a mut self) -> Option<TokenType> {
-//         if let Some(tok) = self.parser.next.get() {
-//             tok.token_type
-//         } else {
-//             None
-//         }
-//     }
-
-//     /// Consumes the current token if its type is [expected]. Returns true if a
-//     /// token was consumed.
-//     fn match_token (&'static mut self, expected: TokenType) -> bool {
-//             if let Some(t) = self.parser.current.get() {
-//                 if t.token_type != Some(expected) {
-//                     false
-//                 } else {
-//                     self.next_token();
-//                     true
-//                 }
-//             } else {
-//                 false
-//             }
-            
-//     }
-
-//     /// Consumes the current token. Emits an error if its type is not [expected].
-//     fn consume(&'static mut self, expected: TokenType, error_message: &'a str) {
-//         self.next_token();
-//         if let Some(prev) = self.parser.previous.get() {
-//             if prev.token_type != Some(expected) {
-//                 self.error(error_message);
-
-//                 // If the next token is the one we want, assume the current one is just a
-//                 // spurious error and discard it to minimize the number of cascaded errors.
-//                 if let Some(cur) = self.parser.current.get() {
-//                     if cur.token_type == Some(expected) {
-//                         self.parser.next_token();
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     /// Matches one or more newlines. Returns true if at least one was found.
-//     fn match_line(&'static self) -> bool {
-//         if !self.match_token(TokenType::Line) { false} else {
-//             while self.match_token(TokenType::Line) {
-
-//             }
-    
-//             true
-//         } 
-//     }
-
-//     /// Discards any newlines starting at the current token.
-//     // fn ignore_new_lines(&'static self) {
-//     //     self.match_line();
-//     // }
-
-//     /// Consumes the current token. Emits an error if it is not a newline. Then
-//     /// discards any duplicate newlines following it.
-//     fn consume_line(&'a self, error_message: &'a str) {
-//         self.consume(TokenType::Line, error_message);
-//         self.match_line(); //ignore line
-//     }
-
-//     fn allow_before_dot(&'a mut self) {
-//         match self.peek() {
-//             Some(TokenType::Line) => {
-//                 match self.peek_next() {
-//                     Some(TokenType::Dot) => {
-//                         self.parser.next_token();
-//                     }
-//                     None => {}
-//                     _ => {}
-//                 }
-//             }
-//             None => {}
-//             _ => {}
-//         }
-//     }
-
-//     /// Starts a new local block scope.
-//     fn push_scope(&mut self) {
-//         self.scope_depth += 1;
-//     }
-// }
+    fn push_scope(&mut self){
+        self.scope_depth += 1;
+    }
+}
