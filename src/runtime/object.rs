@@ -51,6 +51,8 @@ pub struct ObjHeader {
     pub obj_type: ObjType,
     /// GC mark bit / tri-color byte. 0 = white, 1 = gray, 2 = black.
     pub gc_mark: u8,
+    /// GC generation. 0 = young (nursery), 1 = old.
+    pub generation: u8,
     /// Intrusive linked list of all heap objects (for GC sweep).
     pub next: *mut ObjHeader,
     /// The class of this object (for method dispatch). Null for meta-objects.
@@ -62,6 +64,7 @@ impl ObjHeader {
         Self {
             obj_type,
             gc_mark: 0,
+            generation: 0,
             next: std::ptr::null_mut(),
             class: std::ptr::null_mut(),
         }

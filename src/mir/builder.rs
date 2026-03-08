@@ -650,6 +650,8 @@ impl<'a> MirBuilder<'a> {
 }
 
 /// Convenience: lower a parsed module to MIR.
+// TODO: accept a module name derived from the file path / namespace once
+// we support multiple modules, instead of the hardcoded "<module>" sentinel.
 pub fn lower_module(module: &Module, interner: &mut Interner) -> MirFunction {
     let name = interner.intern("<module>");
     let builder = MirBuilder::new(name, 0, interner);
