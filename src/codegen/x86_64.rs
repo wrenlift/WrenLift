@@ -11,14 +11,16 @@
 /// - FP: VReg::fp(n) maps to XMM(n) (0=XMM0..15=XMM15)
 /// - Scratch: R11 (GP 11) and XMM15 (FP 15) reserved for emitter use
 
-use super::{Cond, Label, MachFunc, MachInst, Mem, VReg, VecWidth};
+use super::{Cond, Label, MachFunc, MachInst, VReg, VecWidth};
 use std::collections::HashMap;
 
 // Scratch register indices — register allocator must not assign these.
 const SCRATCH_GP: u32 = 11; // R11
 const SCRATCH_XMM: u32 = 15; // XMM15
 
-/// Assembled x86_64 machine code (byte buffer, not executable on non-x86_64).
+/// Assembled x86_64 machine code (byte buffer).
+///
+/// On x86_64 hosts, call `make_executable()` to get a callable function pointer.
 pub struct EmittedCode {
     code: Vec<u8>,
 }
@@ -29,6 +31,37 @@ impl EmittedCode {
     }
     pub fn len(&self) -> usize {
         self.code.len()
+    }
+
+    /// Copy the code into executable memory via mmap.
+    ///
+    /// Returns an `ExecutableCode` that keeps the mapping alive and provides
+    /// a function pointer. Only useful on x86_64 hosts.
+    pub fn make_executable(&self) -> Result<ExecutableCode, String> {
+        use dynasmrt::mmap::{ExecutableBuffer, MutableBuffer};
+        let mut buf = MutableBuffer::new(self.code.len())
+            .map_err(|e| format!("mmap alloc: {}", e))?;
+        buf.set_len(self.code.len());
+        buf[..self.code.len()].copy_from_slice(&self.code);
+        let exec = buf.make_exec()
+            .map_err(|e| format!("mprotect: {}", e))?;
+        Ok(ExecutableCode { buf: exec })
+    }
+}
+
+/// Executable x86_64 code backed by mmap'd memory.
+pub struct ExecutableCode {
+    buf: dynasmrt::ExecutableBuffer,
+}
+
+impl ExecutableCode {
+    /// Get a callable function pointer.
+    ///
+    /// # Safety
+    /// The caller must ensure the type `F` matches the compiled function's ABI.
+    pub unsafe fn as_fn<F: Copy>(&self) -> F {
+        let ptr = self.buf.ptr(dynasmrt::AssemblyOffset(0));
+        std::mem::transmute_copy(&ptr)
     }
 }
 

@@ -1252,10 +1252,56 @@ pub fn lower_mir(mir: &MirFunction) -> MachFunc {
 
 /// Compiled output from the full pipeline.
 pub enum CompiledFunction {
-    /// x86_64 machine code bytes (not directly executable on non-x86_64 hosts).
+    /// x86_64 machine code bytes.
     X86_64(x86_64::EmittedCode),
-    /// aarch64 executable buffer (only available on aarch64 hosts).
+    /// aarch64 executable buffer.
     Aarch64(aarch64::CompiledCode),
+}
+
+impl CompiledFunction {
+    /// Make the compiled code executable, returning an owned handle.
+    ///
+    /// The returned `ExecutableFunction` owns the mmap'd memory.
+    /// Function pointers obtained from it are valid for its lifetime.
+    pub fn into_executable(self) -> Result<ExecutableFunction, String> {
+        match self {
+            CompiledFunction::X86_64(code) => {
+                let exec = code.make_executable()?;
+                Ok(ExecutableFunction::X86_64(exec))
+            }
+            CompiledFunction::Aarch64(code) => {
+                Ok(ExecutableFunction::Aarch64(code))
+            }
+        }
+    }
+}
+
+/// Executable function backed by mmap'd memory. Drop to release.
+pub enum ExecutableFunction {
+    X86_64(x86_64::ExecutableCode),
+    Aarch64(aarch64::CompiledCode),
+}
+
+impl ExecutableFunction {
+    /// Get a callable function pointer.
+    ///
+    /// # Safety
+    /// Caller must ensure `F` matches the compiled function's ABI and that
+    /// the target architecture matches the host.
+    pub unsafe fn as_fn<F: Copy>(&self) -> F {
+        match self {
+            ExecutableFunction::X86_64(code) => code.as_fn(),
+            ExecutableFunction::Aarch64(code) => code.as_fn(),
+        }
+    }
+
+    /// Whether this function can be called on the current host.
+    pub fn is_native(&self) -> bool {
+        match self {
+            ExecutableFunction::X86_64(_) => cfg!(target_arch = "x86_64"),
+            ExecutableFunction::Aarch64(_) => cfg!(target_arch = "aarch64"),
+        }
+    }
 }
 
 /// Compile a MIR function to native code for the given target.
@@ -3183,6 +3229,137 @@ mod tests {
 
         let result = compile_function(&f, Target::Aarch64);
         assert!(result.is_ok(), "aarch64 pipeline failed: {:?}", result.err());
+    }
+
+    // -- JIT execution tests (native arch only) --
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_jit_execute_add_f64() {
+        // MIR: return 3.0 + 4.0 = 7.0 (as NaN-boxed bits in GP return reg)
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(3.0)));
+            b.instructions.push((v1, Instruction::ConstF64(4.0)));
+            b.instructions.push((v2, Instruction::AddF64(v0, v1)));
+            b.terminator = Terminator::Return(v2);
+        }
+
+        let compiled = compile_function(&f, Target::Aarch64).unwrap();
+        let exec = compiled.into_executable().unwrap();
+        assert!(exec.is_native());
+
+        unsafe {
+            let func: extern "C" fn() -> u64 = exec.as_fn();
+            let result_bits = func();
+            let result = f64::from_bits(result_bits);
+            assert_eq!(result, 7.0, "JIT: 3.0 + 4.0 should be 7.0, got {}", result);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_jit_execute_mul_sub() {
+        // MIR: (10.0 * 3.0) - 5.0 = 25.0
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        let v3 = f.new_value();
+        let v4 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(10.0)));
+            b.instructions.push((v1, Instruction::ConstF64(3.0)));
+            b.instructions.push((v2, Instruction::MulF64(v0, v1)));
+            b.instructions.push((v3, Instruction::ConstF64(5.0)));
+            b.instructions.push((v4, Instruction::SubF64(v2, v3)));
+            b.terminator = Terminator::Return(v4);
+        }
+
+        let compiled = compile_function(&f, Target::Aarch64).unwrap();
+        let exec = compiled.into_executable().unwrap();
+
+        unsafe {
+            let func: extern "C" fn() -> u64 = exec.as_fn();
+            let result = f64::from_bits(func());
+            assert_eq!(result, 25.0, "JIT: (10*3)-5 should be 25, got {}", result);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_jit_execute_const_num_boxed() {
+        // MIR: return ConstNum(42.0) — returns NaN-boxed Value bits
+        use crate::runtime::value::Value;
+
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb).terminator = Terminator::Return(v0);
+
+        let compiled = compile_function(&f, Target::Aarch64).unwrap();
+        let exec = compiled.into_executable().unwrap();
+
+        unsafe {
+            let func: extern "C" fn() -> u64 = exec.as_fn();
+            let bits = func();
+            let val = Value::from_bits(bits);
+            assert_eq!(val.as_num(), Some(42.0), "JIT: ConstNum(42) should return 42.0");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_jit_execute_return_null() {
+        use crate::runtime::value::Value;
+
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        f.block_mut(bb).terminator = Terminator::ReturnNull;
+
+        let compiled = compile_function(&f, Target::Aarch64).unwrap();
+        let exec = compiled.into_executable().unwrap();
+
+        unsafe {
+            let func: extern "C" fn() -> u64 = exec.as_fn();
+            let bits = func();
+            let val = Value::from_bits(bits);
+            assert!(val.is_null(), "JIT: ReturnNull should return null, got bits 0x{:016x}", bits);
+        }
+    }
+
+    #[test]
+    fn test_into_executable_x86_64() {
+        // Verify x86_64 code can be made executable (mmap succeeds).
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        f.block_mut(bb).instructions.push((v0, Instruction::ConstF64(1.0)));
+        f.block_mut(bb).terminator = Terminator::Return(v0);
+
+        let compiled = compile_function(&f, Target::X86_64).unwrap();
+        let exec = compiled.into_executable();
+        assert!(exec.is_ok(), "mmap should succeed: {:?}", exec.err());
+
+        let exec = exec.unwrap();
+        // On aarch64 host, x86_64 code is not native.
+        #[cfg(target_arch = "aarch64")]
+        assert!(!exec.is_native());
+        #[cfg(target_arch = "x86_64")]
+        assert!(exec.is_native());
     }
 
     #[test]

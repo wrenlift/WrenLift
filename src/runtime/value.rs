@@ -178,6 +178,12 @@ impl Value {
         self.0
     }
 
+    /// Reconstruct a Value from its raw bit representation.
+    #[inline(always)]
+    pub fn from_bits(bits: u64) -> Self {
+        Value(bits)
+    }
+
     // -- Equality -----------------------------------------------------------
 
     /// Wren value equality. Numbers use IEEE equality (NaN != NaN).
