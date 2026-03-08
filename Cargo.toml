@@ -7,5 +7,7 @@ edition = "2021"
 [dependencies]
 ariadne = "0.5"
 logos = "0.15"
+dynasmrt = "2"
+dynasm = "2"
 
 [dev-dependencies]
