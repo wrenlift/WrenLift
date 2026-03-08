@@ -1221,6 +1221,17 @@ fn emit_mov(out: &mut Vec<MachInst>, dst: VReg, src: VReg) {
 }
 
 // ---------------------------------------------------------------------------
+// Compilation target
+// ---------------------------------------------------------------------------
+
+/// Target architecture for code generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    X86_64,
+    Aarch64,
+}
+
+// ---------------------------------------------------------------------------
 // MIR → Machine IR lowering
 // ---------------------------------------------------------------------------
 
@@ -1233,6 +1244,150 @@ pub fn lower_mir(mir: &MirFunction) -> MachFunc {
     let mut ctx = LowerCtx::new(&mut mf, mir);
     ctx.lower();
     mf
+}
+
+// ---------------------------------------------------------------------------
+// Full compilation pipeline
+// ---------------------------------------------------------------------------
+
+/// Compiled output from the full pipeline.
+pub enum CompiledFunction {
+    /// x86_64 machine code bytes (not directly executable on non-x86_64 hosts).
+    X86_64(x86_64::EmittedCode),
+    /// aarch64 executable buffer (only available on aarch64 hosts).
+    Aarch64(aarch64::CompiledCode),
+}
+
+/// Compile a MIR function to native code for the given target.
+///
+/// Full pipeline: MIR → lower → regalloc → sentinel fixup → emit.
+pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFunction, String> {
+    // 1. Lower MIR → MachFunc (virtual registers)
+    let mut mach = lower_mir(mir);
+
+    // 2. Register allocation (parallel copies → liveness → assign → rewrite)
+    let target_regs = match target {
+        Target::X86_64 => regalloc::x86_64_target_regs(),
+        Target::Aarch64 => regalloc::aarch64_target_regs(),
+    };
+    regalloc::allocate_registers(&mut mach, &target_regs);
+
+    // 3. Patch sentinel registers to target-specific physical encodings
+    fixup_sentinels(&mut mach, target);
+
+    // 4. Emit native code
+    match target {
+        Target::X86_64 => {
+            let emitted = x86_64::emit(&mach)?;
+            Ok(CompiledFunction::X86_64(emitted))
+        }
+        Target::Aarch64 => {
+            let compiled = aarch64::emit(&mach)?;
+            Ok(CompiledFunction::Aarch64(compiled))
+        }
+    }
+}
+
+/// Replace sentinel VReg indices (frame pointer, spill scratch) with
+/// actual hardware register encodings for the target.
+fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
+    let (fp_enc, gp_scratch, fp_scratch): (u32, u32, u32) = match target {
+        Target::X86_64 => (5, 11, 15),     // RBP, R11, XMM15
+        Target::Aarch64 => (29, 16, 16),   // X29, X16, D16
+    };
+
+    for inst in &mut mach.insts {
+        fixup_vreg_sentinels(inst, fp_enc, gp_scratch, fp_scratch);
+    }
+}
+
+/// Rewrite sentinel indices in a single instruction.
+fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_scratch: u32) {
+    // Visit every VReg field in the instruction.
+    let fix = |v: &mut VReg| {
+        if v.index == u32::MAX && v.class == RegClass::Gp {
+            v.index = fp_enc; // frame pointer
+        } else if v.index == u32::MAX - 1 {
+            v.index = match v.class {
+                RegClass::Gp => gp_scratch,
+                RegClass::Fp | RegClass::Vec => fp_scratch,
+            };
+        }
+    };
+
+    // Apply to all register fields in the instruction.
+    // We use the mutable visitor pattern since MachInst fields are public.
+    match inst {
+        MachInst::LoadImm { dst, .. } | MachInst::LoadFpImm { dst, .. } => fix(dst),
+        MachInst::Mov { dst, src } | MachInst::FMov { dst, src }
+        | MachInst::BitcastGpToFp { dst, src } | MachInst::BitcastFpToGp { dst, src }
+        | MachInst::INeg { dst, src } | MachInst::Not { dst, src }
+        | MachInst::FNeg { dst, src }
+        | MachInst::FCvtToI64 { dst, src } | MachInst::I64CvtToF { dst, src } => {
+            fix(dst); fix(src);
+        }
+        MachInst::IAddImm { dst, src, .. } | MachInst::AndImm { dst, src, .. }
+        | MachInst::OrImm { dst, src, .. } => {
+            fix(dst); fix(src);
+        }
+        MachInst::IAdd { dst, lhs, rhs } | MachInst::ISub { dst, lhs, rhs }
+        | MachInst::IMul { dst, lhs, rhs } | MachInst::IDiv { dst, lhs, rhs }
+        | MachInst::And { dst, lhs, rhs } | MachInst::Or { dst, lhs, rhs }
+        | MachInst::Xor { dst, lhs, rhs }
+        | MachInst::Shl { dst, lhs, rhs } | MachInst::Sar { dst, lhs, rhs }
+        | MachInst::Shr { dst, lhs, rhs }
+        | MachInst::FAdd { dst, lhs, rhs } | MachInst::FSub { dst, lhs, rhs }
+        | MachInst::FMul { dst, lhs, rhs } | MachInst::FDiv { dst, lhs, rhs } => {
+            fix(dst); fix(lhs); fix(rhs);
+        }
+        MachInst::IMulSub { dst, lhs, rhs, acc } => {
+            fix(dst); fix(lhs); fix(rhs); fix(acc);
+        }
+        MachInst::FMAdd { dst, a, b, c } | MachInst::FMSub { dst, a, b, c }
+        | MachInst::FNMAdd { dst, a, b, c } | MachInst::FNMSub { dst, a, b, c } => {
+            fix(dst); fix(a); fix(b); fix(c);
+        }
+        MachInst::ICmp { lhs, rhs } | MachInst::FCmp { lhs, rhs } => {
+            fix(lhs); fix(rhs);
+        }
+        MachInst::ICmpImm { lhs, .. } => fix(lhs),
+        MachInst::CSet { dst, .. } => fix(dst),
+        MachInst::Ldr { dst, mem } | MachInst::FLdr { dst, mem } => {
+            fix(dst); fix(&mut mem.base);
+        }
+        MachInst::Str { src, mem } | MachInst::FStr { src, mem } => {
+            fix(src); fix(&mut mem.base);
+        }
+        MachInst::VLoad { dst, mem, .. } => { fix(dst); fix(&mut mem.base); }
+        MachInst::VStore { src, mem, .. } => { fix(src); fix(&mut mem.base); }
+        MachInst::VFAdd { dst, lhs, rhs, .. } | MachInst::VFSub { dst, lhs, rhs, .. }
+        | MachInst::VFMul { dst, lhs, rhs, .. } | MachInst::VFDiv { dst, lhs, rhs, .. } => {
+            fix(dst); fix(lhs); fix(rhs);
+        }
+        MachInst::VFMAdd { dst, a, b, c, .. } => { fix(dst); fix(a); fix(b); fix(c); }
+        MachInst::VBroadcast { dst, src, .. } | MachInst::VFNeg { dst, src, .. }
+        | MachInst::VReduceAdd { dst, src, .. } | MachInst::VExtractLane { dst, src, .. } => {
+            fix(dst); fix(src);
+        }
+        MachInst::VInsertLane { dst, src, val, .. } => { fix(dst); fix(src); fix(val); }
+        MachInst::JmpZero { src, .. } | MachInst::JmpNonZero { src, .. }
+        | MachInst::TestBitJmpZero { src, .. } | MachInst::TestBitJmpNonZero { src, .. } => {
+            fix(src);
+        }
+        MachInst::CallInd { target } => fix(target),
+        MachInst::Push { src } => fix(src),
+        MachInst::Pop { dst } => fix(dst),
+        MachInst::CallRuntime { args, ret, .. } => {
+            for a in args.iter_mut() { fix(a); }
+            if let Some(r) = ret { fix(r); }
+        }
+        MachInst::ParallelCopy { copies } => {
+            for (d, s) in copies.iter_mut() { fix(d); fix(s); }
+        }
+        MachInst::Prologue { .. } | MachInst::Epilogue { .. }
+        | MachInst::Jmp { .. } | MachInst::JmpIf { .. }
+        | MachInst::DefLabel(_) | MachInst::Nop | MachInst::Trap | MachInst::Ret => {}
+    }
 }
 
 struct LowerCtx<'a> {
@@ -1767,12 +1922,20 @@ impl<'a> LowerCtx<'a> {
         match term {
             Terminator::Return(v) => {
                 let src = self.vreg_for(*v);
-                // Move return value into a well-known vreg (r0 by convention).
+                // Move return value into GP r0 (ABI return register).
                 let ret_reg = VReg::gp(0);
-                self.mf.emit(MachInst::Mov {
-                    dst: ret_reg,
-                    src,
-                });
+                if src.is_fp() {
+                    // FP value → GP: bitcast (e.g. unboxed f64 returned as NaN-boxed bits).
+                    self.mf.emit(MachInst::BitcastFpToGp {
+                        dst: ret_reg,
+                        src,
+                    });
+                } else {
+                    self.mf.emit(MachInst::Mov {
+                        dst: ret_reg,
+                        src,
+                    });
+                }
                 self.mf
                     .emit(MachInst::Epilogue { frame_size: 0 });
                 self.mf.emit(MachInst::Ret);
@@ -2928,5 +3091,134 @@ mod tests {
         assert!(output.contains("vload.v128"));
         assert!(output.contains("vfmadd.v128"));
         assert!(output.contains("vreduce_add.v128"));
+    }
+
+    // -- Full pipeline tests --
+
+    #[test]
+    fn test_compile_function_x86_64() {
+        // Use unboxed f64 ops (no runtime calls needed).
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(10.0)));
+            b.instructions.push((v1, Instruction::ConstF64(32.0)));
+            b.instructions.push((v2, Instruction::AddF64(v0, v1)));
+            b.terminator = Terminator::Return(v2);
+        }
+
+        let result = compile_function(&f, Target::X86_64);
+        assert!(result.is_ok(), "compile_function failed: {:?}", result.err());
+        if let Ok(CompiledFunction::X86_64(code)) = result {
+            assert!(code.len() > 0, "emitted code should not be empty");
+        } else {
+            panic!("expected X86_64 variant");
+        }
+    }
+
+    #[test]
+    fn test_compile_function_f64_ops_x86_64() {
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(3.0)));
+            b.instructions.push((v1, Instruction::ConstF64(4.0)));
+            b.instructions.push((v2, Instruction::AddF64(v0, v1)));
+            b.terminator = Terminator::Return(v2);
+        }
+
+        let result = compile_function(&f, Target::X86_64);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_function_with_branch_x86_64() {
+        use crate::mir::MirType;
+
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb0 = f.new_block();
+        let bb1 = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+
+        f.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb0).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v0],
+        };
+        f.block_mut(bb1).params.push((v1, MirType::Value));
+        f.block_mut(bb1).terminator = Terminator::Return(v1);
+
+        let result = compile_function(&f, Target::X86_64);
+        assert!(result.is_ok(), "branch pipeline failed: {:?}", result.err());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_compile_function_aarch64() {
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(5.0)));
+            b.instructions.push((v1, Instruction::ConstF64(7.0)));
+            b.instructions.push((v2, Instruction::AddF64(v0, v1)));
+            b.terminator = Terminator::Return(v2);
+        }
+
+        let result = compile_function(&f, Target::Aarch64);
+        assert!(result.is_ok(), "aarch64 pipeline failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_fixup_sentinels_x86_64() {
+        let mut mf = MachFunc::new("test".to_string());
+        // Simulate a spill load using sentinel registers.
+        mf.emit(MachInst::Ldr {
+            dst: VReg::gp(u32::MAX - 1),    // GP scratch sentinel
+            mem: Mem::new(VReg::gp(u32::MAX), -8), // frame ptr sentinel
+        });
+
+        fixup_sentinels(&mut mf, Target::X86_64);
+
+        if let MachInst::Ldr { dst, mem } = &mf.insts[0] {
+            assert_eq!(dst.index, 11, "GP scratch should be R11 on x86_64");
+            assert_eq!(mem.base.index, 5, "frame ptr should be RBP on x86_64");
+        } else {
+            panic!("expected Ldr");
+        }
+    }
+
+    #[test]
+    fn test_fixup_sentinels_aarch64() {
+        let mut mf = MachFunc::new("test".to_string());
+        mf.emit(MachInst::FLdr {
+            dst: VReg::fp(u32::MAX - 1),    // FP scratch sentinel
+            mem: Mem::new(VReg::gp(u32::MAX), -16), // frame ptr sentinel
+        });
+
+        fixup_sentinels(&mut mf, Target::Aarch64);
+
+        if let MachInst::FLdr { dst, mem } = &mf.insts[0] {
+            assert_eq!(dst.index, 16, "FP scratch should be D16 on aarch64");
+            assert_eq!(mem.base.index, 29, "frame ptr should be X29 on aarch64");
+        } else {
+            panic!("expected FLdr");
+        }
     }
 }
