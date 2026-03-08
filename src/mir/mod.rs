@@ -8,6 +8,7 @@
 /// one value. Block parameters receive values from predecessor branches.
 
 pub mod builder;
+pub mod interp;
 pub mod opt;
 pub mod ssa;
 
