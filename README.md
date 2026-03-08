@@ -117,4 +117,4 @@ Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution test
 | Hot Module Reload | Planned (recompile + patch code cache at runtime) |
 | Core Library | Not started |
 | Fiber Runtime | Not started |
-| End-to-End CLI | Not started |
+| End-to-End CLI | Complete (lex/parse/sema/MIR/opt/codegen pipeline, REPL, debug dumps) |

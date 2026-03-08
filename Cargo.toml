@@ -4,7 +4,12 @@ version = "0.1.0"
 authors = ["Damilare Akinlaja <damilare@zenturi.co>"]
 edition = "2021"
 
+[[bin]]
+name = "wlift"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 ariadne = "0.5"
 logos = "0.15"
 dynasmrt = "2"
