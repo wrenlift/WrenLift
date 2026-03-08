@@ -13,7 +13,7 @@ Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programmin
 <img src="https://img.shields.io/badge/edition-2021-blue" alt="Rust 2021"/>
 <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
 <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
-<img src="https://img.shields.io/badge/tests-526_passing-brightgreen" alt="526 tests passing"/>
+<img src="https://img.shields.io/badge/tests-532_passing-brightgreen" alt="532 tests passing"/>
 <img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
 </p>
 
@@ -112,7 +112,7 @@ Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution test
 | Generational GC | Complete |
 | x86_64 JIT | Complete |
 | aarch64 JIT | Complete |
-| WASM Codegen | Forward-only (loop back-edges TODO) |
+| WASM Codegen | Complete (structured loops via stackifier) |
 | Tiered Runtime | Planned (MIR interp cold start → JIT hot promotion) |
 | Hot Module Reload | Planned (recompile + patch code cache at runtime) |
 | Core Library | Not started |
