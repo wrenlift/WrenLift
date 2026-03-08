@@ -658,6 +658,43 @@ impl MirFunction {
         BlockId(0)
     }
 
+    /// Remap all SymbolId references in this function using a mapping function.
+    ///
+    /// This is needed when merging a parse interner into the VM interner,
+    /// since the same string may have different SymbolId indices in each.
+    pub fn remap_symbols<F>(&mut self, remap: F)
+    where
+        F: Fn(SymbolId) -> SymbolId,
+    {
+        // Remap function name
+        self.name = remap(self.name);
+
+        // Remap all instructions in all blocks
+        for block in &mut self.blocks {
+            for (_dst, inst) in &mut block.instructions {
+                match inst {
+                    Instruction::ConstString(idx) => {
+                        let old = SymbolId::from_raw(*idx);
+                        *idx = remap(old).index();
+                    }
+                    Instruction::Call { method, .. } => {
+                        *method = remap(*method);
+                    }
+                    Instruction::SuperCall { method, .. } => {
+                        *method = remap(*method);
+                    }
+                    Instruction::GuardClass(_, cls) => {
+                        *cls = remap(*cls);
+                    }
+                    Instruction::IsType(_, ty) => {
+                        *ty = remap(*ty);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Populate predecessor lists from terminator edges.
     pub fn compute_predecessors(&mut self) {
         // Clear existing.

@@ -8,6 +8,7 @@ use std::ffi::c_void;
 use std::ptr;
 
 use crate::intern::{Interner, SymbolId};
+use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
 use super::gc::Gc;
 use super::object::*;
 use super::value::Value;
@@ -60,6 +61,10 @@ pub struct VMConfig {
     pub initial_heap_size: usize,
     pub min_heap_size: usize,
     pub heap_growth_percent: u32,
+    /// Execution mode: Interpreter, Tiered (default), or Jit.
+    pub execution_mode: ExecutionMode,
+    /// Call count threshold before JIT compilation in Tiered mode.
+    pub jit_threshold: u32,
 }
 
 impl Default for VMConfig {
@@ -74,6 +79,8 @@ impl Default for VMConfig {
             initial_heap_size: 10 * 1024 * 1024,
             min_heap_size: 1024 * 1024,
             heap_growth_percent: 50,
+            execution_mode: ExecutionMode::default(),
+            jit_threshold: 100,
         }
     }
 }
@@ -115,6 +122,9 @@ pub struct VM {
     pub fiber: *mut ObjFiber,
     pub modules: HashMap<String, *mut ObjModule>,
 
+    // -- Execution engine (tiered runtime) --
+    pub engine: ExecutionEngine,
+
     // -- API --
     pub api_stack: Vec<Value>,
     pub handles: Vec<WrenHandle>,
@@ -151,6 +161,8 @@ impl VM {
             fiber: ptr::null_mut(),
             modules: HashMap::new(),
 
+            engine: ExecutionEngine::new(config.execution_mode),
+
             api_stack: vec![Value::null(); 16],
             handles: Vec::new(),
             user_data: ptr::null_mut(),
@@ -168,6 +180,123 @@ impl VM {
     /// Create a new VM with default configuration.
     pub fn new_default() -> Self {
         Self::new(VMConfig::default())
+    }
+
+    /// Compile and execute Wren source code.
+    ///
+    /// Pipeline: lex → parse → sema → lower to MIR → optimize → execute.
+    /// Execution happens inside a Fiber context via run_fiber().
+    pub fn interpret(&mut self, module_name: &str, source: &str) -> InterpretResult {
+        use std::collections::HashMap as HMap;
+        use crate::diagnostics::Severity;
+        use crate::mir::BlockId;
+        use crate::mir::opt::{
+            self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
+            licm::Licm, sra::Sra, MirPass,
+        };
+        use crate::parse::parser;
+        use crate::sema;
+
+        // 1. Parse
+        let parse_result = parser::parse(source);
+        if parse_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &parse_result.errors {
+                err.eprint(source);
+            }
+            return InterpretResult::CompileError;
+        }
+
+        // 2. Use the parse interner, merge afterward
+        let mut interner = parse_result.interner;
+
+        // 3. Semantic analysis
+        let resolve_result = sema::resolve::resolve(&parse_result.module, &interner);
+        if resolve_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &resolve_result.errors {
+                err.eprint(source);
+            }
+            return InterpretResult::CompileError;
+        }
+
+        // 4. Lower to MIR
+        let mut mir =
+            crate::mir::builder::lower_module(&parse_result.module, &mut interner);
+
+        // 5. Optimize
+        let constfold = ConstFold;
+        let dce = Dce;
+        let cse = Cse;
+        let type_spec = TypeSpecialize::with_math(&interner);
+        let licm = Licm;
+        let sra = Sra;
+        let passes: Vec<&dyn MirPass> = vec![
+            &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+        ];
+        opt::run_to_fixpoint(&mut mir, &passes, 10);
+
+        // 6. Remap symbols: the parse interner and VM interner have different
+        // indices for the same strings. Build a mapping and rewrite the MIR.
+        let mut sym_map: Vec<crate::intern::SymbolId> = Vec::with_capacity(interner.len());
+        for i in 0..interner.len() {
+            let old_sym = crate::intern::SymbolId::from_raw(i as u32);
+            let s = interner.resolve(old_sym);
+            let new_sym = self.interner.intern(s);
+            sym_map.push(new_sym);
+        }
+        mir.remap_symbols(|old| sym_map[old.index() as usize]);
+
+        // 7. Register function with the engine
+        let func_id = self.engine.register_function(mir);
+
+        // 8. Create module var storage
+        let module_key = module_name.to_string();
+        self.engine.modules.insert(
+            module_key.clone(),
+            super::engine::ModuleEntry {
+                top_level: func_id,
+                vars: Vec::new(),
+            },
+        );
+
+        // 9. Create a fiber and push the initial call frame
+        let fiber = self.gc.alloc_fiber();
+        unsafe {
+            (*fiber).header.class = self.fiber_class;
+            (*fiber).mir_frames.push(MirCallFrame {
+                func_id,
+                current_block: BlockId(0),
+                ip: 0,
+                values: HMap::new(),
+                module_name: module_key,
+                return_dst: None,
+            });
+        }
+
+        // Set as active fiber (save previous)
+        let prev_fiber = self.fiber;
+        self.fiber = fiber;
+
+        // 10. Run the fiber
+        let result = super::vm_interp::run_fiber(self);
+
+        // Restore previous fiber
+        self.fiber = prev_fiber;
+
+        match result {
+            Ok(_) => InterpretResult::Success,
+            Err(e) => {
+                self.report_error(&e.to_string());
+                InterpretResult::RuntimeError
+            }
+        }
     }
 
     // -- Helpers for core library primitives --

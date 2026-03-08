@@ -46,10 +46,11 @@ impl InterpValue {
         }
     }
 
-    /// Extract as f64. Works for both unboxed F64 and boxed nums.
+    /// Extract as f64. Works for unboxed F64, I64, and boxed nums.
     pub fn as_f64(self) -> Result<f64, InterpError> {
         match self {
             InterpValue::F64(n) => Ok(n),
+            InterpValue::I64(n) => Ok(n as f64),
             InterpValue::Boxed(v) => v.as_num().ok_or_else(|| {
                 InterpError::TypeMismatch(format!("expected num, got {:?}", v))
             }),
@@ -57,6 +58,16 @@ impl InterpValue {
                 "expected f64, got {:?}",
                 other
             ))),
+        }
+    }
+
+    /// Convert to a NaN-boxed Value.
+    pub fn to_value(self) -> Value {
+        match self {
+            InterpValue::Boxed(v) => v,
+            InterpValue::F64(n) => Value::num(n),
+            InterpValue::I64(n) => Value::num(n as f64),
+            InterpValue::Bool(b) => Value::bool(b),
         }
     }
 
@@ -142,6 +153,217 @@ impl std::fmt::Display for InterpError {
             InterpError::Unreachable => write!(f, "hit unreachable"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared pure instruction evaluator
+// ---------------------------------------------------------------------------
+
+/// Evaluate a pure MIR instruction using the provided SSA value map.
+///
+/// Handles all computational instructions (arithmetic, comparisons, guards,
+/// box/unbox, bitwise, constants, moves). Returns `Err(InterpError::Unsupported)`
+/// for instructions that require VM/runtime access (calls, collections, module
+/// vars, strings, fields, closures).
+///
+/// Both the standalone MIR interpreter and the VM interpreter delegate here
+/// to avoid duplicating evaluation logic.
+pub fn eval_pure_instruction(
+    inst: &Instruction,
+    values: &HashMap<ValueId, InterpValue>,
+) -> Result<InterpValue, InterpError> {
+    let get = |id: ValueId| -> Result<InterpValue, InterpError> {
+        values.get(&id).copied().ok_or(InterpError::UndefinedValue(id))
+    };
+
+    match inst {
+        // -- Constants --
+        Instruction::ConstNum(n) => Ok(InterpValue::Boxed(Value::num(*n))),
+        Instruction::ConstBool(b) => Ok(InterpValue::Boxed(Value::bool(*b))),
+        Instruction::ConstNull => Ok(InterpValue::Boxed(Value::null())),
+        Instruction::ConstString(_) => {
+            // Strings are opaque in pure evaluation (no allocator).
+            // The VM interpreter handles ConstString before calling this.
+            Ok(InterpValue::Boxed(Value::null()))
+        }
+        Instruction::ConstF64(n) => Ok(InterpValue::F64(*n)),
+        Instruction::ConstI64(n) => Ok(InterpValue::I64(*n)),
+
+        // -- Boxed arithmetic --
+        Instruction::Add(a, b) => boxed_binop(&get, *a, *b, |x, y| x + y),
+        Instruction::Sub(a, b) => boxed_binop(&get, *a, *b, |x, y| x - y),
+        Instruction::Mul(a, b) => boxed_binop(&get, *a, *b, |x, y| x * y),
+        Instruction::Div(a, b) => boxed_binop(&get, *a, *b, |x, y| x / y),
+        Instruction::Mod(a, b) => boxed_binop(&get, *a, *b, |x, y| x % y),
+        Instruction::Neg(a) => {
+            let n = get_boxed_num(&get, *a)?;
+            Ok(InterpValue::Boxed(Value::num(-n)))
+        }
+
+        // -- Unboxed f64 arithmetic --
+        Instruction::AddF64(a, b) => f64_binop(&get, *a, *b, |x, y| x + y),
+        Instruction::SubF64(a, b) => f64_binop(&get, *a, *b, |x, y| x - y),
+        Instruction::MulF64(a, b) => f64_binop(&get, *a, *b, |x, y| x * y),
+        Instruction::DivF64(a, b) => f64_binop(&get, *a, *b, |x, y| x / y),
+        Instruction::ModF64(a, b) => f64_binop(&get, *a, *b, |x, y| x % y),
+        Instruction::NegF64(a) => Ok(InterpValue::F64(-get(*a)?.as_f64()?)),
+
+        // -- Math intrinsics --
+        Instruction::MathUnaryF64(op, a) => Ok(InterpValue::F64(op.apply(get(*a)?.as_f64()?))),
+        Instruction::MathBinaryF64(op, a, b) => {
+            Ok(InterpValue::F64(op.apply(get(*a)?.as_f64()?, get(*b)?.as_f64()?)))
+        }
+
+        // -- Boxed comparisons --
+        Instruction::CmpLt(a, b) => boxed_cmp(&get, *a, *b, |x, y| x < y),
+        Instruction::CmpGt(a, b) => boxed_cmp(&get, *a, *b, |x, y| x > y),
+        Instruction::CmpLe(a, b) => boxed_cmp(&get, *a, *b, |x, y| x <= y),
+        Instruction::CmpGe(a, b) => boxed_cmp(&get, *a, *b, |x, y| x >= y),
+        Instruction::CmpEq(a, b) => {
+            let lhs = get(*a)?.to_value();
+            let rhs = get(*b)?.to_value();
+            Ok(InterpValue::Boxed(Value::bool(lhs == rhs)))
+        }
+        Instruction::CmpNe(a, b) => {
+            let lhs = get(*a)?.to_value();
+            let rhs = get(*b)?.to_value();
+            Ok(InterpValue::Boxed(Value::bool(lhs != rhs)))
+        }
+
+        // -- Unboxed f64 comparisons --
+        Instruction::CmpLtF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x < y),
+        Instruction::CmpGtF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x > y),
+        Instruction::CmpLeF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x <= y),
+        Instruction::CmpGeF64(a, b) => f64_cmp(&get, *a, *b, |x, y| x >= y),
+
+        // -- Logical --
+        Instruction::Not(a) => Ok(InterpValue::Boxed(Value::bool(!get(*a)?.is_truthy()))),
+
+        // -- Bitwise --
+        Instruction::BitAnd(a, b) => bitwise_binop(&get, *a, *b, |x, y| x & y),
+        Instruction::BitOr(a, b) => bitwise_binop(&get, *a, *b, |x, y| x | y),
+        Instruction::BitXor(a, b) => bitwise_binop(&get, *a, *b, |x, y| x ^ y),
+        Instruction::Shl(a, b) => bitwise_binop(&get, *a, *b, |x, y| x << (y & 31)),
+        Instruction::Shr(a, b) => bitwise_binop(&get, *a, *b, |x, y| x >> (y & 31)),
+        Instruction::BitNot(a) => {
+            let n = get_boxed_num(&get, *a)? as i32;
+            Ok(InterpValue::Boxed(Value::num((!n) as f64)))
+        }
+
+        // -- Guards (lenient: accepts both boxed and unboxed forms) --
+        Instruction::GuardNum(a) => {
+            let v = get(*a)?;
+            match v {
+                InterpValue::Boxed(val) if val.is_num() => Ok(v),
+                InterpValue::F64(_) | InterpValue::I64(_) => Ok(v),
+                _ => Err(InterpError::GuardFailed("GuardNum: not a number".into())),
+            }
+        }
+        Instruction::GuardBool(a) => {
+            let v = get(*a)?;
+            match v {
+                InterpValue::Boxed(val) if val.is_bool() => Ok(v),
+                InterpValue::Bool(_) => Ok(v),
+                _ => Err(InterpError::GuardFailed("GuardBool: not a bool".into())),
+            }
+        }
+
+        // -- Box / Unbox (handles already-unboxed values gracefully) --
+        Instruction::Unbox(a) => {
+            match get(*a)? {
+                InterpValue::Boxed(val) => match val.as_num() {
+                    Some(n) => Ok(InterpValue::F64(n)),
+                    None => Err(InterpError::TypeMismatch("unbox: not a number".into())),
+                },
+                InterpValue::F64(n) => Ok(InterpValue::F64(n)),
+                InterpValue::I64(n) => Ok(InterpValue::F64(n as f64)),
+                InterpValue::Bool(_) => Err(InterpError::TypeMismatch("unbox: bool".into())),
+            }
+        }
+        Instruction::Box(a) => Ok(InterpValue::Boxed(get(*a)?.to_value())),
+
+        // -- Move --
+        Instruction::Move(a) => get(*a),
+
+        // -- BlockParam (pre-bound by bind_block_params, no-op here) --
+        Instruction::BlockParam(_) => Ok(InterpValue::Boxed(Value::null())),
+
+        // -- VM/runtime-specific (unsupported in pure evaluation) --
+        Instruction::GuardClass(_, _) => Err(InterpError::Unsupported("GuardClass".into())),
+        Instruction::GetModuleVar(_) => Err(InterpError::Unsupported("GetModuleVar".into())),
+        Instruction::SetModuleVar(_, _) => Err(InterpError::Unsupported("SetModuleVar".into())),
+        Instruction::Call { .. } => Err(InterpError::Unsupported("Call".into())),
+        Instruction::SuperCall { .. } => Err(InterpError::Unsupported("SuperCall".into())),
+        Instruction::GetField(_, _) => Err(InterpError::Unsupported("GetField".into())),
+        Instruction::SetField(_, _, _) => Err(InterpError::Unsupported("SetField".into())),
+        Instruction::GetUpvalue(_) => Err(InterpError::Unsupported("GetUpvalue".into())),
+        Instruction::SetUpvalue(_, _) => Err(InterpError::Unsupported("SetUpvalue".into())),
+        Instruction::MakeClosure { .. } => Err(InterpError::Unsupported("MakeClosure".into())),
+        Instruction::MakeList(_) => Err(InterpError::Unsupported("MakeList".into())),
+        Instruction::MakeMap(_) => Err(InterpError::Unsupported("MakeMap".into())),
+        Instruction::MakeRange(_, _, _) => Err(InterpError::Unsupported("MakeRange".into())),
+        Instruction::StringConcat(_) => Err(InterpError::Unsupported("StringConcat".into())),
+        Instruction::ToString(_) => Err(InterpError::Unsupported("ToString".into())),
+        Instruction::IsType(_, _) => Err(InterpError::Unsupported("IsType".into())),
+        Instruction::SubscriptGet { .. } => Err(InterpError::Unsupported("SubscriptGet".into())),
+        Instruction::SubscriptSet { .. } => Err(InterpError::Unsupported("SubscriptSet".into())),
+    }
+}
+
+// -- Shared helpers for eval_pure_instruction --
+
+fn get_boxed_num(
+    get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
+    id: ValueId,
+) -> Result<f64, InterpError> {
+    get(id)?.as_f64()
+}
+
+fn boxed_binop(
+    get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
+    a: ValueId,
+    b: ValueId,
+    op: impl Fn(f64, f64) -> f64,
+) -> Result<InterpValue, InterpError> {
+    Ok(InterpValue::Boxed(Value::num(op(get_boxed_num(get, a)?, get_boxed_num(get, b)?))))
+}
+
+fn f64_binop(
+    get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
+    a: ValueId,
+    b: ValueId,
+    op: impl Fn(f64, f64) -> f64,
+) -> Result<InterpValue, InterpError> {
+    Ok(InterpValue::F64(op(get(a)?.as_f64()?, get(b)?.as_f64()?)))
+}
+
+fn boxed_cmp(
+    get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
+    a: ValueId,
+    b: ValueId,
+    op: impl Fn(f64, f64) -> bool,
+) -> Result<InterpValue, InterpError> {
+    Ok(InterpValue::Boxed(Value::bool(op(get_boxed_num(get, a)?, get_boxed_num(get, b)?))))
+}
+
+fn f64_cmp(
+    get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
+    a: ValueId,
+    b: ValueId,
+    op: impl Fn(f64, f64) -> bool,
+) -> Result<InterpValue, InterpError> {
+    Ok(InterpValue::Bool(op(get(a)?.as_f64()?, get(b)?.as_f64()?)))
+}
+
+fn bitwise_binop(
+    get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
+    a: ValueId,
+    b: ValueId,
+    op: impl Fn(i32, i32) -> i32,
+) -> Result<InterpValue, InterpError> {
+    let lhs = get_boxed_num(get, a)? as i32;
+    let rhs = get_boxed_num(get, b)? as i32;
+    Ok(InterpValue::Boxed(Value::num(op(lhs, rhs) as f64)))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,143 +481,9 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_instruction(&mut self, inst: &Instruction) -> Result<InterpValue, InterpError> {
+        // Module vars use Interp-local storage, handle them here.
+        // Everything else delegates to the shared evaluator.
         match inst {
-            // -- Constants --
-            Instruction::ConstNum(n) => Ok(InterpValue::Boxed(Value::num(*n))),
-            Instruction::ConstBool(b) => Ok(InterpValue::Boxed(Value::bool(*b))),
-            Instruction::ConstNull => Ok(InterpValue::Boxed(Value::null())),
-            Instruction::ConstString(idx) => {
-                // Strings are opaque in the interpreter — store index as a
-                // tagged i64 so we can at least track identity.
-                let _ = idx;
-                Ok(InterpValue::Boxed(Value::null()))
-            }
-            Instruction::ConstF64(n) => Ok(InterpValue::F64(*n)),
-            Instruction::ConstI64(n) => Ok(InterpValue::I64(*n)),
-
-            // -- Boxed arithmetic --
-            Instruction::Add(a, b) => self.boxed_binop(*a, *b, |x, y| x + y),
-            Instruction::Sub(a, b) => self.boxed_binop(*a, *b, |x, y| x - y),
-            Instruction::Mul(a, b) => self.boxed_binop(*a, *b, |x, y| x * y),
-            Instruction::Div(a, b) => {
-                let lhs = self.get(*a)?.as_boxed()?.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch("div lhs not num".into())
-                })?;
-                let rhs = self.get(*b)?.as_boxed()?.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch("div rhs not num".into())
-                })?;
-                Ok(InterpValue::Boxed(Value::num(lhs / rhs)))
-            }
-            Instruction::Mod(a, b) => {
-                let lhs = self.get(*a)?.as_boxed()?.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch("mod lhs not num".into())
-                })?;
-                let rhs = self.get(*b)?.as_boxed()?.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch("mod rhs not num".into())
-                })?;
-                Ok(InterpValue::Boxed(Value::num(lhs % rhs)))
-            }
-            Instruction::Neg(a) => {
-                let n = self.get(*a)?.as_boxed()?.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch("neg operand not num".into())
-                })?;
-                Ok(InterpValue::Boxed(Value::num(-n)))
-            }
-
-            // -- Unboxed f64 arithmetic --
-            Instruction::AddF64(a, b) => self.f64_binop(*a, *b, |x, y| x + y),
-            Instruction::SubF64(a, b) => self.f64_binop(*a, *b, |x, y| x - y),
-            Instruction::MulF64(a, b) => self.f64_binop(*a, *b, |x, y| x * y),
-            Instruction::DivF64(a, b) => self.f64_binop(*a, *b, |x, y| x / y),
-            Instruction::ModF64(a, b) => self.f64_binop(*a, *b, |x, y| x % y),
-            Instruction::NegF64(a) => {
-                let n = self.get(*a)?.as_f64()?;
-                Ok(InterpValue::F64(-n))
-            }
-
-            // -- Boxed comparisons --
-            Instruction::CmpLt(a, b) => self.boxed_cmp(*a, *b, |x, y| x < y),
-            Instruction::CmpGt(a, b) => self.boxed_cmp(*a, *b, |x, y| x > y),
-            Instruction::CmpLe(a, b) => self.boxed_cmp(*a, *b, |x, y| x <= y),
-            Instruction::CmpGe(a, b) => self.boxed_cmp(*a, *b, |x, y| x >= y),
-            Instruction::CmpEq(a, b) => {
-                let lhs = self.get(*a)?.as_boxed()?;
-                let rhs = self.get(*b)?.as_boxed()?;
-                Ok(InterpValue::Boxed(Value::bool(lhs.equals(rhs))))
-            }
-            Instruction::CmpNe(a, b) => {
-                let lhs = self.get(*a)?.as_boxed()?;
-                let rhs = self.get(*b)?.as_boxed()?;
-                Ok(InterpValue::Boxed(Value::bool(!lhs.equals(rhs))))
-            }
-
-            // -- Unboxed f64 comparisons --
-            Instruction::CmpLtF64(a, b) => self.f64_cmp(*a, *b, |x, y| x < y),
-            Instruction::CmpGtF64(a, b) => self.f64_cmp(*a, *b, |x, y| x > y),
-            Instruction::CmpLeF64(a, b) => self.f64_cmp(*a, *b, |x, y| x <= y),
-            Instruction::CmpGeF64(a, b) => self.f64_cmp(*a, *b, |x, y| x >= y),
-
-            // -- Logical --
-            Instruction::Not(a) => {
-                let v = self.get(*a)?;
-                Ok(InterpValue::Boxed(Value::bool(!v.is_truthy())))
-            }
-
-            // -- Bitwise --
-            Instruction::BitAnd(a, b) => self.bitwise_binop(*a, *b, |x, y| x & y),
-            Instruction::BitOr(a, b) => self.bitwise_binop(*a, *b, |x, y| x | y),
-            Instruction::BitXor(a, b) => self.bitwise_binop(*a, *b, |x, y| x ^ y),
-            Instruction::BitNot(a) => {
-                let n = self.get(*a)?.as_boxed()?.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch("bitnot operand not num".into())
-                })?;
-                let i = n as i32;
-                Ok(InterpValue::Boxed(Value::num((!i) as f64)))
-            }
-            Instruction::Shl(a, b) => self.bitwise_binop(*a, *b, |x, y| x << (y & 31)),
-            Instruction::Shr(a, b) => self.bitwise_binop(*a, *b, |x, y| x >> (y & 31)),
-
-            // -- Guards --
-            Instruction::GuardNum(a) => {
-                let v = self.get(*a)?.as_boxed()?;
-                if v.is_num() {
-                    Ok(InterpValue::Boxed(v))
-                } else {
-                    Err(InterpError::GuardFailed(format!(
-                        "GuardNum: {:?} is not a number",
-                        v
-                    )))
-                }
-            }
-            Instruction::GuardBool(a) => {
-                let v = self.get(*a)?.as_boxed()?;
-                if v.is_bool() {
-                    Ok(InterpValue::Boxed(v))
-                } else {
-                    Err(InterpError::GuardFailed(format!(
-                        "GuardBool: {:?} is not a bool",
-                        v
-                    )))
-                }
-            }
-            Instruction::GuardClass(_, _) => {
-                Err(InterpError::Unsupported("GuardClass".into()))
-            }
-
-            // -- Box / Unbox --
-            Instruction::Unbox(a) => {
-                let v = self.get(*a)?.as_boxed()?;
-                let n = v.as_num().ok_or_else(|| {
-                    InterpError::TypeMismatch(format!("unbox: {:?} is not a number", v))
-                })?;
-                Ok(InterpValue::F64(n))
-            }
-            Instruction::Box(a) => {
-                let n = self.get(*a)?.as_f64()?;
-                Ok(InterpValue::Boxed(Value::num(n)))
-            }
-
-            // -- Module vars --
             Instruction::GetModuleVar(idx) => {
                 self.module_vars
                     .get(idx)
@@ -407,147 +495,8 @@ impl<'a> Interp<'a> {
                 self.module_vars.insert(*idx, v);
                 Ok(InterpValue::Boxed(Value::null()))
             }
-
-            // -- Move --
-            Instruction::Move(a) => self.get(*a),
-
-            // -- BlockParam --
-            // Already bound by bind_block_params; the instruction itself is a no-op.
-            // The value is assigned in the block's params list.
-            Instruction::BlockParam(_) => {
-                // Block params are pre-bound. Return a sentinel that will be
-                // overwritten by the param binding. If we hit this, something
-                // is off, but return null to not crash.
-                Ok(InterpValue::Boxed(Value::null()))
-            }
-
-            // -- Math intrinsics --
-            Instruction::MathUnaryF64(op, a) => {
-                let n = self.get(*a)?.as_f64()?;
-                Ok(InterpValue::F64(op.apply(n)))
-            }
-            Instruction::MathBinaryF64(op, a, b) => {
-                let x = self.get(*a)?.as_f64()?;
-                let y = self.get(*b)?.as_f64()?;
-                Ok(InterpValue::F64(op.apply(x, y)))
-            }
-
-            // -- Unsupported --
-            Instruction::GetField(_, _) => {
-                Err(InterpError::Unsupported("GetField".into()))
-            }
-            Instruction::SetField(_, _, _) => {
-                Err(InterpError::Unsupported("SetField".into()))
-            }
-            Instruction::Call { .. } => {
-                Err(InterpError::Unsupported("Call".into()))
-            }
-            Instruction::SuperCall { .. } => {
-                Err(InterpError::Unsupported("SuperCall".into()))
-            }
-            Instruction::MakeClosure { .. } => {
-                Err(InterpError::Unsupported("MakeClosure".into()))
-            }
-            Instruction::GetUpvalue(_) => {
-                Err(InterpError::Unsupported("GetUpvalue".into()))
-            }
-            Instruction::SetUpvalue(_, _) => {
-                Err(InterpError::Unsupported("SetUpvalue".into()))
-            }
-            Instruction::MakeList(_) => {
-                Err(InterpError::Unsupported("MakeList".into()))
-            }
-            Instruction::MakeMap(_) => {
-                Err(InterpError::Unsupported("MakeMap".into()))
-            }
-            Instruction::MakeRange(_, _, _) => {
-                Err(InterpError::Unsupported("MakeRange".into()))
-            }
-            Instruction::StringConcat(_) => {
-                Err(InterpError::Unsupported("StringConcat".into()))
-            }
-            Instruction::ToString(_) => {
-                Err(InterpError::Unsupported("ToString".into()))
-            }
-            Instruction::IsType(_, _) => {
-                Err(InterpError::Unsupported("IsType".into()))
-            }
-            Instruction::SubscriptGet { .. } => {
-                Err(InterpError::Unsupported("SubscriptGet".into()))
-            }
-            Instruction::SubscriptSet { .. } => {
-                Err(InterpError::Unsupported("SubscriptSet".into()))
-            }
+            _ => eval_pure_instruction(inst, &self.values),
         }
-    }
-
-    // -- Helpers ---
-
-    fn boxed_binop(
-        &self,
-        a: ValueId,
-        b: ValueId,
-        op: impl Fn(f64, f64) -> f64,
-    ) -> Result<InterpValue, InterpError> {
-        let lhs = self.get(a)?.as_boxed()?.as_num().ok_or_else(|| {
-            InterpError::TypeMismatch("binop lhs not num".into())
-        })?;
-        let rhs = self.get(b)?.as_boxed()?.as_num().ok_or_else(|| {
-            InterpError::TypeMismatch("binop rhs not num".into())
-        })?;
-        Ok(InterpValue::Boxed(Value::num(op(lhs, rhs))))
-    }
-
-    fn f64_binop(
-        &self,
-        a: ValueId,
-        b: ValueId,
-        op: impl Fn(f64, f64) -> f64,
-    ) -> Result<InterpValue, InterpError> {
-        let lhs = self.get(a)?.as_f64()?;
-        let rhs = self.get(b)?.as_f64()?;
-        Ok(InterpValue::F64(op(lhs, rhs)))
-    }
-
-    fn boxed_cmp(
-        &self,
-        a: ValueId,
-        b: ValueId,
-        op: impl Fn(f64, f64) -> bool,
-    ) -> Result<InterpValue, InterpError> {
-        let lhs = self.get(a)?.as_boxed()?.as_num().ok_or_else(|| {
-            InterpError::TypeMismatch("cmp lhs not num".into())
-        })?;
-        let rhs = self.get(b)?.as_boxed()?.as_num().ok_or_else(|| {
-            InterpError::TypeMismatch("cmp rhs not num".into())
-        })?;
-        Ok(InterpValue::Boxed(Value::bool(op(lhs, rhs))))
-    }
-
-    fn f64_cmp(
-        &self,
-        a: ValueId,
-        b: ValueId,
-        op: impl Fn(f64, f64) -> bool,
-    ) -> Result<InterpValue, InterpError> {
-        let lhs = self.get(a)?.as_f64()?;
-        let rhs = self.get(b)?.as_f64()?;
-        Ok(InterpValue::Bool(op(lhs, rhs)))
-    }
-
-    fn bitwise_binop(
-        &self,
-        a: ValueId,
-        b: ValueId,
-        op: impl Fn(i32, i32) -> i32,
-    ) -> Result<InterpValue, InterpError> {
-        let lhs = self.get(a)?.as_boxed()?.as_num().ok_or_else(|| {
-            InterpError::TypeMismatch("bitwise lhs not num".into())
-        })? as i32;
-        let rhs = self.get(b)?.as_boxed()?.as_num().ok_or_else(|| {
-            InterpError::TypeMismatch("bitwise rhs not num".into())
-        })? as i32;
-        Ok(InterpValue::Boxed(Value::num(op(lhs, rhs) as f64)))
     }
 }
 

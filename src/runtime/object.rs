@@ -13,6 +13,8 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::intern::SymbolId;
+use crate::mir::BlockId;
+use crate::runtime::engine::FuncId;
 use super::value::Value;
 
 // ---------------------------------------------------------------------------
@@ -524,7 +526,7 @@ pub enum FiberState {
     Error,
 }
 
-/// A call frame on a fiber's call stack.
+/// A call frame on a fiber's call stack (for JIT/closure-based execution).
 #[derive(Debug, Clone)]
 pub struct CallFrame {
     /// The closure being executed.
@@ -535,14 +537,46 @@ pub struct CallFrame {
     pub stack_base: usize,
 }
 
+/// A call frame for MIR interpretation within a fiber.
+///
+/// Holds the per-frame state needed to walk MIR basic blocks:
+/// which function, which block, which instruction, and the SSA value map.
+#[derive(Clone)]
+pub struct MirCallFrame {
+    /// Which function in the engine we're executing.
+    pub func_id: FuncId,
+    /// Current basic block.
+    pub current_block: BlockId,
+    /// Instruction index within the current block (used for resumption after yield).
+    pub ip: usize,
+    /// SSA value map for this frame.
+    pub values: HashMap<crate::mir::ValueId, crate::mir::interp::InterpValue>,
+    /// Module variable storage for this frame's module.
+    pub module_name: String,
+    /// The ValueId in the *caller* frame that should receive our return value.
+    pub return_dst: Option<crate::mir::ValueId>,
+}
+
+impl fmt::Debug for MirCallFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MirCallFrame(func={:?}, block={:?}, ip={})",
+            self.func_id, self.current_block, self.ip
+        )
+    }
+}
+
 /// A fiber (lightweight coroutine / green thread).
 #[repr(C)]
 pub struct ObjFiber {
     pub header: ObjHeader,
-    /// The value stack.
+    /// The value stack (used for passing args between frames).
     pub stack: Vec<Value>,
-    /// The call frame stack.
+    /// Call frame stack for JIT/closure-based execution.
     pub frames: Vec<CallFrame>,
+    /// Call frame stack for MIR interpretation.
+    pub mir_frames: Vec<MirCallFrame>,
     /// Current state.
     pub state: FiberState,
     /// The fiber that will resume when this one finishes or yields.
@@ -557,6 +591,7 @@ impl ObjFiber {
             header: ObjHeader::new(ObjType::Fiber),
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
+            mir_frames: Vec::with_capacity(64),
             state: FiberState::New,
             caller: std::ptr::null_mut(),
             error: Value::null(),
