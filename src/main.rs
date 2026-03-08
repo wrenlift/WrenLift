@@ -1,39 +1,29 @@
-// Copyright 2021 Zenturi Software Co.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-#![feature(destructuring_assignment)]
-#![feature(toowned_clone_into)]
-#![feature(char_indices_offset)]
-#![feature(iter_advance_by)]
-#[macro_use]
-extern crate lazy_static;
+use std::env;
+use std::fs;
+use std::process;
 
+fn main() {
+    let args: Vec<String> = env::args().collect();
 
-mod compiler;
+    if args.len() < 2 {
+        eprintln!("Usage: wren_lift <file.wren>");
+        eprintln!("       wren_lift --dump-tokens <file.wren>");
+        eprintln!("       wren_lift --dump-ast <file.wren>");
+        eprintln!("       wren_lift --dump-mir <file.wren>");
+        eprintln!("       wren_lift --target=wasm <file.wren> -o out.wasm");
+        process::exit(1);
+    }
 
-use compiler::wren_compiler::Compiler;
-use compiler::scanner::Lexer;
+    let filename = &args[1];
+    let source = match fs::read_to_string(filename) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading '{}': {}", filename, e);
+            process::exit(1);
+        }
+    };
 
-
-fn build<'a> () {
-    let source = r#"var isDone = false || true 
-    System.print(1 != 2 ? "math is sane" : "math is not sane!")"#;
-    let compiler = Compiler::new(source);
-
-    // println!("{:#?}", compiler.tokens);
-}
-
- 
-fn main(){
-    build();
+    let _ = source;
+    eprintln!("WrenLift compiler - not yet implemented");
+    process::exit(1);
 }

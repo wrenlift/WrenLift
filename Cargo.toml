@@ -2,19 +2,8 @@
 name = "wren_lift"
 version = "0.1.0"
 authors = ["Damilare Akinlaja <damilare@zenturi.co>"]
-edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+edition = "2021"
 
 [dependencies]
-lazy_static = "1.4.0"
-cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", features = ["unwind"] }
-cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", optional = true }
-cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
 
-[[bin]]
-name = "main"
-path = "src/main.rs"
+[dev-dependencies]
