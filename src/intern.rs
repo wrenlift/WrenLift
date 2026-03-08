@@ -20,6 +20,12 @@ impl SymbolId {
     pub fn index(self) -> u32 {
         self.0
     }
+
+    /// Create from a raw index (for tests and internal use).
+    #[inline]
+    pub fn from_raw(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 impl std::fmt::Debug for SymbolId {
