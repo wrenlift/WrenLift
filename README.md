@@ -13,7 +13,7 @@ Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programmin
 <img src="https://img.shields.io/badge/edition-2021-blue" alt="Rust 2021"/>
 <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
 <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
-<img src="https://img.shields.io/badge/tests-532_passing-brightgreen" alt="532 tests passing"/>
+<img src="https://img.shields.io/badge/tests-556_passing-brightgreen" alt="556 tests passing"/>
 <img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
 </p>
 
@@ -95,6 +95,7 @@ WrenLift uses a layered approach to correctness across the compiler and runtime.
 | `ariadne` | Error reporting with source context |
 | `dynasmrt` / `dynasm` | AArch64 JIT assembly |
 | `wasm-encoder` | WASM binary encoding |
+| `clap` | CLI argument parsing |
 
 Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution tests), `wasmparser` (WASM validation), `wasmprinter` (WAT dump).
 
@@ -115,6 +116,6 @@ Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution test
 | WASM Codegen | Complete (structured loops via stackifier) |
 | Tiered Runtime | Planned (MIR interp cold start → JIT hot promotion) |
 | Hot Module Reload | Planned (recompile + patch code cache at runtime) |
-| Core Library | Not started |
+| Core Library | Complete (Object, Class, Bool, Null, Num, String, List, Map, Range, Fn, Fiber, System) |
 | Fiber Runtime | Not started |
 | End-to-End CLI | Complete (lex/parse/sema/MIR/opt/codegen pipeline, REPL, debug dumps) |

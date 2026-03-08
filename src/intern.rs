@@ -78,6 +78,11 @@ impl Interner {
         id
     }
 
+    /// Look up a string without interning it. Returns `None` if not found.
+    pub fn lookup(&self, s: &str) -> Option<SymbolId> {
+        self.map.get(s).copied()
+    }
+
     /// Resolve a `SymbolId` back to its string.
     #[inline]
     pub fn resolve(&self, id: SymbolId) -> &str {

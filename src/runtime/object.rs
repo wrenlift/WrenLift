@@ -643,10 +643,32 @@ impl fmt::Debug for Method {
 pub type NativeFn = fn(&mut dyn NativeContext, &[Value]) -> Value;
 
 /// Trait for native function context (implemented by the VM).
+///
+/// Core library primitives and foreign methods use this to interact with
+/// the VM without creating circular dependencies.
 pub trait NativeContext {
+    // -- Slot API (for C FFI compatibility) --
     fn get_slot(&self, index: usize) -> Value;
     fn set_slot(&mut self, index: usize, value: Value);
     fn slot_count(&self) -> usize;
+
+    // -- Allocation --
+    fn alloc_string(&mut self, s: String) -> Value;
+    fn alloc_list(&mut self, elements: Vec<Value>) -> Value;
+    fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value;
+    fn alloc_map(&mut self) -> Value;
+
+    // -- Error handling --
+    fn runtime_error(&mut self, msg: String);
+    fn has_error(&self) -> bool;
+
+    // -- Object introspection --
+    fn get_class_of(&self, value: Value) -> *mut ObjClass;
+    fn get_class_name_of(&self, value: Value) -> String;
+
+    // -- Symbol interning --
+    fn intern(&mut self, s: &str) -> SymbolId;
+    fn resolve_symbol(&self, id: SymbolId) -> &str;
 }
 
 impl ObjClass {
