@@ -9,6 +9,10 @@ ariadne = "0.5"
 logos = "0.15"
 dynasmrt = "2"
 dynasm = "2"
+wasm-encoder = "0.245"
 
 [dev-dependencies]
 capstone = "0.12"
+wasmtime = "31"
+wasmprinter = "0.226"
+wasmparser = "0.226"

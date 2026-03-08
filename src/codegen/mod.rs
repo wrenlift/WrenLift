@@ -11,6 +11,7 @@
 /// - Virtual registers resolved by linear-scan register allocator before emission
 
 pub mod aarch64;
+pub mod cfg;
 pub mod regalloc;
 pub mod wasm;
 pub mod x86_64;
@@ -1229,6 +1230,7 @@ fn emit_mov(out: &mut Vec<MachInst>, dst: VReg, src: VReg) {
 pub enum Target {
     X86_64,
     Aarch64,
+    Wasm,
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1258,8 @@ pub enum CompiledFunction {
     X86_64(x86_64::EmittedCode),
     /// aarch64 executable buffer.
     Aarch64(aarch64::CompiledCode),
+    /// WebAssembly module bytes.
+    Wasm(wasm::WasmModule),
 }
 
 impl CompiledFunction {
@@ -1263,6 +1267,7 @@ impl CompiledFunction {
     ///
     /// The returned `ExecutableFunction` owns the mmap'd memory.
     /// Function pointers obtained from it are valid for its lifetime.
+    /// WASM modules cannot be made directly executable (use a WASM runtime).
     pub fn into_executable(self) -> Result<ExecutableFunction, String> {
         match self {
             CompiledFunction::X86_64(code) => {
@@ -1272,6 +1277,17 @@ impl CompiledFunction {
             CompiledFunction::Aarch64(code) => {
                 Ok(ExecutableFunction::Aarch64(code))
             }
+            CompiledFunction::Wasm(_) => {
+                Err("WASM modules cannot be made directly executable; use a WASM runtime".into())
+            }
+        }
+    }
+
+    /// Get the WASM module bytes, if this is a WASM compilation.
+    pub fn as_wasm(&self) -> Option<&wasm::WasmModule> {
+        match self {
+            CompiledFunction::Wasm(m) => Some(m),
+            _ => None,
         }
     }
 }
@@ -1304,32 +1320,40 @@ impl ExecutableFunction {
     }
 }
 
-/// Compile a MIR function to native code for the given target.
+/// Compile a MIR function to native code or WASM for the given target.
 ///
-/// Full pipeline: MIR → lower → regalloc → sentinel fixup → emit.
+/// Native pipeline: MIR → lower → regalloc → sentinel fixup → emit.
+/// WASM pipeline: MIR → emit_mir (bypasses MachInst entirely).
 pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFunction, String> {
-    // 1. Lower MIR → MachFunc (virtual registers)
-    let mut mach = lower_mir(mir);
-
-    // 2. Register allocation (parallel copies → liveness → assign → rewrite)
-    let target_regs = match target {
-        Target::X86_64 => regalloc::x86_64_target_regs(),
-        Target::Aarch64 => regalloc::aarch64_target_regs(),
-    };
-    regalloc::allocate_registers(&mut mach, &target_regs);
-
-    // 3. Patch sentinel registers to target-specific physical encodings
-    fixup_sentinels(&mut mach, target);
-
-    // 4. Emit native code
     match target {
-        Target::X86_64 => {
-            let emitted = x86_64::emit(&mach)?;
-            Ok(CompiledFunction::X86_64(emitted))
+        Target::Wasm => {
+            // WASM: lower directly from MIR, no MachInst layer needed.
+            let module = wasm::emit_mir(mir)?;
+            Ok(CompiledFunction::Wasm(module))
         }
-        Target::Aarch64 => {
-            let compiled = aarch64::emit(&mach)?;
-            Ok(CompiledFunction::Aarch64(compiled))
+        _ => {
+            // 1. Lower MIR → MachFunc (virtual registers)
+            let mut mach = lower_mir(mir);
+            // Native: register allocation + emit.
+            let target_regs = match target {
+                Target::X86_64 => regalloc::x86_64_target_regs(),
+                Target::Aarch64 => regalloc::aarch64_target_regs(),
+                Target::Wasm => unreachable!(),
+            };
+            regalloc::allocate_registers(&mut mach, &target_regs);
+            fixup_sentinels(&mut mach, target);
+
+            match target {
+                Target::X86_64 => {
+                    let emitted = x86_64::emit(&mach)?;
+                    Ok(CompiledFunction::X86_64(emitted))
+                }
+                Target::Aarch64 => {
+                    let compiled = aarch64::emit(&mach)?;
+                    Ok(CompiledFunction::Aarch64(compiled))
+                }
+                Target::Wasm => unreachable!(),
+            }
         }
     }
 }
@@ -1340,6 +1364,7 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
     let (fp_enc, gp_scratch, fp_scratch): (u32, u32, u32) = match target {
         Target::X86_64 => (5, 11, 15),     // RBP, R11, XMM15
         Target::Aarch64 => (29, 16, 16),   // X29, X16, D16
+        Target::Wasm => return,            // WASM has no physical registers.
     };
 
     for inst in &mut mach.insts {
