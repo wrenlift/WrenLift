@@ -8,6 +8,7 @@ pub mod cse;
 pub mod dce;
 pub mod escape;
 pub mod inline;
+pub mod licm;
 pub mod sra;
 
 use std::collections::HashMap;

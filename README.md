@@ -8,9 +8,18 @@
 Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programming language.
 </p>
 
+<p align="center">
+<img src="https://img.shields.io/badge/language-Rust-orange?logo=rust" alt="Rust"/>
+<img src="https://img.shields.io/badge/edition-2021-blue" alt="Rust 2021"/>
+<img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
+<img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
+<img src="https://img.shields.io/badge/tests-526_passing-brightgreen" alt="526 tests passing"/>
+<img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
+</p>
+
 ---
 
-WrenLift replaces Wren's stack-based bytecode interpreter with a modern compilation pipeline. Source code is tokenized by a logos-based lexer (~60 token variants), then parsed by a recursive-descent parser into a fully spanned AST. Semantic analysis performs name/scope resolution and speculative type inference over the AST. The analyzed program is lowered into an SSA-based mid-level IR (MIR) using block parameters (Cranelift/MLIR-style, not phi nodes). Six optimization passes run over the MIR before code generation:
+WrenLift replaces Wren's stack-based bytecode interpreter with a modern compilation pipeline. Source code is tokenized by a logos-based lexer (~60 token variants), then parsed by a recursive-descent parser into a fully spanned AST. Semantic analysis performs name/scope resolution and speculative type inference over the AST. The analyzed program is lowered into an SSA-based mid-level IR (MIR) using block parameters (Cranelift/MLIR-style, not phi nodes). Seven optimization passes run over the MIR before code generation:
 
 - **Constant folding** -- evaluates constant expressions at compile time, folds branches on known conditions, propagates constants through moves and box/unbox boundaries
 - **Dead code elimination** -- removes unused pure instructions and unreachable blocks, preserves side-effectful operations
@@ -18,10 +27,11 @@ WrenLift replaces Wren's stack-based bytecode interpreter with a modern compilat
 - **Type specialization** -- devirtualizes boxed arithmetic when operand types are known (e.g. two Nums), converting `Add` into `GuardNum` + `Unbox` + `AddF64` + `Box` for native-speed floating point
 - **Escape analysis** -- identifies heap allocations that never leave the function (not returned, not stored to fields, not captured by escaping closures)
 - **Scalar replacement of aggregates** -- replaces non-escaping fixed-size lists with individual SSA values when all accesses use constant indices
+- **Loop-invariant code motion** -- detects natural loops via dominance-based back-edge analysis, inserts preheader blocks, and hoists loop-invariant computations out of the loop body using fixpoint iteration
 
 The optimized MIR is then compiled to native machine code (x86_64 via manual byte-level encoding, aarch64 via dynasmrt) or WebAssembly (direct MIR-to-WASM emission, bypassing the machine IR layer entirely). A linear-scan register allocator handles register assignment and spilling for native targets.
 
-The runtime uses NaN-boxed 64-bit values, a generational semi-space garbage collector with bump-pointer nursery allocation, and an object model with O(1) method dispatch via interned symbol IDs.
+The runtime uses NaN-boxed 64-bit values, a generational semi-space garbage collector with bump-pointer nursery allocation, and an object model with O(1) method dispatch via interned symbol IDs. A planned tiered execution model will use the MIR interpreter for fast cold starts, with invocation counters promoting hot functions to optimized JIT compilation -- eliminating upfront compilation latency while still reaching peak performance on critical paths. Hot module reload will allow recompiling changed source files at runtime, patching the code cache and re-resolving module-level bindings without restarting the VM.
 
 ## Getting Started
 
@@ -65,7 +75,7 @@ wlift --gc-stats script.wren       # Print GC statistics after execution
 
 WrenLift uses a layered approach to correctness across the compiler and runtime.
 
-**MIR interpreter as optimization oracle.** A dedicated interpreter executes MIR functions directly, stepping through blocks and following terminators with a configurable step limit to catch infinite loops. Every optimization pass is tested by asserting `eval(f) == eval(optimize(f))` -- if constant folding, DCE, CSE, type specialization, escape analysis, or SRA changes a program's result, the test fails. This catches miscompilations without needing the full Wren VM.
+**MIR interpreter as optimization oracle.** A dedicated interpreter executes MIR functions directly, stepping through blocks and following terminators with a configurable step limit to catch infinite loops. Every optimization pass is tested by asserting `eval(f) == eval(optimize(f))` -- if constant folding, DCE, CSE, type specialization, escape analysis, SRA, or LICM changes a program's result, the test fails. This catches miscompilations without needing the full Wren VM.
 
 **WASM structural validation.** Emitted WebAssembly modules are validated through wasmparser (full structural and type validation) before any execution. When validation fails, the module is automatically disassembled to WAT text via wasmprinter and included in the error output, making it straightforward to locate the malformed instruction. Integration tests go further and execute the validated WASM through wasmtime, confirming the emitted code actually computes correct results.
 
@@ -98,11 +108,13 @@ Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution test
 | Semantic Analysis | Complete |
 | MIR + SSA | Complete |
 | MIR Interpreter | Complete |
-| Optimization Passes | Complete (6 passes) |
+| Optimization Passes | Complete (7 passes) |
 | Generational GC | Complete |
 | x86_64 JIT | Complete |
 | aarch64 JIT | Complete |
 | WASM Codegen | Forward-only (loop back-edges TODO) |
+| Tiered Runtime | Planned (MIR interp cold start → JIT hot promotion) |
+| Hot Module Reload | Planned (recompile + patch code cache at runtime) |
 | Core Library | Not started |
 | Fiber Runtime | Not started |
 | End-to-End CLI | Not started |
