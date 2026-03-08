@@ -350,6 +350,38 @@ pub enum MachInst {
     /// `dst = -src` (f64 negate)
     FNeg { dst: VReg, src: VReg },
 
+    /// `dst = |src|` (f64 absolute value)
+    /// ARM64: `fabs`; x86_64: AND with sign-bit mask
+    FAbs { dst: VReg, src: VReg },
+
+    /// `dst = sqrt(src)` (f64 square root)
+    /// ARM64: `fsqrt`; x86_64: `sqrtsd`
+    FSqrt { dst: VReg, src: VReg },
+
+    /// `dst = floor(src)` (round toward −∞)
+    /// ARM64: `frintm`; x86_64: `roundsd` imm=0x09 (SSE4.1)
+    FFloor { dst: VReg, src: VReg },
+
+    /// `dst = ceil(src)` (round toward +∞)
+    /// ARM64: `frintp`; x86_64: `roundsd` imm=0x0A (SSE4.1)
+    FCeil { dst: VReg, src: VReg },
+
+    /// `dst = round(src)` (round to nearest, ties to even)
+    /// ARM64: `frintn`; x86_64: `roundsd` imm=0x08 (SSE4.1)
+    FRound { dst: VReg, src: VReg },
+
+    /// `dst = trunc(src)` (round toward zero)
+    /// ARM64: `frintz`; x86_64: `roundsd` imm=0x0B (SSE4.1)
+    FTrunc { dst: VReg, src: VReg },
+
+    /// `dst = min(lhs, rhs)` (f64 minimum)
+    /// ARM64: `fmin`; x86_64: `minsd`
+    FMin { dst: VReg, lhs: VReg, rhs: VReg },
+
+    /// `dst = max(lhs, rhs)` (f64 maximum)
+    /// ARM64: `fmax`; x86_64: `maxsd`
+    FMax { dst: VReg, lhs: VReg, rhs: VReg },
+
     // =====================================================================
     // Fused Multiply-Add (scalar)
     // =====================================================================
@@ -666,6 +698,12 @@ impl MachInst {
             | INeg { src, .. }
             | Not { src, .. }
             | FNeg { src, .. }
+            | FAbs { src, .. }
+            | FSqrt { src, .. }
+            | FFloor { src, .. }
+            | FCeil { src, .. }
+            | FRound { src, .. }
+            | FTrunc { src, .. }
             | FCvtToI64 { src, .. }
             | I64CvtToF { src, .. }
             | JmpZero { src, .. }
@@ -696,6 +734,8 @@ impl MachInst {
             | FSub { lhs, rhs, .. }
             | FMul { lhs, rhs, .. }
             | FDiv { lhs, rhs, .. }
+            | FMin { lhs, rhs, .. }
+            | FMax { lhs, rhs, .. }
             | ICmp { lhs, rhs }
             | FCmp { lhs, rhs }
             | VFAdd { lhs, rhs, .. }
@@ -769,6 +809,14 @@ impl MachInst {
             | FMul { dst, .. }
             | FDiv { dst, .. }
             | FNeg { dst, .. }
+            | FAbs { dst, .. }
+            | FSqrt { dst, .. }
+            | FFloor { dst, .. }
+            | FCeil { dst, .. }
+            | FRound { dst, .. }
+            | FTrunc { dst, .. }
+            | FMin { dst, .. }
+            | FMax { dst, .. }
             | FMAdd { dst, .. }
             | FMSub { dst, .. }
             | FNMAdd { dst, .. }
@@ -1394,6 +1442,9 @@ fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_sc
         | MachInst::BitcastGpToFp { dst, src } | MachInst::BitcastFpToGp { dst, src }
         | MachInst::INeg { dst, src } | MachInst::Not { dst, src }
         | MachInst::FNeg { dst, src }
+        | MachInst::FAbs { dst, src } | MachInst::FSqrt { dst, src }
+        | MachInst::FFloor { dst, src } | MachInst::FCeil { dst, src }
+        | MachInst::FRound { dst, src } | MachInst::FTrunc { dst, src }
         | MachInst::FCvtToI64 { dst, src } | MachInst::I64CvtToF { dst, src } => {
             fix(dst); fix(src);
         }
@@ -1408,7 +1459,8 @@ fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_sc
         | MachInst::Shl { dst, lhs, rhs } | MachInst::Sar { dst, lhs, rhs }
         | MachInst::Shr { dst, lhs, rhs }
         | MachInst::FAdd { dst, lhs, rhs } | MachInst::FSub { dst, lhs, rhs }
-        | MachInst::FMul { dst, lhs, rhs } | MachInst::FDiv { dst, lhs, rhs } => {
+        | MachInst::FMul { dst, lhs, rhs } | MachInst::FDiv { dst, lhs, rhs }
+        | MachInst::FMin { dst, lhs, rhs } | MachInst::FMax { dst, lhs, rhs } => {
             fix(dst); fix(lhs); fix(rhs);
         }
         MachInst::IMulSub { dst, lhs, rhs, acc } => {
@@ -1982,6 +2034,71 @@ impl<'a> LowerCtx<'a> {
                 });
             }
 
+            // -- Math intrinsics (unboxed f64) --
+            Instruction::MathUnaryF64(op, a) => {
+                use crate::mir::MathUnaryOp;
+                let la = self.fp_vreg_for(*a);
+                let dst = self.fp_vreg_for(dst_val);
+                match op {
+                    // Hardware-native single-instruction ops
+                    MathUnaryOp::Abs => self.mf.emit(MachInst::FAbs { dst, src: la }),
+                    MathUnaryOp::Sqrt => self.mf.emit(MachInst::FSqrt { dst, src: la }),
+                    MathUnaryOp::Floor => self.mf.emit(MachInst::FFloor { dst, src: la }),
+                    MathUnaryOp::Ceil => self.mf.emit(MachInst::FCeil { dst, src: la }),
+                    MathUnaryOp::Round => self.mf.emit(MachInst::FRound { dst, src: la }),
+                    MathUnaryOp::Trunc => self.mf.emit(MachInst::FTrunc { dst, src: la }),
+                    // Transcendentals — fall back to libm via CallRuntime
+                    _ => {
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: match op {
+                                MathUnaryOp::Acos => "acos",
+                                MathUnaryOp::Asin => "asin",
+                                MathUnaryOp::Atan => "atan",
+                                MathUnaryOp::Cbrt => "cbrt",
+                                MathUnaryOp::Cos => "cos",
+                                MathUnaryOp::Sin => "sin",
+                                MathUnaryOp::Tan => "tan",
+                                MathUnaryOp::Log => "log",
+                                MathUnaryOp::Log2 => "log2",
+                                MathUnaryOp::Exp => "exp",
+                                MathUnaryOp::Fract => "wren_fract",
+                                MathUnaryOp::Sign => "wren_sign",
+                                // Already handled above
+                                MathUnaryOp::Abs | MathUnaryOp::Sqrt | MathUnaryOp::Floor
+                                | MathUnaryOp::Ceil | MathUnaryOp::Round | MathUnaryOp::Trunc => {
+                                    unreachable!()
+                                }
+                            },
+                            args: vec![la],
+                            ret: Some(dst),
+                        });
+                    }
+                }
+            }
+            Instruction::MathBinaryF64(op, a, b) => {
+                use crate::mir::MathBinaryOp;
+                let la = self.fp_vreg_for(*a);
+                let lb = self.fp_vreg_for(*b);
+                let dst = self.fp_vreg_for(dst_val);
+                match op {
+                    // Hardware-native single-instruction ops
+                    MathBinaryOp::Min => self.mf.emit(MachInst::FMin { dst, lhs: la, rhs: lb }),
+                    MathBinaryOp::Max => self.mf.emit(MachInst::FMax { dst, lhs: la, rhs: lb }),
+                    // Transcendentals — fall back to libm via CallRuntime
+                    _ => {
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: match op {
+                                MathBinaryOp::Atan2 => "atan2",
+                                MathBinaryOp::Pow => "pow",
+                                MathBinaryOp::Min | MathBinaryOp::Max => unreachable!(),
+                            },
+                            args: vec![la, lb],
+                            ret: Some(dst),
+                        });
+                    }
+                }
+            }
+
             // Block parameters are handled at block entry.
             Instruction::BlockParam(_) => {
                 self.vreg_for(dst_val);
@@ -2255,6 +2372,14 @@ fn format_inst(inst: &MachInst) -> String {
         FMul { dst, lhs, rhs } => format!("{} = fmul {}, {}", dst, lhs, rhs),
         FDiv { dst, lhs, rhs } => format!("{} = fdiv {}, {}", dst, lhs, rhs),
         FNeg { dst, src } => format!("{} = fneg {}", dst, src),
+        FAbs { dst, src } => format!("{} = fabs {}", dst, src),
+        FSqrt { dst, src } => format!("{} = fsqrt {}", dst, src),
+        FFloor { dst, src } => format!("{} = ffloor {}", dst, src),
+        FCeil { dst, src } => format!("{} = fceil {}", dst, src),
+        FRound { dst, src } => format!("{} = fround {}", dst, src),
+        FTrunc { dst, src } => format!("{} = ftrunc {}", dst, src),
+        FMin { dst, lhs, rhs } => format!("{} = fmin {}, {}", dst, lhs, rhs),
+        FMax { dst, lhs, rhs } => format!("{} = fmax {}, {}", dst, lhs, rhs),
 
         FMAdd { dst, a, b, c } => format!("{} = fmadd {}, {}, {}", dst, a, b, c),
         FMSub { dst, a, b, c } => format!("{} = fmsub {}, {}, {}", dst, a, b, c),

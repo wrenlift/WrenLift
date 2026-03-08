@@ -398,6 +398,12 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
         INeg { dst, src } => INeg { dst: m(*dst), src: m(*src) },
         Not { dst, src } => Not { dst: m(*dst), src: m(*src) },
         FNeg { dst, src } => FNeg { dst: m(*dst), src: m(*src) },
+        FAbs { dst, src } => FAbs { dst: m(*dst), src: m(*src) },
+        FSqrt { dst, src } => FSqrt { dst: m(*dst), src: m(*src) },
+        FFloor { dst, src } => FFloor { dst: m(*dst), src: m(*src) },
+        FCeil { dst, src } => FCeil { dst: m(*dst), src: m(*src) },
+        FRound { dst, src } => FRound { dst: m(*dst), src: m(*src) },
+        FTrunc { dst, src } => FTrunc { dst: m(*dst), src: m(*src) },
         FCvtToI64 { dst, src } => FCvtToI64 { dst: m(*dst), src: m(*src) },
         I64CvtToF { dst, src } => I64CvtToF { dst: m(*dst), src: m(*src) },
 
@@ -421,6 +427,8 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
         FSub { dst, lhs, rhs } => FSub { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
         FMul { dst, lhs, rhs } => FMul { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
         FDiv { dst, lhs, rhs } => FDiv { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
+        FMin { dst, lhs, rhs } => FMin { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
+        FMax { dst, lhs, rhs } => FMax { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
 
         // 4-operand FMA
         IMulSub { dst, lhs, rhs, acc } => IMulSub { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs), acc: m(*acc) },

@@ -99,7 +99,7 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
 
         // One operand
         Neg(a) | NegF64(a) | Not(a) | BitNot(a) | GuardNum(a) | GuardBool(a) | Unbox(a)
-        | Box(a) | Move(a) | ToString(a) => {
+        | Box(a) | Move(a) | ToString(a) | MathUnaryF64(_, a) => {
             *a = resolve(*a, map);
         }
         GuardClass(a, _) | IsType(a, _) => {
@@ -114,7 +114,7 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         | SubF64(a, b) | MulF64(a, b) | DivF64(a, b) | ModF64(a, b) | CmpLt(a, b)
         | CmpGt(a, b) | CmpLe(a, b) | CmpGe(a, b) | CmpEq(a, b) | CmpNe(a, b)
         | CmpLtF64(a, b) | CmpGtF64(a, b) | CmpLeF64(a, b) | CmpGeF64(a, b) | BitAnd(a, b)
-        | BitOr(a, b) | BitXor(a, b) | Shl(a, b) | Shr(a, b) => {
+        | BitOr(a, b) | BitXor(a, b) | Shl(a, b) | Shr(a, b) | MathBinaryF64(_, a, b) => {
             *a = resolve(*a, map);
             *b = resolve(*b, map);
         }

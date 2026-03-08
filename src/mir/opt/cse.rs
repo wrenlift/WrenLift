@@ -87,6 +87,8 @@ fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Opt
             key.push(sym.index() as u64);
         }
         Instruction::MakeRange(_, _, incl) => key.push(*incl as u64),
+        Instruction::MathUnaryF64(op, _) => key.push(*op as u64),
+        Instruction::MathBinaryF64(op, _, _) => key.push(*op as u64),
         _ => {}
     }
 
@@ -160,6 +162,8 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         SubscriptSet { .. } => 56,
         Move(..) => 57,
         BlockParam(..) => 58,
+        MathUnaryF64(..) => 59,
+        MathBinaryF64(..) => 60,
     }
 }
 

@@ -245,6 +245,38 @@ fn emit_inst(
             dynasm!(asm ; fneg D(fp(*dst)), D(fp(*src)));
         }
 
+        FAbs { dst, src } => {
+            dynasm!(asm ; fabs D(fp(*dst)), D(fp(*src)));
+        }
+
+        FSqrt { dst, src } => {
+            dynasm!(asm ; fsqrt D(fp(*dst)), D(fp(*src)));
+        }
+
+        FFloor { dst, src } => {
+            dynasm!(asm ; frintm D(fp(*dst)), D(fp(*src)));
+        }
+
+        FCeil { dst, src } => {
+            dynasm!(asm ; frintp D(fp(*dst)), D(fp(*src)));
+        }
+
+        FRound { dst, src } => {
+            dynasm!(asm ; frintn D(fp(*dst)), D(fp(*src)));
+        }
+
+        FTrunc { dst, src } => {
+            dynasm!(asm ; frintz D(fp(*dst)), D(fp(*src)));
+        }
+
+        FMin { dst, lhs, rhs } => {
+            dynasm!(asm ; fmin D(fp(*dst)), D(fp(*lhs)), D(fp(*rhs)));
+        }
+
+        FMax { dst, lhs, rhs } => {
+            dynasm!(asm ; fmax D(fp(*dst)), D(fp(*lhs)), D(fp(*rhs)));
+        }
+
         // =================================================================
         // FMA
         // =================================================================

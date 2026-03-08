@@ -159,7 +159,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
 
     // 5. Optimize
     if !cli.no_opt {
-        run_opt_pipeline(&mut mir);
+        run_opt_pipeline(&mut mir, &interner);
     }
 
     if cli.dump_opt {
@@ -205,11 +205,11 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
     }
 }
 
-fn run_opt_pipeline(mir: &mut wren_lift::mir::MirFunction) {
+fn run_opt_pipeline(mir: &mut wren_lift::mir::MirFunction, interner: &wren_lift::intern::Interner) {
     let constfold = ConstFold;
     let dce = Dce;
     let cse = Cse;
-    let type_spec = TypeSpecialize;
+    let type_spec = TypeSpecialize::with_math(interner);
     let licm = Licm;
     let sra = Sra;
 
@@ -281,7 +281,7 @@ fn run_repl() {
 
         // Lower + optimize
         let mut mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner);
-        run_opt_pipeline(&mut mir);
+        run_opt_pipeline(&mut mir, &interner);
 
         // Show optimized MIR for now (until we have native execution)
         println!("{}", mir.pretty_print(&interner));

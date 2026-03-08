@@ -75,6 +75,112 @@ pub enum MirType {
 // Instructions
 // ---------------------------------------------------------------------------
 
+/// Unary math operation on an unboxed f64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MathUnaryOp {
+    Abs,
+    Acos,
+    Asin,
+    Atan,
+    Cbrt,
+    Ceil,
+    Cos,
+    Floor,
+    Round,
+    Sin,
+    Sqrt,
+    Tan,
+    Log,
+    Log2,
+    Exp,
+    Trunc,
+    Fract,
+    Sign,
+}
+
+impl MathUnaryOp {
+    /// Apply this operation to an f64 value.
+    pub fn apply(self, x: f64) -> f64 {
+        match self {
+            Self::Abs => x.abs(),
+            Self::Acos => x.acos(),
+            Self::Asin => x.asin(),
+            Self::Atan => x.atan(),
+            Self::Cbrt => x.cbrt(),
+            Self::Ceil => x.ceil(),
+            Self::Cos => x.cos(),
+            Self::Floor => x.floor(),
+            Self::Round => x.round(),
+            Self::Sin => x.sin(),
+            Self::Sqrt => x.sqrt(),
+            Self::Tan => x.tan(),
+            Self::Log => x.ln(),
+            Self::Log2 => x.log2(),
+            Self::Exp => x.exp(),
+            Self::Trunc => x.trunc(),
+            Self::Fract => x.fract(),
+            Self::Sign => {
+                if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+            }
+        }
+    }
+
+    /// Pretty-print name for this operation.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Abs => "fabs",
+            Self::Acos => "facos",
+            Self::Asin => "fasin",
+            Self::Atan => "fatan",
+            Self::Cbrt => "fcbrt",
+            Self::Ceil => "fceil",
+            Self::Cos => "fcos",
+            Self::Floor => "ffloor",
+            Self::Round => "fround",
+            Self::Sin => "fsin",
+            Self::Sqrt => "fsqrt",
+            Self::Tan => "ftan",
+            Self::Log => "flog",
+            Self::Log2 => "flog2",
+            Self::Exp => "fexp",
+            Self::Trunc => "ftrunc",
+            Self::Fract => "ffract",
+            Self::Sign => "fsign",
+        }
+    }
+}
+
+/// Binary math operation on two unboxed f64 values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MathBinaryOp {
+    Atan2,
+    Min,
+    Max,
+    Pow,
+}
+
+impl MathBinaryOp {
+    /// Apply this operation to two f64 values.
+    pub fn apply(self, a: f64, b: f64) -> f64 {
+        match self {
+            Self::Atan2 => a.atan2(b),
+            Self::Min => a.min(b),
+            Self::Max => a.max(b),
+            Self::Pow => a.powf(b),
+        }
+    }
+
+    /// Pretty-print name for this operation.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Atan2 => "fatan2",
+            Self::Min => "fmin",
+            Self::Max => "fmax",
+            Self::Pow => "fpow",
+        }
+    }
+}
+
 /// A single MIR instruction. Each produces at most one `ValueId`.
 #[derive(Debug, Clone)]
 pub enum Instruction {
@@ -110,6 +216,13 @@ pub enum Instruction {
     Mod(ValueId, ValueId),
     /// Boxed negate.
     Neg(ValueId),
+
+    // -- Math intrinsics (unboxed f64, inlined from Num methods) ------------
+
+    /// Unary math intrinsic on unboxed f64 (abs, sin, sqrt, etc.).
+    MathUnaryF64(MathUnaryOp, ValueId),
+    /// Binary math intrinsic on unboxed f64 (atan2, min, max, pow).
+    MathBinaryF64(MathBinaryOp, ValueId, ValueId),
 
     // -- Unboxed f64 arithmetic (the big optimization win) ------------------
 
@@ -313,7 +426,8 @@ impl Instruction {
             | Instruction::BitOr(a, b)
             | Instruction::BitXor(a, b)
             | Instruction::Shl(a, b)
-            | Instruction::Shr(a, b) => vec![*a, *b],
+            | Instruction::Shr(a, b)
+            | Instruction::MathBinaryF64(_, a, b) => vec![*a, *b],
 
             Instruction::Neg(a)
             | Instruction::NegF64(a)
@@ -324,7 +438,8 @@ impl Instruction {
             | Instruction::Unbox(a)
             | Instruction::Box(a)
             | Instruction::Move(a)
-            | Instruction::ToString(a) => vec![*a],
+            | Instruction::ToString(a)
+            | Instruction::MathUnaryF64(_, a) => vec![*a],
 
             Instruction::GuardClass(a, _) | Instruction::IsType(a, _) => vec![*a],
 
@@ -665,6 +780,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::DivF64(a, b) => format!("fdiv {}, {}", a, b),
         Instruction::ModF64(a, b) => format!("fmod {}, {}", a, b),
         Instruction::NegF64(a) => format!("fneg {}", a),
+
+        Instruction::MathUnaryF64(op, a) => format!("{} {}", op.name(), a),
+        Instruction::MathBinaryF64(op, a, b) => format!("{} {}, {}", op.name(), a, b),
 
         Instruction::CmpLt(a, b) => format!("icmp.lt {}, {}", a, b),
         Instruction::CmpGt(a, b) => format!("icmp.gt {}, {}", a, b),

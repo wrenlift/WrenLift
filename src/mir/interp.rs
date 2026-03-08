@@ -421,6 +421,17 @@ impl<'a> Interp<'a> {
                 Ok(InterpValue::Boxed(Value::null()))
             }
 
+            // -- Math intrinsics --
+            Instruction::MathUnaryF64(op, a) => {
+                let n = self.get(*a)?.as_f64()?;
+                Ok(InterpValue::F64(op.apply(n)))
+            }
+            Instruction::MathBinaryF64(op, a, b) => {
+                let x = self.get(*a)?.as_f64()?;
+                let y = self.get(*b)?.as_f64()?;
+                Ok(InterpValue::F64(op.apply(x, y)))
+            }
+
             // -- Unsupported --
             Instruction::GetField(_, _) => {
                 Err(InterpError::Unsupported("GetField".into()))
