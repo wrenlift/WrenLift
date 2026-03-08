@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod capi;
 pub mod codegen;
 pub mod intern;
 pub mod diagnostics;

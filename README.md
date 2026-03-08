@@ -13,7 +13,7 @@ Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programmin
 <img src="https://img.shields.io/badge/edition-2021-blue" alt="Rust 2021"/>
 <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
 <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
-<img src="https://img.shields.io/badge/tests-556_passing-brightgreen" alt="556 tests passing"/>
+<img src="https://img.shields.io/badge/tests-566_passing-brightgreen" alt="566 tests passing"/>
 <img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
 </p>
 
