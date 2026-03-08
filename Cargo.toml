@@ -11,3 +11,4 @@ dynasmrt = "2"
 dynasm = "2"
 
 [dev-dependencies]
+capstone = "0.12"
