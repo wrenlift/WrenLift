@@ -5,5 +5,7 @@ authors = ["Damilare Akinlaja <damilare@zenturi.co>"]
 edition = "2021"
 
 [dependencies]
+ariadne = "0.5"
+logos = "0.15"
 
 [dev-dependencies]
