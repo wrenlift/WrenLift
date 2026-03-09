@@ -255,7 +255,6 @@ System.print(c.count)
 // ===========================================================================
 
 #[test]
-#[ignore] // TODO: 3-level super() chain not yet supported
 fn e2e_inheritance_chain() {
     assert_output(
         r#"
@@ -615,7 +614,6 @@ System.print(list.toList())
 
 #[test]
 fn e2e_state_machine() {
-    // Uses separate if blocks to avoid else-if SSA cross-block field refs
     assert_output(
         r#"
 class StateMachine {
@@ -1077,7 +1075,6 @@ for (i in 1...16) {
 }
 
 #[test]
-#[ignore] // TODO: recursive this.method() calls across SSA blocks
 fn e2e_tower_of_hanoi() {
     assert_output(
         r#"
