@@ -154,6 +154,12 @@ pub struct VM {
 
     // -- Fiber switching (set by fiber natives, consumed by interpreter) --
     pub pending_fiber_action: Option<FiberAction>,
+
+    // -- Source code storage (for runtime error reporting with ariadne) --
+    pub module_sources: HashMap<String, String>,
+
+    // -- Post-mortem error fiber (saved before restoring prev_fiber) --
+    pub error_fiber: *mut ObjFiber,
 }
 
 impl VM {
@@ -190,6 +196,8 @@ impl VM {
             has_error: false,
             output_buffer: None,
             pending_fiber_action: None,
+            module_sources: HashMap::new(),
+            error_fiber: ptr::null_mut(),
         };
 
         // Bootstrap core classes.
@@ -217,6 +225,9 @@ impl VM {
         };
         use crate::parse::parser;
         use crate::sema;
+
+        // 0. Store source for runtime error reporting
+        self.module_sources.insert(module_name.to_string(), source.to_string());
 
         // 1. Parse
         let parse_result = parser::parse(source);
@@ -489,15 +500,158 @@ impl VM {
         // 10. Run the fiber
         let result = super::vm_interp::run_fiber(self);
 
-        // Restore previous fiber
-        self.fiber = prev_fiber;
-
         match result {
-            Ok(_) => InterpretResult::Success,
+            Ok(_) => {
+                self.fiber = prev_fiber;
+                InterpretResult::Success
+            }
             Err(e) => {
-                self.report_error(&e.to_string());
+                // Save the error fiber for post-mortem inspection before restoring
+                self.error_fiber = fiber;
+                let loc = self.extract_error_location(fiber);
+                self.report_runtime_error(&e, loc.as_ref(), fiber);
+                self.fiber = prev_fiber;
                 InterpretResult::RuntimeError
             }
+        }
+    }
+
+    /// Extract source location from a fiber's current MIR frame for error reporting.
+    pub(crate) fn extract_error_location(&self, fiber: *mut ObjFiber) -> Option<super::vm_interp::SourceLoc> {
+        if fiber.is_null() { return None; }
+        let frame = unsafe { (*fiber).mir_frames.last()? };
+        let mir = self.engine.get_mir(frame.func_id)?;
+
+        // Find the span of the instruction at the current ip
+        let block = mir.blocks.get(frame.current_block.0 as usize)?;
+        let ip = frame.ip;
+        if ip > 0 {
+            // ip points to the NEXT instruction, so the failing one is ip-1
+            let (val_id, _) = block.instructions.get(ip - 1)?;
+            let span = mir.span_map.get(val_id)?;
+            Some(super::vm_interp::SourceLoc {
+                span: span.clone(),
+                module: frame.module_name.clone(),
+            })
+        } else if let Some((val_id, _)) = block.instructions.first() {
+            let span = mir.span_map.get(val_id)?;
+            Some(super::vm_interp::SourceLoc {
+                span: span.clone(),
+                module: frame.module_name.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Build a stack trace from the fiber's MIR call frames.
+    fn build_stack_trace(&self, fiber: *mut ObjFiber) -> Vec<String> {
+        if fiber.is_null() { return Vec::new(); }
+        let frames = unsafe { &(*fiber).mir_frames };
+        let mut trace = Vec::new();
+        for frame in frames.iter().rev() {
+            let func_name = self.engine.get_mir(frame.func_id)
+                .map(|mir| self.interner.resolve(mir.name).to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let module = &frame.module_name;
+            // Try to get line number from span
+            if let Some(mir) = self.engine.get_mir(frame.func_id) {
+                let block = mir.blocks.get(frame.current_block.0 as usize);
+                let line_info = block.and_then(|b| {
+                    let idx = if frame.ip > 0 { frame.ip - 1 } else { 0 };
+                    b.instructions.get(idx)
+                        .and_then(|(vid, _)| mir.span_map.get(vid))
+                        .and_then(|span| {
+                            self.module_sources.get(module).map(|src| {
+                                src[..span.start].chars().filter(|c| *c == '\n').count() + 1
+                            })
+                        })
+                });
+                if let Some(line) = line_info {
+                    trace.push(format!("  at {} ({}:{})", func_name, module, line));
+                } else {
+                    trace.push(format!("  at {} ({})", func_name, module));
+                }
+            } else {
+                trace.push(format!("  at {} ({})", func_name, module));
+            }
+        }
+        trace
+    }
+
+    /// Generate a contextual help note for a runtime error.
+    fn error_help(error: &super::vm_interp::RuntimeError) -> Option<String> {
+        use super::vm_interp::RuntimeError;
+        match error {
+            RuntimeError::MethodNotFound { class_name, method } => {
+                if method.contains("(_") {
+                    Some(format!(
+                        "the class `{}` does not define `{}`. Check spelling and argument count",
+                        class_name, method
+                    ))
+                } else {
+                    Some(format!(
+                        "`{}` has no getter or method `{}`. Did you mean to call it with `()`?",
+                        class_name, method
+                    ))
+                }
+            }
+            RuntimeError::GuardFailed(expected) => {
+                Some(format!("expected a value of type {}", expected))
+            }
+            RuntimeError::Error(msg) if msg.contains("not a function") => {
+                Some("only Fn objects and methods can be called".to_string())
+            }
+            RuntimeError::Error(msg) if msg.contains("out of bounds") => {
+                Some("ensure the index is within 0..(count - 1)".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    /// Report a runtime error with full ariadne diagnostics, source snippets,
+    /// contextual help, and a stack trace.
+    fn report_runtime_error(
+        &self,
+        error: &super::vm_interp::RuntimeError,
+        loc: Option<&super::vm_interp::SourceLoc>,
+        fiber: *mut ObjFiber,
+    ) {
+        if let Some(loc) = loc {
+            if let Some(source) = self.module_sources.get(&loc.module) {
+                let mut diag = crate::diagnostics::Diagnostic::error(error.to_string())
+                    .with_label(loc.span.clone(), "error occurred here");
+
+                // Add contextual help note
+                if let Some(help) = Self::error_help(error) {
+                    diag = diag.with_note(help);
+                }
+
+                // Add stack trace as a note
+                let trace = self.build_stack_trace(fiber);
+                if trace.len() > 1 {
+                    let trace_str = format!("stack trace:\n{}", trace.join("\n"));
+                    diag = diag.with_note(trace_str);
+                }
+
+                if self.output_buffer.is_some() {
+                    // In test mode, render to string via error_fn
+                    let rendered = diag.render_to_string(source);
+                    self.report_error(&rendered);
+                } else {
+                    diag.eprint(source);
+                }
+                return;
+            }
+        }
+        // Fallback: no source location available
+        let msg = format!("{}", error);
+        let trace = self.build_stack_trace(fiber);
+        if !trace.is_empty() {
+            let full = format!("{}\n{}", msg, trace.join("\n"));
+            self.report_error(&full);
+        } else {
+            self.report_error(&msg);
         }
     }
 
@@ -839,6 +993,23 @@ fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip ANSI escape sequences from a string for assertion matching.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Skip until 'm' (end of ANSI escape)
+                for esc in chars.by_ref() {
+                    if esc == 'm' { break; }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
 
     fn call_primitive(vm: &mut VM, class: *mut ObjClass, sig: &str, args: &[Value]) -> Value {
         let sym = vm.interner.intern(sig);
@@ -1810,5 +1981,69 @@ System.print(MathUtils.double(21))
         let output = vm.take_output();
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "hello from import\n42\n");
+    }
+
+    #[test]
+    fn test_runtime_error_has_source_location() {
+        // Trigger a MethodNotFound error, verify extract_error_location returns
+        // a valid SourceLoc pointing into the source code.
+        let source = "var x = 42\nx.bogus()";
+        let mut vm = VM::new_default();
+        vm.output_buffer = Some(String::new());
+
+        // We need to inspect the fiber before interpret() restores prev_fiber.
+        // So we'll replicate the interpret pipeline up to run_fiber, then check.
+        let result = vm.interpret("main", source);
+        assert!(matches!(result, InterpretResult::RuntimeError), "{:?}", result);
+
+        // Check that error_fiber was saved for post-mortem inspection
+        let fiber = vm.error_fiber;
+        assert!(!fiber.is_null(), "error_fiber should be saved on runtime error");
+        let loc = vm.extract_error_location(fiber);
+        assert!(loc.is_some(), "extract_error_location should return Some for runtime error");
+        let loc = loc.unwrap();
+        assert_eq!(loc.module, "main");
+        // Span should point somewhere in "x.bogus()" (byte offsets 11..20 in the source)
+        assert!(loc.span.start >= 11, "span start {} should be >= 11", loc.span.start);
+        assert!(loc.span.end <= 20, "span end {} should be <= 20", loc.span.end);
+    }
+
+    #[test]
+    fn test_runtime_error_ariadne_with_snippet_and_help() {
+        // Verify the full ariadne-rendered output includes source snippet,
+        // error label, and contextual help note.
+        use std::sync::{Arc, Mutex};
+
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let errors_clone = errors.clone();
+
+        let mut config = VMConfig::default();
+        config.error_fn = Some(Box::new(move |_kind, _module, _line, msg| {
+            errors_clone.lock().unwrap().push(msg.to_string());
+        }));
+
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", "var x = 42\nx.bogus()");
+        assert!(matches!(result, InterpretResult::RuntimeError));
+
+        let captured = errors.lock().unwrap();
+        assert!(!captured.is_empty(), "expected error to be reported");
+        let rendered = &captured[0];
+
+        // Strip ANSI color codes for easier assertion
+        let plain = strip_ansi(rendered);
+
+        // Should contain the error message
+        assert!(plain.contains("bogus"), "missing method name in:\n{plain}");
+        // Should contain source snippet (the source line with the error)
+        assert!(plain.contains("x.bogus()"), "missing source snippet in:\n{plain}");
+        // Should contain the error label
+        assert!(plain.contains("error occurred here"), "missing label in:\n{plain}");
+        // Should contain contextual help
+        assert!(
+            plain.contains("does not define") || plain.contains("has no getter"),
+            "missing help note in:\n{plain}"
+        );
     }
 }

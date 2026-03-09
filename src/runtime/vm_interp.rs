@@ -33,6 +33,13 @@ pub enum RuntimeError {
     Unreachable,
 }
 
+/// Source location context attached when reporting runtime errors.
+#[derive(Debug, Clone)]
+pub struct SourceLoc {
+    pub span: crate::ast::Span,
+    pub module: String,
+}
+
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -68,6 +75,8 @@ const MAX_STEPS: usize = 1_000_000;
 /// Run the active fiber (vm.fiber) until it finishes, yields, or errors.
 ///
 /// The fiber must have at least one MirCallFrame pushed before calling this.
+/// On error, saves the current ip/block back to the fiber frame so
+/// `extract_error_location` can look up the source span.
 pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
     if vm.fiber.is_null() {
         return Err(RuntimeError::Error("no active fiber".into()));
@@ -116,6 +125,15 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
             while ip < instructions.len() {
                 let (dst, inst) = &instructions[ip];
                 ip += 1;
+
+                // Save execution position to the frame so extract_error_location
+                // can find the source span if a `?` propagates an error.
+                unsafe {
+                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                        frame.ip = ip;
+                        frame.current_block = current_block;
+                    }
+                }
 
                 steps += 1;
                 if steps > MAX_STEPS {

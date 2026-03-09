@@ -128,6 +128,13 @@ impl Diagnostic {
         report.write(Source::from(source), writer)
     }
 
+    /// Render to a String (useful for testing and error_fn callbacks).
+    pub fn render_to_string(&self, source: &str) -> String {
+        let mut buf = Vec::new();
+        let _ = self.render(source, &mut buf);
+        String::from_utf8(buf).unwrap_or_default()
+    }
+
     /// Render to stderr.
     pub fn eprint(&self, source: &str) {
         let mut buf = Vec::new();

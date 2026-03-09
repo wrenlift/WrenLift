@@ -399,6 +399,12 @@ impl<'a> MirBuilder<'a> {
     // -- Expression lowering ------------------------------------------------
 
     fn lower_expr(&mut self, expr: &Spanned<Expr>) -> ValueId {
+        let val = self.lower_expr_inner(expr);
+        self.func.span_map.insert(val, expr.1.clone());
+        val
+    }
+
+    fn lower_expr_inner(&mut self, expr: &Spanned<Expr>) -> ValueId {
         match &expr.0 {
             Expr::Num(n) => self.emit(Instruction::ConstNum(*n)),
             Expr::Str(s) => {

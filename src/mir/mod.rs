@@ -643,6 +643,8 @@ pub struct MirFunction {
     pub next_value: u32,
     /// Next available BlockId.
     pub next_block: u32,
+    /// Source span map: ValueId → source byte range (for runtime error reporting).
+    pub span_map: std::collections::HashMap<ValueId, crate::ast::Span>,
 }
 
 impl MirFunction {
@@ -654,6 +656,7 @@ impl MirFunction {
             strings: Vec::new(),
             next_value: 0,
             next_block: 0,
+            span_map: std::collections::HashMap::new(),
         }
     }
 
