@@ -277,9 +277,12 @@ pub extern "C" fn wrenCall(vm: *mut WrenVM, method: *mut WrenHandle) -> WrenInte
         args.push(vm_ref.get_slot(i));
     }
 
-    match vm_ref.call_method_on(receiver, &handle.signature, &args) {
-        Some(result) => {
-            vm_ref.set_slot(0, result);
+    // call_method_on handles class receivers with static: prefix fallback
+    let result = vm_ref.call_method_on(receiver, &handle.signature, &args);
+
+    match result {
+        Some(value) => {
+            vm_ref.set_slot(0, value);
             WrenInterpretResult::Success
         }
         None => WrenInterpretResult::RuntimeError,
@@ -787,7 +790,7 @@ pub extern "C" fn wrenHasModule(vm: *mut WrenVM, module: *const c_char) -> bool 
         return false;
     }
     let name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("");
-    unsafe { (*vm).modules.contains_key(name) }
+    unsafe { (*vm).engine.modules.contains_key(name) }
 }
 
 #[no_mangle]
@@ -1135,5 +1138,194 @@ mod tests {
         assert_eq!(wrenGetSlotDouble(vm, 0), 99.0);
 
         wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_call_method() {
+        let vm = wrenNewVM(ptr::null());
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.output_buffer = Some(String::new());
+
+        // Define a class with static methods
+        let module = CString::new("test").unwrap();
+        let source = CString::new(
+            "class Greeter {\n  static double(x) { return x * 2 }\n  static greet(name) { return \"hello \" + name }\n}",
+        )
+        .unwrap();
+        let result = wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+        assert_eq!(result, WrenInterpretResult::Success);
+
+        // Test 1: numeric static method
+        wrenEnsureSlots(vm, 2);
+        let class_name = CString::new("Greeter").unwrap();
+        wrenGetVariable(vm, module.as_ptr(), class_name.as_ptr(), 0);
+        wrenSetSlotDouble(vm, 1, 21.0);
+
+        let sig = CString::new("double(_)").unwrap();
+        let handle = wrenMakeCallHandle(vm, sig.as_ptr());
+        assert!(!handle.is_null());
+
+        let call_result = wrenCall(vm, handle);
+        assert_eq!(call_result, WrenInterpretResult::Success);
+        assert_eq!(wrenGetSlotDouble(vm, 0), 42.0);
+        wrenReleaseHandle(vm, handle);
+
+        // Test 2: string static method — slots must survive across calls
+        wrenEnsureSlots(vm, 2);
+        wrenGetVariable(vm, module.as_ptr(), class_name.as_ptr(), 0);
+        let arg = CString::new("world").unwrap();
+        wrenSetSlotString(vm, 1, arg.as_ptr());
+
+        let sig2 = CString::new("greet(_)").unwrap();
+        let handle2 = wrenMakeCallHandle(vm, sig2.as_ptr());
+        assert!(!handle2.is_null());
+
+        let call_result2 = wrenCall(vm, handle2);
+        assert_eq!(call_result2, WrenInterpretResult::Success);
+
+        let result_str = wrenGetSlotString(vm, 0);
+        assert!(!result_str.is_null());
+        let got = unsafe { CStr::from_ptr(result_str) }.to_str().unwrap();
+        assert_eq!(got, "hello world");
+
+        wrenReleaseHandle(vm, handle2);
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_has_module() {
+        let vm = wrenNewVM(ptr::null());
+        let module = CString::new("mymod").unwrap();
+        let source = CString::new("var X = 1").unwrap();
+
+        // Module doesn't exist yet
+        assert!(!wrenHasModule(vm, module.as_ptr()));
+
+        wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+
+        // Now it should exist
+        assert!(wrenHasModule(vm, module.as_ptr()));
+
+        let bogus = CString::new("nonexistent").unwrap();
+        assert!(!wrenHasModule(vm, bogus.as_ptr()));
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_list_set_element() {
+        let vm = wrenNewVM(ptr::null());
+        wrenEnsureSlots(vm, 3);
+
+        wrenSetSlotNewList(vm, 0);
+        wrenSetSlotDouble(vm, 1, 10.0);
+        wrenInsertInList(vm, 0, -1, 1);
+        wrenSetSlotDouble(vm, 1, 20.0);
+        wrenInsertInList(vm, 0, -1, 1);
+        assert_eq!(wrenGetListCount(vm, 0), 2);
+
+        // Overwrite first element
+        wrenSetSlotDouble(vm, 1, 99.0);
+        wrenSetListElement(vm, 0, 0, 1);
+
+        wrenGetListElement(vm, 0, 0, 2);
+        assert_eq!(wrenGetSlotDouble(vm, 2), 99.0);
+
+        // Second element unchanged
+        wrenGetListElement(vm, 0, 1, 2);
+        assert_eq!(wrenGetSlotDouble(vm, 2), 20.0);
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_map_remove() {
+        let vm = wrenNewVM(ptr::null());
+        wrenEnsureSlots(vm, 4);
+
+        wrenSetSlotNewMap(vm, 0);
+
+        let key = CString::new("k").unwrap();
+        wrenSetSlotString(vm, 1, key.as_ptr());
+        wrenSetSlotDouble(vm, 2, 7.0);
+        wrenSetMapValue(vm, 0, 1, 2);
+        assert_eq!(wrenGetMapCount(vm, 0), 1);
+
+        // Remove by key
+        wrenRemoveMapValue(vm, 0, 1, 3);
+        assert_eq!(wrenGetMapCount(vm, 0), 0);
+        assert_eq!(wrenGetSlotDouble(vm, 3), 7.0); // removed value returned
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_interpret_runtime_error() {
+        let vm = wrenNewVM(ptr::null());
+        let module = CString::new("test").unwrap();
+        // Fiber.abort triggers a runtime error
+        let source = CString::new("Fiber.abort(\"boom\")").unwrap();
+        let result = wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+        assert_eq!(result, WrenInterpretResult::RuntimeError);
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_multiple_modules() {
+        let vm = wrenNewVM(ptr::null());
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.output_buffer = Some(String::new());
+
+        // First module
+        let mod_a = CString::new("mod_a").unwrap();
+        let src_a = CString::new("var A = 100").unwrap();
+        assert_eq!(
+            wrenInterpret(vm, mod_a.as_ptr(), src_a.as_ptr()),
+            WrenInterpretResult::Success
+        );
+
+        // Second module
+        let mod_b = CString::new("mod_b").unwrap();
+        let src_b = CString::new("var B = 200").unwrap();
+        assert_eq!(
+            wrenInterpret(vm, mod_b.as_ptr(), src_b.as_ptr()),
+            WrenInterpretResult::Success
+        );
+
+        // Both modules exist
+        assert!(wrenHasModule(vm, mod_a.as_ptr()));
+        assert!(wrenHasModule(vm, mod_b.as_ptr()));
+
+        // Variables are isolated per module
+        wrenEnsureSlots(vm, 1);
+        let var_a = CString::new("A").unwrap();
+        let var_b = CString::new("B").unwrap();
+        wrenGetVariable(vm, mod_a.as_ptr(), var_a.as_ptr(), 0);
+        assert_eq!(wrenGetSlotDouble(vm, 0), 100.0);
+        wrenGetVariable(vm, mod_b.as_ptr(), var_b.as_ptr(), 0);
+        assert_eq!(wrenGetSlotDouble(vm, 0), 200.0);
+
+        // Cross-module: mod_a doesn't have B
+        assert!(!wrenHasVariable(vm, mod_a.as_ptr(), var_b.as_ptr()));
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_null_safety() {
+        // All functions should handle null pointers gracefully
+        assert_eq!(
+            wrenInterpret(ptr::null_mut(), ptr::null(), ptr::null()),
+            WrenInterpretResult::RuntimeError
+        );
+        assert!(wrenMakeCallHandle(ptr::null_mut(), ptr::null()).is_null());
+        assert_eq!(
+            wrenCall(ptr::null_mut(), ptr::null_mut()),
+            WrenInterpretResult::RuntimeError
+        );
+        wrenFreeVM(ptr::null_mut()); // should not crash
+        wrenCollectGarbage(ptr::null_mut()); // should not crash
+        assert!(!wrenHasModule(ptr::null_mut(), ptr::null()));
+        assert!(!wrenHasVariable(ptr::null_mut(), ptr::null(), ptr::null()));
     }
 }

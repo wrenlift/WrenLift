@@ -1254,7 +1254,28 @@ impl NativeContext for VM {
 
         let class = self.class_of(receiver);
         let method_sym = self.interner.intern(method);
-        let method_entry = unsafe { (*class).find_method(method_sym)?.clone() };
+        let method_entry = unsafe {
+            match (*class).find_method(method_sym).cloned() {
+                Some(m) => m,
+                None => {
+                    // If receiver is a class value, try static: prefix on the class itself
+                    if receiver.is_object() {
+                        let ptr = receiver.as_object().unwrap();
+                        let header = ptr as *const ObjHeader;
+                        if (*header).obj_type == ObjType::Class {
+                            let recv_class = ptr as *mut ObjClass;
+                            let static_sig = format!("static:{}", method);
+                            let static_sym = self.interner.intern(&static_sig);
+                            (*recv_class).find_method(static_sym)?.clone()
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        };
 
         let mut all_args = Vec::with_capacity(1 + args.len());
         all_args.push(receiver);
@@ -1274,15 +1295,15 @@ impl NativeContext for VM {
                     let mir = self.engine.get_mir(func_id)?;
                     let mut values = std::collections::HashMap::new();
 
-                    // Bind block params (receiver + args)
                     let block = &mir.blocks[0];
-                    let mut param_idx = 0;
+
+                    // Bind block params using their declared index
                     for (vid, inst) in &block.instructions {
-                        if matches!(inst, Instruction::BlockParam(_)) {
-                            if param_idx < all_args.len() {
-                                values.insert(*vid, InterpValue::Boxed(all_args[param_idx]));
+                        if let Instruction::BlockParam(param_idx) = inst {
+                            let idx = *param_idx as usize;
+                            if idx < all_args.len() {
+                                values.insert(*vid, InterpValue::Boxed(all_args[idx]));
                             }
-                            param_idx += 1;
                         } else {
                             break;
                         }
@@ -1317,13 +1338,12 @@ impl NativeContext for VM {
                     let mir = self.engine.get_mir(func_id)?;
                     let mut values = std::collections::HashMap::new();
                     let block = &mir.blocks[0];
-                    let mut param_idx = 0;
                     for (vid, inst) in &block.instructions {
-                        if matches!(inst, Instruction::BlockParam(_)) {
-                            if param_idx < all_args.len() {
-                                values.insert(*vid, InterpValue::Boxed(all_args[param_idx]));
+                        if let Instruction::BlockParam(param_idx) = inst {
+                            let idx = *param_idx as usize;
+                            if idx < all_args.len() {
+                                values.insert(*vid, InterpValue::Boxed(all_args[idx]));
                             }
-                            param_idx += 1;
                         } else {
                             break;
                         }
