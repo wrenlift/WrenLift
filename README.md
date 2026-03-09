@@ -13,7 +13,7 @@ Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programmin
 <img src="https://img.shields.io/badge/edition-2021-blue" alt="Rust 2021"/>
 <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
 <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
-<img src="https://img.shields.io/badge/tests-566_passing-brightgreen" alt="566 tests passing"/>
+<img src="https://img.shields.io/badge/tests-758_passing-brightgreen" alt="758 tests passing"/>
 <img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
 </p>
 
@@ -31,7 +31,7 @@ WrenLift replaces Wren's stack-based bytecode interpreter with a modern compilat
 
 The optimized MIR is then compiled to native machine code (x86_64 via manual byte-level encoding, aarch64 via dynasmrt) or WebAssembly (direct MIR-to-WASM emission, bypassing the machine IR layer entirely). A linear-scan register allocator handles register assignment and spilling for native targets.
 
-The runtime uses NaN-boxed 64-bit values, a generational semi-space garbage collector with bump-pointer nursery allocation, and an object model with O(1) method dispatch via interned symbol IDs. A planned tiered execution model will use the MIR interpreter for fast cold starts, with invocation counters promoting hot functions to optimized JIT compilation -- eliminating upfront compilation latency while still reaching peak performance on critical paths. Hot module reload will allow recompiling changed source files at runtime, patching the code cache and re-resolving module-level bindings without restarting the VM.
+The runtime uses NaN-boxed 64-bit values, a generational semi-space garbage collector with bump-pointer nursery allocation, and an object model with O(1) method dispatch via interned symbol IDs. A tiered execution model uses the MIR interpreter for fast cold starts, with JIT compilation available for hot functions -- eliminating upfront compilation latency while still reaching peak performance on critical paths. Async background JIT compilation via worker threads and hot module reload (recompile + patch code cache at runtime) are planned.
 
 ## Getting Started
 
@@ -114,8 +114,9 @@ Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution test
 | x86_64 JIT | Complete |
 | aarch64 JIT | Complete |
 | WASM Codegen | Complete (structured loops via stackifier) |
-| Tiered Runtime | Planned (MIR interp cold start → JIT hot promotion) |
+| Tiered Runtime | Complete (MIR interp → JIT; async background compilation planned) |
 | Hot Module Reload | Planned (recompile + patch code cache at runtime) |
 | Core Library | Complete (Object, Class, Bool, Null, Num, String, List, Map, Range, Fn, Fiber, System) |
-| Fiber Runtime | Not started |
+| Fiber Runtime | Complete (create, call, yield, resume, isDone, transfer) |
 | End-to-End CLI | Complete (lex/parse/sema/MIR/opt/codegen pipeline, REPL, debug dumps) |
+| E2E Test Suite | 53 tests (classes, closures, fibers, inheritance, iterators, GC pressure, benchmarks) |
