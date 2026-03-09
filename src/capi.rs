@@ -386,7 +386,7 @@ pub extern "C" fn wrenGetSlotString(vm: *mut WrenVM, slot: c_int) -> *const c_ch
             return ptr::null();
         }
         let obj = &*(ptr as *const ObjString);
-        obj.value.as_ptr() as *const c_char
+        obj.as_c_str()
     }
 }
 

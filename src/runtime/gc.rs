@@ -1428,13 +1428,14 @@ mod tests {
     #[test]
     fn test_should_collect_nursery_pressure() {
         let mut gc = Gc::with_config(GcConfig {
-            nursery_size: 128, // tiny nursery
+            nursery_size: 256, // small nursery
             ..test_config()
         });
         assert!(!gc.should_collect());
         // Fill nursery past 75%.
         gc.alloc_string("a".into());
         gc.alloc_string("b".into());
+        gc.alloc_string("c".into());
         assert!(gc.should_collect());
     }
 

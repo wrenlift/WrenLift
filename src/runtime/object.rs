@@ -97,6 +97,8 @@ pub struct ObjString {
     pub hash: u64,
     /// The string data.
     pub value: String,
+    /// Null-terminated copy for C API (lazily populated).
+    pub c_str: std::cell::RefCell<Option<std::ffi::CString>>,
 }
 
 impl ObjString {
@@ -106,7 +108,20 @@ impl ObjString {
             header: ObjHeader::new(ObjType::String),
             hash,
             value: s,
+            c_str: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Returns a pointer to a null-terminated C string.
+    /// The pointer is valid as long as this ObjString is alive.
+    pub fn as_c_str(&self) -> *const std::ffi::c_char {
+        let mut cache = self.c_str.borrow_mut();
+        if cache.is_none() {
+            // Replace interior nulls with the replacement character to avoid truncation.
+            let cleaned = self.value.replace('\0', "\u{FFFD}");
+            *cache = Some(std::ffi::CString::new(cleaned).unwrap());
+        }
+        cache.as_ref().unwrap().as_ptr()
     }
 
     pub fn as_str(&self) -> &str {
