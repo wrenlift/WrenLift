@@ -199,7 +199,11 @@ impl VM {
             fiber: ptr::null_mut(),
             modules: HashMap::new(),
 
-            engine: ExecutionEngine::new(config.execution_mode),
+            engine: {
+                let mut e = ExecutionEngine::new(config.execution_mode);
+                e.jit_threshold = config.jit_threshold;
+                e
+            },
 
             api_stack: vec![Value::null(); 16],
             handles: Vec::new(),

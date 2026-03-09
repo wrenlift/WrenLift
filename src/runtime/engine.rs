@@ -441,6 +441,7 @@ mod tests {
                 module_name: std::ptr::null(),
                 module_name_len: 0,
                 closure: std::ptr::null_mut(),
+                defining_class: std::ptr::null_mut(),
             });
 
             let result = compile_and_exec(f, &interner);

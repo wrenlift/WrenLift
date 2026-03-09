@@ -34,6 +34,8 @@ pub struct JitContext {
     pub module_name_len: u32,
     /// Current closure pointer (for upvalue access from JIT-compiled closure bodies).
     pub closure: *mut u8,
+    /// The class that defines the current method (for static field access).
+    pub defining_class: *mut u8,
 }
 
 unsafe impl Send for JitContext {}
@@ -47,6 +49,7 @@ impl Default for JitContext {
             module_name: std::ptr::null(),
             module_name_len: 0,
             closure: std::ptr::null_mut(),
+            defining_class: std::ptr::null_mut(),
         }
     }
 }
@@ -615,6 +618,44 @@ pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
     })
 }
 
+/// Get a static field from the defining class.
+/// field_sym is the raw SymbolId index.
+pub extern "C" fn wren_get_static_field(field_sym: u64) -> u64 {
+    JIT_CONTEXT.with(|c| {
+        let ctx = c.borrow();
+        if ctx.defining_class.is_null() {
+            return Value::null().to_bits();
+        }
+        let class = ctx.defining_class as *const ObjClass;
+        let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+        unsafe {
+            (*class)
+                .static_fields
+                .get(&sym)
+                .copied()
+                .unwrap_or(Value::null())
+                .to_bits()
+        }
+    })
+}
+
+/// Set a static field on the defining class.
+/// field_sym is the raw SymbolId index, value is the NaN-boxed value.
+pub extern "C" fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
+    JIT_CONTEXT.with(|c| {
+        let ctx = c.borrow();
+        if ctx.defining_class.is_null() {
+            return value;
+        }
+        let class = ctx.defining_class as *mut ObjClass;
+        let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+        unsafe {
+            (*class).static_fields.insert(sym, Value::from_bits(value));
+        }
+        value
+    })
+}
+
 /// Guard: check that value is an instance of the expected class.
 /// Returns the value if check passes, traps otherwise.
 pub extern "C" fn wren_guard_class(value: u64, class: u64) -> u64 {
@@ -844,6 +885,9 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Upvalues
         "wren_get_upvalue" => Some(wren_get_upvalue as usize),
         "wren_set_upvalue" => Some(wren_set_upvalue as usize),
+        // Static fields
+        "wren_get_static_field" => Some(wren_get_static_field as usize),
+        "wren_set_static_field" => Some(wren_set_static_field as usize),
         // FP transcendentals (raw f64 bits in/out)
         "wren_fp_sin" => Some(wren_fp_sin as usize),
         "wren_fp_cos" => Some(wren_fp_cos as usize),
@@ -1042,6 +1086,7 @@ mod tests {
             module_name: std::ptr::null(),
             module_name_len: 0,
             closure: std::ptr::null_mut(),
+            defining_class: std::ptr::null_mut(),
         });
         assert!(with_context(|_| ()).is_some());
 
@@ -1065,6 +1110,7 @@ mod tests {
             module_name: std::ptr::null(),
             module_name_len: 0,
             closure: std::ptr::null_mut(),
+            defining_class: std::ptr::null_mut(),
         });
 
         // Read first module var (num 42)
@@ -1095,6 +1141,7 @@ mod tests {
             module_name: std::ptr::null(),
             module_name_len: 0,
             closure: std::ptr::null_mut(),
+            defining_class: std::ptr::null_mut(),
         });
 
         let new_val = Value::num(99.0).to_bits();

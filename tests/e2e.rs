@@ -4,7 +4,7 @@
 /// features. Each test verifies correctness (expected output), stability
 /// (no panics), and profiles execution time.
 use std::time::Instant;
-use wren_lift::runtime::engine::InterpretResult;
+use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::vm::{VMConfig, VM};
 
 // ---------------------------------------------------------------------------
@@ -1510,4 +1510,242 @@ while (true) {
         "Expected step limit error, got {:?}",
         result
     );
+}
+
+// ---------------------------------------------------------------------------
+// JIT tiering e2e: nbody simulation
+// ---------------------------------------------------------------------------
+
+const NBODY_SRC: &str = r#"
+class Vec3 {
+    construct new(x, y, z) {
+        _x = x
+        _y = y
+        _z = z
+    }
+    x { _x }
+    y { _y }
+    z { _z }
+    x=(v) { _x = v }
+    y=(v) { _y = v }
+    z=(v) { _z = v }
+}
+
+class Body {
+    construct new(x, y, z, vx, vy, vz, mass) {
+        _pos = Vec3.new(x, y, z)
+        _vel = Vec3.new(vx, vy, vz)
+        _mass = mass
+    }
+    pos { _pos }
+    vel { _vel }
+    mass { _mass }
+}
+
+var PI = 3.141592653589793
+var SOLAR_MASS = 4 * PI * PI
+var DAYS_PER_YEAR = 365.24
+
+var bodies = [
+    Body.new(0, 0, 0, 0, 0, 0, SOLAR_MASS),
+    Body.new(
+        4.84143144246472090,
+        -1.16032004402742839,
+        -0.10362204447112311,
+        0.00166007664274403694 * DAYS_PER_YEAR,
+        0.00769901118419740425 * DAYS_PER_YEAR,
+        -0.00006904600169720200 * DAYS_PER_YEAR,
+        0.000954791938424326609 * SOLAR_MASS
+    ),
+    Body.new(
+        8.34336671824457987,
+        4.12479856412430479,
+        -0.40352341895349131,
+        -0.00276742510726862411 * DAYS_PER_YEAR,
+        0.00499852801234917238 * DAYS_PER_YEAR,
+        0.00023041729757376393 * DAYS_PER_YEAR,
+        0.000285885980666130812 * SOLAR_MASS
+    )
+]
+
+var n = bodies.count
+
+// Advance simulation by dt
+var advance = Fn.new { |dt|
+    for (i in 0...n) {
+        var bi = bodies[i]
+        for (j in (i + 1)...n) {
+            var bj = bodies[j]
+            var dx = bi.pos.x - bj.pos.x
+            var dy = bi.pos.y - bj.pos.y
+            var dz = bi.pos.z - bj.pos.z
+            var dist2 = dx * dx + dy * dy + dz * dz
+            var dist = dist2.sqrt
+            var mag = dt / (dist2 * dist)
+            bi.vel.x = bi.vel.x - dx * bj.mass * mag
+            bi.vel.y = bi.vel.y - dy * bj.mass * mag
+            bi.vel.z = bi.vel.z - dz * bj.mass * mag
+            bj.vel.x = bj.vel.x + dx * bi.mass * mag
+            bj.vel.y = bj.vel.y + dy * bi.mass * mag
+            bj.vel.z = bj.vel.z + dz * bi.mass * mag
+        }
+    }
+    for (i in 0...n) {
+        var b = bodies[i]
+        b.pos.x = b.pos.x + dt * b.vel.x
+        b.pos.y = b.pos.y + dt * b.vel.y
+        b.pos.z = b.pos.z + dt * b.vel.z
+    }
+}
+
+// Compute total energy
+var energy = Fn.new {
+    var e = 0
+    for (i in 0...n) {
+        var bi = bodies[i]
+        var vx = bi.vel.x
+        var vy = bi.vel.y
+        var vz = bi.vel.z
+        e = e + 0.5 * bi.mass * (vx * vx + vy * vy + vz * vz)
+        for (j in (i + 1)...n) {
+            var bj = bodies[j]
+            var dx = bi.pos.x - bj.pos.x
+            var dy = bi.pos.y - bj.pos.y
+            var dz = bi.pos.z - bj.pos.z
+            var dist = (dx * dx + dy * dy + dz * dz).sqrt
+            e = e - bi.mass * bj.mass / dist
+        }
+    }
+    return e
+}
+
+var e0 = energy.call
+for (i in 0...200) {
+    advance.call(0.01)
+}
+var e1 = energy.call
+
+// Energy should be conserved (small drift okay)
+var drift = (e1 - e0).abs
+System.print(drift < 0.001)
+System.print("done")
+"#;
+
+#[test]
+fn e2e_jit_nbody() {
+    let config = VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 5,
+        ..Default::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let start = Instant::now();
+    let result = vm.interpret("main", NBODY_SRC);
+    let elapsed = start.elapsed();
+    let output = vm.take_output();
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "nbody failed: {:?} ({})\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(output.trim(), "true\ndone", "nbody output mismatch ({})", t);
+    eprintln!("  [nbody tiered {}]", t);
+}
+
+// ---------------------------------------------------------------------------
+// JIT tiering e2e: mandelbrot
+// ---------------------------------------------------------------------------
+
+const MANDELBROT_SRC: &str = r##"
+var WIDTH = 16
+var HEIGHT = 12
+var MAX_ITER = 20
+
+var output = ""
+for (py in 0...HEIGHT) {
+    var y0 = py / HEIGHT * 2.4 - 1.2
+    for (px in 0...WIDTH) {
+        var x0 = px / WIDTH * 3.5 - 2.5
+        var x = 0
+        var y = 0
+        var iter = 0
+        while (x * x + y * y <= 4 && iter < MAX_ITER) {
+            var xtemp = x * x - y * y + x0
+            y = 2 * x * y + y0
+            x = xtemp
+            iter = iter + 1
+        }
+        if (iter == MAX_ITER) {
+            output = output + "#"
+        } else if (iter > 10) {
+            output = output + "+"
+        } else if (iter > 5) {
+            output = output + "."
+        } else {
+            output = output + " "
+        }
+    }
+    output = output + "\n"
+}
+System.print(output)
+"##;
+
+#[test]
+fn e2e_jit_mandelbrot() {
+    // Run in both interpreter and tiered mode, verify same output.
+    let (interp_result, interp_output, _) = {
+        let config = VMConfig {
+            execution_mode: ExecutionMode::Interpreter,
+            ..Default::default()
+        };
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let start = Instant::now();
+        let r = vm.interpret("main", MANDELBROT_SRC);
+        let elapsed = start.elapsed();
+        (r, vm.take_output(), elapsed)
+    };
+
+    let (tiered_result, tiered_output, tiered_elapsed) = {
+        let config = VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 3,
+            ..Default::default()
+        };
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let start = Instant::now();
+        let r = vm.interpret("main", MANDELBROT_SRC);
+        let elapsed = start.elapsed();
+        (r, vm.take_output(), elapsed)
+    };
+
+    let t = fmt_elapsed(tiered_elapsed);
+    assert!(
+        matches!(interp_result, InterpretResult::Success),
+        "mandelbrot interpreter failed: {:?}",
+        interp_result
+    );
+    assert!(
+        matches!(tiered_result, InterpretResult::Success),
+        "mandelbrot tiered failed: {:?} ({})",
+        tiered_result,
+        t
+    );
+    assert_eq!(
+        interp_output, tiered_output,
+        "mandelbrot output mismatch between interpreter and tiered ({})",
+        t
+    );
+    // Verify we got non-empty output with expected characters
+    assert!(
+        tiered_output.contains('#') && tiered_output.contains(' '),
+        "mandelbrot output seems wrong: {}",
+        tiered_output
+    );
+    eprintln!("  [mandelbrot tiered {}]", t);
 }

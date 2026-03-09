@@ -283,6 +283,20 @@ impl<'a> MirWasmEmitter<'a> {
                             &[ValType::I64],
                         );
                     }
+                    Instruction::GetStaticField(..) => {
+                        self.register_import(
+                            "wren_get_static_field",
+                            &[ValType::I64],
+                            &[ValType::I64],
+                        );
+                    }
+                    Instruction::SetStaticField(..) => {
+                        self.register_import(
+                            "wren_set_static_field",
+                            &[ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
+                    }
                     Instruction::GetModuleVar(_) => {
                         self.register_import(
                             "wren_get_module_var",
@@ -951,8 +965,22 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
 
-            // Static fields — not yet supported in WASM codegen.
-            Instruction::GetStaticField(_) | Instruction::SetStaticField(_, _) => {}
+            // Static fields — emit runtime calls.
+            Instruction::GetStaticField(sym) => {
+                func.instruction(&WasmInst::I64Const(sym.index() as i64));
+                func.instruction(&WasmInst::Call(
+                    self.runtime_imports["wren_get_static_field"],
+                ));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
+            Instruction::SetStaticField(sym, val) => {
+                func.instruction(&WasmInst::I64Const(sym.index() as i64));
+                func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                func.instruction(&WasmInst::Call(
+                    self.runtime_imports["wren_set_static_field"],
+                ));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
         }
         Ok(())
     }

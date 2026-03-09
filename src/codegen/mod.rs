@@ -2636,10 +2636,33 @@ impl<'a> LowerCtx<'a> {
                 self.vreg_for(dst_val);
             }
 
-            // Static fields — lowered as CallRuntime for now.
-            Instruction::GetStaticField(_) | Instruction::SetStaticField(_, _) => {
-                // TODO: implement static field codegen
-                self.vreg_for(dst_val);
+            // Static fields — lowered as CallRuntime.
+            Instruction::GetStaticField(sym) => {
+                let dst = self.vreg_for(dst_val);
+                let sym_reg = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm {
+                    dst: sym_reg,
+                    bits: sym.index() as u64,
+                });
+                self.mf.emit(MachInst::CallRuntime {
+                    name: "wren_get_static_field",
+                    args: vec![sym_reg],
+                    ret: Some(dst),
+                });
+            }
+            Instruction::SetStaticField(sym, val) => {
+                let dst = self.vreg_for(dst_val);
+                let sym_reg = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm {
+                    dst: sym_reg,
+                    bits: sym.index() as u64,
+                });
+                let v = self.vreg_for(*val);
+                self.mf.emit(MachInst::CallRuntime {
+                    name: "wren_set_static_field",
+                    args: vec![sym_reg, v],
+                    ret: Some(dst),
+                });
             }
         }
     }
