@@ -374,7 +374,23 @@ impl Eq for MapKey {}
 
 impl Hash for MapKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
+        let v = self.0;
+        if v.is_object() {
+            if let Some(ptr) = v.as_object() {
+                let header = ptr as *const ObjHeader;
+                unsafe {
+                    if (*header).obj_type == ObjType::String {
+                        // Hash by string content so equal strings have equal hashes
+                        let s = &*(ptr as *const ObjString);
+                        0xFFu8.hash(state); // discriminant tag for strings
+                        s.value.hash(state);
+                        return;
+                    }
+                }
+            }
+        }
+        // For non-string values, hash by raw bits (identity)
+        v.to_bits().hash(state);
     }
 }
 

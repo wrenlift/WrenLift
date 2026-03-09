@@ -4,6 +4,9 @@ version = "0.1.0"
 authors = ["Damilare Akinlaja <damilare@zenturi.co>"]
 edition = "2021"
 
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [[bin]]
 name = "wlift"
 path = "src/main.rs"
