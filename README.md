@@ -9,11 +9,12 @@ Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programmin
 </p>
 
 <p align="center">
+<a href="https://github.com/wrenlift/WrenLift/actions/workflows/ci.yml"><img src="https://github.com/wrenlift/WrenLift/actions/workflows/ci.yml/badge.svg" alt="CI"/></a>
 <img src="https://img.shields.io/badge/language-Rust-orange?logo=rust" alt="Rust"/>
 <img src="https://img.shields.io/badge/edition-2021-blue" alt="Rust 2021"/>
 <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/>
 <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
-<img src="https://img.shields.io/badge/tests-758_passing-brightgreen" alt="758 tests passing"/>
+<img src="https://img.shields.io/badge/tests-788_passing-brightgreen" alt="788 tests passing"/>
 <img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
 </p>
 
@@ -119,4 +120,6 @@ Dev-only: `capstone` (disassembly verification), `wasmtime` (WASM execution test
 | Core Library | Complete (Object, Class, Bool, Null, Num, String, List, Map, Range, Fn, Fiber, System) |
 | Fiber Runtime | Complete (create, call, yield, resume, isDone, transfer) |
 | End-to-End CLI | Complete (lex/parse/sema/MIR/opt/codegen pipeline, REPL, debug dumps) |
-| E2E Test Suite | 53 tests (classes, closures, fibers, inheritance, iterators, GC pressure, benchmarks) |
+| Optional Modules | Complete (Meta, Random — on-demand via import) |
+| C Embedding API | Complete (wren.h-compatible, header + example) |
+| E2E Test Suite | 70 tests (classes, closures, fibers, inheritance, iterators, GC pressure, JIT tiering, benchmarks) |
