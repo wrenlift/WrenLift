@@ -1901,8 +1901,15 @@ impl<'a> LowerCtx<'a> {
                 for a in args {
                     call_args.push(self.vreg_for(*a));
                 }
+                let call_name = match args.len() {
+                    0 => "wren_call_0",
+                    1 => "wren_call_1",
+                    2 => "wren_call_2",
+                    3 => "wren_call_3",
+                    _ => "wren_call_4",
+                };
                 self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_call",
+                    name: call_name,
                     args: call_args,
                     ret: Some(dst),
                 });
@@ -1918,8 +1925,15 @@ impl<'a> LowerCtx<'a> {
                 for a in args {
                     call_args.push(self.vreg_for(*a));
                 }
+                let call_name = match args.len() {
+                    0 => "wren_super_call_0",
+                    1 => "wren_super_call_1",
+                    2 => "wren_super_call_2",
+                    3 => "wren_super_call_3",
+                    _ => "wren_super_call_4",
+                };
                 self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_super_call",
+                    name: call_name,
                     args: call_args,
                     ret: Some(dst),
                 });
@@ -2268,6 +2282,38 @@ impl<'a> LowerCtx<'a> {
                     MathUnaryOp::Ceil => self.mf.emit(MachInst::FCeil { dst, src: la }),
                     MathUnaryOp::Round => self.mf.emit(MachInst::FRound { dst, src: la }),
                     MathUnaryOp::Trunc => self.mf.emit(MachInst::FTrunc { dst, src: la }),
+                    MathUnaryOp::Fract => {
+                        // fract(x) = x - floor(x)
+                        let floored = self.mf.new_fp();
+                        self.mf.emit(MachInst::FFloor { dst: floored, src: la });
+                        self.mf.emit(MachInst::FSub { dst, lhs: la, rhs: floored });
+                    }
+                    MathUnaryOp::Sign => {
+                        // sign(x) = x > 0 ? 1.0 : (x < 0 ? -1.0 : 0.0)
+                        let zero = self.mf.new_fp();
+                        let one = self.mf.new_fp();
+                        let neg_one = self.mf.new_fp();
+                        let is_pos = self.mf.new_gp();
+                        let is_neg = self.mf.new_gp();
+                        let pos_fp = self.mf.new_fp();
+                        let neg_fp = self.mf.new_fp();
+                        self.mf.emit(MachInst::LoadFpImm { dst: zero, value: 0.0 });
+                        self.mf.emit(MachInst::LoadFpImm { dst: one, value: 1.0 });
+                        self.mf.emit(MachInst::LoadFpImm { dst: neg_one, value: -1.0 });
+                        // is_pos = la > 0.0
+                        self.mf.emit(MachInst::FCmp { lhs: la, rhs: zero });
+                        self.mf.emit(MachInst::CSet { dst: is_pos, cond: Cond::Gt });
+                        // is_neg = la < 0.0
+                        self.mf.emit(MachInst::FCmp { lhs: la, rhs: zero });
+                        self.mf.emit(MachInst::CSet { dst: is_neg, cond: Cond::Lt });
+                        // result = is_pos ? 1.0 : (is_neg ? -1.0 : 0.0)
+                        // Use: pos_fp = is_pos * 1.0, neg_fp = is_neg * (-1.0), result = pos_fp + neg_fp
+                        self.mf.emit(MachInst::I64CvtToF { dst: pos_fp, src: is_pos });
+                        self.mf.emit(MachInst::FMul { dst: pos_fp, lhs: pos_fp, rhs: one });
+                        self.mf.emit(MachInst::I64CvtToF { dst: neg_fp, src: is_neg });
+                        self.mf.emit(MachInst::FMul { dst: neg_fp, lhs: neg_fp, rhs: neg_one });
+                        self.mf.emit(MachInst::FAdd { dst, lhs: pos_fp, rhs: neg_fp });
+                    }
                     // Transcendentals — fall back to libm via CallRuntime
                     _ => {
                         self.mf.emit(MachInst::CallRuntime {
@@ -2282,8 +2328,7 @@ impl<'a> LowerCtx<'a> {
                                 MathUnaryOp::Log => "log",
                                 MathUnaryOp::Log2 => "log2",
                                 MathUnaryOp::Exp => "exp",
-                                MathUnaryOp::Fract => "wren_fract",
-                                MathUnaryOp::Sign => "wren_sign",
+                                MathUnaryOp::Fract | MathUnaryOp::Sign => unreachable!(),
                                 // Already handled above
                                 MathUnaryOp::Abs | MathUnaryOp::Sqrt | MathUnaryOp::Floor
                                 | MathUnaryOp::Ceil | MathUnaryOp::Round | MathUnaryOp::Trunc => {

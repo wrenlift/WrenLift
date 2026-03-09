@@ -12,7 +12,7 @@
 
 use crate::runtime::value::Value;
 use crate::runtime::object::{
-    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjList, ObjMap,
+    MapKey, Method, ObjClass, ObjHeader, ObjList, ObjMap,
     ObjString, ObjType,
 };
 
@@ -130,12 +130,8 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     value
 }
 
-/// Call a method on a receiver.
-/// Args: receiver (NaN-boxed), method_sym (u64 raw SymbolId)
-pub extern "C" fn wren_call(receiver: u64, method: u64) -> u64 {
-    let recv = Value::from_bits(receiver);
-    let method_sym = crate::intern::SymbolId::from_raw(method as u32);
-
+/// Internal: dispatch a method call with a pre-built args slice.
+fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
@@ -147,20 +143,15 @@ pub extern "C" fn wren_call(receiver: u64, method: u64) -> u64 {
 
     match method_entry {
         Some(Method::Native(native_fn)) => {
-            let args = &[recv];
             native_fn(vm, args).to_bits()
         }
-        Some(Method::Closure(_closure_ptr)) => {
-            // Closure dispatch requires pushing a MIR frame — complex.
-            // For now, fall back to null. Full closure dispatch from JIT
-            // requires re-entering the interpreter.
-            Value::null().to_bits()
-        }
-        Some(Method::Constructor(_closure_ptr)) => {
+        Some(Method::Closure(_) | Method::Constructor(_)) => {
+            // Closure/constructor dispatch from JIT requires re-entering the
+            // interpreter. Not yet supported — return null.
             Value::null().to_bits()
         }
         None => {
-            // Try static method dispatch
+            // Try static method dispatch (receiver IS a class object)
             if class == vm.class_class {
                 let method_name = vm.interner.resolve(method_sym).to_string();
                 let static_name = format!("static:{}", method_name);
@@ -169,10 +160,7 @@ pub extern "C" fn wren_call(receiver: u64, method: u64) -> u64 {
                     let recv_class_ptr = recv_ptr as *mut ObjClass;
                     let static_entry = unsafe { (*recv_class_ptr).find_method(static_sym).cloned() };
                     match static_entry {
-                        Some(Method::Native(native_fn)) => {
-                            let args = &[recv];
-                            native_fn(vm, args).to_bits()
-                        }
+                        Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
                         _ => Value::null().to_bits(),
                     }
                 } else {
@@ -185,11 +173,43 @@ pub extern "C" fn wren_call(receiver: u64, method: u64) -> u64 {
     }
 }
 
-/// Super call dispatch.
-pub extern "C" fn wren_super_call(receiver: u64, method: u64) -> u64 {
+/// Call a method with 0 extra args. Codegen: [receiver, method_sym]
+pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     let recv = Value::from_bits(receiver);
-    let method_sym = crate::intern::SymbolId::from_raw(method as u32);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_call(recv, sym, &[recv])
+}
 
+/// Call with 1 extra arg. Codegen: [receiver, method_sym, arg0]
+pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
+    let recv = Value::from_bits(receiver);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_call(recv, sym, &[recv, Value::from_bits(a0)])
+}
+
+/// Call with 2 extra args.
+pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
+    let recv = Value::from_bits(receiver);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1)])
+}
+
+/// Call with 3 extra args.
+pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let recv = Value::from_bits(receiver);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+}
+
+/// Call with 4 extra args (max via registers).
+pub extern "C" fn wren_call_4(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let recv = Value::from_bits(receiver);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2), Value::from_bits(a3)])
+}
+
+/// Internal: dispatch a super call.
+fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
@@ -204,12 +224,29 @@ pub extern "C" fn wren_super_call(receiver: u64, method: u64) -> u64 {
 
     let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
     match method_entry {
-        Some(Method::Native(native_fn)) => {
-            let args = &[recv];
-            native_fn(vm, args).to_bits()
-        }
+        Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
         _ => Value::null().to_bits(),
     }
+}
+
+/// Super call with 0 extra args. Codegen: [method_sym]
+pub extern "C" fn wren_super_call_0(method: u64) -> u64 {
+    // Super calls don't have an explicit receiver in codegen — get from context.
+    // For now, return null (super dispatch from JIT needs interpreter re-entry).
+    let _ = method;
+    Value::null().to_bits()
+}
+pub extern "C" fn wren_super_call_1(method: u64, a0: u64) -> u64 {
+    let _ = (method, a0); Value::null().to_bits()
+}
+pub extern "C" fn wren_super_call_2(method: u64, a0: u64, a1: u64) -> u64 {
+    let _ = (method, a0, a1); Value::null().to_bits()
+}
+pub extern "C" fn wren_super_call_3(method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let _ = (method, a0, a1, a2); Value::null().to_bits()
+}
+pub extern "C" fn wren_super_call_4(method: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let _ = (method, a0, a1, a2, a3); Value::null().to_bits()
 }
 
 /// Allocate a new empty list.
@@ -412,43 +449,19 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
     value
 }
 
-/// Get an upvalue from the current closure.
-pub extern "C" fn wren_get_upvalue(closure: u64, index: u64) -> u64 {
-    let closure_val = Value::from_bits(closure);
-    if !closure_val.is_object() {
-        return Value::null().to_bits();
-    }
-    let ptr = closure_val.as_object().unwrap() as *mut ObjClosure;
-    let idx = index as usize;
-    unsafe {
-        let upvalues = &(*ptr).upvalues;
-        if idx < upvalues.len() {
-            let upvalue = upvalues[idx];
-            if !upvalue.is_null() {
-                return (*upvalue).get().to_bits();
-            }
-        }
-    }
+/// Get an upvalue by index.
+/// Codegen emits: [idx_reg]. Closure comes from JitContext (not yet wired —
+/// upvalue access from JIT requires closure pointer in context or a dedicated register).
+/// For now, return null. The interpreter handles upvalues correctly.
+pub extern "C" fn wren_get_upvalue(index: u64) -> u64 {
+    let _ = index;
     Value::null().to_bits()
 }
 
-/// Set an upvalue in the current closure.
-pub extern "C" fn wren_set_upvalue(closure: u64, index: u64, value: u64) -> u64 {
-    let closure_val = Value::from_bits(closure);
-    if !closure_val.is_object() {
-        return Value::null().to_bits();
-    }
-    let ptr = closure_val.as_object().unwrap() as *mut ObjClosure;
-    let idx = index as usize;
-    unsafe {
-        let upvalues = &(*ptr).upvalues;
-        if idx < upvalues.len() {
-            let upvalue = upvalues[idx];
-            if !upvalue.is_null() {
-                (*upvalue).set(Value::from_bits(value));
-            }
-        }
-    }
+/// Set an upvalue by index.
+/// Codegen emits: [idx_reg, val_reg].
+pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
+    let _ = index;
     value
 }
 
@@ -458,6 +471,13 @@ pub extern "C" fn wren_guard_class(value: u64, class: u64) -> u64 {
     // For now, always pass the guard. A proper implementation would
     // check the class hierarchy and deoptimize on mismatch.
     let _ = class;
+    value
+}
+
+/// Guard: check that value's class implements the expected protocol.
+/// Returns the value if check passes (always passes for now).
+pub extern "C" fn wren_guard_protocol(value: u64, protocol_id: u64) -> u64 {
+    let _ = protocol_id;
     value
 }
 
@@ -575,17 +595,33 @@ fn abi_regs(target: super::Target) -> (&'static [u32], u32, u32, u32) {
 pub fn resolve(name: &str) -> Option<usize> {
     match name {
         "wren_get_module_var" => Some(wren_get_module_var as usize),
-        "wren_call" => Some(wren_call as usize),
+        "wren_set_module_var" => Some(wren_set_module_var as usize),
+        // Arity-specific call dispatch
+        "wren_call_0" => Some(wren_call_0 as usize),
+        "wren_call_1" => Some(wren_call_1 as usize),
+        "wren_call_2" => Some(wren_call_2 as usize),
+        "wren_call_3" => Some(wren_call_3 as usize),
+        "wren_call_4" => Some(wren_call_4 as usize),
+        "wren_super_call_0" => Some(wren_super_call_0 as usize),
+        "wren_super_call_1" => Some(wren_super_call_1 as usize),
+        "wren_super_call_2" => Some(wren_super_call_2 as usize),
+        "wren_super_call_3" => Some(wren_super_call_3 as usize),
+        "wren_super_call_4" => Some(wren_super_call_4 as usize),
+        // Collections
         "wren_make_list" => Some(wren_make_list as usize),
         "wren_make_map" => Some(wren_make_map as usize),
         "wren_make_range" => Some(wren_make_range as usize),
         "wren_make_closure" => Some(wren_make_closure as usize),
+        // Strings
         "wren_string_concat" => Some(wren_string_concat as usize),
         "wren_to_string" => Some(wren_to_string as usize),
+        // Type checks & guards
         "wren_is_type" => Some(wren_is_type as usize),
+        "wren_guard_class" => Some(wren_guard_class as usize),
+        "wren_guard_protocol" => Some(wren_guard_protocol as usize),
+        // Subscript
         "wren_subscript_get" => Some(wren_subscript_get as usize),
         "wren_subscript_set" => Some(wren_subscript_set as usize),
-        "wren_super_call" => Some(wren_super_call as usize),
         // Boxed arithmetic
         "wren_num_add" => Some(wren_num_add as usize),
         "wren_num_sub" => Some(wren_num_sub as usize),
@@ -602,12 +638,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_cmp_ne" => Some(wren_cmp_ne as usize),
         // Logical
         "wren_not" => Some(wren_not as usize),
-        // Upvalue, guard, misc
+        "wren_is_truthy" => Some(wren_is_truthy as usize),
+        // Upvalues (stub — JIT upvalue access needs closure context)
         "wren_get_upvalue" => Some(wren_get_upvalue as usize),
         "wren_set_upvalue" => Some(wren_set_upvalue as usize),
-        "wren_set_module_var" => Some(wren_set_module_var as usize),
-        "wren_guard_class" => Some(wren_guard_class as usize),
-        "wren_is_truthy" => Some(wren_is_truthy as usize),
         _ => None,
     }
 }
@@ -760,7 +794,7 @@ mod tests {
     #[test]
     fn resolve_known_functions() {
         assert!(resolve("wren_get_module_var").is_some());
-        assert!(resolve("wren_call").is_some());
+        assert!(resolve("wren_call_0").is_some());
         assert!(resolve("wren_make_list").is_some());
         assert!(resolve("wren_subscript_get").is_some());
     }
@@ -773,7 +807,7 @@ mod tests {
     #[test]
     fn function_pointers_are_nonzero() {
         assert_ne!(resolve("wren_get_module_var").unwrap(), 0);
-        assert_ne!(resolve("wren_call").unwrap(), 0);
+        assert_ne!(resolve("wren_call_0").unwrap(), 0);
     }
 
     #[test]
