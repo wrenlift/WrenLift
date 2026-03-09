@@ -1135,6 +1135,66 @@ impl NativeContext for VM {
 }
 
 // ---------------------------------------------------------------------------
+// JIT re-entry helpers
+// ---------------------------------------------------------------------------
+
+impl VM {
+    /// Execute a closure synchronously via a temporary fiber.
+    /// Used by JIT runtime functions to re-enter the interpreter for closure bodies.
+    pub fn call_closure_sync(
+        &mut self,
+        closure_ptr: *mut ObjClosure,
+        args: &[Value],
+    ) -> Option<Value> {
+        use crate::mir::{BlockId, Instruction};
+        use crate::mir::interp::InterpValue;
+
+        let temp_fiber = self.gc.alloc_fiber();
+        unsafe {
+            (*temp_fiber).header.class = self.fiber_class;
+
+            let fn_ptr = (*closure_ptr).function;
+            let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
+
+            let mir = self.engine.get_mir(func_id)?;
+            let mut values = std::collections::HashMap::new();
+
+            // Bind block params
+            let block = &mir.blocks[0];
+            let mut param_idx = 0;
+            for (vid, inst) in &block.instructions {
+                if matches!(inst, Instruction::BlockParam(_)) {
+                    if param_idx < args.len() {
+                        values.insert(*vid, InterpValue::Boxed(args[param_idx]));
+                    }
+                    param_idx += 1;
+                } else {
+                    break;
+                }
+            }
+
+            (*temp_fiber).mir_frames.push(MirCallFrame {
+                func_id,
+                current_block: BlockId(0),
+                ip: 0,
+                values,
+                module_name: crate::codegen::runtime_fns::module_name(),
+                return_dst: None,
+                closure: Some(closure_ptr),
+                defining_class: None,
+            });
+        }
+
+        let saved_fiber = self.fiber;
+        self.fiber = temp_fiber;
+        let result = super::vm_interp::run_fiber(self);
+        self.fiber = saved_fiber;
+
+        result.ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

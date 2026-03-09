@@ -12,7 +12,7 @@
 
 use crate::runtime::value::Value;
 use crate::runtime::object::{
-    MapKey, Method, ObjClass, ObjHeader, ObjList, ObjMap,
+    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjList, ObjMap,
     ObjString, ObjType,
 };
 
@@ -34,6 +34,8 @@ pub struct JitContext {
     pub module_name: *const u8,
     /// Module name length.
     pub module_name_len: u32,
+    /// Current closure pointer (for upvalue access from JIT-compiled closure bodies).
+    pub closure: *mut u8,
 }
 
 unsafe impl Send for JitContext {}
@@ -46,6 +48,7 @@ impl Default for JitContext {
             vm: std::ptr::null_mut(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            closure: std::ptr::null_mut(),
         }
     }
 }
@@ -145,10 +148,15 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
         Some(Method::Native(native_fn)) => {
             native_fn(vm, args).to_bits()
         }
-        Some(Method::Closure(_) | Method::Constructor(_)) => {
-            // Closure/constructor dispatch from JIT requires re-entering the
-            // interpreter. Not yet supported — return null.
-            Value::null().to_bits()
+        Some(Method::Closure(closure_ptr)) => {
+            vm.call_closure_sync(closure_ptr, args)
+                .map(|v| v.to_bits())
+                .unwrap_or(Value::null().to_bits())
+        }
+        Some(Method::Constructor(closure_ptr)) => {
+            vm.call_closure_sync(closure_ptr, args)
+                .map(|v| v.to_bits())
+                .unwrap_or(Value::null().to_bits())
         }
         None => {
             // Try static method dispatch (receiver IS a class object)
@@ -208,7 +216,7 @@ pub extern "C" fn wren_call_4(receiver: u64, method: u64, a0: u64, a1: u64, a2: 
     dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2), Value::from_bits(a3)])
 }
 
-/// Internal: dispatch a super call.
+/// Internal: dispatch a super call. Walks to superclass and dispatches method.
 fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
@@ -225,28 +233,48 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
     let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
     match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-        _ => Value::null().to_bits(),
+        Some(Method::Closure(closure_ptr)) => {
+            vm.call_closure_sync(closure_ptr, args)
+                .map(|v| v.to_bits())
+                .unwrap_or(Value::null().to_bits())
+        }
+        Some(Method::Constructor(closure_ptr)) => {
+            vm.call_closure_sync(closure_ptr, args)
+                .map(|v| v.to_bits())
+                .unwrap_or(Value::null().to_bits())
+        }
+        None => Value::null().to_bits(),
     }
 }
 
-/// Super call with 0 extra args. Codegen: [method_sym]
+/// Super call with 0 args. Codegen: [method_sym] (no receiver — shouldn't happen in practice)
 pub extern "C" fn wren_super_call_0(method: u64) -> u64 {
-    // Super calls don't have an explicit receiver in codegen — get from context.
-    // For now, return null (super dispatch from JIT needs interpreter re-entry).
     let _ = method;
     Value::null().to_bits()
 }
-pub extern "C" fn wren_super_call_1(method: u64, a0: u64) -> u64 {
-    let _ = (method, a0); Value::null().to_bits()
+/// Super call with 1 arg. Codegen: [method_sym, this]
+pub extern "C" fn wren_super_call_1(method: u64, this: u64) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call(recv, sym, &[recv])
 }
-pub extern "C" fn wren_super_call_2(method: u64, a0: u64, a1: u64) -> u64 {
-    let _ = (method, a0, a1); Value::null().to_bits()
+/// Super call with 2 args. Codegen: [method_sym, this, a0]
+pub extern "C" fn wren_super_call_2(method: u64, this: u64, a0: u64) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0)])
 }
-pub extern "C" fn wren_super_call_3(method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    let _ = (method, a0, a1, a2); Value::null().to_bits()
+/// Super call with 3 args. Codegen: [method_sym, this, a0, a1]
+pub extern "C" fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1)])
 }
-pub extern "C" fn wren_super_call_4(method: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    let _ = (method, a0, a1, a2, a3); Value::null().to_bits()
+/// Super call with 4 args. Codegen: [method_sym, this, a0, a1, a2]
+pub extern "C" fn wren_super_call_4(method: u64, this: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let recv = Value::from_bits(this);
+    let sym = crate::intern::SymbolId::from_raw(method as u32);
+    dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
 }
 
 /// Allocate a new empty list.
@@ -292,8 +320,8 @@ pub extern "C" fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
     Value::object(range_ptr as *mut u8).to_bits()
 }
 
-/// Allocate a closure from a function ID.
-pub extern "C" fn wren_make_closure(fn_id: u64) -> u64 {
+/// Helper: allocate closure and populate upvalues from a slice of NaN-boxed values.
+fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
@@ -302,12 +330,51 @@ pub extern "C" fn wren_make_closure(fn_id: u64) -> u64 {
 
     let func_id = fn_id as u32;
     let name_sym = vm.interner.intern("<closure>");
-    let fn_ptr = vm.gc.alloc_fn(name_sym, 0, 0, func_id);
+    let uv_count = upvalue_vals.len() as u16;
+    let arity = vm.engine.get_mir(crate::runtime::engine::FuncId(func_id))
+        .map(|mir| mir.arity)
+        .unwrap_or(0);
+    let fn_ptr = vm.gc.alloc_fn(name_sym, arity, uv_count, func_id);
     unsafe { (*fn_ptr).header.class = vm.fn_class; }
 
     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
     unsafe { (*closure_ptr).header.class = vm.fn_class; }
+
+    // Populate upvalues with captured values (pre-closed)
+    for (i, &uv_bits) in upvalue_vals.iter().enumerate() {
+        let captured_val = Value::from_bits(uv_bits);
+        let uv_obj = vm.gc.alloc_upvalue(std::ptr::null_mut());
+        unsafe {
+            (*uv_obj).closed = captured_val;
+            (*uv_obj).location = &mut (*uv_obj).closed as *mut Value;
+            if i < (*closure_ptr).upvalues.len() {
+                (&mut (*closure_ptr).upvalues)[i] = uv_obj;
+            }
+        }
+    }
+
     Value::object(closure_ptr as *mut u8).to_bits()
+}
+
+/// Allocate a closure with 0 upvalues.
+pub extern "C" fn wren_make_closure_0(fn_id: u64) -> u64 {
+    make_closure_inner(fn_id, &[])
+}
+/// Allocate a closure with 1 upvalue.
+pub extern "C" fn wren_make_closure_1(fn_id: u64, uv0: u64) -> u64 {
+    make_closure_inner(fn_id, &[uv0])
+}
+/// Allocate a closure with 2 upvalues.
+pub extern "C" fn wren_make_closure_2(fn_id: u64, uv0: u64, uv1: u64) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1])
+}
+/// Allocate a closure with 3 upvalues.
+pub extern "C" fn wren_make_closure_3(fn_id: u64, uv0: u64, uv1: u64, uv2: u64) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1, uv2])
+}
+/// Allocate a closure with 4 upvalues.
+pub extern "C" fn wren_make_closure_4(fn_id: u64, uv0: u64, uv1: u64, uv2: u64, uv3: u64) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3])
 }
 
 /// Concatenate two strings.
@@ -449,20 +516,45 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
     value
 }
 
-/// Get an upvalue by index.
-/// Codegen emits: [idx_reg]. Closure comes from JitContext (not yet wired —
-/// upvalue access from JIT requires closure pointer in context or a dedicated register).
-/// For now, return null. The interpreter handles upvalues correctly.
+/// Get an upvalue by index from the current closure in JitContext.
 pub extern "C" fn wren_get_upvalue(index: u64) -> u64 {
-    let _ = index;
-    Value::null().to_bits()
+    JIT_CONTEXT.with(|c| {
+        let ctx = c.borrow();
+        if ctx.closure.is_null() {
+            return Value::null().to_bits();
+        }
+        let closure = ctx.closure as *const ObjClosure;
+        let idx = index as usize;
+        unsafe {
+            let upvalues = &(*closure).upvalues;
+            if idx < upvalues.len() {
+                let uv = upvalues[idx];
+                (*uv).get().to_bits()
+            } else {
+                Value::null().to_bits()
+            }
+        }
+    })
 }
 
-/// Set an upvalue by index.
-/// Codegen emits: [idx_reg, val_reg].
+/// Set an upvalue by index on the current closure in JitContext.
 pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
-    let _ = index;
-    value
+    JIT_CONTEXT.with(|c| {
+        let ctx = c.borrow();
+        if ctx.closure.is_null() {
+            return value;
+        }
+        let closure = ctx.closure as *const ObjClosure;
+        let idx = index as usize;
+        unsafe {
+            let upvalues = &(*closure).upvalues;
+            if idx < upvalues.len() {
+                let uv = upvalues[idx];
+                (*uv).set(Value::from_bits(value));
+            }
+        }
+        value
+    })
 }
 
 /// Guard: check that value is an instance of the expected class.
@@ -563,6 +655,25 @@ pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// FP transcendental wrappers (raw f64 bits in/out, for JIT CallRuntime)
+// ---------------------------------------------------------------------------
+
+pub extern "C" fn wren_fp_sin(bits: u64) -> u64 { f64::from_bits(bits).sin().to_bits() }
+pub extern "C" fn wren_fp_cos(bits: u64) -> u64 { f64::from_bits(bits).cos().to_bits() }
+pub extern "C" fn wren_fp_tan(bits: u64) -> u64 { f64::from_bits(bits).tan().to_bits() }
+pub extern "C" fn wren_fp_asin(bits: u64) -> u64 { f64::from_bits(bits).asin().to_bits() }
+pub extern "C" fn wren_fp_acos(bits: u64) -> u64 { f64::from_bits(bits).acos().to_bits() }
+pub extern "C" fn wren_fp_atan(bits: u64) -> u64 { f64::from_bits(bits).atan().to_bits() }
+pub extern "C" fn wren_fp_log(bits: u64) -> u64 { f64::from_bits(bits).ln().to_bits() }
+pub extern "C" fn wren_fp_log2(bits: u64) -> u64 { f64::from_bits(bits).log2().to_bits() }
+pub extern "C" fn wren_fp_exp(bits: u64) -> u64 { f64::from_bits(bits).exp().to_bits() }
+pub extern "C" fn wren_fp_cbrt(bits: u64) -> u64 { f64::from_bits(bits).cbrt().to_bits() }
+pub extern "C" fn wren_fp_atan2(a: u64, b: u64) -> u64 { f64::from_bits(a).atan2(f64::from_bits(b)).to_bits() }
+pub extern "C" fn wren_fp_pow(a: u64, b: u64) -> u64 { f64::from_bits(a).powf(f64::from_bits(b)).to_bits() }
+pub extern "C" fn wren_fp_min(a: u64, b: u64) -> u64 { f64::from_bits(a).min(f64::from_bits(b)).to_bits() }
+pub extern "C" fn wren_fp_max(a: u64, b: u64) -> u64 { f64::from_bits(a).max(f64::from_bits(b)).to_bits() }
+
+// ---------------------------------------------------------------------------
 // ABI physical register mappings
 // ---------------------------------------------------------------------------
 
@@ -611,7 +722,12 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_list" => Some(wren_make_list as usize),
         "wren_make_map" => Some(wren_make_map as usize),
         "wren_make_range" => Some(wren_make_range as usize),
-        "wren_make_closure" => Some(wren_make_closure as usize),
+        // Arity-specific closure creation
+        "wren_make_closure_0" => Some(wren_make_closure_0 as usize),
+        "wren_make_closure_1" => Some(wren_make_closure_1 as usize),
+        "wren_make_closure_2" => Some(wren_make_closure_2 as usize),
+        "wren_make_closure_3" => Some(wren_make_closure_3 as usize),
+        "wren_make_closure_4" => Some(wren_make_closure_4 as usize),
         // Strings
         "wren_string_concat" => Some(wren_string_concat as usize),
         "wren_to_string" => Some(wren_to_string as usize),
@@ -639,9 +755,24 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Logical
         "wren_not" => Some(wren_not as usize),
         "wren_is_truthy" => Some(wren_is_truthy as usize),
-        // Upvalues (stub — JIT upvalue access needs closure context)
+        // Upvalues
         "wren_get_upvalue" => Some(wren_get_upvalue as usize),
         "wren_set_upvalue" => Some(wren_set_upvalue as usize),
+        // FP transcendentals (raw f64 bits in/out)
+        "wren_fp_sin" => Some(wren_fp_sin as usize),
+        "wren_fp_cos" => Some(wren_fp_cos as usize),
+        "wren_fp_tan" => Some(wren_fp_tan as usize),
+        "wren_fp_asin" => Some(wren_fp_asin as usize),
+        "wren_fp_acos" => Some(wren_fp_acos as usize),
+        "wren_fp_atan" => Some(wren_fp_atan as usize),
+        "wren_fp_log" => Some(wren_fp_log as usize),
+        "wren_fp_log2" => Some(wren_fp_log2 as usize),
+        "wren_fp_exp" => Some(wren_fp_exp as usize),
+        "wren_fp_cbrt" => Some(wren_fp_cbrt as usize),
+        "wren_fp_atan2" => Some(wren_fp_atan2 as usize),
+        "wren_fp_pow" => Some(wren_fp_pow as usize),
+        "wren_fp_min" => Some(wren_fp_min as usize),
+        "wren_fp_max" => Some(wren_fp_max as usize),
         _ => None,
     }
 }
@@ -823,6 +954,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            closure: std::ptr::null_mut(),
         });
         assert!(with_context(|_| ()).is_some());
 
@@ -845,6 +977,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            closure: std::ptr::null_mut(),
         });
 
         // Read first module var (num 42)
@@ -874,6 +1007,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            closure: std::ptr::null_mut(),
         });
 
         let new_val = Value::num(99.0).to_bits();

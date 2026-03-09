@@ -424,6 +424,7 @@ mod tests {
                 vm: dummy_vm.as_mut_ptr(),
                 module_name: std::ptr::null(),
                 module_name_len: 0,
+                closure: std::ptr::null_mut(),
             });
 
             let result = compile_and_exec(f, &interner);

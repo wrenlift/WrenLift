@@ -1951,8 +1951,15 @@ impl<'a> LowerCtx<'a> {
                 for uv in upvalues {
                     call_args.push(self.vreg_for(*uv));
                 }
+                let call_name = match upvalues.len() {
+                    0 => "wren_make_closure_0",
+                    1 => "wren_make_closure_1",
+                    2 => "wren_make_closure_2",
+                    3 => "wren_make_closure_3",
+                    _ => "wren_make_closure_4",
+                };
                 self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_make_closure",
+                    name: call_name,
                     args: call_args,
                     ret: Some(dst),
                 });
@@ -2314,30 +2321,34 @@ impl<'a> LowerCtx<'a> {
                         self.mf.emit(MachInst::FMul { dst: neg_fp, lhs: neg_fp, rhs: neg_one });
                         self.mf.emit(MachInst::FAdd { dst, lhs: pos_fp, rhs: neg_fp });
                     }
-                    // Transcendentals — fall back to libm via CallRuntime
+                    // Transcendentals — bitcast FP→GP, call wren_fp_* wrapper, bitcast GP→FP
                     _ => {
+                        let name = match op {
+                            MathUnaryOp::Acos => "wren_fp_acos",
+                            MathUnaryOp::Asin => "wren_fp_asin",
+                            MathUnaryOp::Atan => "wren_fp_atan",
+                            MathUnaryOp::Cbrt => "wren_fp_cbrt",
+                            MathUnaryOp::Cos => "wren_fp_cos",
+                            MathUnaryOp::Sin => "wren_fp_sin",
+                            MathUnaryOp::Tan => "wren_fp_tan",
+                            MathUnaryOp::Log => "wren_fp_log",
+                            MathUnaryOp::Log2 => "wren_fp_log2",
+                            MathUnaryOp::Exp => "wren_fp_exp",
+                            MathUnaryOp::Fract | MathUnaryOp::Sign => unreachable!(),
+                            MathUnaryOp::Abs | MathUnaryOp::Sqrt | MathUnaryOp::Floor
+                            | MathUnaryOp::Ceil | MathUnaryOp::Round | MathUnaryOp::Trunc => {
+                                unreachable!()
+                            }
+                        };
+                        let gp_arg = self.mf.new_gp();
+                        self.mf.emit(MachInst::BitcastFpToGp { dst: gp_arg, src: la });
+                        let gp_ret = self.mf.new_gp();
                         self.mf.emit(MachInst::CallRuntime {
-                            name: match op {
-                                MathUnaryOp::Acos => "acos",
-                                MathUnaryOp::Asin => "asin",
-                                MathUnaryOp::Atan => "atan",
-                                MathUnaryOp::Cbrt => "cbrt",
-                                MathUnaryOp::Cos => "cos",
-                                MathUnaryOp::Sin => "sin",
-                                MathUnaryOp::Tan => "tan",
-                                MathUnaryOp::Log => "log",
-                                MathUnaryOp::Log2 => "log2",
-                                MathUnaryOp::Exp => "exp",
-                                MathUnaryOp::Fract | MathUnaryOp::Sign => unreachable!(),
-                                // Already handled above
-                                MathUnaryOp::Abs | MathUnaryOp::Sqrt | MathUnaryOp::Floor
-                                | MathUnaryOp::Ceil | MathUnaryOp::Round | MathUnaryOp::Trunc => {
-                                    unreachable!()
-                                }
-                            },
-                            args: vec![la],
-                            ret: Some(dst),
+                            name,
+                            args: vec![gp_arg],
+                            ret: Some(gp_ret),
                         });
+                        self.mf.emit(MachInst::BitcastGpToFp { dst, src: gp_ret });
                     }
                 }
             }
@@ -2350,17 +2361,24 @@ impl<'a> LowerCtx<'a> {
                     // Hardware-native single-instruction ops
                     MathBinaryOp::Min => self.mf.emit(MachInst::FMin { dst, lhs: la, rhs: lb }),
                     MathBinaryOp::Max => self.mf.emit(MachInst::FMax { dst, lhs: la, rhs: lb }),
-                    // Transcendentals — fall back to libm via CallRuntime
+                    // Transcendentals — bitcast FP→GP, call wren_fp_* wrapper, bitcast GP→FP
                     _ => {
+                        let name = match op {
+                            MathBinaryOp::Atan2 => "wren_fp_atan2",
+                            MathBinaryOp::Pow => "wren_fp_pow",
+                            MathBinaryOp::Min | MathBinaryOp::Max => unreachable!(),
+                        };
+                        let gp_a = self.mf.new_gp();
+                        let gp_b = self.mf.new_gp();
+                        self.mf.emit(MachInst::BitcastFpToGp { dst: gp_a, src: la });
+                        self.mf.emit(MachInst::BitcastFpToGp { dst: gp_b, src: lb });
+                        let gp_ret = self.mf.new_gp();
                         self.mf.emit(MachInst::CallRuntime {
-                            name: match op {
-                                MathBinaryOp::Atan2 => "atan2",
-                                MathBinaryOp::Pow => "pow",
-                                MathBinaryOp::Min | MathBinaryOp::Max => unreachable!(),
-                            },
-                            args: vec![la, lb],
-                            ret: Some(dst),
+                            name,
+                            args: vec![gp_a, gp_b],
+                            ret: Some(gp_ret),
                         });
+                        self.mf.emit(MachInst::BitcastGpToFp { dst, src: gp_ret });
                     }
                 }
             }
