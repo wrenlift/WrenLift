@@ -312,22 +312,30 @@ impl VM {
 
                 // Skip if already loaded
                 if !self.engine.modules.contains_key(&imported_module) {
-                    // Resolve module source via config callback
-                    let source_opt = self
-                        .config
-                        .load_module_fn
-                        .as_ref()
-                        .and_then(|load_fn| load_fn(&imported_module));
-                    if let Some(mod_source) = source_opt {
-                        let result = self.interpret(&imported_module, &mod_source);
-                        if result != InterpretResult::Success {
-                            self.loading_modules.remove(&module_key);
-                            return result;
-                        }
+                    // Check for built-in optional modules first
+                    if self.try_load_builtin_module(&imported_module) {
+                        // Built-in module registered successfully
                     } else {
-                        self.report_error(&format!("Could not load module '{}'", imported_module));
-                        self.loading_modules.remove(&module_key);
-                        return InterpretResult::CompileError;
+                        // Resolve module source via config callback
+                        let source_opt = self
+                            .config
+                            .load_module_fn
+                            .as_ref()
+                            .and_then(|load_fn| load_fn(&imported_module));
+                        if let Some(mod_source) = source_opt {
+                            let result = self.interpret(&imported_module, &mod_source);
+                            if result != InterpretResult::Success {
+                                self.loading_modules.remove(&module_key);
+                                return result;
+                            }
+                        } else {
+                            self.report_error(&format!(
+                                "Could not load module '{}'",
+                                imported_module
+                            ));
+                            self.loading_modules.remove(&module_key);
+                            return InterpretResult::CompileError;
+                        }
                     }
                 }
 
@@ -967,6 +975,40 @@ impl VM {
         }
     }
 
+    /// Try to load a built-in optional module ("meta" or "random").
+    /// Returns true if the module was recognized and registered.
+    fn try_load_builtin_module(&mut self, name: &str) -> bool {
+        match name {
+            "meta" => {
+                let class = super::core::meta::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "meta".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["Meta".to_string()],
+                    },
+                );
+                true
+            }
+            "random" => {
+                let class = super::core::random::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "random".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["Random".to_string()],
+                    },
+                );
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Create a persistent handle that prevents a value from being GC'd.
     pub fn make_handle(&mut self, value: Value) -> usize {
         let idx = self.handles.len();
@@ -1304,6 +1346,25 @@ impl NativeContext for VM {
                 result.ok()
             }
         }
+    }
+
+    fn alloc_foreign(&mut self, data: Vec<u8>) -> *mut ObjForeign {
+        let ptr = self.gc.alloc_foreign(data);
+        unsafe {
+            (*ptr).header.class = self.object_class;
+        }
+        ptr
+    }
+
+    fn new_list(&mut self) -> Value {
+        self.alloc_list(Vec::new())
+    }
+
+    fn get_module_variable_names(&self, module: &str) -> Option<Vec<String>> {
+        self.engine
+            .modules
+            .get(module)
+            .map(|entry| entry.var_names.clone())
     }
 
     fn trigger_gc(&mut self) {

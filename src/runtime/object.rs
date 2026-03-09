@@ -910,6 +910,13 @@ pub trait NativeContext {
     /// Returns None if the method doesn't exist or the call fails.
     fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value>;
 
+    // -- Foreign objects --
+    fn alloc_foreign(&mut self, data: Vec<u8>) -> *mut ObjForeign;
+    fn new_list(&mut self) -> Value;
+
+    // -- Module variable lookup (for Meta module) --
+    fn get_module_variable_names(&self, module: &str) -> Option<Vec<String>>;
+
     // -- Garbage collection --
     fn trigger_gc(&mut self);
 }

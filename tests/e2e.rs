@@ -1782,3 +1782,128 @@ Boom.go(0)
         result, output
     );
 }
+
+// ---------------------------------------------------------------------------
+// Optional module: random
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_random_module() {
+    let source = r#"
+import "random" for Random
+
+var rng = Random.new(12345)
+var a = rng.float()
+System.print(a > 0)       // true (float in [0,1))
+System.print(a < 1)       // true
+
+var b = rng.int(100)
+System.print(b >= 0)      // true
+System.print(b < 100)     // true
+
+var c = rng.int(10, 20)
+System.print(c >= 10)     // true
+System.print(c < 20)      // true
+
+var d = rng.float(5)
+System.print(d >= 0)      // true
+System.print(d < 5)       // true
+
+var e = rng.float(2, 8)
+System.print(e >= 2)      // true
+System.print(e < 8)       // true
+"#;
+    let (result, output, elapsed) = run(source);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "random module failed: {:?}",
+        result
+    );
+    // All lines should be "true"
+    for (i, line) in output.lines().enumerate() {
+        assert_eq!(line, "true", "line {} was not true: {}", i, line);
+    }
+    eprintln!("  [random module {}]", fmt_elapsed(elapsed));
+}
+
+#[test]
+fn e2e_random_deterministic() {
+    // Same seed should produce same sequence
+    let source = r#"
+import "random" for Random
+
+var rng1 = Random.new(42)
+var rng2 = Random.new(42)
+
+System.print(rng1.float() == rng2.float())
+System.print(rng1.int(1000) == rng2.int(1000))
+System.print(rng1.float(10, 20) == rng2.float(10, 20))
+"#;
+    let (result, output, _) = run(source);
+    assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+    for line in output.lines() {
+        assert_eq!(line, "true");
+    }
+}
+
+#[test]
+fn e2e_random_sample_shuffle() {
+    let source = r#"
+import "random" for Random
+
+var rng = Random.new(99)
+var list = [1, 2, 3, 4, 5]
+
+var picked = rng.sample(list)
+System.print(picked >= 1)
+System.print(picked <= 5)
+
+var sampled = rng.sample(list, 3)
+System.print(sampled.count == 3)
+
+rng.shuffle(list)
+System.print(list.count == 5)
+"#;
+    let (result, output, _) = run(source);
+    assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+    for line in output.lines() {
+        assert_eq!(line, "true");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Optional module: meta
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_meta_get_module_variables() {
+    let source = r#"
+import "meta" for Meta
+
+var Foo = 42
+var Bar = "hello"
+
+var vars = Meta.getModuleVariables("main")
+System.print(vars is List)
+System.print(vars.count > 0)
+// Should contain our variables
+var hasFoo = false
+var hasBar = false
+for (v in vars) {
+    if (v == "Foo") hasFoo = true
+    if (v == "Bar") hasBar = true
+}
+System.print(hasFoo)
+System.print(hasBar)
+"#;
+    let (result, output, elapsed) = run(source);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "meta module failed: {:?}",
+        result
+    );
+    for (i, line) in output.lines().enumerate() {
+        assert_eq!(line, "true", "line {} was not true: {}", i, line);
+    }
+    eprintln!("  [meta module {}]", fmt_elapsed(elapsed));
+}
