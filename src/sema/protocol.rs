@@ -1,20 +1,20 @@
-/// Protocol system for WrenLift metaclasses.
-///
-/// Protocols are compile-time contracts that describe a set of required methods.
-/// Classes that conform to a protocol gain its provided (default) methods and
-/// unlock compiler optimizations like devirtualization and loop specialization.
-///
-/// This is analogous to Rust's trait system:
-/// - `ProtocolDef` ≈ `trait` definition (required + provided methods)
-/// - `ProtocolSet` ≈ trait bounds (what a type is known to implement)
-/// - Conformance checking ≈ `impl Trait for Type` verification
-/// - Auto-derive ≈ `#[derive(Trait)]`
-///
-/// Both built-in (Sequence, Comparable, Hashable) and user-defined classes
-/// participate equally. The compiler uses protocol knowledge for:
-/// - Devirtualization: replace dynamic dispatch with direct calls
-/// - Loop specialization: inline iterate protocol for known Sequence types
-/// - Type folding: `x is Sequence` → true when x's class conforms
+//! Protocol system for WrenLift metaclasses.
+//!
+//! Protocols are compile-time contracts that describe a set of required methods.
+//! Classes that conform to a protocol gain its provided (default) methods and
+//! unlock compiler optimizations like devirtualization and loop specialization.
+//!
+//! This is analogous to Rust's trait system:
+//! - `ProtocolDef` ≈ `trait` definition (required + provided methods)
+//! - `ProtocolSet` ≈ trait bounds (what a type is known to implement)
+//! - Conformance checking ≈ `impl Trait for Type` verification
+//! - Auto-derive ≈ `#[derive(Trait)]`
+//!
+//! Both built-in (Sequence, Comparable, Hashable) and user-defined classes
+//! participate equally. The compiler uses protocol knowledge for:
+//! - Devirtualization: replace dynamic dispatch with direct calls
+//! - Loop specialization: inline iterate protocol for known Sequence types
+//! - Type folding: `x is Sequence` → true when x's class conforms
 
 // ---------------------------------------------------------------------------
 // Protocol identity
@@ -75,9 +75,18 @@ pub const SEQUENCE_DEF: ProtocolDef = ProtocolDef {
     name: "Sequence",
     required: &["iterate(_)", "iteratorValue(_)"],
     provided: &[
-        "all(_)", "any(_)", "contains(_)", "count", "count(_)",
-        "each(_)", "isEmpty", "join()", "join(_)", "toList",
-        "reduce(_)", "reduce(_,_)",
+        "all(_)",
+        "any(_)",
+        "contains(_)",
+        "count",
+        "count(_)",
+        "each(_)",
+        "isEmpty",
+        "join()",
+        "join(_)",
+        "toList",
+        "reduce(_)",
+        "reduce(_,_)",
     ],
     opts: ProtocolOpts {
         devirtualize_iterate: true,
@@ -127,12 +136,8 @@ pub const STRINGABLE_DEF: ProtocolDef = ProtocolDef {
 };
 
 /// All built-in protocols, in order of their IDs.
-pub const BUILTIN_PROTOCOLS: &[ProtocolDef] = &[
-    SEQUENCE_DEF,
-    COMPARABLE_DEF,
-    HASHABLE_DEF,
-    STRINGABLE_DEF,
-];
+pub const BUILTIN_PROTOCOLS: &[ProtocolDef] =
+    &[SEQUENCE_DEF, COMPARABLE_DEF, HASHABLE_DEF, STRINGABLE_DEF];
 
 // ---------------------------------------------------------------------------
 // Protocol set (bitset)
@@ -163,7 +168,9 @@ impl ProtocolSet {
 
     /// Iterate over the protocol IDs in this set.
     pub fn iter(self) -> impl Iterator<Item = ProtocolId> {
-        (0u8..32).filter(move |i| self.0 & (1 << i) != 0).map(ProtocolId)
+        (0u8..32)
+            .filter(move |i| self.0 & (1 << i) != 0)
+            .map(ProtocolId)
     }
 
     /// Is this set empty?
@@ -179,7 +186,8 @@ impl ProtocolSet {
 
 impl std::fmt::Display for ProtocolSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&str> = self.iter()
+        let names: Vec<&str> = self
+            .iter()
             .filter_map(|pid| BUILTIN_PROTOCOLS.get(pid.0 as usize).map(|p| p.name))
             .collect();
         write!(f, "{{{}}}", names.join(", "))
@@ -200,36 +208,24 @@ pub fn builtin_protocols_for(class_name: &str) -> ProtocolSet {
             .with(COMPARABLE)
             .with(HASHABLE)
             .with(STRINGABLE),
-        "List" => ProtocolSet::EMPTY
-            .with(SEQUENCE)
-            .with(STRINGABLE),
-        "Map" => ProtocolSet::EMPTY
-            .with(SEQUENCE)
-            .with(STRINGABLE),
-        "Range" => ProtocolSet::EMPTY
-            .with(SEQUENCE)
-            .with(STRINGABLE),
+        "List" => ProtocolSet::EMPTY.with(SEQUENCE).with(STRINGABLE),
+        "Map" => ProtocolSet::EMPTY.with(SEQUENCE).with(STRINGABLE),
+        "Range" => ProtocolSet::EMPTY.with(SEQUENCE).with(STRINGABLE),
         // Num: comparable, hashable, stringable
         "Num" => ProtocolSet::EMPTY
             .with(COMPARABLE)
             .with(HASHABLE)
             .with(STRINGABLE),
         // Bool: hashable, stringable
-        "Bool" => ProtocolSet::EMPTY
-            .with(HASHABLE)
-            .with(STRINGABLE),
+        "Bool" => ProtocolSet::EMPTY.with(HASHABLE).with(STRINGABLE),
         // Null: stringable
-        "Null" => ProtocolSet::EMPTY
-            .with(STRINGABLE),
+        "Null" => ProtocolSet::EMPTY.with(STRINGABLE),
         // Fn: no protocols
         "Fn" | "Fiber" | "System" => ProtocolSet::EMPTY,
         // Object: base, stringable (toString is defined on Object)
-        "Object" => ProtocolSet::EMPTY
-            .with(STRINGABLE)
-            .with(HASHABLE),
+        "Object" => ProtocolSet::EMPTY.with(STRINGABLE).with(HASHABLE),
         // Sequence itself: conformance comes from Sequence protocol
-        "Sequence" => ProtocolSet::EMPTY
-            .with(SEQUENCE),
+        "Sequence" => ProtocolSet::EMPTY.with(SEQUENCE),
         // Unknown: empty
         _ => ProtocolSet::EMPTY,
     }
@@ -241,11 +237,10 @@ pub fn builtin_protocols_for(class_name: &str) -> ProtocolSet {
 
 /// Check whether a set of method signatures satisfies a protocol's requirements.
 /// Returns a list of missing required methods, or empty if satisfied.
-pub fn check_conformance(
-    protocol: &ProtocolDef,
-    methods: &[&str],
-) -> Vec<&'static str> {
-    protocol.required.iter()
+pub fn check_conformance(protocol: &ProtocolDef, methods: &[&str]) -> Vec<&'static str> {
+    protocol
+        .required
+        .iter()
         .filter(|req| !methods.contains(req))
         .copied()
         .collect()
@@ -307,16 +302,12 @@ pub fn auto_derivable(
     let mut derivable = Vec::new();
 
     // Stringable: auto-derive if no explicit toString
-    if !superclass_protocols.has(STRINGABLE)
-        && !current_methods.contains(&"toString")
-    {
+    if !superclass_protocols.has(STRINGABLE) && !current_methods.contains(&"toString") {
         derivable.push(AutoDerive::Stringable);
     }
 
     // Hashable: auto-derive identity hash if no explicit hashCode
-    if !superclass_protocols.has(HASHABLE)
-        && !current_methods.contains(&"hashCode")
-    {
+    if !superclass_protocols.has(HASHABLE) && !current_methods.contains(&"hashCode") {
         derivable.push(AutoDerive::Hashable);
     }
 
@@ -388,9 +379,7 @@ mod tests {
 
     #[test]
     fn test_protocol_set_iter() {
-        let set = ProtocolSet::EMPTY
-            .with(SEQUENCE)
-            .with(HASHABLE);
+        let set = ProtocolSet::EMPTY.with(SEQUENCE).with(HASHABLE);
         let ids: Vec<ProtocolId> = set.iter().collect();
         assert_eq!(ids, vec![SEQUENCE, HASHABLE]);
     }

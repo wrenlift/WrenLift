@@ -7,7 +7,6 @@
 ///
 /// The engine owns the function registry (MIR + compiled code) and
 /// handles tier-up decisions based on call-count profiling.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -20,20 +19,15 @@ use crate::mir::MirFunction;
 // ---------------------------------------------------------------------------
 
 /// How the VM should execute Wren code.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ExecutionMode {
     /// Walk the MIR directly. Never JIT-compile.
     Interpreter,
     /// Start interpreted, JIT-compile hot functions (default).
+    #[default]
     Tiered,
     /// Compile everything to native before execution.
     Jit,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        ExecutionMode::Tiered
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,7 +141,9 @@ impl ExecutionEngine {
     /// Get the MIR for a function by ID.
     /// Returns an Arc clone so the caller can hold it without borrowing the engine.
     pub fn get_mir(&self, id: FuncId) -> Option<Arc<MirFunction>> {
-        self.functions.get(id.0 as usize).map(|body| Arc::clone(body.mir()))
+        self.functions
+            .get(id.0 as usize)
+            .map(|body| Arc::clone(body.mir()))
     }
 
     /// Get a function body by ID.
@@ -182,18 +178,13 @@ impl ExecutionEngine {
         };
 
         match crate::codegen::compile_function_with_interner(&mir, target, interner) {
-            Ok(compiled) => {
-                match compiled.into_executable() {
-                    Ok(executable) => {
-                        self.functions[id.0 as usize] = FuncBody::Compiled {
-                            executable,
-                            mir,
-                        };
-                        true
-                    }
-                    Err(_) => false,
+            Ok(compiled) => match compiled.into_executable() {
+                Ok(executable) => {
+                    self.functions[id.0 as usize] = FuncBody::Compiled { executable, mir };
+                    true
                 }
-            }
+                Err(_) => false,
+            },
             Err(_) => false,
         }
     }
@@ -201,11 +192,17 @@ impl ExecutionEngine {
     /// Determine the native compilation target for the current platform.
     pub fn native_target() -> crate::codegen::Target {
         #[cfg(target_arch = "x86_64")]
-        { crate::codegen::Target::X86_64 }
+        {
+            crate::codegen::Target::X86_64
+        }
         #[cfg(target_arch = "aarch64")]
-        { crate::codegen::Target::Aarch64 }
+        {
+            crate::codegen::Target::Aarch64
+        }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        { crate::codegen::Target::Wasm }
+        {
+            crate::codegen::Target::Wasm
+        }
     }
 }
 
@@ -252,7 +249,7 @@ mod tests {
 
         assert!(!engine.record_call(id)); // 1
         assert!(!engine.record_call(id)); // 2
-        assert!(engine.record_call(id));  // 3 = threshold
+        assert!(engine.record_call(id)); // 3 = threshold
     }
 
     #[test]
@@ -285,9 +282,12 @@ mod tests {
         let v2 = f.new_value();
         {
             let b = f.block_mut(bb);
-            b.instructions.push((v0, crate::mir::Instruction::ConstF64(10.0)));
-            b.instructions.push((v1, crate::mir::Instruction::ConstF64(32.0)));
-            b.instructions.push((v2, crate::mir::Instruction::AddF64(v0, v1)));
+            b.instructions
+                .push((v0, crate::mir::Instruction::ConstF64(10.0)));
+            b.instructions
+                .push((v1, crate::mir::Instruction::ConstF64(32.0)));
+            b.instructions
+                .push((v2, crate::mir::Instruction::AddF64(v0, v1)));
             b.terminator = crate::mir::Terminator::Return(v2);
         }
 
@@ -297,7 +297,7 @@ mod tests {
 
         assert!(!engine.get_function(id).unwrap().is_compiled());
         assert!(!engine.record_call(id)); // 1
-        assert!(engine.record_call(id));  // 2 = threshold
+        assert!(engine.record_call(id)); // 2 = threshold
 
         let result = engine.tier_up(id, &interner);
         assert!(result, "tier_up should succeed for simple f64 arithmetic");
@@ -321,9 +321,12 @@ mod tests {
         /// Compile MIR to native code for the current platform and execute it.
         fn compile_and_exec(f: MirFunction, interner: &Interner) -> Option<u64> {
             let target = ExecutionEngine::native_target();
-            let compiled = crate::codegen::compile_function_with_interner(&f, target, interner).ok()?;
+            let compiled =
+                crate::codegen::compile_function_with_interner(&f, target, interner).ok()?;
             let executable = compiled.into_executable().ok()?;
-            if !executable.is_native() { return None; }
+            if !executable.is_native() {
+                return None;
+            }
             // SAFETY: executable stays alive while func runs (same scope).
             let func: fn() -> u64 = unsafe { executable.as_fn() };
             let result = func();
@@ -342,9 +345,12 @@ mod tests {
             let v2 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::ConstF64(10.0)));
-                b.instructions.push((v1, crate::mir::Instruction::ConstF64(32.0)));
-                b.instructions.push((v2, crate::mir::Instruction::AddF64(v0, v1)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::ConstF64(10.0)));
+                b.instructions
+                    .push((v1, crate::mir::Instruction::ConstF64(32.0)));
+                b.instructions
+                    .push((v2, crate::mir::Instruction::AddF64(v0, v1)));
                 b.terminator = crate::mir::Terminator::Return(v2);
             }
 
@@ -366,14 +372,20 @@ mod tests {
             let v2 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::ConstNum(10.0)));
-                b.instructions.push((v1, crate::mir::Instruction::ConstNum(32.0)));
-                b.instructions.push((v2, crate::mir::Instruction::Add(v0, v1)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::ConstNum(10.0)));
+                b.instructions
+                    .push((v1, crate::mir::Instruction::ConstNum(32.0)));
+                b.instructions
+                    .push((v2, crate::mir::Instruction::Add(v0, v1)));
                 b.terminator = crate::mir::Terminator::Return(v2);
             }
 
             let result = compile_and_exec(f, &interner);
-            assert!(result.is_some(), "JIT compilation with CallRuntime should succeed");
+            assert!(
+                result.is_some(),
+                "JIT compilation with CallRuntime should succeed"
+            );
             let val = Value::from_bits(result.unwrap());
             let n = val.as_num().expect("should be a number");
             assert_eq!(n, 42.0);
@@ -390,9 +402,12 @@ mod tests {
             let v2 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::ConstNum(10.0)));
-                b.instructions.push((v1, crate::mir::Instruction::ConstNum(32.0)));
-                b.instructions.push((v2, crate::mir::Instruction::CmpLt(v0, v1)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::ConstNum(10.0)));
+                b.instructions
+                    .push((v1, crate::mir::Instruction::ConstNum(32.0)));
+                b.instructions
+                    .push((v2, crate::mir::Instruction::CmpLt(v0, v1)));
                 b.terminator = crate::mir::Terminator::Return(v2);
             }
 
@@ -411,7 +426,8 @@ mod tests {
             let v0 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::GetModuleVar(0)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::GetModuleVar(0)));
                 b.terminator = crate::mir::Terminator::Return(v0);
             }
 
@@ -444,7 +460,8 @@ mod tests {
             let v0 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::ConstBool(true)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::ConstBool(true)));
                 b.terminator = crate::mir::Terminator::Return(v0);
             }
 
@@ -464,7 +481,8 @@ mod tests {
             let v1 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::ConstNum(7.0)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::ConstNum(7.0)));
                 b.instructions.push((v1, crate::mir::Instruction::Neg(v0)));
                 b.terminator = crate::mir::Terminator::Return(v1);
             }
@@ -485,7 +503,8 @@ mod tests {
             let v1 = f.new_value();
             {
                 let b = f.block_mut(bb);
-                b.instructions.push((v0, crate::mir::Instruction::ConstBool(false)));
+                b.instructions
+                    .push((v0, crate::mir::Instruction::ConstBool(false)));
                 b.instructions.push((v1, crate::mir::Instruction::Not(v0)));
                 b.terminator = crate::mir::Terminator::Return(v1);
             }

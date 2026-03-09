@@ -4,13 +4,12 @@
 /// one or more instructions producing a ValueId. Control flow (if, while,
 /// for, short-circuit &&/||) creates multiple basic blocks with conditional
 /// branches.
-
 use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::intern::{Interner, SymbolId};
 use crate::mir::*;
-use crate::sema::resolve::{ResolvedName, ResolveResult};
+use crate::sema::resolve::{ResolveResult, ResolvedName};
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -35,6 +34,9 @@ pub struct MirBuilder<'a> {
     closure_base: u32,
     /// Current method signature (for `super(args)` — uses same name as enclosing method).
     current_method_sig: Option<SymbolId>,
+    /// Stack of shadowed variables per block scope.
+    /// Each entry: (var name, previous value or None if newly introduced).
+    block_shadows: Vec<Vec<(SymbolId, Option<ValueId>)>>,
 }
 
 impl<'a> MirBuilder<'a> {
@@ -62,6 +64,7 @@ impl<'a> MirBuilder<'a> {
             closures: Vec::new(),
             closure_base: 0,
             current_method_sig: None,
+            block_shadows: Vec::new(),
         }
     }
 
@@ -123,7 +126,10 @@ impl<'a> MirBuilder<'a> {
     }
 
     fn module_var_index(&self, name: SymbolId) -> Option<u16> {
-        self.module_vars.iter().position(|&n| n == name).map(|i| i as u16)
+        self.module_vars
+            .iter()
+            .position(|&n| n == name)
+            .map(|i| i as u16)
     }
 
     /// Compute a Wren method signature from name + arity.
@@ -134,12 +140,17 @@ impl<'a> MirBuilder<'a> {
 
     /// Compute a Wren method signature, distinguishing 0-arg calls from getters.
     /// `has_parens` true + 0 args → "name()", false + 0 args → "name" (getter).
-    fn method_sig_with_parens(&mut self, name: SymbolId, arity: usize, has_parens: bool) -> SymbolId {
+    fn method_sig_with_parens(
+        &mut self,
+        name: SymbolId,
+        arity: usize,
+        has_parens: bool,
+    ) -> SymbolId {
         if arity == 0 && !has_parens {
             name
         } else {
             let name_str = self.interner.resolve(name).to_string();
-            let params: Vec<&str> = std::iter::repeat("_").take(arity).collect();
+            let params: Vec<&str> = std::iter::repeat_n("_", arity).collect();
             let sig = format!("{}({})", name_str, params.join(","));
             self.intern(&sig)
         }
@@ -159,16 +170,42 @@ impl<'a> MirBuilder<'a> {
                 } else {
                     self.emit(Instruction::ConstNull)
                 };
-                if let Some(idx) = self.module_var_index(name.0) {
-                    self.emit(Instruction::SetModuleVar(idx, val));
+                // Inside a block scope, `var x` creates a local variable that
+                // may shadow a module var or outer local. Only use the module
+                // var path when at the top level (no block scope active).
+                if self.block_shadows.is_empty() {
+                    if let Some(idx) = self.module_var_index(name.0) {
+                        self.emit(Instruction::SetModuleVar(idx, val));
+                    } else {
+                        self.variables.insert(name.0, val);
+                    }
                 } else {
+                    // Record the shadow so we can restore on block exit.
+                    if let Some(shadows) = self.block_shadows.last_mut() {
+                        let old = self.variables.get(&name.0).copied();
+                        shadows.push((name.0, old));
+                    }
                     self.variables.insert(name.0, val);
                 }
             }
 
             Stmt::Block(stmts) => {
+                self.block_shadows.push(Vec::new());
                 for s in stmts {
                     self.lower_stmt(s);
+                }
+                // Restore shadowed variables and remove block-locals.
+                if let Some(shadows) = self.block_shadows.pop() {
+                    for (name, old_val) in shadows.into_iter().rev() {
+                        match old_val {
+                            Some(v) => {
+                                self.variables.insert(name, v);
+                            }
+                            None => {
+                                self.variables.remove(&name);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -312,7 +349,10 @@ impl<'a> MirBuilder<'a> {
 
             // Need a merge param
             let phi = self.func.new_value();
-            self.func.block_mut(merge_bb).params.push((phi, MirType::Value));
+            self.func
+                .block_mut(merge_bb)
+                .params
+                .push((phi, MirType::Value));
 
             // then branch value: use then_val if available, otherwise before_val, else null
             let tv = then_val.or(before_val).unwrap_or_else(|| {
@@ -362,16 +402,18 @@ impl<'a> MirBuilder<'a> {
         // Pre-create phi block params in cond_bb for ALL variables.
         // This ensures both condition and body use phi values, so mutations
         // in the body propagate correctly back to the condition via the back-edge.
-        let vars_snapshot: Vec<(SymbolId, ValueId)> = self.variables.iter()
-            .map(|(&k, &v)| (k, v))
-            .collect();
+        let vars_snapshot: Vec<(SymbolId, ValueId)> =
+            self.variables.iter().map(|(&k, &v)| (k, v)).collect();
 
         let mut entry_args = Vec::new();
         let mut phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
 
         for &(name, initial_val) in &vars_snapshot {
             let phi = self.func.new_value();
-            self.func.block_mut(cond_bb).params.push((phi, MirType::Value));
+            self.func
+                .block_mut(cond_bb)
+                .params
+                .push((phi, MirType::Value));
             entry_args.push(initial_val);
             phi_map.push((name, phi));
             self.variables.insert(name, phi);
@@ -403,7 +445,8 @@ impl<'a> MirBuilder<'a> {
         self.continue_targets.pop();
 
         // Back-edge: pass current (possibly mutated) variable values
-        let backedge_args: Vec<ValueId> = phi_map.iter()
+        let backedge_args: Vec<ValueId> = phi_map
+            .iter()
             .map(|&(name, _)| self.variables[&name])
             .collect();
 
@@ -554,9 +597,14 @@ impl<'a> MirBuilder<'a> {
 
             Expr::Field(name) => {
                 let this_sym = self.intern("this");
-                let this_val = self.variables.get(&this_sym).copied()
+                let this_val = self
+                    .variables
+                    .get(&this_sym)
+                    .copied()
                     .unwrap_or_else(|| self.emit(Instruction::ConstNull));
-                let idx = self.field_map.as_ref()
+                let idx = self
+                    .field_map
+                    .as_ref()
                     .and_then(|m| m.get(name).copied())
                     .unwrap_or(0);
                 self.emit(Instruction::GetField(this_val, idx))
@@ -674,10 +722,17 @@ impl<'a> MirBuilder<'a> {
                 })
             }
 
-            Expr::SuperCall { method, args, has_parens } => {
+            Expr::SuperCall {
+                method,
+                args,
+                has_parens,
+            } => {
                 // Include `this` as first arg so the VM can use it as receiver
                 let this_sym = self.intern("this");
-                let this_val = self.variables.get(&this_sym).copied()
+                let this_val = self
+                    .variables
+                    .get(&this_sym)
+                    .copied()
                     .unwrap_or_else(|| self.emit(Instruction::ConstNull));
                 let mut all_args = vec![this_val];
                 all_args.extend(args.iter().map(|a| self.lower_expr(a)));
@@ -740,7 +795,11 @@ impl<'a> MirBuilder<'a> {
                 self.emit(Instruction::MakeMap(pairs))
             }
 
-            Expr::Range { from, to, inclusive } => {
+            Expr::Range {
+                from,
+                to,
+                inclusive,
+            } => {
                 let from_val = self.lower_expr(from);
                 let to_val = self.lower_expr(to);
                 self.emit(Instruction::MakeRange(from_val, to_val, *inclusive))
@@ -751,16 +810,21 @@ impl<'a> MirBuilder<'a> {
                 let fn_idx = self.compile_closure(params, body);
                 // Build upvalue capture list from sema info
                 let upvalue_vals = if let Some(uv_info) = self.upvalue_map.get(&scope_id) {
-                    uv_info.iter().map(|info| {
-                        if info.is_local {
-                            // Capture a local variable from this scope by name
-                            self.variables.get(&info.name).copied()
-                                .unwrap_or_else(|| self.emit(Instruction::ConstNull))
-                        } else {
-                            // Capture an upvalue from this scope (we're inside a closure ourselves)
-                            self.emit(Instruction::GetUpvalue(info.index))
-                        }
-                    }).collect()
+                    uv_info
+                        .iter()
+                        .map(|info| {
+                            if info.is_local {
+                                // Capture a local variable from this scope by name
+                                self.variables
+                                    .get(&info.name)
+                                    .copied()
+                                    .unwrap_or_else(|| self.emit(Instruction::ConstNull))
+                            } else {
+                                // Capture an upvalue from this scope (we're inside a closure ourselves)
+                                self.emit(Instruction::GetUpvalue(info.index))
+                            }
+                        })
+                        .collect()
                 } else {
                     vec![]
                 };
@@ -888,9 +952,14 @@ impl<'a> MirBuilder<'a> {
             }
             Expr::Field(name) => {
                 let this_sym = self.intern("this");
-                let this_val = self.variables.get(&this_sym).copied()
+                let this_val = self
+                    .variables
+                    .get(&this_sym)
+                    .copied()
                     .unwrap_or_else(|| self.emit(Instruction::ConstNull));
-                let idx = self.field_map.as_ref()
+                let idx = self
+                    .field_map
+                    .as_ref()
                     .and_then(|m| m.get(name).copied())
                     .unwrap_or(0);
                 self.emit(Instruction::SetField(this_val, idx, value));
@@ -900,11 +969,7 @@ impl<'a> MirBuilder<'a> {
     }
 
     /// Compile a closure body into a separate MirFunction, returning its index.
-    fn compile_closure(
-        &mut self,
-        params: &[Spanned<SymbolId>],
-        body: &Spanned<Stmt>,
-    ) -> u32 {
+    fn compile_closure(&mut self, params: &[Spanned<SymbolId>], body: &Spanned<Stmt>) -> u32 {
         let fn_idx = self.closure_base + self.closures.len() as u32;
 
         let (closure_func, nested_closures) = compile_closure_body(
@@ -965,16 +1030,24 @@ fn compile_closure_body(
     ) {
         // Check if last instruction produced a value we can return
         // Also check block params (for &&/|| merge blocks)
-        let last_val = builder.func.block(builder.current_block)
-            .instructions.last().map(|(id, _)| *id)
-            .or_else(|| builder.func.block(builder.current_block)
-                .params.last().map(|(id, _)| *id));
+        let last_val = builder
+            .func
+            .block(builder.current_block)
+            .instructions
+            .last()
+            .map(|(id, _)| *id)
+            .or_else(|| {
+                builder
+                    .func
+                    .block(builder.current_block)
+                    .params
+                    .last()
+                    .map(|(id, _)| *id)
+            });
         if let Some(val) = last_val {
-            builder.func.block_mut(builder.current_block).terminator =
-                Terminator::Return(val);
+            builder.func.block_mut(builder.current_block).terminator = Terminator::Return(val);
         } else {
-            builder.func.block_mut(builder.current_block).terminator =
-                Terminator::ReturnNull;
+            builder.func.block_mut(builder.current_block).terminator = Terminator::ReturnNull;
         }
     }
 
@@ -991,7 +1064,7 @@ fn wren_signature(sig: &MethodSig, interner: &Interner) -> String {
                 // Named with 0 params is a method call with parens but no args: "foo()"
                 format!("{}()", n)
             } else {
-                let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+                let us: Vec<&str> = std::iter::repeat_n("_", params.len()).collect();
                 format!("{}({})", n, us.join(","))
             }
         }
@@ -1002,7 +1075,7 @@ fn wren_signature(sig: &MethodSig, interner: &Interner) -> String {
             if params.is_empty() {
                 format!("{}()", n)
             } else {
-                let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+                let us: Vec<&str> = std::iter::repeat_n("_", params.len()).collect();
                 format!("{}({})", n, us.join(","))
             }
         }
@@ -1032,16 +1105,16 @@ fn wren_signature(sig: &MethodSig, interner: &Interner) -> String {
             if params.is_empty() {
                 op_str.to_string()
             } else {
-                let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+                let us: Vec<&str> = std::iter::repeat_n("_", params.len()).collect();
                 format!("{}({})", op_str, us.join(","))
             }
         }
         MethodSig::Subscript { params } => {
-            let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+            let us: Vec<&str> = std::iter::repeat_n("_", params.len()).collect();
             format!("[{}]", us.join(","))
         }
         MethodSig::SubscriptSetter { params, .. } => {
-            let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+            let us: Vec<&str> = std::iter::repeat_n("_", params.len()).collect();
             format!("[{}]=(_)", us.join(","))
         }
     }
@@ -1071,7 +1144,14 @@ pub fn lower_module(
     resolve: &ResolveResult,
 ) -> ModuleMir {
     let name = interner.intern("<module>");
-    let builder = MirBuilder::new(name, 0, interner, &resolve.resolutions, &resolve.module_vars, &resolve.upvalues);
+    let builder = MirBuilder::new(
+        name,
+        0,
+        interner,
+        &resolve.resolutions,
+        &resolve.module_vars,
+        &resolve.upvalues,
+    );
     let (top_level, closures) = builder.build_module(module);
 
     // Compile class definitions
@@ -1085,7 +1165,11 @@ pub fn lower_module(
         }
     }
 
-    ModuleMir { top_level, classes, closures: all_closures }
+    ModuleMir {
+        top_level,
+        classes,
+        closures: all_closures,
+    }
 }
 
 /// Compile a class declaration into ClassMir (plus any closures found in method bodies).
@@ -1130,7 +1214,9 @@ fn compile_class(
         );
 
         // Set field map for this class
-        let fmap: HashMap<SymbolId, u16> = field_names.iter().enumerate()
+        let fmap: HashMap<SymbolId, u16> = field_names
+            .iter()
+            .enumerate()
             .map(|(i, &sym)| (sym, i as u16))
             .collect();
         builder.field_map = Some(fmap);
@@ -1162,10 +1248,20 @@ fn compile_class(
             } else {
                 // Return last expression value if available (e.g. getters)
                 // Check instructions first, then block params (for &&/|| merge blocks)
-                let last_val = builder.func.block(builder.current_block)
-                    .instructions.last().map(|(id, _)| *id)
-                    .or_else(|| builder.func.block(builder.current_block)
-                        .params.last().map(|(id, _)| *id));
+                let last_val = builder
+                    .func
+                    .block(builder.current_block)
+                    .instructions
+                    .last()
+                    .map(|(id, _)| *id)
+                    .or_else(|| {
+                        builder
+                            .func
+                            .block(builder.current_block)
+                            .params
+                            .last()
+                            .map(|(id, _)| *id)
+                    });
                 if let Some(val) = last_val {
                     builder.func.block_mut(builder.current_block).terminator =
                         Terminator::Return(val);
@@ -1191,15 +1287,19 @@ fn compile_class(
     // Compute protocol conformance from method signatures.
     let method_sigs: Vec<&str> = methods.iter().map(|m| m.signature.as_str()).collect();
     let superclass_protocols = crate::sema::protocol::ProtocolSet::EMPTY; // resolved at runtime
-    let conformance = crate::sema::protocol::check_all_conformance(&method_sigs, superclass_protocols);
+    let conformance =
+        crate::sema::protocol::check_all_conformance(&method_sigs, superclass_protocols);
 
-    (ClassMir {
-        name: decl.name.0,
-        superclass: decl.superclass.as_ref().map(|s| s.0),
-        methods,
-        num_fields: field_names.len() as u16,
-        protocols: conformance.conforms,
-    }, all_closures)
+    (
+        ClassMir {
+            name: decl.name.0,
+            superclass: decl.superclass.as_ref().map(|s| s.0),
+            methods,
+            num_fields: field_names.len() as u16,
+            protocols: conformance.conforms,
+        },
+        all_closures,
+    )
 }
 
 /// Scan a statement body for field accesses (_name) and register them.
@@ -1210,17 +1310,20 @@ fn scan_fields(stmt: &Spanned<Stmt>, interner: &Interner, fields: &mut Vec<Symbo
 fn scan_stmt_fields(stmt: &Stmt, interner: &Interner, fields: &mut Vec<SymbolId>) {
     match stmt {
         Stmt::Expr(e) => scan_expr_fields(&e.0, interner, fields),
-        Stmt::Var { initializer, .. } => {
-            if let Some(init) = initializer {
-                scan_expr_fields(&init.0, interner, fields);
-            }
+        Stmt::Var { initializer: Some(init), .. } => {
+            scan_expr_fields(&init.0, interner, fields);
         }
+        Stmt::Var { initializer: None, .. } => {}
         Stmt::Block(stmts) => {
             for s in stmts {
                 scan_stmt_fields(&s.0, interner, fields);
             }
         }
-        Stmt::If { condition, then_branch, else_branch } => {
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
             scan_expr_fields(&condition.0, interner, fields);
             scan_stmt_fields(&then_branch.0, interner, fields);
             if let Some(eb) = else_branch {
@@ -1256,7 +1359,12 @@ fn scan_expr_fields(expr: &Expr, interner: &Interner, fields: &mut Vec<SymbolId>
             scan_expr_fields(&right.0, interner, fields);
         }
         Expr::UnaryOp { operand, .. } => scan_expr_fields(&operand.0, interner, fields),
-        Expr::Call { receiver, args, block_arg, .. } => {
+        Expr::Call {
+            receiver,
+            args,
+            block_arg,
+            ..
+        } => {
             if let Some(r) = receiver {
                 scan_expr_fields(&r.0, interner, fields);
             }
@@ -1267,7 +1375,11 @@ fn scan_expr_fields(expr: &Expr, interner: &Interner, fields: &mut Vec<SymbolId>
                 scan_expr_fields(&b.0, interner, fields);
             }
         }
-        Expr::Conditional { condition, then_expr, else_expr } => {
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
             scan_expr_fields(&condition.0, interner, fields);
             scan_expr_fields(&then_expr.0, interner, fields);
             scan_expr_fields(&else_expr.0, interner, fields);
@@ -1282,15 +1394,25 @@ fn scan_expr_fields(expr: &Expr, interner: &Interner, fields: &mut Vec<SymbolId>
         }
         Expr::Subscript { receiver, args } => {
             scan_expr_fields(&receiver.0, interner, fields);
-            for a in args { scan_expr_fields(&a.0, interner, fields); }
+            for a in args {
+                scan_expr_fields(&a.0, interner, fields);
+            }
         }
-        Expr::SubscriptSet { receiver, index_args, value } => {
+        Expr::SubscriptSet {
+            receiver,
+            index_args,
+            value,
+        } => {
             scan_expr_fields(&receiver.0, interner, fields);
-            for a in index_args { scan_expr_fields(&a.0, interner, fields); }
+            for a in index_args {
+                scan_expr_fields(&a.0, interner, fields);
+            }
             scan_expr_fields(&value.0, interner, fields);
         }
         Expr::ListLiteral(elems) => {
-            for e in elems { scan_expr_fields(&e.0, interner, fields); }
+            for e in elems {
+                scan_expr_fields(&e.0, interner, fields);
+            }
         }
         Expr::MapLiteral(entries) => {
             for (k, v) in entries {
@@ -1303,11 +1425,15 @@ fn scan_expr_fields(expr: &Expr, interner: &Interner, fields: &mut Vec<SymbolId>
             scan_expr_fields(&to.0, interner, fields);
         }
         Expr::Interpolation(parts) => {
-            for p in parts { scan_expr_fields(&p.0, interner, fields); }
+            for p in parts {
+                scan_expr_fields(&p.0, interner, fields);
+            }
         }
         Expr::Closure { body, .. } => scan_stmt_fields(&body.0, interner, fields),
         Expr::SuperCall { args, .. } => {
-            for a in args { scan_expr_fields(&a.0, interner, fields); }
+            for a in args {
+                scan_expr_fields(&a.0, interner, fields);
+            }
         }
         _ => {}
     }
@@ -1324,7 +1450,11 @@ mod tests {
 
     fn lower(source: &str) -> (MirFunction, Interner) {
         let mut result = parse(source);
-        assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
         let resolve_result = crate::sema::resolve::resolve(&result.module, &result.interner);
         let module_mir = lower_module(&result.module, &mut result.interner, &resolve_result);
         (module_mir.top_level, result.interner)
@@ -1344,7 +1474,10 @@ mod tests {
     #[test]
     fn test_lower_num() {
         let (func, _) = lower("42");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::ConstNum(n) if *n == 42.0));
+        assert_has_instruction(
+            &func,
+            |i| matches!(i, Instruction::ConstNum(n) if *n == 42.0),
+        );
     }
 
     #[test]
@@ -1412,7 +1545,10 @@ mod tests {
     #[test]
     fn test_lower_var_decl() {
         let (func, _) = lower("var x = 42");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::ConstNum(n) if *n == 42.0));
+        assert_has_instruction(
+            &func,
+            |i| matches!(i, Instruction::ConstNum(n) if *n == 42.0),
+        );
     }
 
     #[test]
@@ -1551,7 +1687,15 @@ mod tests {
                 }
             }
         }
-        assert_eq!(set_indices, vec![0, 1], "SetModuleVar indices should be [0, 1]");
-        assert_eq!(get_indices, vec![0], "GetModuleVar index for x should be [0]");
+        assert_eq!(
+            set_indices,
+            vec![0, 1],
+            "SetModuleVar indices should be [0, 1]"
+        );
+        assert_eq!(
+            get_indices,
+            vec![0],
+            "GetModuleVar index for x should be [0]"
+        );
     }
 }

@@ -13,7 +13,6 @@
 /// - `this` / `super` used outside a method
 /// - `break` / `continue` used outside a loop
 /// - `return` used at module level (allowed in Wren, but we track it)
-
 use std::collections::HashMap;
 
 use crate::ast::*;
@@ -111,7 +110,10 @@ impl Scope {
     fn add_upvalue(&mut self, info: UpvalueInfo) -> u16 {
         // Check if we already capture this.
         for (i, existing) in self.upvalues.iter().enumerate() {
-            if existing.index == info.index && existing.is_local == info.is_local {
+            if existing.index == info.index
+                && existing.is_local == info.is_local
+                && existing.name == info.name
+            {
                 return i as u16;
             }
         }
@@ -208,7 +210,10 @@ impl<'a> Resolver<'a> {
     }
 
     fn find_module_var(&self, name: SymbolId) -> Option<u16> {
-        self.module_vars.iter().position(|&n| n == name).map(|i| i as u16)
+        self.module_vars
+            .iter()
+            .position(|&n| n == name)
+            .map(|i| i as u16)
     }
 
     // -- Scope management ---------------------------------------------------
@@ -297,14 +302,28 @@ impl<'a> Resolver<'a> {
         None
     }
 
-    fn capture_upvalue(&mut self, source_scope: usize, local_idx: u16, target_scope: usize) -> ResolvedName {
+    fn capture_upvalue(
+        &mut self,
+        source_scope: usize,
+        local_idx: u16,
+        target_scope: usize,
+    ) -> ResolvedName {
         // Create a chain of upvalues from source_scope+1 to target_scope.
+        // Skip Block scopes — they aren't closure boundaries at runtime.
+        // Only Closure/Method scopes get upvalue entries.
         let name = self.scopes[source_scope].locals[local_idx as usize].name;
         let mut index = local_idx;
         let mut is_local = true;
 
         for scope_idx in (source_scope + 1)..=target_scope {
-            let info = UpvalueInfo { index, is_local, name };
+            if self.scopes[scope_idx].kind == ScopeKind::Block {
+                continue;
+            }
+            let info = UpvalueInfo {
+                index,
+                is_local,
+                name,
+            };
             index = self.scopes[scope_idx].add_upvalue(info);
             is_local = false;
         }
@@ -717,10 +736,7 @@ mod tests {
 
     #[test]
     fn test_duplicate_local_var() {
-        expect_error_containing(
-            "{\n  var x = 1\n  var x = 2\n}",
-            "already declared",
-        );
+        expect_error_containing("{\n  var x = 1\n  var x = 2\n}", "already declared");
     }
 
     #[test]
@@ -769,9 +785,7 @@ mod tests {
 
     #[test]
     fn test_super_in_method() {
-        expect_no_errors(
-            "class Base {}\nclass Foo is Base {\n  bar { super.bar() }\n}",
-        );
+        expect_no_errors("class Base {}\nclass Foo is Base {\n  bar { super.bar() }\n}");
     }
 
     // -- Fields -------------------------------------------------------------

@@ -52,7 +52,11 @@ impl Value {
     /// Box a boolean.
     #[inline(always)]
     pub fn bool(b: bool) -> Self {
-        if b { Value(TAG_TRUE) } else { Value(TAG_FALSE) }
+        if b {
+            Value(TAG_TRUE)
+        } else {
+            Value(TAG_FALSE)
+        }
     }
 
     /// The internal undefined sentinel (never exposed to user code).
@@ -188,7 +192,10 @@ impl Value {
     #[inline]
     pub fn is_string_object(self) -> bool {
         if let Some(ptr) = self.as_object() {
-            unsafe { (*(ptr as *const super::object::ObjHeader)).obj_type == super::object::ObjType::String }
+            unsafe {
+                (*(ptr as *const super::object::ObjHeader)).obj_type
+                    == super::object::ObjType::String
+            }
         } else {
             false
         }

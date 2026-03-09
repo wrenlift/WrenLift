@@ -149,9 +149,8 @@ impl Parser {
         }
         // Allow semicolons if we ever add them, but Wren uses newlines
         let span = self.current_span();
-        self.errors.push(
-            Diagnostic::error("expected newline after statement").with_label(span, "here"),
-        );
+        self.errors
+            .push(Diagnostic::error("expected newline after statement").with_label(span, "here"));
     }
 
     /// Probe whether a `{` at current position starts a map literal.
@@ -212,9 +211,8 @@ impl Parser {
 
         if !self.check(&Token::Ident) {
             let span = self.current_span();
-            self.errors.push(
-                Diagnostic::error("expected variable name").with_label(span, "here"),
-            );
+            self.errors
+                .push(Diagnostic::error("expected variable name").with_label(span, "here"));
             return None;
         }
         self.advance();
@@ -247,9 +245,8 @@ impl Parser {
         // Module path string
         if !self.check(&Token::StringLit) {
             let span = self.current_span();
-            self.errors.push(
-                Diagnostic::error("expected module path string").with_label(span, "here"),
-            );
+            self.errors
+                .push(Diagnostic::error("expected module path string").with_label(span, "here"));
             return None;
         }
         self.advance();
@@ -262,9 +259,8 @@ impl Parser {
             loop {
                 if !self.check(&Token::Ident) {
                     let span = self.current_span();
-                    self.errors.push(
-                        Diagnostic::error("expected import name").with_label(span, "here"),
-                    );
+                    self.errors
+                        .push(Diagnostic::error("expected import name").with_label(span, "here"));
                     break;
                 }
                 self.advance();
@@ -333,9 +329,8 @@ impl Parser {
             self.skip_newlines();
             if !self.check(&Token::Ident) {
                 let span = self.current_span();
-                self.errors.push(
-                    Diagnostic::error("expected superclass name").with_label(span, "here"),
-                );
+                self.errors
+                    .push(Diagnostic::error("expected superclass name").with_label(span, "here"));
                 return None;
             }
             self.advance();
@@ -383,7 +378,9 @@ impl Parser {
 
         let signature = self.method_signature()?;
 
-        let body = if is_foreign || (class_is_foreign && !matches!(signature, MethodSig::Construct { .. })) {
+        let body = if is_foreign
+            || (class_is_foreign && !matches!(signature, MethodSig::Construct { .. }))
+        {
             self.expect_statement_end();
             None
         } else {
@@ -411,9 +408,8 @@ impl Parser {
             self.skip_newlines();
             if !self.check(&Token::Ident) {
                 let span = self.current_span();
-                self.errors.push(
-                    Diagnostic::error("expected constructor name").with_label(span, "here"),
-                );
+                self.errors
+                    .push(Diagnostic::error("expected constructor name").with_label(span, "here"));
                 return None;
             }
             self.advance();
@@ -461,9 +457,8 @@ impl Parser {
         // Named method, getter, or setter
         if !self.check(&Token::Ident) {
             let span = self.current_span();
-            self.errors.push(
-                Diagnostic::error("expected method name").with_label(span, "here"),
-            );
+            self.errors
+                .push(Diagnostic::error("expected method name").with_label(span, "here"));
             return None;
         }
         self.advance();
@@ -474,9 +469,8 @@ impl Parser {
             self.expect(&Token::LeftParen, "expected '(' after '='");
             if !self.check(&Token::Ident) {
                 let span = self.current_span();
-                self.errors.push(
-                    Diagnostic::error("expected parameter name").with_label(span, "here"),
-                );
+                self.errors
+                    .push(Diagnostic::error("expected parameter name").with_label(span, "here"));
                 return None;
             }
             self.advance();
@@ -727,10 +721,7 @@ impl Parser {
         self.advance(); // consume `return`
 
         // Check if there's an expression on the same line
-        if self.is_at_end()
-            || self.check(&Token::Newline)
-            || self.check(&Token::RightBrace)
-        {
+        if self.is_at_end() || self.check(&Token::Newline) || self.check(&Token::RightBrace) {
             let end = self.previous_span().end;
             self.expect_statement_end();
             return Some((Stmt::Return(None), start..end));
@@ -1308,9 +1299,7 @@ impl Parser {
                 Some((Expr::Str(text), span))
             }
 
-            Token::InterpolationStart => {
-                self.parse_interpolation(start)
-            }
+            Token::InterpolationStart => self.parse_interpolation(start),
 
             Token::True => {
                 self.advance();
@@ -1559,17 +1548,11 @@ impl Parser {
         self.advance(); // consume `{`
         self.skip_newlines();
 
-        // Empty braces: closure with empty body
+        // Empty braces: empty map literal (in expression position, `{}` is a Map)
         if self.check(&Token::RightBrace) {
             self.advance();
             let end = self.previous_span().end;
-            return Some((
-                Expr::Closure {
-                    params: Vec::new(),
-                    body: Box::new((Stmt::Block(Vec::new()), start..end)),
-                },
-                start..end,
-            ));
+            return Some((Expr::MapLiteral(Vec::new()), start..end));
         }
 
         // Pipe means closure params
@@ -1582,13 +1565,12 @@ impl Parser {
         // Save position and errors, try parsing an expression, check for `:`
         let probe_pos = self.pos;
         let probe_errors = self.errors.len();
-        if let Some(_) = self.expression() {
-            if self.check(&Token::Colon) {
-                // It's a map — restore to probe_pos and parse properly.
-                self.pos = probe_pos;
-                self.errors.truncate(probe_errors);
-                return self.map_literal(start);
-            }
+        if self.expression().is_some()
+            && self.check(&Token::Colon) {
+            // It's a map — restore to probe_pos and parse properly.
+            self.pos = probe_pos;
+            self.errors.truncate(probe_errors);
+            return self.map_literal(start);
         }
 
         // Otherwise it's a closure body (no params) — discard probe errors.
@@ -1757,7 +1739,12 @@ mod tests {
 
     fn parse_one_stmt(source: &str) -> Stmt {
         let module = parse_ok(source);
-        assert_eq!(module.len(), 1, "expected 1 statement, got {}", module.len());
+        assert_eq!(
+            module.len(),
+            1,
+            "expected 1 statement, got {}",
+            module.len()
+        );
         module[0].0.clone()
     }
 
@@ -1982,7 +1969,11 @@ mod tests {
         let (expr, errors) = parse_expr("super.method(x)");
         assert!(errors.is_empty());
         match expr {
-            Expr::SuperCall { method, args, has_parens } => {
+            Expr::SuperCall {
+                method,
+                args,
+                has_parens,
+            } => {
                 assert!(method.is_some());
                 assert_eq!(args.len(), 1);
                 assert!(has_parens);
@@ -1996,7 +1987,11 @@ mod tests {
         let (expr, errors) = parse_expr("super(x)");
         assert!(errors.is_empty());
         match expr {
-            Expr::SuperCall { method, args, has_parens } => {
+            Expr::SuperCall {
+                method,
+                args,
+                has_parens,
+            } => {
                 assert!(method.is_none());
                 assert_eq!(args.len(), 1);
                 assert!(has_parens);
@@ -2064,8 +2059,12 @@ mod tests {
         assert!(errors.is_empty());
         // Should be a nested chain of calls
         match expr {
-            Expr::Call { receiver: Some(r), .. } => match &r.0 {
-                Expr::Call { receiver: Some(r2), .. } => match &r2.0 {
+            Expr::Call {
+                receiver: Some(r), ..
+            } => match &r.0 {
+                Expr::Call {
+                    receiver: Some(r2), ..
+                } => match &r2.0 {
                     Expr::Call { .. } => {}
                     _ => panic!("expected inner Call"),
                 },

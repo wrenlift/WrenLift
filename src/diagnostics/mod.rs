@@ -99,11 +99,7 @@ impl Diagnostic {
             Severity::Info => ReportKind::Advice,
         };
 
-        let span = self
-            .labels
-            .first()
-            .map(|l| l.span.clone())
-            .unwrap_or(0..0);
+        let span = self.labels.first().map(|l| l.span.clone()).unwrap_or(0..0);
 
         let mut builder = Report::build(kind, span).with_message(&self.message);
 

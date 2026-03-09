@@ -11,7 +11,6 @@
 /// - MirType::Value, I64 → i64 locals (NaN-boxed values, integers)
 /// - MirType::F64 → f64 locals
 /// - MirType::Bool → i32 locals
-
 use std::collections::HashMap;
 
 use wasm_encoder::{
@@ -84,8 +83,7 @@ impl WasmModule {
     /// Dump module as WAT text format for debugging.
     #[cfg(test)]
     pub fn dump_wat(&self) -> Result<String, String> {
-        wasmprinter::print_bytes(&self.bytes)
-            .map_err(|e| format!("WAT print error: {}", e))
+        wasmprinter::print_bytes(&self.bytes).map_err(|e| format!("WAT print error: {}", e))
     }
 }
 
@@ -136,7 +134,9 @@ impl<'a> MirWasmEmitter<'a> {
         // Type section: import types + compiled function type.
         let mut types = TypeSection::new();
         for (_, params, results) in &self.import_list {
-            types.ty().function(params.iter().copied(), results.iter().copied());
+            types
+                .ty()
+                .function(params.iter().copied(), results.iter().copied());
         }
         let func_type_idx = self.import_list.len() as u32;
         types.ty().function([], [ValType::I64]); // () -> i64 (NaN-boxed Value)
@@ -145,7 +145,7 @@ impl<'a> MirWasmEmitter<'a> {
         // Import section.
         let mut imports = ImportSection::new();
         for (i, (name, _, _)) in self.import_list.iter().enumerate() {
-            imports.import("wren", *name, EntityType::Function(i as u32));
+            imports.import("wren", name, EntityType::Function(i as u32));
         }
         module.section(&imports);
 
@@ -248,14 +248,18 @@ impl<'a> MirWasmEmitter<'a> {
                     Instruction::Mul(..) => self.register_import_binop("wren_num_mul"),
                     Instruction::Div(..) => self.register_import_binop("wren_num_div"),
                     Instruction::Mod(..) => self.register_import_binop("wren_num_mod"),
-                    Instruction::Neg(_) => self.register_import("wren_num_neg", &[ValType::I64], &[ValType::I64]),
+                    Instruction::Neg(_) => {
+                        self.register_import("wren_num_neg", &[ValType::I64], &[ValType::I64])
+                    }
                     Instruction::CmpLt(..) => self.register_import_binop("wren_cmp_lt"),
                     Instruction::CmpGt(..) => self.register_import_binop("wren_cmp_gt"),
                     Instruction::CmpLe(..) => self.register_import_binop("wren_cmp_le"),
                     Instruction::CmpGe(..) => self.register_import_binop("wren_cmp_ge"),
                     Instruction::CmpEq(..) => self.register_import_binop("wren_cmp_eq"),
                     Instruction::CmpNe(..) => self.register_import_binop("wren_cmp_ne"),
-                    Instruction::Not(_) => self.register_import("wren_not", &[ValType::I64], &[ValType::I64]),
+                    Instruction::Not(_) => {
+                        self.register_import("wren_not", &[ValType::I64], &[ValType::I64])
+                    }
                     Instruction::Call { args, .. } => {
                         // wren_call(receiver, method_id, args...) → i64
                         let params = vec![ValType::I64; args.len() + 2];
@@ -266,16 +270,32 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_super_call", &params, &[ValType::I64]);
                     }
                     Instruction::GetField(..) => {
-                        self.register_import("wren_get_field", &[ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_get_field",
+                            &[ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::SetField(..) => {
-                        self.register_import("wren_set_field", &[ValType::I64, ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_set_field",
+                            &[ValType::I64, ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::GetModuleVar(_) => {
-                        self.register_import("wren_get_module_var", &[ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_get_module_var",
+                            &[ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::SetModuleVar(..) => {
-                        self.register_import("wren_set_module_var", &[ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_set_module_var",
+                            &[ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::MakeClosure { upvalues, .. } => {
                         let params = vec![ValType::I64; upvalues.len() + 1];
@@ -285,7 +305,11 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_get_upvalue", &[ValType::I64], &[ValType::I64]);
                     }
                     Instruction::SetUpvalue(..) => {
-                        self.register_import("wren_set_upvalue", &[ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_set_upvalue",
+                            &[ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::MakeList(elems) => {
                         let params = vec![ValType::I64; elems.len()];
@@ -296,7 +320,11 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_make_map", &params, &[ValType::I64]);
                     }
                     Instruction::MakeRange(..) => {
-                        self.register_import("wren_make_range", &[ValType::I64, ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_make_range",
+                            &[ValType::I64, ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::StringConcat(parts) => {
                         let params = vec![ValType::I64; parts.len()];
@@ -306,10 +334,18 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_to_string", &[ValType::I64], &[ValType::I64]);
                     }
                     Instruction::IsType(..) => {
-                        self.register_import("wren_is_type", &[ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_is_type",
+                            &[ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::GuardClass(..) => {
-                        self.register_import("wren_guard_class", &[ValType::I64, ValType::I64], &[ValType::I64]);
+                        self.register_import(
+                            "wren_guard_class",
+                            &[ValType::I64, ValType::I64],
+                            &[ValType::I64],
+                        );
                     }
                     Instruction::SubscriptGet { args, .. } => {
                         let params = vec![ValType::I64; args.len() + 1];
@@ -340,7 +376,8 @@ impl<'a> MirWasmEmitter<'a> {
         }
         let idx = self.import_list.len() as u32;
         self.runtime_imports.insert(name, idx);
-        self.import_list.push((name, params.to_vec(), results.to_vec()));
+        self.import_list
+            .push((name, params.to_vec(), results.to_vec()));
     }
 
     // -----------------------------------------------------------------------
@@ -397,14 +434,7 @@ impl<'a> MirWasmEmitter<'a> {
         }
         loops
             .into_iter()
-            .map(|(header, max_latch)| {
-                (
-                    header,
-                    LoopRegion {
-                        end: max_latch + 1,
-                    },
-                )
-            })
+            .map(|(header, max_latch)| (header, LoopRegion { end: max_latch + 1 }))
             .collect()
     }
 
@@ -509,7 +539,14 @@ impl<'a> MirWasmEmitter<'a> {
                     func.instruction(&WasmInst::Loop(wasm_encoder::BlockType::Empty));
 
                     // Recursively emit loop body (skip_loop_at prevents re-wrapping header).
-                    self.emit_region_inner(func, *header, *loop_end, loops, scope_stack, Some(*header))?;
+                    self.emit_region_inner(
+                        func,
+                        *header,
+                        *loop_end,
+                        loops,
+                        scope_stack,
+                        Some(*header),
+                    )?;
 
                     // Close loop scope.
                     scope_stack.pop();
@@ -593,7 +630,11 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::ConstBool(b) => {
-                let bits = if *b { 0x7FFC_0000_0000_0002u64 } else { 0x7FFC_0000_0000_0001u64 };
+                let bits = if *b {
+                    0x7FFC_0000_0000_0002u64
+                } else {
+                    0x7FFC_0000_0000_0001u64
+                };
                 func.instruction(&WasmInst::I64Const(bits as i64));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
@@ -686,7 +727,13 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::GuardClass(a, sym) => {
-                self.emit_runtime_call_with_imm(func, dst, "wren_guard_class", *a, sym.index() as i64)?;
+                self.emit_runtime_call_with_imm(
+                    func,
+                    dst,
+                    "wren_guard_class",
+                    *a,
+                    sym.index() as i64,
+                )?;
             }
 
             // -- Move --
@@ -696,20 +743,42 @@ impl<'a> MirWasmEmitter<'a> {
             }
 
             // -- Boxed arithmetic → runtime calls --
-            Instruction::Add(a, b) => self.emit_runtime_call(func, dst, "wren_num_add", &[*a, *b])?,
-            Instruction::Sub(a, b) => self.emit_runtime_call(func, dst, "wren_num_sub", &[*a, *b])?,
-            Instruction::Mul(a, b) => self.emit_runtime_call(func, dst, "wren_num_mul", &[*a, *b])?,
-            Instruction::Div(a, b) => self.emit_runtime_call(func, dst, "wren_num_div", &[*a, *b])?,
-            Instruction::Mod(a, b) => self.emit_runtime_call(func, dst, "wren_num_mod", &[*a, *b])?,
+            Instruction::Add(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_num_add", &[*a, *b])?
+            }
+            Instruction::Sub(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_num_sub", &[*a, *b])?
+            }
+            Instruction::Mul(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_num_mul", &[*a, *b])?
+            }
+            Instruction::Div(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_num_div", &[*a, *b])?
+            }
+            Instruction::Mod(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_num_mod", &[*a, *b])?
+            }
             Instruction::Neg(a) => self.emit_runtime_call(func, dst, "wren_num_neg", &[*a])?,
 
             // -- Boxed comparisons → runtime calls --
-            Instruction::CmpLt(a, b) => self.emit_runtime_call(func, dst, "wren_cmp_lt", &[*a, *b])?,
-            Instruction::CmpGt(a, b) => self.emit_runtime_call(func, dst, "wren_cmp_gt", &[*a, *b])?,
-            Instruction::CmpLe(a, b) => self.emit_runtime_call(func, dst, "wren_cmp_le", &[*a, *b])?,
-            Instruction::CmpGe(a, b) => self.emit_runtime_call(func, dst, "wren_cmp_ge", &[*a, *b])?,
-            Instruction::CmpEq(a, b) => self.emit_runtime_call(func, dst, "wren_cmp_eq", &[*a, *b])?,
-            Instruction::CmpNe(a, b) => self.emit_runtime_call(func, dst, "wren_cmp_ne", &[*a, *b])?,
+            Instruction::CmpLt(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_cmp_lt", &[*a, *b])?
+            }
+            Instruction::CmpGt(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_cmp_gt", &[*a, *b])?
+            }
+            Instruction::CmpLe(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_cmp_le", &[*a, *b])?
+            }
+            Instruction::CmpGe(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_cmp_ge", &[*a, *b])?
+            }
+            Instruction::CmpEq(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_cmp_eq", &[*a, *b])?
+            }
+            Instruction::CmpNe(a, b) => {
+                self.emit_runtime_call(func, dst, "wren_cmp_ne", &[*a, *b])?
+            }
 
             // -- Object operations --
             Instruction::GetField(recv, idx) => {
@@ -735,7 +804,11 @@ impl<'a> MirWasmEmitter<'a> {
             }
 
             // -- Calls --
-            Instruction::Call { receiver, method, args } => {
+            Instruction::Call {
+                receiver,
+                method,
+                args,
+            } => {
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 func.instruction(&WasmInst::I64Const(method.index() as i64));
                 for a in args {
@@ -818,7 +891,11 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::Call(self.runtime_imports["wren_subscript_get"]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
-            Instruction::SubscriptSet { receiver, args, value } => {
+            Instruction::SubscriptSet {
+                receiver,
+                args,
+                value,
+            } => {
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 for a in args {
                     func.instruction(&WasmInst::LocalGet(self.local(*a)));
@@ -834,17 +911,25 @@ impl<'a> MirWasmEmitter<'a> {
                 use crate::mir::MathUnaryOp;
                 func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 match op {
-                    MathUnaryOp::Abs => { func.instruction(&WasmInst::F64Abs); }
-                    MathUnaryOp::Ceil => { func.instruction(&WasmInst::F64Ceil); }
-                    MathUnaryOp::Floor => { func.instruction(&WasmInst::F64Floor); }
-                    MathUnaryOp::Sqrt => { func.instruction(&WasmInst::F64Sqrt); }
-                    MathUnaryOp::Trunc => { func.instruction(&WasmInst::F64Trunc); }
+                    MathUnaryOp::Abs => {
+                        func.instruction(&WasmInst::F64Abs);
+                    }
+                    MathUnaryOp::Ceil => {
+                        func.instruction(&WasmInst::F64Ceil);
+                    }
+                    MathUnaryOp::Floor => {
+                        func.instruction(&WasmInst::F64Floor);
+                    }
+                    MathUnaryOp::Sqrt => {
+                        func.instruction(&WasmInst::F64Sqrt);
+                    }
+                    MathUnaryOp::Trunc => {
+                        func.instruction(&WasmInst::F64Trunc);
+                    }
                     _ => {
                         // Other math ops would need imported host functions.
                         // For now, treat as runtime call placeholder.
-                        func.instruction(&WasmInst::Call(
-                            self.runtime_imports["wren_math_unary"],
-                        ));
+                        func.instruction(&WasmInst::Call(self.runtime_imports["wren_math_unary"]));
                     }
                 }
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
@@ -853,9 +938,7 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 func.instruction(&WasmInst::LocalGet(self.local(*b)));
                 // All binary math ops need runtime helpers in WASM.
-                func.instruction(&WasmInst::Call(
-                    self.runtime_imports["wren_math_binary"],
-                ));
+                func.instruction(&WasmInst::Call(self.runtime_imports["wren_math_binary"]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
 
@@ -893,8 +976,7 @@ impl<'a> MirWasmEmitter<'a> {
             }
             Terminator::Branch { target, args } => {
                 self.emit_block_args(func, *target, args);
-                let depth =
-                    Self::find_br_depth(scope_stack, block_idx, target.0 as usize)?;
+                let depth = Self::find_br_depth(scope_stack, block_idx, target.0 as usize)?;
                 func.instruction(&WasmInst::Br(depth));
             }
             Terminator::CondBranch {
@@ -951,14 +1033,28 @@ impl<'a> MirWasmEmitter<'a> {
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn emit_f64_binop(&self, func: &mut Function, dst: ValueId, a: ValueId, b: ValueId, op: WasmInst<'static>) {
+    fn emit_f64_binop(
+        &self,
+        func: &mut Function,
+        dst: ValueId,
+        a: ValueId,
+        b: ValueId,
+        op: WasmInst<'static>,
+    ) {
         func.instruction(&WasmInst::LocalGet(self.local(a)));
         func.instruction(&WasmInst::LocalGet(self.local(b)));
         func.instruction(&op);
         func.instruction(&WasmInst::LocalSet(self.local(dst)));
     }
 
-    fn emit_f64_cmp(&self, func: &mut Function, dst: ValueId, a: ValueId, b: ValueId, op: WasmInst<'static>) {
+    fn emit_f64_cmp(
+        &self,
+        func: &mut Function,
+        dst: ValueId,
+        a: ValueId,
+        b: ValueId,
+        op: WasmInst<'static>,
+    ) {
         func.instruction(&WasmInst::LocalGet(self.local(a)));
         func.instruction(&WasmInst::LocalGet(self.local(b)));
         func.instruction(&op);
@@ -968,7 +1064,14 @@ impl<'a> MirWasmEmitter<'a> {
     }
 
     /// Emit: unbox both operands → truncate → integer op → convert back → rebox.
-    fn emit_bitwise(&self, func: &mut Function, dst: ValueId, a: ValueId, b: ValueId, op: WasmInst<'static>) {
+    fn emit_bitwise(
+        &self,
+        func: &mut Function,
+        dst: ValueId,
+        a: ValueId,
+        b: ValueId,
+        op: WasmInst<'static>,
+    ) {
         // Unbox a: i64 → f64 → i64 (truncated)
         func.instruction(&WasmInst::LocalGet(self.local(a)));
         func.instruction(&WasmInst::F64ReinterpretI64);
@@ -995,7 +1098,9 @@ impl<'a> MirWasmEmitter<'a> {
         for a in args {
             func.instruction(&WasmInst::LocalGet(self.local(*a)));
         }
-        let idx = self.runtime_imports.get(name)
+        let idx = self
+            .runtime_imports
+            .get(name)
             .ok_or_else(|| format!("Runtime function {} not imported", name))?;
         func.instruction(&WasmInst::Call(*idx));
         func.instruction(&WasmInst::LocalSet(self.local(dst)));
@@ -1012,7 +1117,9 @@ impl<'a> MirWasmEmitter<'a> {
     ) -> Result<(), String> {
         func.instruction(&WasmInst::LocalGet(self.local(val)));
         func.instruction(&WasmInst::I64Const(imm));
-        let idx = self.runtime_imports.get(name)
+        let idx = self
+            .runtime_imports
+            .get(name)
             .ok_or_else(|| format!("Runtime function {} not imported", name))?;
         func.instruction(&WasmInst::Call(*idx));
         func.instruction(&WasmInst::LocalSet(self.local(dst)));
@@ -1048,7 +1155,9 @@ mod tests {
     /// Validate a WASM module fully. On failure, dump WAT for debugging.
     fn assert_valid(module: &WasmModule) {
         if let Err(e) = module.validate_full() {
-            let wat = module.dump_wat().unwrap_or_else(|e| format!("<WAT error: {}>", e));
+            let wat = module
+                .dump_wat()
+                .unwrap_or_else(|e| format!("<WAT error: {}>", e));
             panic!("WASM validation failed: {}\n\nWAT dump:\n{}", e, wat);
         }
     }
@@ -1058,7 +1167,9 @@ mod tests {
         let (_, mut mir) = setup();
         let bb = mir.new_block();
         let v0 = mir.new_value();
-        mir.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         mir.block_mut(bb).terminator = Terminator::Return(v0);
 
         let result = emit_mir(&mir);
@@ -1076,10 +1187,18 @@ mod tests {
         let v1 = mir.new_value();
         let v2 = mir.new_value();
         let v3 = mir.new_value();
-        mir.block_mut(bb).instructions.push((v0, Instruction::ConstF64(3.0)));
-        mir.block_mut(bb).instructions.push((v1, Instruction::ConstF64(4.0)));
-        mir.block_mut(bb).instructions.push((v2, Instruction::AddF64(v0, v1)));
-        mir.block_mut(bb).instructions.push((v3, Instruction::Box(v2)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstF64(3.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstF64(4.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::AddF64(v0, v1)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v3, Instruction::Box(v2)));
         mir.block_mut(bb).terminator = Terminator::Return(v3);
 
         let module = emit_mir(&mir).unwrap();
@@ -1107,7 +1226,9 @@ mod tests {
             target: bb1,
             args: vec![],
         };
-        mir.block_mut(bb1).instructions.push((v0, Instruction::ConstNum(1.0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
         mir.block_mut(bb1).terminator = Terminator::Return(v0);
 
         let module = emit_mir(&mir).unwrap();
@@ -1124,7 +1245,9 @@ mod tests {
         let v1 = mir.new_value();
         let v2 = mir.new_value();
 
-        mir.block_mut(bb0).instructions.push((v_cond, Instruction::ConstBool(true)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_cond, Instruction::ConstBool(true)));
         mir.block_mut(bb0).terminator = Terminator::CondBranch {
             condition: v_cond,
             true_target: bb1,
@@ -1132,9 +1255,13 @@ mod tests {
             false_target: bb2,
             false_args: vec![],
         };
-        mir.block_mut(bb1).instructions.push((v1, Instruction::ConstNum(1.0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v1, Instruction::ConstNum(1.0)));
         mir.block_mut(bb1).terminator = Terminator::Return(v1);
-        mir.block_mut(bb2).instructions.push((v2, Instruction::ConstNum(2.0)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v2, Instruction::ConstNum(2.0)));
         mir.block_mut(bb2).terminator = Terminator::Return(v2);
 
         let module = emit_mir(&mir).unwrap();
@@ -1151,14 +1278,18 @@ mod tests {
         let v0 = mir.new_value();
         let p0 = mir.new_value();
 
-        mir.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(42.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v0],
         };
         let bp = mir.new_value();
         mir.block_mut(bb1).params.push((p0, MirType::Value));
-        mir.block_mut(bb1).instructions.push((bp, Instruction::BlockParam(0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp, Instruction::BlockParam(0)));
         mir.block_mut(bb1).terminator = Terminator::Return(p0);
 
         let module = emit_mir(&mir).unwrap();
@@ -1178,10 +1309,18 @@ mod tests {
         // v1 = Unbox(v0) → f64
         // v2 = NegF64(v1) → f64
         // v3 = Box(v2) → i64 NaN-boxed
-        mir.block_mut(bb).instructions.push((v0, Instruction::ConstNum(3.14)));
-        mir.block_mut(bb).instructions.push((v1, Instruction::Unbox(v0)));
-        mir.block_mut(bb).instructions.push((v2, Instruction::NegF64(v1)));
-        mir.block_mut(bb).instructions.push((v3, Instruction::Box(v2)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.234)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::Unbox(v0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::NegF64(v1)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v3, Instruction::Box(v2)));
         mir.block_mut(bb).terminator = Terminator::Return(v3);
 
         let module = emit_mir(&mir).unwrap();
@@ -1196,9 +1335,15 @@ mod tests {
         let v1 = mir.new_value();
         let v2 = mir.new_value();
 
-        mir.block_mut(bb).instructions.push((v0, Instruction::ConstNum(1.0)));
-        mir.block_mut(bb).instructions.push((v1, Instruction::ConstNum(2.0)));
-        mir.block_mut(bb).instructions.push((v2, Instruction::Add(v0, v1)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(2.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::Add(v0, v1)));
         mir.block_mut(bb).terminator = Terminator::Return(v2);
 
         let module = emit_mir(&mir).unwrap();
@@ -1229,14 +1374,30 @@ mod tests {
         let neg = mir.new_value();
         let boxed = mir.new_value();
 
-        mir.block_mut(bb).instructions.push((a, Instruction::ConstF64(10.0)));
-        mir.block_mut(bb).instructions.push((b, Instruction::ConstF64(3.0)));
-        mir.block_mut(bb).instructions.push((add, Instruction::AddF64(a, b)));
-        mir.block_mut(bb).instructions.push((sub, Instruction::SubF64(add, b)));
-        mir.block_mut(bb).instructions.push((mul, Instruction::MulF64(sub, a)));
-        mir.block_mut(bb).instructions.push((div, Instruction::DivF64(mul, b)));
-        mir.block_mut(bb).instructions.push((neg, Instruction::NegF64(div)));
-        mir.block_mut(bb).instructions.push((boxed, Instruction::Box(neg)));
+        mir.block_mut(bb)
+            .instructions
+            .push((a, Instruction::ConstF64(10.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((b, Instruction::ConstF64(3.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((add, Instruction::AddF64(a, b)));
+        mir.block_mut(bb)
+            .instructions
+            .push((sub, Instruction::SubF64(add, b)));
+        mir.block_mut(bb)
+            .instructions
+            .push((mul, Instruction::MulF64(sub, a)));
+        mir.block_mut(bb)
+            .instructions
+            .push((div, Instruction::DivF64(mul, b)));
+        mir.block_mut(bb)
+            .instructions
+            .push((neg, Instruction::NegF64(div)));
+        mir.block_mut(bb)
+            .instructions
+            .push((boxed, Instruction::Box(neg)));
         mir.block_mut(bb).terminator = Terminator::Return(boxed);
 
         let module = emit_mir(&mir).unwrap();
@@ -1252,10 +1413,18 @@ mod tests {
         let cmp = mir.new_value();
         let guarded = mir.new_value();
 
-        mir.block_mut(bb).instructions.push((a, Instruction::ConstF64(1.0)));
-        mir.block_mut(bb).instructions.push((b, Instruction::ConstF64(2.0)));
-        mir.block_mut(bb).instructions.push((cmp, Instruction::CmpLtF64(a, b)));
-        mir.block_mut(bb).instructions.push((guarded, Instruction::ConstNum(42.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((a, Instruction::ConstF64(1.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((b, Instruction::ConstF64(2.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((cmp, Instruction::CmpLtF64(a, b)));
+        mir.block_mut(bb)
+            .instructions
+            .push((guarded, Instruction::ConstNum(42.0)));
         mir.block_mut(bb).terminator = Terminator::Return(guarded);
 
         let module = emit_mir(&mir).unwrap();
@@ -1272,17 +1441,33 @@ mod tests {
         let sum = mir.new_value();
         let boxed = mir.new_value();
 
-        mir.block_mut(bb).instructions.push((a, Instruction::ConstF64(10.0)));
-        mir.block_mut(bb).instructions.push((b, Instruction::ConstF64(20.0)));
-        mir.block_mut(bb).instructions.push((sum, Instruction::AddF64(a, b)));
-        mir.block_mut(bb).instructions.push((boxed, Instruction::Box(sum)));
+        mir.block_mut(bb)
+            .instructions
+            .push((a, Instruction::ConstF64(10.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((b, Instruction::ConstF64(20.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((sum, Instruction::AddF64(a, b)));
+        mir.block_mut(bb)
+            .instructions
+            .push((boxed, Instruction::Box(sum)));
         mir.block_mut(bb).terminator = Terminator::Return(boxed);
 
         let module = emit_mir(&mir).unwrap();
         assert_valid(&module);
         let wat = module.dump_wat().unwrap();
-        assert!(wat.contains("f64.add"), "WAT should contain f64.add:\n{}", wat);
-        assert!(wat.contains("f64.const"), "WAT should contain f64.const:\n{}", wat);
+        assert!(
+            wat.contains("f64.add"),
+            "WAT should contain f64.add:\n{}",
+            wat
+        );
+        assert!(
+            wat.contains("f64.const"),
+            "WAT should contain f64.const:\n{}",
+            wat
+        );
     }
 
     #[test]
@@ -1290,7 +1475,9 @@ mod tests {
         let (_, mut mir) = setup();
         let bb = mir.new_block();
         let v0 = mir.new_value();
-        mir.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         mir.block_mut(bb).terminator = Terminator::Return(v0);
 
         let module = emit_mir(&mir).unwrap();
@@ -1301,12 +1488,18 @@ mod tests {
         let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
-        let func = instance.get_typed_func::<(), i64>(&mut store, "fn_0").unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
         let result = func.call(&mut store, ()).unwrap();
 
         // 42.0 NaN-boxed = f64 bits of 42.0
         let expected = 42.0f64.to_bits() as i64;
-        assert_eq!(result, expected, "Expected NaN-boxed 42.0 ({}), got {}", expected, result);
+        assert_eq!(
+            result, expected,
+            "Expected NaN-boxed 42.0 ({}), got {}",
+            expected, result
+        );
     }
 
     #[test]
@@ -1318,10 +1511,18 @@ mod tests {
         let sum = mir.new_value();
         let boxed = mir.new_value();
 
-        mir.block_mut(bb).instructions.push((a, Instruction::ConstF64(10.0)));
-        mir.block_mut(bb).instructions.push((b, Instruction::ConstF64(20.0)));
-        mir.block_mut(bb).instructions.push((sum, Instruction::AddF64(a, b)));
-        mir.block_mut(bb).instructions.push((boxed, Instruction::Box(sum)));
+        mir.block_mut(bb)
+            .instructions
+            .push((a, Instruction::ConstF64(10.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((b, Instruction::ConstF64(20.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((sum, Instruction::AddF64(a, b)));
+        mir.block_mut(bb)
+            .instructions
+            .push((boxed, Instruction::Box(sum)));
         mir.block_mut(bb).terminator = Terminator::Return(boxed);
 
         let module = emit_mir(&mir).unwrap();
@@ -1331,7 +1532,9 @@ mod tests {
         let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
-        let func = instance.get_typed_func::<(), i64>(&mut store, "fn_0").unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
         let result = func.call(&mut store, ()).unwrap();
 
         let expected = 30.0f64.to_bits() as i64;
@@ -1351,7 +1554,9 @@ mod tests {
         let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
-        let func = instance.get_typed_func::<(), i64>(&mut store, "fn_0").unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
         let result = func.call(&mut store, ()).unwrap();
 
         let null_bits = 0x7FFC_0000_0000_0000u64 as i64;
@@ -1369,7 +1574,9 @@ mod tests {
             target: bb1,
             args: vec![],
         };
-        mir.block_mut(bb1).instructions.push((v0, Instruction::ConstNum(99.0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v0, Instruction::ConstNum(99.0)));
         mir.block_mut(bb1).terminator = Terminator::Return(v0);
 
         let module = emit_mir(&mir).unwrap();
@@ -1379,7 +1586,9 @@ mod tests {
         let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
-        let func = instance.get_typed_func::<(), i64>(&mut store, "fn_0").unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
         let result = func.call(&mut store, ()).unwrap();
 
         let expected = 99.0f64.to_bits() as i64;
@@ -1397,13 +1606,17 @@ mod tests {
         let p0 = mir.new_value();
         let bp = mir.new_value();
 
-        mir.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(42.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v0],
         };
         mir.block_mut(bb1).params.push((p0, MirType::Value));
-        mir.block_mut(bb1).instructions.push((bp, Instruction::BlockParam(0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp, Instruction::BlockParam(0)));
         mir.block_mut(bb1).terminator = Terminator::Return(p0);
 
         let module = emit_mir(&mir).unwrap();
@@ -1413,11 +1626,16 @@ mod tests {
         let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
-        let func = instance.get_typed_func::<(), i64>(&mut store, "fn_0").unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
         let result = func.call(&mut store, ()).unwrap();
 
         let expected = 42.0f64.to_bits() as i64;
-        assert_eq!(result, expected, "Expected NaN-boxed 42.0 through block param");
+        assert_eq!(
+            result, expected,
+            "Expected NaN-boxed 42.0 through block param"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -1439,8 +1657,12 @@ mod tests {
         // bb0: init
         let v_zero = mir.new_value();
         let v_one = mir.new_value();
-        mir.block_mut(bb0).instructions.push((v_zero, Instruction::ConstF64(0.0)));
-        mir.block_mut(bb0).instructions.push((v_one, Instruction::ConstF64(1.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_zero, Instruction::ConstF64(0.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_one, Instruction::ConstF64(1.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v_zero, v_one],
@@ -1453,15 +1675,25 @@ mod tests {
         mir.block_mut(bb1).params.push((p_i, MirType::F64));
         let bp0 = mir.new_value();
         let bp1 = mir.new_value();
-        mir.block_mut(bb1).instructions.push((bp0, Instruction::BlockParam(0)));
-        mir.block_mut(bb1).instructions.push((bp1, Instruction::BlockParam(1)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp0, Instruction::BlockParam(0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp1, Instruction::BlockParam(1)));
         let v_limit = mir.new_value();
         let v_cmp = mir.new_value();
-        mir.block_mut(bb1).instructions.push((v_limit, Instruction::ConstF64(5.0)));
-        mir.block_mut(bb1).instructions.push((v_cmp, Instruction::CmpLtF64(p_i, v_limit)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v_limit, Instruction::ConstF64(5.0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v_cmp, Instruction::CmpLtF64(p_i, v_limit)));
         // Need to box the cmp result for truthiness check
         let v_cmp_boxed = mir.new_value();
-        mir.block_mut(bb1).instructions.push((v_cmp_boxed, Instruction::ConstBool(true)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v_cmp_boxed, Instruction::ConstBool(true)));
         mir.block_mut(bb1).terminator = Terminator::CondBranch {
             condition: v_cmp_boxed, // placeholder - real impl would check v_cmp
             true_target: bb2,
@@ -1474,9 +1706,15 @@ mod tests {
         let v_new_sum = mir.new_value();
         let v_inc = mir.new_value();
         let v_new_i = mir.new_value();
-        mir.block_mut(bb2).instructions.push((v_new_sum, Instruction::AddF64(p_sum, p_i)));
-        mir.block_mut(bb2).instructions.push((v_inc, Instruction::ConstF64(1.0)));
-        mir.block_mut(bb2).instructions.push((v_new_i, Instruction::AddF64(p_i, v_inc)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_new_sum, Instruction::AddF64(p_sum, p_i)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_inc, Instruction::ConstF64(1.0)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_new_i, Instruction::AddF64(p_i, v_inc)));
         mir.block_mut(bb2).terminator = Terminator::Branch {
             target: bb1, // BACK EDGE
             args: vec![v_new_sum, v_new_i],
@@ -1484,7 +1722,9 @@ mod tests {
 
         // bb3: exit
         let v_result = mir.new_value();
-        mir.block_mut(bb3).instructions.push((v_result, Instruction::Box(p_sum)));
+        mir.block_mut(bb3)
+            .instructions
+            .push((v_result, Instruction::Box(p_sum)));
         mir.block_mut(bb3).terminator = Terminator::Return(v_result);
 
         let result = emit_mir(&mir);
@@ -1515,8 +1755,12 @@ mod tests {
         // bb0: sum=0, do_loop=true(boxed); branch bb1
         let v_sum_init = mir.new_value();
         let v_fortytwo = mir.new_value();
-        mir.block_mut(bb0).instructions.push((v_sum_init, Instruction::ConstF64(0.0)));
-        mir.block_mut(bb0).instructions.push((v_fortytwo, Instruction::ConstF64(42.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_sum_init, Instruction::ConstF64(0.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_fortytwo, Instruction::ConstF64(42.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v_sum_init, v_fortytwo],
@@ -1529,8 +1773,12 @@ mod tests {
         mir.block_mut(bb1).params.push((p_val, MirType::F64));
         let bp0 = mir.new_value();
         let bp1 = mir.new_value();
-        mir.block_mut(bb1).instructions.push((bp0, Instruction::BlockParam(0)));
-        mir.block_mut(bb1).instructions.push((bp1, Instruction::BlockParam(1)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp0, Instruction::BlockParam(0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp1, Instruction::BlockParam(1)));
         mir.block_mut(bb1).terminator = Terminator::Branch {
             target: bb2,
             args: vec![],
@@ -1541,12 +1789,18 @@ mod tests {
         // Otherwise exit.
         let v_new_sum = mir.new_value();
         let v_cmp_zero = mir.new_value();
-        mir.block_mut(bb2).instructions.push((v_new_sum, Instruction::AddF64(p_sum, p_val)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_new_sum, Instruction::AddF64(p_sum, p_val)));
         // Check if p_sum was 0 (first iteration). CmpEqF64 doesn't exist as typed, use CmpLtF64.
         // Actually let's simplify: just do one iteration and exit.
         let v_zero = mir.new_value();
-        mir.block_mut(bb2).instructions.push((v_zero, Instruction::ConstF64(0.0)));
-        mir.block_mut(bb2).instructions.push((v_cmp_zero, Instruction::CmpLtF64(p_sum, p_val)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_zero, Instruction::ConstF64(0.0)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_cmp_zero, Instruction::CmpLtF64(p_sum, p_val)));
         // p_sum < p_val means p_sum=0 < p_val=42 on first iter (true), 42 < 42 on second (false)
         // We need this as a boxed value for wren_is_truthy...
         // Since wasmtime tests don't have wren_is_truthy, let's use a direct approach instead.
@@ -1571,7 +1825,9 @@ mod tests {
 
         // bb3: return boxed sum
         let v_result = mir.new_value();
-        mir.block_mut(bb3).instructions.push((v_result, Instruction::Box(v_new_sum)));
+        mir.block_mut(bb3)
+            .instructions
+            .push((v_result, Instruction::Box(v_new_sum)));
         mir.block_mut(bb3).terminator = Terminator::Return(v_result);
 
         // This doesn't actually have a back-edge, so add one from bb3... no.
@@ -1587,7 +1843,9 @@ mod tests {
         let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
         let mut store = wasmtime::Store::new(&engine, ());
         let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
-        let func = instance.get_typed_func::<(), i64>(&mut store, "fn_0").unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
         let result = func.call(&mut store, ()).unwrap();
 
         let expected = 42.0f64.to_bits() as i64;
@@ -1607,8 +1865,12 @@ mod tests {
 
         let v0 = mir.new_value();
         let v_flag = mir.new_value();
-        mir.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(1.0)));
-        mir.block_mut(bb0).instructions.push((v_flag, Instruction::ConstBool(false)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_flag, Instruction::ConstBool(false)));
         mir.block_mut(bb0).terminator = Terminator::CondBranch {
             condition: v_flag,
             true_target: bb1,
@@ -1625,7 +1887,11 @@ mod tests {
         mir.block_mut(bb2).terminator = Terminator::Return(v0);
 
         let result = emit_mir(&mir);
-        assert!(result.is_ok(), "Self-loop emission failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Self-loop emission failed: {:?}",
+            result.err()
+        );
         assert_valid(&result.unwrap());
     }
 
@@ -1642,7 +1908,9 @@ mod tests {
         let bb4 = mir.new_block(); // exit
 
         let v0 = mir.new_value();
-        mir.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(1.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![],
@@ -1650,7 +1918,9 @@ mod tests {
 
         // bb1: outer header, CondBranch → bb2 (enter inner) or bb4 (exit)
         let v_flag1 = mir.new_value();
-        mir.block_mut(bb1).instructions.push((v_flag1, Instruction::ConstBool(true)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v_flag1, Instruction::ConstBool(true)));
         mir.block_mut(bb1).terminator = Terminator::CondBranch {
             condition: v_flag1,
             true_target: bb2,
@@ -1667,7 +1937,9 @@ mod tests {
 
         // bb3: CondBranch → bb2 (inner back-edge) or bb1 (outer back-edge)
         let v_flag2 = mir.new_value();
-        mir.block_mut(bb3).instructions.push((v_flag2, Instruction::ConstBool(false)));
+        mir.block_mut(bb3)
+            .instructions
+            .push((v_flag2, Instruction::ConstBool(false)));
         mir.block_mut(bb3).terminator = Terminator::CondBranch {
             condition: v_flag2,
             true_target: bb2, // inner back-edge
@@ -1679,7 +1951,11 @@ mod tests {
         mir.block_mut(bb4).terminator = Terminator::Return(v0);
 
         let result = emit_mir(&mir);
-        assert!(result.is_ok(), "Nested loop emission failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Nested loop emission failed: {:?}",
+            result.err()
+        );
         assert_valid(&result.unwrap());
     }
 
@@ -1698,7 +1974,9 @@ mod tests {
         let bb3 = mir.new_block();
 
         let v_init = mir.new_value();
-        mir.block_mut(bb0).instructions.push((v_init, Instruction::ConstNum(5.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v_init, Instruction::ConstNum(5.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v_init],
@@ -1707,7 +1985,9 @@ mod tests {
         let p0 = mir.new_value();
         mir.block_mut(bb1).params.push((p0, MirType::Value));
         let bp = mir.new_value();
-        mir.block_mut(bb1).instructions.push((bp, Instruction::BlockParam(0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp, Instruction::BlockParam(0)));
         mir.block_mut(bb1).terminator = Terminator::Branch {
             target: bb2,
             args: vec![],
@@ -1715,7 +1995,9 @@ mod tests {
 
         // bb2: CondBranch — continue loop or exit
         let v_flag = mir.new_value();
-        mir.block_mut(bb2).instructions.push((v_flag, Instruction::ConstBool(false)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_flag, Instruction::ConstBool(false)));
         mir.block_mut(bb2).terminator = Terminator::CondBranch {
             condition: v_flag,
             true_target: bb1, // back-edge (continue)
@@ -1743,7 +2025,9 @@ mod tests {
         let bb4 = mir.new_block(); // exit 2 (reached from bb3 or directly)
 
         let v0 = mir.new_value();
-        mir.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(1.0)));
+        mir.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
         mir.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v0],
@@ -1752,9 +2036,13 @@ mod tests {
         let p0 = mir.new_value();
         mir.block_mut(bb1).params.push((p0, MirType::Value));
         let bp = mir.new_value();
-        mir.block_mut(bb1).instructions.push((bp, Instruction::BlockParam(0)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((bp, Instruction::BlockParam(0)));
         let v_cond = mir.new_value();
-        mir.block_mut(bb1).instructions.push((v_cond, Instruction::ConstBool(true)));
+        mir.block_mut(bb1)
+            .instructions
+            .push((v_cond, Instruction::ConstBool(true)));
         mir.block_mut(bb1).terminator = Terminator::CondBranch {
             condition: v_cond,
             true_target: bb2,
@@ -1764,7 +2052,9 @@ mod tests {
         };
 
         let v_flag = mir.new_value();
-        mir.block_mut(bb2).instructions.push((v_flag, Instruction::ConstBool(false)));
+        mir.block_mut(bb2)
+            .instructions
+            .push((v_flag, Instruction::ConstBool(false)));
         mir.block_mut(bb2).terminator = Terminator::CondBranch {
             condition: v_flag,
             true_target: bb1, // back-edge

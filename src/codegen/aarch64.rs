@@ -2,9 +2,8 @@
 ///
 /// Translates `MachInst` (with physical registers) into ARM64 machine code.
 /// The result is an `ExecutableBuffer` that can be called as a function pointer.
-
 use dynasmrt::aarch64::Assembler;
-use dynasmrt::{AssemblyOffset, dynasm, DynasmApi, DynasmLabelApi, DynamicLabel, ExecutableBuffer};
+use dynasmrt::{dynasm, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer};
 
 use std::collections::HashMap;
 
@@ -49,7 +48,9 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
             | MachInst::JmpNonZero { target, .. }
             | MachInst::TestBitJmpZero { target, .. }
             | MachInst::TestBitJmpNonZero { target, .. } => {
-                labels.entry(*target).or_insert_with(|| asm.new_dynamic_label());
+                labels
+                    .entry(*target)
+                    .or_insert_with(|| asm.new_dynamic_label());
             }
             _ => {}
         }
@@ -61,7 +62,9 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
         emit_inst(&mut asm, inst, &labels)?;
     }
 
-    let buf = asm.finalize().map_err(|_| "assembler finalize failed".to_string())?;
+    let buf = asm
+        .finalize()
+        .map_err(|_| "assembler finalize failed".to_string())?;
     Ok(CompiledCode { buf, start })
 }
 
@@ -71,7 +74,11 @@ fn gp(r: VReg) -> u32 {
 }
 
 fn fp(r: VReg) -> u32 {
-    debug_assert!(r.is_fp() || r.is_vec(), "expected FP/Vec register, got {:?}", r);
+    debug_assert!(
+        r.is_fp() || r.is_vec(),
+        "expected FP/Vec register, got {:?}",
+        r
+    );
     r.index
 }
 
@@ -104,7 +111,6 @@ fn emit_inst(
         // =================================================================
         // Data Movement
         // =================================================================
-
         LoadImm { dst, bits } => {
             let d = gp(*dst);
             // Use movz + movk sequence for arbitrary 64-bit immediate.
@@ -146,7 +152,6 @@ fn emit_inst(
         // =================================================================
         // Integer Arithmetic
         // =================================================================
-
         IAdd { dst, lhs, rhs } => {
             dynasm!(asm ; add X(gp(*dst)), X(gp(*lhs)), X(gp(*rhs)));
         }
@@ -180,7 +185,6 @@ fn emit_inst(
         // =================================================================
         // Bitwise
         // =================================================================
-
         And { dst, lhs, rhs } => {
             dynasm!(asm ; and X(gp(*dst)), X(gp(*lhs)), X(gp(*rhs)));
         }
@@ -224,7 +228,6 @@ fn emit_inst(
         // =================================================================
         // FP Arithmetic
         // =================================================================
-
         FAdd { dst, lhs, rhs } => {
             dynasm!(asm ; fadd D(fp(*dst)), D(fp(*lhs)), D(fp(*rhs)));
         }
@@ -280,7 +283,6 @@ fn emit_inst(
         // =================================================================
         // FMA
         // =================================================================
-
         FMAdd { dst, a, b, c } => {
             dynasm!(asm ; fmadd D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
         }
@@ -300,7 +302,6 @@ fn emit_inst(
         // =================================================================
         // Conversions
         // =================================================================
-
         FCvtToI64 { dst, src } => {
             dynasm!(asm ; fcvtzs X(gp(*dst)), D(fp(*src)));
         }
@@ -312,7 +313,6 @@ fn emit_inst(
         // =================================================================
         // Comparison
         // =================================================================
-
         ICmp { lhs, rhs } => {
             dynasm!(asm ; cmp X(gp(*lhs)), X(gp(*rhs)));
         }
@@ -345,7 +345,6 @@ fn emit_inst(
         // =================================================================
         // Memory
         // =================================================================
-
         Ldr { dst, mem } => {
             let d = gp(*dst);
             let b = emit_addr(asm, mem);
@@ -373,7 +372,6 @@ fn emit_inst(
         // =================================================================
         // Control Flow
         // =================================================================
-
         Jmp { target } => {
             let lbl = get_label(labels, target);
             dynasm!(asm ; b =>lbl);
@@ -418,7 +416,6 @@ fn emit_inst(
         // =================================================================
         // Calls & Returns
         // =================================================================
-
         CallInd { target } => {
             dynasm!(asm ; blr X(gp(*target)));
         }
@@ -427,7 +424,9 @@ fn emit_inst(
             // Runtime calls require the address to be loaded into a register
             // and called via blr. The actual address patching happens at link time.
             // For now, emit a placeholder blr x16.
-            return Err("CallRuntime not yet linked — use CallInd with resolved address".to_string());
+            return Err(
+                "CallRuntime not yet linked — use CallInd with resolved address".to_string(),
+            );
         }
 
         Ret => {
@@ -437,7 +436,6 @@ fn emit_inst(
         // =================================================================
         // Stack Frame
         // =================================================================
-
         Prologue { frame_size } => {
             // Save frame pointer and link register, set up frame.
             let fs = *frame_size as i32;
@@ -467,7 +465,6 @@ fn emit_inst(
         // =================================================================
         // Pseudo-instructions
         // =================================================================
-
         DefLabel(l) => {
             let lbl = get_label(labels, l);
             dynasm!(asm ; =>lbl);
@@ -488,54 +485,83 @@ fn emit_inst(
         // =================================================================
         // SIMD (V128 = NEON 2×f64)
         // =================================================================
-
-        VLoad { dst, mem, width } => {
-            match width {
-                VecWidth::V128 => {
-                    let b = emit_addr(asm, mem);
-                    dynasm!(asm ; ldr Q(fp(*dst)), [X(b)]);
-                }
-                VecWidth::V256 => {
-                    return Err("V256 not supported on aarch64 (no AVX)".to_string());
-                }
+        VLoad { dst, mem, width } => match width {
+            VecWidth::V128 => {
+                let b = emit_addr(asm, mem);
+                dynasm!(asm ; ldr Q(fp(*dst)), [X(b)]);
             }
-        }
-
-        VStore { src, mem, width } => {
-            match width {
-                VecWidth::V128 => {
-                    let b = emit_addr(asm, mem);
-                    dynasm!(asm ; str Q(fp(*src)), [X(b)]);
-                }
-                VecWidth::V256 => {
-                    return Err("V256 not supported on aarch64".to_string());
-                }
+            VecWidth::V256 => {
+                return Err("V256 not supported on aarch64 (no AVX)".to_string());
             }
-        }
+        },
+
+        VStore { src, mem, width } => match width {
+            VecWidth::V128 => {
+                let b = emit_addr(asm, mem);
+                dynasm!(asm ; str Q(fp(*src)), [X(b)]);
+            }
+            VecWidth::V256 => {
+                return Err("V256 not supported on aarch64".to_string());
+            }
+        },
 
         // Vector arithmetic — emit 2d NEON variants for V128.
-        VFAdd { dst, lhs, rhs, width: VecWidth::V128 } => {
+        VFAdd {
+            dst,
+            lhs,
+            rhs,
+            width: VecWidth::V128,
+        } => {
             dynasm!(asm ; fadd V(fp(*dst)).d2, V(fp(*lhs)).d2, V(fp(*rhs)).d2);
         }
-        VFSub { dst, lhs, rhs, width: VecWidth::V128 } => {
+        VFSub {
+            dst,
+            lhs,
+            rhs,
+            width: VecWidth::V128,
+        } => {
             dynasm!(asm ; fsub V(fp(*dst)).d2, V(fp(*lhs)).d2, V(fp(*rhs)).d2);
         }
-        VFMul { dst, lhs, rhs, width: VecWidth::V128 } => {
+        VFMul {
+            dst,
+            lhs,
+            rhs,
+            width: VecWidth::V128,
+        } => {
             dynasm!(asm ; fmul V(fp(*dst)).d2, V(fp(*lhs)).d2, V(fp(*rhs)).d2);
         }
-        VFDiv { dst, lhs, rhs, width: VecWidth::V128 } => {
+        VFDiv {
+            dst,
+            lhs,
+            rhs,
+            width: VecWidth::V128,
+        } => {
             dynasm!(asm ; fdiv V(fp(*dst)).d2, V(fp(*lhs)).d2, V(fp(*rhs)).d2);
         }
-        VFNeg { dst, src, width: VecWidth::V128 } => {
+        VFNeg {
+            dst,
+            src,
+            width: VecWidth::V128,
+        } => {
             dynasm!(asm ; fneg V(fp(*dst)).d2, V(fp(*src)).d2);
         }
 
-        VBroadcast { dst, src, width: VecWidth::V128 } => {
+        VBroadcast {
+            dst,
+            src,
+            width: VecWidth::V128,
+        } => {
             // dup Vd.2D, Vn.D[0] — broadcast scalar d into both lanes
             dynasm!(asm ; dup V(fp(*dst)).d2, V(fp(*src)).d[0]);
         }
 
-        VFMAdd { dst, a, b, c, width: VecWidth::V128 } => {
+        VFMAdd {
+            dst,
+            a,
+            b,
+            c,
+            width: VecWidth::V128,
+        } => {
             // NEON fmla is destructive: Vd = Vd + Va * Vb.
             // If dst != c, we need to move c into dst first.
             let d = fp(*dst);
@@ -565,7 +591,12 @@ fn emit_inst(
             }
         }
 
-        VInsertLane { dst, src, lane, val } => {
+        VInsertLane {
+            dst,
+            src,
+            lane,
+            val,
+        } => {
             let d = fp(*dst);
             let s = fp(*src);
             let v = fp(*val);
@@ -579,20 +610,48 @@ fn emit_inst(
             );
         }
 
-        VReduceAdd { dst, src, width: VecWidth::V128 } => {
+        VReduceAdd {
+            dst,
+            src,
+            width: VecWidth::V128,
+        } => {
             // Horizontal add of 2 f64 lanes: faddp Dd, Vn.2d
             dynasm!(asm ; faddp D(fp(*dst)), V(fp(*src)).d2);
         }
 
         // V256 fallback — not supported on aarch64 NEON.
-        VFAdd { width: VecWidth::V256, .. }
-        | VFSub { width: VecWidth::V256, .. }
-        | VFMul { width: VecWidth::V256, .. }
-        | VFDiv { width: VecWidth::V256, .. }
-        | VFNeg { width: VecWidth::V256, .. }
-        | VBroadcast { width: VecWidth::V256, .. }
-        | VFMAdd { width: VecWidth::V256, .. }
-        | VReduceAdd { width: VecWidth::V256, .. } => {
+        VFAdd {
+            width: VecWidth::V256,
+            ..
+        }
+        | VFSub {
+            width: VecWidth::V256,
+            ..
+        }
+        | VFMul {
+            width: VecWidth::V256,
+            ..
+        }
+        | VFDiv {
+            width: VecWidth::V256,
+            ..
+        }
+        | VFNeg {
+            width: VecWidth::V256,
+            ..
+        }
+        | VBroadcast {
+            width: VecWidth::V256,
+            ..
+        }
+        | VFMAdd {
+            width: VecWidth::V256,
+            ..
+        }
+        | VReduceAdd {
+            width: VecWidth::V256,
+            ..
+        } => {
             return Err("V256 not supported on aarch64 (use V128)".to_string());
         }
     }
@@ -641,7 +700,7 @@ fn emit_load_imm64(asm: &mut Assembler, rd: u32, imm: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::{MachFunc, MachInst, VReg, Cond};
+    use crate::codegen::{Cond, MachFunc, MachInst, VReg};
 
     /// Helper: build a MachFunc, emit, and return CompiledCode.
     fn compile(build: impl FnOnce(&mut MachFunc)) -> CompiledCode {
@@ -655,7 +714,10 @@ mod tests {
         // return 42 (as u64)
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 42 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 42,
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -671,9 +733,19 @@ mod tests {
         // x0 = 10, x1 = 32, return x0 + x1
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 10 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 32 });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(0), lhs: VReg::gp(0), rhs: VReg::gp(1) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 10,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 32,
+            });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(0),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(1),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -689,9 +761,19 @@ mod tests {
         // d0 = 1.5, d1 = 2.5, d0 = d0 + d1, return via fmov x0, d0
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 1.5 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 2.5 });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(0), lhs: VReg::fp(0), rhs: VReg::fp(1) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 1.5,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 2.5,
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(0),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
             // Return f64 in d0 (AAPCS64 returns f64 in d0).
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
@@ -708,12 +790,33 @@ mod tests {
         // (10.0 * 3.0) - 5.0 = 25.0, then 25.0 / 5.0 = 5.0
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 10.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 3.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(2), value: 5.0 });
-            mf.emit(MachInst::FMul { dst: VReg::fp(3), lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::FSub { dst: VReg::fp(3), lhs: VReg::fp(3), rhs: VReg::fp(2) });
-            mf.emit(MachInst::FDiv { dst: VReg::fp(0), lhs: VReg::fp(3), rhs: VReg::fp(2) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 10.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 3.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(2),
+                value: 5.0,
+            });
+            mf.emit(MachInst::FMul {
+                dst: VReg::fp(3),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::FSub {
+                dst: VReg::fp(3),
+                lhs: VReg::fp(3),
+                rhs: VReg::fp(2),
+            });
+            mf.emit(MachInst::FDiv {
+                dst: VReg::fp(0),
+                lhs: VReg::fp(3),
+                rhs: VReg::fp(2),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -729,9 +832,18 @@ mod tests {
         // fmadd: d0 = 2.0 * 3.0 + 1.0 = 7.0
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 2.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(2), value: 3.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(3), value: 1.0 });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 2.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(2),
+                value: 3.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(3),
+                value: 1.0,
+            });
             mf.emit(MachInst::FMAdd {
                 dst: VReg::fp(0),
                 a: VReg::fp(1),
@@ -756,14 +868,26 @@ mod tests {
             let l_end = mf.new_label();
 
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 1 });
-            mf.emit(MachInst::JmpNonZero { src: VReg::gp(0), target: l_true });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 1,
+            });
+            mf.emit(MachInst::JmpNonZero {
+                src: VReg::gp(0),
+                target: l_true,
+            });
             // False path:
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 0 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 0,
+            });
             mf.emit(MachInst::Jmp { target: l_end });
             // True path:
             mf.emit(MachInst::DefLabel(l_true));
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 99 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 99,
+            });
             // End:
             mf.emit(MachInst::DefLabel(l_end));
             mf.emit(MachInst::Epilogue { frame_size: 0 });
@@ -781,10 +905,22 @@ mod tests {
         // x0 = (10 < 20) ? 1 : 0
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 10 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(2), bits: 20 });
-            mf.emit(MachInst::ICmp { lhs: VReg::gp(1), rhs: VReg::gp(2) });
-            mf.emit(MachInst::CSet { dst: VReg::gp(0), cond: Cond::Lt });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 10,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(2),
+                bits: 20,
+            });
+            mf.emit(MachInst::ICmp {
+                lhs: VReg::gp(1),
+                rhs: VReg::gp(2),
+            });
+            mf.emit(MachInst::CSet {
+                dst: VReg::gp(0),
+                cond: Cond::Lt,
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -800,10 +936,22 @@ mod tests {
         // d0=1.0, d1=2.0; x0 = (d0 < d1) ? 1 : 0
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 1.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 2.0 });
-            mf.emit(MachInst::FCmp { lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::CSet { dst: VReg::gp(0), cond: Cond::Lt });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 1.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 2.0,
+            });
+            mf.emit(MachInst::FCmp {
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::CSet {
+                dst: VReg::gp(0),
+                cond: Cond::Lt,
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -822,7 +970,7 @@ mod tests {
             // Load 3.14 bits into x1 (NaN-boxed num = raw f64 bits)
             mf.emit(MachInst::LoadImm {
                 dst: VReg::gp(1),
-                bits: 3.14_f64.to_bits(),
+                bits: 1.234_f64.to_bits(),
             });
             // Unbox: x1 → d0 (bitwise transfer)
             mf.emit(MachInst::BitcastGpToFp {
@@ -837,7 +985,7 @@ mod tests {
             let f: extern "C" fn() -> f64 = code.as_fn();
             f()
         };
-        assert_eq!(result, 3.14);
+        assert_eq!(result, 1.234);
     }
 
     #[test]
@@ -849,18 +997,41 @@ mod tests {
 
             mf.emit(MachInst::Prologue { frame_size: 0 });
             // x0 = sum = 0, x1 = i = 1, x2 = 10
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 0 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 1 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(2), bits: 10 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 0,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 1,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(2),
+                bits: 10,
+            });
 
             // loop:
             mf.emit(MachInst::DefLabel(l_loop));
-            mf.emit(MachInst::ICmp { lhs: VReg::gp(1), rhs: VReg::gp(2) });
-            mf.emit(MachInst::JmpIf { cond: Cond::Gt, target: l_end });
+            mf.emit(MachInst::ICmp {
+                lhs: VReg::gp(1),
+                rhs: VReg::gp(2),
+            });
+            mf.emit(MachInst::JmpIf {
+                cond: Cond::Gt,
+                target: l_end,
+            });
             // sum += i
-            mf.emit(MachInst::IAdd { dst: VReg::gp(0), lhs: VReg::gp(0), rhs: VReg::gp(1) });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(0),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(1),
+            });
             // i++
-            mf.emit(MachInst::IAddImm { dst: VReg::gp(1), src: VReg::gp(1), imm: 1 });
+            mf.emit(MachInst::IAddImm {
+                dst: VReg::gp(1),
+                src: VReg::gp(1),
+                imm: 1,
+            });
             mf.emit(MachInst::Jmp { target: l_loop });
 
             // end:
@@ -879,8 +1050,14 @@ mod tests {
     fn test_f64_negation() {
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 42.0 });
-            mf.emit(MachInst::FNeg { dst: VReg::fp(0), src: VReg::fp(1) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 42.0,
+            });
+            mf.emit(MachInst::FNeg {
+                dst: VReg::fp(0),
+                src: VReg::fp(1),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -896,11 +1073,28 @@ mod tests {
         // (0xFF00 & 0x0FF0) | 0x000F = 0x0F0F
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 0xFF00 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(2), bits: 0x0FF0 });
-            mf.emit(MachInst::And { dst: VReg::gp(0), lhs: VReg::gp(1), rhs: VReg::gp(2) });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(3), bits: 0x000F });
-            mf.emit(MachInst::Or { dst: VReg::gp(0), lhs: VReg::gp(0), rhs: VReg::gp(3) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 0xFF00,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(2),
+                bits: 0x0FF0,
+            });
+            mf.emit(MachInst::And {
+                dst: VReg::gp(0),
+                lhs: VReg::gp(1),
+                rhs: VReg::gp(2),
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(3),
+                bits: 0x000F,
+            });
+            mf.emit(MachInst::Or {
+                dst: VReg::gp(0),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(3),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -916,8 +1110,14 @@ mod tests {
         // convert 3.7 → 3 (truncate)
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 3.7 });
-            mf.emit(MachInst::FCvtToI64 { dst: VReg::gp(0), src: VReg::fp(0) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 3.7,
+            });
+            mf.emit(MachInst::FCvtToI64 {
+                dst: VReg::gp(0),
+                src: VReg::fp(0),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -934,7 +1134,11 @@ mod tests {
         // Args arrive in x0, x1 per AAPCS64.
         let code = compile(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(0), lhs: VReg::gp(0), rhs: VReg::gp(1) });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(0),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(1),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });

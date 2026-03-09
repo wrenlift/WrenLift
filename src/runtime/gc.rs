@@ -9,9 +9,9 @@
 /// - String interning: hash-based dedup (collected when unreachable)
 use std::collections::HashMap;
 
-use crate::intern::SymbolId;
 use super::object::*;
 use super::value::Value;
+use crate::intern::SymbolId;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,7 +52,9 @@ impl Nursery {
         }
 
         let ptr = unsafe { self.buffer.as_mut_ptr().add(aligned) as *mut T };
-        unsafe { std::ptr::write(ptr, val); }
+        unsafe {
+            std::ptr::write(ptr, val);
+        }
         self.alloc_ptr = aligned + size;
         Some(ptr)
     }
@@ -155,6 +157,12 @@ pub struct Gc {
     pub stats: GcStats,
 }
 
+impl Default for Gc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Gc {
     pub fn new() -> Self {
         Self::with_config(GcConfig::default())
@@ -191,8 +199,7 @@ impl Gc {
 
     pub fn should_collect(&self) -> bool {
         // Trigger when nursery is 75%+ full or old gen threshold exceeded.
-        self.nursery.used() > self.nursery.capacity() * 3 / 4
-            || self.old_count >= self.gc_threshold
+        self.nursery.used() > self.nursery.capacity() * 3 / 4 || self.old_count >= self.gc_threshold
     }
 
     pub fn nursery_used(&self) -> usize {
@@ -222,11 +229,16 @@ impl Gc {
     }
 
     pub fn alloc_fn(
-        &mut self, name: SymbolId, arity: u8, upvalue_count: u16, fn_id: u32,
+        &mut self,
+        name: SymbolId,
+        arity: u8,
+        upvalue_count: u16,
+        fn_id: u32,
     ) -> *mut ObjFn {
         self.alloc(ObjFn::new(name, arity, upvalue_count, fn_id))
     }
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn alloc_closure(&mut self, function: *mut ObjFn) -> *mut ObjClosure {
         let uv_count = if function.is_null() {
             0
@@ -322,6 +334,7 @@ impl Gc {
 
     // -- Write barrier ------------------------------------------------------
 
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn write_barrier(&mut self, source: *mut ObjHeader, value: Value) {
         if source.is_null() {
             return;
@@ -365,7 +378,9 @@ impl Gc {
         // Mark from remembered set (old objects that reference young).
         let remembered = std::mem::take(&mut self.remembered_set);
         for &obj in &remembered {
-            unsafe { trace_object(obj, &mut gray_stack); }
+            unsafe {
+                trace_object(obj, &mut gray_stack);
+            }
         }
 
         process_gray_stack(&mut gray_stack);
@@ -376,7 +391,9 @@ impl Gc {
         // 3. Update all pointers to forwarded addresses.
         if !forwards.is_empty() {
             update_roots(roots, &forwards);
-            unsafe { self.update_old_gen_pointers(&forwards); }
+            unsafe {
+                self.update_old_gen_pointers(&forwards);
+            }
             self.update_intern_table(&forwards);
         }
 
@@ -384,7 +401,9 @@ impl Gc {
         self.nursery.reset();
 
         // 5. Reset marks on old objects (they were marked during tracing).
-        unsafe { self.reset_old_marks(); }
+        unsafe {
+            self.reset_old_marks();
+        }
 
         self.stats.minor_collections += 1;
         self.minor_since_major += 1;
@@ -400,7 +419,9 @@ impl Gc {
         }
         let remembered = std::mem::take(&mut self.remembered_set);
         for &obj in &remembered {
-            unsafe { trace_object(obj, &mut gray_stack); }
+            unsafe {
+                trace_object(obj, &mut gray_stack);
+            }
         }
         process_gray_stack(&mut gray_stack);
 
@@ -408,7 +429,9 @@ impl Gc {
         let forwards = self.process_nursery();
         if !forwards.is_empty() {
             update_roots(roots, &forwards);
-            unsafe { self.update_old_gen_pointers(&forwards); }
+            unsafe {
+                self.update_old_gen_pointers(&forwards);
+            }
             self.update_intern_table(&forwards);
         }
         self.nursery.reset();
@@ -511,7 +534,9 @@ impl Gc {
                 // Dead old object — free it.
                 let size = object_size(current);
                 self.unlink_intern(current);
-                unsafe { drop_object(current); }
+                unsafe {
+                    drop_object(current);
+                }
                 self.old_count -= 1;
                 self.stats.objects_freed += 1;
                 self.stats.total_freed += size;
@@ -519,11 +544,15 @@ impl Gc {
                 if prev.is_null() {
                     self.old_objects = next;
                 } else {
-                    unsafe { (*prev).next = next; }
+                    unsafe {
+                        (*prev).next = next;
+                    }
                 }
             } else {
                 // Live — reset mark for next cycle.
-                unsafe { (*current).gc_mark = WHITE; }
+                unsafe {
+                    (*current).gc_mark = WHITE;
+                }
                 prev = current;
             }
 
@@ -586,7 +615,9 @@ impl Drop for Gc {
     fn drop(&mut self) {
         // Drop surviving nursery objects (drop owned types, arena freed by Vec).
         for &obj in &self.nursery_objects {
-            unsafe { drop_in_place_by_type(obj); }
+            unsafe {
+                drop_in_place_by_type(obj);
+            }
         }
         self.nursery_objects.clear();
 
@@ -594,7 +625,9 @@ impl Drop for Gc {
         let mut current = self.old_objects;
         while !current.is_null() {
             let next = unsafe { (*current).next };
-            unsafe { drop_object(current); }
+            unsafe {
+                drop_object(current);
+            }
             current = next;
         }
         self.old_objects = std::ptr::null_mut();
@@ -886,18 +919,42 @@ unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
 /// Reconstruct Box and drop (for old-gen objects only).
 unsafe fn drop_object(header: *mut ObjHeader) {
     match (*header).obj_type {
-        ObjType::String => { let _ = Box::from_raw(header as *mut ObjString); }
-        ObjType::List => { let _ = Box::from_raw(header as *mut ObjList); }
-        ObjType::Map => { let _ = Box::from_raw(header as *mut ObjMap); }
-        ObjType::Range => { let _ = Box::from_raw(header as *mut ObjRange); }
-        ObjType::Fn => { let _ = Box::from_raw(header as *mut ObjFn); }
-        ObjType::Closure => { let _ = Box::from_raw(header as *mut ObjClosure); }
-        ObjType::Upvalue => { let _ = Box::from_raw(header as *mut ObjUpvalue); }
-        ObjType::Fiber => { let _ = Box::from_raw(header as *mut ObjFiber); }
-        ObjType::Class => { let _ = Box::from_raw(header as *mut ObjClass); }
-        ObjType::Instance => { let _ = Box::from_raw(header as *mut ObjInstance); }
-        ObjType::Foreign => { let _ = Box::from_raw(header as *mut ObjForeign); }
-        ObjType::Module => { let _ = Box::from_raw(header as *mut ObjModule); }
+        ObjType::String => {
+            let _ = Box::from_raw(header as *mut ObjString);
+        }
+        ObjType::List => {
+            let _ = Box::from_raw(header as *mut ObjList);
+        }
+        ObjType::Map => {
+            let _ = Box::from_raw(header as *mut ObjMap);
+        }
+        ObjType::Range => {
+            let _ = Box::from_raw(header as *mut ObjRange);
+        }
+        ObjType::Fn => {
+            let _ = Box::from_raw(header as *mut ObjFn);
+        }
+        ObjType::Closure => {
+            let _ = Box::from_raw(header as *mut ObjClosure);
+        }
+        ObjType::Upvalue => {
+            let _ = Box::from_raw(header as *mut ObjUpvalue);
+        }
+        ObjType::Fiber => {
+            let _ = Box::from_raw(header as *mut ObjFiber);
+        }
+        ObjType::Class => {
+            let _ = Box::from_raw(header as *mut ObjClass);
+        }
+        ObjType::Instance => {
+            let _ = Box::from_raw(header as *mut ObjInstance);
+        }
+        ObjType::Foreign => {
+            let _ = Box::from_raw(header as *mut ObjForeign);
+        }
+        ObjType::Module => {
+            let _ = Box::from_raw(header as *mut ObjModule);
+        }
     }
 }
 
@@ -1007,7 +1064,9 @@ mod tests {
 
         // Root was forwarded to promoted address — verify it's still valid.
         let new_keep = roots[0].as_object().unwrap() as *mut ObjString;
-        unsafe { assert_eq!((*new_keep).as_str(), "keep"); }
+        unsafe {
+            assert_eq!((*new_keep).as_str(), "keep");
+        }
     }
 
     #[test]
@@ -1050,7 +1109,9 @@ mod tests {
         let new_ptr = roots[0].as_object().unwrap();
         assert_ne!(old_ptr, new_ptr, "pointer should have been forwarded");
         let new_s = new_ptr as *mut ObjString;
-        unsafe { assert_eq!((*new_s).as_str(), "forwarded"); }
+        unsafe {
+            assert_eq!((*new_s).as_str(), "forwarded");
+        }
     }
 
     // -- Major GC -----------------------------------------------------------
@@ -1077,7 +1138,9 @@ mod tests {
         gc.collect_major(&mut roots);
         assert_eq!(gc.object_count(), 1);
         let kept = roots[0].as_object().unwrap() as *mut ObjString;
-        unsafe { assert_eq!((*kept).as_str(), "survivor"); }
+        unsafe {
+            assert_eq!((*kept).as_str(), "survivor");
+        }
     }
 
     #[test]
@@ -1176,7 +1239,9 @@ mod tests {
         let mut gc = Gc::with_config(test_config());
         let inner = gc.alloc_string("inner".into());
         let list = gc.alloc_list();
-        unsafe { (*list).add(Value::object(inner as *mut u8)); }
+        unsafe {
+            (*list).add(Value::object(inner as *mut u8));
+        }
 
         let mut roots = [Value::object(list as *mut u8)];
         gc.collect_minor(&mut roots);
@@ -1218,10 +1283,14 @@ mod tests {
     fn test_trace_instance_fields() {
         let mut gc = Gc::with_config(test_config());
         let class = gc.alloc_class(SymbolId::from_raw(0), std::ptr::null_mut());
-        unsafe { (*class).num_fields = 1; }
+        unsafe {
+            (*class).num_fields = 1;
+        }
         let inst = gc.alloc_instance(class);
         let field = gc.alloc_string("field_val".into());
-        unsafe { (*inst).set_field(0, Value::object(field as *mut u8)); }
+        unsafe {
+            (*inst).set_field(0, Value::object(field as *mut u8));
+        }
 
         let mut roots = [Value::object(inst as *mut u8)];
         gc.collect_minor(&mut roots);
@@ -1253,7 +1322,9 @@ mod tests {
 
         let young_str = gc.alloc_string("young".into());
         let new_list = roots[0].as_object().unwrap() as *mut ObjList;
-        unsafe { (*new_list).add(Value::object(young_str as *mut u8)); }
+        unsafe {
+            (*new_list).add(Value::object(young_str as *mut u8));
+        }
 
         gc.collect_minor(&mut roots);
         assert_eq!(gc.object_count(), 2);

@@ -10,14 +10,13 @@
 /// bitwise, constants, moves) is delegated to `mir::interp::eval_pure_instruction`.
 /// This module only handles VM-specific instructions: calls, collections,
 /// module vars, string allocation, fields, closures.
-
 use std::collections::HashMap;
 
 use crate::mir::interp::{eval_pure_instruction, InterpError, InterpValue};
 use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 use crate::runtime::object::*;
 use crate::runtime::value::Value;
-use crate::runtime::vm::{VM, FiberAction};
+use crate::runtime::vm::{FiberAction, VM};
 
 // ---------------------------------------------------------------------------
 // Runtime errors
@@ -87,11 +86,15 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
         let fiber = vm.fiber;
-        unsafe { (*fiber).state = FiberState::Running; }
+        unsafe {
+            (*fiber).state = FiberState::Running;
+        }
 
         let frame_count = unsafe { (*fiber).mir_frames.len() };
         if frame_count == 0 {
-            unsafe { (*fiber).state = FiberState::Done; }
+            unsafe {
+                (*fiber).state = FiberState::Done;
+            }
             return Ok(Value::null());
         }
 
@@ -108,7 +111,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
         };
 
         // Grab an Arc to the MIR — doesn't borrow the engine.
-        let mir = vm.engine.get_mir(func_id)
+        let mir = vm
+            .engine
+            .get_mir(func_id)
             .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
 
         // Inner loop: walks basic blocks within the current function
@@ -159,7 +164,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                     // -- Module variables (through VM engine) --
                     GetModuleVar(slot) => {
-                        let val = vm.engine.modules
+                        let val = vm
+                            .engine
+                            .modules
                             .get(&module_name)
                             .and_then(|m| m.vars.get(*slot as usize).copied())
                             .unwrap_or(Value::null());
@@ -178,7 +185,11 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
 
                     // -- Method calls --
-                    Call { receiver, method, args } => {
+                    Call {
+                        receiver,
+                        method,
+                        args,
+                    } => {
                         let recv_val = get_val(&values, *receiver)?.to_value();
                         let mut arg_vals = vec![recv_val];
                         for arg in args {
@@ -194,9 +205,15 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 let closure_ptr = ptr as *mut ObjClosure;
                                 // For Fn.call(), pass only the call args (skip receiver)
                                 dispatch_closure(
-                                    vm, fiber, closure_ptr, &arg_vals[1..],
-                                    &mut current_block, ip, values,
-                                    &module_name, *dst,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &arg_vals[1..],
+                                    &mut current_block,
+                                    ip,
+                                    values,
+                                    &module_name,
+                                    *dst,
                                 )?;
                                 continue 'fiber_loop;
                             }
@@ -205,9 +222,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         let class = vm.class_of(recv_val);
                         let mut method_entry = unsafe { (*class).find_method(*method).cloned() };
                         // Track which class the method was found on (for super dispatch)
-                        let mut defining_class: Option<*mut ObjClass> = unsafe {
-                            find_method_class(class, *method)
-                        };
+                        let mut defining_class: Option<*mut ObjClass> =
+                            unsafe { find_method_class(class, *method) };
 
                         // If not found and receiver IS a class, try static method
                         // on the class itself. Core library stores statics with
@@ -216,7 +232,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let static_name = format!("static:{}", method_name_str);
                             let static_sym = vm.interner.intern(&static_name);
                             let recv_class_ptr = recv_val.as_object().unwrap() as *mut ObjClass;
-                            method_entry = unsafe { (*recv_class_ptr).find_method(static_sym).cloned() };
+                            method_entry =
+                                unsafe { (*recv_class_ptr).find_method(static_sym).cloned() };
                             // For static/constructor methods, the defining class is the receiver class
                             defining_class = Some(recv_class_ptr);
                         }
@@ -233,8 +250,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 // Check for pending fiber action (yield/call/transfer)
                                 if let Some(action) = vm.pending_fiber_action.take() {
                                     handle_fiber_action(
-                                        vm, fiber, action,
-                                        current_block, ip, values,
+                                        vm,
+                                        fiber,
+                                        action,
+                                        current_block,
+                                        ip,
+                                        values,
                                         *dst,
                                     )?;
                                     continue 'fiber_loop;
@@ -243,9 +264,16 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             }
                             Some(Method::Closure(closure_ptr)) => {
                                 dispatch_closure_with_class(
-                                    vm, fiber, closure_ptr, &arg_vals,
-                                    &mut current_block, ip, values,
-                                    &module_name, *dst, defining_class,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &arg_vals,
+                                    &mut current_block,
+                                    ip,
+                                    values,
+                                    &module_name,
+                                    *dst,
+                                    defining_class,
                                 )?;
                                 continue 'fiber_loop;
                             }
@@ -260,16 +288,26 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 ctor_args[0] = instance_val;
 
                                 dispatch_closure_with_class(
-                                    vm, fiber, closure_ptr, &ctor_args,
-                                    &mut current_block, ip, values,
-                                    &module_name, *dst, defining_class,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &ctor_args,
+                                    &mut current_block,
+                                    ip,
+                                    values,
+                                    &module_name,
+                                    *dst,
+                                    defining_class,
                                 )?;
                                 continue 'fiber_loop;
                             }
                             None => {
                                 let method_name = vm.interner.resolve(*method).to_string();
                                 let class_name = vm.class_name_of(recv_val);
-                                return Err(RuntimeError::MethodNotFound { class_name, method: method_name });
+                                return Err(RuntimeError::MethodNotFound {
+                                    class_name,
+                                    method: method_name,
+                                });
                             }
                         }
                     }
@@ -281,55 +319,81 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
 
                         // Get the defining class from the current frame, then look at its superclass
-                        let defining = unsafe { (*fiber).mir_frames.last().unwrap().defining_class };
+                        let defining =
+                            unsafe { (*fiber).mir_frames.last().unwrap().defining_class };
                         let superclass = defining.and_then(|cls| {
                             let sup = unsafe { (*cls).superclass };
-                            if sup.is_null() { None } else { Some(sup) }
+                            if sup.is_null() {
+                                None
+                            } else {
+                                Some(sup)
+                            }
                         });
 
                         if let Some(super_cls) = superclass {
-                            let mut method_entry = unsafe { (*super_cls).find_method(*method).cloned() };
+                            let mut method_entry =
+                                unsafe { (*super_cls).find_method(*method).cloned() };
                             // If not found, try with "static:" prefix (for super constructor calls)
                             if method_entry.is_none() {
                                 let method_name = vm.interner.resolve(*method).to_string();
                                 let static_name = format!("static:{}", method_name);
                                 let static_sym = vm.interner.intern(&static_name);
-                                method_entry = unsafe { (*super_cls).find_method(static_sym).cloned() };
+                                method_entry =
+                                    unsafe { (*super_cls).find_method(static_sym).cloned() };
                             }
                             match method_entry {
                                 Some(Method::Native(func)) => {
                                     InterpValue::Boxed(func(vm, &arg_vals))
                                 }
                                 Some(Method::Closure(closure_ptr)) => {
-                                    let found_class = unsafe {
-                                        find_method_class(super_cls, *method)
-                                    };
+                                    let found_class =
+                                        unsafe { find_method_class(super_cls, *method) };
                                     dispatch_closure_with_class(
-                                        vm, fiber, closure_ptr, &arg_vals,
-                                        &mut current_block, ip, values,
-                                        &module_name, *dst, found_class,
+                                        vm,
+                                        fiber,
+                                        closure_ptr,
+                                        &arg_vals,
+                                        &mut current_block,
+                                        ip,
+                                        values,
+                                        &module_name,
+                                        *dst,
+                                        found_class,
                                     )?;
                                     continue 'fiber_loop;
                                 }
                                 Some(Method::Constructor(closure_ptr)) => {
-                                    let found_class = unsafe {
-                                        find_method_class(super_cls, *method)
-                                    };
+                                    let found_class =
+                                        unsafe { find_method_class(super_cls, *method) };
                                     dispatch_closure_with_class(
-                                        vm, fiber, closure_ptr, &arg_vals,
-                                        &mut current_block, ip, values,
-                                        &module_name, *dst, found_class,
+                                        vm,
+                                        fiber,
+                                        closure_ptr,
+                                        &arg_vals,
+                                        &mut current_block,
+                                        ip,
+                                        values,
+                                        &module_name,
+                                        *dst,
+                                        found_class,
                                     )?;
                                     continue 'fiber_loop;
                                 }
                                 None => {
                                     let method_name = vm.interner.resolve(*method).to_string();
-                                    let class_name = unsafe { vm.interner.resolve((*super_cls).name).to_string() };
-                                    return Err(RuntimeError::MethodNotFound { class_name, method: method_name });
+                                    let class_name = unsafe {
+                                        vm.interner.resolve((*super_cls).name).to_string()
+                                    };
+                                    return Err(RuntimeError::MethodNotFound {
+                                        class_name,
+                                        method: method_name,
+                                    });
                                 }
                             }
                         } else {
-                            return Err(RuntimeError::Error("super called with no superclass".into()));
+                            return Err(RuntimeError::Error(
+                                "super called with no superclass".into(),
+                            ));
                         }
                     }
 
@@ -348,17 +412,31 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             Some(Method::Native(func)) => InterpValue::Boxed(func(vm, &all_args)),
                             Some(Method::Closure(closure_ptr)) => {
                                 dispatch_closure(
-                                    vm, fiber, closure_ptr, &all_args,
-                                    &mut current_block, ip, values,
-                                    &module_name, *dst,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &all_args,
+                                    &mut current_block,
+                                    ip,
+                                    values,
+                                    &module_name,
+                                    *dst,
                                 )?;
                                 continue 'fiber_loop;
                             }
-                            _ => return Err(RuntimeError::Unsupported(
-                                format!("subscript get with sig '{}'", sig))),
+                            _ => {
+                                return Err(RuntimeError::Unsupported(format!(
+                                    "subscript get with sig '{}'",
+                                    sig
+                                )))
+                            }
                         }
                     }
-                    SubscriptSet { receiver, args, value } => {
+                    SubscriptSet {
+                        receiver,
+                        args,
+                        value,
+                    } => {
                         let recv = get_val(&values, *receiver)?.to_value();
                         let mut all_args = vec![recv];
                         for a in args {
@@ -373,20 +451,31 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             Some(Method::Native(func)) => InterpValue::Boxed(func(vm, &all_args)),
                             Some(Method::Closure(closure_ptr)) => {
                                 dispatch_closure(
-                                    vm, fiber, closure_ptr, &all_args,
-                                    &mut current_block, ip, values,
-                                    &module_name, *dst,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &all_args,
+                                    &mut current_block,
+                                    ip,
+                                    values,
+                                    &module_name,
+                                    *dst,
                                 )?;
                                 continue 'fiber_loop;
                             }
-                            _ => return Err(RuntimeError::Unsupported(
-                                format!("subscript set with sig '{}'", sig))),
+                            _ => {
+                                return Err(RuntimeError::Unsupported(format!(
+                                    "subscript set with sig '{}'",
+                                    sig
+                                )))
+                            }
                         }
                     }
 
                     // -- Collections --
                     MakeList(elems) => {
-                        let elements: Vec<Value> = elems.iter()
+                        let elements: Vec<Value> = elems
+                            .iter()
                             .map(|e| get_val(&values, *e).map(|v| v.to_value()))
                             .collect::<Result<_, _>>()?;
                         InterpValue::Boxed(vm.new_list(elements))
@@ -394,19 +483,24 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     MakeMap(pairs) => {
                         let map_val = vm.new_map();
                         if !pairs.is_empty() {
-                            let map_ptr = map_val.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
+                            let map_ptr =
+                                map_val.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
                             for (k, v) in pairs {
                                 let key = get_val(&values, *k)?.to_value();
                                 let val = get_val(&values, *v)?.to_value();
-                                unsafe { (*map_ptr).set(key, val); }
+                                unsafe {
+                                    (*map_ptr).set(key, val);
+                                }
                             }
                         }
                         InterpValue::Boxed(map_val)
                     }
                     MakeRange(from, to, inclusive) => {
-                        let f = get_val(&values, *from)?.as_f64()
+                        let f = get_val(&values, *from)?
+                            .as_f64()
                             .map_err(RuntimeError::from)?;
-                        let t = get_val(&values, *to)?.as_f64()
+                        let t = get_val(&values, *to)?
+                            .as_f64()
                             .map_err(RuntimeError::from)?;
                         InterpValue::Boxed(vm.new_range(f, t, *inclusive))
                     }
@@ -462,7 +556,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         let val = get_val(&values, *val_id)?.to_value();
                         if let Some(ptr) = recv.as_object() {
                             let inst = ptr as *mut ObjInstance;
-                            unsafe { (*inst).set_field(*field_idx as usize, val); }
+                            unsafe {
+                                (*inst).set_field(*field_idx as usize, val);
+                            }
                         }
                         InterpValue::Boxed(val)
                     }
@@ -488,21 +584,32 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let upvalues = unsafe { &(*closure_ptr).upvalues };
                             if (*idx as usize) < upvalues.len() {
                                 let uv = upvalues[*idx as usize];
-                                unsafe { (*uv).set(v); }
+                                unsafe {
+                                    (*uv).set(v);
+                                }
                             }
                         }
                         InterpValue::Boxed(v)
                     }
-                    MakeClosure { fn_id, upvalues: uv_ids } => {
+                    MakeClosure {
+                        fn_id,
+                        upvalues: uv_ids,
+                    } => {
                         let closure_name = vm.interner.intern("<closure>");
                         let uv_count = uv_ids.len() as u16;
-                        let arity = vm.engine.get_mir(crate::runtime::engine::FuncId(*fn_id))
+                        let arity = vm
+                            .engine
+                            .get_mir(crate::runtime::engine::FuncId(*fn_id))
                             .map(|mir| mir.arity)
                             .unwrap_or(0);
                         let fn_ptr = vm.gc.alloc_fn(closure_name, arity, uv_count, *fn_id);
-                        unsafe { (*fn_ptr).header.class = vm.fn_class; }
+                        unsafe {
+                            (*fn_ptr).header.class = vm.fn_class;
+                        }
                         let closure_ptr = vm.gc.alloc_closure(fn_ptr);
-                        unsafe { (*closure_ptr).header.class = vm.fn_class; }
+                        unsafe {
+                            (*closure_ptr).header.class = vm.fn_class;
+                        }
 
                         // Populate upvalues with captured values (pre-closed)
                         for (i, uv_id) in uv_ids.iter().enumerate() {
@@ -512,7 +619,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             unsafe {
                                 (*uv_obj).closed = captured_val;
                                 (*uv_obj).location = &mut (*uv_obj).closed as *mut Value;
-                                if i < (&(*closure_ptr).upvalues).len() {
+                                if i < (*closure_ptr).upvalues.len() {
                                     (&mut (*closure_ptr).upvalues)[i] = uv_obj;
                                 }
                             }
@@ -526,11 +633,14 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     _ => match eval_pure_instruction(inst, &values) {
                         Ok(v) => v,
                         Err(_) => {
-                            if let Some((recv_id, method_str, arg_ids)) = operator_dispatch_info(inst) {
+                            if let Some((recv_id, method_str, arg_ids)) =
+                                operator_dispatch_info(inst)
+                            {
                                 let recv_val = get_val(&values, recv_id)?.to_value();
                                 let method_sym = vm.interner.intern(method_str);
                                 let class = vm.class_of(recv_val);
-                                let method_entry = unsafe { (*class).find_method(method_sym).cloned() };
+                                let method_entry =
+                                    unsafe { (*class).find_method(method_sym).cloned() };
                                 match method_entry {
                                     Some(Method::Native(func)) => {
                                         let mut arg_vals = vec![recv_val];
@@ -545,16 +655,25 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                             arg_vals.push(get_val(&values, a)?.to_value());
                                         }
                                         dispatch_closure(
-                                            vm, fiber, closure_ptr, &arg_vals,
-                                            &mut current_block, ip, values,
-                                            &module_name, *dst,
+                                            vm,
+                                            fiber,
+                                            closure_ptr,
+                                            &arg_vals,
+                                            &mut current_block,
+                                            ip,
+                                            values,
+                                            &module_name,
+                                            *dst,
                                         )?;
                                         continue 'fiber_loop;
                                     }
-                                    _ => return Err(RuntimeError::Error(format!(
-                                        "{} does not implement '{}'",
-                                        vm.class_name_of(recv_val), method_str
-                                    ))),
+                                    _ => {
+                                        return Err(RuntimeError::Error(format!(
+                                            "{} does not implement '{}'",
+                                            vm.class_name_of(recv_val),
+                                            method_str
+                                        )))
+                                    }
                                 }
                             } else {
                                 eval_pure_instruction(inst, &values)?
@@ -576,13 +695,19 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 Terminator::Return(v) => {
                     let return_val = get_val(&values, *v)?.to_value();
                     let return_dst = unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
-                    unsafe { (*fiber).mir_frames.pop(); }
+                    unsafe {
+                        (*fiber).mir_frames.pop();
+                    }
                     if unsafe { (*fiber).mir_frames.is_empty() } {
-                        unsafe { (*fiber).state = FiberState::Done; }
+                        unsafe {
+                            (*fiber).state = FiberState::Done;
+                        }
                         // If this fiber has a caller, resume it with the return value
                         let caller = unsafe { (*fiber).caller };
                         if !caller.is_null() {
-                            unsafe { (*fiber).caller = std::ptr::null_mut(); }
+                            unsafe {
+                                (*fiber).caller = std::ptr::null_mut();
+                            }
                             resume_caller(vm, caller, return_val);
                             continue 'fiber_loop;
                         }
@@ -590,20 +715,30 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                     if let Some(dst) = return_dst {
                         unsafe {
-                            (*fiber).mir_frames.last_mut().unwrap()
-                                .values.insert(dst, InterpValue::Boxed(return_val));
+                            (*fiber)
+                                .mir_frames
+                                .last_mut()
+                                .unwrap()
+                                .values
+                                .insert(dst, InterpValue::Boxed(return_val));
                         }
                     }
                     continue 'fiber_loop;
                 }
                 Terminator::ReturnNull => {
                     let return_dst = unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
-                    unsafe { (*fiber).mir_frames.pop(); }
+                    unsafe {
+                        (*fiber).mir_frames.pop();
+                    }
                     if unsafe { (*fiber).mir_frames.is_empty() } {
-                        unsafe { (*fiber).state = FiberState::Done; }
+                        unsafe {
+                            (*fiber).state = FiberState::Done;
+                        }
                         let caller = unsafe { (*fiber).caller };
                         if !caller.is_null() {
-                            unsafe { (*fiber).caller = std::ptr::null_mut(); }
+                            unsafe {
+                                (*fiber).caller = std::ptr::null_mut();
+                            }
                             resume_caller(vm, caller, Value::null());
                             continue 'fiber_loop;
                         }
@@ -611,8 +746,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                     if let Some(dst) = return_dst {
                         unsafe {
-                            (*fiber).mir_frames.last_mut().unwrap()
-                                .values.insert(dst, InterpValue::Boxed(Value::null()));
+                            (*fiber)
+                                .mir_frames
+                                .last_mut()
+                                .unwrap()
+                                .values
+                                .insert(dst, InterpValue::Boxed(Value::null()));
                         }
                     }
                     continue 'fiber_loop;
@@ -624,13 +763,27 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     bind_block_params(&mut values, &mir.blocks[target.0 as usize], args)?;
                     current_block = *target;
                 }
-                Terminator::CondBranch { condition, true_target, true_args, false_target, false_args } => {
+                Terminator::CondBranch {
+                    condition,
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                } => {
                     let cond = get_val(&values, *condition)?;
                     if cond.is_truthy() {
-                        bind_block_params(&mut values, &mir.blocks[true_target.0 as usize], true_args)?;
+                        bind_block_params(
+                            &mut values,
+                            &mir.blocks[true_target.0 as usize],
+                            true_args,
+                        )?;
                         current_block = *true_target;
                     } else {
-                        bind_block_params(&mut values, &mir.blocks[false_target.0 as usize], false_args)?;
+                        bind_block_params(
+                            &mut values,
+                            &mir.blocks[false_target.0 as usize],
+                            false_args,
+                        )?;
                         current_block = *false_target;
                     }
                 }
@@ -674,7 +827,8 @@ pub fn eval_in_vm(
             values: HashMap::new(),
             module_name: module_name.clone(),
             return_dst: None,
-            closure: None, defining_class: None,
+            closure: None,
+            defining_class: None,
         });
     }
 
@@ -696,8 +850,13 @@ pub fn eval_in_vm(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn get_val(values: &HashMap<ValueId, InterpValue>, id: ValueId) -> Result<InterpValue, RuntimeError> {
-    values.get(&id).copied()
+fn get_val(
+    values: &HashMap<ValueId, InterpValue>,
+    id: ValueId,
+) -> Result<InterpValue, RuntimeError> {
+    values
+        .get(&id)
+        .copied()
         .ok_or_else(|| RuntimeError::Error(format!("undefined value {:?}", id)))
 }
 
@@ -706,7 +865,8 @@ fn bind_block_params(
     target_block: &crate::mir::BasicBlock,
     args: &[ValueId],
 ) -> Result<(), RuntimeError> {
-    let arg_vals: Vec<InterpValue> = args.iter()
+    let arg_vals: Vec<InterpValue> = args
+        .iter()
         .map(|a| get_val(values, *a))
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -733,6 +893,7 @@ fn bind_block_params(
 }
 
 /// Dispatch a closure call: save current frame, push new frame with args bound to block params.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_closure(
     vm: &mut VM,
     fiber: *mut ObjFiber,
@@ -744,10 +905,22 @@ fn dispatch_closure(
     module_name: &str,
     return_dst: ValueId,
 ) -> Result<(), RuntimeError> {
-    dispatch_closure_with_class(vm, fiber, closure_ptr, arg_vals, current_block, ip, values, module_name, return_dst, None)
+    dispatch_closure_with_class(
+        vm,
+        fiber,
+        closure_ptr,
+        arg_vals,
+        current_block,
+        ip,
+        values,
+        module_name,
+        return_dst,
+        None,
+    )
 }
 
 /// Dispatch a closure call with an optional defining class (for super dispatch).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_closure_with_class(
     vm: &mut VM,
     fiber: *mut ObjFiber,
@@ -771,7 +944,9 @@ fn dispatch_closure_with_class(
         vm.engine.tier_up(target_func_id, unsafe { &*interner });
     }
 
-    let target_mir = vm.engine.get_mir(target_func_id)
+    let target_mir = vm
+        .engine
+        .get_mir(target_func_id)
         .ok_or_else(|| RuntimeError::Error("invalid closure func_id".into()))?;
 
     // Bind args to entry block params using BlockParam index
@@ -803,7 +978,8 @@ fn dispatch_closure_with_class(
             values: new_values,
             module_name: module_name.to_string(),
             return_dst: Some(return_dst),
-            closure: Some(closure_ptr), defining_class,
+            closure: Some(closure_ptr),
+            defining_class,
         });
     }
 
@@ -873,9 +1049,13 @@ fn handle_fiber_action(
             }
             let caller = unsafe { (*fiber).caller };
             if caller.is_null() {
-                return Err(RuntimeError::Error("Fiber.yield called with no caller".into()));
+                return Err(RuntimeError::Error(
+                    "Fiber.yield called with no caller".into(),
+                ));
             }
-            unsafe { (*fiber).caller = std::ptr::null_mut(); }
+            unsafe {
+                (*fiber).caller = std::ptr::null_mut();
+            }
             resume_caller(vm, caller, value);
             Ok(())
         }
@@ -909,7 +1089,9 @@ fn handle_fiber_action(
             // If no caller, execution stops (run_fiber will see no active fiber).
             let caller = unsafe { (*fiber).caller };
             if !caller.is_null() {
-                unsafe { (*fiber).caller = std::ptr::null_mut(); }
+                unsafe {
+                    (*fiber).caller = std::ptr::null_mut();
+                }
                 resume_caller(vm, caller, Value::null());
             }
             Ok(())
@@ -945,7 +1127,10 @@ fn operator_dispatch_info(inst: &Instruction) -> Option<(ValueId, &'static str, 
 
 /// Walk the class hierarchy starting from `cls` to find which class owns `method`.
 /// Returns `Some(cls)` for the class that has the method in its own table.
-unsafe fn find_method_class(cls: *mut ObjClass, method: crate::intern::SymbolId) -> Option<*mut ObjClass> {
+unsafe fn find_method_class(
+    cls: *mut ObjClass,
+    method: crate::intern::SymbolId,
+) -> Option<*mut ObjClass> {
     let mut c = cls;
     while !c.is_null() {
         if (*c).methods.contains_key(&method) {
@@ -960,7 +1145,11 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
     if value.is_null() {
         "null".to_string()
     } else if let Some(b) = value.as_bool() {
-        if b { "true".to_string() } else { "false".to_string() }
+        if b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }
     } else if let Some(n) = value.as_num() {
         if n == n.floor() && n.abs() < 1e15 && !n.is_infinite() {
             format!("{}", n as i64)
@@ -993,7 +1182,7 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
 mod tests {
     use super::*;
     use crate::mir::{Instruction, MirFunction, Terminator};
-    use crate::runtime::vm::{VM, VMConfig};
+    use crate::runtime::vm::{VMConfig, VM};
 
     fn make_vm() -> VM {
         VM::new(VMConfig::default())
@@ -1006,7 +1195,9 @@ mod tests {
         let mut f = MirFunction::new(name, 0);
         let bb = f.new_block();
         let v0 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let mut vars = vec![];
@@ -1057,7 +1248,9 @@ mod tests {
         let mut f = MirFunction::new(name, 0);
         let bb = f.new_block();
         let v0 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstString(hello_sym.index())));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstString(hello_sym.index())));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let mut vars = vec![];
@@ -1077,9 +1270,14 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(-5.0)));
-            b.instructions.push((v1, Instruction::Call {
-                receiver: v0, method: abs_sym, args: vec![],
-            }));
+            b.instructions.push((
+                v1,
+                Instruction::Call {
+                    receiver: v0,
+                    method: abs_sym,
+                    args: vec![],
+                },
+            ));
             b.terminator = Terminator::Return(v1);
         }
 
@@ -1102,9 +1300,14 @@ mod tests {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(10.0)));
             b.instructions.push((v1, Instruction::ConstNum(20.0)));
-            b.instructions.push((v2, Instruction::Call {
-                receiver: v0, method: add_sym, args: vec![v1],
-            }));
+            b.instructions.push((
+                v2,
+                Instruction::Call {
+                    receiver: v0,
+                    method: add_sym,
+                    args: vec![v1],
+                },
+            ));
             b.terminator = Terminator::Return(v2);
         }
 
@@ -1126,7 +1329,8 @@ mod tests {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(1.0)));
             b.instructions.push((v1, Instruction::ConstNum(2.0)));
-            b.instructions.push((v2, Instruction::MakeList(vec![v0, v1])));
+            b.instructions
+                .push((v2, Instruction::MakeList(vec![v0, v1])));
             b.terminator = Terminator::Return(v2);
         }
 
@@ -1174,7 +1378,10 @@ mod tests {
             let b = f.block_mut(bb0);
             b.instructions.push((v_zero, Instruction::ConstNum(0.0)));
             b.instructions.push((v_one, Instruction::ConstNum(1.0)));
-            b.terminator = Terminator::Branch { target: bb1, args: vec![v_zero, v_one] };
+            b.terminator = Terminator::Branch {
+                target: bb1,
+                args: vec![v_zero, v_one],
+            };
         }
 
         let v_sum_p = f.new_value();
@@ -1186,11 +1393,14 @@ mod tests {
             b.instructions.push((v_sum_p, Instruction::BlockParam(0)));
             b.instructions.push((v_i_p, Instruction::BlockParam(1)));
             b.instructions.push((v_five, Instruction::ConstNum(5.0)));
-            b.instructions.push((v_cond, Instruction::CmpLe(v_i_p, v_five)));
+            b.instructions
+                .push((v_cond, Instruction::CmpLe(v_i_p, v_five)));
             b.terminator = Terminator::CondBranch {
                 condition: v_cond,
-                true_target: bb2, true_args: vec![v_sum_p, v_i_p],
-                false_target: bb3, false_args: vec![v_sum_p],
+                true_target: bb2,
+                true_args: vec![v_sum_p, v_i_p],
+                false_target: bb3,
+                false_args: vec![v_sum_p],
             };
         }
 
@@ -1203,10 +1413,14 @@ mod tests {
             let b = f.block_mut(bb2);
             b.instructions.push((v_sum_b, Instruction::BlockParam(0)));
             b.instructions.push((v_i_b, Instruction::BlockParam(1)));
-            b.instructions.push((v_sum2, Instruction::Add(v_sum_b, v_i_b)));
+            b.instructions
+                .push((v_sum2, Instruction::Add(v_sum_b, v_i_b)));
             b.instructions.push((v_one2, Instruction::ConstNum(1.0)));
             b.instructions.push((v_i2, Instruction::Add(v_i_b, v_one2)));
-            b.terminator = Terminator::Branch { target: bb1, args: vec![v_sum2, v_i2] };
+            b.terminator = Terminator::Branch {
+                target: bb1,
+                args: vec![v_sum2, v_i2],
+            };
         }
 
         let v_result = f.new_value();
@@ -1233,9 +1447,14 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(1.0)));
-            b.instructions.push((v1, Instruction::Call {
-                receiver: v0, method: bogus, args: vec![],
-            }));
+            b.instructions.push((
+                v1,
+                Instruction::Call {
+                    receiver: v0,
+                    method: bogus,
+                    args: vec![],
+                },
+            ));
             b.terminator = Terminator::Return(v1);
         }
 
@@ -1251,7 +1470,9 @@ mod tests {
         let mut f = MirFunction::new(name, 0);
         let bb = f.new_block();
         let v0 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(77.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(77.0)));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let func_id = vm.engine.register_function(f);
@@ -1265,7 +1486,8 @@ mod tests {
                 values: HashMap::new(),
                 module_name: "__test__".to_string(),
                 return_dst: None,
-                closure: None, defining_class: None,
+                closure: None,
+                defining_class: None,
             });
         }
         vm.fiber = fiber;
@@ -1295,7 +1517,8 @@ mod tests {
                 values: HashMap::new(),
                 module_name: "__test__".to_string(),
                 return_dst: None,
-                closure: None, defining_class: None,
+                closure: None,
+                defining_class: None,
             });
         }
         vm.fiber = fiber;

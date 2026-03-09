@@ -6,7 +6,6 @@
 ///
 /// Also inlines Num math method calls (abs, sin, sqrt, etc.) when the receiver
 /// is known to be Num, replacing the method dispatch with direct f64 intrinsics.
-
 use std::collections::{HashMap, HashSet};
 
 use super::MirPass;
@@ -18,6 +17,12 @@ pub struct TypeSpecialize {
     math_unary: HashMap<SymbolId, MathUnaryOp>,
     /// Maps method SymbolId → binary math intrinsic for known-Num receivers.
     math_binary: HashMap<SymbolId, MathBinaryOp>,
+}
+
+impl Default for TypeSpecialize {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TypeSpecialize {
@@ -91,8 +96,7 @@ impl MirPass for TypeSpecialize {
         let mut changed = false;
 
         for block_idx in 0..func.blocks.len() {
-            let old_instructions =
-                std::mem::take(&mut func.blocks[block_idx].instructions);
+            let old_instructions = std::mem::take(&mut func.blocks[block_idx].instructions);
             let mut new_instructions = Vec::new();
 
             for (val_id, inst) in &old_instructions {
@@ -102,37 +106,27 @@ impl MirPass for TypeSpecialize {
                         new_instructions.push((*val_id, inst.clone()));
                     }
 
-                    Instruction::Add(a, b)
-                        if known_nums.contains(a) && known_nums.contains(b) =>
-                    {
+                    Instruction::Add(a, b) if known_nums.contains(a) && known_nums.contains(b) => {
                         expand_binop(func, &mut new_instructions, *val_id, *a, *b, BinOp::Add);
                         known_nums.insert(*val_id);
                         changed = true;
                     }
-                    Instruction::Sub(a, b)
-                        if known_nums.contains(a) && known_nums.contains(b) =>
-                    {
+                    Instruction::Sub(a, b) if known_nums.contains(a) && known_nums.contains(b) => {
                         expand_binop(func, &mut new_instructions, *val_id, *a, *b, BinOp::Sub);
                         known_nums.insert(*val_id);
                         changed = true;
                     }
-                    Instruction::Mul(a, b)
-                        if known_nums.contains(a) && known_nums.contains(b) =>
-                    {
+                    Instruction::Mul(a, b) if known_nums.contains(a) && known_nums.contains(b) => {
                         expand_binop(func, &mut new_instructions, *val_id, *a, *b, BinOp::Mul);
                         known_nums.insert(*val_id);
                         changed = true;
                     }
-                    Instruction::Div(a, b)
-                        if known_nums.contains(a) && known_nums.contains(b) =>
-                    {
+                    Instruction::Div(a, b) if known_nums.contains(a) && known_nums.contains(b) => {
                         expand_binop(func, &mut new_instructions, *val_id, *a, *b, BinOp::Div);
                         known_nums.insert(*val_id);
                         changed = true;
                     }
-                    Instruction::Mod(a, b)
-                        if known_nums.contains(a) && known_nums.contains(b) =>
-                    {
+                    Instruction::Mod(a, b) if known_nums.contains(a) && known_nums.contains(b) => {
                         expand_binop(func, &mut new_instructions, *val_id, *a, *b, BinOp::Mod);
                         known_nums.insert(*val_id);
                         changed = true;
@@ -186,8 +180,7 @@ impl MirPass for TypeSpecialize {
                         let ua = func.new_value();
                         let result_f = func.new_value();
                         new_instructions.push((ua, Instruction::Unbox(*receiver)));
-                        new_instructions
-                            .push((result_f, Instruction::MathUnaryF64(op, ua)));
+                        new_instructions.push((result_f, Instruction::MathUnaryF64(op, ua)));
                         new_instructions.push((*val_id, Instruction::Box(result_f)));
                         known_nums.insert(*val_id);
                         changed = true;
@@ -210,8 +203,7 @@ impl MirPass for TypeSpecialize {
                         let result_f = func.new_value();
                         new_instructions.push((ua, Instruction::Unbox(*receiver)));
                         new_instructions.push((ub, Instruction::Unbox(arg)));
-                        new_instructions
-                            .push((result_f, Instruction::MathBinaryF64(op, ua, ub)));
+                        new_instructions.push((result_f, Instruction::MathBinaryF64(op, ua, ub)));
                         new_instructions.push((*val_id, Instruction::Box(result_f)));
                         known_nums.insert(*val_id);
                         changed = true;

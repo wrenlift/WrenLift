@@ -24,7 +24,7 @@ fn is(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let mut current = ctx.get_class_of(args[0]);
 
     while !current.is_null() {
-        if current as *const ObjClass == target_class {
+        if std::ptr::eq(current, target_class) {
             return Value::bool(true);
         }
         current = unsafe { (*current).superclass };
@@ -45,8 +45,8 @@ fn type_(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 fn hash_val(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     args[0].to_bits().hash(&mut hasher);
     Value::num((hasher.finish() & 0x001F_FFFF_FFFF_FFFF) as f64)

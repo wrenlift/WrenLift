@@ -2,7 +2,6 @@
 ///
 /// Each pass implements `MirPass`. The pass manager runs passes in sequence,
 /// optionally iterating to fixpoint.
-
 pub mod constfold;
 pub mod cse;
 pub mod dce;
@@ -45,11 +44,7 @@ pub fn run_pipeline(func: &mut MirFunction, passes: &[&dyn MirPass]) -> bool {
 
 /// Run passes repeatedly until no pass reports changes or `max_iters` is reached.
 /// Returns the number of iterations executed.
-pub fn run_to_fixpoint(
-    func: &mut MirFunction,
-    passes: &[&dyn MirPass],
-    max_iters: usize,
-) -> usize {
+pub fn run_to_fixpoint(func: &mut MirFunction, passes: &[&dyn MirPass], max_iters: usize) -> usize {
     let mut iters = 0;
     loop {
         iters += 1;
@@ -99,8 +94,17 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         | GetModuleVar(_) | GetUpvalue(_) | BlockParam(_) => {}
 
         // One operand
-        Neg(a) | NegF64(a) | Not(a) | BitNot(a) | GuardNum(a) | GuardBool(a) | Unbox(a)
-        | Box(a) | Move(a) | ToString(a) | MathUnaryF64(_, a) => {
+        Neg(a)
+        | NegF64(a)
+        | Not(a)
+        | BitNot(a)
+        | GuardNum(a)
+        | GuardBool(a)
+        | Unbox(a)
+        | Box(a)
+        | Move(a)
+        | ToString(a)
+        | MathUnaryF64(_, a) => {
             *a = resolve(*a, map);
         }
         GuardClass(a, _) | GuardProtocol(a, _) | IsType(a, _) => {
@@ -111,11 +115,32 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         }
 
         // Two operands
-        Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Mod(a, b) | AddF64(a, b)
-        | SubF64(a, b) | MulF64(a, b) | DivF64(a, b) | ModF64(a, b) | CmpLt(a, b)
-        | CmpGt(a, b) | CmpLe(a, b) | CmpGe(a, b) | CmpEq(a, b) | CmpNe(a, b)
-        | CmpLtF64(a, b) | CmpGtF64(a, b) | CmpLeF64(a, b) | CmpGeF64(a, b) | BitAnd(a, b)
-        | BitOr(a, b) | BitXor(a, b) | Shl(a, b) | Shr(a, b) | MathBinaryF64(_, a, b) => {
+        Add(a, b)
+        | Sub(a, b)
+        | Mul(a, b)
+        | Div(a, b)
+        | Mod(a, b)
+        | AddF64(a, b)
+        | SubF64(a, b)
+        | MulF64(a, b)
+        | DivF64(a, b)
+        | ModF64(a, b)
+        | CmpLt(a, b)
+        | CmpGt(a, b)
+        | CmpLe(a, b)
+        | CmpGe(a, b)
+        | CmpEq(a, b)
+        | CmpNe(a, b)
+        | CmpLtF64(a, b)
+        | CmpGtF64(a, b)
+        | CmpLeF64(a, b)
+        | CmpGeF64(a, b)
+        | BitAnd(a, b)
+        | BitOr(a, b)
+        | BitXor(a, b)
+        | Shl(a, b)
+        | Shr(a, b)
+        | MathBinaryF64(_, a, b) => {
             *a = resolve(*a, map);
             *b = resolve(*b, map);
         }
@@ -128,9 +153,7 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         SetModuleVar(_, val) | SetUpvalue(_, val) => {
             *val = resolve(*val, map);
         }
-        Call {
-            receiver, args, ..
-        } => {
+        Call { receiver, args, .. } => {
             *receiver = resolve(*receiver, map);
             for arg in args.iter_mut() {
                 *arg = resolve(*arg, map);

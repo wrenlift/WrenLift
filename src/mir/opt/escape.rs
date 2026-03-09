@@ -5,7 +5,6 @@
 ///
 /// A value escapes if it is returned, stored to a field/variable/upvalue,
 /// passed as a call argument, or captured by a closure.
-
 use std::collections::HashSet;
 
 use crate::mir::{Instruction, MirFunction, Terminator, ValueId};
@@ -105,9 +104,7 @@ fn check_inst_escapes(
                 escaping.insert(*val);
             }
         }
-        Instruction::Call {
-            receiver, args, ..
-        } => {
+        Instruction::Call { receiver, args, .. } => {
             if allocations.contains(receiver) {
                 escaping.insert(*receiver);
             }
@@ -226,8 +223,7 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(1.0)));
-            b.instructions
-                .push((v1, Instruction::MakeList(vec![v0])));
+            b.instructions.push((v1, Instruction::MakeList(vec![v0])));
             b.terminator = Terminator::Return(v1);
         }
 
@@ -246,11 +242,9 @@ mod tests {
         let v2 = f.new_value();
         {
             let b = f.block_mut(bb);
-            b.instructions
-                .push((v_recv, Instruction::GetModuleVar(0)));
+            b.instructions.push((v_recv, Instruction::GetModuleVar(0)));
             b.instructions.push((v0, Instruction::ConstNum(1.0)));
-            b.instructions
-                .push((v1, Instruction::MakeList(vec![v0])));
+            b.instructions.push((v1, Instruction::MakeList(vec![v0])));
             b.instructions
                 .push((v2, Instruction::SetField(v_recv, 0, v1)));
             b.terminator = Terminator::ReturnNull;
@@ -271,11 +265,9 @@ mod tests {
         let v2 = f.new_value();
         {
             let b = f.block_mut(bb);
-            b.instructions
-                .push((v_recv, Instruction::GetModuleVar(0)));
+            b.instructions.push((v_recv, Instruction::GetModuleVar(0)));
             b.instructions.push((v0, Instruction::ConstNum(1.0)));
-            b.instructions
-                .push((v1, Instruction::MakeList(vec![v0])));
+            b.instructions.push((v1, Instruction::MakeList(vec![v0])));
             b.instructions.push((
                 v2,
                 Instruction::Call {
@@ -302,8 +294,7 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(1.0)));
-            b.instructions
-                .push((v1, Instruction::MakeList(vec![v0])));
+            b.instructions.push((v1, Instruction::MakeList(vec![v0])));
             b.instructions.push((
                 v2,
                 Instruction::MakeClosure {

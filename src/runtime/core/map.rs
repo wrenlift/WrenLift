@@ -6,6 +6,7 @@ fn receiver_map(args: &[Value]) -> &ObjMap {
     unsafe { &*(args[0].as_object().unwrap() as *const ObjMap) }
 }
 
+#[allow(clippy::mut_from_ref)]
 fn receiver_map_mut(args: &[Value]) -> &mut ObjMap {
     unsafe { &mut *(args[0].as_object().unwrap() as *mut ObjMap) }
 }
@@ -124,7 +125,9 @@ fn map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let mut result = String::from("{");
     let mut first = true;
     for (key, val) in &map.entries {
-        if !first { result.push_str(", "); }
+        if !first {
+            result.push_str(", ");
+        }
         first = false;
         let k = super::sequence::value_to_string(ctx, key.value());
         let v = super::sequence::value_to_string(ctx, *val);

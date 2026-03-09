@@ -59,12 +59,10 @@ fn range_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             } else {
                 Value::num(next)
             }
+        } else if next >= range.to {
+            Value::bool(false)
         } else {
-            if next >= range.to {
-                Value::bool(false)
-            } else {
-                Value::num(next)
-            }
+            Value::num(next)
         }
     } else if range.from > range.to {
         let next = current - 1.0;
@@ -74,12 +72,10 @@ fn range_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             } else {
                 Value::num(next)
             }
+        } else if next <= range.to {
+            Value::bool(false)
         } else {
-            if next <= range.to {
-                Value::bool(false)
-            } else {
-                Value::num(next)
-            }
+            Value::num(next)
         }
     } else {
         // from == to, inclusive range with single element; already yielded.

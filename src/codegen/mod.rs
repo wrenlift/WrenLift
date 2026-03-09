@@ -9,7 +9,6 @@
 /// - Explicit results from comparisons via `CSet` (no implicit flag registers)
 /// - Load/store architecture: memory only via `Ldr`/`Str`
 /// - Virtual registers resolved by linear-scan register allocator before emission
-
 pub mod aarch64;
 pub mod cfg;
 pub mod regalloc;
@@ -247,7 +246,6 @@ pub enum MachInst {
     // =====================================================================
     // Data Movement
     // =====================================================================
-
     /// Load a 64-bit immediate into a GP register.
     /// ARM64: up to 4x `movz`/`movk`; x86_64: `mov r64, imm64`
     LoadImm { dst: VReg, bits: u64 },
@@ -273,7 +271,6 @@ pub enum MachInst {
     // =====================================================================
     // Integer Arithmetic
     // =====================================================================
-
     /// `dst = lhs + rhs`
     IAdd { dst: VReg, lhs: VReg, rhs: VReg },
 
@@ -304,7 +301,6 @@ pub enum MachInst {
     // =====================================================================
     // Bitwise
     // =====================================================================
-
     /// `dst = lhs & rhs`
     And { dst: VReg, lhs: VReg, rhs: VReg },
 
@@ -335,7 +331,6 @@ pub enum MachInst {
     // =====================================================================
     // Floating-Point Arithmetic
     // =====================================================================
-
     /// `dst = lhs + rhs` (f64)
     FAdd { dst: VReg, lhs: VReg, rhs: VReg },
 
@@ -386,7 +381,6 @@ pub enum MachInst {
     // =====================================================================
     // Fused Multiply-Add (scalar)
     // =====================================================================
-
     /// `dst = (a * b) + c` — single rounding, higher precision than separate mul+add.
     /// ARM64: `fmadd`; x86_64: `vfmadd231sd` (FMA3)
     FMAdd {
@@ -432,7 +426,6 @@ pub enum MachInst {
     //   V256 = 4× f64 (AVX/AVX2)
     //
     // The lane count is implicit from VecWidth: lanes = width_bytes / 8.
-
     /// Load packed f64 vector from aligned memory.
     /// ARM64: `ld1 {v0.2d}, [x0]`; x86_64: `vmovapd ymm0, [rax]`
     VLoad {
@@ -500,11 +493,7 @@ pub enum MachInst {
 
     /// Extract scalar f64 from a specific lane.
     /// ARM64: `mov d0, v1.d[lane]`; x86_64: depends on lane
-    VExtractLane {
-        dst: VReg,
-        src: VReg,
-        lane: u8,
-    },
+    VExtractLane { dst: VReg, src: VReg, lane: u8 },
 
     /// Insert scalar f64 into a specific lane (other lanes unchanged).
     VInsertLane {
@@ -532,7 +521,6 @@ pub enum MachInst {
     // =====================================================================
     // Conversions
     // =====================================================================
-
     /// Truncate f64 → i64 (for bitwise ops on Wren numbers).
     /// ARM64: `fcvtzs`; x86_64: `cvttsd2si`
     FCvtToI64 { dst: VReg, src: VReg },
@@ -544,7 +532,6 @@ pub enum MachInst {
     // =====================================================================
     // Comparison
     // =====================================================================
-
     /// Compare two GP registers. Sets internal flags.
     /// Must be immediately followed by `CSet` or `BCond`.
     ICmp { lhs: VReg, rhs: VReg },
@@ -562,7 +549,6 @@ pub enum MachInst {
     // =====================================================================
     // Memory
     // =====================================================================
-
     /// Load 64-bit value from memory into a GP register.
     Ldr { dst: VReg, mem: Mem },
 
@@ -578,7 +564,6 @@ pub enum MachInst {
     // =====================================================================
     // Control Flow
     // =====================================================================
-
     /// Unconditional branch.
     Jmp { target: Label },
 
@@ -594,23 +579,14 @@ pub enum MachInst {
 
     /// Test a single bit and branch if zero.
     /// ARM64: `tbz`; x86_64: `bt` + `jnc`
-    TestBitJmpZero {
-        src: VReg,
-        bit: u8,
-        target: Label,
-    },
+    TestBitJmpZero { src: VReg, bit: u8, target: Label },
 
     /// Test a single bit and branch if non-zero.
-    TestBitJmpNonZero {
-        src: VReg,
-        bit: u8,
-        target: Label,
-    },
+    TestBitJmpNonZero { src: VReg, bit: u8, target: Label },
 
     // =====================================================================
     // Calls & Returns
     // =====================================================================
-
     /// Indirect call through a GP register holding a function pointer.
     /// ARM64: `blr`; x86_64: `call *reg`
     CallInd { target: VReg },
@@ -633,7 +609,6 @@ pub enum MachInst {
     // =====================================================================
     // Stack Frame
     // =====================================================================
-
     /// Function prologue: save frame pointer, allocate `frame_size` bytes.
     /// ARM64: `stp x29, x30, [sp, #-frame_size]!` + `mov x29, sp`
     /// x86_64: `push rbp` + `mov rbp, rsp` + `sub rsp, frame_size`
@@ -651,7 +626,6 @@ pub enum MachInst {
     // =====================================================================
     // Pseudo-instructions
     // =====================================================================
-
     /// Marks a position in the instruction stream.
     /// Resolved to an offset during emission; emits no code.
     DefLabel(Label),
@@ -745,9 +719,7 @@ impl MachInst {
             | VFDiv { lhs, rhs, .. } => vec![*lhs, *rhs],
 
             // Three uses
-            IMulSub {
-                lhs, rhs, acc, ..
-            } => vec![*lhs, *rhs, *acc],
+            IMulSub { lhs, rhs, acc, .. } => vec![*lhs, *rhs, *acc],
             FMAdd { a, b, c, .. }
             | FMSub { a, b, c, .. }
             | FNMAdd { a, b, c, .. }
@@ -1081,7 +1053,9 @@ pub mod phys_aarch64 {
         fp_arg_regs: &[D0, D1, D2, D3, D4, D5, D6, D7],
         gp_ret: X0,
         fp_ret: D0,
-        gp_caller_saved: &[X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17],
+        gp_caller_saved: &[
+            X0, X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17,
+        ],
         gp_callee_saved: &[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28],
         frame_ptr: X29,
         stack_ptr: PhysReg::gp(31), // SP is encoded as 31 in some contexts
@@ -1170,11 +1144,7 @@ pub fn resolve_parallel_copies(mf: &mut MachFunc) {
     mf.insts = resolved;
 }
 
-fn resolve_one_pcopy(
-    copies: &[(VReg, VReg)],
-    out: &mut Vec<MachInst>,
-    mf: &mut MachFunc,
-) {
+fn resolve_one_pcopy(copies: &[(VReg, VReg)], out: &mut Vec<MachInst>, mf: &mut MachFunc) {
     if copies.is_empty() {
         return;
     }
@@ -1205,9 +1175,10 @@ fn resolve_one_pcopy(
             }
             let (dst, _) = pending[i];
             // Check if dst is used as a source by any other pending copy.
-            let blocks_other = pending.iter().enumerate().any(|(j, (_, src))| {
-                j != i && !emitted[j] && *src == dst
-            });
+            let blocks_other = pending
+                .iter()
+                .enumerate()
+                .any(|(j, (_, src))| j != i && !emitted[j] && *src == dst);
             if !blocks_other {
                 let (dst, src) = pending[i];
                 emit_mov(out, dst, src);
@@ -1243,9 +1214,10 @@ fn resolve_one_pcopy(
         let mut current_dst = cycle_start_dst;
         loop {
             // Find the pending copy whose source is current_dst.
-            let next = pending.iter().enumerate().find(|(j, (_, src))| {
-                !emitted[*j] && *src == current_dst
-            });
+            let next = pending
+                .iter()
+                .enumerate()
+                .find(|(j, (_, src))| !emitted[*j] && *src == current_dst);
             match next {
                 Some((j, &(dst, src))) => {
                     emit_mov(out, dst, src);
@@ -1329,9 +1301,7 @@ impl CompiledFunction {
                 let exec = code.make_executable()?;
                 Ok(ExecutableFunction::X86_64(exec))
             }
-            CompiledFunction::Aarch64(code) => {
-                Ok(ExecutableFunction::Aarch64(code))
-            }
+            CompiledFunction::Aarch64(code) => Ok(ExecutableFunction::Aarch64(code)),
             CompiledFunction::Wasm(_) => {
                 Err("WASM modules cannot be made directly executable; use a WASM runtime".into())
             }
@@ -1430,9 +1400,9 @@ pub fn compile_function_with_interner(
 /// actual hardware register encodings for the target.
 fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
     let (fp_enc, gp_scratch, fp_scratch): (u32, u32, u32) = match target {
-        Target::X86_64 => (5, 11, 15),     // RBP, R11, XMM15
-        Target::Aarch64 => (29, 16, 16),   // X29, X16, D16
-        Target::Wasm => return,            // WASM has no physical registers.
+        Target::X86_64 => (5, 11, 15),   // RBP, R11, XMM15
+        Target::Aarch64 => (29, 16, 16), // X29, X16, D16
+        Target::Wasm => return,          // WASM has no physical registers.
     };
 
     for inst in &mut mach.insts {
@@ -1441,7 +1411,13 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
 }
 
 /// Rewrite sentinel indices in a single instruction.
-fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_scratch: u32, _target: Target) {
+fn fixup_vreg_sentinels(
+    inst: &mut MachInst,
+    fp_enc: u32,
+    gp_scratch: u32,
+    fp_scratch: u32,
+    _target: Target,
+) {
     // Visit every VReg field in the instruction.
     let fix = |v: &mut VReg| {
         if v.index == u32::MAX && v.class == RegClass::Gp {
@@ -1458,78 +1434,144 @@ fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_sc
     // We use the mutable visitor pattern since MachInst fields are public.
     match inst {
         MachInst::LoadImm { dst, .. } | MachInst::LoadFpImm { dst, .. } => fix(dst),
-        MachInst::Mov { dst, src } | MachInst::FMov { dst, src }
-        | MachInst::BitcastGpToFp { dst, src } | MachInst::BitcastFpToGp { dst, src }
-        | MachInst::INeg { dst, src } | MachInst::Not { dst, src }
+        MachInst::Mov { dst, src }
+        | MachInst::FMov { dst, src }
+        | MachInst::BitcastGpToFp { dst, src }
+        | MachInst::BitcastFpToGp { dst, src }
+        | MachInst::INeg { dst, src }
+        | MachInst::Not { dst, src }
         | MachInst::FNeg { dst, src }
-        | MachInst::FAbs { dst, src } | MachInst::FSqrt { dst, src }
-        | MachInst::FFloor { dst, src } | MachInst::FCeil { dst, src }
-        | MachInst::FRound { dst, src } | MachInst::FTrunc { dst, src }
-        | MachInst::FCvtToI64 { dst, src } | MachInst::I64CvtToF { dst, src } => {
-            fix(dst); fix(src);
+        | MachInst::FAbs { dst, src }
+        | MachInst::FSqrt { dst, src }
+        | MachInst::FFloor { dst, src }
+        | MachInst::FCeil { dst, src }
+        | MachInst::FRound { dst, src }
+        | MachInst::FTrunc { dst, src }
+        | MachInst::FCvtToI64 { dst, src }
+        | MachInst::I64CvtToF { dst, src } => {
+            fix(dst);
+            fix(src);
         }
-        MachInst::IAddImm { dst, src, .. } | MachInst::AndImm { dst, src, .. }
+        MachInst::IAddImm { dst, src, .. }
+        | MachInst::AndImm { dst, src, .. }
         | MachInst::OrImm { dst, src, .. } => {
-            fix(dst); fix(src);
+            fix(dst);
+            fix(src);
         }
-        MachInst::IAdd { dst, lhs, rhs } | MachInst::ISub { dst, lhs, rhs }
-        | MachInst::IMul { dst, lhs, rhs } | MachInst::IDiv { dst, lhs, rhs }
-        | MachInst::And { dst, lhs, rhs } | MachInst::Or { dst, lhs, rhs }
+        MachInst::IAdd { dst, lhs, rhs }
+        | MachInst::ISub { dst, lhs, rhs }
+        | MachInst::IMul { dst, lhs, rhs }
+        | MachInst::IDiv { dst, lhs, rhs }
+        | MachInst::And { dst, lhs, rhs }
+        | MachInst::Or { dst, lhs, rhs }
         | MachInst::Xor { dst, lhs, rhs }
-        | MachInst::Shl { dst, lhs, rhs } | MachInst::Sar { dst, lhs, rhs }
+        | MachInst::Shl { dst, lhs, rhs }
+        | MachInst::Sar { dst, lhs, rhs }
         | MachInst::Shr { dst, lhs, rhs }
-        | MachInst::FAdd { dst, lhs, rhs } | MachInst::FSub { dst, lhs, rhs }
-        | MachInst::FMul { dst, lhs, rhs } | MachInst::FDiv { dst, lhs, rhs }
-        | MachInst::FMin { dst, lhs, rhs } | MachInst::FMax { dst, lhs, rhs } => {
-            fix(dst); fix(lhs); fix(rhs);
+        | MachInst::FAdd { dst, lhs, rhs }
+        | MachInst::FSub { dst, lhs, rhs }
+        | MachInst::FMul { dst, lhs, rhs }
+        | MachInst::FDiv { dst, lhs, rhs }
+        | MachInst::FMin { dst, lhs, rhs }
+        | MachInst::FMax { dst, lhs, rhs } => {
+            fix(dst);
+            fix(lhs);
+            fix(rhs);
         }
         MachInst::IMulSub { dst, lhs, rhs, acc } => {
-            fix(dst); fix(lhs); fix(rhs); fix(acc);
+            fix(dst);
+            fix(lhs);
+            fix(rhs);
+            fix(acc);
         }
-        MachInst::FMAdd { dst, a, b, c } | MachInst::FMSub { dst, a, b, c }
-        | MachInst::FNMAdd { dst, a, b, c } | MachInst::FNMSub { dst, a, b, c } => {
-            fix(dst); fix(a); fix(b); fix(c);
+        MachInst::FMAdd { dst, a, b, c }
+        | MachInst::FMSub { dst, a, b, c }
+        | MachInst::FNMAdd { dst, a, b, c }
+        | MachInst::FNMSub { dst, a, b, c } => {
+            fix(dst);
+            fix(a);
+            fix(b);
+            fix(c);
         }
         MachInst::ICmp { lhs, rhs } | MachInst::FCmp { lhs, rhs } => {
-            fix(lhs); fix(rhs);
+            fix(lhs);
+            fix(rhs);
         }
         MachInst::ICmpImm { lhs, .. } => fix(lhs),
         MachInst::CSet { dst, .. } => fix(dst),
         MachInst::Ldr { dst, mem } | MachInst::FLdr { dst, mem } => {
-            fix(dst); fix(&mut mem.base);
+            fix(dst);
+            fix(&mut mem.base);
         }
         MachInst::Str { src, mem } | MachInst::FStr { src, mem } => {
-            fix(src); fix(&mut mem.base);
+            fix(src);
+            fix(&mut mem.base);
         }
-        MachInst::VLoad { dst, mem, .. } => { fix(dst); fix(&mut mem.base); }
-        MachInst::VStore { src, mem, .. } => { fix(src); fix(&mut mem.base); }
-        MachInst::VFAdd { dst, lhs, rhs, .. } | MachInst::VFSub { dst, lhs, rhs, .. }
-        | MachInst::VFMul { dst, lhs, rhs, .. } | MachInst::VFDiv { dst, lhs, rhs, .. } => {
-            fix(dst); fix(lhs); fix(rhs);
+        MachInst::VLoad { dst, mem, .. } => {
+            fix(dst);
+            fix(&mut mem.base);
         }
-        MachInst::VFMAdd { dst, a, b, c, .. } => { fix(dst); fix(a); fix(b); fix(c); }
-        MachInst::VBroadcast { dst, src, .. } | MachInst::VFNeg { dst, src, .. }
-        | MachInst::VReduceAdd { dst, src, .. } | MachInst::VExtractLane { dst, src, .. } => {
-            fix(dst); fix(src);
+        MachInst::VStore { src, mem, .. } => {
+            fix(src);
+            fix(&mut mem.base);
         }
-        MachInst::VInsertLane { dst, src, val, .. } => { fix(dst); fix(src); fix(val); }
-        MachInst::JmpZero { src, .. } | MachInst::JmpNonZero { src, .. }
-        | MachInst::TestBitJmpZero { src, .. } | MachInst::TestBitJmpNonZero { src, .. } => {
+        MachInst::VFAdd { dst, lhs, rhs, .. }
+        | MachInst::VFSub { dst, lhs, rhs, .. }
+        | MachInst::VFMul { dst, lhs, rhs, .. }
+        | MachInst::VFDiv { dst, lhs, rhs, .. } => {
+            fix(dst);
+            fix(lhs);
+            fix(rhs);
+        }
+        MachInst::VFMAdd { dst, a, b, c, .. } => {
+            fix(dst);
+            fix(a);
+            fix(b);
+            fix(c);
+        }
+        MachInst::VBroadcast { dst, src, .. }
+        | MachInst::VFNeg { dst, src, .. }
+        | MachInst::VReduceAdd { dst, src, .. }
+        | MachInst::VExtractLane { dst, src, .. } => {
+            fix(dst);
+            fix(src);
+        }
+        MachInst::VInsertLane { dst, src, val, .. } => {
+            fix(dst);
+            fix(src);
+            fix(val);
+        }
+        MachInst::JmpZero { src, .. }
+        | MachInst::JmpNonZero { src, .. }
+        | MachInst::TestBitJmpZero { src, .. }
+        | MachInst::TestBitJmpNonZero { src, .. } => {
             fix(src);
         }
         MachInst::CallInd { target } => fix(target),
         MachInst::Push { src } => fix(src),
         MachInst::Pop { dst } => fix(dst),
         MachInst::CallRuntime { args, ret, .. } => {
-            for a in args.iter_mut() { fix(a); }
-            if let Some(r) = ret { fix(r); }
+            for a in args.iter_mut() {
+                fix(a);
+            }
+            if let Some(r) = ret {
+                fix(r);
+            }
         }
         MachInst::ParallelCopy { copies } => {
-            for (d, s) in copies.iter_mut() { fix(d); fix(s); }
+            for (d, s) in copies.iter_mut() {
+                fix(d);
+                fix(s);
+            }
         }
-        MachInst::Prologue { .. } | MachInst::Epilogue { .. }
-        | MachInst::Jmp { .. } | MachInst::JmpIf { .. }
-        | MachInst::DefLabel(_) | MachInst::Nop | MachInst::Trap | MachInst::Ret => {}
+        MachInst::Prologue { .. }
+        | MachInst::Epilogue { .. }
+        | MachInst::Jmp { .. }
+        | MachInst::JmpIf { .. }
+        | MachInst::DefLabel(_)
+        | MachInst::Nop
+        | MachInst::Trap
+        | MachInst::Ret => {}
     }
 }
 
@@ -1545,7 +1587,11 @@ struct LowerCtx<'a> {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(mf: &'a mut MachFunc, mir: &'a MirFunction, interner: &'a crate::intern::Interner) -> Self {
+    fn new(
+        mf: &'a mut MachFunc,
+        mir: &'a MirFunction,
+        interner: &'a crate::intern::Interner,
+    ) -> Self {
         // Pre-allocate labels for each block.
         let mut block_labels = HashMap::new();
         for block in &mir.blocks {
@@ -1621,7 +1667,11 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::ConstBool(b) => {
                 let dst = self.vreg_for(dst_val);
-                let bits = if *b { 0x7FFC_0000_0000_0002 } else { 0x7FFC_0000_0000_0001 };
+                let bits = if *b {
+                    0x7FFC_0000_0000_0002
+                } else {
+                    0x7FFC_0000_0000_0001
+                };
                 self.mf.emit(MachInst::LoadImm { dst, bits });
             }
             Instruction::ConstNull => {
@@ -1791,8 +1841,14 @@ impl<'a> LowerCtx<'a> {
                 let result_f = self.mf.new_fp();
                 self.mf.emit(MachInst::BitcastGpToFp { dst: fa, src: la });
                 self.mf.emit(MachInst::FCvtToI64 { dst: ia, src: fa });
-                self.mf.emit(MachInst::Not { dst: result_i, src: ia });
-                self.mf.emit(MachInst::I64CvtToF { dst: result_f, src: result_i });
+                self.mf.emit(MachInst::Not {
+                    dst: result_i,
+                    src: ia,
+                });
+                self.mf.emit(MachInst::I64CvtToF {
+                    dst: result_f,
+                    src: result_i,
+                });
                 self.mf.emit(MachInst::BitcastFpToGp { dst, src: result_f });
             }
 
@@ -2066,11 +2122,24 @@ impl<'a> LowerCtx<'a> {
                         // is Num: (val & QNAN) != QNAN
                         // Equivalently: the QNAN bits aren't all set → it's a number
                         let masked = self.mf.new_gp();
-                        self.mf.emit(MachInst::AndImm { dst: masked, src: la, imm: QNAN });
+                        self.mf.emit(MachInst::AndImm {
+                            dst: masked,
+                            src: la,
+                            imm: QNAN,
+                        });
                         let qnan_reg = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: qnan_reg, bits: QNAN });
-                        self.mf.emit(MachInst::ICmp { lhs: masked, rhs: qnan_reg });
-                        self.mf.emit(MachInst::CSet { dst, cond: Cond::Ne });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: qnan_reg,
+                            bits: QNAN,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: masked,
+                            rhs: qnan_reg,
+                        });
+                        self.mf.emit(MachInst::CSet {
+                            dst,
+                            cond: Cond::Ne,
+                        });
                     }
                     "Bool" => {
                         // is Bool: val == TAG_TRUE || val == TAG_FALSE
@@ -2078,20 +2147,51 @@ impl<'a> LowerCtx<'a> {
                         let is_false = self.mf.new_gp();
                         let t_reg = self.mf.new_gp();
                         let f_reg = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: t_reg, bits: TAG_TRUE });
-                        self.mf.emit(MachInst::ICmp { lhs: la, rhs: t_reg });
-                        self.mf.emit(MachInst::CSet { dst: is_true, cond: Cond::Eq });
-                        self.mf.emit(MachInst::LoadImm { dst: f_reg, bits: TAG_FALSE });
-                        self.mf.emit(MachInst::ICmp { lhs: la, rhs: f_reg });
-                        self.mf.emit(MachInst::CSet { dst: is_false, cond: Cond::Eq });
-                        self.mf.emit(MachInst::Or { dst, lhs: is_true, rhs: is_false });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: t_reg,
+                            bits: TAG_TRUE,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: la,
+                            rhs: t_reg,
+                        });
+                        self.mf.emit(MachInst::CSet {
+                            dst: is_true,
+                            cond: Cond::Eq,
+                        });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: f_reg,
+                            bits: TAG_FALSE,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: la,
+                            rhs: f_reg,
+                        });
+                        self.mf.emit(MachInst::CSet {
+                            dst: is_false,
+                            cond: Cond::Eq,
+                        });
+                        self.mf.emit(MachInst::Or {
+                            dst,
+                            lhs: is_true,
+                            rhs: is_false,
+                        });
                     }
                     "Null" => {
                         // is Null: val == TAG_NULL
                         let null_reg = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: null_reg, bits: TAG_NULL });
-                        self.mf.emit(MachInst::ICmp { lhs: la, rhs: null_reg });
-                        self.mf.emit(MachInst::CSet { dst, cond: Cond::Eq });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: null_reg,
+                            bits: TAG_NULL,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: la,
+                            rhs: null_reg,
+                        });
+                        self.mf.emit(MachInst::CSet {
+                            dst,
+                            cond: Cond::Eq,
+                        });
                     }
                     _ => {
                         // Object type: extract obj ptr → load class ptr → compare
@@ -2101,10 +2201,23 @@ impl<'a> LowerCtx<'a> {
 
                         let tag_masked = self.mf.new_gp();
                         let tag_obj_reg = self.mf.new_gp();
-                        self.mf.emit(MachInst::AndImm { dst: tag_masked, src: la, imm: TAG_OBJ });
-                        self.mf.emit(MachInst::LoadImm { dst: tag_obj_reg, bits: TAG_OBJ });
-                        self.mf.emit(MachInst::ICmp { lhs: tag_masked, rhs: tag_obj_reg });
-                        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: is_obj_label });
+                        self.mf.emit(MachInst::AndImm {
+                            dst: tag_masked,
+                            src: la,
+                            imm: TAG_OBJ,
+                        });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: tag_obj_reg,
+                            bits: TAG_OBJ,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: tag_masked,
+                            rhs: tag_obj_reg,
+                        });
+                        self.mf.emit(MachInst::JmpIf {
+                            cond: Cond::Eq,
+                            target: is_obj_label,
+                        });
                         // Not an object → false
                         self.mf.emit(MachInst::LoadImm { dst, bits: 0 });
                         self.mf.emit(MachInst::Jmp { target: done_label });
@@ -2113,15 +2226,23 @@ impl<'a> LowerCtx<'a> {
                         self.mf.emit(MachInst::DefLabel(is_obj_label));
                         let obj_ptr = self.mf.new_gp();
                         self.mf.emit(MachInst::AndImm {
-                            dst: obj_ptr, src: la, imm: 0x0000_FFFF_FFFF_FFFF,
+                            dst: obj_ptr,
+                            src: la,
+                            imm: 0x0000_FFFF_FFFF_FFFF,
                         });
                         // Load class pointer from header
                         let class_ptr = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: class_ptr, mem: Mem::new(obj_ptr, HEADER_CLASS) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: class_ptr,
+                            mem: Mem::new(obj_ptr, HEADER_CLASS),
+                        });
                         // Load class name sym from ObjClass (name field is after header)
                         // For now, fall back to runtime for class hierarchy comparison
                         let sym_reg = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: sym_reg, bits: sym.index() as u64 });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: sym_reg,
+                            bits: sym.index() as u64,
+                        });
                         self.mf.emit(MachInst::CallRuntime {
                             name: "wren_is_type",
                             args: vec![la, sym_reg],
@@ -2173,36 +2294,74 @@ impl<'a> LowerCtx<'a> {
                 // 1. Extract list pointer from NaN-boxed receiver
                 let list_ptr = self.mf.new_gp();
                 self.mf.emit(MachInst::AndImm {
-                    dst: list_ptr, src: recv_reg, imm: 0x0000_FFFF_FFFF_FFFF,
+                    dst: list_ptr,
+                    src: recv_reg,
+                    imm: 0x0000_FFFF_FFFF_FFFF,
                 });
 
                 // 2. Convert NaN-boxed index to i64
                 let idx_fp = self.mf.new_fp();
                 let idx_int = self.mf.new_gp();
-                self.mf.emit(MachInst::BitcastGpToFp { dst: idx_fp, src: idx_reg });
-                self.mf.emit(MachInst::FCvtToI64 { dst: idx_int, src: idx_fp });
+                self.mf.emit(MachInst::BitcastGpToFp {
+                    dst: idx_fp,
+                    src: idx_reg,
+                });
+                self.mf.emit(MachInst::FCvtToI64 {
+                    dst: idx_int,
+                    src: idx_fp,
+                });
 
                 // 3. Bounds check: load count, compare, trap if out of bounds
                 let count_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::Ldr { dst: count_reg, mem: Mem::new(list_ptr, LIST_COUNT) });
-                self.mf.emit(MachInst::ICmp { lhs: idx_int, rhs: count_reg });
+                self.mf.emit(MachInst::Ldr {
+                    dst: count_reg,
+                    mem: Mem::new(list_ptr, LIST_COUNT),
+                });
+                self.mf.emit(MachInst::ICmp {
+                    lhs: idx_int,
+                    rhs: count_reg,
+                });
                 let ok_label = self.mf.new_label();
-                self.mf.emit(MachInst::JmpIf { cond: Cond::Below, target: ok_label });
+                self.mf.emit(MachInst::JmpIf {
+                    cond: Cond::Below,
+                    target: ok_label,
+                });
                 self.mf.emit(MachInst::Trap);
                 self.mf.emit(MachInst::DefLabel(ok_label));
 
                 // 4. Load element: elements_ptr + idx * 8
                 let elements_ptr = self.mf.new_gp();
-                self.mf.emit(MachInst::Ldr { dst: elements_ptr, mem: Mem::new(list_ptr, LIST_ELEMENTS) });
+                self.mf.emit(MachInst::Ldr {
+                    dst: elements_ptr,
+                    mem: Mem::new(list_ptr, LIST_ELEMENTS),
+                });
                 let shift_amt = self.mf.new_gp();
                 let byte_offset = self.mf.new_gp();
                 let elem_addr = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm { dst: shift_amt, bits: 3 });
-                self.mf.emit(MachInst::Shl { dst: byte_offset, lhs: idx_int, rhs: shift_amt });
-                self.mf.emit(MachInst::IAdd { dst: elem_addr, lhs: elements_ptr, rhs: byte_offset });
-                self.mf.emit(MachInst::Ldr { dst, mem: Mem::new(elem_addr, 0) });
+                self.mf.emit(MachInst::LoadImm {
+                    dst: shift_amt,
+                    bits: 3,
+                });
+                self.mf.emit(MachInst::Shl {
+                    dst: byte_offset,
+                    lhs: idx_int,
+                    rhs: shift_amt,
+                });
+                self.mf.emit(MachInst::IAdd {
+                    dst: elem_addr,
+                    lhs: elements_ptr,
+                    rhs: byte_offset,
+                });
+                self.mf.emit(MachInst::Ldr {
+                    dst,
+                    mem: Mem::new(elem_addr, 0),
+                });
             }
-            Instruction::SubscriptSet { receiver, args, value } if args.len() == 1 => {
+            Instruction::SubscriptSet {
+                receiver,
+                args,
+                value,
+            } if args.len() == 1 => {
                 use crate::runtime::object_layout::*;
                 let recv_reg = self.vreg_for(*receiver);
                 let idx_reg = self.vreg_for(args[0]);
@@ -2212,34 +2371,68 @@ impl<'a> LowerCtx<'a> {
                 // 1. Extract list pointer
                 let list_ptr = self.mf.new_gp();
                 self.mf.emit(MachInst::AndImm {
-                    dst: list_ptr, src: recv_reg, imm: 0x0000_FFFF_FFFF_FFFF,
+                    dst: list_ptr,
+                    src: recv_reg,
+                    imm: 0x0000_FFFF_FFFF_FFFF,
                 });
 
                 // 2. Convert NaN-boxed index to i64
                 let idx_fp = self.mf.new_fp();
                 let idx_int = self.mf.new_gp();
-                self.mf.emit(MachInst::BitcastGpToFp { dst: idx_fp, src: idx_reg });
-                self.mf.emit(MachInst::FCvtToI64 { dst: idx_int, src: idx_fp });
+                self.mf.emit(MachInst::BitcastGpToFp {
+                    dst: idx_fp,
+                    src: idx_reg,
+                });
+                self.mf.emit(MachInst::FCvtToI64 {
+                    dst: idx_int,
+                    src: idx_fp,
+                });
 
                 // 3. Bounds check
                 let count_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::Ldr { dst: count_reg, mem: Mem::new(list_ptr, LIST_COUNT) });
-                self.mf.emit(MachInst::ICmp { lhs: idx_int, rhs: count_reg });
+                self.mf.emit(MachInst::Ldr {
+                    dst: count_reg,
+                    mem: Mem::new(list_ptr, LIST_COUNT),
+                });
+                self.mf.emit(MachInst::ICmp {
+                    lhs: idx_int,
+                    rhs: count_reg,
+                });
                 let ok_label = self.mf.new_label();
-                self.mf.emit(MachInst::JmpIf { cond: Cond::Below, target: ok_label });
+                self.mf.emit(MachInst::JmpIf {
+                    cond: Cond::Below,
+                    target: ok_label,
+                });
                 self.mf.emit(MachInst::Trap);
                 self.mf.emit(MachInst::DefLabel(ok_label));
 
                 // 4. Store element: elements_ptr + idx * 8
                 let elements_ptr = self.mf.new_gp();
-                self.mf.emit(MachInst::Ldr { dst: elements_ptr, mem: Mem::new(list_ptr, LIST_ELEMENTS) });
+                self.mf.emit(MachInst::Ldr {
+                    dst: elements_ptr,
+                    mem: Mem::new(list_ptr, LIST_ELEMENTS),
+                });
                 let shift_amt = self.mf.new_gp();
                 let byte_offset = self.mf.new_gp();
                 let elem_addr = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm { dst: shift_amt, bits: 3 });
-                self.mf.emit(MachInst::Shl { dst: byte_offset, lhs: idx_int, rhs: shift_amt });
-                self.mf.emit(MachInst::IAdd { dst: elem_addr, lhs: elements_ptr, rhs: byte_offset });
-                self.mf.emit(MachInst::Str { src: val_reg, mem: Mem::new(elem_addr, 0) });
+                self.mf.emit(MachInst::LoadImm {
+                    dst: shift_amt,
+                    bits: 3,
+                });
+                self.mf.emit(MachInst::Shl {
+                    dst: byte_offset,
+                    lhs: idx_int,
+                    rhs: shift_amt,
+                });
+                self.mf.emit(MachInst::IAdd {
+                    dst: elem_addr,
+                    lhs: elements_ptr,
+                    rhs: byte_offset,
+                });
+                self.mf.emit(MachInst::Str {
+                    src: val_reg,
+                    mem: Mem::new(elem_addr, 0),
+                });
                 self.mf.emit(MachInst::Mov { dst, src: val_reg });
             }
             // Multi-index subscript: fall back to runtime call
@@ -2292,8 +2485,15 @@ impl<'a> LowerCtx<'a> {
                     MathUnaryOp::Fract => {
                         // fract(x) = x - floor(x)
                         let floored = self.mf.new_fp();
-                        self.mf.emit(MachInst::FFloor { dst: floored, src: la });
-                        self.mf.emit(MachInst::FSub { dst, lhs: la, rhs: floored });
+                        self.mf.emit(MachInst::FFloor {
+                            dst: floored,
+                            src: la,
+                        });
+                        self.mf.emit(MachInst::FSub {
+                            dst,
+                            lhs: la,
+                            rhs: floored,
+                        });
                     }
                     MathUnaryOp::Sign => {
                         // sign(x) = x > 0 ? 1.0 : (x < 0 ? -1.0 : 0.0)
@@ -2304,22 +2504,55 @@ impl<'a> LowerCtx<'a> {
                         let is_neg = self.mf.new_gp();
                         let pos_fp = self.mf.new_fp();
                         let neg_fp = self.mf.new_fp();
-                        self.mf.emit(MachInst::LoadFpImm { dst: zero, value: 0.0 });
-                        self.mf.emit(MachInst::LoadFpImm { dst: one, value: 1.0 });
-                        self.mf.emit(MachInst::LoadFpImm { dst: neg_one, value: -1.0 });
+                        self.mf.emit(MachInst::LoadFpImm {
+                            dst: zero,
+                            value: 0.0,
+                        });
+                        self.mf.emit(MachInst::LoadFpImm {
+                            dst: one,
+                            value: 1.0,
+                        });
+                        self.mf.emit(MachInst::LoadFpImm {
+                            dst: neg_one,
+                            value: -1.0,
+                        });
                         // is_pos = la > 0.0
                         self.mf.emit(MachInst::FCmp { lhs: la, rhs: zero });
-                        self.mf.emit(MachInst::CSet { dst: is_pos, cond: Cond::Gt });
+                        self.mf.emit(MachInst::CSet {
+                            dst: is_pos,
+                            cond: Cond::Gt,
+                        });
                         // is_neg = la < 0.0
                         self.mf.emit(MachInst::FCmp { lhs: la, rhs: zero });
-                        self.mf.emit(MachInst::CSet { dst: is_neg, cond: Cond::Lt });
+                        self.mf.emit(MachInst::CSet {
+                            dst: is_neg,
+                            cond: Cond::Lt,
+                        });
                         // result = is_pos ? 1.0 : (is_neg ? -1.0 : 0.0)
                         // Use: pos_fp = is_pos * 1.0, neg_fp = is_neg * (-1.0), result = pos_fp + neg_fp
-                        self.mf.emit(MachInst::I64CvtToF { dst: pos_fp, src: is_pos });
-                        self.mf.emit(MachInst::FMul { dst: pos_fp, lhs: pos_fp, rhs: one });
-                        self.mf.emit(MachInst::I64CvtToF { dst: neg_fp, src: is_neg });
-                        self.mf.emit(MachInst::FMul { dst: neg_fp, lhs: neg_fp, rhs: neg_one });
-                        self.mf.emit(MachInst::FAdd { dst, lhs: pos_fp, rhs: neg_fp });
+                        self.mf.emit(MachInst::I64CvtToF {
+                            dst: pos_fp,
+                            src: is_pos,
+                        });
+                        self.mf.emit(MachInst::FMul {
+                            dst: pos_fp,
+                            lhs: pos_fp,
+                            rhs: one,
+                        });
+                        self.mf.emit(MachInst::I64CvtToF {
+                            dst: neg_fp,
+                            src: is_neg,
+                        });
+                        self.mf.emit(MachInst::FMul {
+                            dst: neg_fp,
+                            lhs: neg_fp,
+                            rhs: neg_one,
+                        });
+                        self.mf.emit(MachInst::FAdd {
+                            dst,
+                            lhs: pos_fp,
+                            rhs: neg_fp,
+                        });
                     }
                     // Transcendentals — bitcast FP→GP, call wren_fp_* wrapper, bitcast GP→FP
                     _ => {
@@ -2335,13 +2568,20 @@ impl<'a> LowerCtx<'a> {
                             MathUnaryOp::Log2 => "wren_fp_log2",
                             MathUnaryOp::Exp => "wren_fp_exp",
                             MathUnaryOp::Fract | MathUnaryOp::Sign => unreachable!(),
-                            MathUnaryOp::Abs | MathUnaryOp::Sqrt | MathUnaryOp::Floor
-                            | MathUnaryOp::Ceil | MathUnaryOp::Round | MathUnaryOp::Trunc => {
+                            MathUnaryOp::Abs
+                            | MathUnaryOp::Sqrt
+                            | MathUnaryOp::Floor
+                            | MathUnaryOp::Ceil
+                            | MathUnaryOp::Round
+                            | MathUnaryOp::Trunc => {
                                 unreachable!()
                             }
                         };
                         let gp_arg = self.mf.new_gp();
-                        self.mf.emit(MachInst::BitcastFpToGp { dst: gp_arg, src: la });
+                        self.mf.emit(MachInst::BitcastFpToGp {
+                            dst: gp_arg,
+                            src: la,
+                        });
                         let gp_ret = self.mf.new_gp();
                         self.mf.emit(MachInst::CallRuntime {
                             name,
@@ -2359,8 +2599,16 @@ impl<'a> LowerCtx<'a> {
                 let dst = self.fp_vreg_for(dst_val);
                 match op {
                     // Hardware-native single-instruction ops
-                    MathBinaryOp::Min => self.mf.emit(MachInst::FMin { dst, lhs: la, rhs: lb }),
-                    MathBinaryOp::Max => self.mf.emit(MachInst::FMax { dst, lhs: la, rhs: lb }),
+                    MathBinaryOp::Min => self.mf.emit(MachInst::FMin {
+                        dst,
+                        lhs: la,
+                        rhs: lb,
+                    }),
+                    MathBinaryOp::Max => self.mf.emit(MachInst::FMax {
+                        dst,
+                        lhs: la,
+                        rhs: lb,
+                    }),
                     // Transcendentals — bitcast FP→GP, call wren_fp_* wrapper, bitcast GP→FP
                     _ => {
                         let name = match op {
@@ -2398,18 +2646,11 @@ impl<'a> LowerCtx<'a> {
                 let ret_reg = VReg::gp(0);
                 if src.is_fp() {
                     // FP value → GP: bitcast (e.g. unboxed f64 returned as NaN-boxed bits).
-                    self.mf.emit(MachInst::BitcastFpToGp {
-                        dst: ret_reg,
-                        src,
-                    });
+                    self.mf.emit(MachInst::BitcastFpToGp { dst: ret_reg, src });
                 } else {
-                    self.mf.emit(MachInst::Mov {
-                        dst: ret_reg,
-                        src,
-                    });
+                    self.mf.emit(MachInst::Mov { dst: ret_reg, src });
                 }
-                self.mf
-                    .emit(MachInst::Epilogue { frame_size: 0 });
+                self.mf.emit(MachInst::Epilogue { frame_size: 0 });
                 self.mf.emit(MachInst::Ret);
             }
             Terminator::ReturnNull => {
@@ -2418,8 +2659,7 @@ impl<'a> LowerCtx<'a> {
                     dst: ret_reg,
                     bits: 0x7FFC_0000_0000_0000,
                 });
-                self.mf
-                    .emit(MachInst::Epilogue { frame_size: 0 });
+                self.mf.emit(MachInst::Epilogue { frame_size: 0 });
                 self.mf.emit(MachInst::Ret);
             }
             Terminator::Branch { target, args } => {
@@ -2480,7 +2720,9 @@ impl<'a> LowerCtx<'a> {
                     // False landing pad.
                     self.mf.emit(MachInst::DefLabel(false_pad));
                     self.emit_block_args(*false_target, false_args);
-                    self.mf.emit(MachInst::Jmp { target: false_label });
+                    self.mf.emit(MachInst::Jmp {
+                        target: false_label,
+                    });
                 }
             }
             Terminator::Unreachable => {
@@ -2590,16 +2832,39 @@ impl<'a> LowerCtx<'a> {
         // Integer operation.
         let result_i = self.mf.new_gp();
         self.mf.emit(match op {
-            BitwiseOp::And => MachInst::And { dst: result_i, lhs: ia, rhs: ib },
-            BitwiseOp::Or => MachInst::Or { dst: result_i, lhs: ia, rhs: ib },
-            BitwiseOp::Xor => MachInst::Xor { dst: result_i, lhs: ia, rhs: ib },
-            BitwiseOp::Shl => MachInst::Shl { dst: result_i, lhs: ia, rhs: ib },
-            BitwiseOp::Shr => MachInst::Sar { dst: result_i, lhs: ia, rhs: ib },
+            BitwiseOp::And => MachInst::And {
+                dst: result_i,
+                lhs: ia,
+                rhs: ib,
+            },
+            BitwiseOp::Or => MachInst::Or {
+                dst: result_i,
+                lhs: ia,
+                rhs: ib,
+            },
+            BitwiseOp::Xor => MachInst::Xor {
+                dst: result_i,
+                lhs: ia,
+                rhs: ib,
+            },
+            BitwiseOp::Shl => MachInst::Shl {
+                dst: result_i,
+                lhs: ia,
+                rhs: ib,
+            },
+            BitwiseOp::Shr => MachInst::Sar {
+                dst: result_i,
+                lhs: ia,
+                rhs: ib,
+            },
         });
 
         // Rebox: i64(GP) → f64(FP) → Value(GP)
         let result_f = self.mf.new_fp();
-        self.mf.emit(MachInst::I64CvtToF { dst: result_f, src: result_i });
+        self.mf.emit(MachInst::I64CvtToF {
+            dst: result_f,
+            src: result_i,
+        });
         self.mf.emit(MachInst::BitcastFpToGp { dst, src: result_f });
     }
 }
@@ -2672,14 +2937,45 @@ fn format_inst(inst: &MachInst) -> String {
 
         VLoad { dst, mem, width } => format!("{} = vload.{} {}", dst, width, mem),
         VStore { src, mem, width } => format!("vstore.{} {}, {}", width, src, mem),
-        VFAdd { dst, lhs, rhs, width } => format!("{} = vfadd.{} {}, {}", dst, width, lhs, rhs),
-        VFSub { dst, lhs, rhs, width } => format!("{} = vfsub.{} {}, {}", dst, width, lhs, rhs),
-        VFMul { dst, lhs, rhs, width } => format!("{} = vfmul.{} {}, {}", dst, width, lhs, rhs),
-        VFDiv { dst, lhs, rhs, width } => format!("{} = vfdiv.{} {}, {}", dst, width, lhs, rhs),
-        VFMAdd { dst, a, b, c, width } => format!("{} = vfmadd.{} {}, {}, {}", dst, width, a, b, c),
+        VFAdd {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => format!("{} = vfadd.{} {}, {}", dst, width, lhs, rhs),
+        VFSub {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => format!("{} = vfsub.{} {}, {}", dst, width, lhs, rhs),
+        VFMul {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => format!("{} = vfmul.{} {}, {}", dst, width, lhs, rhs),
+        VFDiv {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => format!("{} = vfdiv.{} {}, {}", dst, width, lhs, rhs),
+        VFMAdd {
+            dst,
+            a,
+            b,
+            c,
+            width,
+        } => format!("{} = vfmadd.{} {}, {}, {}", dst, width, a, b, c),
         VBroadcast { dst, src, width } => format!("{} = vbroadcast.{} {}", dst, width, src),
         VExtractLane { dst, src, lane } => format!("{} = vextract {}, #{}", dst, src, lane),
-        VInsertLane { dst, src, lane, val } => format!("{} = vinsert {}, #{}, {}", dst, src, lane, val),
+        VInsertLane {
+            dst,
+            src,
+            lane,
+            val,
+        } => format!("{} = vinsert {}, #{}, {}", dst, src, lane, val),
         VFNeg { dst, src, width } => format!("{} = vfneg.{} {}", dst, width, src),
         VReduceAdd { dst, src, width } => format!("{} = vreduce_add.{} {}", dst, width, src),
 
@@ -2821,16 +3117,11 @@ mod tests {
         assert_eq!(inst.def(), Some(r2));
         assert_eq!(inst.uses(), vec![r0, r1]);
 
-        let load = MachInst::LoadImm {
-            dst: r0,
-            bits: 42,
-        };
+        let load = MachInst::LoadImm { dst: r0, bits: 42 };
         assert_eq!(load.def(), Some(r0));
         assert!(load.uses().is_empty());
 
-        let jmp = MachInst::Jmp {
-            target: Label(0),
-        };
+        let jmp = MachInst::Jmp { target: Label(0) };
         assert_eq!(jmp.def(), None);
         assert!(jmp.uses().is_empty());
         assert!(jmp.is_terminator());
@@ -2984,7 +3275,7 @@ mod tests {
         let v2 = f.new_value();
         {
             let b = f.block_mut(bb);
-            b.instructions.push((v0, Instruction::ConstNum(3.14)));
+            b.instructions.push((v0, Instruction::ConstNum(1.234)));
             b.instructions.push((v1, Instruction::Unbox(v0)));
             b.instructions.push((v2, Instruction::Box(v1)));
             b.terminator = Terminator::Return(v2);
@@ -3121,7 +3412,10 @@ mod tests {
             bits: 42u64.to_be(),
         });
         mf.emit(MachInst::BitcastGpToFp { dst: d0, src: r0 });
-        mf.emit(MachInst::LoadFpImm { dst: d1, value: 2.0 });
+        mf.emit(MachInst::LoadFpImm {
+            dst: d1,
+            value: 2.0,
+        });
         mf.emit(MachInst::FAdd {
             dst: d2,
             lhs: d0,
@@ -3143,10 +3437,7 @@ mod tests {
     #[test]
     fn test_pcopy_format() {
         let inst = MachInst::ParallelCopy {
-            copies: vec![
-                (VReg::gp(0), VReg::gp(1)),
-                (VReg::gp(1), VReg::gp(0)),
-            ],
+            copies: vec![(VReg::gp(0), VReg::gp(1)), (VReg::gp(1), VReg::gp(0))],
         };
         assert_eq!(format_inst(&inst), "pcopy [r0 <- r1, r1 <- r0]");
     }
@@ -3154,10 +3445,7 @@ mod tests {
     #[test]
     fn test_pcopy_uses_and_defs() {
         let inst = MachInst::ParallelCopy {
-            copies: vec![
-                (VReg::gp(2), VReg::gp(0)),
-                (VReg::gp(3), VReg::gp(1)),
-            ],
+            copies: vec![(VReg::gp(2), VReg::gp(0)), (VReg::gp(3), VReg::gp(1))],
         };
         assert_eq!(inst.uses(), vec![VReg::gp(0), VReg::gp(1)]);
         assert_eq!(inst.def(), None); // singular def is None for pcopy
@@ -3169,10 +3457,7 @@ mod tests {
         // r2 <- r0, r3 <- r1: no overlap, should produce two Movs.
         let mut mf = MachFunc::new("test".to_string());
         mf.emit(MachInst::ParallelCopy {
-            copies: vec![
-                (VReg::gp(2), VReg::gp(0)),
-                (VReg::gp(3), VReg::gp(1)),
-            ],
+            copies: vec![(VReg::gp(2), VReg::gp(0)), (VReg::gp(3), VReg::gp(1))],
         });
         resolve_parallel_copies(&mut mf);
 
@@ -3201,10 +3486,7 @@ mod tests {
         let _r0 = mf.new_gp(); // index 0
         let _r1 = mf.new_gp(); // index 1
         mf.emit(MachInst::ParallelCopy {
-            copies: vec![
-                (VReg::gp(0), VReg::gp(1)),
-                (VReg::gp(1), VReg::gp(0)),
-            ],
+            copies: vec![(VReg::gp(0), VReg::gp(1)), (VReg::gp(1), VReg::gp(0))],
         });
         resolve_parallel_copies(&mut mf);
 
@@ -3254,10 +3536,7 @@ mod tests {
             mf.new_gp();
         }
         mf.emit(MachInst::ParallelCopy {
-            copies: vec![
-                (VReg::gp(2), VReg::gp(1)),
-                (VReg::gp(1), VReg::gp(0)),
-            ],
+            copies: vec![(VReg::gp(2), VReg::gp(1)), (VReg::gp(1), VReg::gp(0))],
         });
         resolve_parallel_copies(&mut mf);
 
@@ -3283,10 +3562,7 @@ mod tests {
         mf.new_fp();
         mf.new_fp();
         mf.emit(MachInst::ParallelCopy {
-            copies: vec![
-                (VReg::fp(0), VReg::fp(1)),
-                (VReg::fp(1), VReg::fp(0)),
-            ],
+            copies: vec![(VReg::fp(0), VReg::fp(1)), (VReg::fp(1), VReg::fp(0))],
         });
         resolve_parallel_copies(&mut mf);
 
@@ -3367,12 +3643,9 @@ mod tests {
         // bb0: cond=true, a=10, b=20; condbranch cond, bb_t(a), bb_f(b)
         {
             let b = f.block_mut(bb0);
-            b.instructions
-                .push((v_cond, Instruction::ConstBool(true)));
-            b.instructions
-                .push((v_a, Instruction::ConstNum(10.0)));
-            b.instructions
-                .push((v_b, Instruction::ConstNum(20.0)));
+            b.instructions.push((v_cond, Instruction::ConstBool(true)));
+            b.instructions.push((v_a, Instruction::ConstNum(10.0)));
+            b.instructions.push((v_b, Instruction::ConstNum(20.0)));
             b.terminator = Terminator::CondBranch {
                 condition: v_cond,
                 true_target: bb_t,
@@ -3392,7 +3665,11 @@ mod tests {
         let output = mf.display();
         // Should have two separate pcopy instructions for true/false paths.
         let pcopy_count = output.matches("pcopy").count();
-        assert_eq!(pcopy_count, 2, "expected 2 pcopy for true/false paths, got:\n{}", output);
+        assert_eq!(
+            pcopy_count, 2,
+            "expected 2 pcopy for true/false paths, got:\n{}",
+            output
+        );
     }
 
     // -- FMA tests --
@@ -3404,18 +3681,38 @@ mod tests {
         let d2 = VReg::fp(2);
         let d3 = VReg::fp(3);
 
-        let fmadd = MachInst::FMAdd { dst: d3, a: d0, b: d1, c: d2 };
+        let fmadd = MachInst::FMAdd {
+            dst: d3,
+            a: d0,
+            b: d1,
+            c: d2,
+        };
         assert_eq!(format_inst(&fmadd), "d3 = fmadd d0, d1, d2");
         assert_eq!(fmadd.uses(), vec![d0, d1, d2]);
         assert_eq!(fmadd.def(), Some(d3));
 
-        let fmsub = MachInst::FMSub { dst: d3, a: d0, b: d1, c: d2 };
+        let fmsub = MachInst::FMSub {
+            dst: d3,
+            a: d0,
+            b: d1,
+            c: d2,
+        };
         assert_eq!(format_inst(&fmsub), "d3 = fmsub d0, d1, d2");
 
-        let fnmadd = MachInst::FNMAdd { dst: d3, a: d0, b: d1, c: d2 };
+        let fnmadd = MachInst::FNMAdd {
+            dst: d3,
+            a: d0,
+            b: d1,
+            c: d2,
+        };
         assert_eq!(format_inst(&fnmadd), "d3 = fnmadd d0, d1, d2");
 
-        let fnmsub = MachInst::FNMSub { dst: d3, a: d0, b: d1, c: d2 };
+        let fnmsub = MachInst::FNMSub {
+            dst: d3,
+            a: d0,
+            b: d1,
+            c: d2,
+        };
         assert_eq!(format_inst(&fnmsub), "d3 = fnmsub d0, d1, d2");
     }
 
@@ -3456,12 +3753,22 @@ mod tests {
         let v1 = VReg::vec(1);
         let v2 = VReg::vec(2);
 
-        let vfadd = MachInst::VFAdd { dst: v2, lhs: v0, rhs: v1, width: VecWidth::V128 };
+        let vfadd = MachInst::VFAdd {
+            dst: v2,
+            lhs: v0,
+            rhs: v1,
+            width: VecWidth::V128,
+        };
         assert_eq!(format_inst(&vfadd), "v2 = vfadd.v128 v0, v1");
         assert_eq!(vfadd.uses(), vec![v0, v1]);
         assert_eq!(vfadd.def(), Some(v2));
 
-        let vfmul = MachInst::VFMul { dst: v2, lhs: v0, rhs: v1, width: VecWidth::V256 };
+        let vfmul = MachInst::VFMul {
+            dst: v2,
+            lhs: v0,
+            rhs: v1,
+            width: VecWidth::V256,
+        };
         assert_eq!(format_inst(&vfmul), "v2 = vfmul.v256 v0, v1");
     }
 
@@ -3472,7 +3779,13 @@ mod tests {
         let v2 = VReg::vec(2);
         let v3 = VReg::vec(3);
 
-        let vfmadd = MachInst::VFMAdd { dst: v3, a: v0, b: v1, c: v2, width: VecWidth::V128 };
+        let vfmadd = MachInst::VFMAdd {
+            dst: v3,
+            a: v0,
+            b: v1,
+            c: v2,
+            width: VecWidth::V128,
+        };
         assert_eq!(format_inst(&vfmadd), "v3 = vfmadd.v128 v0, v1, v2");
         assert_eq!(vfmadd.uses(), vec![v0, v1, v2]);
         assert_eq!(vfmadd.def(), Some(v3));
@@ -3484,12 +3797,20 @@ mod tests {
         let v0 = VReg::vec(0);
         let d1 = VReg::fp(1);
 
-        let bcast = MachInst::VBroadcast { dst: v0, src: d0, width: VecWidth::V128 };
+        let bcast = MachInst::VBroadcast {
+            dst: v0,
+            src: d0,
+            width: VecWidth::V128,
+        };
         assert_eq!(format_inst(&bcast), "v0 = vbroadcast.v128 d0");
         assert_eq!(bcast.uses(), vec![d0]);
         assert_eq!(bcast.def(), Some(v0));
 
-        let extract = MachInst::VExtractLane { dst: d1, src: v0, lane: 1 };
+        let extract = MachInst::VExtractLane {
+            dst: d1,
+            src: v0,
+            lane: 1,
+        };
         assert_eq!(format_inst(&extract), "d1 = vextract v0, #1");
         assert_eq!(extract.uses(), vec![v0]);
         assert_eq!(extract.def(), Some(d1));
@@ -3500,13 +3821,21 @@ mod tests {
         let r0 = VReg::gp(0);
         let v0 = VReg::vec(0);
 
-        let vload = MachInst::VLoad { dst: v0, mem: Mem::new(r0, 0), width: VecWidth::V128 };
+        let vload = MachInst::VLoad {
+            dst: v0,
+            mem: Mem::new(r0, 0),
+            width: VecWidth::V128,
+        };
         assert_eq!(format_inst(&vload), "v0 = vload.v128 [r0]");
         assert_eq!(vload.uses(), vec![r0]);
         assert_eq!(vload.def(), Some(v0));
         assert!(!vload.has_side_effects());
 
-        let vstore = MachInst::VStore { src: v0, mem: Mem::new(r0, 32), width: VecWidth::V256 };
+        let vstore = MachInst::VStore {
+            src: v0,
+            mem: Mem::new(r0, 32),
+            width: VecWidth::V256,
+        };
         assert_eq!(format_inst(&vstore), "vstore.v256 v0, [r0 + 32]");
         assert!(vstore.has_side_effects());
     }
@@ -3517,12 +3846,20 @@ mod tests {
         let v0 = VReg::vec(0);
         let v1 = VReg::vec(1);
 
-        let reduce = MachInst::VReduceAdd { dst: d0, src: v0, width: VecWidth::V128 };
+        let reduce = MachInst::VReduceAdd {
+            dst: d0,
+            src: v0,
+            width: VecWidth::V128,
+        };
         assert_eq!(format_inst(&reduce), "d0 = vreduce_add.v128 v0");
         assert_eq!(reduce.uses(), vec![v0]);
         assert_eq!(reduce.def(), Some(d0));
 
-        let vneg = MachInst::VFNeg { dst: v1, src: v0, width: VecWidth::V128 };
+        let vneg = MachInst::VFNeg {
+            dst: v1,
+            src: v0,
+            width: VecWidth::V128,
+        };
         assert_eq!(format_inst(&vneg), "v1 = vfneg.v128 v0");
     }
 
@@ -3532,7 +3869,12 @@ mod tests {
         let v1 = VReg::vec(1);
         let d0 = VReg::fp(0);
 
-        let insert = MachInst::VInsertLane { dst: v1, src: v0, lane: 0, val: d0 };
+        let insert = MachInst::VInsertLane {
+            dst: v1,
+            src: v0,
+            lane: 0,
+            val: d0,
+        };
         assert_eq!(format_inst(&insert), "v1 = vinsert v0, #0, d0");
         assert_eq!(insert.uses(), vec![v0, d0]);
         assert_eq!(insert.def(), Some(v1));
@@ -3551,18 +3893,43 @@ mod tests {
 
         // acc = 0 (broadcast 0.0)
         let zero = mf.new_fp();
-        mf.emit(MachInst::LoadFpImm { dst: zero, value: 0.0 });
-        mf.emit(MachInst::VBroadcast { dst: acc, src: zero, width: VecWidth::V128 });
+        mf.emit(MachInst::LoadFpImm {
+            dst: zero,
+            value: 0.0,
+        });
+        mf.emit(MachInst::VBroadcast {
+            dst: acc,
+            src: zero,
+            width: VecWidth::V128,
+        });
 
         // Load 2 f64s from a[] and b[]
-        mf.emit(MachInst::VLoad { dst: va, mem: Mem::new(base_a, 0), width: VecWidth::V128 });
-        mf.emit(MachInst::VLoad { dst: vb, mem: Mem::new(base_b, 0), width: VecWidth::V128 });
+        mf.emit(MachInst::VLoad {
+            dst: va,
+            mem: Mem::new(base_a, 0),
+            width: VecWidth::V128,
+        });
+        mf.emit(MachInst::VLoad {
+            dst: vb,
+            mem: Mem::new(base_b, 0),
+            width: VecWidth::V128,
+        });
 
         // acc = va * vb + acc (fused multiply-add)
-        mf.emit(MachInst::VFMAdd { dst: acc, a: va, b: vb, c: acc, width: VecWidth::V128 });
+        mf.emit(MachInst::VFMAdd {
+            dst: acc,
+            a: va,
+            b: vb,
+            c: acc,
+            width: VecWidth::V128,
+        });
 
         // Horizontal reduce to scalar
-        mf.emit(MachInst::VReduceAdd { dst: result_scalar, src: acc, width: VecWidth::V128 });
+        mf.emit(MachInst::VReduceAdd {
+            dst: result_scalar,
+            src: acc,
+            width: VecWidth::V128,
+        });
 
         mf.emit(MachInst::Ret);
 
@@ -3593,9 +3960,13 @@ mod tests {
         }
 
         let result = compile_function(&f, Target::X86_64);
-        assert!(result.is_ok(), "compile_function failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "compile_function failed: {:?}",
+            result.err()
+        );
         if let Ok(CompiledFunction::X86_64(code)) = result {
-            assert!(code.len() > 0, "emitted code should not be empty");
+            assert!(!code.is_empty(), "emitted code should not be empty");
         } else {
             panic!("expected X86_64 variant");
         }
@@ -3632,7 +4003,9 @@ mod tests {
         let v0 = f.new_value();
         let v1 = f.new_value();
 
-        f.block_mut(bb0).instructions.push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         f.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![v0],
@@ -3662,7 +4035,11 @@ mod tests {
         }
 
         let result = compile_function(&f, Target::Aarch64);
-        assert!(result.is_ok(), "aarch64 pipeline failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "aarch64 pipeline failed: {:?}",
+            result.err()
+        );
     }
 
     // -- JIT execution tests (native arch only) --
@@ -3739,7 +4116,9 @@ mod tests {
         let mut f = make_mir(&mut interner);
         let bb = f.new_block();
         let v0 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let compiled = compile_function(&f, Target::Aarch64).unwrap();
@@ -3749,7 +4128,11 @@ mod tests {
             let func: extern "C" fn() -> u64 = exec.as_fn();
             let bits = func();
             let val = Value::from_bits(bits);
-            assert_eq!(val.as_num(), Some(42.0), "JIT: ConstNum(42) should return 42.0");
+            assert_eq!(
+                val.as_num(),
+                Some(42.0),
+                "JIT: ConstNum(42) should return 42.0"
+            );
         }
     }
 
@@ -3770,7 +4153,11 @@ mod tests {
             let func: extern "C" fn() -> u64 = exec.as_fn();
             let bits = func();
             let val = Value::from_bits(bits);
-            assert!(val.is_null(), "JIT: ReturnNull should return null, got bits 0x{:016x}", bits);
+            assert!(
+                val.is_null(),
+                "JIT: ReturnNull should return null, got bits 0x{:016x}",
+                bits
+            );
         }
     }
 
@@ -3781,7 +4168,9 @@ mod tests {
         let mut f = make_mir(&mut interner);
         let bb = f.new_block();
         let v0 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstF64(1.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstF64(1.0)));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let compiled = compile_function(&f, Target::X86_64).unwrap();
@@ -3801,7 +4190,7 @@ mod tests {
         let mut mf = MachFunc::new("test".to_string());
         // Simulate a spill load using sentinel registers.
         mf.emit(MachInst::Ldr {
-            dst: VReg::gp(u32::MAX - 1),    // GP scratch sentinel
+            dst: VReg::gp(u32::MAX - 1),           // GP scratch sentinel
             mem: Mem::new(VReg::gp(u32::MAX), -8), // frame ptr sentinel
         });
 
@@ -3819,7 +4208,7 @@ mod tests {
     fn test_fixup_sentinels_aarch64() {
         let mut mf = MachFunc::new("test".to_string());
         mf.emit(MachInst::FLdr {
-            dst: VReg::fp(u32::MAX - 1),    // FP scratch sentinel
+            dst: VReg::fp(u32::MAX - 1),            // FP scratch sentinel
             mem: Mem::new(VReg::gp(u32::MAX), -16), // frame ptr sentinel
         });
 
@@ -3848,21 +4237,44 @@ mod tests {
             let b = f.block_mut(bb);
             b.instructions.push((v_list, Instruction::BlockParam(0)));
             b.instructions.push((v_idx, Instruction::BlockParam(1)));
-            b.instructions.push((v_result, Instruction::SubscriptGet {
-                receiver: v_list,
-                args: vec![v_idx],
-            }));
+            b.instructions.push((
+                v_result,
+                Instruction::SubscriptGet {
+                    receiver: v_list,
+                    args: vec![v_idx],
+                },
+            ));
             b.terminator = Terminator::Return(v_result);
         }
         let mf = lower_mir(&f);
         let output = mf.display();
         println!("Generated code:\n{}", output);
         // Should use inline GEP (and_imm, ldr, shl, iadd) not CallRuntime
-        assert!(!output.contains("call_runtime"), "SubscriptGet should use inline GEP, got:\n{}", output);
-        assert!(output.contains("and_imm"), "should have ptr extraction: {}", output);
-        assert!(output.contains("fcvt_to_i64"), "should convert index to int: {}", output);
-        assert!(output.contains("shl"), "should scale index by 8: {}", output);
-        assert!(output.contains("trap"), "should have bounds check trap: {}", output);
+        assert!(
+            !output.contains("call_runtime"),
+            "SubscriptGet should use inline GEP, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("and_imm"),
+            "should have ptr extraction: {}",
+            output
+        );
+        assert!(
+            output.contains("fcvt_to_i64"),
+            "should convert index to int: {}",
+            output
+        );
+        assert!(
+            output.contains("shl"),
+            "should scale index by 8: {}",
+            output
+        );
+        assert!(
+            output.contains("trap"),
+            "should have bounds check trap: {}",
+            output
+        );
     }
 
     #[test]
@@ -3877,15 +4289,28 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v_val, Instruction::BlockParam(0)));
-            b.instructions.push((v_result, Instruction::IsType(v_val, num_sym)));
+            b.instructions
+                .push((v_result, Instruction::IsType(v_val, num_sym)));
             b.terminator = Terminator::Return(v_result);
         }
         let mf = lower_mir_with_interner(&f, &interner);
         let output = mf.display();
         // Should use inline tag check (and_imm + icmp + cset) not CallRuntime
-        assert!(!output.contains("call_runtime"), "IsType(Num) should be inline, got:\n{}", output);
-        assert!(output.contains("and_imm"), "should mask QNAN bits: {}", output);
-        assert!(output.contains("cset"), "should materialize condition: {}", output);
+        assert!(
+            !output.contains("call_runtime"),
+            "IsType(Num) should be inline, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("and_imm"),
+            "should mask QNAN bits: {}",
+            output
+        );
+        assert!(
+            output.contains("cset"),
+            "should materialize condition: {}",
+            output
+        );
     }
 
     #[test]
@@ -3900,12 +4325,21 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v_val, Instruction::BlockParam(0)));
-            b.instructions.push((v_result, Instruction::IsType(v_val, null_sym)));
+            b.instructions
+                .push((v_result, Instruction::IsType(v_val, null_sym)));
             b.terminator = Terminator::Return(v_result);
         }
         let mf = lower_mir_with_interner(&f, &interner);
         let output = mf.display();
-        assert!(!output.contains("call_runtime"), "IsType(Null) should be inline, got:\n{}", output);
-        assert!(output.contains("cset"), "should materialize eq condition: {}", output);
+        assert!(
+            !output.contains("call_runtime"),
+            "IsType(Null) should be inline, got:\n{}",
+            output
+        );
+        assert!(
+            output.contains("cset"),
+            "should materialize eq condition: {}",
+            output
+        );
     }
 }

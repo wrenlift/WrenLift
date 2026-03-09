@@ -11,7 +11,7 @@ use wren_lift::mir::opt::{
 };
 use wren_lift::parse::{lexer, parser};
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
-use wren_lift::runtime::vm::{VM, VMConfig};
+use wren_lift::runtime::vm::{VMConfig, VM};
 use wren_lift::sema;
 
 // ---------------------------------------------------------------------------
@@ -170,9 +170,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
     // --- Execution path: route through VM ---
 
     let mut vm = make_vm(cli);
-    let module_name = filename
-        .strip_suffix(".wren")
-        .unwrap_or(filename);
+    let module_name = filename.strip_suffix(".wren").unwrap_or(filename);
 
     match vm.interpret(module_name, source) {
         InterpretResult::Success => {}
@@ -221,7 +219,8 @@ fn run_manual_pipeline(
     }
 
     // Lower to MIR
-    let mut module_mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+    let mut module_mir =
+        wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
     let mir = &mut module_mir.top_level;
 
     if cli.dump_mir {
@@ -260,11 +259,10 @@ fn run_manual_pipeline(
             }
         }
         Target::Native => {
-            let mach_func = wren_lift::codegen::lower_mir(&mir);
+            let mach_func = wren_lift::codegen::lower_mir(mir);
 
             if cli.dump_asm {
                 println!("{}", mach_func.display());
-                return;
             }
         }
     }

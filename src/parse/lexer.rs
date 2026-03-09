@@ -152,14 +152,12 @@ pub enum Token {
     While,
 
     // -- Literals -----------------------------------------------------------
-
     /// Number: integer, float, hex, scientific notation.
     #[regex(r"0[xX][0-9a-fA-F]+", priority = 3)]
     #[regex(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?", priority = 2)]
     Number,
 
     // -- Identifiers --------------------------------------------------------
-
     /// Static field: `__name`
     #[regex(r"__[a-zA-Z_][a-zA-Z0-9_]*", priority = 4)]
     StaticField,
@@ -177,7 +175,6 @@ pub enum Token {
     Newline,
 
     // -- Tokens produced by custom lexing (not by logos directly) ------------
-
     /// String literal (simple, no interpolation).
     StringLit,
 
@@ -275,8 +272,10 @@ pub fn lex(source: &str) -> (Vec<Lexeme>, Vec<crate::diagnostics::Diagnostic>) {
                 }
             }
             if depth > 0 {
-                errors.push(crate::diagnostics::Diagnostic::error("unterminated block comment")
-                    .with_label(start..pos, "comment starts here"));
+                errors.push(
+                    crate::diagnostics::Diagnostic::error("unterminated block comment")
+                        .with_label(start..pos, "comment starts here"),
+                );
             }
             continue;
         }
@@ -478,11 +477,8 @@ fn lex_string(
         if ch == b'%' && *pos + 1 < source.len() && bytes[*pos + 1] == b'(' {
             has_interpolation = true;
             // Emit the string part before interpolation
-            let seg_token = if lexemes.last().map_or(true, |l| {
-                !matches!(
-                    l.token,
-                    Token::InterpolationStart | Token::InterpolationMid
-                )
+            let seg_token = if lexemes.last().is_none_or(|l| {
+                !matches!(l.token, Token::InterpolationStart | Token::InterpolationMid)
             }) {
                 Token::InterpolationStart
             } else {
@@ -735,7 +731,13 @@ mod tests {
         let tokens = lex_tokens("foo bar123 camelCase PascalCase _x");
         assert_eq!(
             tokens,
-            vec![Token::Ident, Token::Ident, Token::Ident, Token::Ident, Token::Field]
+            vec![
+                Token::Ident,
+                Token::Ident,
+                Token::Ident,
+                Token::Ident,
+                Token::Field
+            ]
         );
     }
 
@@ -784,10 +786,7 @@ mod tests {
     fn test_strings_escapes() {
         let (lexemes, errors) = lex(r#""\n\t\r\\\"\0\a\b\e\f\v\%""#);
         assert!(errors.is_empty());
-        assert_eq!(
-            lexemes[0].text,
-            "\n\t\r\\\"\0\x07\x08\x1b\x0c\x0b%"
-        );
+        assert_eq!(lexemes[0].text, "\n\t\r\\\"\0\x07\x08\x1b\x0c\x0b%");
     }
 
     #[test]
@@ -885,9 +884,9 @@ mod tests {
     #[test]
     fn test_spans_correct() {
         let (lexemes, _) = lex("var x = 42");
-        assert_eq!(lexemes[0].span, 0..3);  // var
-        assert_eq!(lexemes[1].span, 4..5);  // x
-        assert_eq!(lexemes[2].span, 6..7);  // =
+        assert_eq!(lexemes[0].span, 0..3); // var
+        assert_eq!(lexemes[1].span, 4..5); // x
+        assert_eq!(lexemes[2].span, 6..7); // =
         assert_eq!(lexemes[3].span, 8..10); // 42
     }
 

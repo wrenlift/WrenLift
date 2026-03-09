@@ -1,7 +1,9 @@
-use crate::runtime::object::{NativeContext, ObjClosure, ObjFiber, ObjHeader, ObjType, FiberState, MirCallFrame};
+use crate::runtime::engine::FuncId;
+use crate::runtime::object::{
+    FiberState, MirCallFrame, NativeContext, ObjClosure, ObjFiber, ObjHeader, ObjType,
+};
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
-use crate::runtime::engine::FuncId;
 use std::collections::HashMap;
 
 // --- Helpers ---
@@ -79,8 +81,6 @@ fn fiber_abort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         } else {
             ctx.runtime_error("Runtime error.".to_string());
         }
-    } else if args[1].is_null() {
-        ctx.runtime_error("Runtime error.".to_string());
     } else {
         ctx.runtime_error("Runtime error.".to_string());
     }
@@ -238,7 +238,9 @@ fn fiber_transfer_error(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             let state = unsafe { (*f).state };
             match state {
                 FiberState::New | FiberState::Suspended => {
-                    unsafe { (*f).error = args[1]; }
+                    unsafe {
+                        (*f).error = args[1];
+                    }
                     ctx.set_fiber_action_transfer(f, args[1]);
                 }
                 _ => {
@@ -255,7 +257,9 @@ fn fiber_transfer_error(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn fiber_stack_trace(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     if !ctx.fiber_stack_traces_enabled() {
-        return ctx.alloc_string("<stack traces not enabled — set VMConfig.fiber_stack_traces = true>".to_string());
+        return ctx.alloc_string(
+            "<stack traces not enabled — set VMConfig.fiber_stack_traces = true>".to_string(),
+        );
     }
     let fiber = unsafe { as_fiber(args[0]) };
     match fiber {

@@ -35,7 +35,7 @@ fn from_byte(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         None => return Value::null(),
     };
 
-    if byte < 0 || byte > 255 {
+    if !(0..=255).contains(&byte) {
         ctx.runtime_error(format!("Byte must be in range 0..255, was {}.", byte));
         return Value::null();
     }
@@ -78,7 +78,10 @@ fn subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 
     if index < 0 || index >= char_count {
-        ctx.runtime_error(format!("String index {} out of bounds.", args[1].as_num().unwrap() as i64));
+        ctx.runtime_error(format!(
+            "String index {} out of bounds.",
+            args[1].as_num().unwrap() as i64
+        ));
         return Value::null();
     }
 

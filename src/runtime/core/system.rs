@@ -16,7 +16,7 @@ fn system_gc(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 
 fn system_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let s = super::as_string(args[1]);
-    ctx.write_output(&s);
+    ctx.write_output(s);
     args[1]
 }
 
@@ -31,7 +31,12 @@ fn format_object(value: Value) -> String {
             format!("{}", n)
         }
     } else if value.is_bool() {
-        (if value.as_bool().unwrap() { "true" } else { "false" }).to_string()
+        (if value.as_bool().unwrap() {
+            "true"
+        } else {
+            "false"
+        })
+        .to_string()
     } else if value.is_object() {
         if super::is_string(value) {
             super::as_string(value).to_string()
@@ -50,11 +55,18 @@ fn format_object(value: Value) -> String {
                 super::super::object::ObjType::Range => {
                     let range = unsafe { &*(ptr as *const super::super::object::ObjRange) };
                     let op = if range.is_inclusive { ".." } else { "..." };
-                    format!("{}{}{}", format_object(Value::num(range.from)), op, format_object(Value::num(range.to)))
+                    format!(
+                        "{}{}{}",
+                        format_object(Value::num(range.from)),
+                        op,
+                        format_object(Value::num(range.to))
+                    )
                 }
                 super::super::object::ObjType::Map => {
                     let map = unsafe { &*(ptr as *const super::super::object::ObjMap) };
-                    let parts: Vec<String> = map.entries.iter()
+                    let parts: Vec<String> = map
+                        .entries
+                        .iter()
                         .map(|(k, v)| format!("{}: {}", format_object(k.0), format_object(*v)))
                         .collect();
                     format!("{{{}}}", parts.join(", "))

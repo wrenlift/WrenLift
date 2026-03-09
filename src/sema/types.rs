@@ -14,7 +14,6 @@
 ///
 /// Forward-flow lattice analysis.
 /// The key win: tight numeric loops get unboxed f64 ops in codegen.
-
 use std::collections::HashMap;
 
 use crate::ast::*;
@@ -130,6 +129,12 @@ pub struct TypeInferrer {
     env: TypeEnv,
 }
 
+impl Default for TypeInferrer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeInferrer {
     pub fn new() -> Self {
         Self {
@@ -241,9 +246,7 @@ impl TypeInferrer {
 
             Expr::Ident(_) => {
                 // Look up from var types if we tracked it.
-                self.env
-                    .get_expr_type(expr.1.start)
-                    .clone()
+                self.env.get_expr_type(expr.1.start).clone()
             }
 
             Expr::Field(_) | Expr::StaticField(_) => InferredType::Any,
@@ -293,7 +296,12 @@ impl TypeInferrer {
                 InferredType::Any
             }
 
-            Expr::Call { receiver, args, block_arg, .. } => {
+            Expr::Call {
+                receiver,
+                args,
+                block_arg,
+                ..
+            } => {
                 if let Some(recv) = receiver {
                     self.infer_expr(recv);
                 }
@@ -321,7 +329,11 @@ impl TypeInferrer {
                 InferredType::Any
             }
 
-            Expr::SubscriptSet { receiver, index_args, value } => {
+            Expr::SubscriptSet {
+                receiver,
+                index_args,
+                value,
+            } => {
                 self.infer_expr(receiver);
                 for arg in index_args {
                     self.infer_expr(arg);
@@ -396,8 +408,11 @@ impl TypeInferrer {
             }
 
             // Bitwise ops: Num × Num → Num
-            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor
-            | BinaryOp::Shl | BinaryOp::Shr => {
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
                 if left.is_num() && right.is_num() {
                     InferredType::Num
                 } else {
@@ -406,8 +421,12 @@ impl TypeInferrer {
             }
 
             // Comparison ops → Bool
-            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq
-            | BinaryOp::Eq | BinaryOp::NotEq => InferredType::Bool,
+            BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::LtEq
+            | BinaryOp::GtEq
+            | BinaryOp::Eq
+            | BinaryOp::NotEq => InferredType::Bool,
         }
     }
 }
@@ -428,7 +447,11 @@ mod tests {
 
     fn infer_source(source: &str) -> TypeEnv {
         let result = parse(source);
-        assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
         infer_types(&result.module)
     }
 
@@ -593,7 +616,10 @@ mod tests {
 
     #[test]
     fn test_type_join_same() {
-        assert_eq!(InferredType::Num.join(&InferredType::Num), InferredType::Num);
+        assert_eq!(
+            InferredType::Num.join(&InferredType::Num),
+            InferredType::Num
+        );
     }
 
     #[test]

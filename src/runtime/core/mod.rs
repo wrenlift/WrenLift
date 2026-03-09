@@ -2,7 +2,6 @@
 ///
 /// Implements all built-in classes and their native methods, following
 /// the standard Wren specification from wren-lang/wren.
-
 mod bool;
 mod cls;
 mod fiber;
@@ -115,7 +114,11 @@ pub fn validate_int(ctx: &mut dyn NativeContext, value: Value, arg_name: &str) -
 }
 
 /// Validate that a value is a String, returning a reference to the string data.
-pub fn validate_string(ctx: &mut dyn NativeContext, value: Value, arg_name: &str) -> Option<String> {
+pub fn validate_string(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    arg_name: &str,
+) -> Option<String> {
     if !value.is_object() {
         ctx.runtime_error(format!("{} must be a string.", arg_name));
         return None;

@@ -4,7 +4,6 @@
 /// outside the loop (or are themselves loop-invariant) and the instruction
 /// has no side effects. Moved instructions are placed in a preheader block
 /// inserted before the loop header.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::MirPass;
@@ -290,7 +289,10 @@ fn find_invariants(
                     continue;
                 }
                 // Skip module var reads (may change between iterations).
-                if matches!(inst, Instruction::GetModuleVar(_) | Instruction::GetUpvalue(_)) {
+                if matches!(
+                    inst,
+                    Instruction::GetModuleVar(_) | Instruction::GetUpvalue(_)
+                ) {
                     continue;
                 }
 
@@ -316,11 +318,7 @@ fn find_invariants(
 
 /// Insert a preheader block that jumps unconditionally to the loop header.
 /// Redirects all non-loop predecessors of the header to the preheader.
-fn insert_preheader(
-    func: &mut MirFunction,
-    header: BlockId,
-    body: &HashSet<BlockId>,
-) -> BlockId {
+fn insert_preheader(func: &mut MirFunction, header: BlockId, body: &HashSet<BlockId>) -> BlockId {
     let preheader = func.new_block();
 
     // The preheader jumps unconditionally to the header, forwarding any block
@@ -356,7 +354,12 @@ fn insert_preheader(
 }
 
 /// Rewrite all edges from `src` that target `old_target` to point at `new_target`.
-fn redirect_terminator(func: &mut MirFunction, src: BlockId, old_target: BlockId, new_target: BlockId) {
+fn redirect_terminator(
+    func: &mut MirFunction,
+    src: BlockId,
+    old_target: BlockId,
+    new_target: BlockId,
+) {
     let term = &mut func.block_mut(src).terminator;
     match term {
         Terminator::Branch { target, .. } => {
@@ -479,8 +482,7 @@ mod tests {
         {
             let b = f.block_mut(bb0);
             b.instructions.push((v_ten, Instruction::ConstNum(10.0)));
-            b.instructions
-                .push((v_twenty, Instruction::ConstNum(20.0)));
+            b.instructions.push((v_twenty, Instruction::ConstNum(20.0)));
             b.instructions.push((v_zero, Instruction::ConstNum(0.0)));
             b.instructions.push((v_five, Instruction::ConstNum(5.0)));
             b.instructions.push((v_one, Instruction::ConstNum(1.0)));
@@ -512,8 +514,7 @@ mod tests {
                 .push((v_invariant, Instruction::Add(v_ten, v_twenty)));
             b.instructions
                 .push((v_new_sum, Instruction::Add(v_sum, v_invariant)));
-            b.instructions
-                .push((v_new_i, Instruction::Add(v_i, v_one)));
+            b.instructions.push((v_new_i, Instruction::Add(v_i, v_one)));
             b.terminator = Terminator::Branch {
                 target: bb1,
                 args: vec![v_new_i, v_new_sum],
@@ -546,12 +547,7 @@ mod tests {
 
         // The invariant instruction should no longer be in bb2 (the loop body).
         let bb2 = BlockId(2);
-        let body_vals: Vec<ValueId> = f
-            .block(bb2)
-            .instructions
-            .iter()
-            .map(|&(v, _)| v)
-            .collect();
+        let body_vals: Vec<ValueId> = f.block(bb2).instructions.iter().map(|&(v, _)| v).collect();
         assert!(
             !body_vals.contains(&v_invariant),
             "invariant should have been hoisted out of loop body"
@@ -618,8 +614,7 @@ mod tests {
                     args: vec![],
                 },
             ));
-            b.instructions
-                .push((v_new_i, Instruction::Add(v_i, v_one)));
+            b.instructions.push((v_new_i, Instruction::Add(v_i, v_one)));
             b.terminator = Terminator::Branch {
                 target: bb1,
                 args: vec![v_new_i],
@@ -715,14 +710,11 @@ mod tests {
         // bb2: both v_a and v_b are invariant
         {
             let b = f.block_mut(bb2);
-            b.instructions
-                .push((v_a, Instruction::Add(v_two, v_three)));
-            b.instructions
-                .push((v_b, Instruction::Mul(v_a, v_four)));
+            b.instructions.push((v_a, Instruction::Add(v_two, v_three)));
+            b.instructions.push((v_b, Instruction::Mul(v_a, v_four)));
             b.instructions
                 .push((v_new_acc, Instruction::Add(v_acc, v_b)));
-            b.instructions
-                .push((v_new_i, Instruction::Add(v_i, v_one)));
+            b.instructions.push((v_new_i, Instruction::Add(v_i, v_one)));
             b.terminator = Terminator::Branch {
                 target: bb1,
                 args: vec![v_new_i, v_new_acc],
@@ -805,8 +797,7 @@ mod tests {
         // bb2
         {
             let b = f.block_mut(bb2);
-            b.instructions
-                .push((v_new_i, Instruction::Add(v_i, v_one)));
+            b.instructions.push((v_new_i, Instruction::Add(v_i, v_one)));
             b.terminator = Terminator::Branch {
                 target: bb1,
                 args: vec![v_new_i],
@@ -834,7 +825,9 @@ mod tests {
         let bb2 = f.new_block();
 
         let v = f.new_value();
-        f.block_mut(bb0).instructions.push((v, Instruction::ConstNull));
+        f.block_mut(bb0)
+            .instructions
+            .push((v, Instruction::ConstNull));
         f.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![],
@@ -868,12 +861,16 @@ mod tests {
 
         let v = f.new_value();
         let v_cond = f.new_value();
-        f.block_mut(bb0).instructions.push((v, Instruction::ConstBool(true)));
+        f.block_mut(bb0)
+            .instructions
+            .push((v, Instruction::ConstBool(true)));
         f.block_mut(bb0).terminator = Terminator::Branch {
             target: bb1,
             args: vec![],
         };
-        f.block_mut(bb1).instructions.push((v_cond, Instruction::ConstBool(true)));
+        f.block_mut(bb1)
+            .instructions
+            .push((v_cond, Instruction::ConstBool(true)));
         f.block_mut(bb1).terminator = Terminator::CondBranch {
             condition: v_cond,
             true_target: bb2,

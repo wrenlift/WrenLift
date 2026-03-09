@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use super::value::Value;
 use crate::intern::SymbolId;
 use crate::mir::BlockId;
 use crate::runtime::engine::FuncId;
-use super::value::Value;
 
 // ---------------------------------------------------------------------------
 // Object type tag
@@ -51,17 +51,17 @@ pub enum ObjType {
 #[repr(C)]
 pub struct ObjHeader {
     /// What kind of object this is.
-    pub obj_type: ObjType,     // offset 0, u8
+    pub obj_type: ObjType, // offset 0, u8
     /// GC mark bit / tri-color byte. 0 = white, 1 = gray, 2 = black.
-    pub gc_mark: u8,           // offset 1
+    pub gc_mark: u8, // offset 1
     /// GC generation. 0 = young (nursery), 1 = old.
-    pub generation: u8,        // offset 2
+    pub generation: u8, // offset 2
     // 5 bytes padding (implicit)
     /// Intrusive linked list of all heap objects (for GC sweep).
-    pub next: *mut ObjHeader,  // offset 8
+    pub next: *mut ObjHeader, // offset 8
     /// The class of this object (for method dispatch). Null for meta-objects.
-    pub class: *mut ObjClass,  // offset 16
-    // total: 24 bytes
+    pub class: *mut ObjClass, // offset 16
+                              // total: 24 bytes
 }
 
 impl ObjHeader {
@@ -145,14 +145,20 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// A growable array with JIT-friendly raw buffer layout.
 #[repr(C)]
 pub struct ObjList {
-    pub header: ObjHeader,        // offset 0, 24 bytes
-    pub count: u32,               // offset 24
-    pub capacity: u32,            // offset 28
-    pub elements: *mut Value,     // offset 32, heap-allocated buffer
-    // total: 40 bytes
+    pub header: ObjHeader, // offset 0, 24 bytes
+    pub count: u32,        // offset 24
+    pub capacity: u32,     // offset 28
+    pub elements: *mut Value, // offset 32, heap-allocated buffer
+                           // total: 40 bytes
 }
 
 const LIST_INITIAL_CAPACITY: u32 = 8;
+
+impl Default for ObjList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ObjList {
     pub fn new() -> Self {
@@ -194,19 +200,25 @@ impl ObjList {
 
     pub fn set(&mut self, index: usize, value: Value) {
         if index < self.count as usize {
-            unsafe { self.elements.add(index).write(value); }
+            unsafe {
+                self.elements.add(index).write(value);
+            }
         }
     }
 
     pub fn add(&mut self, value: Value) {
         self.ensure_capacity(self.count + 1);
-        unsafe { self.elements.add(self.count as usize).write(value); }
+        unsafe {
+            self.elements.add(self.count as usize).write(value);
+        }
         self.count += 1;
     }
 
     pub fn insert(&mut self, index: usize, value: Value) {
         let count = self.count as usize;
-        if index > count { return; }
+        if index > count {
+            return;
+        }
         self.ensure_capacity(self.count + 1);
         if index < count {
             unsafe {
@@ -217,13 +229,17 @@ impl ObjList {
                 );
             }
         }
-        unsafe { self.elements.add(index).write(value); }
+        unsafe {
+            self.elements.add(index).write(value);
+        }
         self.count += 1;
     }
 
     pub fn remove(&mut self, index: usize) -> Option<Value> {
         let count = self.count as usize;
-        if index >= count { return None; }
+        if index >= count {
+            return None;
+        }
         let val = unsafe { self.elements.add(index).read() };
         if index < count - 1 {
             unsafe {
@@ -280,7 +296,9 @@ impl ObjList {
     }
 
     fn ensure_capacity(&mut self, needed: u32) {
-        if needed <= self.capacity { return; }
+        if needed <= self.capacity {
+            return;
+        }
         let new_cap = if self.capacity == 0 {
             LIST_INITIAL_CAPACITY.max(needed)
         } else {
@@ -292,11 +310,8 @@ impl ObjList {
         } else {
             let old_layout = std::alloc::Layout::array::<Value>(self.capacity as usize).unwrap();
             unsafe {
-                std::alloc::realloc(
-                    self.elements as *mut u8,
-                    old_layout,
-                    new_layout.size(),
-                ) as *mut Value
+                std::alloc::realloc(self.elements as *mut u8, old_layout, new_layout.size())
+                    as *mut Value
             }
         };
         self.elements = new_ptr;
@@ -308,7 +323,9 @@ impl Drop for ObjList {
     fn drop(&mut self) {
         if !self.elements.is_null() && self.capacity > 0 {
             let layout = std::alloc::Layout::array::<Value>(self.capacity as usize).unwrap();
-            unsafe { std::alloc::dealloc(self.elements as *mut u8, layout); }
+            unsafe {
+                std::alloc::dealloc(self.elements as *mut u8, layout);
+            }
         }
     }
 }
@@ -372,6 +389,12 @@ impl fmt::Debug for MapKey {
 pub struct ObjMap {
     pub header: ObjHeader,
     pub entries: HashMap<MapKey, Value>,
+}
+
+impl Default for ObjMap {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ObjMap {
@@ -479,12 +502,10 @@ impl Iterator for RangeIter {
             } else {
                 self.current < self.end
             }
+        } else if self.ascending {
+            self.current >= self.end
         } else {
-            if self.ascending {
-                self.current >= self.end
-            } else {
-                self.current <= self.end
-            }
+            self.current <= self.end
         };
 
         if done {
@@ -726,6 +747,12 @@ pub struct ObjFiber {
     pub spawn_trace: Option<Vec<StackFrame>>,
 }
 
+impl Default for ObjFiber {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ObjFiber {
     pub fn new() -> Self {
         Self {
@@ -879,6 +906,7 @@ pub trait NativeContext {
 }
 
 impl ObjClass {
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(name: SymbolId, superclass: *mut ObjClass) -> Self {
         let mut methods = HashMap::new();
         let mut protocols = crate::sema::protocol::ProtocolSet::EMPTY;
@@ -948,16 +976,16 @@ impl fmt::Debug for ObjClass {
 
 /// A class instance with a fixed number of fields.
 #[repr(C)]
-#[repr(C)]
 pub struct ObjInstance {
-    pub header: ObjHeader,         // offset 0, 24 bytes
-    pub num_fields: u32,           // offset 24
+    pub header: ObjHeader, // offset 0, 24 bytes
+    pub num_fields: u32,   // offset 24
     // 4 bytes padding (implicit, for *mut alignment)
-    pub fields: *mut Value,        // offset 32, heap-allocated [Value; num_fields]
-    // total: 40 bytes
+    pub fields: *mut Value, // offset 32, heap-allocated [Value; num_fields]
+                            // total: 40 bytes
 }
 
 impl ObjInstance {
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(class: *mut ObjClass) -> Self {
         let num_fields = if class.is_null() {
             0
@@ -970,7 +998,9 @@ impl ObjInstance {
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut Value };
             // Initialize all fields to null
             for i in 0..num_fields {
-                unsafe { ptr.add(i).write(Value::null()); }
+                unsafe {
+                    ptr.add(i).write(Value::null());
+                }
             }
             ptr
         } else {
@@ -996,7 +1026,9 @@ impl ObjInstance {
 
     pub fn set_field(&mut self, index: usize, value: Value) {
         if index < self.num_fields as usize {
-            unsafe { self.fields.add(index).write(value); }
+            unsafe {
+                self.fields.add(index).write(value);
+            }
         }
     }
 }
@@ -1005,7 +1037,9 @@ impl Drop for ObjInstance {
     fn drop(&mut self) {
         if !self.fields.is_null() && self.num_fields > 0 {
             let layout = std::alloc::Layout::array::<Value>(self.num_fields as usize).unwrap();
-            unsafe { std::alloc::dealloc(self.fields as *mut u8, layout); }
+            unsafe {
+                std::alloc::dealloc(self.fields as *mut u8, layout);
+            }
         }
     }
 }
@@ -1125,11 +1159,11 @@ mod tests {
     // Helper: create an interner with some symbols.
     fn test_interner() -> Interner {
         let mut i = Interner::new();
-        i.intern("foo");     // 0
-        i.intern("bar");     // 1
-        i.intern("baz");     // 2
-        i.intern("+");       // 3
-        i.intern("init");    // 4
+        i.intern("foo"); // 0
+        i.intern("bar"); // 1
+        i.intern("baz"); // 2
+        i.intern("+"); // 3
+        i.intern("init"); // 4
         i.intern("myClass"); // 5
         i
     }
@@ -1490,7 +1524,10 @@ mod tests {
         assert_eq!(ObjString::new("".into()).header.obj_type, ObjType::String);
         assert_eq!(ObjList::new().header.obj_type, ObjType::List);
         assert_eq!(ObjMap::new().header.obj_type, ObjType::Map);
-        assert_eq!(ObjRange::new(0.0, 1.0, true).header.obj_type, ObjType::Range);
+        assert_eq!(
+            ObjRange::new(0.0, 1.0, true).header.obj_type,
+            ObjType::Range
+        );
         assert_eq!(ObjFiber::new().header.obj_type, ObjType::Fiber);
         assert_eq!(ObjForeign::new(vec![]).header.obj_type, ObjType::Foreign);
     }

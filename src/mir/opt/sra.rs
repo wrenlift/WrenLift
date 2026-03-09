@@ -3,7 +3,6 @@
 /// Replaces non-escaping `MakeList` allocations with individual scalar values
 /// when all `SubscriptGet` accesses use constant indices. This eliminates the
 /// heap allocation entirely — the list elements live as SSA values.
-
 use std::collections::HashMap;
 
 use super::MirPass;
@@ -56,12 +55,10 @@ impl MirPass for Sra {
             for (_, inst) in &block.instructions {
                 match inst {
                     Instruction::SubscriptGet { receiver, args }
-                    | Instruction::SubscriptSet {
-                        receiver, args, ..
-                    } => {
+                    | Instruction::SubscriptSet { receiver, args, .. } => {
                         if list_elements.contains_key(receiver)
                             && !args.is_empty()
-                            && const_nums.get(&args[0]).is_none()
+                            && !const_nums.contains_key(&args[0])
                         {
                             blocked.push(*receiver);
                         }
@@ -192,8 +189,7 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(10.0)));
-            b.instructions
-                .push((v1, Instruction::MakeList(vec![v0])));
+            b.instructions.push((v1, Instruction::MakeList(vec![v0])));
             b.terminator = Terminator::Return(v1);
         }
 

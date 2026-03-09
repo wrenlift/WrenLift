@@ -6,7 +6,6 @@
 ///
 /// SSA values are referenced by `ValueId`. Each instruction produces at most
 /// one value. Block parameters receive values from predecessor branches.
-
 pub mod builder;
 pub mod interp;
 pub mod opt;
@@ -120,7 +119,13 @@ impl MathUnaryOp {
             Self::Trunc => x.trunc(),
             Self::Fract => x.fract(),
             Self::Sign => {
-                if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+                if x > 0.0 {
+                    1.0
+                } else if x < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
             }
         }
     }
@@ -185,7 +190,6 @@ impl MathBinaryOp {
 #[derive(Debug, Clone)]
 pub enum Instruction {
     // -- Constants ----------------------------------------------------------
-
     /// Load an f64 constant as a boxed Value.
     ConstNum(f64),
     /// Load a boolean constant as a boxed Value.
@@ -196,14 +200,12 @@ pub enum Instruction {
     ConstString(u32),
 
     // -- Unboxed constants (for optimized paths) ----------------------------
-
     /// Load an unboxed f64.
     ConstF64(f64),
     /// Load an unboxed i64.
     ConstI64(i64),
 
     // -- Boxed arithmetic (calls runtime helpers) ---------------------------
-
     /// Boxed add: Value + Value → Value (type-checked at runtime).
     Add(ValueId, ValueId),
     /// Boxed sub.
@@ -218,14 +220,12 @@ pub enum Instruction {
     Neg(ValueId),
 
     // -- Math intrinsics (unboxed f64, inlined from Num methods) ------------
-
     /// Unary math intrinsic on unboxed f64 (abs, sin, sqrt, etc.).
     MathUnaryF64(MathUnaryOp, ValueId),
     /// Binary math intrinsic on unboxed f64 (atan2, min, max, pow).
     MathBinaryF64(MathBinaryOp, ValueId, ValueId),
 
     // -- Unboxed f64 arithmetic (the big optimization win) ------------------
-
     /// Unboxed f64 add.
     AddF64(ValueId, ValueId),
     /// Unboxed f64 sub.
@@ -240,7 +240,6 @@ pub enum Instruction {
     NegF64(ValueId),
 
     // -- Comparison ---------------------------------------------------------
-
     /// Compare less-than (boxed).
     CmpLt(ValueId, ValueId),
     /// Compare greater-than (boxed).
@@ -255,14 +254,12 @@ pub enum Instruction {
     CmpNe(ValueId, ValueId),
 
     // -- Unboxed comparison → Bool ------------------------------------------
-
     CmpLtF64(ValueId, ValueId),
     CmpGtF64(ValueId, ValueId),
     CmpLeF64(ValueId, ValueId),
     CmpGeF64(ValueId, ValueId),
 
     // -- Logical / bitwise --------------------------------------------------
-
     /// Logical not (any value → Bool).
     Not(ValueId),
     /// Bitwise AND (boxed).
@@ -279,7 +276,6 @@ pub enum Instruction {
     Shr(ValueId, ValueId),
 
     // -- Type guards (for speculative optimization) -------------------------
-
     /// Assert that a value is a Num. Branches to deopt if not.
     GuardNum(ValueId),
     /// Assert that a value is a Bool.
@@ -290,14 +286,12 @@ pub enum Instruction {
     GuardProtocol(ValueId, crate::sema::protocol::ProtocolId),
 
     // -- Boxing / unboxing --------------------------------------------------
-
     /// Unbox a Value → f64 (assumes GuardNum passed).
     Unbox(ValueId),
     /// Box an f64 → Value.
     Box(ValueId),
 
     // -- Object operations --------------------------------------------------
-
     /// Read an instance field by index.
     GetField(ValueId, u16),
     /// Write an instance field by index.
@@ -308,7 +302,6 @@ pub enum Instruction {
     SetModuleVar(u16, ValueId),
 
     // -- Calls --------------------------------------------------------------
-
     /// Method call: receiver, method symbol, args → result.
     Call {
         receiver: ValueId,
@@ -322,7 +315,6 @@ pub enum Instruction {
     },
 
     // -- Closures -----------------------------------------------------------
-
     /// Create a closure from a function ID and captured upvalues.
     MakeClosure {
         fn_id: u32,
@@ -334,7 +326,6 @@ pub enum Instruction {
     SetUpvalue(u16, ValueId),
 
     // -- Collections --------------------------------------------------------
-
     /// Create a new list from elements.
     MakeList(Vec<ValueId>),
     /// Create a new map from key-value pairs.
@@ -343,19 +334,16 @@ pub enum Instruction {
     MakeRange(ValueId, ValueId, bool),
 
     // -- String interpolation -----------------------------------------------
-
     /// Concatenate string parts.
     StringConcat(Vec<ValueId>),
     /// Convert value to string (for interpolation).
     ToString(ValueId),
 
     // -- Type test ----------------------------------------------------------
-
     /// `value is ClassName` → Bool.
     IsType(ValueId, SymbolId),
 
     // -- Subscript ----------------------------------------------------------
-
     /// Subscript get: receiver[args].
     SubscriptGet {
         receiver: ValueId,
@@ -369,7 +357,6 @@ pub enum Instruction {
     },
 
     // -- Misc ---------------------------------------------------------------
-
     /// Move/copy a value (used during SSA construction).
     Move(ValueId),
     /// A block parameter (receives value from predecessors).
@@ -461,9 +448,7 @@ impl Instruction {
 
             Instruction::MakeClosure { upvalues, .. } => upvalues.clone(),
             Instruction::MakeList(elems) => elems.clone(),
-            Instruction::MakeMap(pairs) => {
-                pairs.iter().flat_map(|(k, v)| [*k, *v]).collect()
-            }
+            Instruction::MakeMap(pairs) => pairs.iter().flat_map(|(k, v)| [*k, *v]).collect(),
             Instruction::MakeRange(from, to, _) => vec![*from, *to],
             Instruction::StringConcat(parts) => parts.clone(),
             Instruction::SubscriptGet { receiver, args } => {
@@ -471,7 +456,11 @@ impl Instruction {
                 ops.extend(args);
                 ops
             }
-            Instruction::SubscriptSet { receiver, args, value } => {
+            Instruction::SubscriptSet {
+                receiver,
+                args,
+                value,
+            } => {
                 let mut ops = vec![*receiver];
                 ops.extend(args);
                 ops.push(*value);
@@ -493,10 +482,7 @@ pub enum Terminator {
     /// Return null (implicit return).
     ReturnNull,
     /// Unconditional jump.
-    Branch {
-        target: BlockId,
-        args: Vec<ValueId>,
-    },
+    Branch { target: BlockId, args: Vec<ValueId> },
     /// Conditional branch.
     CondBranch {
         condition: ValueId,
@@ -718,7 +704,9 @@ impl MirFunction {
             // Block header with params
             out.push_str(&format!("  {}(", block.id));
             for (i, (val, ty)) in block.params.iter().enumerate() {
-                if i > 0 { out.push_str(", "); }
+                if i > 0 {
+                    out.push_str(", ");
+                }
                 out.push_str(&format!("{}: {:?}", val, ty));
             }
             out.push_str("):\n");
@@ -837,10 +825,7 @@ impl MirFunction {
             }
 
             // Terminator
-            out.push_str(&format!(
-                "    {}\n",
-                fmt_terminator(&block.terminator)
-            ));
+            out.push_str(&format!("    {}\n", fmt_terminator(&block.terminator)));
         }
 
         out.push_str("}\n");
@@ -964,10 +949,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
 
         Instruction::MakeList(elems) => format!("make_list [{}]", fmt_val_list(elems)),
         Instruction::MakeMap(pairs) => {
-            let entries: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, v))
-                .collect();
+            let entries: Vec<String> = pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
             format!("make_map {{{}}}", entries.join(", "))
         }
         Instruction::MakeRange(from, to, inclusive) => {
@@ -1128,10 +1110,7 @@ mod tests {
             Instruction::Add(ValueId(0), ValueId(1)).operands(),
             vec![ValueId(0), ValueId(1)]
         );
-        assert_eq!(
-            Instruction::Neg(ValueId(2)).operands(),
-            vec![ValueId(2)]
-        );
+        assert_eq!(Instruction::Neg(ValueId(2)).operands(), vec![ValueId(2)]);
         assert_eq!(
             Instruction::Call {
                 receiver: ValueId(0),

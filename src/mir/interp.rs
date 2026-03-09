@@ -9,7 +9,6 @@
 ///
 /// Returns `InterpError::Unsupported` for runtime-dependent ops (calls, closures,
 /// field access, collections) that require a full VM.
-
 use std::collections::HashMap;
 
 use crate::runtime::value::Value;
@@ -51,9 +50,9 @@ impl InterpValue {
         match self {
             InterpValue::F64(n) => Ok(n),
             InterpValue::I64(n) => Ok(n as f64),
-            InterpValue::Boxed(v) => v.as_num().ok_or_else(|| {
-                InterpError::TypeMismatch(format!("expected num, got {:?}", v))
-            }),
+            InterpValue::Boxed(v) => v
+                .as_num()
+                .ok_or_else(|| InterpError::TypeMismatch(format!("expected num, got {:?}", v))),
             other => Err(InterpError::TypeMismatch(format!(
                 "expected f64, got {:?}",
                 other
@@ -173,7 +172,10 @@ pub fn eval_pure_instruction(
     values: &HashMap<ValueId, InterpValue>,
 ) -> Result<InterpValue, InterpError> {
     let get = |id: ValueId| -> Result<InterpValue, InterpError> {
-        values.get(&id).copied().ok_or(InterpError::UndefinedValue(id))
+        values
+            .get(&id)
+            .copied()
+            .ok_or(InterpError::UndefinedValue(id))
     };
 
     match inst {
@@ -210,9 +212,9 @@ pub fn eval_pure_instruction(
 
         // -- Math intrinsics --
         Instruction::MathUnaryF64(op, a) => Ok(InterpValue::F64(op.apply(get(*a)?.as_f64()?))),
-        Instruction::MathBinaryF64(op, a, b) => {
-            Ok(InterpValue::F64(op.apply(get(*a)?.as_f64()?, get(*b)?.as_f64()?)))
-        }
+        Instruction::MathBinaryF64(op, a, b) => Ok(InterpValue::F64(
+            op.apply(get(*a)?.as_f64()?, get(*b)?.as_f64()?),
+        )),
 
         // -- Boxed comparisons --
         Instruction::CmpLt(a, b) => boxed_cmp(&get, *a, *b, |x, y| x < y),
@@ -224,7 +226,12 @@ pub fn eval_pure_instruction(
             let rhs = get(*b)?.to_value();
             // For non-instance objects (nums, bools, null, strings), use value equality.
             // For instances, return error so vm_interp can dispatch user-defined ==(_).
-            if lhs.is_object() && !lhs.is_string_object() && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num() {
+            if lhs.is_object()
+                && !lhs.is_string_object()
+                && !rhs.is_null()
+                && !rhs.is_bool()
+                && !rhs.is_num()
+            {
                 Err(InterpError::TypeMismatch("CmpEq on objects".into()))
             } else {
                 Ok(InterpValue::Boxed(Value::bool(lhs == rhs)))
@@ -233,7 +240,12 @@ pub fn eval_pure_instruction(
         Instruction::CmpNe(a, b) => {
             let lhs = get(*a)?.to_value();
             let rhs = get(*b)?.to_value();
-            if lhs.is_object() && !lhs.is_string_object() && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num() {
+            if lhs.is_object()
+                && !lhs.is_string_object()
+                && !rhs.is_null()
+                && !rhs.is_bool()
+                && !rhs.is_num()
+            {
                 Err(InterpError::TypeMismatch("CmpNe on objects".into()))
             } else {
                 Ok(InterpValue::Boxed(Value::bool(lhs != rhs)))
@@ -279,17 +291,15 @@ pub fn eval_pure_instruction(
         }
 
         // -- Box / Unbox (handles already-unboxed values gracefully) --
-        Instruction::Unbox(a) => {
-            match get(*a)? {
-                InterpValue::Boxed(val) => match val.as_num() {
-                    Some(n) => Ok(InterpValue::F64(n)),
-                    None => Err(InterpError::TypeMismatch("unbox: not a number".into())),
-                },
-                InterpValue::F64(n) => Ok(InterpValue::F64(n)),
-                InterpValue::I64(n) => Ok(InterpValue::F64(n as f64)),
-                InterpValue::Bool(_) => Err(InterpError::TypeMismatch("unbox: bool".into())),
-            }
-        }
+        Instruction::Unbox(a) => match get(*a)? {
+            InterpValue::Boxed(val) => match val.as_num() {
+                Some(n) => Ok(InterpValue::F64(n)),
+                None => Err(InterpError::TypeMismatch("unbox: not a number".into())),
+            },
+            InterpValue::F64(n) => Ok(InterpValue::F64(n)),
+            InterpValue::I64(n) => Ok(InterpValue::F64(n as f64)),
+            InterpValue::Bool(_) => Err(InterpError::TypeMismatch("unbox: bool".into())),
+        },
         Instruction::Box(a) => Ok(InterpValue::Boxed(get(*a)?.to_value())),
 
         // -- Move --
@@ -336,7 +346,10 @@ fn boxed_binop(
     b: ValueId,
     op: impl Fn(f64, f64) -> f64,
 ) -> Result<InterpValue, InterpError> {
-    Ok(InterpValue::Boxed(Value::num(op(get_boxed_num(get, a)?, get_boxed_num(get, b)?))))
+    Ok(InterpValue::Boxed(Value::num(op(
+        get_boxed_num(get, a)?,
+        get_boxed_num(get, b)?,
+    ))))
 }
 
 fn f64_binop(
@@ -354,7 +367,10 @@ fn boxed_cmp(
     b: ValueId,
     op: impl Fn(f64, f64) -> bool,
 ) -> Result<InterpValue, InterpError> {
-    Ok(InterpValue::Boxed(Value::bool(op(get_boxed_num(get, a)?, get_boxed_num(get, b)?))))
+    Ok(InterpValue::Boxed(Value::bool(op(
+        get_boxed_num(get, a)?,
+        get_boxed_num(get, b)?,
+    ))))
 }
 
 fn f64_cmp(
@@ -473,11 +489,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Bind branch arguments to the target block's parameters.
-    fn bind_block_params(
-        &mut self,
-        target: BlockId,
-        args: &[ValueId],
-    ) -> Result<(), InterpError> {
+    fn bind_block_params(&mut self, target: BlockId, args: &[ValueId]) -> Result<(), InterpError> {
         let block = self
             .func
             .blocks
@@ -495,12 +507,11 @@ impl<'a> Interp<'a> {
         // Module vars use Interp-local storage, handle them here.
         // Everything else delegates to the shared evaluator.
         match inst {
-            Instruction::GetModuleVar(idx) => {
-                self.module_vars
-                    .get(idx)
-                    .copied()
-                    .ok_or_else(|| InterpError::UndefinedValue(ValueId(*idx as u32)))
-            }
+            Instruction::GetModuleVar(idx) => self
+                .module_vars
+                .get(idx)
+                .copied()
+                .ok_or(InterpError::UndefinedValue(ValueId(*idx as u32))),
             Instruction::SetModuleVar(idx, val) => {
                 let v = self.get(*val)?;
                 self.module_vars.insert(*idx, v);
@@ -592,11 +603,11 @@ mod tests {
         let v0 = f.new_value();
         f.block_mut(bb)
             .instructions
-            .push((v0, Instruction::ConstF64(3.14)));
+            .push((v0, Instruction::ConstF64(1.234)));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let result = eval(&f).unwrap();
-        assert_eq!(result, InterpValue::F64(3.14));
+        assert_eq!(result, InterpValue::F64(1.234));
     }
 
     #[test]
@@ -1086,7 +1097,7 @@ mod tests {
         let v2 = f.new_value();
         f.block_mut(bb)
             .instructions
-            .push((v0, Instruction::ConstNum(3.14)));
+            .push((v0, Instruction::ConstNum(1.234)));
         f.block_mut(bb)
             .instructions
             .push((v1, Instruction::Unbox(v0)));
@@ -1096,7 +1107,7 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
         let result = eval(&f).unwrap();
-        assert_eq!(result, InterpValue::Boxed(Value::num(3.14)));
+        assert_eq!(result, InterpValue::Boxed(Value::num(1.234)));
     }
 
     // -- Move --

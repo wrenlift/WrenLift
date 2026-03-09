@@ -7,7 +7,6 @@
 /// 3. Walk intervals, assigning physical registers from a free pool
 /// 4. When no register is free, spill the interval ending latest
 /// 5. Rewrite all VRegs to assigned PhysRegs, inserting spill/reload as needed
-
 use super::{MachFunc, MachInst, Mem, PhysReg, RegClass, VReg};
 use std::collections::{BTreeSet, HashMap};
 
@@ -218,8 +217,7 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
             // Spill: either spill this interval or the one ending latest.
             // Heuristic: spill the one with the longest remaining range.
             let last_active_idx = active.len().checked_sub(1);
-            let spill_active = last_active_idx
-                .filter(|&idx| active[idx].0 > iv.end);
+            let spill_active = last_active_idx.filter(|&idx| active[idx].0 > iv.end);
 
             if let Some(idx) = spill_active {
                 // Spill the active interval that ends latest; give its register to us.
@@ -372,8 +370,12 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
 
     match inst {
         // No registers
-        Prologue { frame_size } => Prologue { frame_size: *frame_size },
-        Epilogue { frame_size } => Epilogue { frame_size: *frame_size },
+        Prologue { frame_size } => Prologue {
+            frame_size: *frame_size,
+        },
+        Epilogue { frame_size } => Epilogue {
+            frame_size: *frame_size,
+        },
         Jmp { target } => Jmp { target: *target },
         DefLabel(l) => DefLabel(*l),
         Nop => Nop,
@@ -381,8 +383,14 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
         Ret => Ret,
 
         // Single dst
-        LoadImm { dst, bits } => LoadImm { dst: m(*dst), bits: *bits },
-        LoadFpImm { dst, value } => LoadFpImm { dst: m(*dst), value: *value },
+        LoadImm { dst, bits } => LoadImm {
+            dst: m(*dst),
+            bits: *bits,
+        },
+        LoadFpImm { dst, value } => LoadFpImm {
+            dst: m(*dst),
+            value: *value,
+        },
         Pop { dst } => Pop { dst: m(*dst) },
 
         // Single src
@@ -390,90 +398,363 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
         CallInd { target } => CallInd { target: m(*target) },
 
         // dst, src
-        Mov { dst, src } => Mov { dst: m(*dst), src: m(*src) },
-        FMov { dst, src } => FMov { dst: m(*dst), src: m(*src) },
-        BitcastGpToFp { dst, src } => BitcastGpToFp { dst: m(*dst), src: m(*src) },
-        BitcastFpToGp { dst, src } => BitcastFpToGp { dst: m(*dst), src: m(*src) },
-        INeg { dst, src } => INeg { dst: m(*dst), src: m(*src) },
-        Not { dst, src } => Not { dst: m(*dst), src: m(*src) },
-        FNeg { dst, src } => FNeg { dst: m(*dst), src: m(*src) },
-        FAbs { dst, src } => FAbs { dst: m(*dst), src: m(*src) },
-        FSqrt { dst, src } => FSqrt { dst: m(*dst), src: m(*src) },
-        FFloor { dst, src } => FFloor { dst: m(*dst), src: m(*src) },
-        FCeil { dst, src } => FCeil { dst: m(*dst), src: m(*src) },
-        FRound { dst, src } => FRound { dst: m(*dst), src: m(*src) },
-        FTrunc { dst, src } => FTrunc { dst: m(*dst), src: m(*src) },
-        FCvtToI64 { dst, src } => FCvtToI64 { dst: m(*dst), src: m(*src) },
-        I64CvtToF { dst, src } => I64CvtToF { dst: m(*dst), src: m(*src) },
+        Mov { dst, src } => Mov {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FMov { dst, src } => FMov {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        BitcastGpToFp { dst, src } => BitcastGpToFp {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        BitcastFpToGp { dst, src } => BitcastFpToGp {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        INeg { dst, src } => INeg {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        Not { dst, src } => Not {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FNeg { dst, src } => FNeg {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FAbs { dst, src } => FAbs {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FSqrt { dst, src } => FSqrt {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FFloor { dst, src } => FFloor {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FCeil { dst, src } => FCeil {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FRound { dst, src } => FRound {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FTrunc { dst, src } => FTrunc {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        FCvtToI64 { dst, src } => FCvtToI64 {
+            dst: m(*dst),
+            src: m(*src),
+        },
+        I64CvtToF { dst, src } => I64CvtToF {
+            dst: m(*dst),
+            src: m(*src),
+        },
 
         // dst, src, imm
-        IAddImm { dst, src, imm } => IAddImm { dst: m(*dst), src: m(*src), imm: *imm },
-        AndImm { dst, src, imm } => AndImm { dst: m(*dst), src: m(*src), imm: *imm },
-        OrImm { dst, src, imm } => OrImm { dst: m(*dst), src: m(*src), imm: *imm },
+        IAddImm { dst, src, imm } => IAddImm {
+            dst: m(*dst),
+            src: m(*src),
+            imm: *imm,
+        },
+        AndImm { dst, src, imm } => AndImm {
+            dst: m(*dst),
+            src: m(*src),
+            imm: *imm,
+        },
+        OrImm { dst, src, imm } => OrImm {
+            dst: m(*dst),
+            src: m(*src),
+            imm: *imm,
+        },
 
         // dst, lhs, rhs (3-address)
-        IAdd { dst, lhs, rhs } => IAdd { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        ISub { dst, lhs, rhs } => ISub { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        IMul { dst, lhs, rhs } => IMul { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        IDiv { dst, lhs, rhs } => IDiv { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        And { dst, lhs, rhs } => And { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        Or { dst, lhs, rhs } => Or { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        Xor { dst, lhs, rhs } => Xor { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        Shl { dst, lhs, rhs } => Shl { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        Sar { dst, lhs, rhs } => Sar { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        Shr { dst, lhs, rhs } => Shr { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        FAdd { dst, lhs, rhs } => FAdd { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        FSub { dst, lhs, rhs } => FSub { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        FMul { dst, lhs, rhs } => FMul { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        FDiv { dst, lhs, rhs } => FDiv { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        FMin { dst, lhs, rhs } => FMin { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
-        FMax { dst, lhs, rhs } => FMax { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs) },
+        IAdd { dst, lhs, rhs } => IAdd {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        ISub { dst, lhs, rhs } => ISub {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        IMul { dst, lhs, rhs } => IMul {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        IDiv { dst, lhs, rhs } => IDiv {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        And { dst, lhs, rhs } => And {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        Or { dst, lhs, rhs } => Or {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        Xor { dst, lhs, rhs } => Xor {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        Shl { dst, lhs, rhs } => Shl {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        Sar { dst, lhs, rhs } => Sar {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        Shr { dst, lhs, rhs } => Shr {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        FAdd { dst, lhs, rhs } => FAdd {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        FSub { dst, lhs, rhs } => FSub {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        FMul { dst, lhs, rhs } => FMul {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        FDiv { dst, lhs, rhs } => FDiv {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        FMin { dst, lhs, rhs } => FMin {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        FMax { dst, lhs, rhs } => FMax {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
 
         // 4-operand FMA
-        IMulSub { dst, lhs, rhs, acc } => IMulSub { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs), acc: m(*acc) },
-        FMAdd { dst, a, b, c } => FMAdd { dst: m(*dst), a: m(*a), b: m(*b), c: m(*c) },
-        FMSub { dst, a, b, c } => FMSub { dst: m(*dst), a: m(*a), b: m(*b), c: m(*c) },
-        FNMAdd { dst, a, b, c } => FNMAdd { dst: m(*dst), a: m(*a), b: m(*b), c: m(*c) },
-        FNMSub { dst, a, b, c } => FNMSub { dst: m(*dst), a: m(*a), b: m(*b), c: m(*c) },
+        IMulSub { dst, lhs, rhs, acc } => IMulSub {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+            acc: m(*acc),
+        },
+        FMAdd { dst, a, b, c } => FMAdd {
+            dst: m(*dst),
+            a: m(*a),
+            b: m(*b),
+            c: m(*c),
+        },
+        FMSub { dst, a, b, c } => FMSub {
+            dst: m(*dst),
+            a: m(*a),
+            b: m(*b),
+            c: m(*c),
+        },
+        FNMAdd { dst, a, b, c } => FNMAdd {
+            dst: m(*dst),
+            a: m(*a),
+            b: m(*b),
+            c: m(*c),
+        },
+        FNMSub { dst, a, b, c } => FNMSub {
+            dst: m(*dst),
+            a: m(*a),
+            b: m(*b),
+            c: m(*c),
+        },
 
         // Comparisons
-        ICmp { lhs, rhs } => ICmp { lhs: m(*lhs), rhs: m(*rhs) },
-        ICmpImm { lhs, imm } => ICmpImm { lhs: m(*lhs), imm: *imm },
-        FCmp { lhs, rhs } => FCmp { lhs: m(*lhs), rhs: m(*rhs) },
-        CSet { dst, cond } => CSet { dst: m(*dst), cond: *cond },
+        ICmp { lhs, rhs } => ICmp {
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        ICmpImm { lhs, imm } => ICmpImm {
+            lhs: m(*lhs),
+            imm: *imm,
+        },
+        FCmp { lhs, rhs } => FCmp {
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+        },
+        CSet { dst, cond } => CSet {
+            dst: m(*dst),
+            cond: *cond,
+        },
 
         // Branches with register operands
-        JmpIf { cond, target } => JmpIf { cond: *cond, target: *target },
-        JmpZero { src, target } => JmpZero { src: m(*src), target: *target },
-        JmpNonZero { src, target } => JmpNonZero { src: m(*src), target: *target },
-        TestBitJmpZero { src, bit, target } => TestBitJmpZero { src: m(*src), bit: *bit, target: *target },
-        TestBitJmpNonZero { src, bit, target } => TestBitJmpNonZero { src: m(*src), bit: *bit, target: *target },
+        JmpIf { cond, target } => JmpIf {
+            cond: *cond,
+            target: *target,
+        },
+        JmpZero { src, target } => JmpZero {
+            src: m(*src),
+            target: *target,
+        },
+        JmpNonZero { src, target } => JmpNonZero {
+            src: m(*src),
+            target: *target,
+        },
+        TestBitJmpZero { src, bit, target } => TestBitJmpZero {
+            src: m(*src),
+            bit: *bit,
+            target: *target,
+        },
+        TestBitJmpNonZero { src, bit, target } => TestBitJmpNonZero {
+            src: m(*src),
+            bit: *bit,
+            target: *target,
+        },
 
         // Memory
-        Ldr { dst, mem } => Ldr { dst: m(*dst), mem: mm(mem) },
-        Str { src, mem } => Str { src: m(*src), mem: mm(mem) },
-        FLdr { dst, mem } => FLdr { dst: m(*dst), mem: mm(mem) },
-        FStr { src, mem } => FStr { src: m(*src), mem: mm(mem) },
+        Ldr { dst, mem } => Ldr {
+            dst: m(*dst),
+            mem: mm(mem),
+        },
+        Str { src, mem } => Str {
+            src: m(*src),
+            mem: mm(mem),
+        },
+        FLdr { dst, mem } => FLdr {
+            dst: m(*dst),
+            mem: mm(mem),
+        },
+        FStr { src, mem } => FStr {
+            src: m(*src),
+            mem: mm(mem),
+        },
 
         // Vector
-        VLoad { dst, mem, width } => VLoad { dst: m(*dst), mem: mm(mem), width: *width },
-        VStore { src, mem, width } => VStore { src: m(*src), mem: mm(mem), width: *width },
-        VFAdd { dst, lhs, rhs, width } => VFAdd { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs), width: *width },
-        VFSub { dst, lhs, rhs, width } => VFSub { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs), width: *width },
-        VFMul { dst, lhs, rhs, width } => VFMul { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs), width: *width },
-        VFDiv { dst, lhs, rhs, width } => VFDiv { dst: m(*dst), lhs: m(*lhs), rhs: m(*rhs), width: *width },
-        VFMAdd { dst, a, b, c, width } => VFMAdd { dst: m(*dst), a: m(*a), b: m(*b), c: m(*c), width: *width },
-        VBroadcast { dst, src, width } => VBroadcast { dst: m(*dst), src: m(*src), width: *width },
-        VExtractLane { dst, src, lane } => VExtractLane { dst: m(*dst), src: m(*src), lane: *lane },
-        VInsertLane { dst, src, lane, val } => VInsertLane { dst: m(*dst), src: m(*src), lane: *lane, val: m(*val) },
-        VFNeg { dst, src, width } => VFNeg { dst: m(*dst), src: m(*src), width: *width },
-        VReduceAdd { dst, src, width } => VReduceAdd { dst: m(*dst), src: m(*src), width: *width },
+        VLoad { dst, mem, width } => VLoad {
+            dst: m(*dst),
+            mem: mm(mem),
+            width: *width,
+        },
+        VStore { src, mem, width } => VStore {
+            src: m(*src),
+            mem: mm(mem),
+            width: *width,
+        },
+        VFAdd {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => VFAdd {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+            width: *width,
+        },
+        VFSub {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => VFSub {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+            width: *width,
+        },
+        VFMul {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => VFMul {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+            width: *width,
+        },
+        VFDiv {
+            dst,
+            lhs,
+            rhs,
+            width,
+        } => VFDiv {
+            dst: m(*dst),
+            lhs: m(*lhs),
+            rhs: m(*rhs),
+            width: *width,
+        },
+        VFMAdd {
+            dst,
+            a,
+            b,
+            c,
+            width,
+        } => VFMAdd {
+            dst: m(*dst),
+            a: m(*a),
+            b: m(*b),
+            c: m(*c),
+            width: *width,
+        },
+        VBroadcast { dst, src, width } => VBroadcast {
+            dst: m(*dst),
+            src: m(*src),
+            width: *width,
+        },
+        VExtractLane { dst, src, lane } => VExtractLane {
+            dst: m(*dst),
+            src: m(*src),
+            lane: *lane,
+        },
+        VInsertLane {
+            dst,
+            src,
+            lane,
+            val,
+        } => VInsertLane {
+            dst: m(*dst),
+            src: m(*src),
+            lane: *lane,
+            val: m(*val),
+        },
+        VFNeg { dst, src, width } => VFNeg {
+            dst: m(*dst),
+            src: m(*src),
+            width: *width,
+        },
+        VReduceAdd { dst, src, width } => VReduceAdd {
+            dst: m(*dst),
+            src: m(*src),
+            width: *width,
+        },
 
         // Runtime calls
         CallRuntime { name, args, ret } => CallRuntime {
             name,
             args: args.iter().map(|a| m(*a)).collect(),
-            ret: ret.map(|r| m(r)),
+            ret: ret.map(&m),
         },
 
         // Parallel copies should be resolved before regalloc, but handle gracefully
@@ -523,8 +804,14 @@ mod tests {
     #[test]
     fn test_single_def_use() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 42 });
-            mf.emit(MachInst::Mov { dst: VReg::gp(1), src: VReg::gp(0) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 42,
+            });
+            mf.emit(MachInst::Mov {
+                dst: VReg::gp(1),
+                src: VReg::gp(0),
+            });
             mf.emit(MachInst::Ret);
         });
         let ivs = compute_live_intervals(&mf);
@@ -536,10 +823,24 @@ mod tests {
     #[test]
     fn test_interval_extends_to_last_use() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 1 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 2 });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(2), lhs: VReg::gp(0), rhs: VReg::gp(1) });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(3), lhs: VReg::gp(2), rhs: VReg::gp(0) }); // r0 used again
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 1,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 2,
+            });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(2),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(1),
+            });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(3),
+                lhs: VReg::gp(2),
+                rhs: VReg::gp(0),
+            }); // r0 used again
             mf.emit(MachInst::Ret);
         });
         let ivs = compute_live_intervals(&mf);
@@ -551,9 +852,19 @@ mod tests {
     #[test]
     fn test_fp_intervals() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 1.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 2.0 });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(2), lhs: VReg::fp(0), rhs: VReg::fp(1) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 1.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 2.0,
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(2),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
             mf.emit(MachInst::Ret);
         });
         let ivs = compute_live_intervals(&mf);
@@ -563,9 +874,18 @@ mod tests {
     #[test]
     fn test_intervals_sorted_by_start() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 1 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 2 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(2), bits: 3 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 1,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 2,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(2),
+                bits: 3,
+            });
             mf.emit(MachInst::Ret);
         });
         let ivs = compute_live_intervals(&mf);
@@ -579,9 +899,19 @@ mod tests {
     #[test]
     fn test_simple_allocation() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 10 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 20 });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(2), lhs: VReg::gp(0), rhs: VReg::gp(1) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 10,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 20,
+            });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(2),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(1),
+            });
             mf.emit(MachInst::Ret);
         });
         let target = x86_64_target_regs();
@@ -600,9 +930,19 @@ mod tests {
     #[test]
     fn test_no_conflicts_distinct_regs() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 1 });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(1), bits: 2 });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(2), lhs: VReg::gp(0), rhs: VReg::gp(1) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 1,
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(1),
+                bits: 2,
+            });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(2),
+                lhs: VReg::gp(0),
+                rhs: VReg::gp(1),
+            });
             mf.emit(MachInst::Ret);
         });
         let target = x86_64_target_regs();
@@ -612,7 +952,10 @@ mod tests {
         let r0 = result.assignments[&VReg::gp(0)];
         let r1 = result.assignments[&VReg::gp(1)];
         if let (Location::Reg(p0), Location::Reg(p1)) = (r0, r1) {
-            assert_ne!(p0.hw_enc, p1.hw_enc, "simultaneously live vregs got same phys reg");
+            assert_ne!(
+                p0.hw_enc, p1.hw_enc,
+                "simultaneously live vregs got same phys reg"
+            );
         }
     }
 
@@ -621,11 +964,24 @@ mod tests {
         // r0 is defined and used, then r1 is defined after r0 is dead.
         // They can share the same physical register.
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 1 });
-            mf.emit(MachInst::Mov { dst: VReg::gp(1), src: VReg::gp(0) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 1,
+            });
+            mf.emit(MachInst::Mov {
+                dst: VReg::gp(1),
+                src: VReg::gp(0),
+            });
             // r0 is dead after inst 1. r2 defined at inst 2.
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(2), bits: 2 });
-            mf.emit(MachInst::IAdd { dst: VReg::gp(3), lhs: VReg::gp(1), rhs: VReg::gp(2) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(2),
+                bits: 2,
+            });
+            mf.emit(MachInst::IAdd {
+                dst: VReg::gp(3),
+                lhs: VReg::gp(1),
+                rhs: VReg::gp(2),
+            });
             mf.emit(MachInst::Ret);
         });
         let target = x86_64_target_regs();
@@ -640,10 +996,23 @@ mod tests {
     #[test]
     fn test_mixed_gp_fp() {
         let mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 42 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 3.14 });
-            mf.emit(MachInst::BitcastGpToFp { dst: VReg::fp(1), src: VReg::gp(0) });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(2), lhs: VReg::fp(0), rhs: VReg::fp(1) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 42,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 1.234,
+            });
+            mf.emit(MachInst::BitcastGpToFp {
+                dst: VReg::fp(1),
+                src: VReg::gp(0),
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(2),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
             mf.emit(MachInst::Ret);
         });
         let target = x86_64_target_regs();
@@ -666,7 +1035,10 @@ mod tests {
         let mut mf = MachFunc::new("spill_test".into());
         let n = 15; // more than 13 available
         for i in 0..n {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(i), bits: i as u64 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(i),
+                bits: i as u64,
+            });
         }
         // Use all of them simultaneously.
         for i in 0..(n - 1) {
@@ -682,12 +1054,18 @@ mod tests {
         let result = linear_scan(&mf, &target);
 
         // Some vregs must be spilled.
-        assert!(result.num_spill_slots > 0, "expected spills under register pressure");
+        assert!(
+            result.num_spill_slots > 0,
+            "expected spills under register pressure"
+        );
 
         // Every vreg must have an assignment (register or spill).
         for i in 0..n {
-            assert!(result.assignments.contains_key(&VReg::gp(i)),
-                "vreg gp({}) missing assignment", i);
+            assert!(
+                result.assignments.contains_key(&VReg::gp(i)),
+                "vreg gp({}) missing assignment",
+                i
+            );
         }
     }
 
@@ -696,8 +1074,14 @@ mod tests {
     #[test]
     fn test_apply_rewrites_registers() {
         let mut mf = build(|mf| {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: 42 });
-            mf.emit(MachInst::Mov { dst: VReg::gp(1), src: VReg::gp(0) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 42,
+            });
+            mf.emit(MachInst::Mov {
+                dst: VReg::gp(1),
+                src: VReg::gp(0),
+            });
             mf.emit(MachInst::Ret);
         });
         let target = x86_64_target_regs();
@@ -720,7 +1104,10 @@ mod tests {
         let mut mf = MachFunc::new("spill_apply".into());
         let n = 15u32;
         for i in 0..n {
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(i), bits: i as u64 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(i),
+                bits: i as u64,
+            });
         }
         // Use all at once.
         for i in 0..(n - 1) {
@@ -737,10 +1124,14 @@ mod tests {
         apply_allocation(&mut mf, &result);
 
         // Should have spill stores (Str) or reloads (Ldr) inserted.
-        let has_spill_ops = mf.insts.iter().any(|inst| {
-            matches!(inst, MachInst::Str { .. } | MachInst::Ldr { .. })
-        });
-        assert!(has_spill_ops, "expected spill/reload instructions after apply");
+        let has_spill_ops = mf
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, MachInst::Str { .. } | MachInst::Ldr { .. }));
+        assert!(
+            has_spill_ops,
+            "expected spill/reload instructions after apply"
+        );
     }
 
     // -- Full pipeline test --
@@ -749,10 +1140,23 @@ mod tests {
     fn test_full_pipeline() {
         let mut mf = build(|mf| {
             mf.emit(MachInst::Prologue { frame_size: 0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 1.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 2.0 });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(2), lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::BitcastFpToGp { dst: VReg::gp(0), src: VReg::fp(2) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 1.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 2.0,
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(2),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::BitcastFpToGp {
+                dst: VReg::gp(0),
+                src: VReg::fp(2),
+            });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
             mf.emit(MachInst::Ret);
         });
@@ -784,7 +1188,7 @@ mod tests {
         let target = x86_64_target_regs();
         assert_eq!(target.gp_allocatable.len(), 13); // 16 - RSP(4) - RBP(5) - R11(11)
         assert_eq!(target.fp_allocatable.len(), 15); // XMM0-XMM14
-        // Verify excluded registers.
+                                                     // Verify excluded registers.
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 4)); // no RSP
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 5)); // no RBP
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 11)); // no R11
@@ -804,9 +1208,15 @@ mod tests {
         let v0 = f.new_value();
         let v1 = f.new_value();
         let v2 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(10.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::ConstNum(20.0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::Add(v0, v1)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(10.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(20.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::Add(v0, v1)));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
         // Lower MIR → MachIR
@@ -832,9 +1242,15 @@ mod tests {
         let v0 = f.new_value();
         let v1 = f.new_value();
         let v2 = f.new_value();
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstF64(3.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::ConstF64(4.0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::AddF64(v0, v1)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstF64(3.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstF64(4.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::AddF64(v0, v1)));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
         let mut mach = super::super::lower_mir(&f);

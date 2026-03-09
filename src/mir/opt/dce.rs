@@ -2,7 +2,6 @@
 ///
 /// - Removes instructions whose results are never used and have no side effects.
 /// - Clears unreachable blocks (no path from entry).
-
 use std::collections::HashSet;
 
 use super::MirPass;
@@ -168,8 +167,7 @@ mod tests {
         {
             let b = f.block_mut(bb);
             b.instructions.push((v0, Instruction::ConstNum(42.0)));
-            b.instructions
-                .push((v1, Instruction::SetModuleVar(0, v0)));
+            b.instructions.push((v1, Instruction::SetModuleVar(0, v0)));
             b.instructions.push((v2, Instruction::ConstNum(99.0)));
             b.terminator = Terminator::Return(v2);
         }
@@ -234,10 +232,7 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(after, InterpValue::Boxed(Value::num(42.0)));
         assert!(f.block(bb1).instructions.is_empty());
-        assert!(matches!(
-            f.block(bb1).terminator,
-            Terminator::Unreachable
-        ));
+        assert!(matches!(f.block(bb1).terminator, Terminator::Unreachable));
     }
 
     #[test]

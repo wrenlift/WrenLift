@@ -10,7 +10,6 @@
 /// - GP: VReg::gp(n) maps to x86_64 encoding n (0=RAX..7=RDI, 8-15=R8-R15)
 /// - FP: VReg::fp(n) maps to XMM(n) (0=XMM0..15=XMM15)
 /// - Scratch: R11 (GP 11) and XMM15 (FP 15) reserved for emitter use
-
 use super::{Cond, Label, MachFunc, MachInst, VReg, VecWidth};
 use std::collections::HashMap;
 
@@ -32,19 +31,21 @@ impl EmittedCode {
     pub fn len(&self) -> usize {
         self.code.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.code.is_empty()
+    }
 
     /// Copy the code into executable memory via mmap.
     ///
     /// Returns an `ExecutableCode` that keeps the mapping alive and provides
     /// a function pointer. Only useful on x86_64 hosts.
     pub fn make_executable(&self) -> Result<ExecutableCode, String> {
-        use dynasmrt::mmap::{ExecutableBuffer, MutableBuffer};
-        let mut buf = MutableBuffer::new(self.code.len())
-            .map_err(|e| format!("mmap alloc: {}", e))?;
+        use dynasmrt::mmap::MutableBuffer;
+        let mut buf =
+            MutableBuffer::new(self.code.len()).map_err(|e| format!("mmap alloc: {}", e))?;
         buf.set_len(self.code.len());
         buf[..self.code.len()].copy_from_slice(&self.code);
-        let exec = buf.make_exec()
-            .map_err(|e| format!("mprotect: {}", e))?;
+        let exec = buf.make_exec().map_err(|e| format!("mprotect: {}", e))?;
         Ok(ExecutableCode { buf: exec })
     }
 }
@@ -169,7 +170,7 @@ impl X64Emitter {
             if need_sib {
                 self.push(0x24); // SIB: scale=0, index=RSP(none), base=RSP
             }
-        } else if disp >= -128 && disp <= 127 {
+        } else if (-128..=127).contains(&disp) {
             // mod=01, disp8
             self.push(0x40 | (reg_lo << 3) | if need_sib { 4 } else { base_lo });
             if need_sib {
@@ -188,6 +189,7 @@ impl X64Emitter {
 
     // ── VEX prefix (3-byte form for FMA3/AVX) ──
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_vex3(
         &mut self,
         reg: u32,
@@ -574,7 +576,6 @@ impl X64Emitter {
         use MachInst::*;
         match inst {
             // ── Data Movement ──
-
             LoadImm { dst, bits } => {
                 self.emit_mov_imm64(gp(*dst), *bits);
             }
@@ -603,7 +604,6 @@ impl X64Emitter {
 
             // ── Integer Arithmetic ──
             // x86_64 is 2-address: mov dst, lhs; op dst, rhs.
-
             IAdd { dst, lhs, rhs } => {
                 let d = gp(*dst);
                 self.emit_mov_rr(d, gp(*lhs));
@@ -653,7 +653,6 @@ impl X64Emitter {
             }
 
             // ── Bitwise ──
-
             And { dst, lhs, rhs } => {
                 let d = gp(*dst);
                 self.emit_mov_rr(d, gp(*lhs));
@@ -714,7 +713,6 @@ impl X64Emitter {
             }
 
             // ── FP Arithmetic (SSE2 scalar double) ──
-
             FAdd { dst, lhs, rhs } => {
                 let d = fp(*dst);
                 self.emit_movsd_rr(d, fp(*lhs));
@@ -799,7 +797,6 @@ impl X64Emitter {
             }
 
             // ── FMA3 ──
-
             FMAdd { dst, a, b, c } => {
                 let d = fp(*dst);
                 self.emit_movsd_rr(d, fp(*a));
@@ -825,7 +822,6 @@ impl X64Emitter {
             }
 
             // ── Conversions ──
-
             FCvtToI64 { dst, src } => {
                 self.emit_cvttsd2si(gp(*dst), fp(*src));
             }
@@ -835,7 +831,6 @@ impl X64Emitter {
             }
 
             // ── Comparison ──
-
             ICmp { lhs, rhs } => {
                 self.emit_alu_rr(0x39, gp(*lhs), gp(*rhs));
             }
@@ -854,7 +849,6 @@ impl X64Emitter {
             }
 
             // ── Memory ──
-
             Ldr { dst, mem } => {
                 self.emit_load_mem(gp(*dst), gp(mem.base), mem.offset);
             }
@@ -872,7 +866,6 @@ impl X64Emitter {
             }
 
             // ── Control Flow ──
-
             Jmp { target } => {
                 self.emit_jmp(*target);
             }
@@ -902,7 +895,6 @@ impl X64Emitter {
             }
 
             // ── Calls & Returns ──
-
             CallInd { target } => {
                 self.emit_call_ind(gp(*target));
             }
@@ -918,7 +910,6 @@ impl X64Emitter {
             }
 
             // ── Stack Frame ──
-
             Prologue { frame_size } => {
                 self.emit_push(5); // push rbp
                 self.emit_mov_rr(5, 4); // mov rbp, rsp
@@ -942,7 +933,6 @@ impl X64Emitter {
             }
 
             // ── Pseudo-instructions ──
-
             DefLabel(l) => {
                 self.define_label(*l);
             }
@@ -960,7 +950,6 @@ impl X64Emitter {
             }
 
             // ── SIMD V128 (SSE2 packed double, 2×f64) ──
-
             VLoad {
                 dst,
                 mem,
@@ -1062,7 +1051,12 @@ impl X64Emitter {
                 }
             }
 
-            VInsertLane { dst, src, lane, val } => {
+            VInsertLane {
+                dst,
+                src,
+                lane,
+                val,
+            } => {
                 let d = fp(*dst);
                 self.emit_movapd_rr(d, fp(*src));
                 match lane {
@@ -1083,7 +1077,6 @@ impl X64Emitter {
             }
 
             // ── SIMD V256 (AVX packed double, 4×f64) ──
-
             VFAdd {
                 dst,
                 lhs,
@@ -1255,7 +1248,9 @@ mod tests {
         assert!(
             o.contains(op_contains),
             "instruction {}: expected ops containing '{}', got '{}'",
-            idx, op_contains, o
+            idx,
+            op_contains,
+            o
         );
     }
 
@@ -1711,7 +1706,11 @@ mod tests {
             mf.emit(MachInst::Ret);
         });
         let asm = disasm(code.bytes());
-        assert!(asm.iter().any(|(m, _)| m == "and"), "expected and: {:?}", asm);
+        assert!(
+            asm.iter().any(|(m, _)| m == "and"),
+            "expected and: {:?}",
+            asm
+        );
     }
 
     #[test]
@@ -1745,8 +1744,16 @@ mod tests {
     #[test]
     fn test_cset_all_conditions() {
         for cond in &[
-            Cond::Eq, Cond::Ne, Cond::Lt, Cond::Le, Cond::Gt, Cond::Ge,
-            Cond::Below, Cond::BelowEq, Cond::Above, Cond::AboveEq,
+            Cond::Eq,
+            Cond::Ne,
+            Cond::Lt,
+            Cond::Le,
+            Cond::Gt,
+            Cond::Ge,
+            Cond::Below,
+            Cond::BelowEq,
+            Cond::Above,
+            Cond::AboveEq,
         ] {
             let code = compile(|mf| {
                 mf.emit(MachInst::ICmp {
@@ -1807,8 +1814,8 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_add_num() {
         use crate::intern::Interner;
-        use crate::mir::{Instruction, MirFunction, Terminator};
         use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::{Instruction, MirFunction, Terminator};
         use crate::runtime::value::Value;
 
         // MIR: return 10 + 32 (boxed num add)
@@ -1819,9 +1826,15 @@ mod tests {
         let v0 = func.new_value();
         let v1 = func.new_value();
         let v2 = func.new_value();
-        func.block_mut(bb).instructions.push((v0, Instruction::ConstNum(10.0)));
-        func.block_mut(bb).instructions.push((v1, Instruction::ConstNum(32.0)));
-        func.block_mut(bb).instructions.push((v2, Instruction::Add(v0, v1)));
+        func.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(10.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(32.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::Add(v0, v1)));
         func.block_mut(bb).terminator = Terminator::Return(v2);
 
         let result = eval(&func).unwrap();
@@ -1836,12 +1849,31 @@ mod tests {
         let code = compile(|mf| {
             let v10_bits = Value::num(10.0).to_bits();
             let v32_bits = Value::num(32.0).to_bits();
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: v10_bits });
-            mf.emit(MachInst::BitcastGpToFp { dst: VReg::fp(0), src: VReg::gp(0) });
-            mf.emit(MachInst::LoadImm { dst: VReg::gp(0), bits: v32_bits });
-            mf.emit(MachInst::BitcastGpToFp { dst: VReg::fp(1), src: VReg::gp(0) });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(0), lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::BitcastFpToGp { dst: VReg::gp(0), src: VReg::fp(0) });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: v10_bits,
+            });
+            mf.emit(MachInst::BitcastGpToFp {
+                dst: VReg::fp(0),
+                src: VReg::gp(0),
+            });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: v32_bits,
+            });
+            mf.emit(MachInst::BitcastGpToFp {
+                dst: VReg::fp(1),
+                src: VReg::gp(0),
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(0),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::BitcastFpToGp {
+                dst: VReg::gp(0),
+                src: VReg::fp(0),
+            });
             mf.emit(MachInst::Ret);
         });
         let asm = disasm(code.bytes());
@@ -1854,8 +1886,8 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_mul_sub() {
         use crate::intern::Interner;
-        use crate::mir::{Instruction, MirFunction, Terminator};
         use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::{Instruction, MirFunction, Terminator};
 
         // MIR: (10 * 3) - 5 = 25
         let mut interner = Interner::new();
@@ -1867,11 +1899,21 @@ mod tests {
         let v2 = func.new_value();
         let v3 = func.new_value();
         let v4 = func.new_value();
-        func.block_mut(bb).instructions.push((v0, Instruction::ConstNum(10.0)));
-        func.block_mut(bb).instructions.push((v1, Instruction::ConstNum(3.0)));
-        func.block_mut(bb).instructions.push((v2, Instruction::ConstNum(5.0)));
-        func.block_mut(bb).instructions.push((v3, Instruction::Mul(v0, v1)));
-        func.block_mut(bb).instructions.push((v4, Instruction::Sub(v3, v2)));
+        func.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(10.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(3.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::ConstNum(5.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v3, Instruction::Mul(v0, v1)));
+        func.block_mut(bb)
+            .instructions
+            .push((v4, Instruction::Sub(v3, v2)));
         func.block_mut(bb).terminator = Terminator::Return(v4);
 
         let result = eval(&func).unwrap();
@@ -1882,23 +1924,48 @@ mod tests {
 
         // x86_64: unboxed f64 path
         let code = compile(|mf| {
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 10.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 3.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(2), value: 5.0 });
-            mf.emit(MachInst::FMul { dst: VReg::fp(3), lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::FSub { dst: VReg::fp(0), lhs: VReg::fp(3), rhs: VReg::fp(2) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 10.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 3.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(2),
+                value: 5.0,
+            });
+            mf.emit(MachInst::FMul {
+                dst: VReg::fp(3),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::FSub {
+                dst: VReg::fp(0),
+                lhs: VReg::fp(3),
+                rhs: VReg::fp(2),
+            });
             mf.emit(MachInst::Ret);
         });
         let asm = disasm(code.bytes());
-        assert!(asm.iter().any(|(m, _)| m == "mulsd"), "expected mulsd: {:?}", asm);
-        assert!(asm.iter().any(|(m, _)| m == "subsd"), "expected subsd: {:?}", asm);
+        assert!(
+            asm.iter().any(|(m, _)| m == "mulsd"),
+            "expected mulsd: {:?}",
+            asm
+        );
+        assert!(
+            asm.iter().any(|(m, _)| m == "subsd"),
+            "expected subsd: {:?}",
+            asm
+        );
     }
 
     #[test]
     fn test_interp_crosscheck_comparison() {
         use crate::intern::Interner;
-        use crate::mir::{Instruction, MirFunction, Terminator};
         use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::{Instruction, MirFunction, Terminator};
 
         // MIR: 10 < 20 → true
         let mut interner = Interner::new();
@@ -1908,9 +1975,15 @@ mod tests {
         let v0 = func.new_value();
         let v1 = func.new_value();
         let v2 = func.new_value();
-        func.block_mut(bb).instructions.push((v0, Instruction::ConstNum(10.0)));
-        func.block_mut(bb).instructions.push((v1, Instruction::ConstNum(20.0)));
-        func.block_mut(bb).instructions.push((v2, Instruction::CmpLt(v0, v1)));
+        func.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(10.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(20.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::CmpLt(v0, v1)));
         func.block_mut(bb).terminator = Terminator::Return(v2);
 
         let result = eval(&func).unwrap();
@@ -1921,10 +1994,22 @@ mod tests {
 
         // x86_64: ucomisd + setb (unsigned below for FP <)
         let code = compile(|mf| {
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 10.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 20.0 });
-            mf.emit(MachInst::FCmp { lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::CSet { dst: VReg::gp(0), cond: Cond::Below });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 10.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 20.0,
+            });
+            mf.emit(MachInst::FCmp {
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::CSet {
+                dst: VReg::gp(0),
+                cond: Cond::Below,
+            });
             mf.emit(MachInst::Ret);
         });
         let asm = disasm(code.bytes());
@@ -1935,8 +2020,8 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_unboxed_f64() {
         use crate::intern::Interner;
-        use crate::mir::{Instruction, MirFunction, Terminator};
         use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::{Instruction, MirFunction, Terminator};
 
         // MIR: ConstF64(2.0) + ConstF64(3.0) = 5.0
         let mut interner = Interner::new();
@@ -1946,9 +2031,15 @@ mod tests {
         let v0 = func.new_value();
         let v1 = func.new_value();
         let v2 = func.new_value();
-        func.block_mut(bb).instructions.push((v0, Instruction::ConstF64(2.0)));
-        func.block_mut(bb).instructions.push((v1, Instruction::ConstF64(3.0)));
-        func.block_mut(bb).instructions.push((v2, Instruction::AddF64(v0, v1)));
+        func.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstF64(2.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstF64(3.0)));
+        func.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::AddF64(v0, v1)));
         func.block_mut(bb).terminator = Terminator::Return(v2);
 
         let result = eval(&func).unwrap();
@@ -1959,9 +2050,19 @@ mod tests {
 
         // x86_64: addsd directly
         let code = compile(|mf| {
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 2.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 3.0 });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(0), lhs: VReg::fp(0), rhs: VReg::fp(1) });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 2.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 3.0,
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(0),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
             mf.emit(MachInst::Ret);
         });
         let asm = disasm(code.bytes());
@@ -1971,8 +2072,8 @@ mod tests {
     #[test]
     fn test_interp_crosscheck_loop_sum() {
         use crate::intern::Interner;
-        use crate::mir::{Instruction, MirFunction, MirType, Terminator};
         use crate::mir::interp::{eval, InterpValue};
+        use crate::mir::{Instruction, MirFunction, MirType, Terminator};
 
         // MIR: sum 1..5 via loop with block params = 15
         let mut interner = Interner::new();
@@ -1985,8 +2086,12 @@ mod tests {
         // entry: goto loop(0.0, 1.0)
         let v_zero = func.new_value();
         let v_one = func.new_value();
-        func.block_mut(entry).instructions.push((v_zero, Instruction::ConstF64(0.0)));
-        func.block_mut(entry).instructions.push((v_one, Instruction::ConstF64(1.0)));
+        func.block_mut(entry)
+            .instructions
+            .push((v_zero, Instruction::ConstF64(0.0)));
+        func.block_mut(entry)
+            .instructions
+            .push((v_one, Instruction::ConstF64(1.0)));
         func.block_mut(entry).terminator = Terminator::Branch {
             target: loop_block,
             args: vec![v_zero, v_one],
@@ -1995,18 +2100,30 @@ mod tests {
         // loop(sum, i): if i > 5 goto exit(sum) else loop(sum+i, i+1)
         let bp_sum = func.new_value();
         let bp_i = func.new_value();
-        func.block_mut(loop_block).params.push((bp_sum, MirType::F64));
+        func.block_mut(loop_block)
+            .params
+            .push((bp_sum, MirType::F64));
         func.block_mut(loop_block).params.push((bp_i, MirType::F64));
         let v_five = func.new_value();
         let v_cmp = func.new_value();
         let v_sum2 = func.new_value();
         let v_inc = func.new_value();
         let v_i2 = func.new_value();
-        func.block_mut(loop_block).instructions.push((v_five, Instruction::ConstF64(5.0)));
-        func.block_mut(loop_block).instructions.push((v_cmp, Instruction::CmpGtF64(bp_i, v_five)));
-        func.block_mut(loop_block).instructions.push((v_sum2, Instruction::AddF64(bp_sum, bp_i)));
-        func.block_mut(loop_block).instructions.push((v_inc, Instruction::ConstF64(1.0)));
-        func.block_mut(loop_block).instructions.push((v_i2, Instruction::AddF64(bp_i, v_inc)));
+        func.block_mut(loop_block)
+            .instructions
+            .push((v_five, Instruction::ConstF64(5.0)));
+        func.block_mut(loop_block)
+            .instructions
+            .push((v_cmp, Instruction::CmpGtF64(bp_i, v_five)));
+        func.block_mut(loop_block)
+            .instructions
+            .push((v_sum2, Instruction::AddF64(bp_sum, bp_i)));
+        func.block_mut(loop_block)
+            .instructions
+            .push((v_inc, Instruction::ConstF64(1.0)));
+        func.block_mut(loop_block)
+            .instructions
+            .push((v_i2, Instruction::AddF64(bp_i, v_inc)));
         func.block_mut(loop_block).terminator = Terminator::CondBranch {
             condition: v_cmp,
             true_target: exit_block,
@@ -2017,7 +2134,9 @@ mod tests {
 
         // exit(result): return
         let bp_result = func.new_value();
-        func.block_mut(exit_block).params.push((bp_result, MirType::F64));
+        func.block_mut(exit_block)
+            .params
+            .push((bp_result, MirType::F64));
         func.block_mut(exit_block).terminator = Terminator::Return(bp_result);
 
         let result = eval(&func).unwrap();
@@ -2030,22 +2149,51 @@ mod tests {
         let code = compile(|mf| {
             let l_loop = mf.new_label();
             let l_end = mf.new_label();
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(0), value: 0.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(1), value: 1.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(2), value: 5.0 });
-            mf.emit(MachInst::LoadFpImm { dst: VReg::fp(3), value: 1.0 });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(0),
+                value: 0.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(1),
+                value: 1.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(2),
+                value: 5.0,
+            });
+            mf.emit(MachInst::LoadFpImm {
+                dst: VReg::fp(3),
+                value: 1.0,
+            });
             mf.emit(MachInst::DefLabel(l_loop));
-            mf.emit(MachInst::FCmp { lhs: VReg::fp(1), rhs: VReg::fp(2) });
-            mf.emit(MachInst::JmpIf { cond: Cond::Above, target: l_end });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(0), lhs: VReg::fp(0), rhs: VReg::fp(1) });
-            mf.emit(MachInst::FAdd { dst: VReg::fp(1), lhs: VReg::fp(1), rhs: VReg::fp(3) });
+            mf.emit(MachInst::FCmp {
+                lhs: VReg::fp(1),
+                rhs: VReg::fp(2),
+            });
+            mf.emit(MachInst::JmpIf {
+                cond: Cond::Above,
+                target: l_end,
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(0),
+                lhs: VReg::fp(0),
+                rhs: VReg::fp(1),
+            });
+            mf.emit(MachInst::FAdd {
+                dst: VReg::fp(1),
+                lhs: VReg::fp(1),
+                rhs: VReg::fp(3),
+            });
             mf.emit(MachInst::Jmp { target: l_loop });
             mf.emit(MachInst::DefLabel(l_end));
             mf.emit(MachInst::Ret);
         });
         let asm = disasm(code.bytes());
         assert!(asm.iter().any(|(m, _)| m == "ucomisd"), "expected ucomisd");
-        assert!(asm.iter().filter(|(m, _)| m == "addsd").count() >= 2, "expected >=2 addsd");
+        assert!(
+            asm.iter().filter(|(m, _)| m == "addsd").count() >= 2,
+            "expected >=2 addsd"
+        );
         assert!(asm.iter().any(|(m, _)| m == "jmp"), "expected jmp");
     }
 }

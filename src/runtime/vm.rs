@@ -2,16 +2,15 @@
 ///
 /// Owns all runtime state: GC heap, interner, core classes, fibers,
 /// module registry, and configuration callbacks.
-
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 
-use crate::intern::{Interner, SymbolId};
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
 use super::gc::Gc;
 use super::object::*;
 use super::value::Value;
+use crate::intern::{Interner, SymbolId};
 
 /// Action requested by a fiber native method, handled by the interpreter loop.
 #[derive(Debug)]
@@ -43,12 +42,10 @@ pub type ResolveModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 pub type LoadModuleFn = Box<dyn Fn(&str) -> Option<String>>;
 
 /// Callback to bind a foreign method.
-pub type BindForeignMethodFn =
-    Box<dyn Fn(&str, &str, bool, &str) -> Option<NativeFn>>;
+pub type BindForeignMethodFn = Box<dyn Fn(&str, &str, bool, &str) -> Option<NativeFn>>;
 
 /// Callback to bind a foreign class (allocate + optional finalize).
-pub type BindForeignClassFn =
-    Box<dyn Fn(&str, &str) -> Option<ForeignClassMethods>>;
+pub type BindForeignClassFn = Box<dyn Fn(&str, &str) -> Option<ForeignClassMethods>>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ErrorKind {
@@ -220,18 +217,19 @@ impl VM {
     /// Pipeline: lex → parse → sema → lower to MIR → optimize → execute.
     /// Execution happens inside a Fiber context via run_fiber().
     pub fn interpret(&mut self, module_name: &str, source: &str) -> InterpretResult {
-        use std::collections::HashMap as HMap;
         use crate::diagnostics::Severity;
-        use crate::mir::BlockId;
         use crate::mir::opt::{
-            self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize,
-            licm::Licm, sra::Sra, MirPass,
+            self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+            sra::Sra, MirPass,
         };
+        use crate::mir::BlockId;
         use crate::parse::parser;
         use crate::sema;
+        use std::collections::HashMap as HMap;
 
         // 0. Store source for runtime error reporting
-        self.module_sources.insert(module_name.to_string(), source.to_string());
+        self.module_sources
+            .insert(module_name.to_string(), source.to_string());
 
         // 1. Parse
         let parse_result = parser::parse(source);
@@ -251,8 +249,8 @@ impl VM {
 
         // 3. Semantic analysis — register core class names as prelude
         let core_names = [
-            "Object", "Class", "Bool", "Num", "String", "List", "Map",
-            "Range", "Null", "Fn", "Fiber", "System", "Sequence",
+            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
+            "Fiber", "System", "Sequence",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -271,15 +269,21 @@ impl VM {
 
         // 3b. Process imports — recursively interpret imported modules
         for stmt in &parse_result.module {
-            if let crate::ast::Stmt::Import { module: mod_path, names: _ } = &stmt.0 {
+            if let crate::ast::Stmt::Import {
+                module: mod_path,
+                names: _,
+            } = &stmt.0
+            {
                 let imported_module = mod_path.0.clone();
 
                 // Skip if already loaded
                 if !self.engine.modules.contains_key(&imported_module) {
                     // Resolve module source via config callback
-                    let source_opt = self.config.load_module_fn.as_ref().and_then(|load_fn| {
-                        load_fn(&imported_module)
-                    });
+                    let source_opt = self
+                        .config
+                        .load_module_fn
+                        .as_ref()
+                        .and_then(|load_fn| load_fn(&imported_module));
                     if let Some(mod_source) = source_opt {
                         let result = self.interpret(&imported_module, &mod_source);
                         if result != InterpretResult::Success {
@@ -333,14 +337,18 @@ impl VM {
             let new_sym = self.interner.intern(s);
             sym_map.push(new_sym);
         }
-        module_mir.top_level.remap_symbols(|old| sym_map[old.index() as usize]);
+        module_mir
+            .top_level
+            .remap_symbols(|old| sym_map[old.index() as usize]);
         for class in &mut module_mir.classes {
             class.name = sym_map[class.name.index() as usize];
             if let Some(ref mut sup) = class.superclass {
                 *sup = sym_map[sup.index() as usize];
             }
             for method in &mut class.methods {
-                method.mir.remap_symbols(|old| sym_map[old.index() as usize]);
+                method
+                    .mir
+                    .remap_symbols(|old| sym_map[old.index() as usize]);
             }
         }
         for closure in &mut module_mir.closures {
@@ -392,12 +400,14 @@ impl VM {
         for class_mir in module_mir.classes {
             // Find module var slot for this class
             let class_name_str = self.interner.resolve(class_mir.name).to_string();
-            let slot = resolve_result.module_vars.iter().position(|&sym| {
-                interner.resolve(sym) == class_name_str
-            });
+            let slot = resolve_result
+                .module_vars
+                .iter()
+                .position(|&sym| interner.resolve(sym) == class_name_str);
 
             // Resolve superclass (check core classes, then module vars)
-            let superclass = class_mir.superclass
+            let superclass = class_mir
+                .superclass
                 .and_then(|sup_sym| {
                     let sup_name = self.interner.resolve(sup_sym).to_string();
                     // Try core classes first
@@ -411,7 +421,8 @@ impl VM {
                                 let ptr = var_val.as_object().unwrap() as *mut ObjClass;
                                 let header = ptr as *const ObjHeader;
                                 if unsafe { (*header).obj_type } == ObjType::Class {
-                                    let name = unsafe { self.interner.resolve((*ptr).name).to_string() };
+                                    let name =
+                                        unsafe { self.interner.resolve((*ptr).name).to_string() };
                                     if name == sup_name {
                                         return Some(ptr);
                                     }
@@ -442,7 +453,7 @@ impl VM {
 
                 // Create ObjFn + ObjClosure for the method
                 let sig_sym = self.interner.intern(&method_mir.signature);
-                let fn_ptr = self.gc.alloc_fn(sig_sym, 0, 0, method_func_id.0 as u32);
+                let fn_ptr = self.gc.alloc_fn(sig_sym, 0, 0, method_func_id.0);
                 unsafe {
                     (*fn_ptr).header.class = self.fn_class;
                 }
@@ -493,7 +504,8 @@ impl VM {
                 values: HMap::new(),
                 module_name: module_key,
                 return_dst: None,
-                closure: None, defining_class: None,
+                closure: None,
+                defining_class: None,
             });
         }
 
@@ -521,8 +533,13 @@ impl VM {
     }
 
     /// Extract source location from a fiber's current MIR frame for error reporting.
-    pub(crate) fn extract_error_location(&self, fiber: *mut ObjFiber) -> Option<super::vm_interp::SourceLoc> {
-        if fiber.is_null() { return None; }
+    pub(crate) fn extract_error_location(
+        &self,
+        fiber: *mut ObjFiber,
+    ) -> Option<super::vm_interp::SourceLoc> {
+        if fiber.is_null() {
+            return None;
+        }
         let frame = unsafe { (*fiber).mir_frames.last()? };
         let mir = self.engine.get_mir(frame.func_id)?;
 
@@ -551,13 +568,19 @@ impl VM {
     /// Resolve a line number from a span offset within a module's source.
     fn line_from_span(&self, module: &str, byte_offset: usize) -> Option<usize> {
         self.module_sources.get(module).map(|src| {
-            src[..byte_offset.min(src.len())].chars().filter(|c| *c == '\n').count() + 1
+            src[..byte_offset.min(src.len())]
+                .chars()
+                .filter(|c| *c == '\n')
+                .count()
+                + 1
         })
     }
 
     /// Extract a StackFrame from a MirCallFrame.
     fn frame_to_stack_frame(&self, frame: &MirCallFrame) -> StackFrame {
-        let func_name = self.engine.get_mir(frame.func_id)
+        let func_name = self
+            .engine
+            .get_mir(frame.func_id)
             .map(|mir| self.interner.resolve(mir.name).to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
         let line = self.engine.get_mir(frame.func_id).and_then(|mir| {
@@ -576,18 +599,26 @@ impl VM {
 
     /// Build a stack trace from a single fiber's MIR call frames.
     fn build_stack_trace(&self, fiber: *mut ObjFiber) -> Vec<String> {
-        if fiber.is_null() { return Vec::new(); }
+        if fiber.is_null() {
+            return Vec::new();
+        }
         let frames = unsafe { &(*fiber).mir_frames };
-        frames.iter().rev()
+        frames
+            .iter()
+            .rev()
             .map(|frame| self.frame_to_stack_frame(frame).to_string())
             .collect()
     }
 
     /// Capture the current fiber's call stack as a Vec<StackFrame> snapshot.
     fn capture_current_trace(&self) -> Vec<StackFrame> {
-        if self.fiber.is_null() { return Vec::new(); }
+        if self.fiber.is_null() {
+            return Vec::new();
+        }
         let frames = unsafe { &(*self.fiber).mir_frames };
-        frames.iter().rev()
+        frames
+            .iter()
+            .rev()
             .map(|frame| self.frame_to_stack_frame(frame))
             .collect()
     }
@@ -595,11 +626,15 @@ impl VM {
     /// Build a full cross-fiber stack trace, walking the caller chain.
     /// Each fiber boundary is annotated. Includes spawn traces when available.
     fn build_full_fiber_trace(&self, fiber: *mut ObjFiber) -> Vec<String> {
-        if fiber.is_null() { return Vec::new(); }
+        if fiber.is_null() {
+            return Vec::new();
+        }
 
         let mut trace = self.build_stack_trace(fiber);
 
-        if !self.config.fiber_stack_traces { return trace; }
+        if !self.config.fiber_stack_traces {
+            return trace;
+        }
 
         // Walk the caller chain
         let mut current = unsafe { (*fiber).caller };
@@ -704,7 +739,9 @@ impl VM {
     /// Allocate a GC-managed string and return it as a Value.
     pub fn new_string(&mut self, s: String) -> Value {
         let obj = self.gc.alloc_string(s);
-        unsafe { (*obj).header.class = self.string_class; }
+        unsafe {
+            (*obj).header.class = self.string_class;
+        }
         Value::object(obj as *mut u8)
     }
 
@@ -737,14 +774,18 @@ impl VM {
     /// Allocate a GC-managed range and return it as a Value.
     pub fn new_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value {
         let obj = self.gc.alloc_range(from, to, inclusive);
-        unsafe { (*obj).header.class = self.range_class; }
+        unsafe {
+            (*obj).header.class = self.range_class;
+        }
         Value::object(obj as *mut u8)
     }
 
     /// Allocate a GC-managed map and return it as a Value.
     pub fn new_map(&mut self) -> Value {
         let obj = self.gc.alloc_map();
-        unsafe { (*obj).header.class = self.map_class; }
+        unsafe {
+            (*obj).header.class = self.map_class;
+        }
         Value::object(obj as *mut u8)
     }
 
@@ -762,6 +803,7 @@ impl VM {
     }
 
     /// Bind a native primitive to a class by method signature string.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn primitive(&mut self, class: *mut ObjClass, signature: &str, func: NativeFn) {
         let sym = self.interner.intern(signature);
         unsafe {
@@ -771,6 +813,7 @@ impl VM {
 
     /// Bind a native primitive to the class's metaclass (static method).
     /// For simplicity, we store static methods directly on the class.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn primitive_static(&mut self, class: *mut ObjClass, signature: &str, func: NativeFn) {
         // In Wren, static methods are on the metaclass. We store them
         // on the class itself with a "static:" prefix for now.
@@ -782,6 +825,7 @@ impl VM {
     }
 
     /// Look up a static method on a class.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn find_static(&self, class: *mut ObjClass, signature: &str) -> Option<&Method> {
         let sig = format!("static:{}", signature);
         let sym = self.interner.lookup(&sig)?;
@@ -818,9 +862,7 @@ impl VM {
         if class.is_null() {
             return "Object".to_string();
         }
-        unsafe {
-            self.interner.resolve((*class).name).to_string()
-        }
+        unsafe { self.interner.resolve((*class).name).to_string() }
     }
 
     /// Map a core class name to its Value (pointer to ObjClass).
@@ -1020,7 +1062,9 @@ impl NativeContext for VM {
     }
 
     fn capture_spawn_trace(&self) -> Option<Vec<StackFrame>> {
-        if !self.config.fiber_stack_traces { return None; }
+        if !self.config.fiber_stack_traces {
+            return None;
+        }
         Some(self.capture_current_trace())
     }
 
@@ -1034,8 +1078,8 @@ impl NativeContext for VM {
     }
 
     fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value> {
-        use crate::mir::{BlockId, Instruction};
         use crate::mir::interp::InterpValue;
+        use crate::mir::{BlockId, Instruction};
 
         let class = self.class_of(receiver);
         let method_sym = self.interner.intern(method);
@@ -1046,9 +1090,7 @@ impl NativeContext for VM {
         all_args.extend_from_slice(args);
 
         match method_entry {
-            Method::Native(func) => {
-                Some(func(self, &all_args))
-            }
+            Method::Native(func) => Some(func(self, &all_args)),
             Method::Closure(closure_ptr) => {
                 // Run closure on a temporary fiber to avoid re-entrancy issues.
                 let temp_fiber = self.gc.alloc_fiber();
@@ -1111,7 +1153,9 @@ impl NativeContext for VM {
                                 values.insert(*vid, InterpValue::Boxed(all_args[param_idx]));
                             }
                             param_idx += 1;
-                        } else { break; }
+                        } else {
+                            break;
+                        }
                     }
                     (*temp_fiber).mir_frames.push(MirCallFrame {
                         func_id,
@@ -1141,13 +1185,14 @@ impl NativeContext for VM {
 impl VM {
     /// Execute a closure synchronously via a temporary fiber.
     /// Used by JIT runtime functions to re-enter the interpreter for closure bodies.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn call_closure_sync(
         &mut self,
         closure_ptr: *mut ObjClosure,
         args: &[Value],
     ) -> Option<Value> {
-        use crate::mir::{BlockId, Instruction};
         use crate::mir::interp::InterpValue;
+        use crate::mir::{BlockId, Instruction};
 
         let temp_fiber = self.gc.alloc_fiber();
         unsafe {
@@ -1216,6 +1261,7 @@ fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -1227,7 +1273,9 @@ mod tests {
             if c == '\x1b' {
                 // Skip until 'm' (end of ANSI escape)
                 for esc in chars.by_ref() {
-                    if esc == 'm' { break; }
+                    if esc == 'm' {
+                        break;
+                    }
                 }
             } else {
                 out.push(c);
@@ -1329,16 +1377,16 @@ mod tests {
         let cls = vm.num_class;
 
         let t = call_primitive(&mut vm, cls, "<(_)", &[Value::num(1.0), Value::num(2.0)]);
-        assert_eq!(t.as_bool().unwrap(), true);
+        assert!(t.as_bool().unwrap());
 
         let f = call_primitive(&mut vm, cls, ">(_)", &[Value::num(1.0), Value::num(2.0)]);
-        assert_eq!(f.as_bool().unwrap(), false);
+        assert!(!f.as_bool().unwrap());
 
         let eq = call_primitive(&mut vm, cls, "==(_)", &[Value::num(5.0), Value::num(5.0)]);
-        assert_eq!(eq.as_bool().unwrap(), true);
+        assert!(eq.as_bool().unwrap());
 
         let neq = call_primitive(&mut vm, cls, "!=(_)", &[Value::num(5.0), Value::num(3.0)]);
-        assert_eq!(neq.as_bool().unwrap(), true);
+        assert!(neq.as_bool().unwrap());
     }
 
     #[test]
@@ -1399,10 +1447,10 @@ mod tests {
         let cls = vm.bool_class;
 
         let r = call_primitive(&mut vm, cls, "!", &[Value::bool(true)]);
-        assert_eq!(r.as_bool().unwrap(), false);
+        assert!(!r.as_bool().unwrap());
 
         let r2 = call_primitive(&mut vm, cls, "!", &[Value::bool(false)]);
-        assert_eq!(r2.as_bool().unwrap(), true);
+        assert!(r2.as_bool().unwrap());
     }
 
     #[test]
@@ -1411,7 +1459,7 @@ mod tests {
         let cls = vm.null_class;
 
         let r = call_primitive(&mut vm, cls, "!", &[Value::null()]);
-        assert_eq!(r.as_bool().unwrap(), true);
+        assert!(r.as_bool().unwrap());
     }
 
     #[test]
@@ -1436,11 +1484,11 @@ mod tests {
         let hello = vm.new_string("hello world".to_string());
         let sub = vm.new_string("world".to_string());
         let r = call_primitive(&mut vm, cls, "contains(_)", &[hello, sub]);
-        assert_eq!(r.as_bool().unwrap(), true);
+        assert!(r.as_bool().unwrap());
 
         let miss = vm.new_string("xyz".to_string());
         let r2 = call_primitive(&mut vm, cls, "contains(_)", &[hello, miss]);
-        assert_eq!(r2.as_bool().unwrap(), false);
+        assert!(!r2.as_bool().unwrap());
     }
 
     #[test]
@@ -1524,11 +1572,11 @@ mod tests {
         call_primitive(&mut vm, cls, "[_]=(_)", &[map, key, Value::num(1.0)]);
 
         let has = call_primitive(&mut vm, cls, "containsKey(_)", &[map, key]);
-        assert_eq!(has.as_bool().unwrap(), true);
+        assert!(has.as_bool().unwrap());
 
         let miss = vm.new_string("y".to_string());
         let no = call_primitive(&mut vm, cls, "containsKey(_)", &[map, miss]);
-        assert_eq!(no.as_bool().unwrap(), false);
+        assert!(!no.as_bool().unwrap());
     }
 
     // -- Range primitives --
@@ -1546,7 +1594,7 @@ mod tests {
         assert_eq!(to.as_num().unwrap(), 5.0);
 
         let incl = call_primitive(&mut vm, cls, "isInclusive", &[range]);
-        assert_eq!(incl.as_bool().unwrap(), true);
+        assert!(incl.as_bool().unwrap());
     }
 
     // -- Object primitives --
@@ -1559,10 +1607,10 @@ mod tests {
         let a = Value::num(5.0);
         let b = Value::num(5.0);
         let eq = call_primitive(&mut vm, cls, "==(_)", &[a, b]);
-        assert_eq!(eq.as_bool().unwrap(), true);
+        assert!(eq.as_bool().unwrap());
 
         let neq = call_primitive(&mut vm, cls, "!=(_)", &[a, Value::num(3.0)]);
-        assert_eq!(neq.as_bool().unwrap(), true);
+        assert!(neq.as_bool().unwrap());
     }
 
     #[test]
@@ -1572,7 +1620,7 @@ mod tests {
 
         // Object.! always returns false (all objects are truthy)
         let r = call_primitive(&mut vm, cls, "!", &[Value::num(42.0)]);
-        assert_eq!(r.as_bool().unwrap(), false);
+        assert!(!r.as_bool().unwrap());
     }
 
     // -- Class primitives --
@@ -1640,13 +1688,15 @@ mod tests {
 
     #[test]
     fn test_interpret_class_construct() {
-        let (result, _) = run_and_capture("class Foo {\n  construct new() {}\n}\nvar f = Foo.new()");
+        let (result, _) =
+            run_and_capture("class Foo {\n  construct new() {}\n}\nvar f = Foo.new()");
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
     }
 
     #[test]
     fn test_interpret_class_with_fields() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Point {
   construct new(x, y) {
     _x = x
@@ -1658,14 +1708,16 @@ class Point {
 var p = Point.new(3, 4)
 System.print(p.x)
 System.print(p.y)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "3\n4\n");
     }
 
     #[test]
     fn test_interpret_instance_method() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Greeter {
   construct new(name) {
     _name = name
@@ -1674,14 +1726,16 @@ class Greeter {
 }
 var g = Greeter.new("Alice")
 System.print(g.greet())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "Alice\n");
     }
 
     #[test]
     fn test_interpret_named_constructor() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Foo {
   construct create(x) {
     _x = x
@@ -1690,38 +1744,44 @@ class Foo {
 }
 var f = Foo.create(42)
 System.print(f.x)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "42\n");
     }
 
     #[test]
     fn test_interpret_fn_call() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fn = Fn.new {
   System.print(42)
 }
 fn.call()
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "42\n");
     }
 
     #[test]
     fn test_interpret_fn_call_with_args() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var add = Fn.new {|a, b|
   System.print(a + b)
 }
 add.call(3, 4)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "7\n");
     }
 
     #[test]
     fn test_interpret_this_access() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Counter {
   construct new(n) {
     _n = n
@@ -1734,7 +1794,8 @@ c.inc()
 c.inc()
 c.inc()
 System.print(c.value)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "3\n");
     }
@@ -1742,7 +1803,8 @@ System.print(c.value)
     #[test]
     fn test_interpret_inheritance() {
         // Test method inheritance (child calls parent method)
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Animal {
   construct new(name) {
     _name = name
@@ -1758,14 +1820,16 @@ class Dog is Animal {
 var d = Dog.new("Rex")
 System.print(d.name)
 System.print(d.bark())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "Rex\nwoof\n");
     }
 
     #[test]
     fn test_interpret_operator_overload() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Vec2 {
   construct new(x, y) {
     _x = x
@@ -1781,14 +1845,16 @@ var b = Vec2.new(3, 4)
 var c = a + b
 System.print(c.x)
 System.print(c.y)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "4\n6\n");
     }
 
     #[test]
     fn test_interpret_prefix_operator() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Num2 {
   construct new(n) { _n = n }
   value { _n }
@@ -1797,48 +1863,56 @@ class Num2 {
 var a = Num2.new(5)
 var b = -a
 System.print(b.value)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "-5\n");
     }
 
     #[test]
     fn test_interpret_closure_capture() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var x = 10
 var f = Fn.new { x }
 System.print(f.call())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "10\n");
     }
 
     #[test]
     fn test_interpret_closure_capture_with_args() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var x = 10
 var f = Fn.new {|y| x + y }
 System.print(f.call(5))
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "15\n");
     }
 
     #[test]
     fn test_interpret_closure_capture_multiple() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var a = 3
 var b = 7
 var f = Fn.new { a + b }
 System.print(f.call())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "10\n");
     }
 
     #[test]
     fn test_interpret_closure_capture_in_block() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var result = null
 {
   var x = 42
@@ -1846,28 +1920,32 @@ var result = null
   result = f.call()
 }
 System.print(result)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "42\n");
     }
 
     #[test]
     fn test_interpret_closure_nested_capture() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var x = 100
 var outer = Fn.new {
   Fn.new { x }
 }
 var inner = outer.call()
 System.print(inner.call())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "100\n");
     }
 
     #[test]
     fn test_interpret_super_call() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Animal {
   construct new(name) { _name = name }
   speak() { _name }
@@ -1878,14 +1956,16 @@ class Dog is Animal {
 }
 var d = Dog.new("Rex")
 System.print(d.speak())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "Rex says woof\n");
     }
 
     #[test]
     fn test_interpret_super_getter() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Base {
   construct new(v) { _v = v }
   value { _v }
@@ -1895,27 +1975,31 @@ class Child is Base {
   value { super.value + 10 }
 }
 System.print(Child.new(5).value)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "15\n");
     }
 
     #[test]
     fn test_interpret_fiber_new_call() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   System.print("inside fiber")
 }
 fiber.call()
 System.print("after call")
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "inside fiber\nafter call\n");
     }
 
     #[test]
     fn test_interpret_fiber_yield() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   System.print("before yield")
   Fiber.yield()
@@ -1925,27 +2009,31 @@ fiber.call()
 System.print("yielded")
 fiber.call()
 System.print("done")
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "before yield\nyielded\nafter yield\ndone\n");
     }
 
     #[test]
     fn test_interpret_fiber_yield_value() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   Fiber.yield(42)
 }
 var result = fiber.call()
 System.print(result)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "42\n");
     }
 
     #[test]
     fn test_interpret_fiber_is_done() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   Fiber.yield()
 }
@@ -1954,28 +2042,32 @@ fiber.call()
 System.print(fiber.isDone)
 fiber.call()
 System.print(fiber.isDone)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "false\nfalse\ntrue\n");
     }
 
     #[test]
     fn test_interpret_fiber_pass_value_on_resume() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   var got = Fiber.yield()
   System.print(got)
 }
 fiber.call()
 fiber.call("hello from caller")
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "hello from caller\n");
     }
 
     #[test]
     fn test_interpret_fiber_multiple_yields() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   Fiber.yield(1)
   Fiber.yield(2)
@@ -1984,52 +2076,72 @@ var fiber = Fiber.new {
 System.print(fiber.call())
 System.print(fiber.call())
 System.print(fiber.call())
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "1\n2\n3\n");
     }
 
     #[test]
     fn test_interpret_while_loop() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var i = 0
 while (i < 3) {
   System.print(i)
   i = i + 1
 }
-"#);
-        assert!(matches!(result, InterpretResult::Success), "while loop failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "while loop failed: {:?}",
+            result
+        );
         assert_eq!(output, "0\n1\n2\n");
     }
 
     #[test]
     fn test_interpret_string_interpolation() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var name = "world"
 var n = 42
 System.print("hello %(name)!")
 System.print("n = %(n)")
-"#);
-        assert!(matches!(result, InterpretResult::Success), "interpolation failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "interpolation failed: {:?}",
+            result
+        );
         assert_eq!(output, "hello world!\nn = 42\n");
     }
 
     #[test]
     fn test_interpret_is_operator() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 System.print(42 is Num)
 System.print("hi" is String)
 System.print(null is Null)
 System.print(42 is String)
 System.print(true is Bool)
-"#);
-        assert!(matches!(result, InterpretResult::Success), "is operator failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "is operator failed: {:?}",
+            result
+        );
         assert_eq!(output, "true\ntrue\ntrue\nfalse\ntrue\n");
     }
 
     #[test]
     fn test_interpret_setter() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 class Point {
   construct new(x, y) {
     _x = x
@@ -2043,55 +2155,84 @@ var p = Point.new(1, 2)
 System.print(p.x)
 p.x = 99
 System.print(p.x)
-"#);
-        assert!(matches!(result, InterpretResult::Success), "setter failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "setter failed: {:?}",
+            result
+        );
         assert_eq!(output, "1\n99\n");
     }
 
     #[test]
     fn test_interpret_list_subscript() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var list = [10, 20, 30]
 System.print(list[0])
 System.print(list[2])
 list[1] = 99
 System.print(list[1])
-"#);
-        assert!(matches!(result, InterpretResult::Success), "list subscript failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "list subscript failed: {:?}",
+            result
+        );
         assert_eq!(output, "10\n30\n99\n");
     }
 
     #[test]
     fn test_interpret_for_in_list() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var list = [10, 20, 30]
 for (x in list) {
   System.print(x)
 }
-"#);
-        assert!(matches!(result, InterpretResult::Success), "for-in list failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "for-in list failed: {:?}",
+            result
+        );
         assert_eq!(output, "10\n20\n30\n");
     }
 
     #[test]
     fn test_interpret_for_in_range() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 for (i in 1..4) {
   System.print(i)
 }
-"#);
-        assert!(matches!(result, InterpretResult::Success), "for-in range failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "for-in range failed: {:?}",
+            result
+        );
         assert_eq!(output, "1\n2\n3\n4\n");
     }
 
     #[test]
     fn test_interpret_string_plus() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var a = "hello"
 var b = " world"
 System.print(a + b)
-"#);
-        assert!(matches!(result, InterpretResult::Success), "string concat failed: {:?}", result);
+"#,
+        );
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "string concat failed: {:?}",
+            result
+        );
         assert_eq!(output, "hello world\n");
     }
 
@@ -2099,65 +2240,82 @@ System.print(a + b)
     fn test_interpret_static_method_with_args() {
         let mut vm = VM::new(VMConfig::default());
         vm.output_buffer = Some(String::new());
-        let result = vm.interpret("main", r#"
+        let result = vm.interpret(
+            "main",
+            r#"
 class Foo {
   static double(n) { n + n }
 }
 System.print(Foo.double(21))
-"#);
+"#,
+        );
         let output = vm.take_output();
-        assert!(matches!(result, InterpretResult::Success), "static method with args failed: {:?}", result);
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "static method with args failed: {:?}",
+            result
+        );
         assert_eq!(output, "42\n");
     }
 
     #[test]
     fn test_interpret_map_literal() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var m = {"a": 1, "b": 2}
 System.print(m["a"])
 System.print(m["b"])
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "1\n2\n");
     }
 
     #[test]
     fn test_interpret_map_subscript_set() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var m = Map.new()
 m["key"] = 42
 System.print(m["key"])
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "42\n");
     }
 
     #[test]
     fn test_interpret_map_count() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var m = {"x": 1, "y": 2, "z": 3}
 System.print(m.count)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "3\n");
     }
 
     #[test]
     fn test_interpret_fn_arity() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var f = Fn.new {|a, b, c| a }
 System.print(f.arity)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "3\n");
     }
 
     #[test]
     fn test_interpret_fiber_current() {
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var f = Fiber.current
 System.print(f is Fiber)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "true\n");
     }
@@ -2166,7 +2324,8 @@ System.print(f is Fiber)
     fn test_interpret_fiber_suspend() {
         // Fiber.suspend() should suspend the current fiber.
         // When called from the root fiber with no caller, execution just stops.
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var fiber = Fiber.new {
   System.print("before")
   Fiber.suspend()
@@ -2174,7 +2333,8 @@ var fiber = Fiber.new {
 }
 fiber.call()
 System.print("main continues")
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         // After fiber.call(), the child runs "before", then suspends.
         // Control returns to main which prints "main continues".
@@ -2187,23 +2347,29 @@ System.print("main continues")
         let mut config = VMConfig::default();
         config.load_module_fn = Some(Box::new(|name: &str| -> Option<String> {
             if name == "math_utils" {
-                Some(r#"
+                Some(
+                    r#"
 class MathUtils {
   static greet() { "hello from import" }
   static double(n) { n + n }
 }
-"#.to_string())
+"#
+                    .to_string(),
+                )
             } else {
                 None
             }
         }));
         let mut vm = VM::new(config);
         vm.output_buffer = Some(String::new());
-        let result = vm.interpret("main", r#"
+        let result = vm.interpret(
+            "main",
+            r#"
 import "math_utils" for MathUtils
 System.print(MathUtils.greet())
 System.print(MathUtils.double(21))
-"#);
+"#,
+        );
         let output = vm.take_output();
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "hello from import\n42\n");
@@ -2220,18 +2386,36 @@ System.print(MathUtils.double(21))
         // We need to inspect the fiber before interpret() restores prev_fiber.
         // So we'll replicate the interpret pipeline up to run_fiber, then check.
         let result = vm.interpret("main", source);
-        assert!(matches!(result, InterpretResult::RuntimeError), "{:?}", result);
+        assert!(
+            matches!(result, InterpretResult::RuntimeError),
+            "{:?}",
+            result
+        );
 
         // Check that error_fiber was saved for post-mortem inspection
         let fiber = vm.error_fiber;
-        assert!(!fiber.is_null(), "error_fiber should be saved on runtime error");
+        assert!(
+            !fiber.is_null(),
+            "error_fiber should be saved on runtime error"
+        );
         let loc = vm.extract_error_location(fiber);
-        assert!(loc.is_some(), "extract_error_location should return Some for runtime error");
+        assert!(
+            loc.is_some(),
+            "extract_error_location should return Some for runtime error"
+        );
         let loc = loc.unwrap();
         assert_eq!(loc.module, "main");
         // Span should point somewhere in "x.bogus()" (byte offsets 11..20 in the source)
-        assert!(loc.span.start >= 11, "span start {} should be >= 11", loc.span.start);
-        assert!(loc.span.end <= 20, "span end {} should be <= 20", loc.span.end);
+        assert!(
+            loc.span.start >= 11,
+            "span start {} should be >= 11",
+            loc.span.start
+        );
+        assert!(
+            loc.span.end <= 20,
+            "span end {} should be <= 20",
+            loc.span.end
+        );
     }
 
     #[test]
@@ -2263,9 +2447,15 @@ System.print(MathUtils.double(21))
         // Should contain the error message
         assert!(plain.contains("bogus"), "missing method name in:\n{plain}");
         // Should contain source snippet (the source line with the error)
-        assert!(plain.contains("x.bogus()"), "missing source snippet in:\n{plain}");
+        assert!(
+            plain.contains("x.bogus()"),
+            "missing source snippet in:\n{plain}"
+        );
         // Should contain the error label
-        assert!(plain.contains("error occurred here"), "missing label in:\n{plain}");
+        assert!(
+            plain.contains("error occurred here"),
+            "missing label in:\n{plain}"
+        );
         // Should contain contextual help
         assert!(
             plain.contains("does not define") || plain.contains("has no getter"),
@@ -2276,12 +2466,17 @@ System.print(MathUtils.double(21))
     #[test]
     fn test_fiber_stack_trace_disabled_by_default() {
         // When fiber_stack_traces is false (default), Fiber.stackTrace returns a message
-        let (result, output) = run_and_capture(r#"
+        let (result, output) = run_and_capture(
+            r#"
 var f = Fiber.new { 1 }
 System.print(f.stackTrace)
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
-        assert!(output.contains("not enabled"), "expected disabled message, got: {output}");
+        assert!(
+            output.contains("not enabled"),
+            "expected disabled message, got: {output}"
+        );
     }
 
     #[test]
@@ -2290,17 +2485,23 @@ System.print(f.stackTrace)
         config.fiber_stack_traces = true;
         let mut vm = VM::new(config);
         vm.output_buffer = Some(String::new());
-        let result = vm.interpret("main", r#"
+        let result = vm.interpret(
+            "main",
+            r#"
 var f = Fiber.new {
   Fiber.yield()
 }
 f.call()
 System.print(f.stackTrace)
-"#);
+"#,
+        );
         let output = vm.take_output();
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         // Should contain stack trace info, not the disabled message
-        assert!(!output.contains("not enabled"), "should be enabled, got: {output}");
+        assert!(
+            !output.contains("not enabled"),
+            "should be enabled, got: {output}"
+        );
     }
 
     #[test]
@@ -2319,13 +2520,16 @@ System.print(f.stackTrace)
 
         let mut vm = VM::new(config);
         vm.output_buffer = Some(String::new());
-        let result = vm.interpret("main", r#"
+        let result = vm.interpret(
+            "main",
+            r#"
 var inner = Fiber.new {
   var x = 42
   x.bogus()
 }
 inner.call()
-"#);
+"#,
+        );
         assert!(matches!(result, InterpretResult::RuntimeError));
         let captured = errors.lock().unwrap();
         assert!(!captured.is_empty(), "expected error");
@@ -2341,14 +2545,20 @@ inner.call()
         config.fiber_stack_traces = true;
         let mut vm = VM::new(config);
         vm.output_buffer = Some(String::new());
-        let result = vm.interpret("main", r#"
+        let result = vm.interpret(
+            "main",
+            r#"
 var f = Fiber.new { 1 }
 System.print(f.stackTrace)
-"#);
+"#,
+        );
         let output = vm.take_output();
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         // The stack trace should mention "main" module and spawned-at info
-        assert!(output.contains("main"), "should reference main module, got: {output}");
+        assert!(
+            output.contains("main"),
+            "should reference main module, got: {output}"
+        );
     }
 
     // -- String new methods --
@@ -2368,10 +2578,18 @@ System.print(f.stackTrace)
         let cls = vm.string_class;
 
         let empty = vm.new_string("".to_string());
-        assert_eq!(call_primitive(&mut vm, cls, "isEmpty", &[empty]).as_bool().unwrap(), true);
+        assert!(
+            call_primitive(&mut vm, cls, "isEmpty", &[empty])
+                .as_bool()
+                .unwrap()
+        );
 
         let nonempty = vm.new_string("a".to_string());
-        assert_eq!(call_primitive(&mut vm, cls, "isEmpty", &[nonempty]).as_bool().unwrap(), false);
+        assert!(
+            !call_primitive(&mut vm, cls, "isEmpty", &[nonempty])
+                .as_bool()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2518,23 +2736,23 @@ System.print(f.stackTrace)
 
         // 42 is Num → true
         let r = call_primitive(&mut vm, cls, "is(_)", &[Value::num(42.0), num_cls]);
-        assert_eq!(r.as_bool().unwrap(), true);
+        assert!(r.as_bool().unwrap());
 
         // 42 is Object → true (Num inherits Object)
         let r2 = call_primitive(&mut vm, cls, "is(_)", &[Value::num(42.0), obj_cls]);
-        assert_eq!(r2.as_bool().unwrap(), true);
+        assert!(r2.as_bool().unwrap());
 
         // "hi" is Num → false
         let s = vm.new_string("hi".to_string());
         let r3 = call_primitive(&mut vm, cls, "is(_)", &[s, num_cls]);
-        assert_eq!(r3.as_bool().unwrap(), false);
+        assert!(!r3.as_bool().unwrap());
     }
 
     // -- Sequence hierarchy --
 
     #[test]
     fn test_sequence_hierarchy() {
-        let mut vm = VM::new_default();
+        let vm = VM::new_default();
         unsafe {
             assert_eq!((*vm.list_class).superclass, vm.sequence_class);
             assert_eq!((*vm.map_class).superclass, vm.sequence_class);

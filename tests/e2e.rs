@@ -3,10 +3,9 @@
 /// These tests exercise complex Wren programs that combine multiple language
 /// features. Each test verifies correctness (expected output), stability
 /// (no panics), and profiles execution time.
-
 use std::time::Instant;
 use wren_lift::runtime::engine::InterpretResult;
-use wren_lift::runtime::vm::{VM, VMConfig};
+use wren_lift::runtime::vm::{VMConfig, VM};
 
 // ---------------------------------------------------------------------------
 // Harness with timing
@@ -38,13 +37,17 @@ fn assert_output(source: &str, expected: &str) {
     assert!(
         matches!(result, InterpretResult::Success),
         "Expected success, got {:?} ({})\nSource:\n{}\nOutput:\n{}",
-        result, t, source, output
+        result,
+        t,
+        source,
+        output
     );
     assert_eq!(
         output.trim_end(),
         expected.trim_end(),
         "\nSource:\n{}\nElapsed: {}",
-        source, t
+        source,
+        t
     );
     eprintln!("  [{}]", t);
 }
@@ -55,7 +58,10 @@ fn assert_success(source: &str) {
     assert!(
         matches!(result, InterpretResult::Success),
         "Expected success, got {:?} ({})\nSource:\n{}\nOutput:\n{}",
-        result, t, source, output
+        result,
+        t,
+        source,
+        output
     );
     eprintln!("  [{}]", t);
 }
@@ -66,7 +72,8 @@ fn assert_runtime_error(source: &str) {
     assert!(
         matches!(result, InterpretResult::RuntimeError),
         "Expected runtime error ({}) for:\n{}",
-        t, source
+        t,
+        source
     );
     eprintln!("  [{}]", t);
 }
@@ -109,14 +116,12 @@ System.print(256 >> 4)
 
 #[test]
 fn e2e_variable_scoping() {
-    // Note: block scoping with same-name shadowing is not yet supported.
-    // Test different-name scoping instead.
     assert_output(
         r#"
 var x = "outer"
 {
-    var y = "inner"
-    System.print(y)
+    var x = "inner"
+    System.print(x)
 }
 System.print(x)
 "#,
@@ -623,24 +628,17 @@ class StateMachine {
     }
     state { _state }
     transition(event) {
-        var matched = false
         if (_state == "idle" && event == "start") {
             _state = "running"
-            matched = true
-        }
-        if (!matched && _state == "running" && event == "pause") {
+            _log.add(_state)
+        } else if (_state == "running" && event == "pause") {
             _state = "paused"
-            matched = true
-        }
-        if (!matched && _state == "paused" && event == "resume") {
+            _log.add(_state)
+        } else if (_state == "paused" && event == "resume") {
             _state = "running"
-            matched = true
-        }
-        if (!matched && _state == "running" && event == "stop") {
+            _log.add(_state)
+        } else if (_state == "running" && event == "stop") {
             _state = "idle"
-            matched = true
-        }
-        if (matched) {
             _log.add(_state)
         } else {
             _log.add("invalid: " + _state + " + " + event)
@@ -692,7 +690,6 @@ System.print(sum)
 }
 
 #[test]
-#[ignore] // TODO: closure upvalue capture for map fields
 fn e2e_observer_pattern() {
     assert_output(
         r#"
@@ -920,22 +917,24 @@ System.print(s.count)
 
 #[test]
 fn e2e_module_import() {
-    let mut config = VMConfig::default();
-    config.load_module_fn = Some(Box::new(|name: &str| -> Option<String> {
-        if name == "math_helpers" {
-            Some(
-                r#"
+    let config = VMConfig {
+        load_module_fn: Some(Box::new(|name: &str| -> Option<String> {
+            if name == "math_helpers" {
+                Some(
+                    r#"
 class MathHelpers {
     static square(n) { n * n }
     static cube(n) { n * n * n }
 }
 "#
-                .to_string(),
-            )
-        } else {
-            None
-        }
-    }));
+                    .to_string(),
+                )
+            } else {
+                None
+            }
+        })),
+        ..Default::default()
+    };
 
     let mut vm = VM::new(config);
     vm.output_buffer = Some(String::new());
@@ -1106,7 +1105,6 @@ for (m in h.moves) System.print(m)
 // ===========================================================================
 
 #[test]
-#[ignore] // TODO: closure upvalue capture across fiber boundaries
 fn e2e_fiber_range_generator() {
     assert_output(
         r#"
@@ -1247,7 +1245,6 @@ System.print(m[0, 1] + m[1, 0])
 // ===========================================================================
 
 #[test]
-#[ignore] // TODO: closure-in-field dispatch triggers UB — needs GC investigation
 fn e2e_strategy_pattern() {
     assert_output(
         r#"
@@ -1269,7 +1266,6 @@ System.print(s)
 }
 
 #[test]
-#[ignore] // TODO: closure upvalue capture for map variables
 fn e2e_memoized_fibonacci() {
     assert_output(
         r#"

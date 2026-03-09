@@ -11,7 +11,6 @@
 /// This pass is analogous to Rust's monomorphization + devirtualization:
 /// when the concrete type is known, we eliminate the vtable (HashMap) lookup
 /// entirely and emit the operation inline.
-
 use std::collections::HashMap;
 
 use crate::intern::Interner;
@@ -98,15 +97,19 @@ impl<'a> MirPass for Devirt<'a> {
                     // --- Sequence iterate devirtualization ---
                     // When calling iterate(_) on a known List, replace with
                     // direct count-based iteration (no method dispatch).
-                    Instruction::Call { receiver, method, args } => {
+                    Instruction::Call {
+                        receiver,
+                        method,
+                        args,
+                    } => {
                         let method_name = self.interner.resolve(*method);
 
                         if let Some(known) = known_types.get(receiver) {
                             // Num arithmetic devirtualization
                             if *known == KnownType::Num && args.len() == 1 {
-                                if let Some(replacement) = self.devirt_num_method(
-                                    method_name, *receiver, args[0],
-                                ) {
+                                if let Some(replacement) =
+                                    self.devirt_num_method(method_name, *receiver, args[0])
+                                {
                                     replacements.push((inst_idx, *vid, replacement));
                                     changed = true;
                                     continue;
@@ -115,9 +118,9 @@ impl<'a> MirPass for Devirt<'a> {
 
                             // Num comparison devirtualization
                             if *known == KnownType::Num && args.len() == 1 {
-                                if let Some(replacement) = self.devirt_num_compare(
-                                    method_name, *receiver, args[0],
-                                ) {
+                                if let Some(replacement) =
+                                    self.devirt_num_compare(method_name, *receiver, args[0])
+                                {
                                     replacements.push((inst_idx, *vid, replacement));
                                     changed = true;
                                     continue;
@@ -176,16 +179,26 @@ impl<'a> Devirt<'a> {
                     }
 
                     // Arithmetic → Num
-                    Instruction::Add(_, _) | Instruction::Sub(_, _)
-                    | Instruction::Mul(_, _) | Instruction::Div(_, _)
-                    | Instruction::Mod(_, _) | Instruction::Neg(_)
-                    | Instruction::AddF64(_, _) | Instruction::SubF64(_, _)
-                    | Instruction::MulF64(_, _) | Instruction::DivF64(_, _)
-                    | Instruction::ModF64(_, _) | Instruction::NegF64(_)
-                    | Instruction::MathUnaryF64(_, _) | Instruction::MathBinaryF64(_, _, _)
-                    | Instruction::BitAnd(_, _) | Instruction::BitOr(_, _)
-                    | Instruction::BitXor(_, _) | Instruction::BitNot(_)
-                    | Instruction::Shl(_, _) | Instruction::Shr(_, _) => {
+                    Instruction::Add(_, _)
+                    | Instruction::Sub(_, _)
+                    | Instruction::Mul(_, _)
+                    | Instruction::Div(_, _)
+                    | Instruction::Mod(_, _)
+                    | Instruction::Neg(_)
+                    | Instruction::AddF64(_, _)
+                    | Instruction::SubF64(_, _)
+                    | Instruction::MulF64(_, _)
+                    | Instruction::DivF64(_, _)
+                    | Instruction::ModF64(_, _)
+                    | Instruction::NegF64(_)
+                    | Instruction::MathUnaryF64(_, _)
+                    | Instruction::MathBinaryF64(_, _, _)
+                    | Instruction::BitAnd(_, _)
+                    | Instruction::BitOr(_, _)
+                    | Instruction::BitXor(_, _)
+                    | Instruction::BitNot(_)
+                    | Instruction::Shl(_, _)
+                    | Instruction::Shr(_, _) => {
                         known.insert(*vid, KnownType::Num);
                     }
 
@@ -195,12 +208,18 @@ impl<'a> Devirt<'a> {
                     }
 
                     // Comparisons → Bool
-                    Instruction::CmpLt(_, _) | Instruction::CmpGt(_, _)
-                    | Instruction::CmpLe(_, _) | Instruction::CmpGe(_, _)
-                    | Instruction::CmpEq(_, _) | Instruction::CmpNe(_, _)
-                    | Instruction::CmpLtF64(_, _) | Instruction::CmpGtF64(_, _)
-                    | Instruction::CmpLeF64(_, _) | Instruction::CmpGeF64(_, _)
-                    | Instruction::Not(_) | Instruction::IsType(_, _) => {
+                    Instruction::CmpLt(_, _)
+                    | Instruction::CmpGt(_, _)
+                    | Instruction::CmpLe(_, _)
+                    | Instruction::CmpGe(_, _)
+                    | Instruction::CmpEq(_, _)
+                    | Instruction::CmpNe(_, _)
+                    | Instruction::CmpLtF64(_, _)
+                    | Instruction::CmpGtF64(_, _)
+                    | Instruction::CmpLeF64(_, _)
+                    | Instruction::CmpGeF64(_, _)
+                    | Instruction::Not(_)
+                    | Instruction::IsType(_, _) => {
                         known.insert(*vid, KnownType::Bool);
                     }
 
@@ -328,7 +347,7 @@ fn name_to_known_type(name: &str) -> Option<KnownType> {
 mod tests {
     use super::*;
     use crate::intern::Interner;
-    use crate::mir::{BasicBlock, BlockId, MirType, Terminator};
+    use crate::mir::Terminator;
 
     fn make_func(interner: &mut Interner) -> MirFunction {
         let name = interner.intern("test");
@@ -344,11 +363,17 @@ mod tests {
         let v1 = f.new_value();
         let num_sym = interner.intern("Num");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::IsType(v0, num_sym)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::IsType(v0, num_sym)));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -367,11 +392,17 @@ mod tests {
         let v1 = f.new_value();
         let obj_sym = interner.intern("Object");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::IsType(v0, obj_sym)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::IsType(v0, obj_sym)));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -390,11 +421,17 @@ mod tests {
         let v1 = f.new_value();
         let seq_sym = interner.intern("Sequence");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::MakeList(vec![])));
-        f.block_mut(bb).instructions.push((v1, Instruction::IsType(v0, seq_sym)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::MakeList(vec![])));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::IsType(v0, seq_sym)));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -413,11 +450,17 @@ mod tests {
         let v1 = f.new_value();
         let str_sym = interner.intern("String");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(42.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::IsType(v0, str_sym)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(42.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::IsType(v0, str_sym)));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -437,16 +480,25 @@ mod tests {
         let v2 = f.new_value();
         let add_sym = interner.intern("+(_)");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(1.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::ConstNum(2.0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::Call {
-            receiver: v0,
-            method: add_sym,
-            args: vec![v1],
-        }));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(2.0)));
+        f.block_mut(bb).instructions.push((
+            v2,
+            Instruction::Call {
+                receiver: v0,
+                method: add_sym,
+                args: vec![v1],
+            },
+        ));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -469,16 +521,25 @@ mod tests {
         let v2 = f.new_value();
         let lt_sym = interner.intern("<(_)");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(1.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::ConstNum(2.0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::Call {
-            receiver: v0,
-            method: lt_sym,
-            args: vec![v1],
-        }));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(2.0)));
+        f.block_mut(bb).instructions.push((
+            v2,
+            Instruction::Call {
+                receiver: v0,
+                method: lt_sym,
+                args: vec![v1],
+            },
+        ));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -502,20 +563,32 @@ mod tests {
         let add_sym = interner.intern("+(_)");
 
         // v0 from BlockParam → unknown type
-        f.block_mut(bb).instructions.push((v0, Instruction::BlockParam(0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::ConstNum(2.0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::Call {
-            receiver: v0,
-            method: add_sym,
-            args: vec![v1],
-        }));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::BlockParam(0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(2.0)));
+        f.block_mut(bb).instructions.push((
+            v2,
+            Instruction::Call {
+                receiver: v0,
+                method: add_sym,
+                args: vec![v1],
+            },
+        ));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(!changed);
-        assert!(matches!(&f.block(bb).instructions[2].1, Instruction::Call { .. }));
+        assert!(matches!(
+            &f.block(bb).instructions[2].1,
+            Instruction::Call { .. }
+        ));
     }
 
     #[test]
@@ -530,17 +603,28 @@ mod tests {
         let add_sym = interner.intern("+(_)");
 
         // v0 = param (unknown), guard.num v0 → now known Num, v0 +(_) v2
-        f.block_mut(bb).instructions.push((v0, Instruction::BlockParam(0)));
-        f.block_mut(bb).instructions.push((_v1, Instruction::GuardNum(v0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::ConstNum(1.0)));
-        f.block_mut(bb).instructions.push((v3, Instruction::Call {
-            receiver: v0,
-            method: add_sym,
-            args: vec![v2],
-        }));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::BlockParam(0)));
+        f.block_mut(bb)
+            .instructions
+            .push((_v1, Instruction::GuardNum(v0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::ConstNum(1.0)));
+        f.block_mut(bb).instructions.push((
+            v3,
+            Instruction::Call {
+                receiver: v0,
+                method: add_sym,
+                args: vec![v2],
+            },
+        ));
         f.block_mut(bb).terminator = Terminator::Return(v3);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         let changed = pass.run(&mut f);
 
         assert!(changed);
@@ -562,13 +646,22 @@ mod tests {
         let v1 = f.new_value();
         let seq_sym = interner.intern("Sequence");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::MakeList(vec![])));
-        f.block_mut(bb).instructions.push((v1, Instruction::IsType(v0, seq_sym)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::MakeList(vec![])));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::IsType(v0, seq_sym)));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         assert!(pass.run(&mut f));
-        assert!(matches!(&f.block(bb).instructions[1].1, Instruction::ConstBool(true)));
+        assert!(matches!(
+            &f.block(bb).instructions[1].1,
+            Instruction::ConstBool(true)
+        ));
     }
 
     #[test]
@@ -582,14 +675,27 @@ mod tests {
         let v3 = f.new_value();
         let seq_sym = interner.intern("Sequence");
 
-        f.block_mut(bb).instructions.push((v0, Instruction::ConstNum(1.0)));
-        f.block_mut(bb).instructions.push((v1, Instruction::ConstNum(10.0)));
-        f.block_mut(bb).instructions.push((v2, Instruction::MakeRange(v0, v1, true)));
-        f.block_mut(bb).instructions.push((v3, Instruction::IsType(v2, seq_sym)));
+        f.block_mut(bb)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v1, Instruction::ConstNum(10.0)));
+        f.block_mut(bb)
+            .instructions
+            .push((v2, Instruction::MakeRange(v0, v1, true)));
+        f.block_mut(bb)
+            .instructions
+            .push((v3, Instruction::IsType(v2, seq_sym)));
         f.block_mut(bb).terminator = Terminator::Return(v3);
 
-        let pass = Devirt { interner: &interner };
+        let pass = Devirt {
+            interner: &interner,
+        };
         assert!(pass.run(&mut f));
-        assert!(matches!(&f.block(bb).instructions[3].1, Instruction::ConstBool(true)));
+        assert!(matches!(
+            &f.block(bb).instructions[3].1,
+            Instruction::ConstBool(true)
+        ));
     }
 }

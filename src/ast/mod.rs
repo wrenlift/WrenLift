@@ -123,9 +123,7 @@ pub enum MethodSig {
     },
 
     /// `[params]` — subscript getter.
-    Subscript {
-        params: Vec<Spanned<SymbolId>>,
-    },
+    Subscript { params: Vec<Spanned<SymbolId>> },
 
     /// `[params]=(value)` — subscript setter.
     SubscriptSetter {
@@ -152,9 +150,9 @@ pub enum MethodSig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
-    Neg,   // -
-    Not,   // !
-    BNot,  // ~
+    Neg,  // -
+    Not,  // !
+    BNot, // ~
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,13 +408,10 @@ mod tests {
         let mut i = Interner::new();
         let x = i.intern("x");
 
-        let expr: Spanned<Expr> = (Expr::Num(3.14), span(0, 4));
+        let expr: Spanned<Expr> = (Expr::Num(1.234), span(0, 4));
         assert_eq!(expr.1, 0..4);
 
-        let stmt: Spanned<Stmt> = (
-            Stmt::Expr((Expr::Ident(x), span(0, 1))),
-            span(0, 1),
-        );
+        let stmt: Spanned<Stmt> = (Stmt::Expr((Expr::Ident(x), span(0, 1))), span(0, 1));
         assert_eq!(stmt.1, 0..1);
     }
 
@@ -546,10 +541,7 @@ mod tests {
         let b = i.intern("b");
 
         let closure = Expr::Closure {
-            params: vec![
-                (a, span(3, 4)),
-                (b, span(6, 7)),
-            ],
+            params: vec![(a, span(3, 4)), (b, span(6, 7))],
             body: Box::new((
                 Stmt::Expr((
                     Expr::BinaryOp {

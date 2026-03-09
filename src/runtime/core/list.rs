@@ -9,6 +9,7 @@ fn receiver_list(args: &[Value]) -> &ObjList {
     }
 }
 
+#[allow(clippy::mut_from_ref)]
 fn receiver_list_mut(args: &[Value]) -> &mut ObjList {
     unsafe {
         let ptr = args[0].as_object().unwrap();
@@ -173,12 +174,16 @@ fn list_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             }
             _ => break,
         }
-        if ctx.has_error() { return Value::null(); }
+        if ctx.has_error() {
+            return Value::null();
+        }
         let element = match ctx.call_method_on(other, "iteratorValue(_)", &[iterator]) {
             Some(v) => v,
             None => break,
         };
-        if ctx.has_error() { return Value::null(); }
+        if ctx.has_error() {
+            return Value::null();
+        }
         let list = receiver_list_mut(args);
         list.add(element);
     }
@@ -223,7 +228,9 @@ fn list_sort_by(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             let a = receiver_list(args).get(min_idx).unwrap();
             let b = receiver_list(args).get(j).unwrap();
             let cmp_result = ctx.call_method_on(comparer, "call(_,_)", &[a, b]);
-            if ctx.has_error() { return Value::null(); }
+            if ctx.has_error() {
+                return Value::null();
+            }
             if let Some(result) = cmp_result {
                 // If result > 0, then a > b, so b should come first.
                 if let Some(n) = result.as_num() {
@@ -251,7 +258,9 @@ fn list_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     for i in 0..len {
         let elem = receiver_list(args).get(i).unwrap_or(Value::null());
         parts.push(super::sequence::value_to_string(ctx, elem));
-        if ctx.has_error() { return Value::null(); }
+        if ctx.has_error() {
+            return Value::null();
+        }
     }
     let result = format!("[{}]", parts.join(", "));
     ctx.alloc_string(result)
@@ -270,12 +279,16 @@ fn list_plus(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             }
             _ => break,
         }
-        if ctx.has_error() { return Value::null(); }
+        if ctx.has_error() {
+            return Value::null();
+        }
         let element = match ctx.call_method_on(other, "iteratorValue(_)", &[iterator]) {
             Some(v) => v,
             None => break,
         };
-        if ctx.has_error() { return Value::null(); }
+        if ctx.has_error() {
+            return Value::null();
+        }
         elements.push(element);
     }
     ctx.alloc_list(elements)

@@ -1,3 +1,6 @@
+use crate::runtime::object::{
+    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjList, ObjMap, ObjString, ObjType,
+};
 /// Runtime functions callable from JIT-compiled code.
 ///
 /// These are `extern "C"` functions that the JIT emits `CallRuntime` for.
@@ -9,12 +12,7 @@
 /// - VM context is accessed via thread-local `JIT_CONTEXT`
 /// - x86_64: System V ABI (RDI, RSI, RDX, RCX, R8, R9 → RAX)
 /// - aarch64: AAPCS64 (X0-X7 → X0)
-
 use crate::runtime::value::Value;
-use crate::runtime::object::{
-    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjList, ObjMap,
-    ObjString, ObjType,
-};
 
 // ---------------------------------------------------------------------------
 // JIT context — thread-local VM state for runtime functions
@@ -72,7 +70,7 @@ fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
         if ctx.vm.is_null() {
             None
         } else {
-            Some(f(&*ctx))
+            Some(f(&ctx))
         }
     })
 }
@@ -99,7 +97,8 @@ pub fn module_name() -> String {
             String::new()
         } else {
             unsafe {
-                let slice = std::slice::from_raw_parts(ctx.module_name, ctx.module_name_len as usize);
+                let slice =
+                    std::slice::from_raw_parts(ctx.module_name, ctx.module_name_len as usize);
                 String::from_utf8_lossy(slice).into_owned()
             }
         }
@@ -119,7 +118,8 @@ pub extern "C" fn wren_get_module_var(slot: u64) -> u64 {
         } else {
             Value::null().to_bits()
         }
-    }).unwrap_or(Value::null().to_bits())
+    })
+    .unwrap_or(Value::null().to_bits())
 }
 
 /// Set a module variable by slot index.
@@ -127,7 +127,9 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     with_context(|ctx| {
         let idx = slot as usize;
         if idx < ctx.module_var_count as usize {
-            unsafe { *ctx.module_vars.add(idx) = value; }
+            unsafe {
+                *ctx.module_vars.add(idx) = value;
+            }
         }
     });
     value
@@ -145,19 +147,15 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
     let method_entry = unsafe { (*class).find_method(method_sym).cloned() };
 
     match method_entry {
-        Some(Method::Native(native_fn)) => {
-            native_fn(vm, args).to_bits()
-        }
-        Some(Method::Closure(closure_ptr)) => {
-            vm.call_closure_sync(closure_ptr, args)
-                .map(|v| v.to_bits())
-                .unwrap_or(Value::null().to_bits())
-        }
-        Some(Method::Constructor(closure_ptr)) => {
-            vm.call_closure_sync(closure_ptr, args)
-                .map(|v| v.to_bits())
-                .unwrap_or(Value::null().to_bits())
-        }
+        Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
+        Some(Method::Closure(closure_ptr)) => vm
+            .call_closure_sync(closure_ptr, args)
+            .map(|v| v.to_bits())
+            .unwrap_or(Value::null().to_bits()),
+        Some(Method::Constructor(closure_ptr)) => vm
+            .call_closure_sync(closure_ptr, args)
+            .map(|v| v.to_bits())
+            .unwrap_or(Value::null().to_bits()),
         None => {
             // Try static method dispatch (receiver IS a class object)
             if class == vm.class_class {
@@ -166,7 +164,8 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
                 let static_sym = vm.interner.intern(&static_name);
                 if let Some(recv_ptr) = recv.as_object() {
                     let recv_class_ptr = recv_ptr as *mut ObjClass;
-                    let static_entry = unsafe { (*recv_class_ptr).find_method(static_sym).cloned() };
+                    let static_entry =
+                        unsafe { (*recv_class_ptr).find_method(static_sym).cloned() };
                     match static_entry {
                         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
                         _ => Value::null().to_bits(),
@@ -199,21 +198,51 @@ pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
     let recv = Value::from_bits(receiver);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1)])
+    dispatch_call(
+        recv,
+        sym,
+        &[recv, Value::from_bits(a0), Value::from_bits(a1)],
+    )
 }
 
 /// Call with 3 extra args.
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let recv = Value::from_bits(receiver);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+    dispatch_call(
+        recv,
+        sym,
+        &[
+            recv,
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+            Value::from_bits(a2),
+        ],
+    )
 }
 
 /// Call with 4 extra args (max via registers).
-pub extern "C" fn wren_call_4(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+pub extern "C" fn wren_call_4(
+    receiver: u64,
+    method: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> u64 {
     let recv = Value::from_bits(receiver);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2), Value::from_bits(a3)])
+    dispatch_call(
+        recv,
+        sym,
+        &[
+            recv,
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+            Value::from_bits(a2),
+            Value::from_bits(a3),
+        ],
+    )
 }
 
 /// Internal: dispatch a super call. Walks to superclass and dispatches method.
@@ -233,16 +262,14 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
     let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
     match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-        Some(Method::Closure(closure_ptr)) => {
-            vm.call_closure_sync(closure_ptr, args)
-                .map(|v| v.to_bits())
-                .unwrap_or(Value::null().to_bits())
-        }
-        Some(Method::Constructor(closure_ptr)) => {
-            vm.call_closure_sync(closure_ptr, args)
-                .map(|v| v.to_bits())
-                .unwrap_or(Value::null().to_bits())
-        }
+        Some(Method::Closure(closure_ptr)) => vm
+            .call_closure_sync(closure_ptr, args)
+            .map(|v| v.to_bits())
+            .unwrap_or(Value::null().to_bits()),
+        Some(Method::Constructor(closure_ptr)) => vm
+            .call_closure_sync(closure_ptr, args)
+            .map(|v| v.to_bits())
+            .unwrap_or(Value::null().to_bits()),
         None => Value::null().to_bits(),
     }
 }
@@ -268,13 +295,26 @@ pub extern "C" fn wren_super_call_2(method: u64, this: u64, a0: u64) -> u64 {
 pub extern "C" fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1)])
+    dispatch_super_call(
+        recv,
+        sym,
+        &[recv, Value::from_bits(a0), Value::from_bits(a1)],
+    )
 }
 /// Super call with 4 args. Codegen: [method_sym, this, a0, a1, a2]
 pub extern "C" fn wren_super_call_4(method: u64, this: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+    dispatch_super_call(
+        recv,
+        sym,
+        &[
+            recv,
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+            Value::from_bits(a2),
+        ],
+    )
 }
 
 /// Allocate a new empty list.
@@ -286,7 +326,9 @@ pub extern "C" fn wren_make_list() -> u64 {
     };
 
     let list_ptr = vm.gc.alloc_list();
-    unsafe { (*list_ptr).header.class = vm.list_class; }
+    unsafe {
+        (*list_ptr).header.class = vm.list_class;
+    }
     Value::object(list_ptr as *mut u8).to_bits()
 }
 
@@ -299,7 +341,9 @@ pub extern "C" fn wren_make_map() -> u64 {
     };
 
     let map_ptr = vm.gc.alloc_map();
-    unsafe { (*map_ptr).header.class = vm.map_class; }
+    unsafe {
+        (*map_ptr).header.class = vm.map_class;
+    }
     Value::object(map_ptr as *mut u8).to_bits()
 }
 
@@ -316,7 +360,9 @@ pub extern "C" fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
     let is_inclusive = inclusive != 0;
 
     let range_ptr = vm.gc.alloc_range(from_val, to_val, is_inclusive);
-    unsafe { (*range_ptr).header.class = vm.range_class; }
+    unsafe {
+        (*range_ptr).header.class = vm.range_class;
+    }
     Value::object(range_ptr as *mut u8).to_bits()
 }
 
@@ -331,14 +377,20 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     let func_id = fn_id as u32;
     let name_sym = vm.interner.intern("<closure>");
     let uv_count = upvalue_vals.len() as u16;
-    let arity = vm.engine.get_mir(crate::runtime::engine::FuncId(func_id))
+    let arity = vm
+        .engine
+        .get_mir(crate::runtime::engine::FuncId(func_id))
         .map(|mir| mir.arity)
         .unwrap_or(0);
     let fn_ptr = vm.gc.alloc_fn(name_sym, arity, uv_count, func_id);
-    unsafe { (*fn_ptr).header.class = vm.fn_class; }
+    unsafe {
+        (*fn_ptr).header.class = vm.fn_class;
+    }
 
     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
-    unsafe { (*closure_ptr).header.class = vm.fn_class; }
+    unsafe {
+        (*closure_ptr).header.class = vm.fn_class;
+    }
 
     // Populate upvalues with captured values (pre-closed)
     for (i, &uv_bits) in upvalue_vals.iter().enumerate() {
@@ -423,7 +475,9 @@ pub extern "C" fn wren_is_type(val: u64, class_sym: u64) -> u64 {
     // Walk the class hierarchy
     let mut class = vm.class_of(v);
     loop {
-        if class.is_null() { break; }
+        if class.is_null() {
+            break;
+        }
         let class_name = unsafe { (*class).name };
         if class_name == target_sym {
             return Value::bool(true).to_bits();
@@ -499,7 +553,9 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                     let i = n as usize;
                     let count = unsafe { (*list).count as usize };
                     if i < count {
-                        unsafe { (*list).set(i, Value::from_bits(value)); }
+                        unsafe {
+                            (*list).set(i, Value::from_bits(value));
+                        }
                         return value;
                     }
                 }
@@ -507,7 +563,9 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
             ObjType::Map => {
                 let map = ptr as *mut ObjMap;
                 let map_key = MapKey::new(idx);
-                unsafe { (*map).entries.insert(map_key, Value::from_bits(value)); }
+                unsafe {
+                    (*map).entries.insert(map_key, Value::from_bits(value));
+                }
                 return value;
             }
             _ => {}
@@ -658,20 +716,48 @@ pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
 // FP transcendental wrappers (raw f64 bits in/out, for JIT CallRuntime)
 // ---------------------------------------------------------------------------
 
-pub extern "C" fn wren_fp_sin(bits: u64) -> u64 { f64::from_bits(bits).sin().to_bits() }
-pub extern "C" fn wren_fp_cos(bits: u64) -> u64 { f64::from_bits(bits).cos().to_bits() }
-pub extern "C" fn wren_fp_tan(bits: u64) -> u64 { f64::from_bits(bits).tan().to_bits() }
-pub extern "C" fn wren_fp_asin(bits: u64) -> u64 { f64::from_bits(bits).asin().to_bits() }
-pub extern "C" fn wren_fp_acos(bits: u64) -> u64 { f64::from_bits(bits).acos().to_bits() }
-pub extern "C" fn wren_fp_atan(bits: u64) -> u64 { f64::from_bits(bits).atan().to_bits() }
-pub extern "C" fn wren_fp_log(bits: u64) -> u64 { f64::from_bits(bits).ln().to_bits() }
-pub extern "C" fn wren_fp_log2(bits: u64) -> u64 { f64::from_bits(bits).log2().to_bits() }
-pub extern "C" fn wren_fp_exp(bits: u64) -> u64 { f64::from_bits(bits).exp().to_bits() }
-pub extern "C" fn wren_fp_cbrt(bits: u64) -> u64 { f64::from_bits(bits).cbrt().to_bits() }
-pub extern "C" fn wren_fp_atan2(a: u64, b: u64) -> u64 { f64::from_bits(a).atan2(f64::from_bits(b)).to_bits() }
-pub extern "C" fn wren_fp_pow(a: u64, b: u64) -> u64 { f64::from_bits(a).powf(f64::from_bits(b)).to_bits() }
-pub extern "C" fn wren_fp_min(a: u64, b: u64) -> u64 { f64::from_bits(a).min(f64::from_bits(b)).to_bits() }
-pub extern "C" fn wren_fp_max(a: u64, b: u64) -> u64 { f64::from_bits(a).max(f64::from_bits(b)).to_bits() }
+pub extern "C" fn wren_fp_sin(bits: u64) -> u64 {
+    f64::from_bits(bits).sin().to_bits()
+}
+pub extern "C" fn wren_fp_cos(bits: u64) -> u64 {
+    f64::from_bits(bits).cos().to_bits()
+}
+pub extern "C" fn wren_fp_tan(bits: u64) -> u64 {
+    f64::from_bits(bits).tan().to_bits()
+}
+pub extern "C" fn wren_fp_asin(bits: u64) -> u64 {
+    f64::from_bits(bits).asin().to_bits()
+}
+pub extern "C" fn wren_fp_acos(bits: u64) -> u64 {
+    f64::from_bits(bits).acos().to_bits()
+}
+pub extern "C" fn wren_fp_atan(bits: u64) -> u64 {
+    f64::from_bits(bits).atan().to_bits()
+}
+pub extern "C" fn wren_fp_log(bits: u64) -> u64 {
+    f64::from_bits(bits).ln().to_bits()
+}
+pub extern "C" fn wren_fp_log2(bits: u64) -> u64 {
+    f64::from_bits(bits).log2().to_bits()
+}
+pub extern "C" fn wren_fp_exp(bits: u64) -> u64 {
+    f64::from_bits(bits).exp().to_bits()
+}
+pub extern "C" fn wren_fp_cbrt(bits: u64) -> u64 {
+    f64::from_bits(bits).cbrt().to_bits()
+}
+pub extern "C" fn wren_fp_atan2(a: u64, b: u64) -> u64 {
+    f64::from_bits(a).atan2(f64::from_bits(b)).to_bits()
+}
+pub extern "C" fn wren_fp_pow(a: u64, b: u64) -> u64 {
+    f64::from_bits(a).powf(f64::from_bits(b)).to_bits()
+}
+pub extern "C" fn wren_fp_min(a: u64, b: u64) -> u64 {
+    f64::from_bits(a).min(f64::from_bits(b)).to_bits()
+}
+pub extern "C" fn wren_fp_max(a: u64, b: u64) -> u64 {
+    f64::from_bits(a).max(f64::from_bits(b)).to_bits()
+}
 
 // ---------------------------------------------------------------------------
 // ABI physical register mappings
@@ -682,16 +768,16 @@ fn abi_regs(target: super::Target) -> (&'static [u32], u32, u32, u32) {
     // Returns (arg_regs, ret_reg, call_scratch, copy_scratch)
     match target {
         super::Target::Aarch64 => (
-            &[0, 1, 2, 3, 4, 5],  // X0-X5
-            0,                      // return in X0
-            16,                     // X16 (IP0) for function pointer
-            17,                     // X17 (IP1) for cycle breaking
+            &[0, 1, 2, 3, 4, 5], // X0-X5
+            0,                   // return in X0
+            16,                  // X16 (IP0) for function pointer
+            17,                  // X17 (IP1) for cycle breaking
         ),
         super::Target::X86_64 => (
-            &[7, 6, 2, 1, 8, 9],  // RDI, RSI, RDX, RCX, R8, R9
-            0,                      // return in RAX
-            11,                     // R11 for function pointer
-            11,                     // R11 for cycle breaking (safe: copy resolves before ptr load)
+            &[7, 6, 2, 1, 8, 9], // RDI, RSI, RDX, RCX, R8, R9
+            0,                   // return in RAX
+            11,                  // R11 for function pointer
+            11,                  // R11 for cycle breaking (safe: copy resolves before ptr load)
         ),
         super::Target::Wasm => (&[], 0, 0, 0),
     }
@@ -781,7 +867,7 @@ pub fn resolve(name: &str) -> Option<usize> {
 // CallRuntime → ABI setup + CallInd lowering pass
 // ---------------------------------------------------------------------------
 
-use crate::codegen::{MachInst, MachFunc, VReg};
+use crate::codegen::{MachFunc, MachInst, VReg};
 
 /// Lower all `CallRuntime` instructions to proper ABI calling sequences.
 ///
@@ -796,7 +882,9 @@ use crate::codegen::{MachInst, MachFunc, VReg};
 /// 4. Move return value from ABI return register to destination
 pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
     let (abi_args, abi_ret, call_scratch, copy_scratch) = abi_regs(target);
-    if abi_args.is_empty() { return; } // Wasm: no runtime calls
+    if abi_args.is_empty() {
+        return;
+    } // Wasm: no runtime calls
 
     let mut i = 0;
     while i < mf.insts.len() {
@@ -809,7 +897,8 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
                 let mut new_insts: Vec<MachInst> = Vec::new();
 
                 // 1. Build (src_phys, dst_abi) move pairs and resolve in parallel
-                let moves: Vec<(u32, u32)> = args.iter()
+                let moves: Vec<(u32, u32)> = args
+                    .iter()
                     .enumerate()
                     .filter(|(idx, _)| *idx < abi_args.len())
                     .map(|(idx, vreg)| (vreg.index, abi_args[idx]))
@@ -862,10 +951,7 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
 /// Output: ordered sequence of (src, dst) moves that is safe to execute sequentially.
 fn resolve_parallel_copy(moves: &[(u32, u32)], scratch: u32) -> Vec<(u32, u32)> {
     // Filter identity moves (src == dst).
-    let mut remaining: Vec<(u32, u32)> = moves.iter()
-        .filter(|(s, d)| s != d)
-        .cloned()
-        .collect();
+    let mut remaining: Vec<(u32, u32)> = moves.iter().filter(|(s, d)| s != d).cloned().collect();
 
     if remaining.is_empty() {
         return vec![];
@@ -881,7 +967,8 @@ fn resolve_parallel_copy(moves: &[(u32, u32)], scratch: u32) -> Vec<(u32, u32)> 
         let mut i = 0;
         while i < remaining.len() {
             let (_, dst) = remaining[i];
-            let dst_is_source = remaining.iter()
+            let dst_is_source = remaining
+                .iter()
                 .enumerate()
                 .any(|(j, (s, _))| j != i && *s == dst);
             if !dst_is_source {
@@ -1029,8 +1116,14 @@ mod tests {
         let arg1 = VReg::gp(5);
         let ret = VReg::gp(3);
 
-        mf.emit(MachInst::LoadImm { dst: arg0, bits: 10 });
-        mf.emit(MachInst::LoadImm { dst: arg1, bits: 20 });
+        mf.emit(MachInst::LoadImm {
+            dst: arg0,
+            bits: 10,
+        });
+        mf.emit(MachInst::LoadImm {
+            dst: arg1,
+            bits: 20,
+        });
         mf.emit(MachInst::CallRuntime {
             name: "wren_num_add",
             args: vec![arg0, arg1],
@@ -1045,14 +1138,16 @@ mod tests {
         assert_eq!(mf.insts.len(), before_len + 4);
 
         // Verify moves target ABI physical registers (X0=0, X1=1)
-        let has_x0_move = mf.insts.iter().any(|inst| {
-            matches!(inst, MachInst::Mov { dst, .. } if dst.index == 0)
-        });
+        let has_x0_move = mf
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, MachInst::Mov { dst, .. } if dst.index == 0));
         assert!(has_x0_move, "should have move to X0");
 
-        let has_x1_move = mf.insts.iter().any(|inst| {
-            matches!(inst, MachInst::Mov { dst, .. } if dst.index == 1)
-        });
+        let has_x1_move = mf
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, MachInst::Mov { dst, .. } if dst.index == 1));
         assert!(has_x1_move, "should have move to X1");
     }
 
@@ -1072,8 +1167,14 @@ mod tests {
         let result = resolve_parallel_copy(&[(0, 1), (1, 0)], 17);
         // Should use scratch: 3 moves total
         assert_eq!(result.len(), 3, "swap should produce 3 moves: {:?}", result);
-        assert!(result.iter().any(|(_, d)| *d == 17), "should use scratch as dst");
-        assert!(result.iter().any(|(s, _)| *s == 17), "should use scratch as src");
+        assert!(
+            result.iter().any(|(_, d)| *d == 17),
+            "should use scratch as dst"
+        );
+        assert!(
+            result.iter().any(|(s, _)| *s == 17),
+            "should use scratch as src"
+        );
     }
 
     #[test]

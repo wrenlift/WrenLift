@@ -3,7 +3,6 @@
 /// For each pure instruction, if an identical computation was already performed,
 /// replace all uses of the new result with the earlier one. The redundant
 /// instruction becomes dead and is cleaned up by DCE.
-
 use std::collections::HashMap;
 
 use super::{replace_uses_in_func, MirPass};
@@ -68,13 +67,16 @@ fn resolve(v: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
 }
 
 fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Option<CseKey> {
-    // Don't CSE block params or mutable reads (fields/module vars/upvalues can be mutated).
+    // Don't CSE block params, mutable reads, or identity-creating allocations.
     if matches!(
         inst,
         Instruction::BlockParam(_)
             | Instruction::GetModuleVar(_)
             | Instruction::GetUpvalue(_)
             | Instruction::GetField(..)
+            | Instruction::MakeClosure { .. }
+            | Instruction::MakeList(..)
+            | Instruction::MakeMap(..)
     ) {
         return None;
     }

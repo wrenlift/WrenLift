@@ -1,3 +1,4 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 /// C embedding API for WrenLift.
 ///
 /// Provides a wren.h-compatible interface for embedding WrenLift in C/C++
@@ -23,13 +24,12 @@
 ///     wrenFreeVM(vm);
 /// }
 /// ```
-
 use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
 use std::ptr;
 
 use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use crate::runtime::value::Value;
-use crate::runtime::vm::{VM, VMConfig};
+use crate::runtime::vm::{VMConfig, VM};
 
 // ---------------------------------------------------------------------------
 // Opaque types
@@ -237,10 +237,7 @@ pub extern "C" fn wrenInterpret(
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn wrenMakeCallHandle(
-    vm: *mut WrenVM,
-    signature: *const c_char,
-) -> *mut WrenHandle {
+pub extern "C" fn wrenMakeCallHandle(vm: *mut WrenVM, signature: *const c_char) -> *mut WrenHandle {
     if vm.is_null() || signature.is_null() {
         return ptr::null_mut();
     }
@@ -627,7 +624,11 @@ pub extern "C" fn wrenInsertInList(
         let list = &mut *(ptr as *mut ObjList);
         let idx = if index < 0 {
             let i = list.len() as i32 + 1 + index;
-            if i < 0 { 0usize } else { i as usize }
+            if i < 0 {
+                0usize
+            } else {
+                i as usize
+            }
         } else {
             index as usize
         };
@@ -657,11 +658,7 @@ pub extern "C" fn wrenGetMapCount(vm: *mut WrenVM, slot: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn wrenGetMapContainsKey(
-    vm: *mut WrenVM,
-    map_slot: c_int,
-    key_slot: c_int,
-) -> bool {
+pub extern "C" fn wrenGetMapContainsKey(vm: *mut WrenVM, map_slot: c_int, key_slot: c_int) -> bool {
     if vm.is_null() {
         return false;
     }
@@ -755,9 +752,7 @@ pub extern "C" fn wrenHasModule(vm: *mut WrenVM, module: *const c_char) -> bool 
     if vm.is_null() || module.is_null() {
         return false;
     }
-    let name = unsafe { CStr::from_ptr(module) }
-        .to_str()
-        .unwrap_or("");
+    let name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("");
     unsafe { (*vm).modules.contains_key(name) }
 }
 
@@ -781,9 +776,7 @@ pub extern "C" fn wrenGetVariable(
     _name: *const c_char,
     _slot: c_int,
 ) {
-    if vm.is_null() {
-        return;
-    }
+    if vm.is_null() {}
     // TODO: Implement module variable lookup.
 }
 
@@ -880,7 +873,7 @@ mod tests {
     fn test_version() {
         let v = wrenGetVersionNumber();
         assert!(v > 0);
-        assert_eq!(v, 0 * 1_000_000 + 5 * 1_000 + 0);
+        assert_eq!(v, 5 * 1_000);
     }
 
     #[test]
@@ -906,10 +899,10 @@ mod tests {
 
         wrenSetSlotBool(vm, 0, true);
         assert_eq!(wrenGetSlotType(vm, 0), WrenType::Bool);
-        assert_eq!(wrenGetSlotBool(vm, 0), true);
+        assert!(wrenGetSlotBool(vm, 0));
 
         wrenSetSlotBool(vm, 0, false);
-        assert_eq!(wrenGetSlotBool(vm, 0), false);
+        assert!(!wrenGetSlotBool(vm, 0));
 
         wrenFreeVM(vm);
     }
@@ -919,9 +912,9 @@ mod tests {
         let vm = wrenNewVM(ptr::null());
         wrenEnsureSlots(vm, 2);
 
-        wrenSetSlotDouble(vm, 0, 3.14);
+        wrenSetSlotDouble(vm, 0, 1.234);
         assert_eq!(wrenGetSlotType(vm, 0), WrenType::Num);
-        assert!((wrenGetSlotDouble(vm, 0) - 3.14).abs() < 1e-10);
+        assert!((wrenGetSlotDouble(vm, 0) - 1.234).abs() < 1e-10);
 
         wrenFreeVM(vm);
     }

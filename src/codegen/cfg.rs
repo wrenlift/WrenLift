@@ -8,7 +8,6 @@
 /// - WASM emitter: structured control flow conversion (block/loop/br)
 /// - Register allocator: liveness analysis improvements
 /// - Optimization: loop-aware scheduling
-
 use super::{Label, MachFunc, MachInst};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -119,16 +118,16 @@ impl Cfg {
 
         // Phase 3: Compute edges from branch instructions.
         let num_blocks = blocks.len();
-        for i in 0..num_blocks {
-            let (start, end) = (blocks[i].start, blocks[i].end);
+        for (i, block) in blocks.iter_mut().enumerate().take(num_blocks) {
+            let (start, end) = (block.start, block.end);
             let mut ends_with_unconditional = false;
 
-            for inst_idx in start..end {
-                match &insts[inst_idx] {
+            for inst in &insts[start..end] {
+                match inst {
                     MachInst::Jmp { target } => {
                         if let Some(&b) = label_to_block.get(target) {
-                            if !blocks[i].succs.contains(&b) {
-                                blocks[i].succs.push(b);
+                            if !block.succs.contains(&b) {
+                                block.succs.push(b);
                             }
                         }
                         ends_with_unconditional = true;
@@ -139,8 +138,8 @@ impl Cfg {
                     | MachInst::TestBitJmpZero { target, .. }
                     | MachInst::TestBitJmpNonZero { target, .. } => {
                         if let Some(&b) = label_to_block.get(target) {
-                            if !blocks[i].succs.contains(&b) {
-                                blocks[i].succs.push(b);
+                            if !block.succs.contains(&b) {
+                                block.succs.push(b);
                             }
                         }
                         // Conditional branches also fall through.
@@ -153,10 +152,9 @@ impl Cfg {
             }
 
             // Fall-through to next block if no unconditional terminator.
-            if !ends_with_unconditional && i + 1 < num_blocks {
-                if !blocks[i].succs.contains(&(i + 1)) {
-                    blocks[i].succs.push(i + 1);
-                }
+            if !ends_with_unconditional && i + 1 < num_blocks
+                && !block.succs.contains(&(i + 1)) {
+                block.succs.push(i + 1);
             }
         }
 
@@ -407,7 +405,11 @@ impl Cfg {
     // -----------------------------------------------------------------------
 
     /// Return the last terminator instruction in a block, if any.
-    pub fn block_terminator<'a>(&self, block_idx: usize, func: &'a MachFunc) -> Option<&'a MachInst> {
+    pub fn block_terminator<'a>(
+        &self,
+        block_idx: usize,
+        func: &'a MachFunc,
+    ) -> Option<&'a MachInst> {
         let b = &self.blocks[block_idx];
         if b.start >= b.end {
             return None;
@@ -425,10 +427,9 @@ impl Cfg {
         let b = &self.blocks[block_idx];
         let mut start = b.start;
         // Skip leading DefLabel instruction.
-        if start < b.end {
-            if matches!(func.insts[start], MachInst::DefLabel(_)) {
-                start += 1;
-            }
+        if start < b.end
+            && matches!(func.insts[start], MachInst::DefLabel(_)) {
+            start += 1;
         }
         (start, b.end)
     }
@@ -494,10 +495,7 @@ mod tests {
     #[test]
     fn test_single_block() {
         let r0 = VReg::gp(0);
-        let func = make_func(vec![
-            MachInst::LoadImm { dst: r0, bits: 42 },
-            MachInst::Ret,
-        ]);
+        let func = make_func(vec![MachInst::LoadImm { dst: r0, bits: 42 }, MachInst::Ret]);
         let cfg = Cfg::build(&func);
 
         assert_eq!(cfg.num_blocks(), 1);
@@ -788,10 +786,7 @@ mod tests {
     #[test]
     fn test_no_loops() {
         let r0 = VReg::gp(0);
-        let func = make_func(vec![
-            MachInst::LoadImm { dst: r0, bits: 42 },
-            MachInst::Ret,
-        ]);
+        let func = make_func(vec![MachInst::LoadImm { dst: r0, bits: 42 }, MachInst::Ret]);
         let cfg = Cfg::build(&func);
         let loops = cfg.detect_loops();
         assert!(loops.is_empty());

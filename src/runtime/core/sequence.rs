@@ -311,7 +311,9 @@ pub(crate) fn value_to_string(ctx: &mut dyn NativeContext, value: Value) -> Stri
         }
         return format!("{}", n);
     }
-    if value.is_null() { return "null".to_string(); }
+    if value.is_null() {
+        return "null".to_string();
+    }
     if let Some(b) = value.as_bool() {
         return if b { "true" } else { "false" }.to_string();
     }

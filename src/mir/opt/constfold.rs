@@ -5,7 +5,6 @@
 /// - Comparisons: `ConstNum(1) < ConstNum(2)` → `ConstBool(true)`
 /// - Branch elimination: `CondBranch` on constant → unconditional `Branch`
 /// - Propagation through `Move`, `Box`, `Unbox`
-
 use std::collections::HashMap;
 
 use super::MirPass;
@@ -161,7 +160,9 @@ fn try_fold(inst: &Instruction, constants: &HashMap<ValueId, ConstVal>) -> Optio
                         | (_, ConstVal::F64(_) | ConstVal::I64(_))
                 ) =>
             {
-                Some(ConstVal::Bool(const_to_value(va).equals(const_to_value(vb))))
+                Some(ConstVal::Bool(
+                    const_to_value(va).equals(const_to_value(vb)),
+                ))
             }
             _ => None,
         },
