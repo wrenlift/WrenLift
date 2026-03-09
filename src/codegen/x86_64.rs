@@ -400,6 +400,17 @@ impl X64Emitter {
         self.emit_modrm_mem(xmm, base, disp);
     }
 
+    /// roundsd dst, src, imm8 (SSE4.1): 66 0F 3A 0B /r ib
+    fn emit_roundsd(&mut self, dst: u32, src: u32, imm: u8) {
+        self.push(0x66);
+        self.emit_rex_if_needed(false, dst, 0, src);
+        self.push(0x0F);
+        self.push(0x3A);
+        self.push(0x0B);
+        self.push(Self::modrm(3, dst, src));
+        self.push(imm);
+    }
+
     /// movsd xmm, xmm (reg-reg)
     fn emit_movsd_rr(&mut self, dst: u32, src: u32) {
         if dst == src {
@@ -735,6 +746,56 @@ impl X64Emitter {
                 self.emit_movq_gp_to_xmm(SCRATCH_XMM, SCRATCH_GP);
                 self.emit_movsd_rr(d, s);
                 self.emit_sse_rr(0x66, 0x57, d, SCRATCH_XMM); // xorpd
+            }
+
+            FAbs { dst, src } => {
+                // Clear sign bit: AND with 0x7FFFFFFFFFFFFFFF
+                let d = fp(*dst);
+                let s = fp(*src);
+                self.emit_mov_imm64(SCRATCH_GP, 0x7FFF_FFFF_FFFF_FFFF);
+                self.emit_movq_gp_to_xmm(SCRATCH_XMM, SCRATCH_GP);
+                self.emit_movsd_rr(d, s);
+                self.emit_sse_rr(0x66, 0x54, d, SCRATCH_XMM); // andpd
+            }
+
+            FSqrt { dst, src } => {
+                // sqrtsd dst, src: F2 0F 51 /r
+                let d = fp(*dst);
+                self.emit_sse_rr(0xF2, 0x51, d, fp(*src));
+            }
+
+            FFloor { dst, src } => {
+                // roundsd dst, src, 0x09 (floor + suppress precision)
+                self.emit_roundsd(fp(*dst), fp(*src), 0x09);
+            }
+
+            FCeil { dst, src } => {
+                // roundsd dst, src, 0x0A (ceil + suppress precision)
+                self.emit_roundsd(fp(*dst), fp(*src), 0x0A);
+            }
+
+            FRound { dst, src } => {
+                // roundsd dst, src, 0x08 (nearest even + suppress precision)
+                self.emit_roundsd(fp(*dst), fp(*src), 0x08);
+            }
+
+            FTrunc { dst, src } => {
+                // roundsd dst, src, 0x0B (truncate + suppress precision)
+                self.emit_roundsd(fp(*dst), fp(*src), 0x0B);
+            }
+
+            FMin { dst, lhs, rhs } => {
+                // minsd dst, rhs: F2 0F 5D /r
+                let d = fp(*dst);
+                self.emit_movsd_rr(d, fp(*lhs));
+                self.emit_sse_rr(0xF2, 0x5D, d, fp(*rhs));
+            }
+
+            FMax { dst, lhs, rhs } => {
+                // maxsd dst, rhs: F2 0F 5F /r
+                let d = fp(*dst);
+                self.emit_movsd_rr(d, fp(*lhs));
+                self.emit_sse_rr(0xF2, 0x5F, d, fp(*rhs));
             }
 
             // ── FMA3 ──

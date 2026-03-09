@@ -13,6 +13,7 @@
 pub mod aarch64;
 pub mod cfg;
 pub mod regalloc;
+pub mod runtime_fns;
 pub mod wasm;
 pub mod x86_64;
 
@@ -350,6 +351,38 @@ pub enum MachInst {
     /// `dst = -src` (f64 negate)
     FNeg { dst: VReg, src: VReg },
 
+    /// `dst = |src|` (f64 absolute value)
+    /// ARM64: `fabs`; x86_64: AND with sign-bit mask
+    FAbs { dst: VReg, src: VReg },
+
+    /// `dst = sqrt(src)` (f64 square root)
+    /// ARM64: `fsqrt`; x86_64: `sqrtsd`
+    FSqrt { dst: VReg, src: VReg },
+
+    /// `dst = floor(src)` (round toward −∞)
+    /// ARM64: `frintm`; x86_64: `roundsd` imm=0x09 (SSE4.1)
+    FFloor { dst: VReg, src: VReg },
+
+    /// `dst = ceil(src)` (round toward +∞)
+    /// ARM64: `frintp`; x86_64: `roundsd` imm=0x0A (SSE4.1)
+    FCeil { dst: VReg, src: VReg },
+
+    /// `dst = round(src)` (round to nearest, ties to even)
+    /// ARM64: `frintn`; x86_64: `roundsd` imm=0x08 (SSE4.1)
+    FRound { dst: VReg, src: VReg },
+
+    /// `dst = trunc(src)` (round toward zero)
+    /// ARM64: `frintz`; x86_64: `roundsd` imm=0x0B (SSE4.1)
+    FTrunc { dst: VReg, src: VReg },
+
+    /// `dst = min(lhs, rhs)` (f64 minimum)
+    /// ARM64: `fmin`; x86_64: `minsd`
+    FMin { dst: VReg, lhs: VReg, rhs: VReg },
+
+    /// `dst = max(lhs, rhs)` (f64 maximum)
+    /// ARM64: `fmax`; x86_64: `maxsd`
+    FMax { dst: VReg, lhs: VReg, rhs: VReg },
+
     // =====================================================================
     // Fused Multiply-Add (scalar)
     // =====================================================================
@@ -666,6 +699,12 @@ impl MachInst {
             | INeg { src, .. }
             | Not { src, .. }
             | FNeg { src, .. }
+            | FAbs { src, .. }
+            | FSqrt { src, .. }
+            | FFloor { src, .. }
+            | FCeil { src, .. }
+            | FRound { src, .. }
+            | FTrunc { src, .. }
             | FCvtToI64 { src, .. }
             | I64CvtToF { src, .. }
             | JmpZero { src, .. }
@@ -696,6 +735,8 @@ impl MachInst {
             | FSub { lhs, rhs, .. }
             | FMul { lhs, rhs, .. }
             | FDiv { lhs, rhs, .. }
+            | FMin { lhs, rhs, .. }
+            | FMax { lhs, rhs, .. }
             | ICmp { lhs, rhs }
             | FCmp { lhs, rhs }
             | VFAdd { lhs, rhs, .. }
@@ -769,6 +810,14 @@ impl MachInst {
             | FMul { dst, .. }
             | FDiv { dst, .. }
             | FNeg { dst, .. }
+            | FAbs { dst, .. }
+            | FSqrt { dst, .. }
+            | FFloor { dst, .. }
+            | FCeil { dst, .. }
+            | FRound { dst, .. }
+            | FTrunc { dst, .. }
+            | FMin { dst, .. }
+            | FMax { dst, .. }
             | FMAdd { dst, .. }
             | FMSub { dst, .. }
             | FNMAdd { dst, .. }
@@ -1242,8 +1291,14 @@ use std::collections::HashMap;
 
 /// Lower a MIR function to platform-agnostic machine instructions.
 pub fn lower_mir(mir: &MirFunction) -> MachFunc {
+    let interner = crate::intern::Interner::new();
+    lower_mir_with_interner(mir, &interner)
+}
+
+/// Lower a MIR function with access to an interner for symbol resolution.
+pub fn lower_mir_with_interner(mir: &MirFunction, interner: &crate::intern::Interner) -> MachFunc {
     let mut mf = MachFunc::new(format!("fn_{}", mir.name.index()));
-    let mut ctx = LowerCtx::new(&mut mf, mir);
+    let mut ctx = LowerCtx::new(&mut mf, mir, interner);
     ctx.lower();
     mf
 }
@@ -1325,6 +1380,16 @@ impl ExecutableFunction {
 /// Native pipeline: MIR → lower → regalloc → sentinel fixup → emit.
 /// WASM pipeline: MIR → emit_mir (bypasses MachInst entirely).
 pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFunction, String> {
+    let interner = crate::intern::Interner::new();
+    compile_function_with_interner(mir, target, &interner)
+}
+
+/// Compile with access to the VM's interner for symbol resolution.
+pub fn compile_function_with_interner(
+    mir: &MirFunction,
+    target: Target,
+    interner: &crate::intern::Interner,
+) -> Result<CompiledFunction, String> {
     match target {
         Target::Wasm => {
             // WASM: lower directly from MIR, no MachInst layer needed.
@@ -1333,7 +1398,9 @@ pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFun
         }
         _ => {
             // 1. Lower MIR → MachFunc (virtual registers)
-            let mut mach = lower_mir(mir);
+            let mut mach = lower_mir_with_interner(mir, interner);
+            // 1b. Link runtime calls: CallRuntime → LoadImm + CallInd
+            runtime_fns::link_runtime_calls(&mut mach);
             // Native: register allocation + emit.
             let target_regs = match target {
                 Target::X86_64 => regalloc::x86_64_target_regs(),
@@ -1394,6 +1461,9 @@ fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_sc
         | MachInst::BitcastGpToFp { dst, src } | MachInst::BitcastFpToGp { dst, src }
         | MachInst::INeg { dst, src } | MachInst::Not { dst, src }
         | MachInst::FNeg { dst, src }
+        | MachInst::FAbs { dst, src } | MachInst::FSqrt { dst, src }
+        | MachInst::FFloor { dst, src } | MachInst::FCeil { dst, src }
+        | MachInst::FRound { dst, src } | MachInst::FTrunc { dst, src }
         | MachInst::FCvtToI64 { dst, src } | MachInst::I64CvtToF { dst, src } => {
             fix(dst); fix(src);
         }
@@ -1408,7 +1478,8 @@ fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_sc
         | MachInst::Shl { dst, lhs, rhs } | MachInst::Sar { dst, lhs, rhs }
         | MachInst::Shr { dst, lhs, rhs }
         | MachInst::FAdd { dst, lhs, rhs } | MachInst::FSub { dst, lhs, rhs }
-        | MachInst::FMul { dst, lhs, rhs } | MachInst::FDiv { dst, lhs, rhs } => {
+        | MachInst::FMul { dst, lhs, rhs } | MachInst::FDiv { dst, lhs, rhs }
+        | MachInst::FMin { dst, lhs, rhs } | MachInst::FMax { dst, lhs, rhs } => {
             fix(dst); fix(lhs); fix(rhs);
         }
         MachInst::IMulSub { dst, lhs, rhs, acc } => {
@@ -1468,10 +1539,12 @@ struct LowerCtx<'a> {
     val_map: HashMap<ValueId, VReg>,
     /// MIR BlockId → Label mapping.
     block_labels: HashMap<BlockId, Label>,
+    /// Interner for resolving symbol names (e.g. IsType class names).
+    interner: &'a crate::intern::Interner,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(mf: &'a mut MachFunc, mir: &'a MirFunction) -> Self {
+    fn new(mf: &'a mut MachFunc, mir: &'a MirFunction, interner: &'a crate::intern::Interner) -> Self {
         // Pre-allocate labels for each block.
         let mut block_labels = HashMap::new();
         for block in &mir.blocks {
@@ -1483,6 +1556,7 @@ impl<'a> LowerCtx<'a> {
             mir,
             val_map: HashMap::new(),
             block_labels,
+            interner,
         }
     }
 
@@ -1721,35 +1795,64 @@ impl<'a> LowerCtx<'a> {
                 self.mf.emit(MachInst::BitcastFpToGp { dst, src: result_f });
             }
 
-            // -- Object operations → runtime calls --
+            // -- Object operations: inline GEP field access --
             Instruction::GetField(recv, idx) => {
-                let r = self.vreg_for(*recv);
+                use crate::runtime::object_layout::*;
+                let recv_reg = self.vreg_for(*recv);
                 let dst = self.vreg_for(dst_val);
-                let idx_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm {
-                    dst: idx_reg,
-                    bits: *idx as u64,
+
+                // 1. Extract object pointer: AND with PTR_MASK (48-bit)
+                let obj_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: obj_ptr,
+                    src: recv_reg,
+                    imm: 0x0000_FFFF_FFFF_FFFF, // PTR_MASK
                 });
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_get_field",
-                    args: vec![r, idx_reg],
-                    ret: Some(dst),
+
+                // 2. Load fields pointer: obj_ptr + INSTANCE_FIELDS
+                let fields_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr {
+                    dst: fields_ptr,
+                    mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
+                });
+
+                // 3. Load field value: fields_ptr + idx * VALUE_SIZE
+                let field_offset = (*idx as i32) * VALUE_SIZE;
+                self.mf.emit(MachInst::Ldr {
+                    dst,
+                    mem: Mem::new(fields_ptr, field_offset),
                 });
             }
             Instruction::SetField(recv, idx, val) => {
-                let r = self.vreg_for(*recv);
+                use crate::runtime::object_layout::*;
+                let recv_reg = self.vreg_for(*recv);
                 let v = self.vreg_for(*val);
                 let dst = self.vreg_for(dst_val);
-                let idx_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm {
-                    dst: idx_reg,
-                    bits: *idx as u64,
+
+                // 1. Extract object pointer
+                let obj_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: obj_ptr,
+                    src: recv_reg,
+                    imm: 0x0000_FFFF_FFFF_FFFF,
                 });
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_set_field",
-                    args: vec![r, idx_reg, v],
-                    ret: Some(dst),
+
+                // 2. Load fields pointer
+                let fields_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr {
+                    dst: fields_ptr,
+                    mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
                 });
+
+                // 3. Store field value
+                let field_offset = (*idx as i32) * VALUE_SIZE;
+                self.mf.emit(MachInst::Str {
+                    src: v,
+                    mem: Mem::new(fields_ptr, field_offset),
+                });
+
+                // SetField result is the stored value
+                self.mf.emit(MachInst::Mov { dst, src: v });
             }
             Instruction::GetModuleVar(idx) => {
                 let dst = self.vreg_for(dst_val);
@@ -1921,19 +2024,91 @@ impl<'a> LowerCtx<'a> {
                     ret: Some(dst),
                 });
             }
+            // -- IsType: inline tag checks for primitives, class ptr for objects --
             Instruction::IsType(a, sym) => {
+                use crate::runtime::object_layout::*;
                 let la = self.vreg_for(*a);
                 let dst = self.vreg_for(dst_val);
-                let sym_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm {
-                    dst: sym_reg,
-                    bits: sym.index() as u64,
-                });
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_is_type",
-                    args: vec![la, sym_reg],
-                    ret: Some(dst),
-                });
+
+                // NaN-box constants
+                const QNAN: u64 = 0x7FFC_0000_0000_0000;
+                const TAG_OBJ: u64 = (1u64 << 63) | QNAN;
+                const TAG_NULL: u64 = QNAN;
+                const TAG_FALSE: u64 = QNAN | 1;
+                const TAG_TRUE: u64 = QNAN | 2;
+
+                // Resolve the type name from the interner
+                let type_name = self.interner.resolve(*sym);
+                match type_name {
+                    "Num" => {
+                        // is Num: (val & QNAN) != QNAN
+                        // Equivalently: the QNAN bits aren't all set → it's a number
+                        let masked = self.mf.new_gp();
+                        self.mf.emit(MachInst::AndImm { dst: masked, src: la, imm: QNAN });
+                        let qnan_reg = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: qnan_reg, bits: QNAN });
+                        self.mf.emit(MachInst::ICmp { lhs: masked, rhs: qnan_reg });
+                        self.mf.emit(MachInst::CSet { dst, cond: Cond::Ne });
+                    }
+                    "Bool" => {
+                        // is Bool: val == TAG_TRUE || val == TAG_FALSE
+                        let is_true = self.mf.new_gp();
+                        let is_false = self.mf.new_gp();
+                        let t_reg = self.mf.new_gp();
+                        let f_reg = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: t_reg, bits: TAG_TRUE });
+                        self.mf.emit(MachInst::ICmp { lhs: la, rhs: t_reg });
+                        self.mf.emit(MachInst::CSet { dst: is_true, cond: Cond::Eq });
+                        self.mf.emit(MachInst::LoadImm { dst: f_reg, bits: TAG_FALSE });
+                        self.mf.emit(MachInst::ICmp { lhs: la, rhs: f_reg });
+                        self.mf.emit(MachInst::CSet { dst: is_false, cond: Cond::Eq });
+                        self.mf.emit(MachInst::Or { dst, lhs: is_true, rhs: is_false });
+                    }
+                    "Null" => {
+                        // is Null: val == TAG_NULL
+                        let null_reg = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: null_reg, bits: TAG_NULL });
+                        self.mf.emit(MachInst::ICmp { lhs: la, rhs: null_reg });
+                        self.mf.emit(MachInst::CSet { dst, cond: Cond::Eq });
+                    }
+                    _ => {
+                        // Object type: extract obj ptr → load class ptr → compare
+                        // First check if it's even an object
+                        let is_obj_label = self.mf.new_label();
+                        let done_label = self.mf.new_label();
+
+                        let tag_masked = self.mf.new_gp();
+                        let tag_obj_reg = self.mf.new_gp();
+                        self.mf.emit(MachInst::AndImm { dst: tag_masked, src: la, imm: TAG_OBJ });
+                        self.mf.emit(MachInst::LoadImm { dst: tag_obj_reg, bits: TAG_OBJ });
+                        self.mf.emit(MachInst::ICmp { lhs: tag_masked, rhs: tag_obj_reg });
+                        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: is_obj_label });
+                        // Not an object → false
+                        self.mf.emit(MachInst::LoadImm { dst, bits: 0 });
+                        self.mf.emit(MachInst::Jmp { target: done_label });
+
+                        // Is an object → load class name sym and compare
+                        self.mf.emit(MachInst::DefLabel(is_obj_label));
+                        let obj_ptr = self.mf.new_gp();
+                        self.mf.emit(MachInst::AndImm {
+                            dst: obj_ptr, src: la, imm: 0x0000_FFFF_FFFF_FFFF,
+                        });
+                        // Load class pointer from header
+                        let class_ptr = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: class_ptr, mem: Mem::new(obj_ptr, HEADER_CLASS) });
+                        // Load class name sym from ObjClass (name field is after header)
+                        // For now, fall back to runtime for class hierarchy comparison
+                        let sym_reg = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: sym_reg, bits: sym.index() as u64 });
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: "wren_is_type",
+                            args: vec![la, sym_reg],
+                            ret: Some(dst),
+                        });
+
+                        self.mf.emit(MachInst::DefLabel(done_label));
+                    }
+                }
             }
             Instruction::GuardClass(a, sym) => {
                 let la = self.vreg_for(*a);
@@ -1949,6 +2124,103 @@ impl<'a> LowerCtx<'a> {
                     ret: Some(dst),
                 });
             }
+            Instruction::GuardProtocol(a, proto_id) => {
+                // Protocol guard: checks the class's protocol bitset at runtime.
+                // For now, emit as a runtime call; the devirt pass eliminates
+                // most of these before codegen.
+                let la = self.vreg_for(*a);
+                let dst = self.vreg_for(dst_val);
+                let pid_reg = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm {
+                    dst: pid_reg,
+                    bits: proto_id.0 as u64,
+                });
+                self.mf.emit(MachInst::CallRuntime {
+                    name: "wren_guard_protocol",
+                    args: vec![la, pid_reg],
+                    ret: Some(dst),
+                });
+            }
+            // -- Subscript: inline GEP for single-index list access --
+            Instruction::SubscriptGet { receiver, args } if args.len() == 1 => {
+                use crate::runtime::object_layout::*;
+                let recv_reg = self.vreg_for(*receiver);
+                let idx_reg = self.vreg_for(args[0]);
+                let dst = self.vreg_for(dst_val);
+
+                // 1. Extract list pointer from NaN-boxed receiver
+                let list_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: list_ptr, src: recv_reg, imm: 0x0000_FFFF_FFFF_FFFF,
+                });
+
+                // 2. Convert NaN-boxed index to i64
+                let idx_fp = self.mf.new_fp();
+                let idx_int = self.mf.new_gp();
+                self.mf.emit(MachInst::BitcastGpToFp { dst: idx_fp, src: idx_reg });
+                self.mf.emit(MachInst::FCvtToI64 { dst: idx_int, src: idx_fp });
+
+                // 3. Bounds check: load count, compare, trap if out of bounds
+                let count_reg = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr { dst: count_reg, mem: Mem::new(list_ptr, LIST_COUNT) });
+                self.mf.emit(MachInst::ICmp { lhs: idx_int, rhs: count_reg });
+                let ok_label = self.mf.new_label();
+                self.mf.emit(MachInst::JmpIf { cond: Cond::Below, target: ok_label });
+                self.mf.emit(MachInst::Trap);
+                self.mf.emit(MachInst::DefLabel(ok_label));
+
+                // 4. Load element: elements_ptr + idx * 8
+                let elements_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr { dst: elements_ptr, mem: Mem::new(list_ptr, LIST_ELEMENTS) });
+                let shift_amt = self.mf.new_gp();
+                let byte_offset = self.mf.new_gp();
+                let elem_addr = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm { dst: shift_amt, bits: 3 });
+                self.mf.emit(MachInst::Shl { dst: byte_offset, lhs: idx_int, rhs: shift_amt });
+                self.mf.emit(MachInst::IAdd { dst: elem_addr, lhs: elements_ptr, rhs: byte_offset });
+                self.mf.emit(MachInst::Ldr { dst, mem: Mem::new(elem_addr, 0) });
+            }
+            Instruction::SubscriptSet { receiver, args, value } if args.len() == 1 => {
+                use crate::runtime::object_layout::*;
+                let recv_reg = self.vreg_for(*receiver);
+                let idx_reg = self.vreg_for(args[0]);
+                let val_reg = self.vreg_for(*value);
+                let dst = self.vreg_for(dst_val);
+
+                // 1. Extract list pointer
+                let list_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: list_ptr, src: recv_reg, imm: 0x0000_FFFF_FFFF_FFFF,
+                });
+
+                // 2. Convert NaN-boxed index to i64
+                let idx_fp = self.mf.new_fp();
+                let idx_int = self.mf.new_gp();
+                self.mf.emit(MachInst::BitcastGpToFp { dst: idx_fp, src: idx_reg });
+                self.mf.emit(MachInst::FCvtToI64 { dst: idx_int, src: idx_fp });
+
+                // 3. Bounds check
+                let count_reg = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr { dst: count_reg, mem: Mem::new(list_ptr, LIST_COUNT) });
+                self.mf.emit(MachInst::ICmp { lhs: idx_int, rhs: count_reg });
+                let ok_label = self.mf.new_label();
+                self.mf.emit(MachInst::JmpIf { cond: Cond::Below, target: ok_label });
+                self.mf.emit(MachInst::Trap);
+                self.mf.emit(MachInst::DefLabel(ok_label));
+
+                // 4. Store element: elements_ptr + idx * 8
+                let elements_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr { dst: elements_ptr, mem: Mem::new(list_ptr, LIST_ELEMENTS) });
+                let shift_amt = self.mf.new_gp();
+                let byte_offset = self.mf.new_gp();
+                let elem_addr = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm { dst: shift_amt, bits: 3 });
+                self.mf.emit(MachInst::Shl { dst: byte_offset, lhs: idx_int, rhs: shift_amt });
+                self.mf.emit(MachInst::IAdd { dst: elem_addr, lhs: elements_ptr, rhs: byte_offset });
+                self.mf.emit(MachInst::Str { src: val_reg, mem: Mem::new(elem_addr, 0) });
+                self.mf.emit(MachInst::Mov { dst, src: val_reg });
+            }
+            // Multi-index subscript: fall back to runtime call
             Instruction::SubscriptGet { receiver, args } => {
                 let r = self.vreg_for(*receiver);
                 let dst = self.vreg_for(dst_val);
@@ -1980,6 +2252,71 @@ impl<'a> LowerCtx<'a> {
                     args: call_args,
                     ret: Some(dst),
                 });
+            }
+
+            // -- Math intrinsics (unboxed f64) --
+            Instruction::MathUnaryF64(op, a) => {
+                use crate::mir::MathUnaryOp;
+                let la = self.fp_vreg_for(*a);
+                let dst = self.fp_vreg_for(dst_val);
+                match op {
+                    // Hardware-native single-instruction ops
+                    MathUnaryOp::Abs => self.mf.emit(MachInst::FAbs { dst, src: la }),
+                    MathUnaryOp::Sqrt => self.mf.emit(MachInst::FSqrt { dst, src: la }),
+                    MathUnaryOp::Floor => self.mf.emit(MachInst::FFloor { dst, src: la }),
+                    MathUnaryOp::Ceil => self.mf.emit(MachInst::FCeil { dst, src: la }),
+                    MathUnaryOp::Round => self.mf.emit(MachInst::FRound { dst, src: la }),
+                    MathUnaryOp::Trunc => self.mf.emit(MachInst::FTrunc { dst, src: la }),
+                    // Transcendentals — fall back to libm via CallRuntime
+                    _ => {
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: match op {
+                                MathUnaryOp::Acos => "acos",
+                                MathUnaryOp::Asin => "asin",
+                                MathUnaryOp::Atan => "atan",
+                                MathUnaryOp::Cbrt => "cbrt",
+                                MathUnaryOp::Cos => "cos",
+                                MathUnaryOp::Sin => "sin",
+                                MathUnaryOp::Tan => "tan",
+                                MathUnaryOp::Log => "log",
+                                MathUnaryOp::Log2 => "log2",
+                                MathUnaryOp::Exp => "exp",
+                                MathUnaryOp::Fract => "wren_fract",
+                                MathUnaryOp::Sign => "wren_sign",
+                                // Already handled above
+                                MathUnaryOp::Abs | MathUnaryOp::Sqrt | MathUnaryOp::Floor
+                                | MathUnaryOp::Ceil | MathUnaryOp::Round | MathUnaryOp::Trunc => {
+                                    unreachable!()
+                                }
+                            },
+                            args: vec![la],
+                            ret: Some(dst),
+                        });
+                    }
+                }
+            }
+            Instruction::MathBinaryF64(op, a, b) => {
+                use crate::mir::MathBinaryOp;
+                let la = self.fp_vreg_for(*a);
+                let lb = self.fp_vreg_for(*b);
+                let dst = self.fp_vreg_for(dst_val);
+                match op {
+                    // Hardware-native single-instruction ops
+                    MathBinaryOp::Min => self.mf.emit(MachInst::FMin { dst, lhs: la, rhs: lb }),
+                    MathBinaryOp::Max => self.mf.emit(MachInst::FMax { dst, lhs: la, rhs: lb }),
+                    // Transcendentals — fall back to libm via CallRuntime
+                    _ => {
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: match op {
+                                MathBinaryOp::Atan2 => "atan2",
+                                MathBinaryOp::Pow => "pow",
+                                MathBinaryOp::Min | MathBinaryOp::Max => unreachable!(),
+                            },
+                            args: vec![la, lb],
+                            ret: Some(dst),
+                        });
+                    }
+                }
             }
 
             // Block parameters are handled at block entry.
@@ -2255,6 +2592,14 @@ fn format_inst(inst: &MachInst) -> String {
         FMul { dst, lhs, rhs } => format!("{} = fmul {}, {}", dst, lhs, rhs),
         FDiv { dst, lhs, rhs } => format!("{} = fdiv {}, {}", dst, lhs, rhs),
         FNeg { dst, src } => format!("{} = fneg {}", dst, src),
+        FAbs { dst, src } => format!("{} = fabs {}", dst, src),
+        FSqrt { dst, src } => format!("{} = fsqrt {}", dst, src),
+        FFloor { dst, src } => format!("{} = ffloor {}", dst, src),
+        FCeil { dst, src } => format!("{} = fceil {}", dst, src),
+        FRound { dst, src } => format!("{} = fround {}", dst, src),
+        FTrunc { dst, src } => format!("{} = ftrunc {}", dst, src),
+        FMin { dst, lhs, rhs } => format!("{} = fmin {}, {}", dst, lhs, rhs),
+        FMax { dst, lhs, rhs } => format!("{} = fmax {}, {}", dst, lhs, rhs),
 
         FMAdd { dst, a, b, c } => format!("{} = fmadd {}, {}, {}", dst, a, b, c),
         FMSub { dst, a, b, c } => format!("{} = fmsub {}, {}, {}", dst, a, b, c),
@@ -3422,5 +3767,81 @@ mod tests {
         } else {
             panic!("expected FLdr");
         }
+    }
+
+    // -- Inline GEP tests --
+
+    #[test]
+    fn test_subscript_get_inline_gep() {
+        let mut interner = crate::intern::Interner::new();
+        let name = interner.intern("test_subscript_get");
+        let mut f = MirFunction::new(name, 0);
+        let bb = f.new_block();
+        let v_list = f.new_value();
+        let v_idx = f.new_value();
+        let v_result = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v_list, Instruction::BlockParam(0)));
+            b.instructions.push((v_idx, Instruction::BlockParam(1)));
+            b.instructions.push((v_result, Instruction::SubscriptGet {
+                receiver: v_list,
+                args: vec![v_idx],
+            }));
+            b.terminator = Terminator::Return(v_result);
+        }
+        let mf = lower_mir(&f);
+        let output = mf.display();
+        println!("Generated code:\n{}", output);
+        // Should use inline GEP (and_imm, ldr, shl, iadd) not CallRuntime
+        assert!(!output.contains("call_runtime"), "SubscriptGet should use inline GEP, got:\n{}", output);
+        assert!(output.contains("and_imm"), "should have ptr extraction: {}", output);
+        assert!(output.contains("fcvt_to_i64"), "should convert index to int: {}", output);
+        assert!(output.contains("shl"), "should scale index by 8: {}", output);
+        assert!(output.contains("trap"), "should have bounds check trap: {}", output);
+    }
+
+    #[test]
+    fn test_is_type_num_inline() {
+        let mut interner = crate::intern::Interner::new();
+        let name = interner.intern("test_is_num");
+        let num_sym = interner.intern("Num");
+        let mut f = MirFunction::new(name, 0);
+        let bb = f.new_block();
+        let v_val = f.new_value();
+        let v_result = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v_val, Instruction::BlockParam(0)));
+            b.instructions.push((v_result, Instruction::IsType(v_val, num_sym)));
+            b.terminator = Terminator::Return(v_result);
+        }
+        let mf = lower_mir_with_interner(&f, &interner);
+        let output = mf.display();
+        // Should use inline tag check (and_imm + icmp + cset) not CallRuntime
+        assert!(!output.contains("call_runtime"), "IsType(Num) should be inline, got:\n{}", output);
+        assert!(output.contains("and_imm"), "should mask QNAN bits: {}", output);
+        assert!(output.contains("cset"), "should materialize condition: {}", output);
+    }
+
+    #[test]
+    fn test_is_type_null_inline() {
+        let mut interner = crate::intern::Interner::new();
+        let name = interner.intern("test_is_null");
+        let null_sym = interner.intern("Null");
+        let mut f = MirFunction::new(name, 0);
+        let bb = f.new_block();
+        let v_val = f.new_value();
+        let v_result = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v_val, Instruction::BlockParam(0)));
+            b.instructions.push((v_result, Instruction::IsType(v_val, null_sym)));
+            b.terminator = Terminator::Return(v_result);
+        }
+        let mf = lower_mir_with_interner(&f, &interner);
+        let output = mf.display();
+        assert!(!output.contains("call_runtime"), "IsType(Null) should be inline, got:\n{}", output);
+        assert!(output.contains("cset"), "should materialize eq condition: {}", output);
     }
 }

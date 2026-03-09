@@ -828,8 +828,45 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
 
+            // Math intrinsics — call runtime helpers (WASM has sqrt/floor/ceil
+            // natively; others go through imported math functions).
+            Instruction::MathUnaryF64(op, a) => {
+                use crate::mir::MathUnaryOp;
+                func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                match op {
+                    MathUnaryOp::Abs => { func.instruction(&WasmInst::F64Abs); }
+                    MathUnaryOp::Ceil => { func.instruction(&WasmInst::F64Ceil); }
+                    MathUnaryOp::Floor => { func.instruction(&WasmInst::F64Floor); }
+                    MathUnaryOp::Sqrt => { func.instruction(&WasmInst::F64Sqrt); }
+                    MathUnaryOp::Trunc => { func.instruction(&WasmInst::F64Trunc); }
+                    _ => {
+                        // Other math ops would need imported host functions.
+                        // For now, treat as runtime call placeholder.
+                        func.instruction(&WasmInst::Call(
+                            self.runtime_imports["wren_math_unary"],
+                        ));
+                    }
+                }
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
+            Instruction::MathBinaryF64(_op, a, b) => {
+                func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                func.instruction(&WasmInst::LocalGet(self.local(*b)));
+                // All binary math ops need runtime helpers in WASM.
+                func.instruction(&WasmInst::Call(
+                    self.runtime_imports["wren_math_binary"],
+                ));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
+
             // Block params handled at block entry from branch args.
             Instruction::BlockParam(_) => {}
+
+            // Protocol guard: emit as runtime call (devirt pass typically eliminates these).
+            Instruction::GuardProtocol(a, _) => {
+                func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
         }
         Ok(())
     }

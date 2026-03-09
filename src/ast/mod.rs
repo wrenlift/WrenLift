@@ -292,12 +292,16 @@ pub enum Expr {
         method: Spanned<SymbolId>,
         args: Vec<Spanned<Expr>>,
         block_arg: Option<Box<Spanned<Expr>>>,
+        /// Whether call was made with explicit parens: `foo.bar()` vs `foo.bar`
+        has_parens: bool,
     },
 
     /// `super.method(args)` or `super(args)`
     SuperCall {
         method: Option<Spanned<SymbolId>>,
         args: Vec<Spanned<Expr>>,
+        /// Whether call was made with explicit parens: `super.bar()` vs `super.bar`
+        has_parens: bool,
     },
 
     /// Subscript getter: `receiver[args]`
@@ -592,6 +596,7 @@ mod tests {
                 },
                 span(12, 25),
             ))),
+            has_parens: false,
         };
         match &call {
             Expr::Call { block_arg, .. } => assert!(block_arg.is_some()),

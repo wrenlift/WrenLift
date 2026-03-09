@@ -10,6 +10,8 @@ use wren_lift::mir::opt::{
     MirPass,
 };
 use wren_lift::parse::{lexer, parser};
+use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
+use wren_lift::runtime::vm::{VM, VMConfig};
 use wren_lift::sema;
 
 // ---------------------------------------------------------------------------
@@ -26,6 +28,10 @@ struct Cli {
     /// Compilation target.
     #[arg(long, value_enum, default_value_t = Target::Native)]
     target: Target,
+
+    /// Execution mode.
+    #[arg(long, value_enum, default_value_t = Mode::Tiered)]
+    mode: Mode,
 
     /// Output file path (for WASM target).
     #[arg(short, long)]
@@ -66,11 +72,45 @@ enum Target {
     Wasm,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Mode {
+    /// Walk MIR directly. Never JIT-compile.
+    Interpreter,
+    /// Start interpreted, JIT-compile hot functions.
+    Tiered,
+    /// Compile everything to native before execution.
+    Jit,
+}
+
+impl From<Mode> for ExecutionMode {
+    fn from(m: Mode) -> Self {
+        match m {
+            Mode::Interpreter => ExecutionMode::Interpreter,
+            Mode::Tiered => ExecutionMode::Tiered,
+            Mode::Jit => ExecutionMode::Jit,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VM setup
+// ---------------------------------------------------------------------------
+
+fn make_vm(cli: &Cli) -> VM {
+    let config = VMConfig {
+        execution_mode: cli.mode.into(),
+        ..VMConfig::default()
+    };
+    VM::new(config)
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 
 fn run_file(source: &str, filename: &str, cli: &Cli) {
+    // --- Debug dump paths (don't need VM) ---
+
     // 1. Lex
     if cli.dump_tokens {
         let (lexemes, errors) = lexer::lex(source);
@@ -121,7 +161,38 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         return;
     }
 
-    // 3. Semantic analysis
+    // For dump_mir/dump_opt/dump_asm/wasm, use the manual pipeline
+    if cli.dump_mir || cli.dump_opt || cli.dump_asm || cli.target == Target::Wasm {
+        run_manual_pipeline(source, filename, cli, parse_result);
+        return;
+    }
+
+    // --- Execution path: route through VM ---
+
+    let mut vm = make_vm(cli);
+    let module_name = filename
+        .strip_suffix(".wren")
+        .unwrap_or(filename);
+
+    match vm.interpret(module_name, source) {
+        InterpretResult::Success => {}
+        InterpretResult::CompileError => {
+            process::exit(65);
+        }
+        InterpretResult::RuntimeError => {
+            process::exit(70);
+        }
+    }
+}
+
+/// Manual pipeline for debug dumps and WASM codegen.
+fn run_manual_pipeline(
+    source: &str,
+    filename: &str,
+    cli: &Cli,
+    parse_result: wren_lift::parse::parser::ParseResult,
+) {
+    // Semantic analysis
     let mut interner = parse_result.interner;
     let resolve_result = sema::resolve::resolve(&parse_result.module, &interner);
 
@@ -149,17 +220,18 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         }
     }
 
-    // 4. Lower to MIR
-    let mut mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner);
+    // Lower to MIR
+    let mut module_mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+    let mir = &mut module_mir.top_level;
 
     if cli.dump_mir {
         println!("{}", mir.pretty_print(&interner));
         return;
     }
 
-    // 5. Optimize
+    // Optimize
     if !cli.no_opt {
-        run_opt_pipeline(&mut mir);
+        run_opt_pipeline(mir, &interner);
     }
 
     if cli.dump_opt {
@@ -167,10 +239,10 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         return;
     }
 
-    // 6. Code generation
+    // Code generation
     match cli.target {
         Target::Wasm => {
-            let wasm_module = match wren_lift::codegen::wasm::emit_mir(&mir) {
+            let wasm_module = match wren_lift::codegen::wasm::emit_mir(mir) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("error: WASM codegen failed: {}", e);
@@ -194,22 +266,15 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
                 println!("{}", mach_func.display());
                 return;
             }
-
-            eprintln!(
-                "Compilation successful ({} machine instructions)",
-                mach_func.insts.len()
-            );
-            eprintln!("Native execution not yet available — use --dump-asm to inspect output");
-            eprintln!("or --target=wasm to emit a WebAssembly module.");
         }
     }
 }
 
-fn run_opt_pipeline(mir: &mut wren_lift::mir::MirFunction) {
+fn run_opt_pipeline(mir: &mut wren_lift::mir::MirFunction, interner: &wren_lift::intern::Interner) {
     let constfold = ConstFold;
     let dce = Dce;
     let cse = Cse;
-    let type_spec = TypeSpecialize;
+    let type_spec = TypeSpecialize::with_math(interner);
     let licm = Licm;
     let sra = Sra;
 
@@ -224,10 +289,17 @@ fn run_opt_pipeline(mir: &mut wren_lift::mir::MirFunction) {
 // ---------------------------------------------------------------------------
 
 fn run_repl() {
+    let cli_args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse_from(&cli_args);
+
     println!("WrenLift REPL (type Ctrl-D to exit)");
+    println!("Mode: {:?}", ExecutionMode::from(cli.mode));
     println!();
 
+    let mut vm = make_vm(&cli);
+
     let stdin = io::stdin();
+    let mut line_num: u32 = 0;
     loop {
         print!("> ");
         if io::stdout().flush().is_err() {
@@ -252,39 +324,18 @@ fn run_repl() {
             continue;
         }
 
-        // Parse
-        let parse_result = parser::parse(line);
-        let has_errors = parse_result
-            .errors
-            .iter()
-            .any(|d| d.severity == Severity::Error);
-        if has_errors {
-            for err in &parse_result.errors {
-                err.eprint(line);
+        line_num += 1;
+        let module_name = format!("repl_{}", line_num);
+
+        match vm.interpret(&module_name, line) {
+            InterpretResult::Success => {}
+            InterpretResult::CompileError => {
+                // Error already printed by vm.interpret
             }
-            continue;
-        }
-
-        // Sema
-        let mut interner = parse_result.interner;
-        let resolve_result = sema::resolve::resolve(&parse_result.module, &interner);
-        if resolve_result
-            .errors
-            .iter()
-            .any(|d| d.severity == Severity::Error)
-        {
-            for err in &resolve_result.errors {
-                err.eprint(line);
+            InterpretResult::RuntimeError => {
+                // Error already printed by vm.interpret
             }
-            continue;
         }
-
-        // Lower + optimize
-        let mut mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner);
-        run_opt_pipeline(&mut mir);
-
-        // Show optimized MIR for now (until we have native execution)
-        println!("{}", mir.pretty_print(&interner));
     }
 }
 

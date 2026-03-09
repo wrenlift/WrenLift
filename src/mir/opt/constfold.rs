@@ -197,6 +197,13 @@ fn try_fold(inst: &Instruction, constants: &HashMap<ValueId, ConstVal>) -> Optio
         Instruction::Shl(a, b) => int_binop(constants, *a, *b, |x, y| x << (y & 31)),
         Instruction::Shr(a, b) => int_binop(constants, *a, *b, |x, y| x >> (y & 31)),
 
+        // Math intrinsics
+        Instruction::MathUnaryF64(op, a) => match constants.get(a) {
+            Some(ConstVal::F64(n)) => Some(ConstVal::F64(op.apply(*n))),
+            _ => None,
+        },
+        Instruction::MathBinaryF64(op, a, b) => f64_binop(constants, *a, *b, |x, y| op.apply(x, y)),
+
         _ => None,
     }
 }

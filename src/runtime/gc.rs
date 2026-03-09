@@ -646,7 +646,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
-            for &val in &list.elements {
+            for &val in list.as_slice() {
                 mark_value(val, gray_stack);
             }
         }
@@ -708,8 +708,10 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
 
         ObjType::Instance => {
             let inst = &*(header as *mut ObjInstance);
-            for &val in &inst.fields {
-                mark_value(val, gray_stack);
+            if !inst.fields.is_null() {
+                for i in 0..inst.num_fields as usize {
+                    mark_value(*inst.fields.add(i), gray_stack);
+                }
             }
         }
 
@@ -759,7 +761,7 @@ unsafe fn update_pointers_in_object(
 
         ObjType::List => {
             let list = &mut *(header as *mut ObjList);
-            for val in &mut list.elements {
+            for val in list.as_mut_slice() {
                 update_value(val, forwards);
             }
         }
@@ -815,8 +817,11 @@ unsafe fn update_pointers_in_object(
 
         ObjType::Instance => {
             let inst = &mut *(header as *mut ObjInstance);
-            for val in &mut inst.fields {
-                update_value(val, forwards);
+            if !inst.fields.is_null() {
+                for i in 0..inst.num_fields as usize {
+                    let val_ptr = inst.fields.add(i);
+                    update_value(&mut *val_ptr, forwards);
+                }
             }
         }
 

@@ -75,6 +75,112 @@ pub enum MirType {
 // Instructions
 // ---------------------------------------------------------------------------
 
+/// Unary math operation on an unboxed f64.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MathUnaryOp {
+    Abs,
+    Acos,
+    Asin,
+    Atan,
+    Cbrt,
+    Ceil,
+    Cos,
+    Floor,
+    Round,
+    Sin,
+    Sqrt,
+    Tan,
+    Log,
+    Log2,
+    Exp,
+    Trunc,
+    Fract,
+    Sign,
+}
+
+impl MathUnaryOp {
+    /// Apply this operation to an f64 value.
+    pub fn apply(self, x: f64) -> f64 {
+        match self {
+            Self::Abs => x.abs(),
+            Self::Acos => x.acos(),
+            Self::Asin => x.asin(),
+            Self::Atan => x.atan(),
+            Self::Cbrt => x.cbrt(),
+            Self::Ceil => x.ceil(),
+            Self::Cos => x.cos(),
+            Self::Floor => x.floor(),
+            Self::Round => x.round(),
+            Self::Sin => x.sin(),
+            Self::Sqrt => x.sqrt(),
+            Self::Tan => x.tan(),
+            Self::Log => x.ln(),
+            Self::Log2 => x.log2(),
+            Self::Exp => x.exp(),
+            Self::Trunc => x.trunc(),
+            Self::Fract => x.fract(),
+            Self::Sign => {
+                if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+            }
+        }
+    }
+
+    /// Pretty-print name for this operation.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Abs => "fabs",
+            Self::Acos => "facos",
+            Self::Asin => "fasin",
+            Self::Atan => "fatan",
+            Self::Cbrt => "fcbrt",
+            Self::Ceil => "fceil",
+            Self::Cos => "fcos",
+            Self::Floor => "ffloor",
+            Self::Round => "fround",
+            Self::Sin => "fsin",
+            Self::Sqrt => "fsqrt",
+            Self::Tan => "ftan",
+            Self::Log => "flog",
+            Self::Log2 => "flog2",
+            Self::Exp => "fexp",
+            Self::Trunc => "ftrunc",
+            Self::Fract => "ffract",
+            Self::Sign => "fsign",
+        }
+    }
+}
+
+/// Binary math operation on two unboxed f64 values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MathBinaryOp {
+    Atan2,
+    Min,
+    Max,
+    Pow,
+}
+
+impl MathBinaryOp {
+    /// Apply this operation to two f64 values.
+    pub fn apply(self, a: f64, b: f64) -> f64 {
+        match self {
+            Self::Atan2 => a.atan2(b),
+            Self::Min => a.min(b),
+            Self::Max => a.max(b),
+            Self::Pow => a.powf(b),
+        }
+    }
+
+    /// Pretty-print name for this operation.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Atan2 => "fatan2",
+            Self::Min => "fmin",
+            Self::Max => "fmax",
+            Self::Pow => "fpow",
+        }
+    }
+}
+
 /// A single MIR instruction. Each produces at most one `ValueId`.
 #[derive(Debug, Clone)]
 pub enum Instruction {
@@ -110,6 +216,13 @@ pub enum Instruction {
     Mod(ValueId, ValueId),
     /// Boxed negate.
     Neg(ValueId),
+
+    // -- Math intrinsics (unboxed f64, inlined from Num methods) ------------
+
+    /// Unary math intrinsic on unboxed f64 (abs, sin, sqrt, etc.).
+    MathUnaryF64(MathUnaryOp, ValueId),
+    /// Binary math intrinsic on unboxed f64 (atan2, min, max, pow).
+    MathBinaryF64(MathBinaryOp, ValueId, ValueId),
 
     // -- Unboxed f64 arithmetic (the big optimization win) ------------------
 
@@ -173,6 +286,8 @@ pub enum Instruction {
     GuardBool(ValueId),
     /// Assert that a value is an instance of a specific class.
     GuardClass(ValueId, SymbolId),
+    /// Assert that a value conforms to a protocol (protocol-based devirtualization guard).
+    GuardProtocol(ValueId, crate::sema::protocol::ProtocolId),
 
     // -- Boxing / unboxing --------------------------------------------------
 
@@ -313,7 +428,8 @@ impl Instruction {
             | Instruction::BitOr(a, b)
             | Instruction::BitXor(a, b)
             | Instruction::Shl(a, b)
-            | Instruction::Shr(a, b) => vec![*a, *b],
+            | Instruction::Shr(a, b)
+            | Instruction::MathBinaryF64(_, a, b) => vec![*a, *b],
 
             Instruction::Neg(a)
             | Instruction::NegF64(a)
@@ -324,9 +440,12 @@ impl Instruction {
             | Instruction::Unbox(a)
             | Instruction::Box(a)
             | Instruction::Move(a)
-            | Instruction::ToString(a) => vec![*a],
+            | Instruction::ToString(a)
+            | Instruction::MathUnaryF64(_, a) => vec![*a],
 
-            Instruction::GuardClass(a, _) | Instruction::IsType(a, _) => vec![*a],
+            Instruction::GuardClass(a, _)
+            | Instruction::GuardProtocol(a, _)
+            | Instruction::IsType(a, _) => vec![*a],
 
             Instruction::GetField(recv, _) => vec![*recv],
             Instruction::SetField(recv, _, val) => vec![*recv, *val],
@@ -477,6 +596,44 @@ impl BasicBlock {
 // MIR Function
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Module-level MIR output (includes classes)
+// ---------------------------------------------------------------------------
+
+/// The complete MIR output for a module: top-level code + class definitions.
+#[derive(Debug, Clone)]
+pub struct ModuleMir {
+    pub top_level: MirFunction,
+    pub classes: Vec<ClassMir>,
+    /// Closure / nested function bodies referenced by MakeClosure instructions.
+    pub closures: Vec<MirFunction>,
+}
+
+/// MIR for a user-defined class.
+#[derive(Debug, Clone)]
+pub struct ClassMir {
+    pub name: SymbolId,
+    pub superclass: Option<SymbolId>,
+    pub methods: Vec<MethodMir>,
+    pub num_fields: u16,
+    /// Protocols this class conforms to (computed during compilation).
+    pub protocols: crate::sema::protocol::ProtocolSet,
+}
+
+/// MIR for a single method within a class.
+#[derive(Debug, Clone)]
+pub struct MethodMir {
+    /// Wren method signature (e.g. "foo(_)", "bar", "[_]").
+    pub signature: String,
+    pub is_static: bool,
+    pub is_constructor: bool,
+    pub mir: MirFunction,
+}
+
+// ---------------------------------------------------------------------------
+// MirFunction
+// ---------------------------------------------------------------------------
+
 /// A compiled function in MIR form.
 #[derive(Debug, Clone)]
 pub struct MirFunction {
@@ -492,6 +649,8 @@ pub struct MirFunction {
     pub next_value: u32,
     /// Next available BlockId.
     pub next_block: u32,
+    /// Source span map: ValueId → source byte range (for runtime error reporting).
+    pub span_map: std::collections::HashMap<ValueId, crate::ast::Span>,
 }
 
 impl MirFunction {
@@ -503,6 +662,7 @@ impl MirFunction {
             strings: Vec::new(),
             next_value: 0,
             next_block: 0,
+            span_map: std::collections::HashMap::new(),
         }
     }
 
@@ -541,6 +701,43 @@ impl MirFunction {
     /// The entry block (always block 0).
     pub fn entry_block(&self) -> BlockId {
         BlockId(0)
+    }
+
+    /// Remap all SymbolId references in this function using a mapping function.
+    ///
+    /// This is needed when merging a parse interner into the VM interner,
+    /// since the same string may have different SymbolId indices in each.
+    pub fn remap_symbols<F>(&mut self, remap: F)
+    where
+        F: Fn(SymbolId) -> SymbolId,
+    {
+        // Remap function name
+        self.name = remap(self.name);
+
+        // Remap all instructions in all blocks
+        for block in &mut self.blocks {
+            for (_dst, inst) in &mut block.instructions {
+                match inst {
+                    Instruction::ConstString(idx) => {
+                        let old = SymbolId::from_raw(*idx);
+                        *idx = remap(old).index();
+                    }
+                    Instruction::Call { method, .. } => {
+                        *method = remap(*method);
+                    }
+                    Instruction::SuperCall { method, .. } => {
+                        *method = remap(*method);
+                    }
+                    Instruction::GuardClass(_, cls) => {
+                        *cls = remap(*cls);
+                    }
+                    Instruction::IsType(_, ty) => {
+                        *ty = remap(*ty);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Populate predecessor lists from terminator edges.
@@ -666,6 +863,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::ModF64(a, b) => format!("fmod {}, {}", a, b),
         Instruction::NegF64(a) => format!("fneg {}", a),
 
+        Instruction::MathUnaryF64(op, a) => format!("{} {}", op.name(), a),
+        Instruction::MathBinaryF64(op, a, b) => format!("{} {}, {}", op.name(), a, b),
+
         Instruction::CmpLt(a, b) => format!("icmp.lt {}, {}", a, b),
         Instruction::CmpGt(a, b) => format!("icmp.gt {}, {}", a, b),
         Instruction::CmpLe(a, b) => format!("icmp.le {}, {}", a, b),
@@ -690,6 +890,13 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::GuardBool(a) => format!("guard.bool {}", a),
         Instruction::GuardClass(a, sym) => {
             format!("guard.class {}, %{}", a, interner.resolve(*sym))
+        }
+        Instruction::GuardProtocol(a, pid) => {
+            let name = crate::sema::protocol::BUILTIN_PROTOCOLS
+                .get(pid.0 as usize)
+                .map(|p| p.name)
+                .unwrap_or("?");
+            format!("guard.protocol {}, {}", a, name)
         }
 
         Instruction::Unbox(a) => format!("unbox {}", a),
