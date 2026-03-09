@@ -13,6 +13,7 @@
 pub mod aarch64;
 pub mod cfg;
 pub mod regalloc;
+pub mod runtime_fns;
 pub mod wasm;
 pub mod x86_64;
 
@@ -1773,35 +1774,64 @@ impl<'a> LowerCtx<'a> {
                 self.mf.emit(MachInst::BitcastFpToGp { dst, src: result_f });
             }
 
-            // -- Object operations → runtime calls --
+            // -- Object operations: inline GEP field access --
             Instruction::GetField(recv, idx) => {
-                let r = self.vreg_for(*recv);
+                use crate::runtime::object_layout::*;
+                let recv_reg = self.vreg_for(*recv);
                 let dst = self.vreg_for(dst_val);
-                let idx_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm {
-                    dst: idx_reg,
-                    bits: *idx as u64,
+
+                // 1. Extract object pointer: AND with PTR_MASK (48-bit)
+                let obj_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: obj_ptr,
+                    src: recv_reg,
+                    imm: 0x0000_FFFF_FFFF_FFFF, // PTR_MASK
                 });
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_get_field",
-                    args: vec![r, idx_reg],
-                    ret: Some(dst),
+
+                // 2. Load fields pointer: obj_ptr + INSTANCE_FIELDS
+                let fields_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr {
+                    dst: fields_ptr,
+                    mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
+                });
+
+                // 3. Load field value: fields_ptr + idx * VALUE_SIZE
+                let field_offset = (*idx as i32) * VALUE_SIZE;
+                self.mf.emit(MachInst::Ldr {
+                    dst,
+                    mem: Mem::new(fields_ptr, field_offset),
                 });
             }
             Instruction::SetField(recv, idx, val) => {
-                let r = self.vreg_for(*recv);
+                use crate::runtime::object_layout::*;
+                let recv_reg = self.vreg_for(*recv);
                 let v = self.vreg_for(*val);
                 let dst = self.vreg_for(dst_val);
-                let idx_reg = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm {
-                    dst: idx_reg,
-                    bits: *idx as u64,
+
+                // 1. Extract object pointer
+                let obj_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: obj_ptr,
+                    src: recv_reg,
+                    imm: 0x0000_FFFF_FFFF_FFFF,
                 });
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_set_field",
-                    args: vec![r, idx_reg, v],
-                    ret: Some(dst),
+
+                // 2. Load fields pointer
+                let fields_ptr = self.mf.new_gp();
+                self.mf.emit(MachInst::Ldr {
+                    dst: fields_ptr,
+                    mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
                 });
+
+                // 3. Store field value
+                let field_offset = (*idx as i32) * VALUE_SIZE;
+                self.mf.emit(MachInst::Str {
+                    src: v,
+                    mem: Mem::new(fields_ptr, field_offset),
+                });
+
+                // SetField result is the stored value
+                self.mf.emit(MachInst::Mov { dst, src: v });
             }
             Instruction::GetModuleVar(idx) => {
                 let dst = self.vreg_for(dst_val);

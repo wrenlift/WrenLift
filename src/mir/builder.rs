@@ -21,6 +21,8 @@ pub struct MirBuilder<'a> {
     interner: &'a mut Interner,
     resolutions: &'a HashMap<usize, ResolvedName>,
     module_vars: &'a [SymbolId],
+    /// Sema upvalue info: scope_id → Vec<UpvalueInfo> for closures that capture variables.
+    upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
     current_block: BlockId,
     variables: HashMap<SymbolId, ValueId>,
     break_targets: Vec<BlockId>,
@@ -31,6 +33,8 @@ pub struct MirBuilder<'a> {
     closures: Vec<MirFunction>,
     /// Base index for closure fn_ids (offset into module's closure list).
     closure_base: u32,
+    /// Current method signature (for `super(args)` — uses same name as enclosing method).
+    current_method_sig: Option<SymbolId>,
 }
 
 impl<'a> MirBuilder<'a> {
@@ -40,6 +44,7 @@ impl<'a> MirBuilder<'a> {
         interner: &'a mut Interner,
         resolutions: &'a HashMap<usize, ResolvedName>,
         module_vars: &'a [SymbolId],
+        upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
     ) -> Self {
         let mut func = MirFunction::new(name, arity);
         let entry = func.new_block();
@@ -48,6 +53,7 @@ impl<'a> MirBuilder<'a> {
             interner,
             resolutions,
             module_vars,
+            upvalue_map,
             current_block: entry,
             variables: HashMap::new(),
             break_targets: Vec::new(),
@@ -55,6 +61,7 @@ impl<'a> MirBuilder<'a> {
             field_map: None,
             closures: Vec::new(),
             closure_base: 0,
+            current_method_sig: None,
         }
     }
 
@@ -73,8 +80,8 @@ impl<'a> MirBuilder<'a> {
     }
 
     pub fn build_body(mut self, body: &Spanned<Stmt>, params: &[Spanned<SymbolId>]) -> MirFunction {
-        for param in params {
-            let val = self.emit(Instruction::BlockParam(0));
+        for (i, param) in params.iter().enumerate() {
+            let val = self.emit(Instruction::BlockParam(i as u16));
             self.variables.insert(param.0, val);
         }
         self.lower_stmt(body);
@@ -411,10 +418,15 @@ impl<'a> MirBuilder<'a> {
             Expr::Ident(name) => {
                 if let Some(&val) = self.variables.get(name) {
                     self.emit(Instruction::Move(val))
-                } else if let Some(&ResolvedName::ModuleVar(idx)) =
-                    self.resolutions.get(&expr.1.start)
-                {
-                    self.emit(Instruction::GetModuleVar(idx))
+                } else if let Some(resolved) = self.resolutions.get(&expr.1.start) {
+                    match resolved {
+                        ResolvedName::ModuleVar(idx) => self.emit(Instruction::GetModuleVar(*idx)),
+                        ResolvedName::Upvalue(idx) => self.emit(Instruction::GetUpvalue(*idx)),
+                        ResolvedName::Local(_) => {
+                            // Local should have been in variables map; fallback
+                            self.emit(Instruction::ConstNull)
+                        }
+                    }
                 } else {
                     self.emit(Instruction::GetModuleVar(0))
                 }
@@ -537,15 +549,25 @@ impl<'a> MirBuilder<'a> {
                 })
             }
 
-            Expr::SuperCall { method, args } => {
-                let arg_vals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
-                let method_sym = method
-                    .as_ref()
-                    .map(|m| m.0)
-                    .unwrap_or_else(|| self.intern("init"));
+            Expr::SuperCall { method, args, has_parens } => {
+                // Include `this` as first arg so the VM can use it as receiver
+                let this_sym = self.intern("this");
+                let this_val = self.variables.get(&this_sym).copied()
+                    .unwrap_or_else(|| self.emit(Instruction::ConstNull));
+                let mut all_args = vec![this_val];
+                all_args.extend(args.iter().map(|a| self.lower_expr(a)));
+
+                let method_sym = if let Some(m) = method {
+                    // super.method(args) or super.getter
+                    self.method_sig_with_parens(m.0, args.len(), *has_parens)
+                } else {
+                    // super(args) — call same-named constructor/method on super
+                    self.current_method_sig
+                        .unwrap_or_else(|| self.intern("init"))
+                };
                 self.emit(Instruction::SuperCall {
                     method: method_sym,
-                    args: arg_vals,
+                    args: all_args,
                 })
             }
 
@@ -600,10 +622,26 @@ impl<'a> MirBuilder<'a> {
             }
 
             Expr::Closure { params, body } => {
+                let scope_id = expr.1.start;
                 let fn_idx = self.compile_closure(params, body);
+                // Build upvalue capture list from sema info
+                let upvalue_vals = if let Some(uv_info) = self.upvalue_map.get(&scope_id) {
+                    uv_info.iter().map(|info| {
+                        if info.is_local {
+                            // Capture a local variable from this scope by name
+                            self.variables.get(&info.name).copied()
+                                .unwrap_or_else(|| self.emit(Instruction::ConstNull))
+                        } else {
+                            // Capture an upvalue from this scope (we're inside a closure ourselves)
+                            self.emit(Instruction::GetUpvalue(info.index))
+                        }
+                    }).collect()
+                } else {
+                    vec![]
+                };
                 self.emit(Instruction::MakeClosure {
                     fn_id: fn_idx,
-                    upvalues: vec![],
+                    upvalues: upvalue_vals,
                 })
             }
         }
@@ -707,10 +745,18 @@ impl<'a> MirBuilder<'a> {
             Expr::Ident(name) => {
                 if self.variables.contains_key(name) {
                     self.variables.insert(*name, value);
-                } else if let Some(&ResolvedName::ModuleVar(idx)) =
-                    self.resolutions.get(&target.1.start)
-                {
-                    self.emit(Instruction::SetModuleVar(idx, value));
+                } else if let Some(resolved) = self.resolutions.get(&target.1.start) {
+                    match resolved {
+                        ResolvedName::ModuleVar(idx) => {
+                            self.emit(Instruction::SetModuleVar(*idx, value));
+                        }
+                        ResolvedName::Upvalue(idx) => {
+                            self.emit(Instruction::SetUpvalue(*idx, value));
+                        }
+                        _ => {
+                            self.variables.insert(*name, value);
+                        }
+                    }
                 } else {
                     self.variables.insert(*name, value);
                 }
@@ -742,6 +788,7 @@ impl<'a> MirBuilder<'a> {
             self.interner,
             self.resolutions,
             self.module_vars,
+            self.upvalue_map,
             fn_idx + 1, // nested closures start after this one
         );
 
@@ -761,6 +808,7 @@ fn compile_closure_body(
     interner: &mut Interner,
     resolutions: &HashMap<usize, ResolvedName>,
     module_vars: &[SymbolId],
+    upvalue_map: &HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
     nested_base: u32,
 ) -> (MirFunction, Vec<MirFunction>) {
     let closure_name = interner.intern("<closure>");
@@ -772,12 +820,13 @@ fn compile_closure_body(
         interner,
         resolutions,
         module_vars,
+        upvalue_map,
     );
     builder.closure_base = nested_base;
 
     // Bind parameters
-    for param in params {
-        let val = builder.emit(Instruction::BlockParam(0));
+    for (i, param) in params.iter().enumerate() {
+        let val = builder.emit(Instruction::BlockParam(i as u16));
         builder.variables.insert(param.0, val);
     }
 
@@ -894,29 +943,32 @@ pub fn lower_module(
     resolve: &ResolveResult,
 ) -> ModuleMir {
     let name = interner.intern("<module>");
-    let builder = MirBuilder::new(name, 0, interner, &resolve.resolutions, &resolve.module_vars);
+    let builder = MirBuilder::new(name, 0, interner, &resolve.resolutions, &resolve.module_vars, &resolve.upvalues);
     let (top_level, closures) = builder.build_module(module);
 
     // Compile class definitions
     let mut classes = Vec::new();
+    let mut all_closures = closures;
     for stmt in module {
         if let Stmt::Class(decl) = &stmt.0 {
-            let class_mir = compile_class(decl, interner, resolve);
+            let (class_mir, method_closures) = compile_class(decl, interner, resolve);
             classes.push(class_mir);
+            all_closures.extend(method_closures);
         }
     }
 
-    ModuleMir { top_level, classes, closures }
+    ModuleMir { top_level, classes, closures: all_closures }
 }
 
-/// Compile a class declaration into ClassMir.
+/// Compile a class declaration into ClassMir (plus any closures found in method bodies).
 fn compile_class(
     decl: &ClassDecl,
     interner: &mut Interner,
     resolve: &ResolveResult,
-) -> ClassMir {
+) -> (ClassMir, Vec<MirFunction>) {
     let mut methods = Vec::new();
     let mut field_names: Vec<SymbolId> = Vec::new();
+    let mut all_closures: Vec<MirFunction> = Vec::new();
 
     // First pass: scan all methods for field accesses to determine field count.
     for method_spanned in &decl.methods {
@@ -946,6 +998,7 @@ fn compile_class(
             interner,
             &resolve.resolutions,
             &resolve.module_vars,
+            &resolve.upvalues,
         );
 
         // Set field map for this class
@@ -953,15 +1006,16 @@ fn compile_class(
             .map(|(i, &sym)| (sym, i as u16))
             .collect();
         builder.field_map = Some(fmap);
+        builder.current_method_sig = Some(method_name);
 
-        // Bind 'this' as first block param
+        // Bind 'this' as first block param (param index 0)
         let this_sym = builder.intern("this");
         let this_val = builder.emit(Instruction::BlockParam(0));
         builder.variables.insert(this_sym, this_val);
 
-        // Bind explicit parameters
-        for param in &params {
-            let val = builder.emit(Instruction::BlockParam(0));
+        // Bind explicit parameters (param index 1, 2, ...)
+        for (i, param) in params.iter().enumerate() {
+            let val = builder.emit(Instruction::BlockParam((i + 1) as u16));
             builder.variables.insert(param.0, val);
         }
 
@@ -992,6 +1046,9 @@ fn compile_class(
         }
         builder.func.compute_predecessors();
 
+        // Collect closures from this method body
+        all_closures.extend(builder.closures);
+
         methods.push(MethodMir {
             signature: sig_str,
             is_static: method.is_static,
@@ -1000,12 +1057,12 @@ fn compile_class(
         });
     }
 
-    ClassMir {
+    (ClassMir {
         name: decl.name.0,
         superclass: decl.superclass.as_ref().map(|s| s.0),
         methods,
         num_fields: field_names.len() as u16,
-    }
+    }, all_closures)
 }
 
 /// Scan a statement body for field accesses (_name) and register them.

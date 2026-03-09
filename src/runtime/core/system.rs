@@ -63,7 +63,7 @@ fn system_print_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         let header = ptr as *const super::super::object::ObjHeader;
         if unsafe { (*header).obj_type } == super::super::object::ObjType::List {
             let list = unsafe { &*(ptr as *const super::super::object::ObjList) };
-            for elem in &list.elements {
+            for elem in list.as_slice() {
                 ctx.write_output(&format_object(*elem));
             }
         } else {
@@ -82,7 +82,7 @@ fn system_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         let header = ptr as *const super::super::object::ObjHeader;
         if unsafe { (*header).obj_type } == super::super::object::ObjType::List {
             let list = unsafe { &*(ptr as *const super::super::object::ObjList) };
-            for elem in &list.elements {
+            for elem in list.as_slice() {
                 ctx.write_output(&format_object(*elem));
             }
         } else {

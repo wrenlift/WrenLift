@@ -1348,7 +1348,8 @@ impl Parser {
                     let method_text = self.previous().text.clone();
                     let method_span = self.previous_span();
                     let method_sym = self.intern(&method_text);
-                    let args = if self.check(&Token::LeftParen) {
+                    let has_parens = self.check(&Token::LeftParen);
+                    let args = if has_parens {
                         self.argument_list()?
                     } else {
                         Vec::new()
@@ -1358,6 +1359,7 @@ impl Parser {
                         Expr::SuperCall {
                             method: Some((method_sym, method_span)),
                             args,
+                            has_parens,
                         },
                         start..end,
                     ))
@@ -1368,6 +1370,7 @@ impl Parser {
                         Expr::SuperCall {
                             method: None,
                             args,
+                            has_parens: true,
                         },
                         start..end,
                     ))
@@ -1376,6 +1379,7 @@ impl Parser {
                         Expr::SuperCall {
                             method: None,
                             args: Vec::new(),
+                            has_parens: false,
                         },
                         super_span,
                     ))
@@ -1978,9 +1982,10 @@ mod tests {
         let (expr, errors) = parse_expr("super.method(x)");
         assert!(errors.is_empty());
         match expr {
-            Expr::SuperCall { method, args } => {
+            Expr::SuperCall { method, args, has_parens } => {
                 assert!(method.is_some());
                 assert_eq!(args.len(), 1);
+                assert!(has_parens);
             }
             _ => panic!("expected SuperCall"),
         }
@@ -1991,9 +1996,10 @@ mod tests {
         let (expr, errors) = parse_expr("super(x)");
         assert!(errors.is_empty());
         match expr {
-            Expr::SuperCall { method, args } => {
+            Expr::SuperCall { method, args, has_parens } => {
                 assert!(method.is_none());
                 assert_eq!(args.len(), 1);
+                assert!(has_parens);
             }
             _ => panic!("expected SuperCall"),
         }

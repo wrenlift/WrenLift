@@ -53,6 +53,8 @@ pub struct UpvalueInfo {
     /// Whether this captures a local from the immediately enclosing scope
     /// (true) or an upvalue from it (false).
     pub is_local: bool,
+    /// The original variable name being captured.
+    pub name: SymbolId,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,11 +299,12 @@ impl<'a> Resolver<'a> {
 
     fn capture_upvalue(&mut self, source_scope: usize, local_idx: u16, target_scope: usize) -> ResolvedName {
         // Create a chain of upvalues from source_scope+1 to target_scope.
+        let name = self.scopes[source_scope].locals[local_idx as usize].name;
         let mut index = local_idx;
         let mut is_local = true;
 
         for scope_idx in (source_scope + 1)..=target_scope {
-            let info = UpvalueInfo { index, is_local };
+            let info = UpvalueInfo { index, is_local, name };
             index = self.scopes[scope_idx].add_upvalue(info);
             is_local = false;
         }

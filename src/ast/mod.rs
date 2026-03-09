@@ -300,6 +300,8 @@ pub enum Expr {
     SuperCall {
         method: Option<Spanned<SymbolId>>,
         args: Vec<Spanned<Expr>>,
+        /// Whether call was made with explicit parens: `super.bar()` vs `super.bar`
+        has_parens: bool,
     },
 
     /// Subscript getter: `receiver[args]`

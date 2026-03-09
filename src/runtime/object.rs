@@ -48,17 +48,20 @@ pub enum ObjType {
 /// Every `Obj*` struct must begin with this header so the GC can walk the
 /// object graph uniformly. The `next` pointer forms an intrusive linked list
 /// of all live objects for the GC sweep phase.
+#[repr(C)]
 pub struct ObjHeader {
     /// What kind of object this is.
-    pub obj_type: ObjType,
+    pub obj_type: ObjType,     // offset 0, u8
     /// GC mark bit / tri-color byte. 0 = white, 1 = gray, 2 = black.
-    pub gc_mark: u8,
+    pub gc_mark: u8,           // offset 1
     /// GC generation. 0 = young (nursery), 1 = old.
-    pub generation: u8,
+    pub generation: u8,        // offset 2
+    // 5 bytes padding (implicit)
     /// Intrusive linked list of all heap objects (for GC sweep).
-    pub next: *mut ObjHeader,
+    pub next: *mut ObjHeader,  // offset 8
     /// The class of this object (for method dispatch). Null for meta-objects.
-    pub class: *mut ObjClass,
+    pub class: *mut ObjClass,  // offset 16
+    // total: 24 bytes
 }
 
 impl ObjHeader {
@@ -139,72 +142,185 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 // List
 // ---------------------------------------------------------------------------
 
-/// A growable array.
+/// A growable array with JIT-friendly raw buffer layout.
 #[repr(C)]
 pub struct ObjList {
-    pub header: ObjHeader,
-    pub elements: Vec<Value>,
+    pub header: ObjHeader,        // offset 0, 24 bytes
+    pub count: u32,               // offset 24
+    pub capacity: u32,            // offset 28
+    pub elements: *mut Value,     // offset 32, heap-allocated buffer
+    // total: 40 bytes
 }
+
+const LIST_INITIAL_CAPACITY: u32 = 8;
 
 impl ObjList {
     pub fn new() -> Self {
         Self {
             header: ObjHeader::new(ObjType::List),
-            elements: Vec::new(),
+            count: 0,
+            capacity: 0,
+            elements: std::ptr::null_mut(),
         }
     }
 
     pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(1) as u32;
+        let layout = std::alloc::Layout::array::<Value>(cap as usize).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut Value };
         Self {
             header: ObjHeader::new(ObjType::List),
-            elements: Vec::with_capacity(cap),
+            count: 0,
+            capacity: cap,
+            elements: ptr,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.elements.len()
+        self.count as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+        self.count == 0
     }
 
     pub fn get(&self, index: usize) -> Option<Value> {
-        self.elements.get(index).copied()
-    }
-
-    pub fn set(&mut self, index: usize, value: Value) {
-        if index < self.elements.len() {
-            self.elements[index] = value;
-        }
-    }
-
-    pub fn add(&mut self, value: Value) {
-        self.elements.push(value);
-    }
-
-    pub fn insert(&mut self, index: usize, value: Value) {
-        if index <= self.elements.len() {
-            self.elements.insert(index, value);
-        }
-    }
-
-    pub fn remove(&mut self, index: usize) -> Option<Value> {
-        if index < self.elements.len() {
-            Some(self.elements.remove(index))
+        if index < self.count as usize {
+            Some(unsafe { *self.elements.add(index) })
         } else {
             None
         }
     }
 
+    pub fn set(&mut self, index: usize, value: Value) {
+        if index < self.count as usize {
+            unsafe { self.elements.add(index).write(value); }
+        }
+    }
+
+    pub fn add(&mut self, value: Value) {
+        self.ensure_capacity(self.count + 1);
+        unsafe { self.elements.add(self.count as usize).write(value); }
+        self.count += 1;
+    }
+
+    pub fn insert(&mut self, index: usize, value: Value) {
+        let count = self.count as usize;
+        if index > count { return; }
+        self.ensure_capacity(self.count + 1);
+        if index < count {
+            unsafe {
+                std::ptr::copy(
+                    self.elements.add(index),
+                    self.elements.add(index + 1),
+                    count - index,
+                );
+            }
+        }
+        unsafe { self.elements.add(index).write(value); }
+        self.count += 1;
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<Value> {
+        let count = self.count as usize;
+        if index >= count { return None; }
+        let val = unsafe { self.elements.add(index).read() };
+        if index < count - 1 {
+            unsafe {
+                std::ptr::copy(
+                    self.elements.add(index + 1),
+                    self.elements.add(index),
+                    count - index - 1,
+                );
+            }
+        }
+        self.count -= 1;
+        Some(val)
+    }
+
     pub fn clear(&mut self) {
-        self.elements.clear();
+        self.count = 0;
+    }
+
+    pub fn as_slice(&self) -> &[Value] {
+        if self.elements.is_null() || self.count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.elements, self.count as usize) }
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [Value] {
+        if self.elements.is_null() || self.count == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.elements, self.count as usize) }
+        }
+    }
+
+    pub fn swap(&mut self, a: usize, b: usize) {
+        let count = self.count as usize;
+        if a < count && b < count {
+            unsafe {
+                let va = self.elements.add(a).read();
+                let vb = self.elements.add(b).read();
+                self.elements.add(a).write(vb);
+                self.elements.add(b).write(va);
+            }
+        }
+    }
+
+    /// Build a list from a Vec of values.
+    pub fn from_elements(elems: Vec<Value>) -> Self {
+        let mut list = Self::with_capacity(elems.len());
+        for v in elems {
+            list.add(v);
+        }
+        list
+    }
+
+    fn ensure_capacity(&mut self, needed: u32) {
+        if needed <= self.capacity { return; }
+        let new_cap = if self.capacity == 0 {
+            LIST_INITIAL_CAPACITY.max(needed)
+        } else {
+            (self.capacity * 2).max(needed)
+        };
+        let new_layout = std::alloc::Layout::array::<Value>(new_cap as usize).unwrap();
+        let new_ptr = if self.elements.is_null() {
+            unsafe { std::alloc::alloc(new_layout) as *mut Value }
+        } else {
+            let old_layout = std::alloc::Layout::array::<Value>(self.capacity as usize).unwrap();
+            unsafe {
+                std::alloc::realloc(
+                    self.elements as *mut u8,
+                    old_layout,
+                    new_layout.size(),
+                ) as *mut Value
+            }
+        };
+        self.elements = new_ptr;
+        self.capacity = new_cap;
+    }
+}
+
+impl Drop for ObjList {
+    fn drop(&mut self) {
+        if !self.elements.is_null() && self.capacity > 0 {
+            let layout = std::alloc::Layout::array::<Value>(self.capacity as usize).unwrap();
+            unsafe { std::alloc::dealloc(self.elements as *mut u8, layout); }
+        }
     }
 }
 
 impl fmt::Debug for ObjList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ObjList({:?})", self.elements)
+        let slice = if self.elements.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.elements, self.count as usize) }
+        };
+        write!(f, "ObjList({:?})", slice)
     }
 }
 
@@ -555,6 +671,10 @@ pub struct MirCallFrame {
     pub module_name: String,
     /// The ValueId in the *caller* frame that should receive our return value.
     pub return_dst: Option<crate::mir::ValueId>,
+    /// The closure being executed (if any), for upvalue access.
+    pub closure: Option<*mut ObjClosure>,
+    /// The class that defines the current method (for super dispatch).
+    pub defining_class: Option<*mut ObjClass>,
 }
 
 impl fmt::Debug for MirCallFrame {
@@ -583,6 +703,8 @@ pub struct ObjFiber {
     pub caller: *mut ObjFiber,
     /// Error value (if state == Error).
     pub error: Value,
+    /// Where to store the resume value when this fiber is resumed after yielding.
+    pub resume_value_dst: Option<crate::mir::ValueId>,
 }
 
 impl ObjFiber {
@@ -595,6 +717,7 @@ impl ObjFiber {
             state: FiberState::New,
             caller: std::ptr::null_mut(),
             error: Value::null(),
+            resume_value_dst: None,
         }
     }
 
@@ -710,6 +833,14 @@ pub trait NativeContext {
 
     // -- Output --
     fn write_output(&mut self, s: &str);
+
+    // -- Fiber operations --
+    fn alloc_fiber(&mut self) -> *mut ObjFiber;
+    fn get_fiber_class(&self) -> *mut ObjClass;
+    fn get_fn_class(&self) -> *mut ObjClass;
+    fn set_fiber_action_call(&mut self, target: *mut ObjFiber, value: Value);
+    fn set_fiber_action_yield(&mut self, value: Value);
+    fn set_fiber_action_transfer(&mut self, target: *mut ObjFiber, value: Value);
 }
 
 impl ObjClass {
@@ -779,10 +910,13 @@ impl fmt::Debug for ObjClass {
 
 /// A class instance with a fixed number of fields.
 #[repr(C)]
+#[repr(C)]
 pub struct ObjInstance {
-    pub header: ObjHeader,
-    /// Field values, indexed by field slot number.
-    pub fields: Vec<Value>,
+    pub header: ObjHeader,         // offset 0, 24 bytes
+    pub num_fields: u32,           // offset 24
+    // 4 bytes padding (implicit, for *mut alignment)
+    pub fields: *mut Value,        // offset 32, heap-allocated [Value; num_fields]
+    // total: 40 bytes
 }
 
 impl ObjInstance {
@@ -793,28 +927,54 @@ impl ObjInstance {
             unsafe { (*class).num_fields as usize }
         };
 
+        let fields = if num_fields > 0 {
+            let layout = std::alloc::Layout::array::<Value>(num_fields).unwrap();
+            let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut Value };
+            // Initialize all fields to null
+            for i in 0..num_fields {
+                unsafe { ptr.add(i).write(Value::null()); }
+            }
+            ptr
+        } else {
+            std::ptr::null_mut()
+        };
+
         let mut instance = Self {
             header: ObjHeader::new(ObjType::Instance),
-            fields: vec![Value::null(); num_fields],
+            num_fields: num_fields as u32,
+            fields,
         };
         instance.header.class = class;
         instance
     }
 
     pub fn get_field(&self, index: usize) -> Option<Value> {
-        self.fields.get(index).copied()
+        if index < self.num_fields as usize {
+            Some(unsafe { *self.fields.add(index) })
+        } else {
+            None
+        }
     }
 
     pub fn set_field(&mut self, index: usize, value: Value) {
-        if index < self.fields.len() {
-            self.fields[index] = value;
+        if index < self.num_fields as usize {
+            unsafe { self.fields.add(index).write(value); }
+        }
+    }
+}
+
+impl Drop for ObjInstance {
+    fn drop(&mut self) {
+        if !self.fields.is_null() && self.num_fields > 0 {
+            let layout = std::alloc::Layout::array::<Value>(self.num_fields as usize).unwrap();
+            unsafe { std::alloc::dealloc(self.fields as *mut u8, layout); }
         }
     }
 }
 
 impl fmt::Debug for ObjInstance {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ObjInstance({} fields)", self.fields.len())
+        write!(f, "ObjInstance({} fields)", self.num_fields)
     }
 }
 
@@ -1177,7 +1337,7 @@ mod tests {
 
         let class_ptr = &mut class as *mut ObjClass;
         let mut inst = ObjInstance::new(class_ptr);
-        assert_eq!(inst.fields.len(), 2);
+        assert_eq!(inst.num_fields, 2);
         assert!(inst.get_field(0).unwrap().is_null());
 
         inst.set_field(0, Value::num(10.0));

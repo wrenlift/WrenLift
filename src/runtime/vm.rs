@@ -13,6 +13,17 @@ use super::gc::Gc;
 use super::object::*;
 use super::value::Value;
 
+/// Action requested by a fiber native method, handled by the interpreter loop.
+#[derive(Debug)]
+pub enum FiberAction {
+    /// Switch to target fiber, pass value when it yields/completes.
+    Call { target: *mut ObjFiber, value: Value },
+    /// Yield from current fiber, return value to caller.
+    Yield { value: Value },
+    /// Transfer to target fiber (no caller chain).
+    Transfer { target: *mut ObjFiber, value: Value },
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -138,6 +149,9 @@ pub struct VM {
 
     // -- Output capture (for testing; None = print to stdout) --
     pub output_buffer: Option<String>,
+
+    // -- Fiber switching (set by fiber natives, consumed by interpreter) --
+    pub pending_fiber_action: Option<FiberAction>,
 }
 
 impl VM {
@@ -173,6 +187,7 @@ impl VM {
             config,
             has_error: false,
             output_buffer: None,
+            pending_fiber_action: None,
         };
 
         // Bootstrap core classes.
@@ -235,6 +250,35 @@ impl VM {
                 err.eprint(source);
             }
             return InterpretResult::CompileError;
+        }
+
+        // 3b. Process imports — recursively interpret imported modules
+        for stmt in &parse_result.module {
+            if let crate::ast::Stmt::Import { module: mod_path, names: _ } = &stmt.0 {
+                let imported_module = mod_path.0.clone();
+
+                // Skip if already loaded
+                if !self.engine.modules.contains_key(&imported_module) {
+                    // Resolve module source via config callback
+                    let source_opt = self.config.load_module_fn.as_ref().and_then(|load_fn| {
+                        load_fn(&imported_module)
+                    });
+                    if let Some(mod_source) = source_opt {
+                        let result = self.interpret(&imported_module, &mod_source);
+                        if result != InterpretResult::Success {
+                            return result;
+                        }
+                    } else {
+                        self.report_error(&format!("Could not load module '{}'", imported_module));
+                        return InterpretResult::CompileError;
+                    }
+                }
+
+                // Copy imported names from the imported module's vars to this module's
+                // resolve_result.module_vars. We'll look them up by name after MIR
+                // compilation when building the module var storage (step 8).
+                // For now, just ensure the imported module exists.
+            }
         }
 
         // 4. Lower to MIR
@@ -305,14 +349,15 @@ impl VM {
         // 7b. Register top-level function with the engine
         let func_id = self.engine.register_function(module_mir.top_level);
 
-        // 8. Create module var storage, pre-populated with core class values.
-        // resolve_result.module_vars uses parse-interner SymbolIds; look up
-        // their string names to check for core classes.
+        // 8. Create module var storage, pre-populated with core class values
+        // and imported module vars.
         let module_key = module_name.to_string();
         let mut module_vars = Vec::with_capacity(resolve_result.module_vars.len());
         for &parse_sym in &resolve_result.module_vars {
             let name = interner.resolve(parse_sym);
             if let Some(value) = self.core_class_value(name) {
+                module_vars.push(value);
+            } else if let Some(value) = self.find_imported_var(name) {
                 module_vars.push(value);
             } else {
                 module_vars.push(Value::null());
@@ -365,7 +410,13 @@ impl VM {
             let class_ptr = self.gc.alloc_class(class_mir.name, superclass);
             unsafe {
                 (*class_ptr).header.class = self.class_class;
-                (*class_ptr).num_fields = class_mir.num_fields;
+                // Total fields = own fields + inherited fields from superclass chain
+                let inherited_fields = if !superclass.is_null() {
+                    (*superclass).num_fields
+                } else {
+                    0
+                };
+                (*class_ptr).num_fields = class_mir.num_fields + inherited_fields;
             }
 
             // Register each method's MIR and bind to the class
@@ -425,6 +476,7 @@ impl VM {
                 values: HMap::new(),
                 module_name: module_key,
                 return_dst: None,
+                closure: None, defining_class: None,
             });
         }
 
@@ -475,7 +527,9 @@ impl VM {
         let obj = self.gc.alloc_list();
         unsafe {
             (*obj).header.class = self.list_class;
-            (*obj).elements = elements;
+            for elem in elements {
+                (*obj).add(elem);
+            }
         }
         Value::object(obj as *mut u8)
     }
@@ -567,6 +621,28 @@ impl VM {
     }
 
     /// Map a core class name to its Value (pointer to ObjClass).
+    /// Search all loaded modules for a variable with the given name.
+    /// Used to resolve imported names across module boundaries.
+    fn find_imported_var(&self, name: &str) -> Option<Value> {
+        let target_sym = self.interner.lookup(name)?;
+        for entry in self.engine.modules.values() {
+            for &var_val in &entry.vars {
+                if var_val.is_object() {
+                    if let Some(ptr) = var_val.as_object() {
+                        let header = ptr as *const ObjHeader;
+                        if unsafe { (*header).obj_type } == ObjType::Class {
+                            let cls = ptr as *mut ObjClass;
+                            if unsafe { (*cls).name } == target_sym {
+                                return Some(var_val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn core_class_value(&self, name: &str) -> Option<Value> {
         let class_ptr = match name {
             "Object" => self.object_class,
@@ -702,6 +778,30 @@ impl NativeContext for VM {
 
     fn write_output(&mut self, s: &str) {
         self.vm_write(s);
+    }
+
+    fn alloc_fiber(&mut self) -> *mut ObjFiber {
+        self.gc.alloc_fiber()
+    }
+
+    fn get_fiber_class(&self) -> *mut ObjClass {
+        self.fiber_class
+    }
+
+    fn get_fn_class(&self) -> *mut ObjClass {
+        self.fn_class
+    }
+
+    fn set_fiber_action_call(&mut self, target: *mut ObjFiber, value: Value) {
+        self.pending_fiber_action = Some(FiberAction::Call { target, value });
+    }
+
+    fn set_fiber_action_yield(&mut self, value: Value) {
+        self.pending_fiber_action = Some(FiberAction::Yield { value });
+    }
+
+    fn set_fiber_action_transfer(&mut self, target: *mut ObjFiber, value: Value) {
+        self.pending_fiber_action = Some(FiberAction::Transfer { target, value });
     }
 }
 
@@ -1293,5 +1393,247 @@ System.print(b.value)
 "#);
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "-5\n");
+    }
+
+    #[test]
+    fn test_interpret_closure_capture() {
+        let (result, output) = run_and_capture(r#"
+var x = 10
+var f = Fn.new { x }
+System.print(f.call())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "10\n");
+    }
+
+    #[test]
+    fn test_interpret_closure_capture_with_args() {
+        let (result, output) = run_and_capture(r#"
+var x = 10
+var f = Fn.new {|y| x + y }
+System.print(f.call(5))
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "15\n");
+    }
+
+    #[test]
+    fn test_interpret_closure_capture_multiple() {
+        let (result, output) = run_and_capture(r#"
+var a = 3
+var b = 7
+var f = Fn.new { a + b }
+System.print(f.call())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "10\n");
+    }
+
+    #[test]
+    fn test_interpret_closure_capture_in_block() {
+        let (result, output) = run_and_capture(r#"
+var result = null
+{
+  var x = 42
+  var f = Fn.new { x }
+  result = f.call()
+}
+System.print(result)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_closure_nested_capture() {
+        let (result, output) = run_and_capture(r#"
+var x = 100
+var outer = Fn.new {
+  Fn.new { x }
+}
+var inner = outer.call()
+System.print(inner.call())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "100\n");
+    }
+
+    #[test]
+    fn test_interpret_super_call() {
+        let (result, output) = run_and_capture(r#"
+class Animal {
+  construct new(name) { _name = name }
+  speak() { _name }
+}
+class Dog is Animal {
+  construct new(name) { super(name) }
+  speak() { super.speak() + " says woof" }
+}
+var d = Dog.new("Rex")
+System.print(d.speak())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "Rex says woof\n");
+    }
+
+    #[test]
+    fn test_interpret_super_getter() {
+        let (result, output) = run_and_capture(r#"
+class Base {
+  construct new(v) { _v = v }
+  value { _v }
+}
+class Child is Base {
+  construct new(v) { super(v) }
+  value { super.value + 10 }
+}
+System.print(Child.new(5).value)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "15\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_new_call() {
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  System.print("inside fiber")
+}
+fiber.call()
+System.print("after call")
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "inside fiber\nafter call\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_yield() {
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  System.print("before yield")
+  Fiber.yield()
+  System.print("after yield")
+}
+fiber.call()
+System.print("yielded")
+fiber.call()
+System.print("done")
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "before yield\nyielded\nafter yield\ndone\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_yield_value() {
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  Fiber.yield(42)
+}
+var result = fiber.call()
+System.print(result)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_is_done() {
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  Fiber.yield()
+}
+System.print(fiber.isDone)
+fiber.call()
+System.print(fiber.isDone)
+fiber.call()
+System.print(fiber.isDone)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "false\nfalse\ntrue\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_pass_value_on_resume() {
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  var got = Fiber.yield()
+  System.print(got)
+}
+fiber.call()
+fiber.call("hello from caller")
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "hello from caller\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_multiple_yields() {
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  Fiber.yield(1)
+  Fiber.yield(2)
+  Fiber.yield(3)
+}
+System.print(fiber.call())
+System.print(fiber.call())
+System.print(fiber.call())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "1\n2\n3\n");
+    }
+
+    #[test]
+    fn test_interpret_while_loop() {
+        let (result, output) = run_and_capture(r#"
+var i = 0
+while (i < 3) {
+  System.print(i)
+  i = i + 1
+}
+"#);
+        assert!(matches!(result, InterpretResult::Success), "while loop failed: {:?}", result);
+        assert_eq!(output, "0\n1\n2\n");
+    }
+
+    #[test]
+    fn test_interpret_static_method_with_args() {
+        let mut vm = VM::new(VMConfig::default());
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", r#"
+class Foo {
+  static double(n) { n + n }
+}
+System.print(Foo.double(21))
+"#);
+        let output = vm.take_output();
+        assert!(matches!(result, InterpretResult::Success), "static method with args failed: {:?}", result);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_import_module() {
+        let mut config = VMConfig::default();
+        config.load_module_fn = Some(Box::new(|name: &str| -> Option<String> {
+            if name == "math_utils" {
+                Some(r#"
+class MathUtils {
+  static greet() { "hello from import" }
+  static double(n) { n + n }
+}
+"#.to_string())
+            } else {
+                None
+            }
+        }));
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", r#"
+import "math_utils" for MathUtils
+System.print(MathUtils.greet())
+System.print(MathUtils.double(21))
+"#);
+        let output = vm.take_output();
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "hello from import\n42\n");
     }
 }

@@ -40,63 +40,63 @@ fn list_filled(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn list_subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list(args);
-    let count = list.elements.len();
+    let count = list.len();
     let index = match super::validate_index(ctx, args[1], count, "Subscript") {
         Some(v) => v,
         None => return Value::null(),
     };
-    list.elements[index]
+    list.get(index).unwrap_or(Value::null())
 }
 
 fn list_subscript_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let count = receiver_list(args).elements.len();
+    let count = receiver_list(args).len();
     let index = match super::validate_index(ctx, args[1], count, "Subscript") {
         Some(v) => v,
         None => return Value::null(),
     };
     let list = receiver_list_mut(args);
-    list.elements[index] = args[2];
+    list.set(index, args[2]);
     args[2]
 }
 
 fn list_add(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
-    list.elements.push(args[1]);
+    list.add(args[1]);
     args[0]
 }
 
 fn list_add_core(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
-    list.elements.push(args[1]);
+    list.add(args[1]);
     args[0]
 }
 
 fn list_clear(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
-    list.elements.clear();
+    list.clear();
     Value::null()
 }
 
 fn list_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list(args);
-    Value::num(list.elements.len() as f64)
+    Value::num(list.len() as f64)
 }
 
 fn list_insert(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let count = receiver_list(args).elements.len();
+    let count = receiver_list(args).len();
     let index = match super::validate_index(ctx, args[1], count + 1, "Index") {
         Some(v) => v,
         None => return Value::null(),
     };
     let list = receiver_list_mut(args);
-    list.elements.insert(index, args[2]);
+    list.insert(index, args[2]);
     args[2]
 }
 
 fn list_iterate(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list(args);
     if args[1].is_null() {
-        if list.elements.is_empty() {
+        if list.is_empty() {
             return Value::bool(false);
         }
         return Value::num(0.0);
@@ -107,7 +107,7 @@ fn list_iterate(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 
     let index = args[1].as_num().unwrap() + 1.0;
-    if index >= list.elements.len() as f64 {
+    if index >= list.len() as f64 {
         return Value::bool(false);
     }
     Value::num(index)
@@ -116,23 +116,23 @@ fn list_iterate(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn list_iterator_value(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list(args);
     let index = args[1].as_num().unwrap() as usize;
-    list.elements[index]
+    list.get(index).unwrap_or(Value::null())
 }
 
 fn list_remove_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let count = receiver_list(args).elements.len();
+    let count = receiver_list(args).len();
     let index = match super::validate_index(ctx, args[1], count, "Index") {
         Some(v) => v,
         None => return Value::null(),
     };
     let list = receiver_list_mut(args);
-    list.elements.remove(index)
+    list.remove(index).unwrap_or(Value::null())
 }
 
 fn list_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
-    if let Some(pos) = list.elements.iter().position(|v| *v == args[1]) {
-        list.elements.remove(pos);
+    if let Some(pos) = list.as_slice().iter().position(|v| *v == args[1]) {
+        list.remove(pos);
         args[1]
     } else {
         Value::null()
@@ -141,14 +141,14 @@ fn list_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn list_index_of(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list(args);
-    match list.elements.iter().position(|v| *v == args[1]) {
+    match list.as_slice().iter().position(|v| *v == args[1]) {
         Some(i) => Value::num(i as f64),
         None => Value::num(-1.0),
     }
 }
 
 fn list_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let count = receiver_list(args).elements.len();
+    let count = receiver_list(args).len();
     let index_a = match super::validate_index(ctx, args[1], count, "Index 0") {
         Some(v) => v,
         None => return Value::null(),
@@ -158,7 +158,7 @@ fn list_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         None => return Value::null(),
     };
     let list = receiver_list_mut(args);
-    list.elements.swap(index_a, index_b);
+    list.swap(index_a, index_b);
     Value::null()
 }
 

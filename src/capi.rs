@@ -548,7 +548,7 @@ pub extern "C" fn wrenGetListCount(vm: *mut WrenVM, slot: c_int) -> c_int {
     let ptr = val.as_object().unwrap();
     unsafe {
         let list = &*(ptr as *const ObjList);
-        list.elements.len() as c_int
+        list.len() as c_int
     }
 }
 
@@ -570,12 +570,11 @@ pub extern "C" fn wrenGetListElement(
     unsafe {
         let list = &*(ptr as *const ObjList);
         let idx = if index < 0 {
-            (list.elements.len() as i32 + index) as usize
+            (list.len() as i32 + index) as usize
         } else {
             index as usize
         };
-        if idx < list.elements.len() {
-            let elem = list.elements[idx];
+        if let Some(elem) = list.get(idx) {
             (*vm).set_slot(element_slot as usize, elem);
         }
     }
@@ -600,13 +599,11 @@ pub extern "C" fn wrenSetListElement(
     unsafe {
         let list = &mut *(ptr as *mut ObjList);
         let idx = if index < 0 {
-            (list.elements.len() as i32 + index) as usize
+            (list.len() as i32 + index) as usize
         } else {
             index as usize
         };
-        if idx < list.elements.len() {
-            list.elements[idx] = elem;
-        }
+        list.set(idx, elem);
     }
 }
 
@@ -629,14 +626,13 @@ pub extern "C" fn wrenInsertInList(
     unsafe {
         let list = &mut *(ptr as *mut ObjList);
         let idx = if index < 0 {
-            // -1 means append
-            let i = list.elements.len() as i32 + 1 + index;
+            let i = list.len() as i32 + 1 + index;
             if i < 0 { 0usize } else { i as usize }
         } else {
             index as usize
         };
-        let idx = idx.min(list.elements.len());
-        list.elements.insert(idx, elem);
+        let idx = idx.min(list.len());
+        list.insert(idx, elem);
     }
 }
 
