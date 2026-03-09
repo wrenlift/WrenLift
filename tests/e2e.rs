@@ -1417,3 +1417,97 @@ System.print(fiber.error)
         "something went wrong",
     );
 }
+
+// ---------------------------------------------------------------------------
+// System.gc() — explicit garbage collection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_system_gc() {
+    assert_output(
+        r#"
+System.print("before")
+System.gc()
+System.print("after")
+"#,
+        "before\nafter",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GC under allocation pressure — objects survive collection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_gc_objects_survive() {
+    assert_output(
+        r#"
+var list = []
+for (i in 0...1000) {
+    list.add("item %(i)")
+}
+System.gc()
+System.print(list.count)
+System.print(list[999])
+"#,
+        "1000\nitem 999",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Circular import detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_circular_import_detected() {
+    let config = VMConfig {
+        load_module_fn: Some(Box::new(|name: &str| -> Option<String> {
+            match name {
+                "module_a" => Some(r#"import "module_b" for B"#.to_string()),
+                "module_b" => Some(r#"import "module_a" for A"#.to_string()),
+                _ => None,
+            }
+        })),
+        ..Default::default()
+    };
+
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", r#"import "module_a" for A"#);
+    assert!(
+        matches!(
+            result,
+            InterpretResult::CompileError | InterpretResult::RuntimeError
+        ),
+        "Expected error for circular import, got {:?}",
+        result
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Configurable step limit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_custom_step_limit() {
+    let config = VMConfig {
+        step_limit: 100,
+        ..Default::default()
+    };
+
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret(
+        "main",
+        r#"
+while (true) {
+    var x = 1
+}
+"#,
+    );
+    assert!(
+        matches!(result, InterpretResult::RuntimeError),
+        "Expected step limit error, got {:?}",
+        result
+    );
+}

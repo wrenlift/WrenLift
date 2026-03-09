@@ -10,7 +10,8 @@ fn system_clock(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     Value::num(duration.as_secs_f64())
 }
 
-fn system_gc(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+fn system_gc(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    ctx.trigger_gc();
     Value::null()
 }
 

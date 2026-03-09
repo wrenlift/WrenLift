@@ -65,8 +65,6 @@ impl From<InterpError> for RuntimeError {
     }
 }
 
-const MAX_STEPS: usize = 100_000_000;
-
 // ---------------------------------------------------------------------------
 // Fiber-based MIR interpreter
 // ---------------------------------------------------------------------------
@@ -85,7 +83,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
-        let fiber = vm.fiber;
+        let mut fiber = vm.fiber;
         unsafe {
             (*fiber).state = FiberState::Running;
         }
@@ -141,8 +139,30 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 }
 
                 steps += 1;
-                if steps > MAX_STEPS {
+                if steps > vm.config.step_limit {
                     return Err(RuntimeError::StepLimitExceeded);
+                }
+
+                // GC safepoint: check every 1024 instructions, or when explicitly requested.
+                if (steps & 0x3FF == 0 && vm.gc.should_collect()) || vm.gc_requested {
+                    vm.gc_requested = false;
+                    // Save values back to frame so GC can trace them.
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            frame.values = std::mem::take(&mut values);
+                            frame.current_block = current_block;
+                            frame.ip = ip;
+                        }
+                    }
+                    vm.collect_garbage();
+                    // Reload fiber — GC may have promoted/moved it.
+                    fiber = vm.fiber;
+                    // Restore (GC may have updated forwarded pointers).
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            values = std::mem::take(&mut frame.values);
+                        }
+                    }
                 }
 
                 use Instruction::*;
@@ -732,7 +752,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
             // -- Terminator --
             steps += 1;
-            if steps > MAX_STEPS {
+            if steps > vm.config.step_limit {
                 return Err(RuntimeError::StepLimitExceeded);
             }
 

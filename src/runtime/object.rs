@@ -909,6 +909,9 @@ pub trait NativeContext {
     /// Closure methods (closures run on a temporary fiber).
     /// Returns None if the method doesn't exist or the call fails.
     fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value>;
+
+    // -- Garbage collection --
+    fn trigger_gc(&mut self);
 }
 
 impl ObjClass {

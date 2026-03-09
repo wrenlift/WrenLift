@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use super::object::*;
 use super::value::Value;
 use crate::intern::SymbolId;
+use crate::mir::interp::InterpValue;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -719,6 +720,24 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                     mark_gray(frame.closure as *mut ObjHeader, gray_stack);
                 }
             }
+            // Trace MIR interpreter frames (SSA value maps, closures, classes).
+            for frame in &fiber.mir_frames {
+                for interp_val in frame.values.values() {
+                    if let InterpValue::Boxed(val) = interp_val {
+                        mark_value(*val, gray_stack);
+                    }
+                }
+                if let Some(closure) = frame.closure {
+                    if !closure.is_null() {
+                        mark_gray(closure as *mut ObjHeader, gray_stack);
+                    }
+                }
+                if let Some(class) = frame.defining_class {
+                    if !class.is_null() {
+                        mark_gray(class as *mut ObjHeader, gray_stack);
+                    }
+                }
+            }
             if !fiber.caller.is_null() {
                 mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
             }
@@ -731,11 +750,17 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                 mark_gray(class.superclass as *mut ObjHeader, gray_stack);
             }
             for method in class.methods.values() {
-                if let Method::Closure(ptr) = method {
-                    if !ptr.is_null() {
-                        mark_gray(*ptr as *mut ObjHeader, gray_stack);
+                match method {
+                    Method::Closure(ptr) | Method::Constructor(ptr) => {
+                        if !ptr.is_null() {
+                            mark_gray(*ptr as *mut ObjHeader, gray_stack);
+                        }
                     }
+                    Method::Native(_) => {}
                 }
+            }
+            for &val in class.static_fields.values() {
+                mark_value(val, gray_stack);
             }
         }
 
@@ -834,6 +859,20 @@ unsafe fn update_pointers_in_object(
             for frame in &mut fiber.frames {
                 update_raw_ptr(&mut frame.closure, forwards);
             }
+            // Update MIR interpreter frames.
+            for frame in &mut fiber.mir_frames {
+                for interp_val in frame.values.values_mut() {
+                    if let InterpValue::Boxed(ref mut val) = interp_val {
+                        update_value(val, forwards);
+                    }
+                }
+                if let Some(ref mut closure) = frame.closure {
+                    update_raw_ptr(closure, forwards);
+                }
+                if let Some(ref mut class) = frame.defining_class {
+                    update_raw_ptr(class, forwards);
+                }
+            }
             update_raw_ptr(&mut fiber.caller, forwards);
             update_value(&mut fiber.error, forwards);
         }
@@ -842,9 +881,15 @@ unsafe fn update_pointers_in_object(
             let class = &mut *(header as *mut ObjClass);
             update_raw_ptr(&mut class.superclass, forwards);
             for method in class.methods.values_mut() {
-                if let Method::Closure(ref mut ptr) = method {
-                    update_raw_ptr(ptr, forwards);
+                match method {
+                    Method::Closure(ref mut ptr) | Method::Constructor(ref mut ptr) => {
+                        update_raw_ptr(ptr, forwards);
+                    }
+                    Method::Native(_) => {}
                 }
+            }
+            for val in class.static_fields.values_mut() {
+                update_value(val, forwards);
             }
         }
 

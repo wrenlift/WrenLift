@@ -2,7 +2,7 @@
 ///
 /// Owns all runtime state: GC heap, interner, core classes, fibers,
 /// module registry, and configuration callbacks.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr;
 
@@ -78,6 +78,8 @@ pub struct VMConfig {
     /// Enable fiber stack trace tracking (opt-in, not standard Wren behavior).
     /// When enabled, cross-fiber stack traces include spawn sites and caller chains.
     pub fiber_stack_traces: bool,
+    /// Maximum number of interpreter steps before aborting (default: 100M).
+    pub step_limit: usize,
 }
 
 impl Default for VMConfig {
@@ -95,6 +97,7 @@ impl Default for VMConfig {
             execution_mode: ExecutionMode::default(),
             jit_threshold: 100,
             fiber_stack_traces: false,
+            step_limit: 100_000_000,
         }
     }
 }
@@ -164,6 +167,12 @@ pub struct VM {
 
     /// Last error message from runtime_error (for Fiber.try to retrieve).
     pub last_error: Option<String>,
+
+    /// Modules currently being loaded (for circular import detection).
+    loading_modules: HashSet<String>,
+
+    /// Flag set by System.gc() — actual collection happens at next safepoint.
+    pub gc_requested: bool,
 }
 
 impl VM {
@@ -203,6 +212,8 @@ impl VM {
             module_sources: HashMap::new(),
             error_fiber: ptr::null_mut(),
             last_error: None,
+            loading_modules: HashSet::new(),
+            gc_requested: false,
         };
 
         // Bootstrap core classes.
@@ -231,7 +242,17 @@ impl VM {
         use crate::sema;
         use std::collections::HashMap as HMap;
 
-        // 0. Store source for runtime error reporting
+        // 0. Cycle detection for imports
+        let module_key = module_name.to_string();
+        if !self.loading_modules.insert(module_key.clone()) {
+            self.report_error(&format!(
+                "Circular import detected: module '{}' is already being loaded",
+                module_name
+            ));
+            return InterpretResult::CompileError;
+        }
+
+        // 0b. Store source for runtime error reporting
         self.module_sources
             .insert(module_name.to_string(), source.to_string());
 
@@ -245,6 +266,7 @@ impl VM {
             for err in &parse_result.errors {
                 err.eprint(source);
             }
+            self.loading_modules.remove(&module_key);
             return InterpretResult::CompileError;
         }
 
@@ -268,6 +290,7 @@ impl VM {
             for err in &resolve_result.errors {
                 err.eprint(source);
             }
+            self.loading_modules.remove(&module_key);
             return InterpretResult::CompileError;
         }
 
@@ -291,10 +314,12 @@ impl VM {
                     if let Some(mod_source) = source_opt {
                         let result = self.interpret(&imported_module, &mod_source);
                         if result != InterpretResult::Success {
+                            self.loading_modules.remove(&module_key);
                             return result;
                         }
                     } else {
                         self.report_error(&format!("Could not load module '{}'", imported_module));
+                        self.loading_modules.remove(&module_key);
                         return InterpretResult::CompileError;
                     }
                 }
@@ -506,7 +531,7 @@ impl VM {
                 current_block: BlockId(0),
                 ip: 0,
                 values: HMap::new(),
-                module_name: module_key,
+                module_name: module_key.clone(),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
@@ -520,7 +545,7 @@ impl VM {
         // 10. Run the fiber
         let result = super::vm_interp::run_fiber(self);
 
-        match result {
+        let interpret_result = match result {
             Ok(_) => {
                 self.fiber = prev_fiber;
                 InterpretResult::Success
@@ -533,7 +558,9 @@ impl VM {
                 self.fiber = prev_fiber;
                 InterpretResult::RuntimeError
             }
-        }
+        };
+        self.loading_modules.remove(&module_key);
+        interpret_result
     }
 
     /// Extract source location from a fiber's current MIR frame for error reporting.
@@ -944,19 +971,106 @@ impl VM {
         }
     }
 
-    /// Run the garbage collector.
+    /// Run the garbage collector with complete root gathering.
     pub fn collect_garbage(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
 
-        // API stack roots
+        // 1. API stack
+        let api_len = self.api_stack.len();
         roots.extend_from_slice(&self.api_stack);
 
-        // Handle roots
+        // 2. Handles
+        let handles_start = roots.len();
         for h in &self.handles {
             roots.push(h.value);
         }
 
+        // 3. Core class pointers (13 classes) — may be nursery-allocated,
+        //    so they can be promoted/forwarded during GC.
+        let classes_start = roots.len();
+        let core_classes: [*mut ObjClass; 13] = [
+            self.object_class,
+            self.class_class,
+            self.bool_class,
+            self.num_class,
+            self.string_class,
+            self.list_class,
+            self.map_class,
+            self.range_class,
+            self.null_class,
+            self.fn_class,
+            self.fiber_class,
+            self.system_class,
+            self.sequence_class,
+        ];
+        for &ptr in &core_classes {
+            if !ptr.is_null() {
+                roots.push(Value::object(ptr as *mut u8));
+            } else {
+                roots.push(Value::null());
+            }
+        }
+
+        // 4. Current fiber (GC traces its mir_frames/caller chain internally)
+        let fiber_idx = roots.len();
+        if !self.fiber.is_null() {
+            roots.push(Value::object(self.fiber as *mut u8));
+        }
+
+        // 5. Module variables
+        let mut module_ranges: Vec<(String, usize, usize)> = Vec::new();
+        for (name, entry) in &self.engine.modules {
+            let start = roots.len();
+            roots.extend_from_slice(&entry.vars);
+            module_ranges.push((name.clone(), start, roots.len()));
+        }
+
+        // Collect
         self.gc.collect(&mut roots);
+
+        // Write back updated values (GC may have forwarded nursery pointers)
+        self.api_stack.copy_from_slice(&roots[..api_len]);
+        for (i, h) in self.handles.iter_mut().enumerate() {
+            h.value = roots[handles_start + i];
+        }
+
+        // Write back core class pointers
+        let class_fields: [&mut *mut ObjClass; 13] = [
+            &mut self.object_class,
+            &mut self.class_class,
+            &mut self.bool_class,
+            &mut self.num_class,
+            &mut self.string_class,
+            &mut self.list_class,
+            &mut self.map_class,
+            &mut self.range_class,
+            &mut self.null_class,
+            &mut self.fn_class,
+            &mut self.fiber_class,
+            &mut self.system_class,
+            &mut self.sequence_class,
+        ];
+        for (i, field) in class_fields.into_iter().enumerate() {
+            let val = roots[classes_start + i];
+            if let Some(ptr) = val.as_object() {
+                *field = ptr as *mut ObjClass;
+            }
+        }
+
+        // Write back fiber pointer
+        if !self.fiber.is_null() {
+            let val = roots[fiber_idx];
+            if let Some(ptr) = val.as_object() {
+                self.fiber = ptr as *mut ObjFiber;
+            }
+        }
+
+        // Write back module vars (may contain nursery objects that were promoted)
+        for (name, start, end) in &module_ranges {
+            if let Some(entry) = self.engine.modules.get_mut(name) {
+                entry.vars.copy_from_slice(&roots[*start..*end]);
+            }
+        }
     }
 }
 
@@ -1180,6 +1294,10 @@ impl NativeContext for VM {
                 result.ok()
             }
         }
+    }
+
+    fn trigger_gc(&mut self) {
+        self.gc_requested = true;
     }
 }
 
