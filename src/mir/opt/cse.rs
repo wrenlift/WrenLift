@@ -173,6 +173,8 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         MathUnaryF64(..) => 59,
         MathBinaryF64(..) => 60,
         GuardProtocol(..) => 61,
+        GetStaticField(..) => 62,
+        SetStaticField(..) => 63,
     }
 }
 

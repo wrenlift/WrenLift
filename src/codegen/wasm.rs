@@ -950,6 +950,9 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
+
+            // Static fields — not yet supported in WASM codegen.
+            Instruction::GetStaticField(_) | Instruction::SetStaticField(_, _) => {}
         }
         Ok(())
     }

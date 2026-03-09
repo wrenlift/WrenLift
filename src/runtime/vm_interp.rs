@@ -243,6 +243,25 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 let result = func(vm, &arg_vals);
                                 if vm.has_error {
                                     vm.has_error = false;
+                                    // If the fiber was invoked via try(), catch the error
+                                    // and return it to the caller instead of propagating.
+                                    let fiber_is_try = unsafe { (*fiber).is_try };
+                                    if fiber_is_try {
+                                        let err_msg = vm.last_error.take().unwrap_or_default();
+                                        let err_val = vm.new_string(err_msg);
+                                        unsafe {
+                                            (*fiber).error = err_val;
+                                            (*fiber).is_try = false;
+                                            (*fiber).state = FiberState::Done;
+                                        }
+                                        let caller = unsafe { (*fiber).caller };
+                                        if !caller.is_null() {
+                                            unsafe { (*fiber).caller = std::ptr::null_mut() };
+                                            resume_caller(vm, caller, err_val);
+                                            continue 'fiber_loop;
+                                        }
+                                        return Ok(err_val);
+                                    }
                                     return Err(RuntimeError::Error(
                                         "runtime error in native method".into(),
                                     ));
@@ -558,6 +577,32 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let inst = ptr as *mut ObjInstance;
                             unsafe {
                                 (*inst).set_field(*field_idx as usize, val);
+                            }
+                        }
+                        InterpValue::Boxed(val)
+                    }
+                    GetStaticField(sym) => {
+                        // Read from the defining class's static_fields map
+                        let frame = unsafe { (*fiber).mir_frames.last().unwrap() };
+                        if let Some(class_ptr) = frame.defining_class {
+                            let val = unsafe {
+                                (*class_ptr)
+                                    .static_fields
+                                    .get(sym)
+                                    .copied()
+                                    .unwrap_or(Value::null())
+                            };
+                            InterpValue::Boxed(val)
+                        } else {
+                            InterpValue::Boxed(Value::null())
+                        }
+                    }
+                    SetStaticField(sym, val_id) => {
+                        let val = get_val(&values, *val_id)?.to_value();
+                        let frame = unsafe { (*fiber).mir_frames.last().unwrap() };
+                        if let Some(class_ptr) = frame.defining_class {
+                            unsafe {
+                                (*class_ptr).static_fields.insert(*sym, val);
                             }
                         }
                         InterpValue::Boxed(val)

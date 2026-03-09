@@ -206,6 +206,10 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
             }
             *value = resolve(*value, map);
         }
+        Instruction::GetStaticField(_) => {}
+        Instruction::SetStaticField(_, val) => {
+            *val = resolve(*val, map);
+        }
     }
 }
 

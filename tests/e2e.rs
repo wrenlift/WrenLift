@@ -1355,3 +1355,65 @@ System.print(count)
         "10000",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Static fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_static_fields() {
+    assert_output(
+        r#"
+class Counter {
+    static increment() {
+        __count = __count + 1
+    }
+    static count { __count }
+    static reset() {
+        __count = 0
+    }
+}
+
+Counter.reset()
+Counter.increment()
+Counter.increment()
+Counter.increment()
+System.print(Counter.count)
+"#,
+        "3",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Compound assignment on subscript
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_compound_assign_subscript() {
+    assert_output(
+        r#"
+var list = [10, 20, 30]
+list[1] = list[1] + 5
+System.print(list[1])
+"#,
+        "25",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fiber.try — catches runtime errors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_fiber_try() {
+    assert_output(
+        r#"
+var fiber = Fiber.new {
+    Fiber.abort("something went wrong")
+}
+var result = fiber.try()
+System.print(fiber.error)
+"#,
+        "something went wrong",
+    );
+}

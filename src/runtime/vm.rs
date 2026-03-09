@@ -161,6 +161,9 @@ pub struct VM {
 
     // -- Post-mortem error fiber (saved before restoring prev_fiber) --
     pub error_fiber: *mut ObjFiber,
+
+    /// Last error message from runtime_error (for Fiber.try to retrieve).
+    pub last_error: Option<String>,
 }
 
 impl VM {
@@ -199,6 +202,7 @@ impl VM {
             pending_fiber_action: None,
             module_sources: HashMap::new(),
             error_fiber: ptr::null_mut(),
+            last_error: None,
         };
 
         // Bootstrap core classes.
@@ -998,6 +1002,7 @@ impl NativeContext for VM {
 
     fn runtime_error(&mut self, msg: String) {
         self.has_error = true;
+        self.last_error = Some(msg.clone());
         self.report_error(&msg);
     }
 

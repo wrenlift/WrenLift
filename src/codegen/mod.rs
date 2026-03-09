@@ -2635,6 +2635,12 @@ impl<'a> LowerCtx<'a> {
             Instruction::BlockParam(_) => {
                 self.vreg_for(dst_val);
             }
+
+            // Static fields — lowered as CallRuntime for now.
+            Instruction::GetStaticField(_) | Instruction::SetStaticField(_, _) => {
+                // TODO: implement static field codegen
+                self.vreg_for(dst_val);
+            }
         }
     }
 

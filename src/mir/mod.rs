@@ -296,6 +296,10 @@ pub enum Instruction {
     GetField(ValueId, u16),
     /// Write an instance field by index.
     SetField(ValueId, u16, ValueId),
+    /// Read a static field (__name) from the defining class.
+    GetStaticField(SymbolId),
+    /// Write a static field (__name) on the defining class.
+    SetStaticField(SymbolId, ValueId),
     /// Read a module variable by index.
     GetModuleVar(u16),
     /// Write a module variable by index.
@@ -436,6 +440,8 @@ impl Instruction {
 
             Instruction::GetField(recv, _) => vec![*recv],
             Instruction::SetField(recv, _, val) => vec![*recv, *val],
+            Instruction::GetStaticField(_) => vec![],
+            Instruction::SetStaticField(_, val) => vec![*val],
             Instruction::SetModuleVar(_, val) => vec![*val],
             Instruction::SetUpvalue(_, val) => vec![*val],
 
@@ -919,6 +925,10 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::GetField(recv, idx) => format!("get_field {}, #{}", recv, idx),
         Instruction::SetField(recv, idx, val) => {
             format!("set_field {}, #{}, {}", recv, idx, val)
+        }
+        Instruction::GetStaticField(sym) => format!("get_static_field :{}", sym.index()),
+        Instruction::SetStaticField(sym, val) => {
+            format!("set_static_field :{}, {}", sym.index(), val)
         }
         Instruction::GetModuleVar(idx) => format!("get_module_var @{}", idx),
         Instruction::SetModuleVar(idx, val) => format!("set_module_var @{}, {}", idx, val),

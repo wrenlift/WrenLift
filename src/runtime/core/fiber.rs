@@ -275,12 +275,53 @@ fn fiber_stack_trace(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    // try() is like call() but catches runtime errors
-    fiber_call_0(ctx, args)
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => {
+            let state = unsafe { (*f).state };
+            match state {
+                FiberState::New | FiberState::Suspended => {
+                    unsafe { (*f).is_try = true };
+                    ctx.set_fiber_action_call(f, Value::null());
+                }
+                FiberState::Done => {
+                    ctx.runtime_error("Cannot call a finished fiber.".to_string());
+                }
+                _ => {
+                    ctx.runtime_error("Fiber has already been called.".to_string());
+                }
+            }
+        }
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+        }
+    }
+    Value::null()
 }
 
 fn fiber_try_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    fiber_call_1(ctx, args)
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => {
+            let state = unsafe { (*f).state };
+            match state {
+                FiberState::New | FiberState::Suspended => {
+                    unsafe { (*f).is_try = true };
+                    ctx.set_fiber_action_call(f, args[1]);
+                }
+                FiberState::Done => {
+                    ctx.runtime_error("Cannot call a finished fiber.".to_string());
+                }
+                _ => {
+                    ctx.runtime_error("Fiber has already been called.".to_string());
+                }
+            }
+        }
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+        }
+    }
+    Value::null()
 }
 
 pub fn bind(vm: &mut VM) {

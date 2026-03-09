@@ -609,12 +609,7 @@ impl<'a> MirBuilder<'a> {
                     .unwrap_or(0);
                 self.emit(Instruction::GetField(this_val, idx))
             }
-            Expr::StaticField(_name) => {
-                // Static fields (__name) are class-level storage. Not yet fully
-                // implemented — emit ConstNull so we don't misresolve as wrong
-                // module var.
-                self.emit(Instruction::ConstNull)
-            }
+            Expr::StaticField(name) => self.emit(Instruction::GetStaticField(*name)),
 
             Expr::Interpolation(parts) => {
                 let mut vals = Vec::new();
@@ -963,6 +958,34 @@ impl<'a> MirBuilder<'a> {
                     .and_then(|m| m.get(name).copied())
                     .unwrap_or(0);
                 self.emit(Instruction::SetField(this_val, idx, value));
+            }
+            Expr::StaticField(name) => {
+                self.emit(Instruction::SetStaticField(*name, value));
+            }
+            Expr::Subscript { receiver, args } => {
+                let recv = self.lower_expr(receiver);
+                let arg_vals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
+                self.emit(Instruction::SubscriptSet {
+                    receiver: recv,
+                    args: arg_vals,
+                    value,
+                });
+            }
+            Expr::Call {
+                receiver: Some(recv_expr),
+                method,
+                args,
+                ..
+            } if args.is_empty() => {
+                // Property setter: obj.name = value → Call obj.name=(value)
+                let recv = self.lower_expr(recv_expr);
+                let setter_name = format!("{}=(_)", self.interner.resolve(method.0));
+                let setter_sym = self.interner.intern(&setter_name);
+                self.emit(Instruction::Call {
+                    receiver: recv,
+                    method: setter_sym,
+                    args: vec![value],
+                });
             }
             _ => {}
         }

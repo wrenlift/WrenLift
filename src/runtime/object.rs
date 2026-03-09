@@ -745,6 +745,9 @@ pub struct ObjFiber {
     pub resume_value_dst: Option<crate::mir::ValueId>,
     /// Stack trace snapshot from where this fiber was spawned (opt-in).
     pub spawn_trace: Option<Vec<StackFrame>>,
+    /// When true, runtime errors are caught and stored on the fiber instead
+    /// of propagating (set by Fiber.try).
+    pub is_try: bool,
 }
 
 impl Default for ObjFiber {
@@ -765,6 +768,7 @@ impl ObjFiber {
             error: Value::null(),
             resume_value_dst: None,
             spawn_trace: None,
+            is_try: false,
         }
     }
 
@@ -826,6 +830,8 @@ pub struct ObjClass {
     pub is_foreign: bool,
     /// Protocols this class conforms to (bitset, populated at class creation).
     pub protocols: crate::sema::protocol::ProtocolSet,
+    /// Static fields (__name) — per-class storage shared across instances.
+    pub static_fields: HashMap<SymbolId, Value>,
 }
 
 /// A method entry in the class method table.
@@ -929,6 +935,7 @@ impl ObjClass {
             num_fields: 0,
             is_foreign: false,
             protocols,
+            static_fields: HashMap::new(),
         }
     }
 
