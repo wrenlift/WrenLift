@@ -84,13 +84,17 @@ fn fiber_abort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::null()
 }
 
-fn fiber_current(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    // TODO: return the current fiber as a Value
-    Value::null()
+fn fiber_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let fiber = ctx.get_current_fiber();
+    if fiber.is_null() {
+        Value::null()
+    } else {
+        Value::object(fiber as *mut u8)
+    }
 }
 
-fn fiber_suspend(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    // TODO: suspend the current fiber
+fn fiber_suspend(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    ctx.set_fiber_action_suspend();
     Value::null()
 }
 

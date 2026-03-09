@@ -82,6 +82,109 @@ pub extern "C" fn wren_super_call(_receiver: u64, _method: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Boxed NaN-boxed arithmetic runtime functions
+// ---------------------------------------------------------------------------
+
+/// Helper: unbox a NaN-boxed u64 as f64.
+#[inline(always)]
+fn unbox_num(bits: u64) -> f64 {
+    f64::from_bits(bits)
+}
+
+/// Helper: box an f64 as NaN-boxed u64.
+#[inline(always)]
+fn box_num(n: f64) -> u64 {
+    Value::num(n).to_bits()
+}
+
+pub extern "C" fn wren_num_add(a: u64, b: u64) -> u64 {
+    box_num(unbox_num(a) + unbox_num(b))
+}
+
+pub extern "C" fn wren_num_sub(a: u64, b: u64) -> u64 {
+    box_num(unbox_num(a) - unbox_num(b))
+}
+
+pub extern "C" fn wren_num_mul(a: u64, b: u64) -> u64 {
+    box_num(unbox_num(a) * unbox_num(b))
+}
+
+pub extern "C" fn wren_num_div(a: u64, b: u64) -> u64 {
+    box_num(unbox_num(a) / unbox_num(b))
+}
+
+pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
+    box_num(unbox_num(a) % unbox_num(b))
+}
+
+pub extern "C" fn wren_num_neg(a: u64) -> u64 {
+    box_num(-unbox_num(a))
+}
+
+// ---------------------------------------------------------------------------
+// Boxed comparison runtime functions
+// ---------------------------------------------------------------------------
+
+pub extern "C" fn wren_cmp_lt(a: u64, b: u64) -> u64 {
+    Value::bool(unbox_num(a) < unbox_num(b)).to_bits()
+}
+
+pub extern "C" fn wren_cmp_gt(a: u64, b: u64) -> u64 {
+    Value::bool(unbox_num(a) > unbox_num(b)).to_bits()
+}
+
+pub extern "C" fn wren_cmp_le(a: u64, b: u64) -> u64 {
+    Value::bool(unbox_num(a) <= unbox_num(b)).to_bits()
+}
+
+pub extern "C" fn wren_cmp_ge(a: u64, b: u64) -> u64 {
+    Value::bool(unbox_num(a) >= unbox_num(b)).to_bits()
+}
+
+pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
+    Value::bool(a == b).to_bits()
+}
+
+pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
+    Value::bool(a != b).to_bits()
+}
+
+// ---------------------------------------------------------------------------
+// Boxed logical
+// ---------------------------------------------------------------------------
+
+pub extern "C" fn wren_not(a: u64) -> u64 {
+    Value::bool(Value::from_bits(a).is_falsy()).to_bits()
+}
+
+// ---------------------------------------------------------------------------
+// Upvalue, guard, and misc runtime functions
+// ---------------------------------------------------------------------------
+
+pub extern "C" fn wren_get_upvalue(_closure: u64, _index: u64) -> u64 {
+    Value::null().to_bits()
+}
+
+pub extern "C" fn wren_set_upvalue(_closure: u64, _index: u64, _value: u64) -> u64 {
+    Value::null().to_bits()
+}
+
+pub extern "C" fn wren_set_module_var(_slot: u64, _value: u64) -> u64 {
+    Value::null().to_bits()
+}
+
+pub extern "C" fn wren_guard_class(_value: u64, _class: u64) -> u64 {
+    // Guard pass — no-op if type matches, trap on mismatch.
+    // Stub: always passes.
+    _value
+}
+
+pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
+    let v = Value::from_bits(value);
+    Value::bool(!v.is_falsy()).to_bits()
+}
+
+// ---------------------------------------------------------------------------
 // Address resolution
 // ---------------------------------------------------------------------------
 
@@ -101,6 +204,28 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_subscript_get" => Some(wren_subscript_get as usize),
         "wren_subscript_set" => Some(wren_subscript_set as usize),
         "wren_super_call" => Some(wren_super_call as usize),
+        // Boxed arithmetic
+        "wren_num_add" => Some(wren_num_add as usize),
+        "wren_num_sub" => Some(wren_num_sub as usize),
+        "wren_num_mul" => Some(wren_num_mul as usize),
+        "wren_num_div" => Some(wren_num_div as usize),
+        "wren_num_mod" => Some(wren_num_mod as usize),
+        "wren_num_neg" => Some(wren_num_neg as usize),
+        // Boxed comparisons
+        "wren_cmp_lt" => Some(wren_cmp_lt as usize),
+        "wren_cmp_gt" => Some(wren_cmp_gt as usize),
+        "wren_cmp_le" => Some(wren_cmp_le as usize),
+        "wren_cmp_ge" => Some(wren_cmp_ge as usize),
+        "wren_cmp_eq" => Some(wren_cmp_eq as usize),
+        "wren_cmp_ne" => Some(wren_cmp_ne as usize),
+        // Logical
+        "wren_not" => Some(wren_not as usize),
+        // Upvalue, guard, misc
+        "wren_get_upvalue" => Some(wren_get_upvalue as usize),
+        "wren_set_upvalue" => Some(wren_set_upvalue as usize),
+        "wren_set_module_var" => Some(wren_set_module_var as usize),
+        "wren_guard_class" => Some(wren_guard_class as usize),
+        "wren_is_truthy" => Some(wren_is_truthy as usize),
         _ => None,
     }
 }

@@ -22,6 +22,8 @@ pub enum FiberAction {
     Yield { value: Value },
     /// Transfer to target fiber (no caller chain).
     Transfer { target: *mut ObjFiber, value: Value },
+    /// Suspend the current fiber (no caller to return to).
+    Suspend,
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +804,14 @@ impl NativeContext for VM {
 
     fn set_fiber_action_transfer(&mut self, target: *mut ObjFiber, value: Value) {
         self.pending_fiber_action = Some(FiberAction::Transfer { target, value });
+    }
+
+    fn set_fiber_action_suspend(&mut self) {
+        self.pending_fiber_action = Some(FiberAction::Suspend);
+    }
+
+    fn get_current_fiber(&self) -> *mut ObjFiber {
+        self.fiber
     }
 }
 
@@ -1596,6 +1606,52 @@ while (i < 3) {
     }
 
     #[test]
+    fn test_interpret_string_interpolation() {
+        let (result, output) = run_and_capture(r#"
+var name = "world"
+var n = 42
+System.print("hello %(name)!")
+System.print("n = %(n)")
+"#);
+        assert!(matches!(result, InterpretResult::Success), "interpolation failed: {:?}", result);
+        assert_eq!(output, "hello world!\nn = 42\n");
+    }
+
+    #[test]
+    fn test_interpret_is_operator() {
+        let (result, output) = run_and_capture(r#"
+System.print(42 is Num)
+System.print("hi" is String)
+System.print(null is Null)
+System.print(42 is String)
+System.print(true is Bool)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "is operator failed: {:?}", result);
+        assert_eq!(output, "true\ntrue\ntrue\nfalse\ntrue\n");
+    }
+
+    #[test]
+    fn test_interpret_setter() {
+        let (result, output) = run_and_capture(r#"
+class Point {
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
+  x { _x }
+  x=(v) { _x = v }
+  y { _y }
+}
+var p = Point.new(1, 2)
+System.print(p.x)
+p.x = 99
+System.print(p.x)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "setter failed: {:?}", result);
+        assert_eq!(output, "1\n99\n");
+    }
+
+    #[test]
     fn test_interpret_list_subscript() {
         let (result, output) = run_and_capture(r#"
 var list = [10, 20, 30]
@@ -1655,6 +1711,78 @@ System.print(Foo.double(21))
         let output = vm.take_output();
         assert!(matches!(result, InterpretResult::Success), "static method with args failed: {:?}", result);
         assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_map_literal() {
+        let (result, output) = run_and_capture(r#"
+var m = {"a": 1, "b": 2}
+System.print(m["a"])
+System.print(m["b"])
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "1\n2\n");
+    }
+
+    #[test]
+    fn test_interpret_map_subscript_set() {
+        let (result, output) = run_and_capture(r#"
+var m = Map.new()
+m["key"] = 42
+System.print(m["key"])
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_map_count() {
+        let (result, output) = run_and_capture(r#"
+var m = {"x": 1, "y": 2, "z": 3}
+System.print(m.count)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "3\n");
+    }
+
+    #[test]
+    fn test_interpret_fn_arity() {
+        let (result, output) = run_and_capture(r#"
+var f = Fn.new {|a, b, c| a }
+System.print(f.arity)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "3\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_current() {
+        let (result, output) = run_and_capture(r#"
+var f = Fiber.current
+System.print(f is Fiber)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "true\n");
+    }
+
+    #[test]
+    fn test_interpret_fiber_suspend() {
+        // Fiber.suspend() should suspend the current fiber.
+        // When called from the root fiber with no caller, execution just stops.
+        let (result, output) = run_and_capture(r#"
+var fiber = Fiber.new {
+  System.print("before")
+  Fiber.suspend()
+  System.print("after")
+}
+fiber.call()
+System.print("main continues")
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        // After fiber.call(), the child runs "before", then suspends.
+        // Control returns to main which prints "main continues".
+        // "after" is never printed because the fiber is suspended and not resumed.
+        assert_eq!(output, "before\nmain continues\n");
     }
 
     #[test]

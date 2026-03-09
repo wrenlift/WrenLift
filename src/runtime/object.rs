@@ -841,6 +841,8 @@ pub trait NativeContext {
     fn set_fiber_action_call(&mut self, target: *mut ObjFiber, value: Value);
     fn set_fiber_action_yield(&mut self, value: Value);
     fn set_fiber_action_transfer(&mut self, target: *mut ObjFiber, value: Value);
+    fn set_fiber_action_suspend(&mut self);
+    fn get_current_fiber(&self) -> *mut ObjFiber;
 }
 
 impl ObjClass {

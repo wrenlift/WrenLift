@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::codegen::ExecutableFunction;
 use crate::intern::SymbolId;
 use crate::mir::MirFunction;
 
@@ -55,7 +56,11 @@ pub enum FuncBody {
         /// Number of times this function has been called (for tier-up).
         call_count: u32,
     },
-    // Future: Compiled { executable, mir } for JIT tier
+    /// JIT-compiled native code. MIR retained for deopt/debugging.
+    Compiled {
+        executable: ExecutableFunction,
+        mir: Arc<MirFunction>,
+    },
 }
 
 impl FuncBody {
@@ -63,8 +68,13 @@ impl FuncBody {
     /// Returns an Arc so callers can hold the MIR independently of the engine.
     pub fn mir(&self) -> &Arc<MirFunction> {
         match self {
-            FuncBody::Interpreted { mir, .. } => mir,
+            FuncBody::Interpreted { mir, .. } | FuncBody::Compiled { mir, .. } => mir,
         }
+    }
+
+    /// Whether this function has been compiled to native code.
+    pub fn is_compiled(&self) -> bool {
+        matches!(self, FuncBody::Compiled { .. })
     }
 }
 
@@ -160,6 +170,43 @@ impl ExecutionEngine {
             false
         }
     }
+
+    /// Compile a function to native code and replace its body.
+    /// Returns true if compilation succeeded.
+    pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
+        let target = Self::native_target();
+        let mir = match self.functions.get(id.0 as usize) {
+            Some(FuncBody::Interpreted { mir, .. }) => Arc::clone(mir),
+            Some(FuncBody::Compiled { .. }) => return true, // already compiled
+            None => return false,
+        };
+
+        match crate::codegen::compile_function_with_interner(&mir, target, interner) {
+            Ok(compiled) => {
+                match compiled.into_executable() {
+                    Ok(executable) => {
+                        self.functions[id.0 as usize] = FuncBody::Compiled {
+                            executable,
+                            mir,
+                        };
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Determine the native compilation target for the current platform.
+    fn native_target() -> crate::codegen::Target {
+        #[cfg(target_arch = "x86_64")]
+        { crate::codegen::Target::X86_64 }
+        #[cfg(target_arch = "aarch64")]
+        { crate::codegen::Target::Aarch64 }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        { crate::codegen::Target::Wasm }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,5 +270,39 @@ mod tests {
     #[test]
     fn test_default_execution_mode() {
         assert_eq!(ExecutionMode::default(), ExecutionMode::Tiered);
+    }
+
+    #[test]
+    fn test_tier_up_compiles_function() {
+        let mut interner = Interner::new();
+        let name = interner.intern("add_f64");
+        // Use unboxed f64 arithmetic (ConstF64 + AddF64) which compiles
+        // inline without needing CallRuntime ABI support.
+        let mut f = MirFunction::new(name, 0);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, crate::mir::Instruction::ConstF64(10.0)));
+            b.instructions.push((v1, crate::mir::Instruction::ConstF64(32.0)));
+            b.instructions.push((v2, crate::mir::Instruction::AddF64(v0, v1)));
+            b.terminator = crate::mir::Terminator::Return(v2);
+        }
+
+        let mut engine = ExecutionEngine::new(ExecutionMode::Tiered);
+        engine.jit_threshold = 2;
+        let id = engine.register_function(f);
+
+        assert!(!engine.get_function(id).unwrap().is_compiled());
+        assert!(!engine.record_call(id)); // 1
+        assert!(engine.record_call(id));  // 2 = threshold
+
+        let result = engine.tier_up(id, &interner);
+        assert!(result, "tier_up should succeed for simple f64 arithmetic");
+        assert!(engine.get_function(id).unwrap().is_compiled());
+        // MIR should still be accessible after compilation
+        assert!(engine.get_mir(id).is_some());
     }
 }

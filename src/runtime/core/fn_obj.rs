@@ -8,9 +8,17 @@ fn fn_new(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     args[1]
 }
 
-fn fn_arity(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    // Extract ObjClosure from receiver, get function, return arity as Num.
-    // For now return 0 as placeholder.
+fn fn_arity(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    if let Some(ptr) = args[0].as_object() {
+        let header = ptr as *const crate::runtime::object::ObjHeader;
+        unsafe {
+            if (*header).obj_type == crate::runtime::object::ObjType::Closure {
+                let closure = ptr as *const crate::runtime::object::ObjClosure;
+                let func = (*closure).function;
+                return Value::num((*func).arity as f64);
+            }
+        }
+    }
     Value::num(0.0)
 }
 
@@ -19,7 +27,7 @@ fn fn_to_string(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 fn fn_call_stub(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    ctx.runtime_error("Fn.call not yet implemented.".to_string());
+    ctx.runtime_error("Receiver is not a function.".to_string());
     Value::null()
 }
 

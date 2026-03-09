@@ -1380,6 +1380,16 @@ impl ExecutableFunction {
 /// Native pipeline: MIR → lower → regalloc → sentinel fixup → emit.
 /// WASM pipeline: MIR → emit_mir (bypasses MachInst entirely).
 pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFunction, String> {
+    let interner = crate::intern::Interner::new();
+    compile_function_with_interner(mir, target, &interner)
+}
+
+/// Compile with access to the VM's interner for symbol resolution.
+pub fn compile_function_with_interner(
+    mir: &MirFunction,
+    target: Target,
+    interner: &crate::intern::Interner,
+) -> Result<CompiledFunction, String> {
     match target {
         Target::Wasm => {
             // WASM: lower directly from MIR, no MachInst layer needed.
@@ -1388,7 +1398,9 @@ pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFun
         }
         _ => {
             // 1. Lower MIR → MachFunc (virtual registers)
-            let mut mach = lower_mir(mir);
+            let mut mach = lower_mir_with_interner(mir, interner);
+            // 1b. Link runtime calls: CallRuntime → LoadImm + CallInd
+            runtime_fns::link_runtime_calls(&mut mach);
             // Native: register allocation + emit.
             let target_regs = match target {
                 Target::X86_64 => regalloc::x86_64_target_regs(),

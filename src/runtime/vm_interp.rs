@@ -351,7 +351,18 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             .collect::<Result<_, _>>()?;
                         InterpValue::Boxed(vm.new_list(elements))
                     }
-                    MakeMap(_) => InterpValue::Boxed(vm.new_map()),
+                    MakeMap(pairs) => {
+                        let map_val = vm.new_map();
+                        if !pairs.is_empty() {
+                            let map_ptr = map_val.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
+                            for (k, v) in pairs {
+                                let key = get_val(&values, *k)?.to_value();
+                                let val = get_val(&values, *v)?.to_value();
+                                unsafe { (*map_ptr).set(key, val); }
+                            }
+                        }
+                        InterpValue::Boxed(map_val)
+                    }
                     MakeRange(from, to, inclusive) => {
                         let f = get_val(&values, *from)?.as_f64()
                             .map_err(RuntimeError::from)?;
@@ -444,7 +455,10 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     MakeClosure { fn_id, upvalues: uv_ids } => {
                         let closure_name = vm.interner.intern("<closure>");
                         let uv_count = uv_ids.len() as u16;
-                        let fn_ptr = vm.gc.alloc_fn(closure_name, 0, uv_count, *fn_id);
+                        let arity = vm.engine.get_mir(crate::runtime::engine::FuncId(*fn_id))
+                            .map(|mir| mir.arity)
+                            .unwrap_or(0);
+                        let fn_ptr = vm.gc.alloc_fn(closure_name, arity, uv_count, *fn_id);
                         unsafe { (*fn_ptr).header.class = vm.fn_class; }
                         let closure_ptr = vm.gc.alloc_closure(fn_ptr);
                         unsafe { (*closure_ptr).header.class = vm.fn_class; }
@@ -708,6 +722,14 @@ fn dispatch_closure_with_class(
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = crate::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
 
+    // Tier-up: record call and compile if threshold reached
+    let should_tier_up = vm.engine.record_call(target_func_id);
+    if should_tier_up {
+        let interner = &vm.interner as *const crate::intern::Interner;
+        // Safety: interner is not modified during tier_up; separate field from engine
+        vm.engine.tier_up(target_func_id, unsafe { &*interner });
+    }
+
     let target_mir = vm.engine.get_mir(target_func_id)
         .ok_or_else(|| RuntimeError::Error("invalid closure func_id".into()))?;
 
@@ -835,6 +857,20 @@ fn handle_fiber_action(
             }
 
             vm.fiber = target;
+            Ok(())
+        }
+        FiberAction::Suspend => {
+            unsafe {
+                (*fiber).state = FiberState::Suspended;
+                (*fiber).resume_value_dst = Some(call_dst);
+            }
+            // If there's a caller, return to it (like yield with null).
+            // If no caller, execution stops (run_fiber will see no active fiber).
+            let caller = unsafe { (*fiber).caller };
+            if !caller.is_null() {
+                unsafe { (*fiber).caller = std::ptr::null_mut(); }
+                resume_caller(vm, caller, Value::null());
+            }
             Ok(())
         }
     }
