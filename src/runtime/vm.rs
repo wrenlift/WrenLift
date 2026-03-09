@@ -1367,6 +1367,30 @@ impl NativeContext for VM {
             .map(|entry| entry.var_names.clone())
     }
 
+    fn meta_eval(&mut self, _module: &str, source: &str) -> bool {
+        // Find the calling module from the current fiber's frame
+        let eval_module = if !self.fiber.is_null() {
+            unsafe {
+                (*self.fiber)
+                    .mir_frames
+                    .last()
+                    .map(|f| f.module_name.clone())
+                    .unwrap_or_else(|| "main".to_string())
+            }
+        } else {
+            "main".to_string()
+        };
+        self.eval_source_in_module(&eval_module, source)
+    }
+
+    fn meta_compile(&mut self, source: &str) -> Option<Value> {
+        self.compile_to_closure(source, false)
+    }
+
+    fn meta_compile_expression(&mut self, expr: &str) -> Option<Value> {
+        self.compile_to_closure(expr, true)
+    }
+
     fn trigger_gc(&mut self) {
         self.gc_requested = true;
     }
@@ -1377,6 +1401,274 @@ impl NativeContext for VM {
 // ---------------------------------------------------------------------------
 
 impl VM {
+    /// Compile and execute Wren source within an existing module's scope.
+    ///
+    /// The calling module's variable names are added to the resolver prelude
+    /// so the eval'd code can reference them. The compiled code runs on a
+    /// temporary fiber with the module's variable storage.
+    fn eval_source_in_module(&mut self, module_name: &str, source: &str) -> bool {
+        use crate::diagnostics::Severity;
+        use crate::mir::opt::{
+            constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+            run_to_fixpoint, sra::Sra, MirPass,
+        };
+        use crate::parse::parser;
+
+        // 1. Parse
+        let parse_result = parser::parse(source);
+        if parse_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &parse_result.errors {
+                err.eprint(source);
+            }
+            return false;
+        }
+
+        // 2. Resolve with core classes + calling module's variables in prelude
+        let mut interner = parse_result.interner;
+        let core_names = [
+            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
+            "Fiber", "System", "Sequence",
+        ];
+        let mut prelude: Vec<crate::intern::SymbolId> =
+            core_names.iter().map(|n| interner.intern(n)).collect();
+
+        // Add calling module's variable names to prelude
+        if let Some(entry) = self.engine.modules.get(module_name) {
+            for name in &entry.var_names {
+                prelude.push(interner.intern(name));
+            }
+        }
+
+        let resolve_result =
+            crate::sema::resolve::resolve_with_prelude(&parse_result.module, &interner, &prelude);
+        if resolve_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &resolve_result.errors {
+                err.eprint(source);
+            }
+            return false;
+        }
+
+        // 3. Lower + optimize
+        let mut module_mir =
+            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+        let constfold = ConstFold;
+        let dce = Dce;
+        let cse = Cse;
+        let type_spec = TypeSpecialize::with_math(&interner);
+        let licm = Licm;
+        let sra = Sra;
+        let passes: Vec<&dyn MirPass> = vec![
+            &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+        ];
+        run_to_fixpoint(&mut module_mir.top_level, &passes, 10);
+
+        // 4. Remap symbols
+        let mut sym_map: Vec<crate::intern::SymbolId> = Vec::with_capacity(interner.len());
+        for i in 0..interner.len() {
+            let old_sym = crate::intern::SymbolId::from_raw(i as u32);
+            let s = interner.resolve(old_sym);
+            let new_sym = self.interner.intern(s);
+            sym_map.push(new_sym);
+        }
+        module_mir
+            .top_level
+            .remap_symbols(|old| sym_map[old.index() as usize]);
+
+        // 5. Register closures if any
+        let mut closure_func_ids: Vec<u32> = Vec::new();
+        for closure in module_mir.closures.drain(..) {
+            let fid = self.engine.register_function(closure);
+            closure_func_ids.push(fid.0);
+        }
+        patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
+
+        // 6. Register the eval function and execute on temp fiber with module vars
+        let func_id = self.engine.register_function(module_mir.top_level);
+
+        // Build eval module vars in the order the resolver expects, looking up
+        // values by name from the calling module (to match slot indices).
+        let calling_var_names: Vec<String> = self
+            .engine
+            .modules
+            .get(module_name)
+            .map(|e| e.var_names.clone())
+            .unwrap_or_default();
+        let calling_vars: Vec<Value> = self
+            .engine
+            .modules
+            .get(module_name)
+            .map(|e| e.vars.clone())
+            .unwrap_or_default();
+
+        let mut eval_vars = Vec::with_capacity(resolve_result.module_vars.len());
+        let mut eval_var_names = Vec::with_capacity(resolve_result.module_vars.len());
+        for &parse_sym in &resolve_result.module_vars {
+            let name = interner.resolve(parse_sym);
+            eval_var_names.push(name.to_string());
+            if let Some(idx) = calling_var_names.iter().position(|n| n == name) {
+                eval_vars.push(calling_vars[idx]);
+            } else if let Some(value) = self.core_class_value(name) {
+                eval_vars.push(value);
+            } else if let Some(value) = self.find_imported_var(name) {
+                eval_vars.push(value);
+            } else {
+                eval_vars.push(Value::null());
+            }
+        }
+
+        let eval_module_name = format!("__eval_{}__", module_name);
+        self.engine.modules.insert(
+            eval_module_name.clone(),
+            super::engine::ModuleEntry {
+                top_level: func_id,
+                vars: eval_vars,
+                var_names: eval_var_names,
+            },
+        );
+
+        let fiber = self.gc.alloc_fiber();
+        unsafe {
+            (*fiber).header.class = self.fiber_class;
+            (*fiber).mir_frames.push(MirCallFrame {
+                func_id,
+                current_block: crate::mir::BlockId(0),
+                ip: 0,
+                values: std::collections::HashMap::new(),
+                module_name: eval_module_name.clone(),
+                return_dst: None,
+                closure: None,
+                defining_class: None,
+            });
+        }
+
+        let prev_fiber = self.fiber;
+        self.fiber = fiber;
+        let result = super::vm_interp::run_fiber(self);
+        self.fiber = prev_fiber;
+
+        // Write back eval module vars to the calling module by name
+        if let Some(eval_entry) = self.engine.modules.get(&eval_module_name) {
+            let eval_names = eval_entry.var_names.clone();
+            let eval_vals = eval_entry.vars.clone();
+            if let Some(calling_entry) = self.engine.modules.get_mut(module_name) {
+                for (i, name) in eval_names.iter().enumerate() {
+                    if let Some(j) = calling_entry.var_names.iter().position(|n| n == name) {
+                        if i < eval_vals.len() {
+                            calling_entry.vars[j] = eval_vals[i];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cleanup temp module
+        self.engine.modules.remove(&eval_module_name);
+
+        result.is_ok()
+    }
+
+    /// Compile Wren source into a callable closure value.
+    ///
+    /// If `is_expression` is true, wraps the source as `return <expr>\n`
+    /// so calling the closure evaluates the expression.
+    fn compile_to_closure(&mut self, source: &str, is_expression: bool) -> Option<Value> {
+        use crate::diagnostics::Severity;
+        use crate::mir::opt::{
+            constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+            run_to_fixpoint, sra::Sra, MirPass,
+        };
+        use crate::parse::parser;
+
+        // For expressions, wrap as a function body that returns the value
+        let wrapped = if is_expression {
+            format!("return {}\n", source)
+        } else {
+            source.to_string()
+        };
+
+        // 1. Parse
+        let parse_result = parser::parse(&wrapped);
+        if parse_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &parse_result.errors {
+                err.eprint(&wrapped);
+            }
+            return None;
+        }
+
+        // 2. Resolve names with core prelude
+        let mut interner = parse_result.interner;
+        let core_names = [
+            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
+            "Fiber", "System", "Sequence",
+        ];
+        let prelude: Vec<crate::intern::SymbolId> =
+            core_names.iter().map(|n| interner.intern(n)).collect();
+        let resolve_result =
+            crate::sema::resolve::resolve_with_prelude(&parse_result.module, &interner, &prelude);
+        if resolve_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &resolve_result.errors {
+                err.eprint(&wrapped);
+            }
+            return None;
+        }
+
+        // 3. Lower to MIR and optimize
+        let mut module_mir =
+            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+        let constfold = ConstFold;
+        let dce = Dce;
+        let cse = Cse;
+        let type_spec = TypeSpecialize::with_math(&interner);
+        let licm = Licm;
+        let sra = Sra;
+        let passes: Vec<&dyn MirPass> = vec![
+            &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+        ];
+        run_to_fixpoint(&mut module_mir.top_level, &passes, 10);
+
+        // 4. Remap symbols to VM interner
+        let mut sym_map: Vec<crate::intern::SymbolId> = Vec::with_capacity(interner.len());
+        for i in 0..interner.len() {
+            let old_sym = crate::intern::SymbolId::from_raw(i as u32);
+            let s = interner.resolve(old_sym);
+            let new_sym = self.interner.intern(s);
+            sym_map.push(new_sym);
+        }
+        module_mir
+            .top_level
+            .remap_symbols(|old| sym_map[old.index() as usize]);
+
+        // 5. Register and create closure
+        let func_id = self.engine.register_function(module_mir.top_level);
+        let fn_name = self.interner.intern("<compiled>");
+        let fn_ptr = self.gc.alloc_fn(fn_name, 0, 0, func_id.0);
+        unsafe {
+            (*fn_ptr).header.class = self.fn_class;
+        }
+        let closure_ptr = self.gc.alloc_closure(fn_ptr);
+        unsafe {
+            (*closure_ptr).header.class = self.fn_class;
+        }
+
+        Some(Value::object(closure_ptr as *mut u8))
+    }
+
     /// Execute a closure synchronously via a temporary fiber.
     /// Used by JIT runtime functions to re-enter the interpreter for closure bodies.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]

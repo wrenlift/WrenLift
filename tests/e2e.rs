@@ -1907,3 +1907,60 @@ System.print(hasBar)
     }
     eprintln!("  [meta module {}]", fmt_elapsed(elapsed));
 }
+
+#[test]
+fn e2e_meta_eval() {
+    let source = r#"
+import "meta" for Meta
+
+var a = 10
+var b = 20
+Meta.eval("System.print(a + b)")
+"#;
+    let (result, output, _) = run(source);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "Meta.eval failed: {:?}",
+        result
+    );
+    assert_eq!(output.trim(), "30");
+}
+
+#[test]
+fn e2e_meta_compile() {
+    let source = r#"
+import "meta" for Meta
+
+var closure = Meta.compile("System.print(\"compiled\")")
+System.print(closure is Fn)
+closure.call()
+"#;
+    let (result, output, _) = run(source);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "Meta.compile failed: {:?}",
+        result
+    );
+    assert!(output.contains("true"), "closure should be a Fn");
+    assert!(output.contains("compiled"), "compiled code should execute");
+}
+
+#[test]
+fn e2e_meta_compile_expression() {
+    let source = r#"
+import "meta" for Meta
+
+var closure = Meta.compileExpression("2 + 3 * 4")
+System.print(closure is Fn)
+System.print(closure.call())
+"#;
+    let (result, output, _) = run(source);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "Meta.compileExpression failed: {:?}",
+        result
+    );
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "true");
+    assert_eq!(lines[1], "14");
+}

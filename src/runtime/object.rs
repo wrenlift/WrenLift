@@ -917,6 +917,14 @@ pub trait NativeContext {
     // -- Module variable lookup (for Meta module) --
     fn get_module_variable_names(&self, module: &str) -> Option<Vec<String>>;
 
+    // -- Runtime compilation (for Meta module) --
+    /// Compile and execute Wren source in the given module scope.
+    fn meta_eval(&mut self, module: &str, source: &str) -> bool;
+    /// Compile Wren source into a closure value (does not execute).
+    fn meta_compile(&mut self, source: &str) -> Option<Value>;
+    /// Compile a Wren expression into a closure that returns the expression's value.
+    fn meta_compile_expression(&mut self, expr: &str) -> Option<Value>;
+
     // -- Garbage collection --
     fn trigger_gc(&mut self);
 }

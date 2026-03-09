@@ -28,39 +28,33 @@ fn meta_get_module_variables(ctx: &mut dyn NativeContext, args: &[Value]) -> Val
     }
 }
 
-/// Meta.eval(source) — compile and execute source
-///
-/// Note: Full eval requires compiling Wren source at runtime and executing
-/// it in the current module's scope. This is a simplified version that
-/// interprets the source in a fresh "__eval__" module context.
+/// Meta.eval(source) — compile and execute source in the calling module scope
 fn meta_eval(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(source) = super::validate_string(ctx, args[1], "Source") else {
         return Value::null();
     };
-    // We store the source string; the VM will handle compilation
-    // by intercepting this in the interpreter loop.
-    // For now, write a diagnostic — full eval requires VM-level support.
-    let _ = source;
-    ctx.runtime_error("Meta.eval() is not yet supported.".into());
-    Value::null()
+    if ctx.meta_eval("main", &source) {
+        Value::null()
+    } else {
+        // Error already reported by the compilation/execution pipeline
+        Value::null()
+    }
 }
 
 /// Meta.compile(source) — compile source into a Fn closure
 fn meta_compile(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let Some(_source) = super::validate_string(ctx, args[1], "Source") else {
+    let Some(source) = super::validate_string(ctx, args[1], "Source") else {
         return Value::null();
     };
-    ctx.runtime_error("Meta.compile() is not yet supported.".into());
-    Value::null()
+    ctx.meta_compile(&source).unwrap_or(Value::null())
 }
 
 /// Meta.compileExpression(expr) — compile expression into a Fn closure
 fn meta_compile_expression(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let Some(_expr) = super::validate_string(ctx, args[1], "Source") else {
+    let Some(expr) = super::validate_string(ctx, args[1], "Source") else {
         return Value::null();
     };
-    ctx.runtime_error("Meta.compileExpression() is not yet supported.".into());
-    Value::null()
+    ctx.meta_compile_expression(&expr).unwrap_or(Value::null())
 }
 
 // ---------------------------------------------------------------------------
