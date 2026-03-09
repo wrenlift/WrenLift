@@ -2578,18 +2578,14 @@ System.print(f.stackTrace)
         let cls = vm.string_class;
 
         let empty = vm.new_string("".to_string());
-        assert!(
-            call_primitive(&mut vm, cls, "isEmpty", &[empty])
-                .as_bool()
-                .unwrap()
-        );
+        assert!(call_primitive(&mut vm, cls, "isEmpty", &[empty])
+            .as_bool()
+            .unwrap());
 
         let nonempty = vm.new_string("a".to_string());
-        assert!(
-            !call_primitive(&mut vm, cls, "isEmpty", &[nonempty])
-                .as_bool()
-                .unwrap()
-        );
+        assert!(!call_primitive(&mut vm, cls, "isEmpty", &[nonempty])
+            .as_bool()
+            .unwrap());
     }
 
     #[test]

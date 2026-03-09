@@ -152,8 +152,7 @@ impl Cfg {
             }
 
             // Fall-through to next block if no unconditional terminator.
-            if !ends_with_unconditional && i + 1 < num_blocks
-                && !block.succs.contains(&(i + 1)) {
+            if !ends_with_unconditional && i + 1 < num_blocks && !block.succs.contains(&(i + 1)) {
                 block.succs.push(i + 1);
             }
         }
@@ -427,8 +426,7 @@ impl Cfg {
         let b = &self.blocks[block_idx];
         let mut start = b.start;
         // Skip leading DefLabel instruction.
-        if start < b.end
-            && matches!(func.insts[start], MachInst::DefLabel(_)) {
+        if start < b.end && matches!(func.insts[start], MachInst::DefLabel(_)) {
             start += 1;
         }
         (start, b.end)

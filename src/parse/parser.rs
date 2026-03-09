@@ -1565,8 +1565,7 @@ impl Parser {
         // Save position and errors, try parsing an expression, check for `:`
         let probe_pos = self.pos;
         let probe_errors = self.errors.len();
-        if self.expression().is_some()
-            && self.check(&Token::Colon) {
+        if self.expression().is_some() && self.check(&Token::Colon) {
             // It's a map — restore to probe_pos and parse properly.
             self.pos = probe_pos;
             self.errors.truncate(probe_errors);

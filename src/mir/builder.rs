@@ -1310,10 +1310,15 @@ fn scan_fields(stmt: &Spanned<Stmt>, interner: &Interner, fields: &mut Vec<Symbo
 fn scan_stmt_fields(stmt: &Stmt, interner: &Interner, fields: &mut Vec<SymbolId>) {
     match stmt {
         Stmt::Expr(e) => scan_expr_fields(&e.0, interner, fields),
-        Stmt::Var { initializer: Some(init), .. } => {
+        Stmt::Var {
+            initializer: Some(init),
+            ..
+        } => {
             scan_expr_fields(&init.0, interner, fields);
         }
-        Stmt::Var { initializer: None, .. } => {}
+        Stmt::Var {
+            initializer: None, ..
+        } => {}
         Stmt::Block(stmts) => {
             for s in stmts {
                 scan_stmt_fields(&s.0, interner, fields);
