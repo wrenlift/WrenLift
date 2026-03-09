@@ -328,6 +328,203 @@ pub(crate) fn value_to_string(ctx: &mut dyn NativeContext, value: Value) -> Stri
 }
 
 // ---------------------------------------------------------------------------
+// Sequence: map(_), skip(_), take(_), where(_) — return lazy wrapper instances
+// ---------------------------------------------------------------------------
+
+use crate::runtime::object::ObjInstance;
+
+/// Helper to read an ObjInstance field from the receiver value.
+pub(crate) fn instance_field(receiver: Value, index: usize) -> Value {
+    unsafe {
+        let ptr = receiver.as_object().unwrap();
+        let inst = &*(ptr as *const ObjInstance);
+        inst.get_field(index).unwrap_or(Value::null())
+    }
+}
+
+/// Helper to write an ObjInstance field.
+pub(crate) fn set_instance_field(receiver: Value, index: usize, value: Value) {
+    unsafe {
+        let ptr = receiver.as_object().unwrap();
+        let inst = &mut *(ptr as *mut ObjInstance);
+        inst.set_field(index, value);
+    }
+}
+
+fn seq_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let class = ctx.lookup_class("MapSequence").unwrap();
+    let inst = ctx.alloc_instance(class);
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _fn
+    inst
+}
+
+fn seq_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    if let Some(n) = args[1].as_num() {
+        if n != n.trunc() || n < 0.0 {
+            ctx.runtime_error("Count must be a non-negative integer.".to_string());
+            return Value::null();
+        }
+    } else {
+        ctx.runtime_error("Count must be a non-negative integer.".to_string());
+        return Value::null();
+    }
+    let class = ctx.lookup_class("SkipSequence").unwrap();
+    let inst = ctx.alloc_instance(class);
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _count
+    inst
+}
+
+fn seq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    if let Some(n) = args[1].as_num() {
+        if n != n.trunc() || n < 0.0 {
+            ctx.runtime_error("Count must be a non-negative integer.".to_string());
+            return Value::null();
+        }
+    } else {
+        ctx.runtime_error("Count must be a non-negative integer.".to_string());
+        return Value::null();
+    }
+    let class = ctx.lookup_class("TakeSequence").unwrap();
+    let inst = ctx.alloc_instance(class);
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _count
+    inst
+}
+
+fn seq_where(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let class = ctx.lookup_class("WhereSequence").unwrap();
+    let inst = ctx.alloc_instance(class);
+    set_instance_field(inst, 0, args[0]); // _sequence
+    set_instance_field(inst, 1, args[1]); // _fn (predicate)
+    inst
+}
+
+// ---------------------------------------------------------------------------
+// MapSequence: iterate(_) and iteratorValue(_)
+// Fields: [0]=sequence, [1]=fn
+// ---------------------------------------------------------------------------
+
+fn map_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    ctx.call_method_on(sequence, "iterate(_)", &[args[1]])
+        .unwrap_or(Value::bool(false))
+}
+
+fn map_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    let func = instance_field(args[0], 1);
+    let inner_val = ctx
+        .call_method_on(sequence, "iteratorValue(_)", &[args[1]])
+        .unwrap_or(Value::null());
+    ctx.call_method_on(func, "call(_)", &[inner_val])
+        .unwrap_or(Value::null())
+}
+
+// ---------------------------------------------------------------------------
+// SkipSequence: iterate(_) and iteratorValue(_)
+// Fields: [0]=sequence, [1]=count
+// ---------------------------------------------------------------------------
+
+fn skip_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    let iterator = args[1];
+
+    if !iterator.is_null() && !iterator.is_falsy() {
+        // Already started, just delegate.
+        return ctx
+            .call_method_on(sequence, "iterate(_)", &[iterator])
+            .unwrap_or(Value::bool(false));
+    }
+
+    // First call: skip `count` items.
+    let count = instance_field(args[0], 1).as_num().unwrap_or(0.0) as i64;
+    let mut it = ctx
+        .call_method_on(sequence, "iterate(_)", &[Value::null()])
+        .unwrap_or(Value::bool(false));
+    let mut remaining = count;
+    while remaining > 0 && !it.is_falsy() && !it.is_null() {
+        it = ctx
+            .call_method_on(sequence, "iterate(_)", &[it])
+            .unwrap_or(Value::bool(false));
+        remaining -= 1;
+    }
+    it
+}
+
+fn skip_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    ctx.call_method_on(sequence, "iteratorValue(_)", &[args[1]])
+        .unwrap_or(Value::null())
+}
+
+// ---------------------------------------------------------------------------
+// TakeSequence: iterate(_) and iteratorValue(_)
+// Fields: [0]=sequence, [1]=count, [2]=taken
+// ---------------------------------------------------------------------------
+
+fn take_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    let max_count = instance_field(args[0], 1).as_num().unwrap_or(0.0);
+    let iterator = args[1];
+
+    let taken = if iterator.is_null() || iterator.is_falsy() {
+        1.0
+    } else {
+        instance_field(args[0], 2).as_num().unwrap_or(0.0) + 1.0
+    };
+
+    set_instance_field(args[0], 2, Value::num(taken));
+
+    if taken > max_count {
+        return Value::null();
+    }
+
+    ctx.call_method_on(sequence, "iterate(_)", &[iterator])
+        .unwrap_or(Value::bool(false))
+}
+
+fn take_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    ctx.call_method_on(sequence, "iteratorValue(_)", &[args[1]])
+        .unwrap_or(Value::null())
+}
+
+// ---------------------------------------------------------------------------
+// WhereSequence: iterate(_) and iteratorValue(_)
+// Fields: [0]=sequence, [1]=fn
+// ---------------------------------------------------------------------------
+
+fn where_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    let func = instance_field(args[0], 1);
+    let mut iterator = args[1];
+
+    loop {
+        iterator = match ctx.call_method_on(sequence, "iterate(_)", &[iterator]) {
+            Some(v) if !v.is_falsy() && !v.is_null() => v,
+            _ => return Value::bool(false),
+        };
+        let value = ctx
+            .call_method_on(sequence, "iteratorValue(_)", &[iterator])
+            .unwrap_or(Value::null());
+        let result = ctx
+            .call_method_on(func, "call(_)", &[value])
+            .unwrap_or(Value::bool(false));
+        if !result.is_falsy() {
+            return iterator;
+        }
+    }
+}
+
+fn where_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let sequence = instance_field(args[0], 0);
+    ctx.call_method_on(sequence, "iteratorValue(_)", &[args[1]])
+        .unwrap_or(Value::null())
+}
+
+// ---------------------------------------------------------------------------
 // Bind
 // ---------------------------------------------------------------------------
 
@@ -346,4 +543,28 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "toList", seq_to_list);
     vm.primitive(class, "reduce(_)", seq_reduce_1);
     vm.primitive(class, "reduce(_,_)", seq_reduce_2);
+    vm.primitive(class, "map(_)", seq_map);
+    vm.primitive(class, "skip(_)", seq_skip);
+    vm.primitive(class, "take(_)", seq_take);
+    vm.primitive(class, "where(_)", seq_where);
+
+    // MapSequence methods
+    let map_seq = vm.map_sequence_class;
+    vm.primitive(map_seq, "iterate(_)", map_seq_iterate);
+    vm.primitive(map_seq, "iteratorValue(_)", map_seq_iterator_value);
+
+    // SkipSequence methods
+    let skip_seq = vm.skip_sequence_class;
+    vm.primitive(skip_seq, "iterate(_)", skip_seq_iterate);
+    vm.primitive(skip_seq, "iteratorValue(_)", skip_seq_iterator_value);
+
+    // TakeSequence methods
+    let take_seq = vm.take_sequence_class;
+    vm.primitive(take_seq, "iterate(_)", take_seq_iterate);
+    vm.primitive(take_seq, "iteratorValue(_)", take_seq_iterator_value);
+
+    // WhereSequence methods
+    let where_seq = vm.where_sequence_class;
+    vm.primitive(where_seq, "iterate(_)", where_seq_iterate);
+    vm.primitive(where_seq, "iteratorValue(_)", where_seq_iterator_value);
 }

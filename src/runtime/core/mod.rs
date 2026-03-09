@@ -20,10 +20,6 @@ mod system;
 
 use super::vm::VM;
 
-/// The core Wren source that defines Sequence and other Wren-level methods.
-/// This will be compiled and executed when the VM starts.
-pub const CORE_SOURCE: &str = include_str!("wren_core.wren");
-
 /// Initialize all core classes and bind their native methods.
 ///
 /// Bootstrap order follows standard Wren:
@@ -62,6 +58,42 @@ pub fn initialize(vm: &mut VM) {
     vm.list_class = vm.make_class("List", vm.sequence_class);
     vm.map_class = vm.make_class("Map", vm.sequence_class);
     vm.range_class = vm.make_class("Range", vm.sequence_class);
+
+    // Wrapper sequence classes (lazy iterators).
+    let seq = vm.sequence_class;
+    vm.map_sequence_class = vm.make_class("MapSequence", seq);
+    unsafe {
+        (*vm.map_sequence_class).num_fields = 2;
+    } // [0]=sequence, [1]=fn
+    vm.skip_sequence_class = vm.make_class("SkipSequence", seq);
+    unsafe {
+        (*vm.skip_sequence_class).num_fields = 2;
+    } // [0]=sequence, [1]=count
+    vm.take_sequence_class = vm.make_class("TakeSequence", seq);
+    unsafe {
+        (*vm.take_sequence_class).num_fields = 3;
+    } // [0]=sequence, [1]=count, [2]=taken
+    vm.where_sequence_class = vm.make_class("WhereSequence", seq);
+    unsafe {
+        (*vm.where_sequence_class).num_fields = 2;
+    } // [0]=sequence, [1]=fn
+
+    // String sub-sequences
+    vm.string_byte_seq_class = vm.make_class("StringByteSequence", seq);
+    unsafe {
+        (*vm.string_byte_seq_class).num_fields = 1;
+    } // [0]=string
+    vm.string_code_point_seq_class = vm.make_class("StringCodePointSequence", seq);
+    unsafe {
+        (*vm.string_code_point_seq_class).num_fields = 1;
+    } // [0]=string
+
+    // MapEntry helper
+    let obj = vm.object_class;
+    vm.map_entry_class = vm.make_class("MapEntry", obj);
+    unsafe {
+        (*vm.map_entry_class).num_fields = 2;
+    } // [0]=key, [1]=value
 
     // 3. Bind native methods to each class.
     //    Sequence methods are bound first, then subclass-specific methods

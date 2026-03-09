@@ -120,6 +120,41 @@ fn map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     ctx.alloc_list(vals)
 }
 
+fn map_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let map = receiver_map(args);
+    let key_val = args[1];
+    let key = MapKey::new(key_val);
+    let value = map.entries.get(&key).copied().unwrap_or(Value::null());
+
+    // Wrap in a MapEntry instance: fields [0]=key, [1]=value
+    let class = ctx.lookup_class("MapEntry").unwrap();
+    let entry = ctx.alloc_instance(class);
+    use super::sequence::set_instance_field;
+    set_instance_field(entry, 0, key_val);
+    set_instance_field(entry, 1, value);
+    entry
+}
+
+// MapEntry methods — fields: [0]=key, [1]=value
+fn map_entry_key(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    use super::sequence::instance_field;
+    instance_field(args[0], 0)
+}
+
+fn map_entry_value(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    use super::sequence::instance_field;
+    instance_field(args[0], 1)
+}
+
+fn map_entry_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    use super::sequence::instance_field;
+    let key = instance_field(args[0], 0);
+    let value = instance_field(args[0], 1);
+    let k = super::sequence::value_to_string(ctx, key);
+    let v = super::sequence::value_to_string(ctx, value);
+    ctx.alloc_string(format!("{}:{}", k, v))
+}
+
 fn map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let map = receiver_map(args);
     let mut result = String::from("{");
@@ -150,9 +185,16 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(cls, "count", map_count);
     vm.primitive(cls, "remove(_)", map_remove);
     vm.primitive(cls, "iterate(_)", map_iterate);
+    vm.primitive(cls, "iteratorValue(_)", map_iterator_value);
     vm.primitive(cls, "keyIteratorValue_(_)", map_key_iterator_value);
     vm.primitive(cls, "valueIteratorValue_(_)", map_value_iterator_value);
     vm.primitive(cls, "keys", map_keys);
     vm.primitive(cls, "values", map_values);
     vm.primitive(cls, "toString", map_to_string);
+
+    // MapEntry methods
+    let entry_cls = vm.map_entry_class;
+    vm.primitive(entry_cls, "key", map_entry_key);
+    vm.primitive(entry_cls, "value", map_entry_value);
+    vm.primitive(entry_cls, "toString", map_entry_to_string);
 }

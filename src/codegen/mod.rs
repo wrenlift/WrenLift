@@ -9,6 +9,7 @@
 /// - Explicit results from comparisons via `CSet` (no implicit flag registers)
 /// - Load/store architecture: memory only via `Ldr`/`Str`
 /// - Virtual registers resolved by linear-scan register allocator before emission
+#[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 pub mod cfg;
 pub mod regalloc;
@@ -1284,6 +1285,7 @@ pub enum CompiledFunction {
     /// x86_64 machine code bytes.
     X86_64(x86_64::EmittedCode),
     /// aarch64 executable buffer.
+    #[cfg(target_arch = "aarch64")]
     Aarch64(aarch64::CompiledCode),
     /// WebAssembly module bytes.
     Wasm(wasm::WasmModule),
@@ -1301,6 +1303,7 @@ impl CompiledFunction {
                 let exec = code.make_executable()?;
                 Ok(ExecutableFunction::X86_64(exec))
             }
+            #[cfg(target_arch = "aarch64")]
             CompiledFunction::Aarch64(code) => Ok(ExecutableFunction::Aarch64(code)),
             CompiledFunction::Wasm(_) => {
                 Err("WASM modules cannot be made directly executable; use a WASM runtime".into())
@@ -1320,6 +1323,7 @@ impl CompiledFunction {
 /// Executable function backed by mmap'd memory. Drop to release.
 pub enum ExecutableFunction {
     X86_64(x86_64::ExecutableCode),
+    #[cfg(target_arch = "aarch64")]
     Aarch64(aarch64::CompiledCode),
 }
 
@@ -1332,6 +1336,7 @@ impl ExecutableFunction {
     pub unsafe fn as_fn<F: Copy>(&self) -> F {
         match self {
             ExecutableFunction::X86_64(code) => code.as_fn(),
+            #[cfg(target_arch = "aarch64")]
             ExecutableFunction::Aarch64(code) => code.as_fn(),
         }
     }
@@ -1340,7 +1345,8 @@ impl ExecutableFunction {
     pub fn is_native(&self) -> bool {
         match self {
             ExecutableFunction::X86_64(_) => cfg!(target_arch = "x86_64"),
-            ExecutableFunction::Aarch64(_) => cfg!(target_arch = "aarch64"),
+            #[cfg(target_arch = "aarch64")]
+            ExecutableFunction::Aarch64(_) => true,
         }
     }
 }
@@ -1386,10 +1392,13 @@ pub fn compile_function_with_interner(
                     let emitted = x86_64::emit(&mach)?;
                     Ok(CompiledFunction::X86_64(emitted))
                 }
+                #[cfg(target_arch = "aarch64")]
                 Target::Aarch64 => {
                     let compiled = aarch64::emit(&mach)?;
                     Ok(CompiledFunction::Aarch64(compiled))
                 }
+                #[cfg(not(target_arch = "aarch64"))]
+                Target::Aarch64 => Err("aarch64 codegen is only available on aarch64 hosts".into()),
                 Target::Wasm => unreachable!(),
             }
         }

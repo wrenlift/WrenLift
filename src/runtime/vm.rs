@@ -138,6 +138,15 @@ pub struct VM {
     pub system_class: *mut ObjClass,
     pub sequence_class: *mut ObjClass,
 
+    // -- Wrapper / helper classes --
+    pub map_sequence_class: *mut ObjClass,
+    pub skip_sequence_class: *mut ObjClass,
+    pub take_sequence_class: *mut ObjClass,
+    pub where_sequence_class: *mut ObjClass,
+    pub string_byte_seq_class: *mut ObjClass,
+    pub string_code_point_seq_class: *mut ObjClass,
+    pub map_entry_class: *mut ObjClass,
+
     // -- Execution state --
     pub fiber: *mut ObjFiber,
     pub modules: HashMap<String, *mut ObjModule>,
@@ -198,6 +207,14 @@ impl VM {
             fiber_class: ptr::null_mut(),
             system_class: ptr::null_mut(),
             sequence_class: ptr::null_mut(),
+
+            map_sequence_class: ptr::null_mut(),
+            skip_sequence_class: ptr::null_mut(),
+            take_sequence_class: ptr::null_mut(),
+            where_sequence_class: ptr::null_mut(),
+            string_byte_seq_class: ptr::null_mut(),
+            string_code_point_seq_class: ptr::null_mut(),
+            map_entry_class: ptr::null_mut(),
 
             fiber: ptr::null_mut(),
             modules: HashMap::new(),
@@ -1252,6 +1269,20 @@ impl NativeContext for VM {
         use crate::mir::interp::InterpValue;
         use crate::mir::{BlockId, Instruction};
 
+        // Special-case: calling a closure/function via call(...)
+        // Pass only the call arguments (not the closure receiver) — closures
+        // don't have a "self" block param; their block params map directly to
+        // the call arguments.
+        if method.starts_with("call") && receiver.is_object() {
+            let ptr = receiver.as_object().unwrap();
+            let header = ptr as *const ObjHeader;
+            let is_closure = unsafe { (*header).obj_type == ObjType::Closure };
+            if is_closure {
+                let closure_ptr = ptr as *mut ObjClosure;
+                return self.call_closure_sync(closure_ptr, args);
+            }
+        }
+
         let class = self.class_of(receiver);
         let method_sym = self.interner.intern(method);
         let method_entry = unsafe {
@@ -1409,6 +1440,37 @@ impl NativeContext for VM {
 
     fn meta_compile_expression(&mut self, expr: &str) -> Option<Value> {
         self.compile_to_closure(expr, true)
+    }
+
+    fn alloc_instance(&mut self, class: *mut ObjClass) -> Value {
+        let inst = self.gc.alloc_instance(class);
+        unsafe {
+            (*inst).header.class = class;
+        }
+        Value::object(inst as *mut u8)
+    }
+
+    fn lookup_class(&self, name: &str) -> Option<*mut ObjClass> {
+        let cls = match name {
+            "MapSequence" => self.map_sequence_class,
+            "SkipSequence" => self.skip_sequence_class,
+            "TakeSequence" => self.take_sequence_class,
+            "WhereSequence" => self.where_sequence_class,
+            "StringByteSequence" => self.string_byte_seq_class,
+            "StringCodePointSequence" => self.string_code_point_seq_class,
+            "MapEntry" => self.map_entry_class,
+            "Object" => self.object_class,
+            "Sequence" => self.sequence_class,
+            "String" => self.string_class,
+            "List" => self.list_class,
+            "Map" => self.map_class,
+            _ => return None,
+        };
+        if cls.is_null() {
+            None
+        } else {
+            Some(cls)
+        }
     }
 
     fn trigger_gc(&mut self) {

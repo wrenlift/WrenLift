@@ -941,6 +941,14 @@ pub trait NativeContext {
     /// Compile a Wren expression into a closure that returns the expression's value.
     fn meta_compile_expression(&mut self, expr: &str) -> Option<Value>;
 
+    // -- Instance allocation --
+    /// Allocate a new ObjInstance of the given class, returning its Value.
+    fn alloc_instance(&mut self, class: *mut ObjClass) -> Value;
+
+    // -- Class lookup --
+    /// Look up a core class by name (e.g. "MapSequence").
+    fn lookup_class(&self, name: &str) -> Option<*mut ObjClass>;
+
     // -- Garbage collection --
     fn trigger_gc(&mut self);
 }

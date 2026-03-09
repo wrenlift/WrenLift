@@ -365,6 +365,121 @@ fn to_string(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// bytes / codePoints getters — return wrapper sequences
+// ---------------------------------------------------------------------------
+
+use super::sequence::{instance_field, set_instance_field};
+
+fn bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let class = ctx.lookup_class("StringByteSequence").unwrap();
+    let inst = ctx.alloc_instance(class);
+    set_instance_field(inst, 0, args[0]); // _string
+    inst
+}
+
+fn code_points(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let class = ctx.lookup_class("StringCodePointSequence").unwrap();
+    let inst = ctx.alloc_instance(class);
+    set_instance_field(inst, 0, args[0]); // _string
+    inst
+}
+
+// StringByteSequence methods — fields: [0]=string
+fn byte_seq_subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    let s = super::as_string(string);
+    let index = match super::validate_index(ctx, args[1], s.len(), "Index") {
+        Some(i) => i,
+        None => return Value::null(),
+    };
+    Value::num(s.as_bytes()[index] as f64)
+}
+
+fn byte_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    ctx.call_method_on(string, "iterateByte_(_)", &[args[1]])
+        .unwrap_or(Value::bool(false))
+}
+
+fn byte_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    ctx.call_method_on(string, "byteAt_(_)", &[args[1]])
+        .unwrap_or(Value::null())
+}
+
+fn byte_seq_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    let s = super::as_string(string);
+    Value::num(s.len() as f64)
+}
+
+// StringCodePointSequence methods — fields: [0]=string
+fn code_point_seq_subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    ctx.call_method_on(string, "codePointAt_(_)", &[args[1]])
+        .unwrap_or(Value::null())
+}
+
+fn code_point_seq_iterate(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    ctx.call_method_on(string, "iterate(_)", &[args[1]])
+        .unwrap_or(Value::bool(false))
+}
+
+fn code_point_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    ctx.call_method_on(string, "codePointAt_(_)", &[args[1]])
+        .unwrap_or(Value::null())
+}
+
+fn code_point_seq_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let string = instance_field(args[0], 0);
+    let s = super::as_string(string);
+    Value::num(s.chars().count() as f64)
+}
+
+// ---------------------------------------------------------------------------
+// trim/trimStart/trimEnd with custom chars
+// ---------------------------------------------------------------------------
+
+fn trim_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let chars = match super::validate_string(ctx, args[1], "Characters") {
+        Some(c) => c,
+        None => return Value::null(),
+    };
+    let s = receiver_str(args);
+    let char_set: Vec<char> = chars.chars().collect();
+    let result = s.trim_matches(|c: char| char_set.contains(&c)).to_string();
+    ctx.alloc_string(result)
+}
+
+fn trim_start_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let chars = match super::validate_string(ctx, args[1], "Characters") {
+        Some(c) => c,
+        None => return Value::null(),
+    };
+    let s = receiver_str(args);
+    let char_set: Vec<char> = chars.chars().collect();
+    let result = s
+        .trim_start_matches(|c: char| char_set.contains(&c))
+        .to_string();
+    ctx.alloc_string(result)
+}
+
+fn trim_end_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let chars = match super::validate_string(ctx, args[1], "Characters") {
+        Some(c) => c,
+        None => return Value::null(),
+    };
+    let s = receiver_str(args);
+    let char_set: Vec<char> = chars.chars().collect();
+    let result = s
+        .trim_end_matches(|c: char| char_set.contains(&c))
+        .to_string();
+    ctx.alloc_string(result)
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -380,9 +495,14 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "count", count);
     vm.primitive(class, "isEmpty", is_empty);
     vm.primitive(class, "toString", to_string);
+    vm.primitive(class, "bytes", bytes);
+    vm.primitive(class, "codePoints", code_points);
     vm.primitive(class, "trim()", trim);
+    vm.primitive(class, "trim(_)", trim_chars);
     vm.primitive(class, "trimStart()", trim_start);
+    vm.primitive(class, "trimStart(_)", trim_start_chars);
     vm.primitive(class, "trimEnd()", trim_end);
+    vm.primitive(class, "trimEnd(_)", trim_end_chars);
 
     // Subscript
     vm.primitive(class, "[_]", subscript);
@@ -406,4 +526,18 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "iterate(_)", iterate);
     vm.primitive(class, "iterateByte_(_)", iterate_byte);
     vm.primitive(class, "iteratorValue(_)", iterator_value);
+
+    // StringByteSequence methods
+    let byte_cls = vm.string_byte_seq_class;
+    vm.primitive(byte_cls, "[_]", byte_seq_subscript);
+    vm.primitive(byte_cls, "iterate(_)", byte_seq_iterate);
+    vm.primitive(byte_cls, "iteratorValue(_)", byte_seq_iterator_value);
+    vm.primitive(byte_cls, "count", byte_seq_count);
+
+    // StringCodePointSequence methods
+    let cp_cls = vm.string_code_point_seq_class;
+    vm.primitive(cp_cls, "[_]", code_point_seq_subscript);
+    vm.primitive(cp_cls, "iterate(_)", code_point_seq_iterate);
+    vm.primitive(cp_cls, "iteratorValue(_)", code_point_seq_iterator_value);
+    vm.primitive(cp_cls, "count", code_point_seq_count);
 }

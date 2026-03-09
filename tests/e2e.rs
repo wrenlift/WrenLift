@@ -1964,3 +1964,133 @@ System.print(closure.call())
     assert_eq!(lines[0], "true");
     assert_eq!(lines[1], "14");
 }
+
+// ---------------------------------------------------------------------------
+// Lazy sequence wrappers (MapSequence, WhereSequence, SkipSequence, TakeSequence)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_sequence_map() {
+    let source = r#"
+var list = [1, 2, 3, 4]
+var doubled = list.map {|x| x * 2 }
+System.print(doubled.toList)
+"#;
+    assert_output(source, "[2, 4, 6, 8]\n");
+}
+
+#[test]
+fn e2e_sequence_where() {
+    let source = r#"
+var list = [1, 2, 3, 4, 5, 6]
+var evens = list.where {|x| x % 2 == 0 }
+System.print(evens.toList)
+"#;
+    assert_output(source, "[2, 4, 6]\n");
+}
+
+#[test]
+fn e2e_sequence_skip() {
+    let source = r#"
+var list = [10, 20, 30, 40, 50]
+var skipped = list.skip(2)
+System.print(skipped.toList)
+"#;
+    assert_output(source, "[30, 40, 50]\n");
+}
+
+#[test]
+fn e2e_sequence_take() {
+    let source = r#"
+var list = [10, 20, 30, 40, 50]
+var taken = list.take(3)
+System.print(taken.toList)
+"#;
+    assert_output(source, "[10, 20, 30]\n");
+}
+
+#[test]
+fn e2e_sequence_chain() {
+    let source = r#"
+var list = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+var result = list.where {|x| x % 2 == 0 }.map {|x| x * 10 }.take(3).toList
+System.print(result)
+"#;
+    assert_output(source, "[20, 40, 60]\n");
+}
+
+#[test]
+fn e2e_sequence_skip_and_take() {
+    let source = r#"
+var list = [1, 2, 3, 4, 5, 6, 7, 8]
+var result = list.skip(2).take(4).toList
+System.print(result)
+"#;
+    assert_output(source, "[3, 4, 5, 6]\n");
+}
+
+// ---------------------------------------------------------------------------
+// String byte and code point sequences
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_string_bytes() {
+    let source = r#"
+var s = "ABC"
+var bytes = s.bytes
+System.print(bytes.toList)
+"#;
+    assert_output(source, "[65, 66, 67]\n");
+}
+
+#[test]
+fn e2e_string_code_points() {
+    let source = r#"
+var s = "Hi!"
+var cp = s.codePoints
+System.print(cp.toList)
+"#;
+    assert_output(source, "[72, 105, 33]\n");
+}
+
+// ---------------------------------------------------------------------------
+// String trim with custom characters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_string_trim_chars() {
+    let source = r#"
+System.print("***hello***".trim("*"))
+System.print("xxhelloxx".trimStart("x"))
+System.print("helloxx".trimEnd("x"))
+"#;
+    assert_output(source, "hello\nhelloxx\nhello\n");
+}
+
+// ---------------------------------------------------------------------------
+// Map iteration with MapEntry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_map_entry() {
+    let source = r#"
+var map = {"a": 1}
+for (entry in map) {
+  System.print(entry.key)
+  System.print(entry.value)
+}
+"#;
+    assert_output(source, "a\n1\n");
+}
+
+// ---------------------------------------------------------------------------
+// System.writeObject_
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_system_write_object() {
+    let source = r#"
+System.writeObject_(42)
+"#;
+    assert_output(source, "42");
+}

@@ -138,12 +138,27 @@ fn system_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     args[1]
 }
 
+fn system_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let obj = args[1];
+    // Try calling toString on the object
+    if let Some(s) = ctx.call_method_on(obj, "toString", &[]) {
+        if super::is_string(s) {
+            let text = super::as_string(s);
+            ctx.write_output(text);
+            return Value::null();
+        }
+    }
+    ctx.write_output("[invalid toString]");
+    Value::null()
+}
+
 pub fn bind(vm: &mut VM) {
     let class = vm.system_class;
 
     vm.primitive_static(class, "clock", system_clock);
     vm.primitive_static(class, "gc()", system_gc);
     vm.primitive_static(class, "writeString_(_)", system_write_string);
+    vm.primitive_static(class, "writeObject_(_)", system_write_object);
     vm.primitive_static(class, "print", system_print_no_arg);
     vm.primitive_static(class, "print(_)", system_print);
     vm.primitive_static(class, "write(_)", system_write);
