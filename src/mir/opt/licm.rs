@@ -362,10 +362,8 @@ fn redirect_terminator(
 ) {
     let term = &mut func.block_mut(src).terminator;
     match term {
-        Terminator::Branch { target, .. } => {
-            if *target == old_target {
-                *target = new_target;
-            }
+        Terminator::Branch { target, .. } if *target == old_target => {
+            *target = new_target;
         }
         Terminator::CondBranch {
             true_target,

@@ -1373,10 +1373,8 @@ fn scan_stmt_fields(stmt: &Stmt, interner: &Interner, fields: &mut Vec<SymbolId>
 
 fn scan_expr_fields(expr: &Expr, interner: &Interner, fields: &mut Vec<SymbolId>) {
     match expr {
-        Expr::Field(name) => {
-            if !fields.contains(name) {
-                fields.push(*name);
-            }
+        Expr::Field(name) if !fields.contains(name) => {
+            fields.push(*name);
         }
         Expr::Assign { target, value } => {
             scan_expr_fields(&target.0, interner, fields);

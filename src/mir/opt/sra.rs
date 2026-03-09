@@ -55,13 +55,12 @@ impl MirPass for Sra {
             for (_, inst) in &block.instructions {
                 match inst {
                     Instruction::SubscriptGet { receiver, args }
-                    | Instruction::SubscriptSet { receiver, args, .. } => {
+                    | Instruction::SubscriptSet { receiver, args, .. }
                         if list_elements.contains_key(receiver)
                             && !args.is_empty()
-                            && !const_nums.contains_key(&args[0])
-                        {
-                            blocked.push(*receiver);
-                        }
+                            && !const_nums.contains_key(&args[0]) =>
+                    {
+                        blocked.push(*receiver);
                     }
                     _ => {}
                 }

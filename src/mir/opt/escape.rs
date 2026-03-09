@@ -38,10 +38,8 @@ pub fn analyze(func: &MirFunction) -> HashSet<ValueId> {
 
         // Check terminator.
         match &block.terminator {
-            Terminator::Return(v) => {
-                if allocations.contains(v) {
-                    escaping.insert(*v);
-                }
+            Terminator::Return(v) if allocations.contains(v) => {
+                escaping.insert(*v);
             }
             Terminator::Branch { args, .. } => {
                 for arg in args {
@@ -99,10 +97,10 @@ fn check_inst_escapes(
         }
         Instruction::SetField(_, _, val)
         | Instruction::SetModuleVar(_, val)
-        | Instruction::SetUpvalue(_, val) => {
-            if allocations.contains(val) {
-                escaping.insert(*val);
-            }
+        | Instruction::SetUpvalue(_, val)
+            if allocations.contains(val) =>
+        {
+            escaping.insert(*val);
         }
         Instruction::Call { receiver, args, .. } => {
             if allocations.contains(receiver) {
@@ -160,10 +158,8 @@ fn check_inst_escapes(
                 }
             }
         }
-        Instruction::ToString(v) => {
-            if allocations.contains(v) {
-                escaping.insert(*v);
-            }
+        Instruction::ToString(v) if allocations.contains(v) => {
+            escaping.insert(*v);
         }
         _ => {}
     }
