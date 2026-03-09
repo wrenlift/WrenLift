@@ -1063,11 +1063,17 @@ fn compile_class(
         });
     }
 
+    // Compute protocol conformance from method signatures.
+    let method_sigs: Vec<&str> = methods.iter().map(|m| m.signature.as_str()).collect();
+    let superclass_protocols = crate::sema::protocol::ProtocolSet::EMPTY; // resolved at runtime
+    let conformance = crate::sema::protocol::check_all_conformance(&method_sigs, superclass_protocols);
+
     (ClassMir {
         name: decl.name.0,
         superclass: decl.superclass.as_ref().map(|s| s.0),
         methods,
         num_fields: field_names.len() as u16,
+        protocols: conformance.conforms,
     }, all_closures)
 }
 

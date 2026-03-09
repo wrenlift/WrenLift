@@ -44,6 +44,14 @@ fn type_(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::object(class_ptr as *mut u8)
 }
 
+fn hash_val(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    use std::hash::{Hash, Hasher};
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    args[0].to_bits().hash(&mut hasher);
+    Value::num((hasher.finish() & 0x001F_FFFF_FFFF_FFFF) as f64)
+}
+
 fn same(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::bool(args[1].to_bits() == args[2].to_bits())
 }
@@ -57,6 +65,7 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "is(_)", is as NativeFn);
     vm.primitive(class, "toString", to_string as NativeFn);
     vm.primitive(class, "type", type_ as NativeFn);
+    vm.primitive(class, "hashCode", hash_val as NativeFn);
 
     vm.primitive_static(class, "same(_,_)", same as NativeFn);
 }

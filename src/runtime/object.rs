@@ -797,6 +797,8 @@ pub struct ObjClass {
     pub num_fields: u16,
     /// Is this a foreign class?
     pub is_foreign: bool,
+    /// Protocols this class conforms to (bitset, populated at class creation).
+    pub protocols: crate::sema::protocol::ProtocolSet,
 }
 
 /// A method entry in the class method table.
@@ -868,18 +870,26 @@ pub trait NativeContext {
     fn fiber_stack_traces_enabled(&self) -> bool;
     fn capture_spawn_trace(&self) -> Option<Vec<StackFrame>>;
     fn get_stack_trace_string(&self, fiber: *mut ObjFiber) -> String;
+
+    // -- Method dispatch from native code --
+    /// Call a method on a receiver from native code. Handles both Native and
+    /// Closure methods (closures run on a temporary fiber).
+    /// Returns None if the method doesn't exist or the call fails.
+    fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value>;
 }
 
 impl ObjClass {
     pub fn new(name: SymbolId, superclass: *mut ObjClass) -> Self {
         let mut methods = HashMap::new();
+        let mut protocols = crate::sema::protocol::ProtocolSet::EMPTY;
 
-        // Inherit methods from superclass.
+        // Inherit methods and protocols from superclass.
         if !superclass.is_null() {
             unsafe {
                 for (sym, method) in &(*superclass).methods {
                     methods.insert(*sym, method.clone());
                 }
+                protocols = (*superclass).protocols;
             }
         }
 
@@ -890,6 +900,7 @@ impl ObjClass {
             methods,
             num_fields: 0,
             is_foreign: false,
+            protocols,
         }
     }
 

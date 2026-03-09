@@ -164,6 +164,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         BlockParam(..) => 58,
         MathUnaryF64(..) => 59,
         MathBinaryF64(..) => 60,
+        GuardProtocol(..) => 61,
     }
 }
 

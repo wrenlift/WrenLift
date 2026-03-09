@@ -162,6 +162,142 @@ fn list_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::null()
 }
 
+fn list_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let other = args[1];
+    // Iterate the other sequence using the iterate/iteratorValue protocol.
+    let mut iterator = Value::null();
+    loop {
+        match ctx.call_method_on(other, "iterate(_)", &[iterator]) {
+            Some(next) if !next.is_bool() || next.as_bool() != Some(false) => {
+                iterator = next;
+            }
+            _ => break,
+        }
+        if ctx.has_error() { return Value::null(); }
+        let element = match ctx.call_method_on(other, "iteratorValue(_)", &[iterator]) {
+            Some(v) => v,
+            None => break,
+        };
+        if ctx.has_error() { return Value::null(); }
+        let list = receiver_list_mut(args);
+        list.add(element);
+    }
+    other
+}
+
+fn list_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let list = receiver_list_mut(args);
+    let len = list.len();
+    if len <= 1 {
+        return args[0];
+    }
+    // Copy elements into a Vec so we can sort with Rust's sort.
+    let mut elements: Vec<Value> = list.as_slice().to_vec();
+    elements.sort_by(|a, b| {
+        // Numbers compare by f64 value.
+        if let (Some(na), Some(nb)) = (a.as_num(), b.as_num()) {
+            return na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal);
+        }
+        // If both are the same type, fall back to bit comparison for stability.
+        std::cmp::Ordering::Equal
+    });
+    // Write sorted elements back into the list.
+    let list = receiver_list_mut(args);
+    for (i, v) in elements.into_iter().enumerate() {
+        list.set(i, v);
+    }
+    let _ = ctx; // suppress unused warning
+    args[0]
+}
+
+fn list_sort_by(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let comparer = args[1];
+    let len = receiver_list(args).len();
+    if len <= 1 {
+        return args[0];
+    }
+    // Selection sort: O(n^2) but safe with ctx callbacks.
+    for i in 0..len {
+        let mut min_idx = i;
+        for j in (i + 1)..len {
+            let a = receiver_list(args).get(min_idx).unwrap();
+            let b = receiver_list(args).get(j).unwrap();
+            let cmp_result = ctx.call_method_on(comparer, "call(_,_)", &[a, b]);
+            if ctx.has_error() { return Value::null(); }
+            if let Some(result) = cmp_result {
+                // If result > 0, then a > b, so b should come first.
+                if let Some(n) = result.as_num() {
+                    if n > 0.0 {
+                        min_idx = j;
+                    }
+                } else if let Some(false) = result.as_bool() {
+                    // false means a > b in some Wren comparators
+                    min_idx = j;
+                }
+            }
+        }
+        if min_idx != i {
+            let list = receiver_list_mut(args);
+            list.swap(i, min_idx);
+        }
+    }
+    args[0]
+}
+
+fn list_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let list = receiver_list(args);
+    let len = list.len();
+    let mut parts = Vec::with_capacity(len);
+    for i in 0..len {
+        let elem = receiver_list(args).get(i).unwrap_or(Value::null());
+        parts.push(super::sequence::value_to_string(ctx, elem));
+        if ctx.has_error() { return Value::null(); }
+    }
+    let result = format!("[{}]", parts.join(", "));
+    ctx.alloc_string(result)
+}
+
+fn list_plus(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    // Clone receiver's elements.
+    let mut elements: Vec<Value> = receiver_list(args).as_slice().to_vec();
+    // Iterate args[1] using the iterate/iteratorValue protocol.
+    let other = args[1];
+    let mut iterator = Value::null();
+    loop {
+        match ctx.call_method_on(other, "iterate(_)", &[iterator]) {
+            Some(next) if !next.is_bool() || next.as_bool() != Some(false) => {
+                iterator = next;
+            }
+            _ => break,
+        }
+        if ctx.has_error() { return Value::null(); }
+        let element = match ctx.call_method_on(other, "iteratorValue(_)", &[iterator]) {
+            Some(v) => v,
+            None => break,
+        };
+        if ctx.has_error() { return Value::null(); }
+        elements.push(element);
+    }
+    ctx.alloc_list(elements)
+}
+
+fn list_times(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let n = match super::validate_int(ctx, args[1], "Count") {
+        Some(v) => v,
+        None => return Value::null(),
+    };
+    if n < 0 {
+        ctx.runtime_error("Count must be non-negative.".to_string());
+        return Value::null();
+    }
+    let source = receiver_list(args).as_slice().to_vec();
+    let mut elements = Vec::with_capacity(source.len() * n as usize);
+    for _ in 0..n {
+        elements.extend_from_slice(&source);
+    }
+    ctx.alloc_list(elements)
+}
+
 pub fn bind(vm: &mut VM) {
     let cls = vm.list_class;
 
@@ -181,4 +317,10 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(cls, "remove(_)", list_remove);
     vm.primitive(cls, "indexOf(_)", list_index_of);
     vm.primitive(cls, "swap(_,_)", list_swap);
+    vm.primitive(cls, "addAll(_)", list_add_all);
+    vm.primitive(cls, "sort()", list_sort);
+    vm.primitive(cls, "sort(_)", list_sort_by);
+    vm.primitive(cls, "toString", list_to_string);
+    vm.primitive(cls, "+(_)", list_plus);
+    vm.primitive(cls, "*(_)", list_times);
 }

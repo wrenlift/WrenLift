@@ -290,6 +290,7 @@ pub fn eval_pure_instruction(
 
         // -- VM/runtime-specific (unsupported in pure evaluation) --
         Instruction::GuardClass(_, _) => Err(InterpError::Unsupported("GuardClass".into())),
+        Instruction::GuardProtocol(_, _) => Err(InterpError::Unsupported("GuardProtocol".into())),
         Instruction::GetModuleVar(_) => Err(InterpError::Unsupported("GetModuleVar".into())),
         Instruction::SetModuleVar(_, _) => Err(InterpError::Unsupported("SetModuleVar".into())),
         Instruction::Call { .. } => Err(InterpError::Unsupported("Call".into())),

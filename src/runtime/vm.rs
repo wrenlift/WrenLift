@@ -754,6 +754,9 @@ impl VM {
         let class = self.gc.alloc_class(sym, superclass);
         unsafe {
             (*class).header.class = self.class_class;
+            // Set protocol conformance (inherits from superclass + own built-in protocols).
+            let builtin = crate::sema::protocol::builtin_protocols_for(name);
+            (*class).protocols = (*class).protocols.union(builtin);
         }
         class
     }
@@ -1029,6 +1032,106 @@ impl NativeContext for VM {
             trace.join("\n")
         }
     }
+
+    fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value> {
+        use crate::mir::{BlockId, Instruction};
+        use crate::mir::interp::InterpValue;
+
+        let class = self.class_of(receiver);
+        let method_sym = self.interner.intern(method);
+        let method_entry = unsafe { (*class).find_method(method_sym)?.clone() };
+
+        let mut all_args = Vec::with_capacity(1 + args.len());
+        all_args.push(receiver);
+        all_args.extend_from_slice(args);
+
+        match method_entry {
+            Method::Native(func) => {
+                Some(func(self, &all_args))
+            }
+            Method::Closure(closure_ptr) => {
+                // Run closure on a temporary fiber to avoid re-entrancy issues.
+                let temp_fiber = self.gc.alloc_fiber();
+                unsafe {
+                    (*temp_fiber).header.class = self.fiber_class;
+
+                    let fn_ptr = (*closure_ptr).function;
+                    let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
+
+                    let mir = self.engine.get_mir(func_id)?;
+                    let mut values = std::collections::HashMap::new();
+
+                    // Bind block params (receiver + args)
+                    let block = &mir.blocks[0];
+                    let mut param_idx = 0;
+                    for (vid, inst) in &block.instructions {
+                        if matches!(inst, Instruction::BlockParam(_)) {
+                            if param_idx < all_args.len() {
+                                values.insert(*vid, InterpValue::Boxed(all_args[param_idx]));
+                            }
+                            param_idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    (*temp_fiber).mir_frames.push(MirCallFrame {
+                        func_id,
+                        current_block: BlockId(0),
+                        ip: 0,
+                        values,
+                        module_name: "core".to_string(),
+                        return_dst: None,
+                        closure: Some(closure_ptr),
+                        defining_class: None,
+                    });
+                }
+
+                let saved_fiber = self.fiber;
+                self.fiber = temp_fiber;
+                let result = super::vm_interp::run_fiber(self);
+                self.fiber = saved_fiber;
+
+                result.ok()
+            }
+            Method::Constructor(closure_ptr) => {
+                // Constructors are called like closures
+                let temp_fiber = self.gc.alloc_fiber();
+                unsafe {
+                    (*temp_fiber).header.class = self.fiber_class;
+                    let fn_ptr = (*closure_ptr).function;
+                    let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
+                    let mir = self.engine.get_mir(func_id)?;
+                    let mut values = std::collections::HashMap::new();
+                    let block = &mir.blocks[0];
+                    let mut param_idx = 0;
+                    for (vid, inst) in &block.instructions {
+                        if matches!(inst, Instruction::BlockParam(_)) {
+                            if param_idx < all_args.len() {
+                                values.insert(*vid, InterpValue::Boxed(all_args[param_idx]));
+                            }
+                            param_idx += 1;
+                        } else { break; }
+                    }
+                    (*temp_fiber).mir_frames.push(MirCallFrame {
+                        func_id,
+                        current_block: BlockId(0),
+                        ip: 0,
+                        values,
+                        module_name: "core".to_string(),
+                        return_dst: None,
+                        closure: Some(closure_ptr),
+                        defining_class: None,
+                    });
+                }
+                let saved_fiber = self.fiber;
+                self.fiber = temp_fiber;
+                let result = super::vm_interp::run_fiber(self);
+                self.fiber = saved_fiber;
+                result.ok()
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,9 +1231,10 @@ mod tests {
             assert_eq!((*vm.object_class).header.class, vm.class_class);
             assert_eq!((*vm.num_class).header.class, vm.class_class);
             assert_eq!((*vm.string_class).header.class, vm.class_class);
-            // Num, String, etc. should inherit from Object.
+            // Num inherits from Object; String inherits from Sequence.
             assert_eq!((*vm.num_class).superclass, vm.object_class);
-            assert_eq!((*vm.string_class).superclass, vm.object_class);
+            assert_eq!((*vm.string_class).superclass, vm.sequence_class);
+            assert_eq!((*vm.sequence_class).superclass, vm.object_class);
         }
     }
 
@@ -2185,5 +2289,198 @@ System.print(f.stackTrace)
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         // The stack trace should mention "main" module and spawned-at info
         assert!(output.contains("main"), "should reference main module, got: {output}");
+    }
+
+    // -- String new methods --
+
+    #[test]
+    fn test_string_count() {
+        let mut vm = VM::new_default();
+        let cls = vm.string_class;
+        let s = vm.new_string("hello".to_string());
+        let count = call_primitive(&mut vm, cls, "count", &[s]);
+        assert_eq!(count.as_num().unwrap(), 5.0);
+    }
+
+    #[test]
+    fn test_string_is_empty() {
+        let mut vm = VM::new_default();
+        let cls = vm.string_class;
+
+        let empty = vm.new_string("".to_string());
+        assert_eq!(call_primitive(&mut vm, cls, "isEmpty", &[empty]).as_bool().unwrap(), true);
+
+        let nonempty = vm.new_string("a".to_string());
+        assert_eq!(call_primitive(&mut vm, cls, "isEmpty", &[nonempty]).as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_string_split() {
+        let mut vm = VM::new_default();
+        let cls = vm.string_class;
+        let s = vm.new_string("a,b,c".to_string());
+        let delim = vm.new_string(",".to_string());
+        let result = call_primitive(&mut vm, cls, "split(_)", &[s, delim]);
+        assert!(result.is_object());
+        // Result is a list; check count
+        let list_cls = vm.list_class;
+        let count = call_primitive(&mut vm, list_cls, "count", &[result]);
+        assert_eq!(count.as_num().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn test_string_replace() {
+        let mut vm = VM::new_default();
+        let cls = vm.string_class;
+        let s = vm.new_string("hello world".to_string());
+        let from = vm.new_string("world".to_string());
+        let to = vm.new_string("wren".to_string());
+        let result = call_primitive(&mut vm, cls, "replace(_,_)", &[s, from, to]);
+        assert_eq!(super::super::core::as_string(result), "hello wren");
+    }
+
+    #[test]
+    fn test_string_trim() {
+        let mut vm = VM::new_default();
+        let cls = vm.string_class;
+        let s = vm.new_string("  hi  ".to_string());
+
+        let trimmed = call_primitive(&mut vm, cls, "trim()", &[s]);
+        assert_eq!(super::super::core::as_string(trimmed), "hi");
+
+        let ts = call_primitive(&mut vm, cls, "trimStart()", &[s]);
+        assert_eq!(super::super::core::as_string(ts), "hi  ");
+
+        let te = call_primitive(&mut vm, cls, "trimEnd()", &[s]);
+        assert_eq!(super::super::core::as_string(te), "  hi");
+    }
+
+    #[test]
+    fn test_string_multiply() {
+        let mut vm = VM::new_default();
+        let cls = vm.string_class;
+        let s = vm.new_string("ab".to_string());
+        let result = call_primitive(&mut vm, cls, "*(_)", &[s, Value::num(3.0)]);
+        assert_eq!(super::super::core::as_string(result), "ababab");
+    }
+
+    // -- List new methods --
+
+    #[test]
+    fn test_list_sort() {
+        let mut vm = VM::new_default();
+        let cls = vm.list_class;
+
+        let list = vm.new_list(vec![Value::num(3.0), Value::num(1.0), Value::num(2.0)]);
+        let sorted = call_primitive(&mut vm, cls, "sort()", &[list]);
+
+        let first = call_primitive(&mut vm, cls, "[_]", &[sorted, Value::num(0.0)]);
+        assert_eq!(first.as_num().unwrap(), 1.0);
+        let second = call_primitive(&mut vm, cls, "[_]", &[sorted, Value::num(1.0)]);
+        assert_eq!(second.as_num().unwrap(), 2.0);
+        let third = call_primitive(&mut vm, cls, "[_]", &[sorted, Value::num(2.0)]);
+        assert_eq!(third.as_num().unwrap(), 3.0);
+    }
+
+    #[test]
+    fn test_list_times() {
+        let mut vm = VM::new_default();
+        let cls = vm.list_class;
+
+        let list = vm.new_list(vec![Value::num(1.0), Value::num(2.0)]);
+        let result = call_primitive(&mut vm, cls, "*(_)", &[list, Value::num(3.0)]);
+        let count = call_primitive(&mut vm, cls, "count", &[result]);
+        assert_eq!(count.as_num().unwrap(), 6.0);
+    }
+
+    // -- Map new methods --
+
+    #[test]
+    fn test_map_keys() {
+        let mut vm = VM::new_default();
+        let cls = vm.map_class;
+
+        let map = vm.new_map();
+        let k1 = vm.new_string("a".to_string());
+        let k2 = vm.new_string("b".to_string());
+        call_primitive(&mut vm, cls, "[_]=(_)", &[map, k1, Value::num(1.0)]);
+        call_primitive(&mut vm, cls, "[_]=(_)", &[map, k2, Value::num(2.0)]);
+
+        let keys = call_primitive(&mut vm, cls, "keys", &[map]);
+        let list_cls = vm.list_class;
+        let count = call_primitive(&mut vm, list_cls, "count", &[keys]);
+        assert_eq!(count.as_num().unwrap(), 2.0);
+    }
+
+    #[test]
+    fn test_map_values() {
+        let mut vm = VM::new_default();
+        let cls = vm.map_class;
+
+        let map = vm.new_map();
+        let k1 = vm.new_string("x".to_string());
+        call_primitive(&mut vm, cls, "[_]=(_)", &[map, k1, Value::num(42.0)]);
+
+        let vals = call_primitive(&mut vm, cls, "values", &[map]);
+        let list_cls = vm.list_class;
+        let count = call_primitive(&mut vm, list_cls, "count", &[vals]);
+        assert_eq!(count.as_num().unwrap(), 1.0);
+
+        let first = call_primitive(&mut vm, list_cls, "[_]", &[vals, Value::num(0.0)]);
+        assert_eq!(first.as_num().unwrap(), 42.0);
+    }
+
+    // -- Object.hashCode --
+
+    #[test]
+    fn test_object_hash() {
+        let mut vm = VM::new_default();
+        let cls = vm.object_class;
+
+        let h1 = call_primitive(&mut vm, cls, "hashCode", &[Value::num(42.0)]);
+        let h2 = call_primitive(&mut vm, cls, "hashCode", &[Value::num(42.0)]);
+        assert_eq!(h1.as_num().unwrap(), h2.as_num().unwrap());
+
+        // Different values should (almost certainly) have different hashes
+        let h3 = call_primitive(&mut vm, cls, "hashCode", &[Value::num(43.0)]);
+        assert_ne!(h1.as_num().unwrap(), h3.as_num().unwrap());
+    }
+
+    // -- Object.is --
+
+    #[test]
+    fn test_object_is() {
+        let mut vm = VM::new_default();
+        let cls = vm.object_class;
+
+        let num_cls = Value::object(vm.num_class as *mut u8);
+        let obj_cls = Value::object(vm.object_class as *mut u8);
+
+        // 42 is Num → true
+        let r = call_primitive(&mut vm, cls, "is(_)", &[Value::num(42.0), num_cls]);
+        assert_eq!(r.as_bool().unwrap(), true);
+
+        // 42 is Object → true (Num inherits Object)
+        let r2 = call_primitive(&mut vm, cls, "is(_)", &[Value::num(42.0), obj_cls]);
+        assert_eq!(r2.as_bool().unwrap(), true);
+
+        // "hi" is Num → false
+        let s = vm.new_string("hi".to_string());
+        let r3 = call_primitive(&mut vm, cls, "is(_)", &[s, num_cls]);
+        assert_eq!(r3.as_bool().unwrap(), false);
+    }
+
+    // -- Sequence hierarchy --
+
+    #[test]
+    fn test_sequence_hierarchy() {
+        let mut vm = VM::new_default();
+        unsafe {
+            assert_eq!((*vm.list_class).superclass, vm.sequence_class);
+            assert_eq!((*vm.map_class).superclass, vm.sequence_class);
+            assert_eq!((*vm.range_class).superclass, vm.sequence_class);
+            assert_eq!((*vm.string_class).superclass, vm.sequence_class);
+            assert_eq!((*vm.sequence_class).superclass, vm.object_class);
+        }
     }
 }

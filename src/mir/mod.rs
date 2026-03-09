@@ -286,6 +286,8 @@ pub enum Instruction {
     GuardBool(ValueId),
     /// Assert that a value is an instance of a specific class.
     GuardClass(ValueId, SymbolId),
+    /// Assert that a value conforms to a protocol (protocol-based devirtualization guard).
+    GuardProtocol(ValueId, crate::sema::protocol::ProtocolId),
 
     // -- Boxing / unboxing --------------------------------------------------
 
@@ -441,7 +443,9 @@ impl Instruction {
             | Instruction::ToString(a)
             | Instruction::MathUnaryF64(_, a) => vec![*a],
 
-            Instruction::GuardClass(a, _) | Instruction::IsType(a, _) => vec![*a],
+            Instruction::GuardClass(a, _)
+            | Instruction::GuardProtocol(a, _)
+            | Instruction::IsType(a, _) => vec![*a],
 
             Instruction::GetField(recv, _) => vec![*recv],
             Instruction::SetField(recv, _, val) => vec![*recv, *val],
@@ -612,6 +616,8 @@ pub struct ClassMir {
     pub superclass: Option<SymbolId>,
     pub methods: Vec<MethodMir>,
     pub num_fields: u16,
+    /// Protocols this class conforms to (computed during compilation).
+    pub protocols: crate::sema::protocol::ProtocolSet,
 }
 
 /// MIR for a single method within a class.
@@ -884,6 +890,13 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::GuardBool(a) => format!("guard.bool {}", a),
         Instruction::GuardClass(a, sym) => {
             format!("guard.class {}, %{}", a, interner.resolve(*sym))
+        }
+        Instruction::GuardProtocol(a, pid) => {
+            let name = crate::sema::protocol::BUILTIN_PROTOCOLS
+                .get(pid.0 as usize)
+                .map(|p| p.name)
+                .unwrap_or("?");
+            format!("guard.protocol {}, {}", a, name)
         }
 
         Instruction::Unbox(a) => format!("unbox {}", a),

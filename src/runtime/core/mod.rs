@@ -13,6 +13,7 @@ mod null;
 mod num;
 mod obj;
 mod range;
+mod sequence;
 mod string;
 mod system;
 
@@ -43,25 +44,34 @@ pub fn initialize(vm: &mut VM) {
         (*class_class).header.class = class_class;
     }
 
-    // 2. Create remaining core classes (all inherit from Object).
+    // 2. Create remaining core classes.
+    //    Sequence is created first so String/List/Map/Range can inherit from it.
     vm.bool_class = vm.make_class("Bool", object_class);
     vm.num_class = vm.make_class("Num", object_class);
     vm.null_class = vm.make_class("Null", object_class);
-    vm.string_class = vm.make_class("String", object_class);
-    vm.list_class = vm.make_class("List", object_class);
-    vm.map_class = vm.make_class("Map", object_class);
-    vm.range_class = vm.make_class("Range", object_class);
     vm.fn_class = vm.make_class("Fn", object_class);
     vm.fiber_class = vm.make_class("Fiber", object_class);
     vm.system_class = vm.make_class("System", object_class);
+
+    // Sequence is the base class for iterable types.
     vm.sequence_class = vm.make_class("Sequence", object_class);
 
+    // Collection classes inherit from Sequence (user classes can too).
+    vm.string_class = vm.make_class("String", vm.sequence_class);
+    vm.list_class = vm.make_class("List", vm.sequence_class);
+    vm.map_class = vm.make_class("Map", vm.sequence_class);
+    vm.range_class = vm.make_class("Range", vm.sequence_class);
+
     // 3. Bind native methods to each class.
+    //    Sequence methods are bound first, then subclass-specific methods
+    //    override as needed (e.g., List has a native `count` that's faster
+    //    than Sequence's iterate-based one).
     obj::bind(vm);
     cls::bind(vm);
     self::bool::bind(vm);
     null::bind(vm);
     num::bind(vm);
+    sequence::bind(vm);
     string::bind(vm);
     list::bind(vm);
     map::bind(vm);

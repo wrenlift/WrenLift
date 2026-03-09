@@ -6,6 +6,7 @@
 pub mod constfold;
 pub mod cse;
 pub mod dce;
+pub mod devirt;
 pub mod escape;
 pub mod inline;
 pub mod licm;
@@ -102,7 +103,7 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         | Box(a) | Move(a) | ToString(a) | MathUnaryF64(_, a) => {
             *a = resolve(*a, map);
         }
-        GuardClass(a, _) | IsType(a, _) => {
+        GuardClass(a, _) | GuardProtocol(a, _) | IsType(a, _) => {
             *a = resolve(*a, map);
         }
         GetField(recv, _) => {

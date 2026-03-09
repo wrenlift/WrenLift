@@ -419,8 +419,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         InterpValue::Boxed(Value::bool(matched))
                     }
 
-                    // -- Guard that needs VM class system --
+                    // -- Guards that need VM class system --
                     GuardClass(a, _cls) => get_val(&values, *a)?,
+                    GuardProtocol(a, _proto) => get_val(&values, *a)?,
 
                     // -- Field access --
                     GetField(recv_id, field_idx) => {

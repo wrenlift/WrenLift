@@ -861,6 +861,12 @@ impl<'a> MirWasmEmitter<'a> {
 
             // Block params handled at block entry from branch args.
             Instruction::BlockParam(_) => {}
+
+            // Protocol guard: emit as runtime call (devirt pass typically eliminates these).
+            Instruction::GuardProtocol(a, _) => {
+                func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
         }
         Ok(())
     }

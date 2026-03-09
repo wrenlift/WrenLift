@@ -276,6 +276,76 @@ fn iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 }
 
+fn count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    Value::num(receiver_str(args).chars().count() as f64)
+}
+
+fn is_empty(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    Value::bool(receiver_str(args).is_empty())
+}
+
+fn split(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let delimiter = match super::validate_string(ctx, args[1], "Delimiter") {
+        Some(d) => d,
+        None => return Value::null(),
+    };
+
+    if delimiter.is_empty() {
+        ctx.runtime_error("Delimiter cannot be empty.".to_string());
+        return Value::null();
+    }
+
+    let s = receiver_str(args);
+    let elements: Vec<Value> = s
+        .split(delimiter.as_str())
+        .map(|part| ctx.alloc_string(part.to_string()))
+        .collect();
+    ctx.alloc_list(elements)
+}
+
+fn replace(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let from = match super::validate_string(ctx, args[1], "From") {
+        Some(s) => s,
+        None => return Value::null(),
+    };
+    let to = match super::validate_string(ctx, args[2], "To") {
+        Some(s) => s,
+        None => return Value::null(),
+    };
+
+    let s = receiver_str(args);
+    let result = s.replace(from.as_str(), to.as_str());
+    ctx.alloc_string(result)
+}
+
+fn trim(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    ctx.alloc_string(receiver_str(args).trim().to_string())
+}
+
+fn trim_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    ctx.alloc_string(receiver_str(args).trim_start().to_string())
+}
+
+fn trim_end(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    ctx.alloc_string(receiver_str(args).trim_end().to_string())
+}
+
+fn multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let n = match super::validate_int(ctx, args[1], "Count") {
+        Some(v) => v,
+        None => return Value::null(),
+    };
+
+    if n < 0 {
+        ctx.runtime_error("Count must be non-negative.".to_string());
+        return Value::null();
+    }
+
+    let s = receiver_str(args);
+    let result = s.repeat(n as usize);
+    ctx.alloc_string(result)
+}
+
 fn starts_with(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     if !super::is_string(args[1]) {
         ctx.runtime_error("Argument must be a string.".to_string());
@@ -304,18 +374,26 @@ pub fn bind(vm: &mut VM) {
 
     // Instance getters
     vm.primitive(class, "byteCount_", byte_count);
+    vm.primitive(class, "count", count);
+    vm.primitive(class, "isEmpty", is_empty);
     vm.primitive(class, "toString", to_string);
+    vm.primitive(class, "trim()", trim);
+    vm.primitive(class, "trimStart()", trim_start);
+    vm.primitive(class, "trimEnd()", trim_end);
 
     // Subscript
     vm.primitive(class, "[_]", subscript);
 
     // Binary / single-arg methods
     vm.primitive(class, "+(_)", plus);
+    vm.primitive(class, "*(_)", multiply);
     vm.primitive(class, "contains(_)", contains);
     vm.primitive(class, "endsWith(_)", ends_with);
     vm.primitive(class, "indexOf(_)", index_of_1);
     vm.primitive(class, "indexOf(_,_)", index_of_2);
+    vm.primitive(class, "split(_)", split);
     vm.primitive(class, "startsWith(_)", starts_with);
+    vm.primitive(class, "replace(_,_)", replace);
 
     // Byte access
     vm.primitive(class, "byteAt_(_)", byte_at);

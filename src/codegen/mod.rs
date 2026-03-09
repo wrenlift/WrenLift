@@ -2124,6 +2124,23 @@ impl<'a> LowerCtx<'a> {
                     ret: Some(dst),
                 });
             }
+            Instruction::GuardProtocol(a, proto_id) => {
+                // Protocol guard: checks the class's protocol bitset at runtime.
+                // For now, emit as a runtime call; the devirt pass eliminates
+                // most of these before codegen.
+                let la = self.vreg_for(*a);
+                let dst = self.vreg_for(dst_val);
+                let pid_reg = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm {
+                    dst: pid_reg,
+                    bits: proto_id.0 as u64,
+                });
+                self.mf.emit(MachInst::CallRuntime {
+                    name: "wren_guard_protocol",
+                    args: vec![la, pid_reg],
+                    ret: Some(dst),
+                });
+            }
             // -- Subscript: inline GEP for single-index list access --
             Instruction::SubscriptGet { receiver, args } if args.len() == 1 => {
                 use crate::runtime::object_layout::*;

@@ -107,6 +107,33 @@ fn map_value_iterator_value(_ctx: &mut dyn NativeContext, args: &[Value]) -> Val
     }
 }
 
+fn map_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let map = receiver_map(args);
+    let keys: Vec<Value> = map.entries.keys().map(|k| k.value()).collect();
+    ctx.alloc_list(keys)
+}
+
+fn map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let map = receiver_map(args);
+    let vals: Vec<Value> = map.entries.values().copied().collect();
+    ctx.alloc_list(vals)
+}
+
+fn map_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let map = receiver_map(args);
+    let mut result = String::from("{");
+    let mut first = true;
+    for (key, val) in &map.entries {
+        if !first { result.push_str(", "); }
+        first = false;
+        let k = super::sequence::value_to_string(ctx, key.value());
+        let v = super::sequence::value_to_string(ctx, *val);
+        result.push_str(&format!("{}: {}", k, v));
+    }
+    result.push('}');
+    ctx.alloc_string(result)
+}
+
 pub fn bind(vm: &mut VM) {
     let cls = vm.map_class;
 
@@ -122,4 +149,7 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(cls, "iterate(_)", map_iterate);
     vm.primitive(cls, "keyIteratorValue_(_)", map_key_iterator_value);
     vm.primitive(cls, "valueIteratorValue_(_)", map_value_iterator_value);
+    vm.primitive(cls, "keys", map_keys);
+    vm.primitive(cls, "values", map_values);
+    vm.primitive(cls, "toString", map_to_string);
 }
