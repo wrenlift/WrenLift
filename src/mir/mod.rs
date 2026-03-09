@@ -592,6 +592,42 @@ impl BasicBlock {
 // MIR Function
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Module-level MIR output (includes classes)
+// ---------------------------------------------------------------------------
+
+/// The complete MIR output for a module: top-level code + class definitions.
+#[derive(Debug, Clone)]
+pub struct ModuleMir {
+    pub top_level: MirFunction,
+    pub classes: Vec<ClassMir>,
+    /// Closure / nested function bodies referenced by MakeClosure instructions.
+    pub closures: Vec<MirFunction>,
+}
+
+/// MIR for a user-defined class.
+#[derive(Debug, Clone)]
+pub struct ClassMir {
+    pub name: SymbolId,
+    pub superclass: Option<SymbolId>,
+    pub methods: Vec<MethodMir>,
+    pub num_fields: u16,
+}
+
+/// MIR for a single method within a class.
+#[derive(Debug, Clone)]
+pub struct MethodMir {
+    /// Wren method signature (e.g. "foo(_)", "bar", "[_]").
+    pub signature: String,
+    pub is_static: bool,
+    pub is_constructor: bool,
+    pub mir: MirFunction,
+}
+
+// ---------------------------------------------------------------------------
+// MirFunction
+// ---------------------------------------------------------------------------
+
 /// A compiled function in MIR form.
 #[derive(Debug, Clone)]
 pub struct MirFunction {

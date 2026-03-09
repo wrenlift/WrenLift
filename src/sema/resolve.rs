@@ -41,6 +41,8 @@ pub struct ResolveResult {
     pub errors: Vec<Diagnostic>,
     /// Upvalue info for each scope that captures variables.
     pub upvalues: HashMap<usize, Vec<UpvalueInfo>>,
+    /// Module-level variable names, in declaration order.
+    pub module_vars: Vec<SymbolId>,
 }
 
 /// Information about a captured upvalue.
@@ -183,6 +185,7 @@ impl<'a> Resolver<'a> {
             resolutions: self.resolutions,
             errors: self.errors,
             upvalues: self.upvalue_map,
+            module_vars: self.module_vars,
         }
     }
 
@@ -629,7 +632,21 @@ impl<'a> Resolver<'a> {
 
 /// Convenience: resolve a parsed module.
 pub fn resolve(module: &Module, interner: &Interner) -> ResolveResult {
-    let resolver = Resolver::new(interner);
+    resolve_with_prelude(module, interner, &[])
+}
+
+/// Resolve a parsed module with pre-defined module-level names (e.g. core classes).
+/// Prelude names are registered as module vars before user declarations, so they
+/// get lower indices and are available for resolution throughout the module.
+pub fn resolve_with_prelude(
+    module: &Module,
+    interner: &Interner,
+    prelude: &[SymbolId],
+) -> ResolveResult {
+    let mut resolver = Resolver::new(interner);
+    for &sym in prelude {
+        resolver.module_vars.push(sym);
+    }
     resolver.resolve(module)
 }
 

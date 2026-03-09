@@ -135,6 +135,9 @@ pub struct VM {
 
     // -- Error state (set by primitives) --
     pub has_error: bool,
+
+    // -- Output capture (for testing; None = print to stdout) --
+    pub output_buffer: Option<String>,
 }
 
 impl VM {
@@ -169,6 +172,7 @@ impl VM {
 
             config,
             has_error: false,
+            output_buffer: None,
         };
 
         // Bootstrap core classes.
@@ -213,8 +217,15 @@ impl VM {
         // 2. Use the parse interner, merge afterward
         let mut interner = parse_result.interner;
 
-        // 3. Semantic analysis
-        let resolve_result = sema::resolve::resolve(&parse_result.module, &interner);
+        // 3. Semantic analysis — register core class names as prelude
+        let core_names = [
+            "Object", "Class", "Bool", "Num", "String", "List", "Map",
+            "Range", "Null", "Fn", "Fiber", "System", "Sequence",
+        ];
+        let prelude: Vec<crate::intern::SymbolId> =
+            core_names.iter().map(|n| interner.intern(n)).collect();
+        let resolve_result =
+            sema::resolve::resolve_with_prelude(&parse_result.module, &interner, &prelude);
         if resolve_result
             .errors
             .iter()
@@ -227,10 +238,10 @@ impl VM {
         }
 
         // 4. Lower to MIR
-        let mut mir =
-            crate::mir::builder::lower_module(&parse_result.module, &mut interner);
+        let mut module_mir =
+            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
 
-        // 5. Optimize
+        // 5. Optimize top-level function
         let constfold = ConstFold;
         let dce = Dce;
         let cse = Cse;
@@ -240,7 +251,17 @@ impl VM {
         let passes: Vec<&dyn MirPass> = vec![
             &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
         ];
-        opt::run_to_fixpoint(&mut mir, &passes, 10);
+        opt::run_to_fixpoint(&mut module_mir.top_level, &passes, 10);
+        // Also optimize method bodies
+        for class in &mut module_mir.classes {
+            for method in &mut class.methods {
+                opt::run_to_fixpoint(&mut method.mir, &passes, 10);
+            }
+        }
+        // Optimize closure bodies
+        for closure in &mut module_mir.closures {
+            opt::run_to_fixpoint(closure, &passes, 10);
+        }
 
         // 6. Remap symbols: the parse interner and VM interner have different
         // indices for the same strings. Build a mapping and rewrite the MIR.
@@ -251,20 +272,147 @@ impl VM {
             let new_sym = self.interner.intern(s);
             sym_map.push(new_sym);
         }
-        mir.remap_symbols(|old| sym_map[old.index() as usize]);
+        module_mir.top_level.remap_symbols(|old| sym_map[old.index() as usize]);
+        for class in &mut module_mir.classes {
+            class.name = sym_map[class.name.index() as usize];
+            if let Some(ref mut sup) = class.superclass {
+                *sup = sym_map[sup.index() as usize];
+            }
+            for method in &mut class.methods {
+                method.mir.remap_symbols(|old| sym_map[old.index() as usize]);
+            }
+        }
+        for closure in &mut module_mir.closures {
+            closure.remap_symbols(|old| sym_map[old.index() as usize]);
+        }
 
-        // 7. Register function with the engine
-        let func_id = self.engine.register_function(mir);
+        // 7a. Register closure functions with the engine first, so we can
+        // patch MakeClosure fn_ids to use actual engine FuncIds.
+        let mut closure_func_ids: Vec<u32> = Vec::new();
+        for closure in module_mir.closures.drain(..) {
+            let fid = self.engine.register_function(closure);
+            closure_func_ids.push(fid.0);
+        }
 
-        // 8. Create module var storage
+        // Patch MakeClosure instructions in top-level and method bodies
+        patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
+        for class in &mut module_mir.classes {
+            for method in &mut class.methods {
+                patch_closure_ids(&mut method.mir, &closure_func_ids);
+            }
+        }
+
+        // 7b. Register top-level function with the engine
+        let func_id = self.engine.register_function(module_mir.top_level);
+
+        // 8. Create module var storage, pre-populated with core class values.
+        // resolve_result.module_vars uses parse-interner SymbolIds; look up
+        // their string names to check for core classes.
         let module_key = module_name.to_string();
+        let mut module_vars = Vec::with_capacity(resolve_result.module_vars.len());
+        for &parse_sym in &resolve_result.module_vars {
+            let name = interner.resolve(parse_sym);
+            if let Some(value) = self.core_class_value(name) {
+                module_vars.push(value);
+            } else {
+                module_vars.push(Value::null());
+            }
+        }
         self.engine.modules.insert(
             module_key.clone(),
             super::engine::ModuleEntry {
                 top_level: func_id,
-                vars: Vec::new(),
+                vars: module_vars,
             },
         );
+
+        // 8b. Create user-defined classes and bind their methods.
+        for class_mir in module_mir.classes {
+            // Find module var slot for this class
+            let class_name_str = self.interner.resolve(class_mir.name).to_string();
+            let slot = resolve_result.module_vars.iter().position(|&sym| {
+                interner.resolve(sym) == class_name_str
+            });
+
+            // Resolve superclass (check core classes, then module vars)
+            let superclass = class_mir.superclass
+                .and_then(|sup_sym| {
+                    let sup_name = self.interner.resolve(sup_sym).to_string();
+                    // Try core classes first
+                    if let Some(v) = self.core_class_value(&sup_name) {
+                        return v.as_object().map(|p| p as *mut ObjClass);
+                    }
+                    // Try module vars (user-defined classes created earlier)
+                    if let Some(entry) = self.engine.modules.get(&module_key) {
+                        for &var_val in &entry.vars {
+                            if var_val.is_object() {
+                                let ptr = var_val.as_object().unwrap() as *mut ObjClass;
+                                let header = ptr as *const ObjHeader;
+                                if unsafe { (*header).obj_type } == ObjType::Class {
+                                    let name = unsafe { self.interner.resolve((*ptr).name).to_string() };
+                                    if name == sup_name {
+                                        return Some(ptr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None
+                })
+                .unwrap_or(self.object_class);
+
+            // Create the class
+            let class_ptr = self.gc.alloc_class(class_mir.name, superclass);
+            unsafe {
+                (*class_ptr).header.class = self.class_class;
+                (*class_ptr).num_fields = class_mir.num_fields;
+            }
+
+            // Register each method's MIR and bind to the class
+            for method_mir in class_mir.methods {
+                let method_func_id = self.engine.register_function(method_mir.mir);
+
+                // Create ObjFn + ObjClosure for the method
+                let sig_sym = self.interner.intern(&method_mir.signature);
+                let fn_ptr = self.gc.alloc_fn(sig_sym, 0, 0, method_func_id.0 as u32);
+                unsafe {
+                    (*fn_ptr).header.class = self.fn_class;
+                }
+
+                let closure_ptr = self.gc.alloc_closure(fn_ptr);
+                unsafe {
+                    (*closure_ptr).header.class = self.fn_class;
+                }
+
+                let sig_sym = self.interner.intern(&method_mir.signature);
+                let bind_sym = if method_mir.is_static || method_mir.is_constructor {
+                    let static_sig = format!("static:{}", method_mir.signature);
+                    self.interner.intern(&static_sig)
+                } else {
+                    sig_sym
+                };
+
+                unsafe {
+                    let method = if method_mir.is_constructor {
+                        Method::Constructor(closure_ptr)
+                    } else {
+                        Method::Closure(closure_ptr)
+                    };
+                    (*class_ptr).methods.insert(bind_sym, method);
+                }
+            }
+
+            // Store class in module vars
+            if let Some(idx) = slot {
+                let class_val = Value::object(class_ptr as *mut u8);
+                if let Some(entry) = self.engine.modules.get_mut(&module_key) {
+                    while entry.vars.len() <= idx {
+                        entry.vars.push(Value::null());
+                    }
+                    entry.vars[idx] = class_val;
+                }
+            }
+        }
 
         // 9. Create a fiber and push the initial call frame
         let fiber = self.gc.alloc_fiber();
@@ -306,6 +454,20 @@ impl VM {
         let obj = self.gc.alloc_string(s);
         unsafe { (*obj).header.class = self.string_class; }
         Value::object(obj as *mut u8)
+    }
+
+    /// Write to output (captured buffer if set, otherwise stdout).
+    pub fn vm_write(&mut self, s: &str) {
+        if let Some(ref mut buf) = self.output_buffer {
+            buf.push_str(s);
+        } else {
+            print!("{}", s);
+        }
+    }
+
+    /// Take captured output (for tests).
+    pub fn take_output(&mut self) -> String {
+        self.output_buffer.take().unwrap_or_default()
     }
 
     /// Allocate a GC-managed list and return it as a Value.
@@ -402,6 +564,27 @@ impl VM {
         unsafe {
             self.interner.resolve((*class).name).to_string()
         }
+    }
+
+    /// Map a core class name to its Value (pointer to ObjClass).
+    pub fn core_class_value(&self, name: &str) -> Option<Value> {
+        let class_ptr = match name {
+            "Object" => self.object_class,
+            "Class" => self.class_class,
+            "Bool" => self.bool_class,
+            "Num" => self.num_class,
+            "String" => self.string_class,
+            "List" => self.list_class,
+            "Map" => self.map_class,
+            "Range" => self.range_class,
+            "Null" => self.null_class,
+            "Fn" => self.fn_class,
+            "Fiber" => self.fiber_class,
+            "System" => self.system_class,
+            "Sequence" => self.sequence_class,
+            _ => return None,
+        };
+        Some(Value::object(class_ptr as *mut u8))
     }
 
     /// Write text via the configured write callback (or stdout).
@@ -516,6 +699,27 @@ impl NativeContext for VM {
     fn resolve_symbol(&self, id: SymbolId) -> &str {
         self.interner.resolve(id)
     }
+
+    fn write_output(&mut self, s: &str) {
+        self.vm_write(s);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Patch MakeClosure fn_id indices to actual engine FuncIds.
+fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32]) {
+    for block in &mut func.blocks {
+        for (_, inst) in &mut block.instructions {
+            if let crate::mir::Instruction::MakeClosure { fn_id, .. } = inst {
+                if let Some(&actual_id) = closure_func_ids.get(*fn_id as usize) {
+                    *fn_id = actual_id;
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +747,15 @@ mod tests {
             Some(Method::Native(func)) => func(vm, args),
             _ => panic!("Static method '{}' not found", sig),
         }
+    }
+
+    /// Create a VM with output capture enabled. Run source, return (result, output).
+    fn run_and_capture(source: &str) -> (InterpretResult, String) {
+        let mut vm = VM::new_default();
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", source);
+        let output = vm.take_output();
+        (result, output)
     }
 
     // -- VM creation --
@@ -886,5 +1099,199 @@ mod tests {
         assert_eq!(vm.class_of(Value::num(1.0)), vm.num_class);
         assert_eq!(vm.class_of(Value::bool(true)), vm.bool_class);
         assert_eq!(vm.class_of(Value::null()), vm.null_class);
+    }
+
+    // -- interpret (integration) --
+
+    #[test]
+    fn test_interpret_system_print() {
+        let (result, output) = run_and_capture("System.print(\"hello\")");
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "hello\n");
+    }
+
+    #[test]
+    fn test_interpret_arithmetic() {
+        let (result, output) = run_and_capture("System.print(1 + 2)");
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "3\n");
+    }
+
+    #[test]
+    fn test_interpret_module_vars() {
+        let (result, output) = run_and_capture("var x = 10\nSystem.print(x)");
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "10\n");
+    }
+
+    #[test]
+    fn test_interpret_is_type() {
+        let (result, output) = run_and_capture("System.print(42 is Num)");
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "true\n");
+    }
+
+    #[test]
+    fn test_interpret_class_construct() {
+        let (result, _) = run_and_capture("class Foo {\n  construct new() {}\n}\nvar f = Foo.new()");
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+    }
+
+    #[test]
+    fn test_interpret_class_with_fields() {
+        let (result, output) = run_and_capture(r#"
+class Point {
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
+  x { _x }
+  y { _y }
+}
+var p = Point.new(3, 4)
+System.print(p.x)
+System.print(p.y)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "3\n4\n");
+    }
+
+    #[test]
+    fn test_interpret_instance_method() {
+        let (result, output) = run_and_capture(r#"
+class Greeter {
+  construct new(name) {
+    _name = name
+  }
+  greet() { _name }
+}
+var g = Greeter.new("Alice")
+System.print(g.greet())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "Alice\n");
+    }
+
+    #[test]
+    fn test_interpret_named_constructor() {
+        let (result, output) = run_and_capture(r#"
+class Foo {
+  construct create(x) {
+    _x = x
+  }
+  x { _x }
+}
+var f = Foo.create(42)
+System.print(f.x)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_fn_call() {
+        let (result, output) = run_and_capture(r#"
+var fn = Fn.new {
+  System.print(42)
+}
+fn.call()
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "42\n");
+    }
+
+    #[test]
+    fn test_interpret_fn_call_with_args() {
+        let (result, output) = run_and_capture(r#"
+var add = Fn.new {|a, b|
+  System.print(a + b)
+}
+add.call(3, 4)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "7\n");
+    }
+
+    #[test]
+    fn test_interpret_this_access() {
+        let (result, output) = run_and_capture(r#"
+class Counter {
+  construct new(n) {
+    _n = n
+  }
+  inc() { _n = _n + 1 }
+  value { _n }
+}
+var c = Counter.new(0)
+c.inc()
+c.inc()
+c.inc()
+System.print(c.value)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "3\n");
+    }
+
+    #[test]
+    fn test_interpret_inheritance() {
+        // Test method inheritance (child calls parent method)
+        let (result, output) = run_and_capture(r#"
+class Animal {
+  construct new(name) {
+    _name = name
+  }
+  name { _name }
+}
+class Dog is Animal {
+  construct new(name) {
+    _name = name
+  }
+  bark() { "woof" }
+}
+var d = Dog.new("Rex")
+System.print(d.name)
+System.print(d.bark())
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "Rex\nwoof\n");
+    }
+
+    #[test]
+    fn test_interpret_operator_overload() {
+        let (result, output) = run_and_capture(r#"
+class Vec2 {
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
+  x { _x }
+  y { _y }
+  +(other) { Vec2.new(_x + other.x, _y + other.y) }
+  toString { "(" + _x.toString + ", " + _y.toString + ")" }
+}
+var a = Vec2.new(1, 2)
+var b = Vec2.new(3, 4)
+var c = a + b
+System.print(c.x)
+System.print(c.y)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "4\n6\n");
+    }
+
+    #[test]
+    fn test_interpret_prefix_operator() {
+        let (result, output) = run_and_capture(r#"
+class Num2 {
+  construct new(n) { _n = n }
+  value { _n }
+  -() { Num2.new(-_n) }
+}
+var a = Num2.new(5)
+var b = -a
+System.print(b.value)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "-5\n");
     }
 }

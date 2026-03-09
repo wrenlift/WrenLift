@@ -661,6 +661,8 @@ pub struct ObjClass {
 pub enum Method {
     /// A Wren closure.
     Closure(*mut ObjClosure),
+    /// A constructor closure — allocates an instance then calls the body.
+    Constructor(*mut ObjClosure),
     /// A native/foreign function.
     Native(NativeFn),
 }
@@ -669,6 +671,7 @@ impl fmt::Debug for Method {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Method::Closure(_) => write!(f, "Method::Closure(...)"),
+            Method::Constructor(_) => write!(f, "Method::Constructor(...)"),
             Method::Native(_) => write!(f, "Method::Native(...)"),
         }
     }
@@ -704,6 +707,9 @@ pub trait NativeContext {
     // -- Symbol interning --
     fn intern(&mut self, s: &str) -> SymbolId;
     fn resolve_symbol(&self, id: SymbolId) -> &str;
+
+    // -- Output --
+    fn write_output(&mut self, s: &str);
 }
 
 impl ObjClass {
@@ -739,9 +745,20 @@ impl ObjClass {
         self.methods.insert(name, Method::Native(func));
     }
 
-    /// Look up a method by symbol. O(1) via HashMap.
+    /// Look up a method by symbol. Walks superclass chain.
     pub fn find_method(&self, name: SymbolId) -> Option<&Method> {
-        self.methods.get(&name)
+        if let Some(m) = self.methods.get(&name) {
+            return Some(m);
+        }
+        let mut cls = self.superclass;
+        while !cls.is_null() {
+            let parent = unsafe { &*cls };
+            if let Some(m) = parent.methods.get(&name) {
+                return Some(m);
+            }
+            cls = parent.superclass;
+        }
+        None
     }
 }
 

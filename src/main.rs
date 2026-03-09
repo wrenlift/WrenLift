@@ -221,7 +221,8 @@ fn run_manual_pipeline(
     }
 
     // Lower to MIR
-    let mut mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner);
+    let mut module_mir = wren_lift::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+    let mir = &mut module_mir.top_level;
 
     if cli.dump_mir {
         println!("{}", mir.pretty_print(&interner));
@@ -230,7 +231,7 @@ fn run_manual_pipeline(
 
     // Optimize
     if !cli.no_opt {
-        run_opt_pipeline(&mut mir, &interner);
+        run_opt_pipeline(mir, &interner);
     }
 
     if cli.dump_opt {
@@ -241,7 +242,7 @@ fn run_manual_pipeline(
     // Code generation
     match cli.target {
         Target::Wasm => {
-            let wasm_module = match wren_lift::codegen::wasm::emit_mir(&mir) {
+            let wasm_module = match wren_lift::codegen::wasm::emit_mir(mir) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("error: WASM codegen failed: {}", e);

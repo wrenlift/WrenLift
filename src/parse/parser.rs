@@ -1150,6 +1150,7 @@ impl Parser {
                             method: (method_sym, method_span),
                             args,
                             block_arg,
+                            has_parens: true,
                         },
                         span,
                     );
@@ -1164,6 +1165,7 @@ impl Parser {
                             method: (method_sym, method_span),
                             args: Vec::new(),
                             block_arg,
+                            has_parens: false,
                         },
                         span,
                     );
@@ -1181,6 +1183,7 @@ impl Parser {
                             method: (setter_sym, method_span),
                             args: vec![value],
                             block_arg: None,
+                            has_parens: true,
                         },
                         span,
                     );
@@ -1194,6 +1197,7 @@ impl Parser {
                             method: (method_sym, method_span),
                             args: Vec::new(),
                             block_arg: None,
+                            has_parens: false,
                         },
                         span,
                     );
@@ -1395,6 +1399,7 @@ impl Parser {
                             method: (sym, ident_span.clone()),
                             args,
                             block_arg,
+                            has_parens: true,
                         },
                         start..end,
                     ));
@@ -1410,6 +1415,7 @@ impl Parser {
                             method: (sym, ident_span.clone()),
                             args: Vec::new(),
                             block_arg,
+                            has_parens: false,
                         },
                         start..end,
                     ));

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::ast::*;
 use crate::intern::{Interner, SymbolId};
 use crate::mir::*;
+use crate::sema::resolve::{ResolvedName, ResolveResult};
 
 // ---------------------------------------------------------------------------
 // Builder
@@ -18,27 +19,46 @@ use crate::mir::*;
 pub struct MirBuilder<'a> {
     func: MirFunction,
     interner: &'a mut Interner,
+    resolutions: &'a HashMap<usize, ResolvedName>,
+    module_vars: &'a [SymbolId],
     current_block: BlockId,
     variables: HashMap<SymbolId, ValueId>,
     break_targets: Vec<BlockId>,
     continue_targets: Vec<BlockId>,
+    /// Field name → index mapping for the current class (None if not in a method).
+    field_map: Option<HashMap<SymbolId, u16>>,
+    /// Compiled closure bodies collected during lowering.
+    closures: Vec<MirFunction>,
+    /// Base index for closure fn_ids (offset into module's closure list).
+    closure_base: u32,
 }
 
 impl<'a> MirBuilder<'a> {
-    pub fn new(name: SymbolId, arity: u8, interner: &'a mut Interner) -> Self {
+    pub fn new(
+        name: SymbolId,
+        arity: u8,
+        interner: &'a mut Interner,
+        resolutions: &'a HashMap<usize, ResolvedName>,
+        module_vars: &'a [SymbolId],
+    ) -> Self {
         let mut func = MirFunction::new(name, arity);
         let entry = func.new_block();
         Self {
             func,
             interner,
+            resolutions,
+            module_vars,
             current_block: entry,
             variables: HashMap::new(),
             break_targets: Vec::new(),
             continue_targets: Vec::new(),
+            field_map: None,
+            closures: Vec::new(),
+            closure_base: 0,
         }
     }
 
-    pub fn build_module(mut self, module: &Module) -> MirFunction {
+    pub fn build_module(mut self, module: &Module) -> (MirFunction, Vec<MirFunction>) {
         for stmt in module {
             self.lower_stmt(stmt);
         }
@@ -49,7 +69,7 @@ impl<'a> MirBuilder<'a> {
             self.func.block_mut(self.current_block).terminator = Terminator::ReturnNull;
         }
         self.func.compute_predecessors();
-        self.func
+        (self.func, self.closures)
     }
 
     pub fn build_body(mut self, body: &Spanned<Stmt>, params: &[Spanned<SymbolId>]) -> MirFunction {
@@ -95,6 +115,29 @@ impl<'a> MirBuilder<'a> {
         self.interner.intern(s)
     }
 
+    fn module_var_index(&self, name: SymbolId) -> Option<u16> {
+        self.module_vars.iter().position(|&n| n == name).map(|i| i as u16)
+    }
+
+    /// Compute a Wren method signature from name + arity.
+    /// 0 args → "name" (getter), 1+ args → "name(_)" / "name(_,_)" etc.
+    fn method_sig(&mut self, name: SymbolId, arity: usize) -> SymbolId {
+        self.method_sig_with_parens(name, arity, arity > 0)
+    }
+
+    /// Compute a Wren method signature, distinguishing 0-arg calls from getters.
+    /// `has_parens` true + 0 args → "name()", false + 0 args → "name" (getter).
+    fn method_sig_with_parens(&mut self, name: SymbolId, arity: usize, has_parens: bool) -> SymbolId {
+        if arity == 0 && !has_parens {
+            name
+        } else {
+            let name_str = self.interner.resolve(name).to_string();
+            let params: Vec<&str> = std::iter::repeat("_").take(arity).collect();
+            let sig = format!("{}({})", name_str, params.join(","));
+            self.intern(&sig)
+        }
+    }
+
     // -- Statement lowering -------------------------------------------------
 
     fn lower_stmt(&mut self, stmt: &Spanned<Stmt>) {
@@ -109,7 +152,11 @@ impl<'a> MirBuilder<'a> {
                 } else {
                     self.emit(Instruction::ConstNull)
                 };
-                self.variables.insert(name.0, val);
+                if let Some(idx) = self.module_var_index(name.0) {
+                    self.emit(Instruction::SetModuleVar(idx, val));
+                } else {
+                    self.variables.insert(name.0, val);
+                }
             }
 
             Stmt::Block(stmts) => {
@@ -273,12 +320,14 @@ impl<'a> MirBuilder<'a> {
         let iter_obj = self.lower_expr(iterator);
 
         let iterate_sym = self.intern("iterate");
+        let iterate_sig = self.method_sig(iterate_sym, 1);
         let iter_value_sym = self.intern("iteratorValue");
+        let iter_value_sig = self.method_sig(iter_value_sym, 1);
 
         let null_val = self.emit(Instruction::ConstNull);
         let iter_val = self.emit(Instruction::Call {
             receiver: iter_obj,
-            method: iterate_sym,
+            method: iterate_sig,
             args: vec![null_val],
         });
 
@@ -310,7 +359,7 @@ impl<'a> MirBuilder<'a> {
         self.switch_to(body_bb);
         let elem_val = self.emit(Instruction::Call {
             receiver: iter_obj,
-            method: iter_value_sym,
+            method: iter_value_sig,
             args: vec![iter_param],
         });
         self.variables.insert(variable.0, elem_val);
@@ -323,7 +372,7 @@ impl<'a> MirBuilder<'a> {
 
         let next_iter = self.emit(Instruction::Call {
             receiver: iter_obj,
-            method: iterate_sym,
+            method: iterate_sig,
             args: vec![iter_param],
         });
 
@@ -346,8 +395,8 @@ impl<'a> MirBuilder<'a> {
         match &expr.0 {
             Expr::Num(n) => self.emit(Instruction::ConstNum(*n)),
             Expr::Str(s) => {
-                let idx = self.func.add_string(s.clone());
-                self.emit(Instruction::ConstString(idx))
+                let sym = self.interner.intern(s);
+                self.emit(Instruction::ConstString(sym.index()))
             }
             Expr::Bool(b) => self.emit(Instruction::ConstBool(*b)),
             Expr::Null => self.emit(Instruction::ConstNull),
@@ -362,12 +411,24 @@ impl<'a> MirBuilder<'a> {
             Expr::Ident(name) => {
                 if let Some(&val) = self.variables.get(name) {
                     self.emit(Instruction::Move(val))
+                } else if let Some(&ResolvedName::ModuleVar(idx)) =
+                    self.resolutions.get(&expr.1.start)
+                {
+                    self.emit(Instruction::GetModuleVar(idx))
                 } else {
                     self.emit(Instruction::GetModuleVar(0))
                 }
             }
 
-            Expr::Field(_) => self.emit(Instruction::GetField(ValueId(0), 0)),
+            Expr::Field(name) => {
+                let this_sym = self.intern("this");
+                let this_val = self.variables.get(&this_sym).copied()
+                    .unwrap_or_else(|| self.emit(Instruction::ConstNull));
+                let idx = self.field_map.as_ref()
+                    .and_then(|m| m.get(name).copied())
+                    .unwrap_or(0);
+                self.emit(Instruction::GetField(this_val, idx))
+            }
             Expr::StaticField(_) => self.emit(Instruction::GetModuleVar(0)),
 
             Expr::Interpolation(parts) => {
@@ -450,6 +511,7 @@ impl<'a> MirBuilder<'a> {
                 method,
                 args,
                 block_arg,
+                has_parens,
             } => {
                 let recv = if let Some(r) = receiver {
                     self.lower_expr(r)
@@ -467,9 +529,10 @@ impl<'a> MirBuilder<'a> {
                     arg_vals.push(block_val);
                 }
 
+                let sig = self.method_sig_with_parens(method.0, arg_vals.len(), *has_parens);
                 self.emit(Instruction::Call {
                     receiver: recv,
-                    method: method.0,
+                    method: sig,
                     args: arg_vals,
                 })
             }
@@ -536,10 +599,13 @@ impl<'a> MirBuilder<'a> {
                 self.emit(Instruction::MakeRange(from_val, to_val, *inclusive))
             }
 
-            Expr::Closure { .. } => self.emit(Instruction::MakeClosure {
-                fn_id: 0,
-                upvalues: vec![],
-            }),
+            Expr::Closure { params, body } => {
+                let fn_idx = self.compile_closure(params, body);
+                self.emit(Instruction::MakeClosure {
+                    fn_id: fn_idx,
+                    upvalues: vec![],
+                })
+            }
         }
     }
 
@@ -639,23 +705,418 @@ impl<'a> MirBuilder<'a> {
     fn lower_assign(&mut self, target: &Spanned<Expr>, value: ValueId) {
         match &target.0 {
             Expr::Ident(name) => {
-                self.variables.insert(*name, value);
+                if self.variables.contains_key(name) {
+                    self.variables.insert(*name, value);
+                } else if let Some(&ResolvedName::ModuleVar(idx)) =
+                    self.resolutions.get(&target.1.start)
+                {
+                    self.emit(Instruction::SetModuleVar(idx, value));
+                } else {
+                    self.variables.insert(*name, value);
+                }
             }
-            Expr::Field(_) => {
-                self.emit(Instruction::SetField(ValueId(0), 0, value));
+            Expr::Field(name) => {
+                let this_sym = self.intern("this");
+                let this_val = self.variables.get(&this_sym).copied()
+                    .unwrap_or_else(|| self.emit(Instruction::ConstNull));
+                let idx = self.field_map.as_ref()
+                    .and_then(|m| m.get(name).copied())
+                    .unwrap_or(0);
+                self.emit(Instruction::SetField(this_val, idx, value));
             }
             _ => {}
         }
     }
+
+    /// Compile a closure body into a separate MirFunction, returning its index.
+    fn compile_closure(
+        &mut self,
+        params: &[Spanned<SymbolId>],
+        body: &Spanned<Stmt>,
+    ) -> u32 {
+        let fn_idx = self.closure_base + self.closures.len() as u32;
+
+        let (closure_func, nested_closures) = compile_closure_body(
+            params,
+            body,
+            self.interner,
+            self.resolutions,
+            self.module_vars,
+            fn_idx + 1, // nested closures start after this one
+        );
+
+        self.closures.push(closure_func);
+        for nested in nested_closures {
+            self.closures.push(nested);
+        }
+
+        fn_idx
+    }
 }
 
-/// Convenience: lower a parsed module to MIR.
-// TODO: accept a module name derived from the file path / namespace once
-// we support multiple modules, instead of the hardcoded "<module>" sentinel.
-pub fn lower_module(module: &Module, interner: &mut Interner) -> MirFunction {
+/// Standalone function to compile a closure body (avoids borrow conflicts).
+fn compile_closure_body(
+    params: &[Spanned<SymbolId>],
+    body: &Spanned<Stmt>,
+    interner: &mut Interner,
+    resolutions: &HashMap<usize, ResolvedName>,
+    module_vars: &[SymbolId],
+    nested_base: u32,
+) -> (MirFunction, Vec<MirFunction>) {
+    let closure_name = interner.intern("<closure>");
+    let arity = params.len() as u8;
+
+    let mut builder = MirBuilder::new(
+        closure_name,
+        arity,
+        interner,
+        resolutions,
+        module_vars,
+    );
+    builder.closure_base = nested_base;
+
+    // Bind parameters
+    for param in params {
+        let val = builder.emit(Instruction::BlockParam(0));
+        builder.variables.insert(param.0, val);
+    }
+
+    // Lower body
+    builder.lower_stmt(body);
+
+    // If body is a single expression statement, make it the return value
+    if matches!(
+        builder.func.block(builder.current_block).terminator,
+        Terminator::Unreachable
+    ) {
+        // Check if last instruction produced a value we can return
+        let last_val = builder.func.block(builder.current_block)
+            .instructions.last().map(|(id, _)| *id);
+        if let Some(val) = last_val {
+            builder.func.block_mut(builder.current_block).terminator =
+                Terminator::Return(val);
+        } else {
+            builder.func.block_mut(builder.current_block).terminator =
+                Terminator::ReturnNull;
+        }
+    }
+
+    let closures = builder.closures;
+    (builder.func, closures)
+}
+
+/// Compute a Wren method signature string from a MethodSig AST node.
+fn wren_signature(sig: &MethodSig, interner: &Interner) -> String {
+    match sig {
+        MethodSig::Named { name, params } => {
+            let n = interner.resolve(*name);
+            if params.is_empty() {
+                // Named with 0 params is a method call with parens but no args: "foo()"
+                format!("{}()", n)
+            } else {
+                let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+                format!("{}({})", n, us.join(","))
+            }
+        }
+        MethodSig::Getter(name) => interner.resolve(*name).to_string(),
+        MethodSig::Setter { name, .. } => format!("{}=(_)", interner.resolve(*name)),
+        MethodSig::Construct { name, params } => {
+            let n = interner.resolve(*name);
+            if params.is_empty() {
+                format!("{}()", n)
+            } else {
+                let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+                format!("{}({})", n, us.join(","))
+            }
+        }
+        MethodSig::Operator { op, params } => {
+            let op_str = match op {
+                Op::Plus => "+",
+                Op::Minus | Op::Neg => "-",
+                Op::Star => "*",
+                Op::Slash => "/",
+                Op::Percent => "%",
+                Op::Lt => "<",
+                Op::Gt => ">",
+                Op::LtEq => "<=",
+                Op::GtEq => ">=",
+                Op::EqEq => "==",
+                Op::BangEq => "!=",
+                Op::BitAnd => "&",
+                Op::BitOr => "|",
+                Op::BitXor => "^",
+                Op::Shl => "<<",
+                Op::Shr => ">>",
+                Op::Bang => "!",
+                Op::Tilde => "~",
+                Op::DotDot => "..",
+                Op::DotDotDot => "...",
+            };
+            if params.is_empty() {
+                op_str.to_string()
+            } else {
+                let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+                format!("{}({})", op_str, us.join(","))
+            }
+        }
+        MethodSig::Subscript { params } => {
+            let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+            format!("[{}]", us.join(","))
+        }
+        MethodSig::SubscriptSetter { params, .. } => {
+            let us: Vec<&str> = std::iter::repeat("_").take(params.len()).collect();
+            format!("[{}]=(_)", us.join(","))
+        }
+    }
+}
+
+/// Get the parameter list from a MethodSig for compiling the body.
+fn method_params(sig: &MethodSig) -> Vec<&Spanned<SymbolId>> {
+    match sig {
+        MethodSig::Named { params, .. }
+        | MethodSig::Construct { params, .. }
+        | MethodSig::Operator { params, .. }
+        | MethodSig::Subscript { params } => params.iter().collect(),
+        MethodSig::Setter { param, .. } => vec![param],
+        MethodSig::SubscriptSetter { params, value } => {
+            let mut v: Vec<&Spanned<SymbolId>> = params.iter().collect();
+            v.push(value);
+            v
+        }
+        MethodSig::Getter(_) => Vec::new(),
+    }
+}
+
+/// Convenience: lower a parsed module to MIR (including class definitions).
+pub fn lower_module(
+    module: &Module,
+    interner: &mut Interner,
+    resolve: &ResolveResult,
+) -> ModuleMir {
     let name = interner.intern("<module>");
-    let builder = MirBuilder::new(name, 0, interner);
-    builder.build_module(module)
+    let builder = MirBuilder::new(name, 0, interner, &resolve.resolutions, &resolve.module_vars);
+    let (top_level, closures) = builder.build_module(module);
+
+    // Compile class definitions
+    let mut classes = Vec::new();
+    for stmt in module {
+        if let Stmt::Class(decl) = &stmt.0 {
+            let class_mir = compile_class(decl, interner, resolve);
+            classes.push(class_mir);
+        }
+    }
+
+    ModuleMir { top_level, classes, closures }
+}
+
+/// Compile a class declaration into ClassMir.
+fn compile_class(
+    decl: &ClassDecl,
+    interner: &mut Interner,
+    resolve: &ResolveResult,
+) -> ClassMir {
+    let mut methods = Vec::new();
+    let mut field_names: Vec<SymbolId> = Vec::new();
+
+    // First pass: scan all methods for field accesses to determine field count.
+    for method_spanned in &decl.methods {
+        let method = &method_spanned.0;
+        if let Some(body) = &method.body {
+            scan_fields(body, interner, &mut field_names);
+        }
+    }
+
+    // Second pass: compile method bodies.
+    for method_spanned in &decl.methods {
+        let method = &method_spanned.0;
+        if method.is_foreign || method.body.is_none() {
+            continue;
+        }
+
+        let sig_str = wren_signature(&method.signature, interner);
+        let is_constructor = matches!(&method.signature, MethodSig::Construct { .. });
+
+        let method_name = interner.intern(&sig_str);
+        let params = method_params(&method.signature);
+        let arity = params.len() as u8 + 1; // +1 for receiver (this)
+
+        let mut builder = MirBuilder::new(
+            method_name,
+            arity,
+            interner,
+            &resolve.resolutions,
+            &resolve.module_vars,
+        );
+
+        // Set field map for this class
+        let fmap: HashMap<SymbolId, u16> = field_names.iter().enumerate()
+            .map(|(i, &sym)| (sym, i as u16))
+            .collect();
+        builder.field_map = Some(fmap);
+
+        // Bind 'this' as first block param
+        let this_sym = builder.intern("this");
+        let this_val = builder.emit(Instruction::BlockParam(0));
+        builder.variables.insert(this_sym, this_val);
+
+        // Bind explicit parameters
+        for param in &params {
+            let val = builder.emit(Instruction::BlockParam(0));
+            builder.variables.insert(param.0, val);
+        }
+
+        // Lower the body
+        builder.lower_stmt(method.body.as_ref().unwrap());
+
+        // Ensure method returns something
+        if matches!(
+            builder.func.block(builder.current_block).terminator,
+            Terminator::Unreachable
+        ) {
+            if is_constructor {
+                // Constructors return 'this'
+                builder.func.block_mut(builder.current_block).terminator =
+                    Terminator::Return(this_val);
+            } else {
+                // Return last expression value if available (e.g. getters)
+                let last_val = builder.func.block(builder.current_block)
+                    .instructions.last().map(|(id, _)| *id);
+                if let Some(val) = last_val {
+                    builder.func.block_mut(builder.current_block).terminator =
+                        Terminator::Return(val);
+                } else {
+                    builder.func.block_mut(builder.current_block).terminator =
+                        Terminator::ReturnNull;
+                }
+            }
+        }
+        builder.func.compute_predecessors();
+
+        methods.push(MethodMir {
+            signature: sig_str,
+            is_static: method.is_static,
+            is_constructor,
+            mir: builder.func,
+        });
+    }
+
+    ClassMir {
+        name: decl.name.0,
+        superclass: decl.superclass.as_ref().map(|s| s.0),
+        methods,
+        num_fields: field_names.len() as u16,
+    }
+}
+
+/// Scan a statement body for field accesses (_name) and register them.
+fn scan_fields(stmt: &Spanned<Stmt>, interner: &Interner, fields: &mut Vec<SymbolId>) {
+    scan_stmt_fields(&stmt.0, interner, fields);
+}
+
+fn scan_stmt_fields(stmt: &Stmt, interner: &Interner, fields: &mut Vec<SymbolId>) {
+    match stmt {
+        Stmt::Expr(e) => scan_expr_fields(&e.0, interner, fields),
+        Stmt::Var { initializer, .. } => {
+            if let Some(init) = initializer {
+                scan_expr_fields(&init.0, interner, fields);
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                scan_stmt_fields(&s.0, interner, fields);
+            }
+        }
+        Stmt::If { condition, then_branch, else_branch } => {
+            scan_expr_fields(&condition.0, interner, fields);
+            scan_stmt_fields(&then_branch.0, interner, fields);
+            if let Some(eb) = else_branch {
+                scan_stmt_fields(&eb.0, interner, fields);
+            }
+        }
+        Stmt::While { condition, body } => {
+            scan_expr_fields(&condition.0, interner, fields);
+            scan_stmt_fields(&body.0, interner, fields);
+        }
+        Stmt::For { iterator, body, .. } => {
+            scan_expr_fields(&iterator.0, interner, fields);
+            scan_stmt_fields(&body.0, interner, fields);
+        }
+        Stmt::Return(Some(e)) => scan_expr_fields(&e.0, interner, fields),
+        _ => {}
+    }
+}
+
+fn scan_expr_fields(expr: &Expr, interner: &Interner, fields: &mut Vec<SymbolId>) {
+    match expr {
+        Expr::Field(name) => {
+            if !fields.contains(name) {
+                fields.push(*name);
+            }
+        }
+        Expr::Assign { target, value } => {
+            scan_expr_fields(&target.0, interner, fields);
+            scan_expr_fields(&value.0, interner, fields);
+        }
+        Expr::BinaryOp { left, right, .. } | Expr::LogicalOp { left, right, .. } => {
+            scan_expr_fields(&left.0, interner, fields);
+            scan_expr_fields(&right.0, interner, fields);
+        }
+        Expr::UnaryOp { operand, .. } => scan_expr_fields(&operand.0, interner, fields),
+        Expr::Call { receiver, args, block_arg, .. } => {
+            if let Some(r) = receiver {
+                scan_expr_fields(&r.0, interner, fields);
+            }
+            for a in args {
+                scan_expr_fields(&a.0, interner, fields);
+            }
+            if let Some(b) = block_arg {
+                scan_expr_fields(&b.0, interner, fields);
+            }
+        }
+        Expr::Conditional { condition, then_expr, else_expr } => {
+            scan_expr_fields(&condition.0, interner, fields);
+            scan_expr_fields(&then_expr.0, interner, fields);
+            scan_expr_fields(&else_expr.0, interner, fields);
+        }
+        Expr::Is { value, type_name } => {
+            scan_expr_fields(&value.0, interner, fields);
+            scan_expr_fields(&type_name.0, interner, fields);
+        }
+        Expr::CompoundAssign { target, value, .. } => {
+            scan_expr_fields(&target.0, interner, fields);
+            scan_expr_fields(&value.0, interner, fields);
+        }
+        Expr::Subscript { receiver, args } => {
+            scan_expr_fields(&receiver.0, interner, fields);
+            for a in args { scan_expr_fields(&a.0, interner, fields); }
+        }
+        Expr::SubscriptSet { receiver, index_args, value } => {
+            scan_expr_fields(&receiver.0, interner, fields);
+            for a in index_args { scan_expr_fields(&a.0, interner, fields); }
+            scan_expr_fields(&value.0, interner, fields);
+        }
+        Expr::ListLiteral(elems) => {
+            for e in elems { scan_expr_fields(&e.0, interner, fields); }
+        }
+        Expr::MapLiteral(entries) => {
+            for (k, v) in entries {
+                scan_expr_fields(&k.0, interner, fields);
+                scan_expr_fields(&v.0, interner, fields);
+            }
+        }
+        Expr::Range { from, to, .. } => {
+            scan_expr_fields(&from.0, interner, fields);
+            scan_expr_fields(&to.0, interner, fields);
+        }
+        Expr::Interpolation(parts) => {
+            for p in parts { scan_expr_fields(&p.0, interner, fields); }
+        }
+        Expr::Closure { body, .. } => scan_stmt_fields(&body.0, interner, fields),
+        Expr::SuperCall { args, .. } => {
+            for a in args { scan_expr_fields(&a.0, interner, fields); }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -670,8 +1131,9 @@ mod tests {
     fn lower(source: &str) -> (MirFunction, Interner) {
         let mut result = parse(source);
         assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
-        let func = lower_module(&result.module, &mut result.interner);
-        (func, result.interner)
+        let resolve_result = crate::sema::resolve::resolve(&result.module, &result.interner);
+        let module_mir = lower_module(&result.module, &mut result.interner, &resolve_result);
+        (module_mir.top_level, result.interner)
     }
 
     fn assert_has_instruction(func: &MirFunction, pred: impl Fn(&Instruction) -> bool) {
@@ -693,9 +1155,16 @@ mod tests {
 
     #[test]
     fn test_lower_string() {
-        let (func, _) = lower("\"hello\"");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::ConstString(0)));
-        assert_eq!(func.strings[0], "hello");
+        let (func, interner) = lower("\"hello\"");
+        // ConstString now stores a SymbolId index (interned string)
+        assert_has_instruction(&func, |i| {
+            if let Instruction::ConstString(idx) = i {
+                let sym = crate::intern::SymbolId::from_raw(*idx);
+                interner.resolve(sym) == "hello"
+            } else {
+                false
+            }
+        });
     }
 
     #[test]
@@ -754,8 +1223,9 @@ mod tests {
 
     #[test]
     fn test_lower_var_use() {
+        // Module-level vars now use GetModuleVar/SetModuleVar instead of Move.
         let (func, _) = lower("var x = 1\nx");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::Move(..)));
+        assert_has_instruction(&func, |i| matches!(i, Instruction::GetModuleVar(0)));
     }
 
     #[test]
@@ -868,5 +1338,26 @@ mod tests {
         let (func, _) = lower("if (true) 1 else 2");
         let has_preds = func.blocks.iter().any(|b| !b.predecessors.is_empty());
         assert!(has_preds);
+    }
+
+    #[test]
+    fn test_module_var_indices() {
+        let (func, _) = lower("var x = 1\nvar y = x");
+        // x is module var 0, y is module var 1.
+        // Should emit SetModuleVar(0, ...) for x, GetModuleVar(0) for the x reference,
+        // and SetModuleVar(1, ...) for y.
+        let mut set_indices = Vec::new();
+        let mut get_indices = Vec::new();
+        for block in &func.blocks {
+            for (_, inst) in &block.instructions {
+                match inst {
+                    Instruction::SetModuleVar(idx, _) => set_indices.push(*idx),
+                    Instruction::GetModuleVar(idx) => get_indices.push(*idx),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(set_indices, vec![0, 1], "SetModuleVar indices should be [0, 1]");
+        assert_eq!(get_indices, vec![0], "GetModuleVar index for x should be [0]");
     }
 }
