@@ -1749,3 +1749,36 @@ fn e2e_jit_mandelbrot() {
     );
     eprintln!("  [mandelbrot tiered {}]", t);
 }
+
+// ---------------------------------------------------------------------------
+// Stack overflow detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_stack_overflow() {
+    let config = VMConfig {
+        max_call_depth: 64,
+        ..Default::default()
+    };
+    let mut vm = VM::new(config);
+    vm.output_buffer = Some(String::new());
+    let source = r#"
+class Boom {
+    static go(n) {
+        Boom.go(n + 1)
+    }
+}
+Boom.go(0)
+"#;
+    let result = vm.interpret("main", source);
+    // Should fail with a runtime error, not panic
+    assert!(
+        result != InterpretResult::Success,
+        "infinite recursion should not succeed"
+    );
+    let output = vm.take_output();
+    eprintln!(
+        "  [stack overflow detected: result={:?}, output={:?}]",
+        result, output
+    );
+}

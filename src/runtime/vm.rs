@@ -80,6 +80,8 @@ pub struct VMConfig {
     pub fiber_stack_traces: bool,
     /// Maximum number of interpreter steps before aborting (default: 100M).
     pub step_limit: usize,
+    /// Maximum call frame depth before aborting (default: 1024).
+    pub max_call_depth: usize,
 }
 
 impl Default for VMConfig {
@@ -98,6 +100,7 @@ impl Default for VMConfig {
             jit_threshold: 100,
             fiber_stack_traces: false,
             step_limit: 100_000_000,
+            max_call_depth: 1024,
         }
     }
 }
@@ -411,8 +414,10 @@ impl VM {
         // and imported module vars.
         let module_key = module_name.to_string();
         let mut module_vars = Vec::with_capacity(resolve_result.module_vars.len());
+        let mut var_names = Vec::with_capacity(resolve_result.module_vars.len());
         for &parse_sym in &resolve_result.module_vars {
             let name = interner.resolve(parse_sym);
+            var_names.push(name.to_string());
             if let Some(value) = self.core_class_value(name) {
                 module_vars.push(value);
             } else if let Some(value) = self.find_imported_var(name) {
@@ -426,6 +431,7 @@ impl VM {
             super::engine::ModuleEntry {
                 top_level: func_id,
                 vars: module_vars,
+                var_names,
             },
         );
 

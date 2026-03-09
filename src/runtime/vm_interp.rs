@@ -28,6 +28,7 @@ pub enum RuntimeError {
     GuardFailed(&'static str),
     Unsupported(String),
     StepLimitExceeded,
+    StackOverflow,
     Error(String),
     Unreachable,
 }
@@ -48,6 +49,7 @@ impl std::fmt::Display for RuntimeError {
             RuntimeError::GuardFailed(ty) => write!(f, "type guard failed: expected {}", ty),
             RuntimeError::Unsupported(msg) => write!(f, "unsupported: {}", msg),
             RuntimeError::StepLimitExceeded => write!(f, "step limit exceeded"),
+            RuntimeError::StackOverflow => write!(f, "stack overflow"),
             RuntimeError::Error(msg) => write!(f, "{}", msg),
             RuntimeError::Unreachable => write!(f, "reached unreachable code"),
         }
@@ -879,6 +881,7 @@ pub fn eval_in_vm(
         crate::runtime::engine::ModuleEntry {
             top_level: func_id,
             vars: std::mem::take(module_vars),
+            var_names: Vec::new(),
         },
     );
 
@@ -1024,6 +1027,12 @@ fn dispatch_closure_with_class(
                 new_values.insert(*dst, InterpValue::Boxed(arg_vals[idx]));
             }
         }
+    }
+
+    // Check call depth limit
+    let depth = unsafe { (*fiber).mir_frames.len() };
+    if depth >= vm.config.max_call_depth {
+        return Err(RuntimeError::StackOverflow);
     }
 
     // Save current frame state

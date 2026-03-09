@@ -107,6 +107,8 @@ pub struct ModuleEntry {
     pub top_level: FuncId,
     /// Module-level variable storage (indexed by slot number).
     pub vars: Vec<super::value::Value>,
+    /// Variable names corresponding to each slot (for C API lookup).
+    pub var_names: Vec<String>,
 }
 
 /// Result of interpreting Wren source.

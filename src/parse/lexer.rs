@@ -475,15 +475,13 @@ fn lex_string(
 
         // Interpolation: `%(`
         if ch == b'%' && *pos + 1 < source.len() && bytes[*pos + 1] == b'(' {
-            has_interpolation = true;
             // Emit the string part before interpolation
-            let seg_token = if lexemes.last().is_none_or(|l| {
-                !matches!(l.token, Token::InterpolationStart | Token::InterpolationMid)
-            }) {
+            let seg_token = if !has_interpolation {
                 Token::InterpolationStart
             } else {
                 Token::InterpolationMid
             };
+            has_interpolation = true;
             lexemes.push(Lexeme {
                 token: seg_token,
                 span: start..*pos + 2,
@@ -832,6 +830,52 @@ mod tests {
         assert!(tokens.contains(&&Token::InterpolationStart));
         assert!(tokens.contains(&&Token::Ident));
         assert!(tokens.contains(&&Token::Plus));
+    }
+
+    #[test]
+    fn test_strings_multiple_interpolation() {
+        // "%(x) and %(y)" should produce:
+        // InterpolationStart(""), Ident(x), InterpolationMid(" and "), Ident(y), InterpolationEnd("")
+        let (lexemes, errors) = lex(r#""%(x) and %(y)""#);
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+
+        let tokens: Vec<_> = lexemes.iter().map(|l| &l.token).collect();
+        assert_eq!(
+            tokens,
+            vec![
+                &Token::InterpolationStart,
+                &Token::Ident,
+                &Token::InterpolationMid,
+                &Token::Ident,
+                &Token::InterpolationEnd,
+            ]
+        );
+        assert_eq!(lexemes[0].text, "");
+        assert_eq!(lexemes[1].text, "x");
+        assert_eq!(lexemes[2].text, " and ");
+        assert_eq!(lexemes[3].text, "y");
+        assert_eq!(lexemes[4].text, "");
+    }
+
+    #[test]
+    fn test_strings_triple_interpolation() {
+        // "%(a)%(b)%(c)" — three consecutive interpolations
+        let (lexemes, errors) = lex(r#""%(a)%(b)%(c)""#);
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+
+        let tokens: Vec<_> = lexemes.iter().map(|l| &l.token).collect();
+        assert_eq!(
+            tokens,
+            vec![
+                &Token::InterpolationStart,
+                &Token::Ident,
+                &Token::InterpolationMid,
+                &Token::Ident,
+                &Token::InterpolationMid,
+                &Token::Ident,
+                &Token::InterpolationEnd,
+            ]
+        );
     }
 
     #[test]

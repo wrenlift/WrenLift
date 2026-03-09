@@ -42,6 +42,8 @@ pub type WrenVM = VM;
 #[repr(C)]
 pub struct WrenHandle {
     index: usize,
+    /// Method signature for call handles (empty for value handles).
+    signature: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,15 +223,21 @@ pub extern "C" fn wrenCollectGarbage(vm: *mut WrenVM) {
 #[no_mangle]
 pub extern "C" fn wrenInterpret(
     vm: *mut WrenVM,
-    _module: *const c_char,
-    _source: *const c_char,
+    module: *const c_char,
+    source: *const c_char,
 ) -> WrenInterpretResult {
-    if vm.is_null() {
+    if vm.is_null() || module.is_null() || source.is_null() {
         return WrenInterpretResult::RuntimeError;
     }
-    // TODO: Wire to the compilation pipeline and execution engine.
-    // For now, return success as a placeholder.
-    WrenInterpretResult::Success
+    let module_name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("main");
+    let source_str = unsafe { CStr::from_ptr(source) }.to_str().unwrap_or("");
+    let vm_ref = unsafe { &mut *vm };
+    use crate::runtime::engine::InterpretResult;
+    match vm_ref.interpret(module_name, source_str) {
+        InterpretResult::Success => WrenInterpretResult::Success,
+        InterpretResult::CompileError => WrenInterpretResult::CompileError,
+        InterpretResult::RuntimeError => WrenInterpretResult::RuntimeError,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,18 +249,41 @@ pub extern "C" fn wrenMakeCallHandle(vm: *mut WrenVM, signature: *const c_char) 
     if vm.is_null() || signature.is_null() {
         return ptr::null_mut();
     }
-    let _sig = unsafe { CStr::from_ptr(signature) }.to_str().unwrap_or("");
-    // TODO: Create a proper call handle once the execution engine is wired up.
-    Box::into_raw(Box::new(WrenHandle { index: 0 }))
+    let sig = unsafe { CStr::from_ptr(signature) }
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    Box::into_raw(Box::new(WrenHandle {
+        index: 0,
+        signature: sig,
+    }))
 }
 
 #[no_mangle]
-pub extern "C" fn wrenCall(vm: *mut WrenVM, _method: *mut WrenHandle) -> WrenInterpretResult {
-    if vm.is_null() {
+pub extern "C" fn wrenCall(vm: *mut WrenVM, method: *mut WrenHandle) -> WrenInterpretResult {
+    if vm.is_null() || method.is_null() {
         return WrenInterpretResult::RuntimeError;
     }
-    // TODO: Execute method call via VM.
-    WrenInterpretResult::Success
+    let handle = unsafe { &*method };
+    let vm_ref = unsafe { &mut *vm };
+
+    // Receiver is in slot 0, args in slots 1..N
+    let receiver = vm_ref.get_slot(0);
+
+    // Count args from signature (number of underscores)
+    let num_args = handle.signature.chars().filter(|&c| c == '_').count();
+    let mut args = Vec::with_capacity(num_args);
+    for i in 1..=num_args {
+        args.push(vm_ref.get_slot(i));
+    }
+
+    match vm_ref.call_method_on(receiver, &handle.signature, &args) {
+        Some(result) => {
+            vm_ref.set_slot(0, result);
+            WrenInterpretResult::Success
+        }
+        None => WrenInterpretResult::RuntimeError,
+    }
 }
 
 #[no_mangle]
@@ -403,7 +434,10 @@ pub extern "C" fn wrenGetSlotHandle(vm: *mut WrenVM, slot: c_int) -> *mut WrenHa
     }
     let val = unsafe { (*vm).get_slot(slot as usize) };
     let idx = unsafe { (*vm).make_handle(val) };
-    Box::into_raw(Box::new(WrenHandle { index: idx }))
+    Box::into_raw(Box::new(WrenHandle {
+        index: idx,
+        signature: String::new(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -759,25 +793,41 @@ pub extern "C" fn wrenHasModule(vm: *mut WrenVM, module: *const c_char) -> bool 
 #[no_mangle]
 pub extern "C" fn wrenHasVariable(
     vm: *mut WrenVM,
-    _module: *const c_char,
-    _name: *const c_char,
+    module: *const c_char,
+    name: *const c_char,
 ) -> bool {
-    if vm.is_null() {
+    if vm.is_null() || module.is_null() || name.is_null() {
         return false;
     }
-    // TODO: Implement module variable lookup.
-    false
+    let mod_name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("");
+    let var_name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
+    let vm_ref = unsafe { &*vm };
+    if let Some(entry) = vm_ref.engine.modules.get(mod_name) {
+        entry.var_names.iter().any(|n| n == var_name)
+    } else {
+        false
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn wrenGetVariable(
     vm: *mut WrenVM,
-    _module: *const c_char,
-    _name: *const c_char,
-    _slot: c_int,
+    module: *const c_char,
+    name: *const c_char,
+    slot: c_int,
 ) {
-    if vm.is_null() {}
-    // TODO: Implement module variable lookup.
+    if vm.is_null() || module.is_null() || name.is_null() {
+        return;
+    }
+    let mod_name = unsafe { CStr::from_ptr(module) }.to_str().unwrap_or("");
+    let var_name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("");
+    let vm_ref = unsafe { &mut *vm };
+    if let Some(entry) = vm_ref.engine.modules.get(mod_name) {
+        if let Some(idx) = entry.var_names.iter().position(|n| n == var_name) {
+            let value = entry.vars[idx];
+            vm_ref.set_slot(slot as usize, value);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1072,67 @@ mod tests {
         wrenSetUserData(vm, &data as *const u64 as *mut c_void);
         let got = wrenGetUserData(vm) as *const u64;
         assert_eq!(unsafe { *got }, 0xDEADBEEF);
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_interpret_runs_code() {
+        let vm = wrenNewVM(ptr::null());
+        assert!(!vm.is_null());
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.output_buffer = Some(String::new());
+
+        let module = CString::new("test").unwrap();
+        let source = CString::new("System.print(\"hello from capi\")").unwrap();
+        let result = wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+        assert_eq!(result, WrenInterpretResult::Success);
+
+        let output = vm_ref.take_output();
+        assert_eq!(output, "hello from capi\n");
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_interpret_compile_error() {
+        let vm = wrenNewVM(ptr::null());
+        let module = CString::new("test").unwrap();
+        let source = CString::new("class {").unwrap();
+        let result = wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+        assert_eq!(result, WrenInterpretResult::CompileError);
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_has_variable() {
+        let vm = wrenNewVM(ptr::null());
+        let module = CString::new("test").unwrap();
+        let source = CString::new("var Foo = 42").unwrap();
+        let result = wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+        assert_eq!(result, WrenInterpretResult::Success);
+
+        let var_name = CString::new("Foo").unwrap();
+        assert!(wrenHasVariable(vm, module.as_ptr(), var_name.as_ptr()));
+
+        let missing = CString::new("Bar").unwrap();
+        assert!(!wrenHasVariable(vm, module.as_ptr(), missing.as_ptr()));
+
+        wrenFreeVM(vm);
+    }
+
+    #[test]
+    fn test_get_variable() {
+        let vm = wrenNewVM(ptr::null());
+        let module = CString::new("test").unwrap();
+        let source = CString::new("var MyVal = 99").unwrap();
+        let result = wrenInterpret(vm, module.as_ptr(), source.as_ptr());
+        assert_eq!(result, WrenInterpretResult::Success);
+
+        wrenEnsureSlots(vm, 1);
+        let var_name = CString::new("MyVal").unwrap();
+        wrenGetVariable(vm, module.as_ptr(), var_name.as_ptr(), 0);
+        assert_eq!(wrenGetSlotDouble(vm, 0), 99.0);
 
         wrenFreeVM(vm);
     }
