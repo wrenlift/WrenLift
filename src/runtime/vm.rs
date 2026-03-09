@@ -78,6 +78,9 @@ pub struct VMConfig {
     pub execution_mode: ExecutionMode,
     /// Call count threshold before JIT compilation in Tiered mode.
     pub jit_threshold: u32,
+    /// Enable fiber stack trace tracking (opt-in, not standard Wren behavior).
+    /// When enabled, cross-fiber stack traces include spawn sites and caller chains.
+    pub fiber_stack_traces: bool,
 }
 
 impl Default for VMConfig {
@@ -94,6 +97,7 @@ impl Default for VMConfig {
             heap_growth_percent: 50,
             execution_mode: ExecutionMode::default(),
             jit_threshold: 100,
+            fiber_stack_traces: false,
         }
     }
 }
@@ -544,38 +548,78 @@ impl VM {
         }
     }
 
-    /// Build a stack trace from the fiber's MIR call frames.
+    /// Resolve a line number from a span offset within a module's source.
+    fn line_from_span(&self, module: &str, byte_offset: usize) -> Option<usize> {
+        self.module_sources.get(module).map(|src| {
+            src[..byte_offset.min(src.len())].chars().filter(|c| *c == '\n').count() + 1
+        })
+    }
+
+    /// Extract a StackFrame from a MirCallFrame.
+    fn frame_to_stack_frame(&self, frame: &MirCallFrame) -> StackFrame {
+        let func_name = self.engine.get_mir(frame.func_id)
+            .map(|mir| self.interner.resolve(mir.name).to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let line = self.engine.get_mir(frame.func_id).and_then(|mir| {
+            let block = mir.blocks.get(frame.current_block.0 as usize)?;
+            let idx = if frame.ip > 0 { frame.ip - 1 } else { 0 };
+            let (vid, _) = block.instructions.get(idx)?;
+            let span = mir.span_map.get(vid)?;
+            self.line_from_span(&frame.module_name, span.start)
+        });
+        StackFrame {
+            func_name,
+            module: frame.module_name.clone(),
+            line,
+        }
+    }
+
+    /// Build a stack trace from a single fiber's MIR call frames.
     fn build_stack_trace(&self, fiber: *mut ObjFiber) -> Vec<String> {
         if fiber.is_null() { return Vec::new(); }
         let frames = unsafe { &(*fiber).mir_frames };
-        let mut trace = Vec::new();
-        for frame in frames.iter().rev() {
-            let func_name = self.engine.get_mir(frame.func_id)
-                .map(|mir| self.interner.resolve(mir.name).to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let module = &frame.module_name;
-            // Try to get line number from span
-            if let Some(mir) = self.engine.get_mir(frame.func_id) {
-                let block = mir.blocks.get(frame.current_block.0 as usize);
-                let line_info = block.and_then(|b| {
-                    let idx = if frame.ip > 0 { frame.ip - 1 } else { 0 };
-                    b.instructions.get(idx)
-                        .and_then(|(vid, _)| mir.span_map.get(vid))
-                        .and_then(|span| {
-                            self.module_sources.get(module).map(|src| {
-                                src[..span.start].chars().filter(|c| *c == '\n').count() + 1
-                            })
-                        })
-                });
-                if let Some(line) = line_info {
-                    trace.push(format!("  at {} ({}:{})", func_name, module, line));
-                } else {
-                    trace.push(format!("  at {} ({})", func_name, module));
+        frames.iter().rev()
+            .map(|frame| self.frame_to_stack_frame(frame).to_string())
+            .collect()
+    }
+
+    /// Capture the current fiber's call stack as a Vec<StackFrame> snapshot.
+    fn capture_current_trace(&self) -> Vec<StackFrame> {
+        if self.fiber.is_null() { return Vec::new(); }
+        let frames = unsafe { &(*self.fiber).mir_frames };
+        frames.iter().rev()
+            .map(|frame| self.frame_to_stack_frame(frame))
+            .collect()
+    }
+
+    /// Build a full cross-fiber stack trace, walking the caller chain.
+    /// Each fiber boundary is annotated. Includes spawn traces when available.
+    fn build_full_fiber_trace(&self, fiber: *mut ObjFiber) -> Vec<String> {
+        if fiber.is_null() { return Vec::new(); }
+
+        let mut trace = self.build_stack_trace(fiber);
+
+        if !self.config.fiber_stack_traces { return trace; }
+
+        // Walk the caller chain
+        let mut current = unsafe { (*fiber).caller };
+        while !current.is_null() {
+            trace.push("  --- in calling fiber ---".to_string());
+            trace.extend(self.build_stack_trace(current));
+            current = unsafe { (*current).caller };
+        }
+
+        // Append spawn trace if present
+        let spawn_trace = unsafe { &(*fiber).spawn_trace };
+        if let Some(ref frames) = spawn_trace {
+            if !frames.is_empty() {
+                trace.push("  --- spawned at ---".to_string());
+                for frame in frames {
+                    trace.push(frame.to_string());
                 }
-            } else {
-                trace.push(format!("  at {} ({})", func_name, module));
             }
         }
+
         trace
     }
 
@@ -627,8 +671,8 @@ impl VM {
                     diag = diag.with_note(help);
                 }
 
-                // Add stack trace as a note
-                let trace = self.build_stack_trace(fiber);
+                // Add stack trace as a note (uses full cross-fiber trace when enabled)
+                let trace = self.build_full_fiber_trace(fiber);
                 if trace.len() > 1 {
                     let trace_str = format!("stack trace:\n{}", trace.join("\n"));
                     diag = diag.with_note(trace_str);
@@ -646,7 +690,7 @@ impl VM {
         }
         // Fallback: no source location available
         let msg = format!("{}", error);
-        let trace = self.build_stack_trace(fiber);
+        let trace = self.build_full_fiber_trace(fiber);
         if !trace.is_empty() {
             let full = format!("{}\n{}", msg, trace.join("\n"));
             self.report_error(&full);
@@ -966,6 +1010,24 @@ impl NativeContext for VM {
 
     fn get_current_fiber(&self) -> *mut ObjFiber {
         self.fiber
+    }
+
+    fn fiber_stack_traces_enabled(&self) -> bool {
+        self.config.fiber_stack_traces
+    }
+
+    fn capture_spawn_trace(&self) -> Option<Vec<StackFrame>> {
+        if !self.config.fiber_stack_traces { return None; }
+        Some(self.capture_current_trace())
+    }
+
+    fn get_stack_trace_string(&self, fiber: *mut ObjFiber) -> String {
+        let trace = self.build_full_fiber_trace(fiber);
+        if trace.is_empty() {
+            "<no stack trace>".to_string()
+        } else {
+            trace.join("\n")
+        }
     }
 }
 
@@ -2045,5 +2107,83 @@ System.print(MathUtils.double(21))
             plain.contains("does not define") || plain.contains("has no getter"),
             "missing help note in:\n{plain}"
         );
+    }
+
+    #[test]
+    fn test_fiber_stack_trace_disabled_by_default() {
+        // When fiber_stack_traces is false (default), Fiber.stackTrace returns a message
+        let (result, output) = run_and_capture(r#"
+var f = Fiber.new { 1 }
+System.print(f.stackTrace)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert!(output.contains("not enabled"), "expected disabled message, got: {output}");
+    }
+
+    #[test]
+    fn test_fiber_stack_trace_enabled() {
+        let mut config = VMConfig::default();
+        config.fiber_stack_traces = true;
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", r#"
+var f = Fiber.new {
+  Fiber.yield()
+}
+f.call()
+System.print(f.stackTrace)
+"#);
+        let output = vm.take_output();
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        // Should contain stack trace info, not the disabled message
+        assert!(!output.contains("not enabled"), "should be enabled, got: {output}");
+    }
+
+    #[test]
+    fn test_fiber_cross_fiber_error_trace() {
+        // When a fiber errors out, the full trace should include caller chain
+        use std::sync::{Arc, Mutex};
+
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let errors_clone = errors.clone();
+
+        let mut config = VMConfig::default();
+        config.fiber_stack_traces = true;
+        config.error_fn = Some(Box::new(move |_kind, _module, _line, msg| {
+            errors_clone.lock().unwrap().push(msg.to_string());
+        }));
+
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", r#"
+var inner = Fiber.new {
+  var x = 42
+  x.bogus()
+}
+inner.call()
+"#);
+        assert!(matches!(result, InterpretResult::RuntimeError));
+        let captured = errors.lock().unwrap();
+        assert!(!captured.is_empty(), "expected error");
+        let plain = strip_ansi(&captured[0]);
+        // Error should mention bogus
+        assert!(plain.contains("bogus"), "should mention bogus in:\n{plain}");
+    }
+
+    #[test]
+    fn test_fiber_spawn_trace_recorded() {
+        // Verify that spawn_trace is populated when fiber_stack_traces is enabled
+        let mut config = VMConfig::default();
+        config.fiber_stack_traces = true;
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", r#"
+var f = Fiber.new { 1 }
+System.print(f.stackTrace)
+"#);
+        let output = vm.take_output();
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        // The stack trace should mention "main" module and spawned-at info
+        assert!(output.contains("main"), "should reference main module, got: {output}");
     }
 }

@@ -53,10 +53,13 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let closure_ptr = unsafe { as_closure(args[1]) };
     match closure_ptr {
         Some(closure) => {
+            // Capture spawn-site stack trace if opt-in is enabled
+            let spawn_trace = ctx.capture_spawn_trace();
             let fiber = ctx.alloc_fiber();
             unsafe {
                 (*fiber).header.class = ctx.get_fiber_class();
                 setup_fiber_from_closure(fiber, closure);
+                (*fiber).spawn_trace = spawn_trace;
             }
             Value::object(fiber as *mut u8)
         }
@@ -250,6 +253,23 @@ fn fiber_transfer_error(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::null()
 }
 
+fn fiber_stack_trace(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    if !ctx.fiber_stack_traces_enabled() {
+        return ctx.alloc_string("<stack traces not enabled — set VMConfig.fiber_stack_traces = true>".to_string());
+    }
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => {
+            let trace = ctx.get_stack_trace_string(f);
+            ctx.alloc_string(trace)
+        }
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+            Value::null()
+        }
+    }
+}
+
 fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     // try() is like call() but catches runtime errors
     fiber_call_0(ctx, args)
@@ -280,4 +300,5 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "transferError(_)", fiber_transfer_error);
     vm.primitive(class, "try()", fiber_try_0);
     vm.primitive(class, "try(_)", fiber_try_1);
+    vm.primitive(class, "stackTrace", fiber_stack_trace);
 }

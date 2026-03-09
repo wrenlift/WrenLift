@@ -687,6 +687,23 @@ impl fmt::Debug for MirCallFrame {
     }
 }
 
+/// A snapshot of a call frame's location, used for spawn-site traces.
+#[derive(Debug, Clone)]
+pub struct StackFrame {
+    pub func_name: String,
+    pub module: String,
+    pub line: Option<usize>,
+}
+
+impl std::fmt::Display for StackFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.line {
+            Some(line) => write!(f, "  at {} ({}:{})", self.func_name, self.module, line),
+            None => write!(f, "  at {} ({})", self.func_name, self.module),
+        }
+    }
+}
+
 /// A fiber (lightweight coroutine / green thread).
 #[repr(C)]
 pub struct ObjFiber {
@@ -705,6 +722,8 @@ pub struct ObjFiber {
     pub error: Value,
     /// Where to store the resume value when this fiber is resumed after yielding.
     pub resume_value_dst: Option<crate::mir::ValueId>,
+    /// Stack trace snapshot from where this fiber was spawned (opt-in).
+    pub spawn_trace: Option<Vec<StackFrame>>,
 }
 
 impl ObjFiber {
@@ -718,6 +737,7 @@ impl ObjFiber {
             caller: std::ptr::null_mut(),
             error: Value::null(),
             resume_value_dst: None,
+            spawn_trace: None,
         }
     }
 
@@ -843,6 +863,11 @@ pub trait NativeContext {
     fn set_fiber_action_transfer(&mut self, target: *mut ObjFiber, value: Value);
     fn set_fiber_action_suspend(&mut self);
     fn get_current_fiber(&self) -> *mut ObjFiber;
+
+    // -- Stack trace support (opt-in) --
+    fn fiber_stack_traces_enabled(&self) -> bool;
+    fn capture_spawn_trace(&self) -> Option<Vec<StackFrame>>;
+    fn get_stack_trace_string(&self, fiber: *mut ObjFiber) -> String;
 }
 
 impl ObjClass {
