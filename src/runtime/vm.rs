@@ -1596,6 +1596,53 @@ while (i < 3) {
     }
 
     #[test]
+    fn test_interpret_list_subscript() {
+        let (result, output) = run_and_capture(r#"
+var list = [10, 20, 30]
+System.print(list[0])
+System.print(list[2])
+list[1] = 99
+System.print(list[1])
+"#);
+        assert!(matches!(result, InterpretResult::Success), "list subscript failed: {:?}", result);
+        assert_eq!(output, "10\n30\n99\n");
+    }
+
+    #[test]
+    fn test_interpret_for_in_list() {
+        let (result, output) = run_and_capture(r#"
+var list = [10, 20, 30]
+for (x in list) {
+  System.print(x)
+}
+"#);
+        assert!(matches!(result, InterpretResult::Success), "for-in list failed: {:?}", result);
+        assert_eq!(output, "10\n20\n30\n");
+    }
+
+    #[test]
+    fn test_interpret_for_in_range() {
+        let (result, output) = run_and_capture(r#"
+for (i in 1..4) {
+  System.print(i)
+}
+"#);
+        assert!(matches!(result, InterpretResult::Success), "for-in range failed: {:?}", result);
+        assert_eq!(output, "1\n2\n3\n4\n");
+    }
+
+    #[test]
+    fn test_interpret_string_plus() {
+        let (result, output) = run_and_capture(r#"
+var a = "hello"
+var b = " world"
+System.print(a + b)
+"#);
+        assert!(matches!(result, InterpretResult::Success), "string concat failed: {:?}", result);
+        assert_eq!(output, "hello world\n");
+    }
+
+    #[test]
     fn test_interpret_static_method_with_args() {
         let mut vm = VM::new(VMConfig::default());
         vm.output_buffer = Some(String::new());
