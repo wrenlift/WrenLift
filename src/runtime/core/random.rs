@@ -57,7 +57,7 @@ impl Well512 {
         let e = a ^ ((a << 5) & 0xDA442D24);
         self.index = ((i + 15) & 15) as u32;
         let idx = self.index as usize;
-        self.state[idx] ^= self.state[idx] ^ e;
+        self.state[idx] ^= e;
         self.state[idx]
     }
 
