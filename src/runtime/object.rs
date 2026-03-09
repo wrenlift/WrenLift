@@ -335,7 +335,7 @@ impl fmt::Debug for ObjList {
 /// for nums we use the bits directly which gives consistent hashing
 /// with IEEE equality for non-NaN values).
 #[derive(Clone, Copy)]
-pub struct MapKey(Value);
+pub struct MapKey(pub Value);
 
 impl MapKey {
     pub fn new(v: Value) -> Self {

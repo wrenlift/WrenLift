@@ -66,7 +66,7 @@ impl From<InterpError> for RuntimeError {
     }
 }
 
-const MAX_STEPS: usize = 1_000_000;
+const MAX_STEPS: usize = 100_000_000;
 
 // ---------------------------------------------------------------------------
 // Fiber-based MIR interpreter
@@ -341,10 +341,21 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             all_args.push(get_val(&values, *a)?.to_value());
                         }
                         let class = vm.class_of(recv);
-                        let sym = vm.interner.intern("[_]");
+                        // Build signature: [_] or [_,_] etc based on arg count
+                        let sig = format!("[{}]", vec!["_"; args.len()].join(","));
+                        let sym = vm.interner.intern(&sig);
                         match unsafe { (*class).find_method(sym).cloned() } {
                             Some(Method::Native(func)) => InterpValue::Boxed(func(vm, &all_args)),
-                            _ => return Err(RuntimeError::Unsupported("subscript get".into())),
+                            Some(Method::Closure(closure_ptr)) => {
+                                dispatch_closure(
+                                    vm, fiber, closure_ptr, &all_args,
+                                    &mut current_block, ip, values,
+                                    &module_name, *dst,
+                                )?;
+                                continue 'fiber_loop;
+                            }
+                            _ => return Err(RuntimeError::Unsupported(
+                                format!("subscript get with sig '{}'", sig))),
                         }
                     }
                     SubscriptSet { receiver, args, value } => {
@@ -355,10 +366,21 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                         all_args.push(get_val(&values, *value)?.to_value());
                         let class = vm.class_of(recv);
-                        let sym = vm.interner.intern("[_]=(_)");
+                        // Build signature: [_]=(_) or [_,_]=(_) etc
+                        let sig = format!("[{}]=(_)", vec!["_"; args.len()].join(","));
+                        let sym = vm.interner.intern(&sig);
                         match unsafe { (*class).find_method(sym).cloned() } {
                             Some(Method::Native(func)) => InterpValue::Boxed(func(vm, &all_args)),
-                            _ => return Err(RuntimeError::Unsupported("subscript set".into())),
+                            Some(Method::Closure(closure_ptr)) => {
+                                dispatch_closure(
+                                    vm, fiber, closure_ptr, &all_args,
+                                    &mut current_block, ip, values,
+                                    &module_name, *dst,
+                                )?;
+                                continue 'fiber_loop;
+                            }
+                            _ => return Err(RuntimeError::Unsupported(
+                                format!("subscript set with sig '{}'", sig))),
                         }
                     }
 

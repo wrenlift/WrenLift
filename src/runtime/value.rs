@@ -184,22 +184,50 @@ impl Value {
         Value(bits)
     }
 
+    /// Returns true if this is an object of type String.
+    #[inline]
+    pub fn is_string_object(self) -> bool {
+        if let Some(ptr) = self.as_object() {
+            unsafe { (*(ptr as *const super::object::ObjHeader)).obj_type == super::object::ObjType::String }
+        } else {
+            false
+        }
+    }
+
     // -- Equality -----------------------------------------------------------
 
     /// Wren value equality. Numbers use IEEE equality (NaN != NaN).
-    /// Objects use pointer identity. Bools and null use value equality.
+    /// Strings compare by content. Other objects use pointer identity.
     #[inline]
     pub fn equals(self, other: Value) -> bool {
+        if self.0 == other.0 {
+            // Fast path: identical bits (same pointer, same bool, same null, or same num bits).
+            // NaN != NaN in Wren, but two NaN bit patterns can't be equal here
+            // unless they're the exact same NaN bits, which we allow.
+            return !self.is_num() || !f64::from_bits(self.0).is_nan();
+        }
         if self.is_num() && other.is_num() {
-            // IEEE 754 semantics: NaN != NaN
             let a = f64::from_bits(self.0);
             let b = f64::from_bits(other.0);
-            a == b
-        } else {
-            // For non-numbers, bitwise equality is correct:
-            // same bool, same null, same object pointer.
-            self.0 == other.0
+            return a == b;
         }
+        // Different object pointers: compare string contents
+        if self.is_object() && other.is_object() {
+            let pa = self.as_object().unwrap();
+            let pb = other.as_object().unwrap();
+            unsafe {
+                let ha = &*(pa as *const super::object::ObjHeader);
+                let hb = &*(pb as *const super::object::ObjHeader);
+                if ha.obj_type == super::object::ObjType::String
+                    && hb.obj_type == super::object::ObjType::String
+                {
+                    let sa = &*(pa as *const super::object::ObjString);
+                    let sb = &*(pb as *const super::object::ObjString);
+                    return sa.value == sb.value;
+                }
+            }
+        }
+        false
     }
 }
 

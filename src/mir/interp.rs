@@ -222,12 +222,22 @@ pub fn eval_pure_instruction(
         Instruction::CmpEq(a, b) => {
             let lhs = get(*a)?.to_value();
             let rhs = get(*b)?.to_value();
-            Ok(InterpValue::Boxed(Value::bool(lhs == rhs)))
+            // For non-instance objects (nums, bools, null, strings), use value equality.
+            // For instances, return error so vm_interp can dispatch user-defined ==(_).
+            if lhs.is_object() && !lhs.is_string_object() && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num() {
+                Err(InterpError::TypeMismatch("CmpEq on objects".into()))
+            } else {
+                Ok(InterpValue::Boxed(Value::bool(lhs == rhs)))
+            }
         }
         Instruction::CmpNe(a, b) => {
             let lhs = get(*a)?.to_value();
             let rhs = get(*b)?.to_value();
-            Ok(InterpValue::Boxed(Value::bool(lhs != rhs)))
+            if lhs.is_object() && !lhs.is_string_object() && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num() {
+                Err(InterpError::TypeMismatch("CmpNe on objects".into()))
+            } else {
+                Ok(InterpValue::Boxed(Value::bool(lhs != rhs)))
+            }
         }
 
         // -- Unboxed f64 comparisons --

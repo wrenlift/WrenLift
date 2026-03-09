@@ -703,6 +703,35 @@ impl MirFunction {
         BlockId(0)
     }
 
+    /// Dump a human-readable text representation of this function.
+    pub fn dump(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("fn {} (arity={}):\n", self.name, self.arity));
+        if !self.strings.is_empty() {
+            out.push_str("  strings:");
+            for (i, s) in self.strings.iter().enumerate() {
+                out.push_str(&format!(" [{}]={:?}", i, s));
+            }
+            out.push('\n');
+        }
+        for block in &self.blocks {
+            // Block header with params
+            out.push_str(&format!("  {}(", block.id));
+            for (i, (val, ty)) in block.params.iter().enumerate() {
+                if i > 0 { out.push_str(", "); }
+                out.push_str(&format!("{}: {:?}", val, ty));
+            }
+            out.push_str("):\n");
+            // Instructions
+            for (val, inst) in &block.instructions {
+                out.push_str(&format!("    {} = {:?}\n", val, inst));
+            }
+            // Terminator
+            out.push_str(&format!("    -> {:?}\n", block.terminator));
+        }
+        out
+    }
+
     /// Remap all SymbolId references in this function using a mapping function.
     ///
     /// This is needed when merging a parse interner into the VM interner,

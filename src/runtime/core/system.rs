@@ -33,7 +33,38 @@ fn format_object(value: Value) -> String {
     } else if value.is_bool() {
         (if value.as_bool().unwrap() { "true" } else { "false" }).to_string()
     } else if value.is_object() {
-        super::as_string(value).to_string()
+        if super::is_string(value) {
+            super::as_string(value).to_string()
+        } else {
+            // For non-string objects, format by type
+            let ptr = value.as_object().unwrap();
+            let header = unsafe { &*(ptr as *const super::super::object::ObjHeader) };
+            match header.obj_type {
+                super::super::object::ObjType::List => {
+                    let list = unsafe { &*(ptr as *const super::super::object::ObjList) };
+                    let parts: Vec<String> = (0..list.len())
+                        .map(|i| format_object(list.get(i).unwrap_or(Value::null())))
+                        .collect();
+                    format!("[{}]", parts.join(", "))
+                }
+                super::super::object::ObjType::Range => {
+                    let range = unsafe { &*(ptr as *const super::super::object::ObjRange) };
+                    let op = if range.is_inclusive { ".." } else { "..." };
+                    format!("{}{}{}", format_object(Value::num(range.from)), op, format_object(Value::num(range.to)))
+                }
+                super::super::object::ObjType::Map => {
+                    let map = unsafe { &*(ptr as *const super::super::object::ObjMap) };
+                    let parts: Vec<String> = map.entries.iter()
+                        .map(|(k, v)| format!("{}: {}", format_object(k.0), format_object(*v)))
+                        .collect();
+                    format!("{{{}}}", parts.join(", "))
+                }
+                super::super::object::ObjType::Fn => "Fn".to_string(),
+                super::super::object::ObjType::Closure => "Fn".to_string(),
+                super::super::object::ObjType::Fiber => "Fiber".to_string(),
+                _ => "instance".to_string(),
+            }
+        }
     } else {
         String::new()
     }

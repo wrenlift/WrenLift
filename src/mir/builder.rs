@@ -249,30 +249,106 @@ impl<'a> MirBuilder<'a> {
             false_args: vec![],
         });
 
+        // Snapshot variables before branches
+        let vars_before = self.variables.clone();
+
+        // Lower then branch
         self.switch_to(then_bb);
         self.lower_stmt(then_branch);
-        if matches!(
+        let then_vars = self.variables.clone();
+        let then_exit_block = self.current_block;
+        let then_returns = !matches!(
             self.func.block(self.current_block).terminator,
             Terminator::Unreachable
-        ) {
-            self.set_terminator(Terminator::Branch {
-                target: merge_bb,
-                args: vec![],
-            });
-        }
+        );
 
+        // Restore variables for else branch
+        self.variables = vars_before.clone();
+
+        // Lower else branch
         self.switch_to(else_bb);
         if let Some(else_stmt) = else_branch {
             self.lower_stmt(else_stmt);
         }
-        if matches!(
+        let else_vars = self.variables.clone();
+        let else_exit_block = self.current_block;
+        let else_returns = !matches!(
             self.func.block(self.current_block).terminator,
             Terminator::Unreachable
-        ) {
-            self.set_terminator(Terminator::Branch {
-                target: merge_bb,
-                args: vec![],
+        );
+
+        // Find variables that differ between branches and create merge block params
+        let mut merge_args_then = Vec::new();
+        let mut merge_args_else = Vec::new();
+
+        // Collect all variable names from both branches
+        let all_names: Vec<SymbolId> = {
+            let mut names: Vec<SymbolId> = vars_before.keys().copied().collect();
+            for name in then_vars.keys() {
+                if !names.contains(name) {
+                    names.push(*name);
+                }
+            }
+            for name in else_vars.keys() {
+                if !names.contains(name) {
+                    names.push(*name);
+                }
+            }
+            names
+        };
+
+        for &name in &all_names {
+            let then_val = then_vars.get(&name).copied();
+            let else_val = else_vars.get(&name).copied();
+            let before_val = vars_before.get(&name).copied();
+
+            // If both branches agree, no phi needed
+            if then_val == else_val {
+                if let Some(v) = then_val {
+                    self.variables.insert(name, v);
+                }
+                continue;
+            }
+
+            // Need a merge param
+            let phi = self.func.new_value();
+            self.func.block_mut(merge_bb).params.push((phi, MirType::Value));
+
+            // then branch value: use then_val if available, otherwise before_val, else null
+            let tv = then_val.or(before_val).unwrap_or_else(|| {
+                let saved = self.current_block;
+                self.current_block = then_exit_block;
+                let v = self.emit(Instruction::ConstNull);
+                self.current_block = saved;
+                v
             });
+            merge_args_then.push(tv);
+
+            // else branch value
+            let ev = else_val.or(before_val).unwrap_or_else(|| {
+                let saved = self.current_block;
+                self.current_block = else_exit_block;
+                let v = self.emit(Instruction::ConstNull);
+                self.current_block = saved;
+                v
+            });
+            merge_args_else.push(ev);
+
+            self.variables.insert(name, phi);
+        }
+
+        // Wire branches to merge block
+        if !then_returns {
+            self.func.block_mut(then_exit_block).terminator = Terminator::Branch {
+                target: merge_bb,
+                args: merge_args_then,
+            };
+        }
+        if !else_returns {
+            self.func.block_mut(else_exit_block).terminator = Terminator::Branch {
+                target: merge_bb,
+                args: merge_args_else,
+            };
         }
 
         self.switch_to(merge_bb);
@@ -283,11 +359,31 @@ impl<'a> MirBuilder<'a> {
         let body_bb = self.new_block();
         let exit_bb = self.new_block();
 
+        // Pre-create phi block params in cond_bb for ALL variables.
+        // This ensures both condition and body use phi values, so mutations
+        // in the body propagate correctly back to the condition via the back-edge.
+        let vars_snapshot: Vec<(SymbolId, ValueId)> = self.variables.iter()
+            .map(|(&k, &v)| (k, v))
+            .collect();
+
+        let mut entry_args = Vec::new();
+        let mut phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
+
+        for &(name, initial_val) in &vars_snapshot {
+            let phi = self.func.new_value();
+            self.func.block_mut(cond_bb).params.push((phi, MirType::Value));
+            entry_args.push(initial_val);
+            phi_map.push((name, phi));
+            self.variables.insert(name, phi);
+        }
+
+        // Branch from current block to cond_bb with initial values
         self.set_terminator(Terminator::Branch {
             target: cond_bb,
-            args: vec![],
+            args: entry_args,
         });
 
+        // Lower condition (uses phi values)
         self.switch_to(cond_bb);
         let cond_val = self.lower_expr(condition);
         self.set_terminator(Terminator::CondBranch {
@@ -298,6 +394,7 @@ impl<'a> MirBuilder<'a> {
             false_args: vec![],
         });
 
+        // Lower body (cond_bb dominates body_bb, so phi values are accessible)
         self.switch_to(body_bb);
         self.break_targets.push(exit_bb);
         self.continue_targets.push(cond_bb);
@@ -305,14 +402,24 @@ impl<'a> MirBuilder<'a> {
         self.break_targets.pop();
         self.continue_targets.pop();
 
+        // Back-edge: pass current (possibly mutated) variable values
+        let backedge_args: Vec<ValueId> = phi_map.iter()
+            .map(|&(name, _)| self.variables[&name])
+            .collect();
+
         if matches!(
             self.func.block(self.current_block).terminator,
             Terminator::Unreachable
         ) {
             self.set_terminator(Terminator::Branch {
                 target: cond_bb,
-                args: vec![],
+                args: backedge_args,
             });
+        }
+
+        // Restore variables to phi values for post-loop code
+        for &(name, phi) in &phi_map {
+            self.variables.insert(name, phi);
         }
 
         self.switch_to(exit_bb);
@@ -857,8 +964,11 @@ fn compile_closure_body(
         Terminator::Unreachable
     ) {
         // Check if last instruction produced a value we can return
+        // Also check block params (for &&/|| merge blocks)
         let last_val = builder.func.block(builder.current_block)
-            .instructions.last().map(|(id, _)| *id);
+            .instructions.last().map(|(id, _)| *id)
+            .or_else(|| builder.func.block(builder.current_block)
+                .params.last().map(|(id, _)| *id));
         if let Some(val) = last_val {
             builder.func.block_mut(builder.current_block).terminator =
                 Terminator::Return(val);
@@ -1051,8 +1161,11 @@ fn compile_class(
                     Terminator::Return(this_val);
             } else {
                 // Return last expression value if available (e.g. getters)
+                // Check instructions first, then block params (for &&/|| merge blocks)
                 let last_val = builder.func.block(builder.current_block)
-                    .instructions.last().map(|(id, _)| *id);
+                    .instructions.last().map(|(id, _)| *id)
+                    .or_else(|| builder.func.block(builder.current_block)
+                        .params.last().map(|(id, _)| *id));
                 if let Some(val) = last_val {
                     builder.func.block_mut(builder.current_block).terminator =
                         Terminator::Return(val);

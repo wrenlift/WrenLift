@@ -17,10 +17,13 @@ impl MirPass for Cse {
     }
 
     fn run(&self, func: &mut MirFunction) -> bool {
-        let mut seen: HashMap<CseKey, ValueId> = HashMap::new();
         let mut replacements: HashMap<ValueId, ValueId> = HashMap::new();
 
+        // CSE within each block only — merging across blocks requires
+        // dominance analysis to avoid referencing values from non-dominating
+        // blocks (e.g. merging constants between then/else branches).
         for block in &func.blocks {
+            let mut seen: HashMap<CseKey, ValueId> = HashMap::new();
             for (val_id, inst) in &block.instructions {
                 if inst.has_side_effects() {
                     continue;
@@ -65,10 +68,13 @@ fn resolve(v: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
 }
 
 fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Option<CseKey> {
-    // Don't CSE block params or mutable reads.
+    // Don't CSE block params or mutable reads (fields/module vars/upvalues can be mutated).
     if matches!(
         inst,
-        Instruction::BlockParam(_) | Instruction::GetModuleVar(_) | Instruction::GetUpvalue(_)
+        Instruction::BlockParam(_)
+            | Instruction::GetModuleVar(_)
+            | Instruction::GetUpvalue(_)
+            | Instruction::GetField(..)
     ) {
         return None;
     }
