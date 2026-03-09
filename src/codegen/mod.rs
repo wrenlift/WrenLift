@@ -1399,8 +1399,6 @@ pub fn compile_function_with_interner(
         _ => {
             // 1. Lower MIR → MachFunc (virtual registers)
             let mut mach = lower_mir_with_interner(mir, interner);
-            // 1b. Link runtime calls: CallRuntime → LoadImm + CallInd
-            runtime_fns::link_runtime_calls(&mut mach);
             // Native: register allocation + emit.
             let target_regs = match target {
                 Target::X86_64 => regalloc::x86_64_target_regs(),
@@ -1409,6 +1407,9 @@ pub fn compile_function_with_interner(
             };
             regalloc::allocate_registers(&mut mach, &target_regs);
             fixup_sentinels(&mut mach, target);
+            // Link runtime calls AFTER regalloc + fixup so all vregs are
+            // physical registers. Uses parallel copy to avoid clobbering.
+            runtime_fns::link_runtime_calls(&mut mach, target);
 
             match target {
                 Target::X86_64 => {
@@ -1425,7 +1426,7 @@ pub fn compile_function_with_interner(
     }
 }
 
-/// Replace sentinel VReg indices (frame pointer, spill scratch) with
+/// Replace sentinel VReg indices (frame pointer, spill scratch, ABI regs) with
 /// actual hardware register encodings for the target.
 fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
     let (fp_enc, gp_scratch, fp_scratch): (u32, u32, u32) = match target {
@@ -1435,12 +1436,12 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
     };
 
     for inst in &mut mach.insts {
-        fixup_vreg_sentinels(inst, fp_enc, gp_scratch, fp_scratch);
+        fixup_vreg_sentinels(inst, fp_enc, gp_scratch, fp_scratch, target);
     }
 }
 
 /// Rewrite sentinel indices in a single instruction.
-fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_scratch: u32) {
+fn fixup_vreg_sentinels(inst: &mut MachInst, fp_enc: u32, gp_scratch: u32, fp_scratch: u32, _target: Target) {
     // Visit every VReg field in the instruction.
     let fix = |v: &mut VReg| {
         if v.index == u32::MAX && v.class == RegClass::Gp {

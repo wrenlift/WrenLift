@@ -199,7 +199,7 @@ impl ExecutionEngine {
     }
 
     /// Determine the native compilation target for the current platform.
-    fn native_target() -> crate::codegen::Target {
+    pub fn native_target() -> crate::codegen::Target {
         #[cfg(target_arch = "x86_64")]
         { crate::codegen::Target::X86_64 }
         #[cfg(target_arch = "aarch64")]
@@ -304,5 +304,195 @@ mod tests {
         assert!(engine.get_function(id).unwrap().is_compiled());
         // MIR should still be accessible after compilation
         assert!(engine.get_mir(id).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // JIT execution tests (compile + actually call native code)
+    // -----------------------------------------------------------------------
+
+    // JIT execution tests — compile MIR to native code and call it.
+    // Only enabled on the native architecture.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    mod jit_exec {
+        use super::*;
+        use crate::codegen::runtime_fns::{self, JitContext};
+        use crate::runtime::value::Value;
+
+        /// Compile MIR to native code for the current platform and execute it.
+        fn compile_and_exec(f: MirFunction, interner: &Interner) -> Option<u64> {
+            let target = ExecutionEngine::native_target();
+            let compiled = crate::codegen::compile_function_with_interner(&f, target, interner).ok()?;
+            let executable = compiled.into_executable().ok()?;
+            if !executable.is_native() { return None; }
+            // SAFETY: executable stays alive while func runs (same scope).
+            let func: fn() -> u64 = unsafe { executable.as_fn() };
+            let result = func();
+            drop(executable); // explicit: release mmap after call
+            Some(result)
+        }
+
+        #[test]
+        fn test_jit_exec_f64_add() {
+            let mut interner = Interner::new();
+            let name = interner.intern("f64_add");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            let v1 = f.new_value();
+            let v2 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::ConstF64(10.0)));
+                b.instructions.push((v1, crate::mir::Instruction::ConstF64(32.0)));
+                b.instructions.push((v2, crate::mir::Instruction::AddF64(v0, v1)));
+                b.terminator = crate::mir::Terminator::Return(v2);
+            }
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some(), "JIT compilation should succeed");
+            let val = f64::from_bits(result.unwrap());
+            assert_eq!(val, 42.0);
+        }
+
+        #[test]
+        fn test_jit_exec_boxed_add() {
+            // Test boxed (NaN-boxed) arithmetic via CallRuntime → wren_num_add
+            let mut interner = Interner::new();
+            let name = interner.intern("boxed_add");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            let v1 = f.new_value();
+            let v2 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::ConstNum(10.0)));
+                b.instructions.push((v1, crate::mir::Instruction::ConstNum(32.0)));
+                b.instructions.push((v2, crate::mir::Instruction::Add(v0, v1)));
+                b.terminator = crate::mir::Terminator::Return(v2);
+            }
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some(), "JIT compilation with CallRuntime should succeed");
+            let val = Value::from_bits(result.unwrap());
+            let n = val.as_num().expect("should be a number");
+            assert_eq!(n, 42.0);
+        }
+
+        #[test]
+        fn test_jit_exec_boxed_cmp() {
+            let mut interner = Interner::new();
+            let name = interner.intern("boxed_cmp");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            let v1 = f.new_value();
+            let v2 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::ConstNum(10.0)));
+                b.instructions.push((v1, crate::mir::Instruction::ConstNum(32.0)));
+                b.instructions.push((v2, crate::mir::Instruction::CmpLt(v0, v1)));
+                b.terminator = crate::mir::Terminator::Return(v2);
+            }
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some());
+            let val = Value::from_bits(result.unwrap());
+            assert_eq!(val.as_bool(), Some(true));
+        }
+
+        #[test]
+        fn test_jit_exec_module_var() {
+            let mut interner = Interner::new();
+            let name = interner.intern("read_modvar");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::GetModuleVar(0)));
+                b.terminator = crate::mir::Terminator::Return(v0);
+            }
+
+            let expected = Value::num(99.0);
+            let mut vars: Vec<u64> = vec![expected.to_bits()];
+            let mut dummy_vm = [0u8; 8192];
+            runtime_fns::set_jit_context(JitContext {
+                module_vars: vars.as_mut_ptr(),
+                module_var_count: 1,
+                vm: dummy_vm.as_mut_ptr(),
+                module_name: std::ptr::null(),
+                module_name_len: 0,
+            });
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some());
+            let val = Value::from_bits(result.unwrap());
+            assert_eq!(val.as_num(), Some(99.0));
+
+            runtime_fns::set_jit_context(JitContext::default());
+        }
+
+        #[test]
+        fn test_jit_exec_const_bool() {
+            let mut interner = Interner::new();
+            let name = interner.intern("const_bool");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::ConstBool(true)));
+                b.terminator = crate::mir::Terminator::Return(v0);
+            }
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some());
+            let val = Value::from_bits(result.unwrap());
+            assert_eq!(val.as_bool(), Some(true));
+        }
+
+        #[test]
+        fn test_jit_exec_boxed_neg() {
+            let mut interner = Interner::new();
+            let name = interner.intern("boxed_neg");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            let v1 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::ConstNum(7.0)));
+                b.instructions.push((v1, crate::mir::Instruction::Neg(v0)));
+                b.terminator = crate::mir::Terminator::Return(v1);
+            }
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some());
+            let val = Value::from_bits(result.unwrap());
+            assert_eq!(val.as_num(), Some(-7.0));
+        }
+
+        #[test]
+        fn test_jit_exec_boxed_not() {
+            let mut interner = Interner::new();
+            let name = interner.intern("boxed_not");
+            let mut f = MirFunction::new(name, 0);
+            let bb = f.new_block();
+            let v0 = f.new_value();
+            let v1 = f.new_value();
+            {
+                let b = f.block_mut(bb);
+                b.instructions.push((v0, crate::mir::Instruction::ConstBool(false)));
+                b.instructions.push((v1, crate::mir::Instruction::Not(v0)));
+                b.terminator = crate::mir::Terminator::Return(v1);
+            }
+
+            let result = compile_and_exec(f, &interner);
+            assert!(result.is_some());
+            let val = Value::from_bits(result.unwrap());
+            assert_eq!(val.as_bool(), Some(true));
+        }
     }
 }

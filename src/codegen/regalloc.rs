@@ -351,7 +351,6 @@ fn map_vreg(vreg: VReg, assignments: &HashMap<VReg, Location>) -> VReg {
     if vreg.index == u32::MAX - 1 {
         return vreg; // stays as-is, patched by target-specific fixup
     }
-
     match assignments.get(&vreg) {
         Some(&Location::Reg(phys)) => VReg {
             index: phys.hw_enc as u32,

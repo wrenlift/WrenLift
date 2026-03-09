@@ -434,7 +434,14 @@ impl<'a> MirBuilder<'a> {
                         }
                     }
                 } else {
-                    self.emit(Instruction::GetModuleVar(0))
+                    // Identifier not in variables map and not in resolutions.
+                    // Try to find it as a module var by name (safety net).
+                    let found = self.module_vars.iter().position(|s| s == name);
+                    if let Some(idx) = found {
+                        self.emit(Instruction::GetModuleVar(idx as u16))
+                    } else {
+                        self.emit(Instruction::ConstNull)
+                    }
                 }
             }
 
@@ -447,7 +454,12 @@ impl<'a> MirBuilder<'a> {
                     .unwrap_or(0);
                 self.emit(Instruction::GetField(this_val, idx))
             }
-            Expr::StaticField(_) => self.emit(Instruction::GetModuleVar(0)),
+            Expr::StaticField(_name) => {
+                // Static fields (__name) are class-level storage. Not yet fully
+                // implemented — emit ConstNull so we don't misresolve as wrong
+                // module var.
+                self.emit(Instruction::ConstNull)
+            }
 
             Expr::Interpolation(parts) => {
                 let mut vals = Vec::new();
