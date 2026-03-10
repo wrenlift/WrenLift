@@ -84,6 +84,45 @@ impl Nursery {
         self.buffer.len()
     }
 
+    /// Bump-allocate an array of Values into the arena. Returns None if full.
+    fn try_alloc_values(&mut self, count: usize) -> Option<*mut Value> {
+        if count == 0 {
+            return None;
+        }
+        let align = std::mem::align_of::<Value>();
+        let size = std::mem::size_of::<Value>() * count;
+        let aligned = (self.alloc_ptr + align - 1) & !(align - 1);
+
+        if aligned + size > self.buffer.len() {
+            return None;
+        }
+
+        let ptr = unsafe { self.buffer.as_mut_ptr().add(aligned) as *mut Value };
+        // Initialize to null
+        for i in 0..count {
+            unsafe {
+                ptr.add(i).write(Value::null());
+            }
+        }
+        self.alloc_ptr = aligned + size;
+        Some(ptr)
+    }
+
+    /// Check if the nursery has space for an instance + its fields.
+    fn has_space_for_instance(&self, num_fields: usize) -> bool {
+        let inst_align = std::mem::align_of::<ObjInstance>();
+        let inst_size = std::mem::size_of::<ObjInstance>();
+        let aligned = (self.alloc_ptr + inst_align - 1) & !(inst_align - 1);
+        let after_inst = aligned + inst_size;
+        if num_fields == 0 {
+            return after_inst <= self.buffer.len();
+        }
+        let val_align = std::mem::align_of::<Value>();
+        let val_size = std::mem::size_of::<Value>() * num_fields;
+        let val_aligned = (after_inst + val_align - 1) & !(val_align - 1);
+        val_aligned + val_size <= self.buffer.len()
+    }
+
     /// Reset the bump pointer. All objects must be cleaned up first.
     fn reset(&mut self) {
         self.alloc_ptr = 0;
@@ -108,7 +147,7 @@ pub struct GcConfig {
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
-            nursery_size: 4 * 1024 * 1024, // 4 MB
+            nursery_size: 16 * 1024 * 1024, // 16 MB
             initial_threshold: 256,
             heap_grow_factor: 2.0,
             major_gc_interval: 8,
@@ -393,7 +432,34 @@ impl Gc {
     }
 
     pub fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
-        self.alloc(ObjInstance::new(class))
+        let num_fields = if class.is_null() {
+            0
+        } else {
+            unsafe { (*class).num_fields as usize }
+        };
+
+        // Fast path: bump-allocate both instance and fields in nursery.
+        if self.nursery.has_space_for_instance(num_fields) {
+            let inst_ptr = self.nursery.try_alloc(ObjInstance::new_with_fields(
+                class,
+                num_fields as u32,
+                std::ptr::null_mut(), // fields set below
+            )).unwrap();
+            self.nursery_objects.push(inst_ptr as *mut ObjHeader);
+
+            if num_fields > 0 {
+                let fields_ptr = self.nursery.try_alloc_values(num_fields).unwrap();
+                unsafe { (*inst_ptr).fields = fields_ptr; }
+            }
+
+            let size = std::mem::size_of::<ObjInstance>()
+                + std::mem::size_of::<Value>() * num_fields;
+            self.track_alloc(size);
+            return inst_ptr;
+        }
+
+        // Slow path: heap-allocate (old gen).
+        self.alloc_old(ObjInstance::new(class))
     }
 
     pub fn alloc_foreign(&mut self, data: Vec<u8>) -> *mut ObjForeign {
@@ -642,12 +708,24 @@ impl Gc {
         };
 
         // Fix ObjUpvalue self-referential location pointer.
-        // When open, location points to a stack slot (outside nursery) — fine.
-        // When closed, location points to self.closed (inside nursery) — stale!
         if (*old_header).obj_type == ObjType::Upvalue {
             let new_uv = new_header as *mut ObjUpvalue;
             if self.nursery.contains((*new_uv).location as *const u8) {
                 (*new_uv).location = &mut (*new_uv).closed;
+            }
+        }
+
+        // Fix ObjInstance: if fields were nursery-allocated, copy to heap.
+        if (*old_header).obj_type == ObjType::Instance {
+            let new_inst = new_header as *mut ObjInstance;
+            let nf = (*new_inst).num_fields as usize;
+            if nf > 0 && !(*new_inst).fields_owned {
+                let old_fields = (*new_inst).fields;
+                let layout = std::alloc::Layout::array::<Value>(nf).unwrap();
+                let new_fields = std::alloc::alloc(layout) as *mut Value;
+                std::ptr::copy_nonoverlapping(old_fields, new_fields, nf);
+                (*new_inst).fields = new_fields;
+                (*new_inst).fields_owned = true;
             }
         }
 

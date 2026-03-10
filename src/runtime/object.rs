@@ -1053,8 +1053,8 @@ impl fmt::Debug for ObjClass {
 pub struct ObjInstance {
     pub header: ObjHeader, // offset 0, 24 bytes
     pub num_fields: u32,   // offset 24
-    // 4 bytes padding (implicit, for *mut alignment)
-    pub fields: *mut Value, // offset 32, heap-allocated [Value; num_fields]
+    pub fields_owned: bool, // offset 28 (in padding before *mut)
+    pub fields: *mut Value, // offset 32, heap-allocated or nursery-bump-allocated
                             // total: 40 bytes
 }
 
@@ -1070,7 +1070,6 @@ impl ObjInstance {
         let fields = if num_fields > 0 {
             let layout = std::alloc::Layout::array::<Value>(num_fields).unwrap();
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut Value };
-            // Initialize all fields to null
             for i in 0..num_fields {
                 unsafe {
                     ptr.add(i).write(Value::null());
@@ -1084,6 +1083,21 @@ impl ObjInstance {
         let mut instance = Self {
             header: ObjHeader::new(ObjType::Instance),
             num_fields: num_fields as u32,
+            fields_owned: true,
+            fields,
+        };
+        instance.header.class = class;
+        instance
+    }
+
+    /// Create an instance with an externally-managed fields pointer (e.g. nursery bump-allocated).
+    /// The fields pointer will NOT be freed on drop.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn new_with_fields(class: *mut ObjClass, num_fields: u32, fields: *mut Value) -> Self {
+        let mut instance = Self {
+            header: ObjHeader::new(ObjType::Instance),
+            num_fields,
+            fields_owned: false,
             fields,
         };
         instance.header.class = class;
@@ -1109,7 +1123,7 @@ impl ObjInstance {
 
 impl Drop for ObjInstance {
     fn drop(&mut self) {
-        if !self.fields.is_null() && self.num_fields > 0 {
+        if self.fields_owned && !self.fields.is_null() && self.num_fields > 0 {
             let layout = std::alloc::Layout::array::<Value>(self.num_fields as usize).unwrap();
             unsafe {
                 std::alloc::dealloc(self.fields as *mut u8, layout);
