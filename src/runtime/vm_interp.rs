@@ -1523,10 +1523,7 @@ fn dispatch_closure_bc(
 
     // JIT dispatch: if the function is compiled to native code and has ≤4 args,
     // call it directly instead of pushing a bytecode frame.
-    // Tiered mode still compiles but doesn't dispatch — codegen doesn't yet handle
-    // all MIR ops (GC safepoints, runtime callbacks, fiber ops). Remove this guard
-    // once codegen is complete.
-    if vm.engine.mode == ExecutionMode::Jit && arg_vals.len() <= 4 {
+    if vm.engine.mode != ExecutionMode::Interpreter && arg_vals.len() <= 4 {
         // Extract native fn pointer first, then drop the borrow on vm.engine.
         let native_fn_ptr: Option<*const u8> =
             if let Some(crate::runtime::engine::FuncBody::Compiled { executable, .. }) =
@@ -1542,6 +1539,11 @@ fn dispatch_closure_bc(
             };
 
         if let Some(fn_ptr_raw) = native_fn_ptr {
+            // Root all argument values so GC can find them during native execution.
+            for &arg in arg_vals {
+                crate::codegen::runtime_fns::push_jit_root(arg);
+            }
+
             // Set up JIT context for runtime helpers.
             let (module_vars_ptr, module_var_count) = vm
                 .engine
@@ -1601,6 +1603,9 @@ fn dispatch_closure_bc(
                     }
                 }
             };
+
+            // Native call returned — clear JIT roots, values are back in interpreter.
+            crate::codegen::runtime_fns::clear_jit_roots();
 
             let result_val = Value::from_bits(result_bits);
             // Store result in caller's return_dst register

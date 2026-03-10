@@ -66,6 +66,68 @@ pub fn set_jit_context(ctx: JitContext) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// JIT root set — GC-visible heap pointers held by native frames
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Values reachable only from JIT-compiled native frames.
+    /// GC scans this during collection so objects aren't freed while native code
+    /// holds them in registers/spill slots.
+    static JIT_ROOTS: std::cell::RefCell<Vec<Value>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Push a value into the JIT root set so GC can see it.
+pub fn push_jit_root(v: Value) {
+    JIT_ROOTS.with(|r| r.borrow_mut().push(v));
+}
+
+/// Take all JIT roots for GC scanning. Returns the values (caller must write back
+/// after collection via `set_jit_roots` for nursery forwarding).
+pub fn take_jit_roots() -> Vec<Value> {
+    JIT_ROOTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+/// Write back JIT roots after GC (with nursery-forwarded pointers).
+pub fn set_jit_roots(roots: Vec<Value>) {
+    JIT_ROOTS.with(|r| *r.borrow_mut() = roots);
+}
+
+/// Clear JIT roots (called after native code returns to interpreter).
+pub fn clear_jit_roots() {
+    JIT_ROOTS.with(|r| r.borrow_mut().clear());
+}
+
+/// Read JitContext's GC-managed pointers as Values for root scanning.
+/// Returns (closure_val, defining_class_val) — null if not set.
+pub fn jit_context_roots() -> (Value, Value) {
+    JIT_CONTEXT.with(|c| {
+        let ctx = c.borrow();
+        let closure = if ctx.closure.is_null() {
+            Value::null()
+        } else {
+            Value::object(ctx.closure)
+        };
+        let defining_class = if ctx.defining_class.is_null() {
+            Value::null()
+        } else {
+            Value::object(ctx.defining_class)
+        };
+        (closure, defining_class)
+    })
+}
+
+/// Write back JitContext's GC-managed pointers after collection (nursery forwarding).
+pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
+    JIT_CONTEXT.with(|c| {
+        let mut ctx = c.borrow_mut();
+        ctx.closure = closure.as_object().unwrap_or(std::ptr::null_mut());
+        ctx.defining_class = defining_class
+            .as_object()
+            .unwrap_or(std::ptr::null_mut());
+    });
+}
+
 /// Access the JIT context. Returns None if not set (vm is null).
 fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
     JIT_CONTEXT.with(|c| {
@@ -90,6 +152,30 @@ unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
             Some(&mut *(ctx.vm as *mut crate::runtime::vm::VM))
         }
     })
+}
+
+/// Refresh JitContext's module_vars pointer from the VM's engine.
+/// Must be called after any operation that might reallocate the module's
+/// variable Vec (e.g., call_closure_sync which can import modules).
+fn refresh_module_vars() {
+    let vm = unsafe { vm_ref() };
+    if let Some(vm) = vm {
+        JIT_CONTEXT.with(|c| {
+            let mut ctx = c.borrow_mut();
+            if !ctx.module_name.is_null() {
+                let name = unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                        ctx.module_name,
+                        ctx.module_name_len as usize,
+                    ))
+                };
+                if let Some(m) = vm.engine.modules.get(name) {
+                    ctx.module_vars = m.vars.as_ptr() as *mut u64;
+                    ctx.module_var_count = m.vars.len() as u32;
+                }
+            }
+        });
+    }
 }
 
 /// Get the module name from the JIT context.
@@ -146,10 +232,17 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
         None => return Value::null().to_bits(),
     };
 
+    // Root receiver and args before potential re-entrant interpreter calls
+    // that could trigger GC.
+    push_jit_root(recv);
+    for a in args {
+        push_jit_root(*a);
+    }
+
     let class = vm.class_of(recv);
     let method_entry = unsafe { (*class).find_method(method_sym).cloned() };
 
-    match method_entry {
+    let result = match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
         Some(Method::Closure(closure_ptr)) => vm
             .call_closure_sync(closure_ptr, args)
@@ -180,7 +273,13 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
                 Value::null().to_bits()
             }
         }
-    }
+    };
+
+    // Refresh module_vars pointer — call_closure_sync may have modified
+    // the module's variable Vec (imports, new definitions).
+    refresh_module_vars();
+
+    result
 }
 
 /// Call a method with 0 extra args. Codegen: [receiver, method_sym]
@@ -256,6 +355,12 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
         None => return Value::null().to_bits(),
     };
 
+    // Root receiver and args before potential re-entrant interpreter calls.
+    push_jit_root(recv);
+    for a in args {
+        push_jit_root(*a);
+    }
+
     let class = vm.class_of(recv);
     let superclass = unsafe { (*class).superclass };
     if superclass.is_null() {
@@ -263,7 +368,7 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
     }
 
     let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
-    match method_entry {
+    let result = match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
         Some(Method::Closure(closure_ptr)) => vm
             .call_closure_sync(closure_ptr, args)
@@ -274,7 +379,10 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
             .map(|v| v.to_bits())
             .unwrap_or(Value::null().to_bits()),
         None => Value::null().to_bits(),
-    }
+    };
+
+    refresh_module_vars();
+    result
 }
 
 /// Super call with 0 args. Codegen: [method_sym] (no receiver — shouldn't happen in practice)
@@ -332,7 +440,9 @@ pub extern "C" fn wren_make_list() -> u64 {
     unsafe {
         (*list_ptr).header.class = vm.list_class;
     }
-    Value::object(list_ptr as *mut u8).to_bits()
+    let val = Value::object(list_ptr as *mut u8);
+    push_jit_root(val);
+    val.to_bits()
 }
 
 /// Allocate a new empty map.
@@ -347,7 +457,9 @@ pub extern "C" fn wren_make_map() -> u64 {
     unsafe {
         (*map_ptr).header.class = vm.map_class;
     }
-    Value::object(map_ptr as *mut u8).to_bits()
+    let val = Value::object(map_ptr as *mut u8);
+    push_jit_root(val);
+    val.to_bits()
 }
 
 /// Allocate a new range.
@@ -366,7 +478,9 @@ pub extern "C" fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
     unsafe {
         (*range_ptr).header.class = vm.range_class;
     }
-    Value::object(range_ptr as *mut u8).to_bits()
+    let val = Value::object(range_ptr as *mut u8);
+    push_jit_root(val);
+    val.to_bits()
 }
 
 /// Helper: allocate closure and populate upvalues from a slice of NaN-boxed values.
@@ -389,11 +503,15 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     unsafe {
         (*fn_ptr).header.class = vm.fn_class;
     }
+    // Root the fn object before further allocations.
+    push_jit_root(Value::object(fn_ptr as *mut u8));
 
     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
     unsafe {
         (*closure_ptr).header.class = vm.fn_class;
     }
+    // Root the closure before upvalue allocations.
+    push_jit_root(Value::object(closure_ptr as *mut u8));
 
     // Populate upvalues with captured values (pre-closed)
     for (i, &uv_bits) in upvalue_vals.iter().enumerate() {
@@ -446,7 +564,9 @@ pub extern "C" fn wren_string_concat(a: u64, b: u64) -> u64 {
     let sa = crate::runtime::vm_interp::value_to_string(vm, va);
     let sb = crate::runtime::vm_interp::value_to_string(vm, vb);
     let concatenated = format!("{}{}", sa, sb);
-    vm.new_string(concatenated).to_bits()
+    let val = vm.new_string(concatenated);
+    push_jit_root(val);
+    val.to_bits()
 }
 
 /// Convert a value to its string representation.
@@ -460,7 +580,9 @@ pub extern "C" fn wren_to_string(val: u64) -> u64 {
     };
 
     let s = crate::runtime::vm_interp::value_to_string(vm, v);
-    vm.new_string(s).to_bits()
+    let val = vm.new_string(s);
+    push_jit_root(val);
+    val.to_bits()
 }
 
 /// Type check: is value an instance of class?
@@ -930,6 +1052,15 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
         return;
     } // Wasm: no runtime calls
 
+    // Build caller-saved register set for this target.
+    let caller_saved: &[super::PhysReg] = match target {
+        super::Target::Aarch64 => super::phys_aarch64::ABI.gp_caller_saved,
+        super::Target::X86_64 => super::phys_x86_64::ABI.gp_caller_saved,
+        super::Target::Wasm => return,
+    };
+    let caller_saved_set: std::collections::HashSet<u32> =
+        caller_saved.iter().map(|r| r.hw_enc as u32).collect();
+
     let mut i = 0;
     while i < mf.insts.len() {
         if let MachInst::CallRuntime { name, args, ret } = &mf.insts[i] {
@@ -938,7 +1069,56 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
             let ret = *ret;
 
             if let Some(addr) = resolve(name) {
+                // Compute which caller-saved GP registers are live across this call:
+                // any register referenced (used or defined) by instructions after this call.
+                let mut live_across: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                for j in (i + 1)..mf.insts.len() {
+                    for u in mf.insts[j].uses() {
+                        if u.class == super::RegClass::Gp {
+                            live_across.insert(u.index);
+                        }
+                    }
+                    if let Some(d) = mf.insts[j].def() {
+                        if d.class == super::RegClass::Gp {
+                            live_across.insert(d.index);
+                        }
+                    }
+                }
+
+                // Only save caller-saved regs that are live, excluding ABI regs
+                // used for this call's args/ret/scratch (they're already managed).
+                let mut excluded: std::collections::HashSet<u32> =
+                    std::collections::HashSet::new();
+                for (idx, _) in args.iter().enumerate() {
+                    if idx < abi_args.len() {
+                        excluded.insert(abi_args[idx]);
+                    }
+                }
+                excluded.insert(abi_ret);
+                excluded.insert(call_scratch);
+                excluded.insert(copy_scratch);
+                // Also exclude the destination register — pop must not overwrite
+                // the call result that was moved there.
+                if let Some(rv) = ret {
+                    excluded.insert(rv.index);
+                }
+
+                let mut save_regs: Vec<u32> = caller_saved_set
+                    .intersection(&live_across)
+                    .copied()
+                    .filter(|r| !excluded.contains(r))
+                    .collect();
+                save_regs.sort(); // deterministic order
+
                 let mut new_insts: Vec<MachInst> = Vec::new();
+
+                // 0. Push caller-saved live registers
+                for &reg in &save_regs {
+                    new_insts.push(MachInst::Push {
+                        src: VReg::gp(reg),
+                    });
+                }
 
                 // 1. Build (src_phys, dst_abi) move pairs and resolve in parallel
                 let moves: Vec<(u32, u32)> = args
@@ -974,6 +1154,13 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
                             src: VReg::gp(abi_ret),
                         });
                     }
+                }
+
+                // 5. Pop caller-saved live registers (reverse order)
+                for &reg in save_regs.iter().rev() {
+                    new_insts.push(MachInst::Pop {
+                        dst: VReg::gp(reg),
+                    });
                 }
 
                 let seq_len = new_insts.len();

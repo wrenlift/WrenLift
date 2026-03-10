@@ -1105,7 +1105,19 @@ impl VM {
             roots.push(Value::object(self.fiber as *mut u8));
         }
 
-        // 5. Module variables
+        // 5. JIT roots — values held in native frames invisible to normal root scanning.
+        let jit_roots_start = roots.len();
+        let mut jit_roots = crate::codegen::runtime_fns::take_jit_roots();
+        roots.append(&mut jit_roots);
+        let jit_roots_end = roots.len();
+
+        // 6. JitContext GC-managed pointers (closure, defining_class).
+        let jit_ctx_start = roots.len();
+        let (jit_closure, jit_class) = crate::codegen::runtime_fns::jit_context_roots();
+        roots.push(jit_closure);
+        roots.push(jit_class);
+
+        // 6. Module variables
         let mut module_ranges: Vec<(String, usize, usize)> = Vec::new();
         for (name, entry) in &self.engine.modules {
             let start = roots.len();
@@ -1152,6 +1164,19 @@ impl VM {
                 self.fiber = ptr as *mut ObjFiber;
             }
         }
+
+        // Write back JIT roots (nursery forwarding)
+        if jit_roots_end > jit_roots_start {
+            crate::codegen::runtime_fns::set_jit_roots(
+                roots[jit_roots_start..jit_roots_end].to_vec(),
+            );
+        }
+
+        // Write back JitContext pointers (nursery forwarding)
+        crate::codegen::runtime_fns::update_jit_context_roots(
+            roots[jit_ctx_start],
+            roots[jit_ctx_start + 1],
+        );
 
         // Write back module vars (may contain nursery objects that were promoted)
         for (name, start, end) in &module_ranges {
@@ -1831,6 +1856,14 @@ impl VM {
         }
 
         let saved_fiber = self.fiber;
+        // Root the saved fiber so GC can trace it during re-entrant interpreter
+        // calls (it holds roots from the outer native/interpreter frame).
+        // We can't use fiber.caller because that has semantic meaning (fiber resumption).
+        if !saved_fiber.is_null() {
+            crate::codegen::runtime_fns::push_jit_root(Value::object(
+                saved_fiber as *mut u8,
+            ));
+        }
         self.fiber = temp_fiber;
         let result = super::vm_interp::run_fiber(self);
         self.fiber = saved_fiber;

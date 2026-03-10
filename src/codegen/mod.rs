@@ -1606,6 +1606,8 @@ struct LowerCtx<'a> {
     block_labels: HashMap<BlockId, Label>,
     /// Interner for resolving symbol names (e.g. IsType class names).
     interner: &'a crate::intern::Interner,
+    /// Whether we're currently lowering the entry block (block 0).
+    in_entry_block: bool,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1626,6 +1628,7 @@ impl<'a> LowerCtx<'a> {
             val_map: HashMap::new(),
             block_labels,
             interner,
+            in_entry_block: false,
         }
     }
 
@@ -1662,19 +1665,12 @@ impl<'a> LowerCtx<'a> {
             let label = self.block_labels[&block.id];
             self.mf.emit(MachInst::DefLabel(label));
 
-            // Block parameters are pre-assigned vregs by predecessors.
-            // For the entry block (block 0), emit FuncArg to load from
-            // ABI argument registers so regalloc gives them proper defs.
-            for (i, (val, _ty)) in block.params.iter().enumerate() {
-                let vreg = self.vreg_for(*val);
-                if block_idx == 0 {
-                    self.mf.emit(MachInst::FuncArg {
-                        dst: vreg,
-                        index: i as u32,
-                    });
-                }
+            // Block parameters (SSA phi-joins) — just register their vregs.
+            for (val, _ty) in &block.params {
+                self.vreg_for(*val);
             }
 
+            self.in_entry_block = block_idx == 0;
             let insts: Vec<_> = block.instructions.clone();
             for (val, inst) in &insts {
                 self.lower_inst(*val, inst);
@@ -2661,9 +2657,17 @@ impl<'a> LowerCtx<'a> {
                 }
             }
 
-            // Block parameters are handled at block entry.
-            Instruction::BlockParam(_) => {
-                self.vreg_for(dst_val);
+            // Block parameters: in the entry block, emit FuncArg to load
+            // from ABI argument registers. In other blocks, just register the vreg
+            // (values are bound by predecessor branches).
+            Instruction::BlockParam(idx) => {
+                let vreg = self.vreg_for(dst_val);
+                if self.in_entry_block {
+                    self.mf.emit(MachInst::FuncArg {
+                        dst: vreg,
+                        index: *idx as u32,
+                    });
+                }
             }
 
             // Static fields — lowered as CallRuntime.
