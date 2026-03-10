@@ -1541,10 +1541,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                             let target_fn_ptr = unsafe { (*closure_ptr).function };
                             let target_func_id = FuncId(unsafe { (*target_fn_ptr).fn_id });
-                            let fn_idx = target_func_id.0 as usize;
 
-                            // Tier-up profiling (but always use inline dispatch to
-                            // avoid native stack overflow from recursive constructors).
+                            // Tier-up profiling (but always use interpreter dispatch
+                            // to avoid GC root issues with recursive constructors).
                             if vm.engine.mode != ExecutionMode::Interpreter {
                                 let should_tier_up = vm.engine.record_call(target_func_id);
                                 if should_tier_up {
@@ -1554,7 +1553,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 vm.engine.poll_compilations();
                             }
 
-                            // ── Inline constructor frame push ──
+                            // ── Inline constructor frame push (interpreter path) ──
                             let target_bc_ptr =
                                 vm.engine.ensure_bytecode(target_func_id).ok_or_else(|| {
                                     RuntimeError::Error("invalid ctor func_id".into())
@@ -2151,83 +2150,92 @@ fn dispatch_closure_bc(
         };
 
         if !fn_ptr_raw.is_null() {
-            let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+            // Guard native recursion depth.
+            let jit_depth = crate::codegen::runtime_fns::jit_depth();
+            if jit_depth < crate::codegen::runtime_fns::MAX_JIT_DEPTH {
+                crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+                let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
 
-            if !is_leaf {
-                // Non-leaf: full setup — GC roots + JIT context needed for runtime calls.
-                for &arg in arg_vals {
-                    crate::codegen::runtime_fns::push_jit_root(arg);
+                if !is_leaf {
+                    // Non-leaf: full setup — GC roots + JIT context needed for runtime calls.
+                    for &arg in arg_vals {
+                        crate::codegen::runtime_fns::push_jit_root(arg);
+                    }
+                    let (module_vars_ptr, module_var_count) = vm
+                        .engine
+                        .modules
+                        .get(module_name.as_str())
+                        .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+                        .unwrap_or((std::ptr::null_mut(), 0));
+                    crate::codegen::runtime_fns::set_jit_context(
+                        crate::codegen::runtime_fns::JitContext {
+                            module_vars: module_vars_ptr,
+                            module_var_count,
+                            vm: vm as *mut VM as *mut u8,
+                            module_name: module_name.as_ptr(),
+                            module_name_len: module_name.len() as u32,
+                            closure: closure_ptr as *mut u8,
+                            defining_class: defining_class.unwrap_or(std::ptr::null_mut()) as *mut u8,
+                        },
+                    );
                 }
-                let (module_vars_ptr, module_var_count) = vm
-                    .engine
-                    .modules
-                    .get(module_name.as_str())
-                    .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
-                    .unwrap_or((std::ptr::null_mut(), 0));
-                crate::codegen::runtime_fns::set_jit_context(
-                    crate::codegen::runtime_fns::JitContext {
-                        module_vars: module_vars_ptr,
-                        module_var_count,
-                        vm: vm as *mut VM as *mut u8,
-                        module_name: module_name.as_ptr(),
-                        module_name_len: module_name.len() as u32,
-                        closure: closure_ptr as *mut u8,
-                        defining_class: defining_class.unwrap_or(std::ptr::null_mut()) as *mut u8,
-                    },
-                );
-            }
 
-            // Call native code with args as NaN-boxed u64 values.
-            let result_bits = unsafe {
-                match arg_vals.len() {
-                    0 => {
-                        let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr_raw);
-                        f()
+                // Call native code with args as NaN-boxed u64 values.
+                let result_bits = unsafe {
+                    match arg_vals.len() {
+                        0 => {
+                            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr_raw);
+                            f()
+                        }
+                        1 => {
+                            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr_raw);
+                            f(arg_vals[0].to_bits())
+                        }
+                        2 => {
+                            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr_raw);
+                            f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
+                        }
+                        3 => {
+                            let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                std::mem::transmute(fn_ptr_raw);
+                            f(
+                                arg_vals[0].to_bits(),
+                                arg_vals[1].to_bits(),
+                                arg_vals[2].to_bits(),
+                            )
+                        }
+                        _ => {
+                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                std::mem::transmute(fn_ptr_raw);
+                            f(
+                                arg_vals[0].to_bits(),
+                                arg_vals[1].to_bits(),
+                                arg_vals[2].to_bits(),
+                                arg_vals[3].to_bits(),
+                            )
+                        }
                     }
-                    1 => {
-                        let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr_raw);
-                        f(arg_vals[0].to_bits())
-                    }
-                    2 => {
-                        let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr_raw);
-                        f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
-                    }
-                    3 => {
-                        let f: extern "C" fn(u64, u64, u64) -> u64 =
-                            std::mem::transmute(fn_ptr_raw);
-                        f(
-                            arg_vals[0].to_bits(),
-                            arg_vals[1].to_bits(),
-                            arg_vals[2].to_bits(),
-                        )
-                    }
-                    _ => {
-                        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                            std::mem::transmute(fn_ptr_raw);
-                        f(
-                            arg_vals[0].to_bits(),
-                            arg_vals[1].to_bits(),
-                            arg_vals[2].to_bits(),
-                            arg_vals[3].to_bits(),
-                        )
-                    }
+                };
+
+                // Restore depth counter.
+                crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+
+                if !is_leaf {
+                    crate::codegen::runtime_fns::clear_jit_roots();
                 }
-            };
 
-            if !is_leaf {
-                crate::codegen::runtime_fns::clear_jit_roots();
+                let result_val = Value::from_bits(result_bits);
+                // Store result in caller's return_dst register
+                set_reg(&mut values, return_dst.0 as u16, result_val);
+                // Save caller frame state
+                unsafe {
+                    let frame = (*fiber).mir_frames.last_mut().unwrap();
+                    frame.pc = pc;
+                    frame.values = values;
+                }
+                return Ok(());
             }
-
-            let result_val = Value::from_bits(result_bits);
-            // Store result in caller's return_dst register
-            set_reg(&mut values, return_dst.0 as u16, result_val);
-            // Save caller frame state
-            unsafe {
-                let frame = (*fiber).mir_frames.last_mut().unwrap();
-                frame.pc = pc;
-                frame.values = values;
-            }
-            return Ok(());
+            // Depth exceeded — fall through to interpreter path below.
         }
     }
 

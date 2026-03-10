@@ -76,6 +76,27 @@ thread_local! {
     /// JIT root set — UnsafeCell for zero-overhead Vec mutation.
     /// SAFETY: single-threaded access within each thread (no concurrent borrows).
     static JIT_ROOTS_STORE: std::cell::UnsafeCell<Vec<Value>> = const { std::cell::UnsafeCell::new(Vec::new()) };
+
+    /// JIT native recursion depth — guards against native stack overflow.
+    /// When depth exceeds MAX_JIT_DEPTH, calls fall back to interpreter dispatch.
+    static JIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Maximum native JIT recursion depth before falling back to interpreter.
+/// Each JIT call chain level uses ~1-2KB of native stack.
+/// 256 levels ≈ 256-512KB, well within the default 8MB stack.
+pub const MAX_JIT_DEPTH: u32 = 256;
+
+/// Read the current JIT native recursion depth.
+#[inline(always)]
+pub fn jit_depth() -> u32 {
+    JIT_DEPTH.with(|d| d.get())
+}
+
+/// Set the JIT native recursion depth.
+#[inline(always)]
+pub fn set_jit_depth(depth: u32) {
+    JIT_DEPTH.with(|d| d.set(depth));
 }
 
 /// Set up the JIT context before calling compiled code.
@@ -283,38 +304,47 @@ fn call_closure_jit_or_sync(
             };
 
         if let Some(fn_ptr) = native_fn_ptr {
-            // Native-to-native dispatch: call compiled code directly.
-            let result = unsafe {
-                match args.len() {
-                    0 => {
-                        let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
-                        f()
+            // Guard: check native recursion depth to prevent stack overflow.
+            // Each JIT call level uses ~1-2KB native stack; limit to 256 levels.
+            let depth = JIT_DEPTH.with(|d| d.get());
+            if depth < MAX_JIT_DEPTH {
+                JIT_DEPTH.with(|d| d.set(depth + 1));
+                // Native-to-native dispatch: call compiled code directly.
+                let result = unsafe {
+                    match args.len() {
+                        0 => {
+                            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                            f()
+                        }
+                        1 => {
+                            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                            f(args[0].to_bits())
+                        }
+                        2 => {
+                            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+                            f(args[0].to_bits(), args[1].to_bits())
+                        }
+                        3 => {
+                            let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                std::mem::transmute(fn_ptr);
+                            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+                        }
+                        _ => {
+                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                std::mem::transmute(fn_ptr);
+                            f(
+                                args[0].to_bits(),
+                                args[1].to_bits(),
+                                args[2].to_bits(),
+                                args[3].to_bits(),
+                            )
+                        }
                     }
-                    1 => {
-                        let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-                        f(args[0].to_bits())
-                    }
-                    2 => {
-                        let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-                        f(args[0].to_bits(), args[1].to_bits())
-                    }
-                    3 => {
-                        let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-                        f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
-                    }
-                    _ => {
-                        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                            std::mem::transmute(fn_ptr);
-                        f(
-                            args[0].to_bits(),
-                            args[1].to_bits(),
-                            args[2].to_bits(),
-                            args[3].to_bits(),
-                        )
-                    }
-                }
-            };
-            return result;
+                };
+                JIT_DEPTH.with(|d| d.set(depth));
+                return result;
+            }
+            // depth >= MAX_JIT_DEPTH: fall through to interpreter path.
         }
     }
 

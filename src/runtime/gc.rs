@@ -1365,6 +1365,70 @@ fn fnv1a_hash_bytes(bytes: &[u8]) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// GcAllocator trait implementation
+// ---------------------------------------------------------------------------
+
+impl super::gc_trait::GcAllocator for Gc {
+    fn alloc_string(&mut self, s: String) -> *mut ObjString {
+        self.alloc_string(s)
+    }
+    fn alloc_list(&mut self) -> *mut ObjList {
+        self.alloc_list()
+    }
+    fn alloc_map(&mut self) -> *mut ObjMap {
+        self.alloc_map()
+    }
+    fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange {
+        self.alloc_range(from, to, inclusive)
+    }
+    fn alloc_fn(
+        &mut self,
+        name: SymbolId,
+        arity: u8,
+        upvalue_count: u16,
+        fn_id: u32,
+    ) -> *mut ObjFn {
+        self.alloc_fn(name, arity, upvalue_count, fn_id)
+    }
+    fn alloc_closure(&mut self, function: *mut ObjFn) -> *mut ObjClosure {
+        self.alloc_closure(function)
+    }
+    fn alloc_upvalue(&mut self, location: *mut Value) -> *mut ObjUpvalue {
+        self.alloc_upvalue(location)
+    }
+    fn alloc_fiber(&mut self) -> *mut ObjFiber {
+        self.alloc_fiber()
+    }
+    fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
+        self.alloc_class(name, superclass)
+    }
+    fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
+        self.alloc_instance(class)
+    }
+    fn alloc_foreign(&mut self, data: Vec<u8>) -> *mut ObjForeign {
+        self.alloc_foreign(data)
+    }
+    fn alloc_module(&mut self, name: SymbolId) -> *mut ObjModule {
+        self.alloc_module(name)
+    }
+    fn intern_string(&mut self, s: String) -> *mut ObjString {
+        self.intern_string(s)
+    }
+    fn write_barrier(&mut self, source: *mut ObjHeader, value: Value) {
+        self.write_barrier(source, value)
+    }
+    fn collect(&mut self, roots: &mut [Value]) {
+        self.collect(roots)
+    }
+    fn should_collect(&self) -> bool {
+        self.should_collect()
+    }
+    fn stats(&self) -> &GcStats {
+        &self.stats
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

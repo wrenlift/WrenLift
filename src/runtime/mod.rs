@@ -2,6 +2,8 @@ pub mod core;
 pub mod engine;
 pub mod fiber;
 pub mod gc;
+pub mod gc_arena;
+pub mod gc_trait;
 pub mod object;
 pub mod object_layout;
 pub mod value;
