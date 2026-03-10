@@ -168,7 +168,11 @@ fn set_reg(values: &mut Vec<InterpValue>, idx: u16, val: InterpValue) {
 #[inline(always)]
 fn read_u16_at(code: &[u8], offset: u32) -> u16 {
     let i = offset as usize;
-    u16::from_le_bytes([code[i], code[i + 1]])
+    unsafe {
+        let lo = *code.get_unchecked(i);
+        let hi = *code.get_unchecked(i + 1);
+        u16::from_le_bytes([lo, hi])
+    }
 }
 
 /// Build a SmallVec of arg values from bytecode arg register indices.
@@ -914,13 +918,6 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let arg_regs_pc = pc;
                     pc += (argc as u32) * 2;
 
-                    // Save pc before any call dispatch (for error reporting)
-                    unsafe {
-                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
-                            frame.pc = pc;
-                        }
-                    }
-
                     // ── IC fast path: monomorphic inline cache ──────────────
                     // After warmup, each call site caches (class, jit_ptr).
                     // On hit: single class compare → direct native call.
@@ -986,6 +983,13 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 steps += 1;
                                 continue;
                             }
+                        }
+                    }
+
+                    // Save pc before slow-path dispatch (for error reporting / frame push)
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            frame.pc = pc;
                         }
                     }
 

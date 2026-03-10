@@ -821,10 +821,16 @@ pub fn u8_to_math_binary(v: u8) -> MathBinaryOp {
 // ---------------------------------------------------------------------------
 
 /// Read a little-endian u16 from `code` at `pc` and advance `pc`.
+/// SAFETY: caller must ensure `pc + 1 < code.len()`. All bytecode is
+/// produced by our encoder and validated, so bounds checks are redundant.
 #[inline(always)]
 pub fn read_u16(code: &[u8], pc: &mut u32) -> u16 {
     let i = *pc as usize;
-    let v = u16::from_le_bytes([code[i], code[i + 1]]);
+    let v = unsafe {
+        let lo = *code.get_unchecked(i);
+        let hi = *code.get_unchecked(i + 1);
+        u16::from_le_bytes([lo, hi])
+    };
     *pc += 2;
     v
 }
@@ -833,7 +839,14 @@ pub fn read_u16(code: &[u8], pc: &mut u32) -> u16 {
 #[inline(always)]
 pub fn read_u32(code: &[u8], pc: &mut u32) -> u32 {
     let i = *pc as usize;
-    let v = u32::from_le_bytes([code[i], code[i + 1], code[i + 2], code[i + 3]]);
+    let v = unsafe {
+        u32::from_le_bytes([
+            *code.get_unchecked(i),
+            *code.get_unchecked(i + 1),
+            *code.get_unchecked(i + 2),
+            *code.get_unchecked(i + 3),
+        ])
+    };
     *pc += 4;
     v
 }
