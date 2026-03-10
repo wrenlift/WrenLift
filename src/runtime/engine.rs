@@ -386,8 +386,24 @@ impl ExecutionEngine {
         match crate::codegen::compile_function_with_interner(&mir, target, interner) {
             Ok(compiled) => match compiled.into_executable() {
                 Ok(executable) => {
-                    self.functions[id.0 as usize] =
+                    let idx = id.0 as usize;
+                    // Cache native code pointer for O(1) dispatch
+                    let native_ptr = if executable.is_native() {
+                        executable.native_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
+                    self.functions[idx] =
                         FuncBody::Compiled { executable, mir, bytecode };
+                    // Update jit_code/jit_leaf arrays
+                    if idx >= self.jit_code.len() {
+                        self.jit_code.resize(idx + 1, std::ptr::null());
+                        self.jit_leaf.resize(idx + 1, false);
+                    }
+                    self.jit_code[idx] = native_ptr;
+                    if let Some(body) = self.functions.get(idx) {
+                        self.jit_leaf[idx] = is_mir_leaf(body.mir());
+                    }
                     true
                 }
                 Err(_) => false,
