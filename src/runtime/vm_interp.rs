@@ -358,6 +358,15 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
         let bc = unsafe { &*bc_ptr };
         let code = &bc.code;
 
+        // Cache raw pointer to module vars — eliminates HashMap lookup per
+        // GetModuleVar/SetModuleVar (was 42% of runtime in method_call).
+        let module_vars_ptr: *mut Vec<Value> = vm
+            .engine
+            .modules
+            .get_mut(module_name.as_str())
+            .map(|m| &mut m.vars as *mut Vec<Value>)
+            .unwrap_or(std::ptr::null_mut());
+
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
             // GC safepoint: check every 4096 instructions
@@ -447,12 +456,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 Op::GetModuleVar => {
                     let dst = read_u16(code, &mut pc);
                     let slot = read_u16(code, &mut pc) as usize;
-                    let val = vm
-                        .engine
-                        .modules
-                        .get(module_name.as_str())
-                        .and_then(|m| m.vars.get(slot).copied())
-                        .unwrap_or(Value::null());
+                    let val = if !module_vars_ptr.is_null() {
+                        let vars = unsafe { &*module_vars_ptr };
+                        vars.get(slot).copied().unwrap_or(Value::null())
+                    } else {
+                        Value::null()
+                    };
                     set_reg(&mut values, dst, InterpValue::Boxed(val));
                 }
                 Op::SetModuleVar => {
@@ -460,11 +469,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let val_reg = read_u16(code, &mut pc);
                     let slot = read_u16(code, &mut pc) as usize;
                     let v = get_reg_val(&values, val_reg);
-                    if let Some(entry) = vm.engine.modules.get_mut(module_name.as_str()) {
-                        while entry.vars.len() <= slot {
-                            entry.vars.push(Value::null());
+                    if !module_vars_ptr.is_null() {
+                        let vars = unsafe { &mut *module_vars_ptr };
+                        while vars.len() <= slot {
+                            vars.push(Value::null());
                         }
-                        entry.vars[slot] = v;
+                        vars[slot] = v;
                     }
                     set_reg(&mut values, dst, InterpValue::Boxed(v));
                 }
