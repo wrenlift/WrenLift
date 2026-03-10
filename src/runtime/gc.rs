@@ -23,6 +23,7 @@ const GEN_OLD: u8 = 1;
 const WHITE: u8 = 0;
 const GRAY: u8 = 1;
 const BLACK: u8 = 2;
+const FORWARDED: u8 = 3;
 
 // ---------------------------------------------------------------------------
 // Nursery — bump-allocated arena
@@ -107,7 +108,7 @@ pub struct GcConfig {
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
-            nursery_size: 256 * 1024, // 256 KB
+            nursery_size: 4 * 1024 * 1024, // 4 MB
             initial_threshold: 256,
             heap_grow_factor: 2.0,
             major_gc_interval: 8,
@@ -129,6 +130,8 @@ pub struct GcStats {
     pub objects_freed: usize,
     pub objects_promoted: usize,
     pub peak_objects: usize,
+    /// Total time spent in GC (nanoseconds).
+    pub gc_time_ns: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,8 +201,137 @@ impl Gc {
     }
 
     pub fn should_collect(&self) -> bool {
-        // Trigger when nursery is 75%+ full or old gen threshold exceeded.
         self.nursery.used() > self.nursery.capacity() * 3 / 4 || self.old_count >= self.gc_threshold
+    }
+
+    /// Debug: validate that every old→young reference has a corresponding
+    /// remembered set entry. Panics on first missing write barrier.
+    #[cfg(debug_assertions)]
+    pub fn validate_write_barriers(&self) {
+        use std::collections::HashSet;
+        let remembered: HashSet<usize> =
+            self.remembered_set.iter().map(|&p| p as usize).collect();
+        let mut current = self.old_objects;
+        while !current.is_null() {
+            unsafe {
+                self.check_old_obj_barriers(current, &remembered);
+                current = (*current).next;
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    unsafe fn check_old_obj_barriers(
+        &self,
+        header: *mut ObjHeader,
+        remembered: &std::collections::HashSet<usize>,
+    ) {
+        let check_val = |val: Value, desc: &str| {
+            if let Some(ptr) = val.as_object() {
+                let target = ptr as *mut ObjHeader;
+                if !target.is_null() && (*target).generation == GEN_YOUNG {
+                    if !remembered.contains(&(header as usize)) {
+                        panic!(
+                            "WRITE BARRIER BUG: old {:?} ({:?}) → young {:?}, not in remembered set. desc: {}",
+                            header, (*header).obj_type, target, desc
+                        );
+                    }
+                }
+            }
+        };
+        let check_raw = |ptr: *const u8, desc: &str| {
+            if !ptr.is_null() && self.nursery.contains(ptr) {
+                let target = ptr as *mut ObjHeader;
+                if (*target).generation == GEN_YOUNG {
+                    if !remembered.contains(&(header as usize)) {
+                        panic!(
+                            "WRITE BARRIER BUG: old {:?} ({:?}) → young raw {:?}, not in remembered set. desc: {}",
+                            header, (*header).obj_type, ptr, desc
+                        );
+                    }
+                }
+            }
+        };
+
+        check_raw((*header).class as *const u8, "header.class");
+
+        match (*header).obj_type {
+            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+            ObjType::List => {
+                let list = &*(header as *mut ObjList);
+                for (i, &val) in list.as_slice().iter().enumerate() {
+                    check_val(val, &format!("list[{}]", i));
+                }
+            }
+            ObjType::Map => {
+                let map = &*(header as *mut ObjMap);
+                for (key, &val) in &map.entries {
+                    check_val(key.value(), "map key");
+                    check_val(val, "map val");
+                }
+            }
+            ObjType::Closure => {
+                let closure = &*(header as *mut ObjClosure);
+                check_raw(closure.function as *const u8, "closure.function");
+                for (i, &uv) in closure.upvalues.iter().enumerate() {
+                    check_raw(uv as *const u8, &format!("closure.upvalue[{}]", i));
+                }
+            }
+            ObjType::Upvalue => {
+                let uv = &*(header as *mut ObjUpvalue);
+                check_val(uv.closed, "upvalue.closed");
+            }
+            ObjType::Fiber => {
+                let fiber = &*(header as *mut ObjFiber);
+                for (i, &val) in fiber.stack.iter().enumerate() {
+                    check_val(val, &format!("fiber.stack[{}]", i));
+                }
+                for (fi, frame) in fiber.mir_frames.iter().enumerate() {
+                    for (vi, &val) in frame.values.iter().enumerate() {
+                        check_val(val, &format!("fiber.frame[{}].values[{}]", fi, vi));
+                    }
+                    if let Some(c) = frame.closure {
+                        check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
+                    }
+                    if let Some(c) = frame.defining_class {
+                        check_raw(c as *const u8, &format!("fiber.frame[{}].defining_class", fi));
+                    }
+                }
+                check_raw(fiber.caller as *const u8, "fiber.caller");
+                check_val(fiber.error, "fiber.error");
+            }
+            ObjType::Class => {
+                let class = &*(header as *mut ObjClass);
+                check_raw(class.superclass as *const u8, "class.superclass");
+                for (i, method) in class.methods.iter().enumerate() {
+                    if let Some(m) = method {
+                        match m {
+                            Method::Closure(ptr) | Method::Constructor(ptr) => {
+                                check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
+                            }
+                            Method::Native(_) => {}
+                        }
+                    }
+                }
+                for &val in class.static_fields.values() {
+                    check_val(val, "class.static_field");
+                }
+            }
+            ObjType::Instance => {
+                let inst = &*(header as *mut ObjInstance);
+                if !inst.fields.is_null() {
+                    for i in 0..inst.num_fields as usize {
+                        check_val(*inst.fields.add(i), &format!("instance.field[{}]", i));
+                    }
+                }
+            }
+            ObjType::Module => {
+                let module = &*(header as *mut ObjModule);
+                for (i, &val) in module.variables.iter().enumerate() {
+                    check_val(val, &format!("module.var[{}]", i));
+                }
+            }
+        }
     }
 
     pub fn nursery_used(&self) -> usize {
@@ -355,11 +487,13 @@ impl Gc {
 
     /// Auto-select minor or major GC based on interval.
     pub fn collect(&mut self, roots: &mut [Value]) {
+        let start = std::time::Instant::now();
         if self.minor_since_major >= self.config.major_gc_interval {
             self.collect_major(roots);
         } else {
             self.collect_minor(roots);
         }
+        self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
     }
 
     /// Minor GC: mark from roots, promote live nursery objects to old gen,
@@ -385,16 +519,17 @@ impl Gc {
 
         process_gray_stack(&mut gray_stack);
 
-        // 2. Promote live nursery objects, drop dead ones, build forwarding table.
-        let forwards = self.process_nursery();
+        // 2. Promote live nursery objects, drop dead ones.
+        //    Forwarding pointers are stored inline in nursery headers (gc_mark=FORWARDED).
+        let has_promoted = self.process_nursery();
 
         // 3. Update all pointers to forwarded addresses.
-        if !forwards.is_empty() {
-            update_roots(roots, &forwards);
+        if has_promoted {
+            update_roots_inline(roots, &self.nursery);
             unsafe {
-                self.update_old_gen_pointers(&forwards);
+                self.update_old_gen_pointers_inline();
             }
-            self.update_intern_table(&forwards);
+            self.update_intern_table_inline();
         }
 
         // 4. Reset nursery arena.
@@ -426,14 +561,21 @@ impl Gc {
         process_gray_stack(&mut gray_stack);
 
         // 2. Promote live nursery objects, drop dead ones.
-        let forwards = self.process_nursery();
-        if !forwards.is_empty() {
-            update_roots(roots, &forwards);
+        //    Forwarding pointers stored inline in nursery headers (gc_mark=FORWARDED).
+        let has_promoted = self.process_nursery();
+        if has_promoted {
+            update_roots_inline(roots, &self.nursery);
             unsafe {
-                self.update_old_gen_pointers(&forwards);
+                self.update_old_gen_pointers_inline();
             }
-            self.update_intern_table(&forwards);
+            self.update_intern_table_inline();
         }
+
+        #[cfg(debug_assertions)]
+        unsafe {
+            self.validate_no_nursery_ptrs_inline(roots);
+        }
+
         self.nursery.reset();
 
         // 3. Sweep dead old-gen objects. Promoted objects have gc_mark=BLACK,
@@ -453,16 +595,20 @@ impl Gc {
 
     // -- Process nursery (promote / drop) -----------------------------------
 
-    fn process_nursery(&mut self) -> HashMap<usize, *mut ObjHeader> {
-        let mut forwards: HashMap<usize, *mut ObjHeader> = HashMap::new();
+    fn process_nursery(&mut self) -> bool {
         let nursery_objects = std::mem::take(&mut self.nursery_objects);
+        let mut has_promoted = false;
 
         for &obj in &nursery_objects {
             unsafe {
                 if (*obj).gc_mark != WHITE {
                     // Live → promote to old gen.
                     let new_ptr = self.promote_object(obj);
-                    forwards.insert(obj as usize, new_ptr);
+                    // Store forwarding pointer in old nursery location's `next` field.
+                    // The nursery bytes still exist (not overwritten until reset).
+                    (*obj).gc_mark = FORWARDED;
+                    (*obj).next = new_ptr;
+                    has_promoted = true;
                     self.stats.objects_promoted += 1;
                 } else {
                     // Dead → remove from intern table, drop owned Rust types.
@@ -475,7 +621,7 @@ impl Gc {
             }
         }
 
-        forwards
+        has_promoted
     }
 
     /// Promote a nursery object to old gen: ptr::read from arena → Box on heap.
@@ -560,6 +706,128 @@ impl Gc {
         }
     }
 
+    /// Debug: validate no old-gen object or root references a nursery address.
+    #[cfg(debug_assertions)]
+    unsafe fn validate_no_nursery_ptrs_inline(&self, roots: &[Value]) {
+        for (i, val) in roots.iter().enumerate() {
+            if let Some(ptr) = val.as_object() {
+                if self.nursery.contains(ptr) {
+                    panic!(
+                        "GC BUG: root[{}] contains stale nursery ptr {:?}",
+                        i, ptr
+                    );
+                }
+            }
+        }
+        let mut current = self.old_objects;
+        while !current.is_null() {
+            self.validate_object_no_nursery_inline(current);
+            current = (*current).next;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    unsafe fn validate_object_no_nursery_inline(&self, header: *mut ObjHeader) {
+        let check_val = |val: Value, desc: &str| {
+            if let Some(ptr) = val.as_object() {
+                if self.nursery.contains(ptr) {
+                    panic!(
+                        "GC BUG: {:?} ({:?}) contains stale nursery ptr {:?}, desc: {}",
+                        header, (*header).obj_type, ptr, desc
+                    );
+                }
+            }
+        };
+        let check_raw = |ptr: *const u8, desc: &str| {
+            if !ptr.is_null() && self.nursery.contains(ptr) {
+                panic!(
+                    "GC BUG: {:?} ({:?}) contains stale nursery raw ptr {:?}, desc: {}",
+                    header, (*header).obj_type, ptr, desc
+                );
+            }
+        };
+
+        check_raw((*header).class as *const u8, "header.class");
+
+        match (*header).obj_type {
+            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+            ObjType::List => {
+                let list = &*(header as *mut ObjList);
+                for (i, &val) in list.as_slice().iter().enumerate() {
+                    check_val(val, &format!("list[{}]", i));
+                }
+            }
+            ObjType::Map => {
+                let map = &*(header as *mut ObjMap);
+                for (key, &val) in &map.entries {
+                    check_val(key.value(), "map key");
+                    check_val(val, "map val");
+                }
+            }
+            ObjType::Closure => {
+                let closure = &*(header as *mut ObjClosure);
+                check_raw(closure.function as *const u8, "closure.function");
+                for (i, &uv) in closure.upvalues.iter().enumerate() {
+                    check_raw(uv as *const u8, &format!("closure.upvalue[{}]", i));
+                }
+            }
+            ObjType::Upvalue => {
+                let uv = &*(header as *mut ObjUpvalue);
+                check_val(uv.closed, "upvalue.closed");
+            }
+            ObjType::Fiber => {
+                let fiber = &*(header as *mut ObjFiber);
+                for (i, &val) in fiber.stack.iter().enumerate() {
+                    check_val(val, &format!("fiber.stack[{}]", i));
+                }
+                for (fi, frame) in fiber.mir_frames.iter().enumerate() {
+                    for (vi, &val) in frame.values.iter().enumerate() {
+                        check_val(val, &format!("fiber.frame[{}].values[{}]", fi, vi));
+                    }
+                    if let Some(c) = frame.closure {
+                        check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
+                    }
+                    if let Some(c) = frame.defining_class {
+                        check_raw(c as *const u8, &format!("fiber.frame[{}].defining_class", fi));
+                    }
+                }
+                check_raw(fiber.caller as *const u8, "fiber.caller");
+                check_val(fiber.error, "fiber.error");
+            }
+            ObjType::Class => {
+                let class = &*(header as *mut ObjClass);
+                check_raw(class.superclass as *const u8, "class.superclass");
+                for (i, method) in class.methods.iter().enumerate() {
+                    if let Some(m) = method {
+                        match m {
+                            Method::Closure(ptr) | Method::Constructor(ptr) => {
+                                check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
+                            }
+                            Method::Native(_) => {}
+                        }
+                    }
+                }
+                for &val in class.static_fields.values() {
+                    check_val(val, "class.static_field");
+                }
+            }
+            ObjType::Instance => {
+                let inst = &*(header as *mut ObjInstance);
+                if !inst.fields.is_null() {
+                    for i in 0..inst.num_fields as usize {
+                        check_val(*inst.fields.add(i), &format!("instance.field[{}]", i));
+                    }
+                }
+            }
+            ObjType::Module => {
+                let module = &*(header as *mut ObjModule);
+                for (i, &val) in module.variables.iter().enumerate() {
+                    check_val(val, &format!("module.var[{}]", i));
+                }
+            }
+        }
+    }
+
     /// Reset marks on all old objects (after minor GC where no old sweep runs).
     unsafe fn reset_old_marks(&self) {
         let mut current = self.old_objects;
@@ -569,21 +837,26 @@ impl Gc {
         }
     }
 
-    // -- Pointer forwarding (update after promotion) ------------------------
+    // -- Inline forwarding (no HashMap) -------------------------------------
 
-    unsafe fn update_old_gen_pointers(&self, forwards: &HashMap<usize, *mut ObjHeader>) {
+    unsafe fn update_old_gen_pointers_inline(&self) {
         let mut current = self.old_objects;
         while !current.is_null() {
-            update_pointers_in_object(current, forwards);
+            update_pointers_in_object_inline(current, &self.nursery);
             current = (*current).next;
         }
     }
 
-    fn update_intern_table(&mut self, forwards: &HashMap<usize, *mut ObjHeader>) {
+    fn update_intern_table_inline(&mut self) {
         for ptrs in self.intern_table.values_mut() {
             for ptr in ptrs.iter_mut() {
-                if let Some(&new_hdr) = forwards.get(&(*ptr as usize)) {
-                    *ptr = new_hdr as *mut ObjString;
+                let hdr = *ptr as *mut ObjHeader;
+                unsafe {
+                    if self.nursery.contains(hdr as *const u8)
+                        && (*hdr).gc_mark == FORWARDED
+                    {
+                        *ptr = (*hdr).next as *mut ObjString;
+                    }
                 }
             }
         }
@@ -783,32 +1056,49 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
 // Pointer forwarding helpers
 // ---------------------------------------------------------------------------
 
-fn update_roots(roots: &mut [Value], forwards: &HashMap<usize, *mut ObjHeader>) {
+
+// ---------------------------------------------------------------------------
+// Inline forwarding helpers (read forwarding ptr from nursery header)
+// ---------------------------------------------------------------------------
+
+/// Update roots by reading forwarding pointers directly from nursery headers.
+fn update_roots_inline(roots: &mut [Value], nursery: &Nursery) {
     for val in roots.iter_mut() {
-        update_value(val, forwards);
+        update_value_inline(val, nursery);
     }
 }
 
-fn update_value(val: &mut Value, forwards: &HashMap<usize, *mut ObjHeader>) {
+fn update_value_inline(val: &mut Value, nursery: &Nursery) {
     if val.is_object() {
         if let Some(ptr) = val.as_object() {
-            if let Some(&new_ptr) = forwards.get(&(ptr as usize)) {
-                *val = Value::object(new_ptr as *mut u8);
+            if nursery.contains(ptr) {
+                let header = ptr as *mut ObjHeader;
+                unsafe {
+                    if (*header).gc_mark == FORWARDED {
+                        *val = Value::object((*header).next as *mut u8);
+                    }
+                }
             }
         }
     }
 }
 
-/// Update all object-reference fields inside a single object.
-unsafe fn update_pointers_in_object(
-    header: *mut ObjHeader,
-    forwards: &HashMap<usize, *mut ObjHeader>,
-) {
+fn update_raw_ptr_inline<T>(ptr: &mut *mut T, nursery: &Nursery) {
+    if !ptr.is_null() && nursery.contains(*ptr as *const u8) {
+        let header = *ptr as *mut ObjHeader;
+        unsafe {
+            if (*header).gc_mark == FORWARDED {
+                *ptr = (*header).next as *mut T;
+            }
+        }
+    }
+}
+
+/// Update all object-reference fields inside a single object using inline forwarding.
+unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nursery) {
     // Update class pointer.
     if !(*header).class.is_null() {
-        if let Some(&new_ptr) = forwards.get(&((*header).class as usize)) {
-            (*header).class = new_ptr as *mut ObjClass;
-        }
+        update_raw_ptr_inline(&mut (*header).class, nursery);
     }
 
     match (*header).obj_type {
@@ -817,74 +1107,71 @@ unsafe fn update_pointers_in_object(
         ObjType::List => {
             let list = &mut *(header as *mut ObjList);
             for val in list.as_mut_slice() {
-                update_value(val, forwards);
+                update_value_inline(val, nursery);
             }
         }
 
         ObjType::Map => {
             let map = &mut *(header as *mut ObjMap);
-            // Must drain+reinsert: key hashes change when object ptrs change.
             let entries: Vec<(MapKey, Value)> = map.entries.drain().collect();
             for (key, val) in entries {
                 let mut k = key.value();
                 let mut v = val;
-                update_value(&mut k, forwards);
-                update_value(&mut v, forwards);
+                update_value_inline(&mut k, nursery);
+                update_value_inline(&mut v, nursery);
                 map.entries.insert(MapKey::new(k), v);
             }
         }
 
         ObjType::Closure => {
             let closure = &mut *(header as *mut ObjClosure);
-            update_raw_ptr(&mut closure.function, forwards);
+            update_raw_ptr_inline(&mut closure.function, nursery);
             for uv in &mut closure.upvalues {
-                update_raw_ptr(uv, forwards);
+                update_raw_ptr_inline(uv, nursery);
             }
         }
 
         ObjType::Upvalue => {
             let uv = &mut *(header as *mut ObjUpvalue);
-            update_value(&mut uv.closed, forwards);
-            // location: either stack slot (not in nursery) or already fixed in promote_object.
+            update_value_inline(&mut uv.closed, nursery);
         }
 
         ObjType::Fiber => {
             let fiber = &mut *(header as *mut ObjFiber);
             for val in &mut fiber.stack {
-                update_value(val, forwards);
+                update_value_inline(val, nursery);
             }
             for frame in &mut fiber.frames {
-                update_raw_ptr(&mut frame.closure, forwards);
+                update_raw_ptr_inline(&mut frame.closure, nursery);
             }
-            // Update MIR interpreter frames.
             for frame in &mut fiber.mir_frames {
                 for val in frame.values.iter_mut() {
-                    update_value(val, forwards);
+                    update_value_inline(val, nursery);
                 }
                 if let Some(ref mut closure) = frame.closure {
-                    update_raw_ptr(closure, forwards);
+                    update_raw_ptr_inline(closure, nursery);
                 }
                 if let Some(ref mut class) = frame.defining_class {
-                    update_raw_ptr(class, forwards);
+                    update_raw_ptr_inline(class, nursery);
                 }
             }
-            update_raw_ptr(&mut fiber.caller, forwards);
-            update_value(&mut fiber.error, forwards);
+            update_raw_ptr_inline(&mut fiber.caller, nursery);
+            update_value_inline(&mut fiber.error, nursery);
         }
 
         ObjType::Class => {
             let class = &mut *(header as *mut ObjClass);
-            update_raw_ptr(&mut class.superclass, forwards);
+            update_raw_ptr_inline(&mut class.superclass, nursery);
             for method in class.methods.iter_mut().flatten() {
                 match method {
                     Method::Closure(ref mut ptr) | Method::Constructor(ref mut ptr) => {
-                        update_raw_ptr(ptr, forwards);
+                        update_raw_ptr_inline(ptr, nursery);
                     }
                     Method::Native(_) => {}
                 }
             }
             for val in class.static_fields.values_mut() {
-                update_value(val, forwards);
+                update_value_inline(val, nursery);
             }
         }
 
@@ -893,7 +1180,7 @@ unsafe fn update_pointers_in_object(
             if !inst.fields.is_null() {
                 for i in 0..inst.num_fields as usize {
                     let val_ptr = inst.fields.add(i);
-                    update_value(&mut *val_ptr, forwards);
+                    update_value_inline(&mut *val_ptr, nursery);
                 }
             }
         }
@@ -901,16 +1188,8 @@ unsafe fn update_pointers_in_object(
         ObjType::Module => {
             let module = &mut *(header as *mut ObjModule);
             for val in &mut module.variables {
-                update_value(val, forwards);
+                update_value_inline(val, nursery);
             }
-        }
-    }
-}
-
-fn update_raw_ptr<T>(ptr: &mut *mut T, forwards: &HashMap<usize, *mut ObjHeader>) {
-    if !ptr.is_null() {
-        if let Some(&new_ptr) = forwards.get(&(*ptr as usize)) {
-            *ptr = new_ptr as *mut T;
         }
     }
 }

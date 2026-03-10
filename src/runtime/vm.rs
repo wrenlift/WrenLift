@@ -78,7 +78,9 @@ pub struct VMConfig {
     /// Enable fiber stack trace tracking (opt-in, not standard Wren behavior).
     /// When enabled, cross-fiber stack traces include spawn sites and caller chains.
     pub fiber_stack_traces: bool,
-    /// Maximum number of interpreter steps before aborting (default: 100M).
+    /// Maximum interpreter steps before aborting (default: 1B).
+    /// In tiered/JIT mode, JIT-compiled code doesn't count steps so a
+    /// higher limit (10B) is recommended for long-running programs.
     pub step_limit: usize,
     /// Maximum call frame depth before aborting (default: 1024).
     pub max_call_depth: usize,
@@ -99,7 +101,7 @@ impl Default for VMConfig {
             execution_mode: ExecutionMode::default(),
             jit_threshold: 100,
             fiber_stack_traces: false,
-            step_limit: 100_000_000,
+            step_limit: 1_000_000_000,
             max_call_depth: 1024,
         }
     }
@@ -601,6 +603,10 @@ impl VM {
 
         // 10. Run the fiber
         let result = super::vm_interp::run_fiber(self);
+
+        // Reload fiber pointer: GC may have promoted/moved it during run_fiber.
+        // The local `fiber` from before run_fiber is potentially stale.
+        let fiber = self.fiber;
 
         let interpret_result = match result {
             Ok(_) => {

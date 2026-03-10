@@ -11,6 +11,8 @@ RUNS=${BENCH_RUNS:-5}
 WLIFT="./target/release/wlift"
 WREN="${WREN_CLI:-wren_cli}"
 TIMEOUT_SEC=${BENCH_TIMEOUT:-60}
+WLIFT_STEP_LIMIT=${BENCH_STEP_LIMIT:-10000000000}
+WLIFT_MODE=${BENCH_MODE:-tiered}
 
 # Colors
 BOLD="\033[1m"
@@ -49,13 +51,13 @@ extract_time() {
 # Run a single benchmark N times, return best time
 # Handles crashes (exit code 139), compile errors (65), runtime errors (70), timeouts
 run_bench() {
-  local cmd="$1"
-  local script="$2"
+  local script="$1"
+  shift
   local best=""
 
   for ((i = 1; i <= RUNS; i++)); do
     local output exit_code
-    output=$(timeout "$TIMEOUT_SEC" "$cmd" "$script" 2>/dev/null) && exit_code=$? || exit_code=$?
+    output=$(timeout "$TIMEOUT_SEC" "$@" "$script" 2>/dev/null) && exit_code=$? || exit_code=$?
 
     if [[ $exit_code -eq 139 ]]; then
       echo "CRASH"
@@ -123,11 +125,11 @@ for bench in "${BENCHMARKS[@]}"; do
   printf "${DIM}Running %-14s (%d runs each)...${RESET}\r" "$bench" "$RUNS"
 
   # WrenLift
-  wlift_time=$(run_bench "$WLIFT" "$script")
+  wlift_time=$(run_bench "$script" "$WLIFT" --mode "$WLIFT_MODE" --step-limit "$WLIFT_STEP_LIMIT")
 
   if $HAS_WREN; then
     # Standard Wren
-    wren_time=$(run_bench "$WREN" "$script")
+    wren_time=$(run_bench "$script" "$WREN")
 
     # Calculate ratio
     printf "%-20s " "$bench"

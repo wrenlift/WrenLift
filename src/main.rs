@@ -64,6 +64,11 @@ struct Cli {
     /// Print GC statistics after execution.
     #[arg(long)]
     gc_stats: bool,
+
+    /// Maximum interpreter steps before aborting.
+    /// Defaults to 1B (interpreter) or 10B (tiered/jit).
+    #[arg(long)]
+    step_limit: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -97,8 +102,14 @@ impl From<Mode> for ExecutionMode {
 // ---------------------------------------------------------------------------
 
 fn make_vm(cli: &Cli) -> VM {
+    let mode = cli.mode.into();
+    let step_limit = cli.step_limit.unwrap_or(match mode {
+        ExecutionMode::Interpreter => 1_000_000_000,
+        _ => 10_000_000_000, // tiered/jit: 10x headroom since JIT code doesn't count steps
+    });
     let config = VMConfig {
-        execution_mode: cli.mode.into(),
+        execution_mode: mode,
+        step_limit,
         ..VMConfig::default()
     };
     VM::new(config)
@@ -180,6 +191,20 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         InterpretResult::RuntimeError => {
             process::exit(70);
         }
+    }
+
+    if cli.gc_stats {
+        let stats = &vm.gc.stats;
+        eprintln!("--- GC Stats ---");
+        eprintln!("  minor collections: {}", stats.minor_collections);
+        eprintln!("  major collections: {}", stats.major_collections);
+        eprintln!("  objects allocated:  {}", stats.objects_allocated);
+        eprintln!("  objects freed:      {}", stats.objects_freed);
+        eprintln!("  objects promoted:   {}", stats.objects_promoted);
+        eprintln!("  peak objects:       {}", stats.peak_objects);
+        eprintln!("  total allocated:    {} KB", stats.total_allocated / 1024);
+        eprintln!("  total freed:        {} KB", stats.total_freed / 1024);
+        eprintln!("  gc time:            {:.3}s", stats.gc_time_ns as f64 / 1e9);
     }
 }
 

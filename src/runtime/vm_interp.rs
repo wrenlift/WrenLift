@@ -93,6 +93,14 @@ impl MethodCache {
             defining_class,
         });
     }
+
+    /// Invalidate all cache entries. Must be called after GC since
+    /// nursery promotion can relocate ObjClass/ObjClosure pointers.
+    pub fn invalidate(&mut self) {
+        for entry in &mut self.entries {
+            *entry = None;
+        }
+    }
 }
 
 /// Sentinel value for uninitialized register slots.
@@ -426,6 +434,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                     }
                     vm.collect_garbage();
+                    vm.method_cache.invalidate();
                     vm.engine.poll_compilations();
                     fiber = vm.fiber;
                     unsafe {
@@ -550,7 +559,10 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     if let Some(closure_ptr) = frame_closure {
                         let upvalues = unsafe { &mut (*closure_ptr).upvalues };
                         if idx < upvalues.len() {
-                            unsafe { (*upvalues[idx]).set(v) };
+                            let uv_ptr = upvalues[idx];
+                            unsafe { (*uv_ptr).set(v) };
+                            vm.gc
+                                .write_barrier(uv_ptr as *mut ObjHeader, v);
                         }
                     }
                     set_reg(&mut values, dst, v);
@@ -602,6 +614,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         unsafe {
                             (*class_ptr).static_fields.insert(sym, v);
                         }
+                        vm.gc
+                            .write_barrier(class_ptr as *mut ObjHeader, v);
                     }
                     set_reg(&mut values, dst, v);
                 }
@@ -787,6 +801,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     if let Some(ptr) = recv.as_object() {
                         let inst = ptr as *mut ObjInstance;
                         unsafe { (*inst).set_field(field_idx, val) };
+                        // Write barrier: if old-gen instance stores a young pointer,
+                        // add to remembered set so GC can find it during minor collection.
+                        vm.gc.write_barrier(ptr as *mut ObjHeader, val);
                     }
                     set_reg(&mut values, dst, val);
                 }
@@ -1516,20 +1533,97 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let recv_class = recv_val.as_object().unwrap() as *mut ObjClass;
                             let instance = vm.gc.alloc_instance(recv_class);
                             let instance_val = Value::object(instance as *mut u8);
-                            let mut ctor_args = arg_vals.clone();
-                            ctor_args[0] = instance_val;
-                            dispatch_closure_bc(
-                                vm,
-                                fiber,
-                                closure_ptr,
-                                &ctor_args,
-                                pc,
-                                values,
-                                &module_name,
-                                ValueId(dst as u32),
-                                defining_class,
-                            )?;
-                            continue 'fiber_loop;
+                            // Write barrier: instance may be old-gen if nursery overflowed
+                            vm.gc.write_barrier(
+                                instance as *mut ObjHeader,
+                                recv_val, // class ref
+                            );
+
+                            let target_fn_ptr = unsafe { (*closure_ptr).function };
+                            let target_func_id = FuncId(unsafe { (*target_fn_ptr).fn_id });
+                            let fn_idx = target_func_id.0 as usize;
+
+                            // Tier-up profiling (but always use inline dispatch to
+                            // avoid native stack overflow from recursive constructors).
+                            if vm.engine.mode != ExecutionMode::Interpreter {
+                                let should_tier_up = vm.engine.record_call(target_func_id);
+                                if should_tier_up {
+                                    vm.engine
+                                        .request_tier_up(target_func_id, &vm.interner);
+                                }
+                                vm.engine.poll_compilations();
+                            }
+
+                            // ── Inline constructor frame push ──
+                            let target_bc_ptr =
+                                vm.engine.ensure_bytecode(target_func_id).ok_or_else(|| {
+                                    RuntimeError::Error("invalid ctor func_id".into())
+                                })?;
+                            let target_bc = unsafe { &*target_bc_ptr };
+
+                            let reg_count = target_bc.register_count as usize;
+                            let mut new_values = if let Some(mut recycled) =
+                                vm.register_pool.pop()
+                            {
+                                recycled.resize(reg_count, UNDEF);
+                                new_values_fill_undef(&mut recycled, reg_count);
+                                recycled
+                            } else {
+                                vec![UNDEF; reg_count]
+                            };
+                            // Bind params: arg[0] = instance, rest from arg_vals
+                            // Build ctor args inline to avoid SmallVec clone
+                            let mut ctor_args: SmallVec<[Value; 8]> =
+                                SmallVec::with_capacity(arg_vals.len());
+                            ctor_args.push(instance_val);
+                            if arg_vals.len() > 1 {
+                                ctor_args.extend_from_slice(&arg_vals[1..]);
+                            }
+                            for &(dst_reg, param_idx) in target_bc.param_offsets.iter() {
+                                if (param_idx as usize) < ctor_args.len()
+                                    && (dst_reg as usize) < reg_count
+                                {
+                                    new_values[dst_reg as usize] =
+                                        ctor_args[param_idx as usize];
+                                }
+                            }
+
+                            let depth = unsafe { (*fiber).mir_frames.len() };
+                            if depth >= vm.config.max_call_depth {
+                                return Err(RuntimeError::StackOverflow);
+                            }
+
+                            // Save caller frame
+                            unsafe {
+                                let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                frame.pc = pc;
+                                frame.values = values;
+                            }
+
+                            // Push constructor frame
+                            unsafe {
+                                (*fiber).mir_frames.push(MirCallFrame {
+                                    func_id: target_func_id,
+                                    current_block: BlockId(0),
+                                    ip: 0,
+                                    pc: 0,
+                                    values: new_values,
+                                    module_name: Rc::clone(&module_name),
+                                    return_dst: Some(ValueId(dst as u32)),
+                                    closure: Some(closure_ptr),
+                                    defining_class,
+                                });
+                            }
+
+                            pc = 0;
+                            values = unsafe {
+                                std::mem::take(
+                                    &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                                )
+                            };
+                            bc = unsafe { &*target_bc_ptr };
+                            code = &bc.code;
+                            continue;
                         }
                         None => {
                             let method_name = vm.interner.resolve(method).to_string();
