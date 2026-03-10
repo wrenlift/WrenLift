@@ -20,8 +20,74 @@ use crate::mir::interp::{InterpError, InterpValue};
 use crate::mir::{BlockId, ValueId};
 use crate::runtime::engine::FuncId;
 use crate::runtime::object::*;
+use crate::runtime::engine::ExecutionMode;
 use crate::runtime::value::Value;
 use crate::runtime::vm::{FiberAction, VM};
+
+// ---------------------------------------------------------------------------
+// Global inline method cache
+// ---------------------------------------------------------------------------
+
+/// Direct-mapped method cache: (class_ptr, method_sym) → (Method, defining_class).
+/// Eliminates HashMap lookups for monomorphic call sites.
+const METHOD_CACHE_SIZE: usize = 1024; // power of 2
+
+struct MethodCacheEntry {
+    class: *mut ObjClass,
+    method_raw: u32,
+    result: Method,
+    defining_class: *mut ObjClass,
+}
+
+pub struct MethodCache {
+    entries: Vec<Option<MethodCacheEntry>>,
+}
+
+impl MethodCache {
+    pub fn new() -> Self {
+        let mut entries = Vec::with_capacity(METHOD_CACHE_SIZE);
+        entries.resize_with(METHOD_CACHE_SIZE, || None);
+        Self { entries }
+    }
+
+    #[inline(always)]
+    fn hash(class: *mut ObjClass, method: SymbolId) -> usize {
+        ((class as usize).wrapping_mul(2654435761) ^ (method.index() as usize))
+            & (METHOD_CACHE_SIZE - 1)
+    }
+
+    #[inline]
+    pub fn lookup(
+        &self,
+        class: *mut ObjClass,
+        method: SymbolId,
+    ) -> Option<(Method, *mut ObjClass)> {
+        let idx = Self::hash(class, method);
+        if let Some(entry) = unsafe { self.entries.get_unchecked(idx) } {
+            if entry.class == class && entry.method_raw == method.index() {
+                return Some((entry.result.clone(), entry.defining_class));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub fn insert(
+        &mut self,
+        class: *mut ObjClass,
+        method: SymbolId,
+        result: Method,
+        defining_class: *mut ObjClass,
+    ) {
+        let idx = Self::hash(class, method);
+        self.entries[idx] = Some(MethodCacheEntry {
+            class,
+            method_raw: method.index(),
+            result,
+            defining_class,
+        });
+    }
+}
 
 /// Sentinel value for uninitialized register slots.
 const UNDEF: InterpValue = InterpValue::Boxed(Value::UNDEFINED);
@@ -842,40 +908,51 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                     let class = vm.class_of(recv_val);
 
-                    // For class receivers, try static method first (common case
-                    // for Foo.bar() calls). Uses stack buffer + lookup to avoid heap alloc.
+                    // For class receivers, use the actual class object as cache key
+                    // (not class_class, since all classes share that metaclass).
+                    let cache_key_class = if class == vm.class_class {
+                        recv_val.as_object().unwrap() as *mut ObjClass
+                    } else {
+                        class
+                    };
+
+                    // Inline method cache: check cache first, fall back to full lookup.
                     let (method_entry, defining_class) =
-                        if class == vm.class_class {
-                            let recv_class_ptr =
-                                recv_val.as_object().unwrap() as *mut ObjClass;
-                            let method_str = vm.interner.resolve(method);
-                            let prefix = b"static:";
-                            let total = prefix.len() + method_str.len();
-                            let mut buf = [0u8; 128];
-                            let found = if total <= buf.len() {
-                                buf[..prefix.len()].copy_from_slice(prefix);
-                                buf[prefix.len()..total]
-                                    .copy_from_slice(method_str.as_bytes());
-                                let static_str = unsafe {
-                                    std::str::from_utf8_unchecked(&buf[..total])
+                        if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method) {
+                            (Some(m), Some(dc))
+                        } else {
+                            let result = if class == vm.class_class {
+                                let recv_class_ptr = cache_key_class;
+                                // Static method: construct "static:method" and probe
+                                let method_str = vm.interner.resolve(method);
+                                let prefix = b"static:";
+                                let total = prefix.len() + method_str.len();
+                                let mut buf = [0u8; 128];
+                                let found = if total <= buf.len() {
+                                    buf[..prefix.len()].copy_from_slice(prefix);
+                                    buf[prefix.len()..total]
+                                        .copy_from_slice(method_str.as_bytes());
+                                    let static_str = unsafe {
+                                        std::str::from_utf8_unchecked(&buf[..total])
+                                    };
+                                    vm.interner.lookup(static_str).and_then(|sym| {
+                                        unsafe { (*recv_class_ptr).find_method(sym).cloned() }
+                                            .map(|m| (m, recv_class_ptr))
+                                    })
+                                } else {
+                                    None
                                 };
-                                vm.interner.lookup(static_str).and_then(|sym| {
-                                    unsafe { (*recv_class_ptr).find_method(sym).cloned() }
+                                found.or_else(|| unsafe {
+                                    find_method_with_class(class, method)
                                 })
                             } else {
-                                None
+                                unsafe { find_method_with_class(class, method) }
                             };
-                            match found {
-                                Some(m) => (Some(m), Some(recv_class_ptr)),
-                                None => {
-                                    match unsafe { find_method_with_class(class, method) } {
-                                        Some((m, c)) => (Some(m), Some(c)),
-                                        None => (None, None),
-                                    }
-                                }
+                            // Populate cache on successful lookup
+                            if let Some((ref m, dc)) = result {
+                                vm.method_cache.insert(cache_key_class, method, m.clone(), dc);
                             }
-                        } else {
-                            match unsafe { find_method_with_class(class, method) } {
+                            match result {
                                 Some((m, c)) => (Some(m), Some(c)),
                                 None => (None, None),
                             }
@@ -1436,10 +1513,12 @@ fn dispatch_closure_bc(
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
 
-    // Tier-up profiling: record call and queue background compilation if hot
-    let should_tier_up = vm.engine.record_call(target_func_id);
-    if should_tier_up {
-        vm.engine.request_tier_up(target_func_id, &vm.interner);
+    // Tier-up profiling: only in Tiered mode
+    if vm.engine.mode == ExecutionMode::Tiered {
+        let should_tier_up = vm.engine.record_call(target_func_id);
+        if should_tier_up {
+            vm.engine.request_tier_up(target_func_id, &vm.interner);
+        }
     }
 
     // Get bytecode for target function (lazily compiled, survives tier-up).
@@ -1625,7 +1704,16 @@ fn try_operator_dispatch(
 ) -> Result<bool, RuntimeError> {
     let method_sym = vm.interner.intern(method_str);
     let class = vm.class_of(recv);
-    let method_entry = unsafe { (*class).find_method(method_sym).cloned() };
+    // Check method cache first
+    let method_entry = if let Some((m, _dc)) = vm.method_cache.lookup(class, method_sym) {
+        Some(m)
+    } else {
+        let found = unsafe { (*class).find_method(method_sym).cloned() };
+        if let Some(ref m) = found {
+            vm.method_cache.insert(class, method_sym, m.clone(), class);
+        }
+        found
+    };
     match method_entry {
         Some(Method::Native(func)) => {
             let mut arg_vals: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + args.len());

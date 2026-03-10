@@ -188,6 +188,9 @@ pub struct VM {
 
     /// Pool of reusable register files to avoid per-call heap allocation.
     pub register_pool: Vec<Vec<crate::mir::interp::InterpValue>>,
+
+    /// Global inline method cache for fast monomorphic dispatch.
+    pub method_cache: super::vm_interp::MethodCache,
 }
 
 impl VM {
@@ -242,6 +245,7 @@ impl VM {
             loading_modules: HashSet::new(),
             gc_requested: false,
             register_pool: Vec::new(),
+            method_cache: super::vm_interp::MethodCache::new(),
         };
 
         // Bootstrap core classes.

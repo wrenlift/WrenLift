@@ -6,12 +6,12 @@ Discovered during benchmark comparison against standard Wren 0.4.0.
 
 | Benchmark       | WrenLift   | Wren 0.4 | Ratio  | Status               |
 |-----------------|------------|----------|--------|----------------------|
-| Recursive Fib   | 0.95s      | 0.17s    | 5.4x   | Runs, improving      |
-| Method Call     | 0.47s      | 0.08s    | 5.5x   | Runs, improving      |
+| Recursive Fib   | 0.62s      | 0.17s    | 3.5x   | Runs, improving      |
+| Method Call     | 0.36s      | 0.09s    | 4.1x   | Runs, improving      |
 | Binary Trees    | CRASH      | 0.97s    | —      | SIGABRT at depth ~10 |
 | DeltaBlue       | COMPILE_ERR| —        | —      | Blocked by Issue 4   |
 
-*History: original 27.2x/29.8x → P2 hot-path fixes 24.0x/25.4x → Vec registers 12.4x/13.5x → bytecode VM 5.4x/5.5x*
+*History: original 27.2x/29.8x → P2 hot-path fixes 24.0x/25.4x → Vec registers 12.4x/13.5x → bytecode VM 5.4x/5.5x → method cache 3.5x/4.1x*
 
 ---
 
