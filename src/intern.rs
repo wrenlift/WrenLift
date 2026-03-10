@@ -41,6 +41,7 @@ impl std::fmt::Display for SymbolId {
 }
 
 /// Append-only string interner.
+#[derive(Clone)]
 pub struct Interner {
     /// Maps string content → symbol id for dedup lookup.
     map: HashMap<String, SymbolId>,

@@ -185,6 +185,9 @@ pub struct VM {
 
     /// Flag set by System.gc() — actual collection happens at next safepoint.
     pub gc_requested: bool,
+
+    /// Pool of reusable register files to avoid per-call heap allocation.
+    pub register_pool: Vec<Vec<crate::mir::interp::InterpValue>>,
 }
 
 impl VM {
@@ -238,6 +241,7 @@ impl VM {
             last_error: None,
             loading_modules: HashSet::new(),
             gc_requested: false,
+            register_pool: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -566,8 +570,9 @@ impl VM {
                 func_id,
                 current_block: BlockId(0),
                 ip: 0,
+                pc: 0,
                 values: vec![crate::mir::interp::InterpValue::Boxed(Value::UNDEFINED); reg_size],
-                module_name: module_key.clone(),
+                module_name: std::rc::Rc::new(module_key.clone()),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
@@ -608,13 +613,22 @@ impl VM {
             return None;
         }
         let frame = unsafe { (*fiber).mir_frames.last()? };
-        let mir = self.engine.get_mir(frame.func_id)?;
 
-        // Find the span of the instruction at the current ip
+        // Try bytecode source map first (pc-based lookup)
+        if let Some(bc) = self.engine.peek_bytecode(frame.func_id) {
+            if let Some(span) = bc.lookup_span(frame.pc) {
+                return Some(super::vm_interp::SourceLoc {
+                    span: span.clone(),
+                    module: frame.module_name.clone(),
+                });
+            }
+        }
+
+        // Fallback to MIR span_map (for non-bytecode paths)
+        let mir = self.engine.get_mir(frame.func_id)?;
         let block = mir.blocks.get(frame.current_block.0 as usize)?;
         let ip = frame.ip;
         if ip > 0 {
-            // ip points to the NEXT instruction, so the failing one is ip-1
             let (val_id, _) = block.instructions.get(ip - 1)?;
             let span = mir.span_map.get(val_id)?;
             Some(super::vm_interp::SourceLoc {
@@ -659,7 +673,7 @@ impl VM {
         });
         StackFrame {
             func_name,
-            module: frame.module_name.clone(),
+            module: (*frame.module_name).clone(),
             line,
         }
     }
@@ -764,7 +778,7 @@ impl VM {
         fiber: *mut ObjFiber,
     ) {
         if let Some(loc) = loc {
-            if let Some(source) = self.module_sources.get(&loc.module) {
+            if let Some(source) = self.module_sources.get(loc.module.as_str()) {
                 let mut diag = crate::diagnostics::Diagnostic::error(error.to_string())
                     .with_label(loc.span.clone(), "error occurred here");
 
@@ -1347,8 +1361,9 @@ impl NativeContext for VM {
                         func_id,
                         current_block: BlockId(0),
                         ip: 0,
+                        pc: 0,
                         values,
-                        module_name: "core".to_string(),
+                        module_name: std::rc::Rc::new("core".to_string()),
                         return_dst: None,
                         closure: Some(closure_ptr),
                         defining_class: None,
@@ -1388,8 +1403,9 @@ impl NativeContext for VM {
                         func_id,
                         current_block: BlockId(0),
                         ip: 0,
+                        pc: 0,
                         values,
-                        module_name: "core".to_string(),
+                        module_name: std::rc::Rc::new("core".to_string()),
                         return_dst: None,
                         closure: Some(closure_ptr),
                         defining_class: None,
@@ -1425,12 +1441,12 @@ impl NativeContext for VM {
 
     fn meta_eval(&mut self, _module: &str, source: &str) -> bool {
         // Find the calling module from the current fiber's frame
-        let eval_module = if !self.fiber.is_null() {
+        let eval_module: String = if !self.fiber.is_null() {
             unsafe {
                 (*self.fiber)
                     .mir_frames
                     .last()
-                    .map(|f| f.module_name.clone())
+                    .map(|f| (*f.module_name).clone())
                     .unwrap_or_else(|| "main".to_string())
             }
         } else {
@@ -1631,8 +1647,9 @@ impl VM {
                 func_id,
                 current_block: crate::mir::BlockId(0),
                 ip: 0,
+                pc: 0,
                 values: vec![crate::mir::interp::InterpValue::Boxed(Value::UNDEFINED); reg_size],
-                module_name: eval_module_name.clone(),
+                module_name: std::rc::Rc::new(eval_module_name.clone()),
                 return_dst: None,
                 closure: None,
                 defining_class: None,
@@ -1800,8 +1817,9 @@ impl VM {
                 func_id,
                 current_block: BlockId(0),
                 ip: 0,
+                pc: 0,
                 values,
-                module_name: crate::codegen::runtime_fns::module_name(),
+                module_name: std::rc::Rc::new(crate::codegen::runtime_fns::module_name()),
                 return_dst: None,
                 closure: Some(closure_ptr),
                 defining_class: None,
@@ -2982,7 +3000,7 @@ System.print(MathUtils.double(21))
             "extract_error_location should return Some for runtime error"
         );
         let loc = loc.unwrap();
-        assert_eq!(loc.module, "main");
+        assert_eq!(loc.module.as_str(), "main");
         // Span should point somewhere in "x.bogus()" (byte offsets 11..20 in the source)
         assert!(
             loc.span.start >= 11,

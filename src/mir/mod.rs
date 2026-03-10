@@ -7,6 +7,7 @@
 /// SSA values are referenced by `ValueId`. Each instruction produces at most
 /// one value. Block parameters receive values from predecessor branches.
 pub mod builder;
+pub mod bytecode;
 pub mod interp;
 pub mod opt;
 pub mod ssa;

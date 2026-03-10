@@ -7,11 +7,17 @@
 ///
 /// The engine owns the function registry (MIR + compiled code) and
 /// handles tier-up decisions based on call-count profiling.
+///
+/// In Tiered mode, compilation happens asynchronously on a background
+/// thread. The interpreter continues using bytecode until compilation
+/// finishes, then swaps to native code on the next dispatch.
 use std::collections::HashMap;
+use std::sync::mpsc;
 use std::sync::Arc;
 
 use crate::codegen::ExecutableFunction;
 use crate::intern::SymbolId;
+use crate::mir::bytecode::BytecodeFunction;
 use crate::mir::MirFunction;
 
 // ---------------------------------------------------------------------------
@@ -47,13 +53,16 @@ pub enum FuncBody {
     /// MIR available for interpretation. Not yet compiled to native.
     Interpreted {
         mir: Arc<MirFunction>,
+        /// Lazily-lowered compact bytecode for the bytecode VM.
+        bytecode: Option<Arc<BytecodeFunction>>,
         /// Number of times this function has been called (for tier-up).
         call_count: u32,
     },
-    /// JIT-compiled native code. MIR retained for deopt/debugging.
+    /// JIT-compiled native code. MIR + bytecode retained for fallback/debugging.
     Compiled {
         executable: ExecutableFunction,
         mir: Arc<MirFunction>,
+        bytecode: Option<Arc<BytecodeFunction>>,
     },
 }
 
@@ -88,8 +97,21 @@ pub struct CompiledModule {
 // Execution engine
 // ---------------------------------------------------------------------------
 
+/// A completed background compilation ready to be installed.
+struct CompilationResult {
+    id: FuncId,
+    executable: ExecutableFunction,
+    mir: Arc<MirFunction>,
+    bytecode: Option<Arc<BytecodeFunction>>,
+}
+
 /// The execution engine: owns all function bodies, dispatches calls,
 /// and manages tiered compilation.
+///
+/// In Tiered mode, hot functions are compiled asynchronously — each
+/// request spawns a thread that compiles and sends the result back
+/// via a channel. The interpreter continues using bytecode until
+/// `poll_compilations` installs the native code at the next safepoint.
 pub struct ExecutionEngine {
     /// Current execution mode.
     pub mode: ExecutionMode,
@@ -99,6 +121,12 @@ pub struct ExecutionEngine {
     pub jit_threshold: u32,
     /// Module registry: module name → (top_level FuncId, module var storage).
     pub modules: HashMap<String, ModuleEntry>,
+    /// Sender cloned into each background compilation thread.
+    compilation_tx: mpsc::Sender<CompilationResult>,
+    /// Receiver polled at safepoints to install completed compilations.
+    compilation_rx: mpsc::Receiver<CompilationResult>,
+    /// Per-function flag: true while a background compilation is in flight.
+    compiling: Vec<bool>,
 }
 
 /// Per-module execution state.
@@ -122,11 +150,15 @@ pub enum InterpretResult {
 impl ExecutionEngine {
     /// Create a new engine with the given mode.
     pub fn new(mode: ExecutionMode) -> Self {
+        let (tx, rx) = mpsc::channel();
         Self {
             mode,
             functions: Vec::new(),
             jit_threshold: 100,
             modules: HashMap::new(),
+            compilation_tx: tx,
+            compilation_rx: rx,
+            compiling: Vec::new(),
         }
     }
 
@@ -135,8 +167,10 @@ impl ExecutionEngine {
         let id = FuncId(self.functions.len() as u32);
         self.functions.push(FuncBody::Interpreted {
             mir: Arc::new(mir),
+            bytecode: None,
             call_count: 0,
         });
+        self.compiling.push(false);
         id
     }
 
@@ -151,6 +185,61 @@ impl ExecutionEngine {
     /// Get a function body by ID.
     pub fn get_function(&self, id: FuncId) -> Option<&FuncBody> {
         self.functions.get(id.0 as usize)
+    }
+
+    /// Peek at already-compiled bytecode without triggering lazy compilation.
+    pub fn peek_bytecode(&self, id: FuncId) -> Option<Arc<BytecodeFunction>> {
+        match self.functions.get(id.0 as usize)? {
+            FuncBody::Interpreted { bytecode, .. } => bytecode.clone(),
+            FuncBody::Compiled { bytecode, .. } => bytecode.clone(),
+        }
+    }
+
+    /// Get (or lazily lower) the bytecode for a function.
+    /// Works for both Interpreted and Compiled functions (bytecode is preserved
+    /// across tier-up so the interpreter can continue as a fallback).
+    pub fn get_bytecode(&mut self, id: FuncId) -> Option<Arc<BytecodeFunction>> {
+        match self.functions.get_mut(id.0 as usize)? {
+            FuncBody::Interpreted {
+                mir, bytecode, ..
+            } => {
+                if bytecode.is_none() {
+                    let bc = crate::mir::bytecode::lower(mir);
+                    *bytecode = Some(Arc::new(bc));
+                }
+                bytecode.clone()
+            }
+            FuncBody::Compiled { bytecode, mir, .. } => {
+                if bytecode.is_none() {
+                    let bc = crate::mir::bytecode::lower(mir);
+                    *bytecode = Some(Arc::new(bc));
+                }
+                bytecode.clone()
+            }
+        }
+    }
+
+    /// Ensure bytecode is compiled and return a raw pointer to it.
+    /// The pointer is stable as long as the engine's function table is not modified
+    /// (bytecode is never freed once compiled). Use this in the hot interpreter loop
+    /// to avoid Arc clone overhead.
+    pub fn ensure_bytecode(&mut self, id: FuncId) -> Option<*const BytecodeFunction> {
+        match self.functions.get_mut(id.0 as usize)? {
+            FuncBody::Interpreted { mir, bytecode, .. } => {
+                if bytecode.is_none() {
+                    let bc = crate::mir::bytecode::lower(mir);
+                    *bytecode = Some(Arc::new(bc));
+                }
+                bytecode.as_ref().map(|arc| Arc::as_ptr(arc))
+            }
+            FuncBody::Compiled { bytecode, mir, .. } => {
+                if bytecode.is_none() {
+                    let bc = crate::mir::bytecode::lower(mir);
+                    *bytecode = Some(Arc::new(bc));
+                }
+                bytecode.as_ref().map(|arc| Arc::as_ptr(arc))
+            }
+        }
     }
 
     /// Record a call to a function. Returns true if the function should
@@ -170,11 +259,14 @@ impl ExecutionEngine {
     }
 
     /// Compile a function to native code and replace its body.
+    /// Preserves bytecode so the interpreter can continue as a fallback.
     /// Returns true if compilation succeeded.
     pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
         let target = Self::native_target();
-        let mir = match self.functions.get(id.0 as usize) {
-            Some(FuncBody::Interpreted { mir, .. }) => Arc::clone(mir),
+        let (mir, bytecode) = match self.functions.get(id.0 as usize) {
+            Some(FuncBody::Interpreted { mir, bytecode, .. }) => {
+                (Arc::clone(mir), bytecode.clone())
+            }
             Some(FuncBody::Compiled { .. }) => return true, // already compiled
             None => return false,
         };
@@ -182,12 +274,72 @@ impl ExecutionEngine {
         match crate::codegen::compile_function_with_interner(&mir, target, interner) {
             Ok(compiled) => match compiled.into_executable() {
                 Ok(executable) => {
-                    self.functions[id.0 as usize] = FuncBody::Compiled { executable, mir };
+                    self.functions[id.0 as usize] =
+                        FuncBody::Compiled { executable, mir, bytecode };
                     true
                 }
                 Err(_) => false,
             },
             Err(_) => false,
+        }
+    }
+
+    /// Submit a function for background JIT compilation.
+    /// The interpreter keeps running bytecode; the compiled result is installed
+    /// when `poll_compilations` is called at the next safepoint.
+    pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        let idx = id.0 as usize;
+        // Guard: already compiled or already in-flight
+        if idx >= self.compiling.len() {
+            return;
+        }
+        if self.compiling[idx] {
+            return;
+        }
+        let (mir, bytecode) = match self.functions.get(idx) {
+            Some(FuncBody::Interpreted { mir, bytecode, .. }) => {
+                (Arc::clone(mir), bytecode.clone())
+            }
+            Some(FuncBody::Compiled { .. }) => return,
+            None => return,
+        };
+
+        self.compiling[idx] = true;
+        let tx = self.compilation_tx.clone();
+        let target = Self::native_target();
+        let interner_clone = interner.clone();
+
+        std::thread::spawn(move || {
+            let result =
+                crate::codegen::compile_function_with_interner(&mir, target, &interner_clone)
+                    .ok()
+                    .and_then(|c| c.into_executable().ok());
+            if let Some(executable) = result {
+                let _ = tx.send(CompilationResult {
+                    id,
+                    executable,
+                    mir,
+                    bytecode,
+                });
+            }
+        });
+    }
+
+    /// Install any completed background compilations.
+    /// Call this at GC safepoints so the interpreter picks up native code.
+    pub fn poll_compilations(&mut self) {
+        while let Ok(result) = self.compilation_rx.try_recv() {
+            let idx = result.id.0 as usize;
+            if idx < self.functions.len() {
+                self.functions[idx] = FuncBody::Compiled {
+                    executable: result.executable,
+                    mir: result.mir,
+                    bytecode: result.bytecode,
+                };
+            }
+            if idx < self.compiling.len() {
+                self.compiling[idx] = false;
+            }
         }
     }
 
@@ -240,6 +392,21 @@ mod tests {
         let id = engine.register_function(mir);
         assert_eq!(id, FuncId(0));
         assert!(engine.get_function(id).is_some());
+    }
+
+    #[test]
+    fn test_bytecode_cache_lazy() {
+        let mut engine = ExecutionEngine::new(ExecutionMode::Interpreter);
+        let mir = make_mir();
+        let id = engine.register_function(mir);
+
+        // First call lazily compiles bytecode
+        let bc1 = engine.get_bytecode(id);
+        assert!(bc1.is_some());
+
+        // Second call returns the same Arc (cached)
+        let bc2 = engine.get_bytecode(id);
+        assert!(Arc::ptr_eq(bc1.as_ref().unwrap(), bc2.as_ref().unwrap()));
     }
 
     #[test]

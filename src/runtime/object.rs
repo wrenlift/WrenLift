@@ -713,15 +713,17 @@ pub struct CallFrame {
 pub struct MirCallFrame {
     /// Which function in the engine we're executing.
     pub func_id: FuncId,
-    /// Current basic block.
+    /// Current basic block (tree-walking path; unused in bytecode path).
     pub current_block: BlockId,
-    /// Instruction index within the current block (used for resumption after yield).
+    /// Instruction index within the current block (tree-walking path).
     pub ip: usize,
+    /// Flat bytecode program counter (bytecode path).
+    pub pc: u32,
     /// SSA register file for this frame. Indexed by ValueId.0.
     /// Uninitialized slots hold InterpValue::Boxed(Value::undefined()).
     pub values: Vec<crate::mir::interp::InterpValue>,
-    /// Module variable storage for this frame's module.
-    pub module_name: String,
+    /// Module variable storage for this frame's module (Rc to avoid clone per call).
+    pub module_name: std::rc::Rc<String>,
     /// The ValueId in the *caller* frame that should receive our return value.
     pub return_dst: Option<crate::mir::ValueId>,
     /// The closure being executed (if any), for upvalue access.
@@ -734,8 +736,8 @@ impl fmt::Debug for MirCallFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "MirCallFrame(func={:?}, block={:?}, ip={})",
-            self.func_id, self.current_block, self.ip
+            "MirCallFrame(func={:?}, block={:?}, ip={}, pc={})",
+            self.func_id, self.current_block, self.ip, self.pc
         )
     }
 }
