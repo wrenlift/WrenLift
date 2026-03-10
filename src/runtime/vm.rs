@@ -264,8 +264,6 @@ impl VM {
         use crate::mir::BlockId;
         use crate::parse::parser;
         use crate::sema;
-        use std::collections::HashMap as HMap;
-
         // 0. Cycle detection for imports
         let module_key = module_name.to_string();
         if !self.loading_modules.insert(module_key.clone()) {
@@ -559,13 +557,16 @@ impl VM {
 
         // 9. Create a fiber and push the initial call frame
         let fiber = self.gc.alloc_fiber();
+        let reg_size = self.engine.get_mir(func_id)
+            .map(|m| m.next_value as usize)
+            .unwrap_or(0);
         unsafe {
             (*fiber).header.class = self.fiber_class;
             (*fiber).mir_frames.push(MirCallFrame {
                 func_id,
                 current_block: BlockId(0),
                 ip: 0,
-                values: HMap::new(),
+                values: vec![crate::mir::interp::InterpValue::Boxed(Value::UNDEFINED); reg_size],
                 module_name: module_key.clone(),
                 return_dst: None,
                 closure: None,
@@ -1324,7 +1325,7 @@ impl NativeContext for VM {
                     let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
                     let mir = self.engine.get_mir(func_id)?;
-                    let mut values = std::collections::HashMap::new();
+                    let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
 
                     let block = &mir.blocks[0];
 
@@ -1333,7 +1334,9 @@ impl NativeContext for VM {
                         if let Instruction::BlockParam(param_idx) = inst {
                             let idx = *param_idx as usize;
                             if idx < all_args.len() {
-                                values.insert(*vid, InterpValue::Boxed(all_args[idx]));
+                                let i = vid.0 as usize;
+                                if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
+                                values[i] = InterpValue::Boxed(all_args[idx]);
                             }
                         } else {
                             break;
@@ -1367,13 +1370,15 @@ impl NativeContext for VM {
                     let fn_ptr = (*closure_ptr).function;
                     let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
                     let mir = self.engine.get_mir(func_id)?;
-                    let mut values = std::collections::HashMap::new();
+                    let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
                     let block = &mir.blocks[0];
                     for (vid, inst) in &block.instructions {
                         if let Instruction::BlockParam(param_idx) = inst {
                             let idx = *param_idx as usize;
                             if idx < all_args.len() {
-                                values.insert(*vid, InterpValue::Boxed(all_args[idx]));
+                                let i = vid.0 as usize;
+                                if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
+                                values[i] = InterpValue::Boxed(all_args[idx]);
                             }
                         } else {
                             break;
@@ -1617,13 +1622,16 @@ impl VM {
         );
 
         let fiber = self.gc.alloc_fiber();
+        let reg_size = self.engine.get_mir(func_id)
+            .map(|m| m.next_value as usize)
+            .unwrap_or(0);
         unsafe {
             (*fiber).header.class = self.fiber_class;
             (*fiber).mir_frames.push(MirCallFrame {
                 func_id,
                 current_block: crate::mir::BlockId(0),
                 ip: 0,
-                values: std::collections::HashMap::new(),
+                values: vec![crate::mir::interp::InterpValue::Boxed(Value::UNDEFINED); reg_size],
                 module_name: eval_module_name.clone(),
                 return_dst: None,
                 closure: None,
@@ -1770,7 +1778,7 @@ impl VM {
             let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
             let mir = self.engine.get_mir(func_id)?;
-            let mut values = std::collections::HashMap::new();
+            let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
 
             // Bind block params
             let block = &mir.blocks[0];
@@ -1778,7 +1786,9 @@ impl VM {
             for (vid, inst) in &block.instructions {
                 if matches!(inst, Instruction::BlockParam(_)) {
                     if param_idx < args.len() {
-                        values.insert(*vid, InterpValue::Boxed(args[param_idx]));
+                        let i = vid.0 as usize;
+                        if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
+                        values[i] = InterpValue::Boxed(args[param_idx]);
                     }
                     param_idx += 1;
                 } else {

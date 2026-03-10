@@ -169,11 +169,11 @@ impl std::fmt::Display for InterpError {
 /// to avoid duplicating evaluation logic.
 pub fn eval_pure_instruction(
     inst: &Instruction,
-    values: &HashMap<ValueId, InterpValue>,
+    values: &[InterpValue],
 ) -> Result<InterpValue, InterpError> {
     let get = |id: ValueId| -> Result<InterpValue, InterpError> {
         values
-            .get(&id)
+            .get(id.0 as usize)
             .copied()
             .ok_or(InterpError::UndefinedValue(id))
     };
@@ -404,7 +404,7 @@ const MAX_STEPS: usize = 100_000;
 /// Interpreter state.
 pub struct Interp<'a> {
     func: &'a MirFunction,
-    values: HashMap<ValueId, InterpValue>,
+    values: Vec<InterpValue>,
     module_vars: HashMap<u16, InterpValue>,
     steps: usize,
 }
@@ -413,7 +413,7 @@ impl<'a> Interp<'a> {
     pub fn new(func: &'a MirFunction) -> Self {
         Self {
             func,
-            values: HashMap::new(),
+            values: vec![InterpValue::Boxed(Value::UNDEFINED); func.next_value as usize],
             module_vars: HashMap::new(),
             steps: 0,
         }
@@ -434,7 +434,11 @@ impl<'a> Interp<'a> {
             for (result_id, inst) in &block.instructions {
                 self.step()?;
                 let val = self.eval_instruction(inst)?;
-                self.values.insert(*result_id, val);
+                let idx = result_id.0 as usize;
+                if idx >= self.values.len() {
+                    self.values.resize(idx + 1, InterpValue::Boxed(Value::UNDEFINED));
+                }
+                self.values[idx] = val;
             }
 
             self.step()?;
@@ -485,7 +489,7 @@ impl<'a> Interp<'a> {
 
     fn get(&self, id: ValueId) -> Result<InterpValue, InterpError> {
         self.values
-            .get(&id)
+            .get(id.0 as usize)
             .copied()
             .ok_or(InterpError::UndefinedValue(id))
     }
@@ -500,7 +504,11 @@ impl<'a> Interp<'a> {
         let params: Vec<ValueId> = block.params.iter().map(|(v, _)| *v).collect();
         for (param_id, arg_id) in params.iter().zip(args.iter()) {
             let val = self.get(*arg_id)?;
-            self.values.insert(*param_id, val);
+            let idx = param_id.0 as usize;
+            if idx >= self.values.len() {
+                self.values.resize(idx + 1, InterpValue::Boxed(Value::UNDEFINED));
+            }
+            self.values[idx] = val;
         }
         Ok(())
     }

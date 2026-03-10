@@ -717,8 +717,9 @@ pub struct MirCallFrame {
     pub current_block: BlockId,
     /// Instruction index within the current block (used for resumption after yield).
     pub ip: usize,
-    /// SSA value map for this frame.
-    pub values: HashMap<crate::mir::ValueId, crate::mir::interp::InterpValue>,
+    /// SSA register file for this frame. Indexed by ValueId.0.
+    /// Uninitialized slots hold InterpValue::Boxed(Value::undefined()).
+    pub values: Vec<crate::mir::interp::InterpValue>,
     /// Module variable storage for this frame's module.
     pub module_name: String,
     /// The ValueId in the *caller* frame that should receive our return value.

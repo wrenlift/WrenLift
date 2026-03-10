@@ -4,7 +4,6 @@ use crate::runtime::object::{
 };
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
-use std::collections::HashMap;
 
 // --- Helpers ---
 
@@ -35,11 +34,13 @@ unsafe fn setup_fiber_from_closure(fiber: *mut ObjFiber, closure: *mut ObjClosur
     let fn_ptr = (*closure).function;
     let func_id = FuncId((*fn_ptr).fn_id);
 
+    // The register file starts empty; it will be sized correctly when the
+    // fiber's first frame is loaded in run_fiber.
     (*fiber).mir_frames.push(MirCallFrame {
         func_id,
         current_block: crate::mir::BlockId(0),
         ip: 0,
-        values: HashMap::new(),
+        values: Vec::new(),
         module_name: String::from("main"),
         return_dst: None,
         closure: Some(closure),

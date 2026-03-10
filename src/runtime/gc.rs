@@ -722,7 +722,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
             }
             // Trace MIR interpreter frames (SSA value maps, closures, classes).
             for frame in &fiber.mir_frames {
-                for interp_val in frame.values.values() {
+                for interp_val in &frame.values {
                     if let InterpValue::Boxed(val) = interp_val {
                         mark_value(*val, gray_stack);
                     }
@@ -861,7 +861,7 @@ unsafe fn update_pointers_in_object(
             }
             // Update MIR interpreter frames.
             for frame in &mut fiber.mir_frames {
-                for interp_val in frame.values.values_mut() {
+                for interp_val in frame.values.iter_mut() {
                     if let InterpValue::Boxed(ref mut val) = interp_val {
                         update_value(val, forwards);
                     }

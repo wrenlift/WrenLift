@@ -10,13 +10,16 @@
 /// bitwise, constants, moves) is delegated to `mir::interp::eval_pure_instruction`.
 /// This module only handles VM-specific instructions: calls, collections,
 /// module vars, string allocation, fields, closures.
-use std::collections::HashMap;
+use smallvec::SmallVec;
 
 use crate::mir::interp::{eval_pure_instruction, InterpError, InterpValue};
 use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 use crate::runtime::object::*;
 use crate::runtime::value::Value;
 use crate::runtime::vm::{FiberAction, VM};
+
+/// Sentinel value for uninitialized register slots.
+const UNDEF: InterpValue = InterpValue::Boxed(Value::UNDEFINED);
 
 // ---------------------------------------------------------------------------
 // Runtime errors
@@ -171,7 +174,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 let result: InterpValue = match inst {
                     // -- BlockParam (pre-bound by bind_block_params) --
                     BlockParam(_) => {
-                        if values.contains_key(dst) {
+                        // Already bound by bind_block_params — skip unless uninitialized
+                        let idx = dst.0 as usize;
+                        if idx < values.len() && !matches!(values[idx], InterpValue::Boxed(v) if v.is_undefined()) {
                             continue;
                         }
                         InterpValue::Boxed(Value::null())
@@ -213,14 +218,16 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         args,
                     } => {
                         let recv_val = get_val(&values, *receiver)?.to_value();
-                        let mut arg_vals = vec![recv_val];
+                        let mut arg_vals: SmallVec<[Value; 8]> =
+                            SmallVec::with_capacity(1 + args.len());
+                        arg_vals.push(recv_val);
                         for arg in args {
                             arg_vals.push(get_val(&values, *arg)?.to_value());
                         }
 
                         // If receiver is a closure and method is call(...), dispatch directly
-                        let method_name_str = vm.interner.resolve(*method).to_string();
-                        if method_name_str.starts_with("call") && recv_val.is_object() {
+                        let is_call = vm.interner.resolve(*method).starts_with("call");
+                        if is_call && recv_val.is_object() {
                             let ptr = recv_val.as_object().unwrap();
                             let header = ptr as *const ObjHeader;
                             if unsafe { (*header).obj_type } == ObjType::Closure {
@@ -242,16 +249,20 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
 
                         let class = vm.class_of(recv_val);
-                        let mut method_entry = unsafe { (*class).find_method(*method).cloned() };
-                        // Track which class the method was found on (for super dispatch)
-                        let mut defining_class: Option<*mut ObjClass> =
-                            unsafe { find_method_class(class, *method) };
+                        // Single walk: find method and its defining class in one pass
+                        let (mut method_entry, mut defining_class) =
+                            match unsafe { find_method_with_class(class, *method) } {
+                                Some((m, c)) => (Some(m), Some(c)),
+                                None => (None, None),
+                            };
 
                         // If not found and receiver IS a class, try static method
                         // on the class itself. Core library stores statics with
                         // "static:" prefix (e.g. "static:print(_)").
                         if method_entry.is_none() && class == vm.class_class {
-                            let static_name = format!("static:{}", method_name_str);
+                            // Only allocate the "static:..." string on this cold path
+                            let method_str = vm.interner.resolve(*method).to_string();
+                            let static_name = format!("static:{}", method_str);
                             let static_sym = vm.interner.intern(&static_name);
                             let recv_class_ptr = recv_val.as_object().unwrap() as *mut ObjClass;
                             method_entry =
@@ -354,7 +365,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                     SuperCall { method, args } => {
                         // args[0] is `this`, rest are actual arguments
-                        let mut arg_vals: Vec<Value> = Vec::with_capacity(args.len());
+                        let mut arg_vals: SmallVec<[Value; 8]> =
+                            SmallVec::with_capacity(args.len());
                         for arg in args {
                             arg_vals.push(get_val(&values, *arg)?.to_value());
                         }
@@ -372,23 +384,28 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         });
 
                         if let Some(super_cls) = superclass {
-                            let mut method_entry =
-                                unsafe { (*super_cls).find_method(*method).cloned() };
+                            // Single-pass lookup: get method + defining class together
+                            let found = unsafe { find_method_with_class(super_cls, *method) };
                             // If not found, try with "static:" prefix (for super constructor calls)
-                            if method_entry.is_none() {
-                                let method_name = vm.interner.resolve(*method).to_string();
-                                let static_name = format!("static:{}", method_name);
-                                let static_sym = vm.interner.intern(&static_name);
-                                method_entry =
-                                    unsafe { (*super_cls).find_method(static_sym).cloned() };
-                            }
+                            let (method_entry, found_class) = match found {
+                                Some((m, c)) => (Some(m), Some(c)),
+                                None => {
+                                    let method_name = vm.interner.resolve(*method).to_string();
+                                    let static_name = format!("static:{}", method_name);
+                                    let static_sym = vm.interner.intern(&static_name);
+                                    match unsafe {
+                                        find_method_with_class(super_cls, static_sym)
+                                    } {
+                                        Some((m, c)) => (Some(m), Some(c)),
+                                        None => (None, None),
+                                    }
+                                }
+                            };
                             match method_entry {
                                 Some(Method::Native(func)) => {
                                     InterpValue::Boxed(func(vm, &arg_vals))
                                 }
                                 Some(Method::Closure(closure_ptr)) => {
-                                    let found_class =
-                                        unsafe { find_method_class(super_cls, *method) };
                                     dispatch_closure_with_class(
                                         vm,
                                         fiber,
@@ -404,8 +421,6 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                     continue 'fiber_loop;
                                 }
                                 Some(Method::Constructor(closure_ptr)) => {
-                                    let found_class =
-                                        unsafe { find_method_class(super_cls, *method) };
                                     dispatch_closure_with_class(
                                         vm,
                                         fiber,
@@ -441,14 +456,15 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     // -- Subscript --
                     SubscriptGet { receiver, args } => {
                         let recv = get_val(&values, *receiver)?.to_value();
-                        let mut all_args = vec![recv];
+                        let mut all_args: SmallVec<[Value; 4]> =
+                            SmallVec::with_capacity(1 + args.len());
+                        all_args.push(recv);
                         for a in args {
                             all_args.push(get_val(&values, *a)?.to_value());
                         }
                         let class = vm.class_of(recv);
-                        // Build signature: [_] or [_,_] etc based on arg count
-                        let sig = format!("[{}]", vec!["_"; args.len()].join(","));
-                        let sym = vm.interner.intern(&sig);
+                        // Use static strings for common arities to avoid format! allocation
+                        let sym = subscript_get_sym(vm, args.len());
                         match unsafe { (*class).find_method(sym).cloned() } {
                             Some(Method::Native(func)) => InterpValue::Boxed(func(vm, &all_args)),
                             Some(Method::Closure(closure_ptr)) => {
@@ -467,8 +483,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             }
                             _ => {
                                 return Err(RuntimeError::Unsupported(format!(
-                                    "subscript get with sig '{}'",
-                                    sig
+                                    "subscript get with arity {}",
+                                    args.len()
                                 )))
                             }
                         }
@@ -479,15 +495,16 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         value,
                     } => {
                         let recv = get_val(&values, *receiver)?.to_value();
-                        let mut all_args = vec![recv];
+                        let mut all_args: SmallVec<[Value; 4]> =
+                            SmallVec::with_capacity(2 + args.len());
+                        all_args.push(recv);
                         for a in args {
                             all_args.push(get_val(&values, *a)?.to_value());
                         }
                         all_args.push(get_val(&values, *value)?.to_value());
                         let class = vm.class_of(recv);
-                        // Build signature: [_]=(_) or [_,_]=(_) etc
-                        let sig = format!("[{}]=(_)", vec!["_"; args.len()].join(","));
-                        let sym = vm.interner.intern(&sig);
+                        // Use static strings for common arities to avoid format! allocation
+                        let sym = subscript_set_sym(vm, args.len());
                         match unsafe { (*class).find_method(sym).cloned() } {
                             Some(Method::Native(func)) => InterpValue::Boxed(func(vm, &all_args)),
                             Some(Method::Closure(closure_ptr)) => {
@@ -506,8 +523,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             }
                             _ => {
                                 return Err(RuntimeError::Unsupported(format!(
-                                    "subscript set with sig '{}'",
-                                    sig
+                                    "subscript set with arity {}",
+                                    args.len()
                                 )))
                             }
                         }
@@ -562,12 +579,11 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     // -- Type checking --
                     IsType(val_id, class_sym) => {
                         let value = get_val(&values, *val_id)?.to_value();
-                        let target_name = vm.interner.resolve(*class_sym).to_string();
+                        // Compare SymbolIds (u32 ==) instead of allocating and comparing strings
                         let mut cls = vm.class_of(value);
                         let mut matched = false;
                         while !cls.is_null() {
-                            let name = unsafe { vm.interner.resolve((*cls).name).to_string() };
-                            if name == target_name {
+                            if unsafe { (*cls).name } == *class_sym {
                                 matched = true;
                                 break;
                             }
@@ -749,7 +765,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     },
                 };
 
-                values.insert(*dst, result);
+                set_val(&mut values, *dst, result);
             }
 
             // -- Terminator --
@@ -782,12 +798,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                     if let Some(dst) = return_dst {
                         unsafe {
-                            (*fiber)
-                                .mir_frames
-                                .last_mut()
-                                .unwrap()
-                                .values
-                                .insert(dst, InterpValue::Boxed(return_val));
+                            let frame = (*fiber).mir_frames.last_mut().unwrap();
+                            set_val(&mut frame.values, dst, InterpValue::Boxed(return_val));
                         }
                     }
                     continue 'fiber_loop;
@@ -813,12 +825,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                     if let Some(dst) = return_dst {
                         unsafe {
-                            (*fiber)
-                                .mir_frames
-                                .last_mut()
-                                .unwrap()
-                                .values
-                                .insert(dst, InterpValue::Boxed(Value::null()));
+                            let frame = (*fiber).mir_frames.last_mut().unwrap();
+                            set_val(&mut frame.values, dst, InterpValue::Boxed(Value::null()));
                         }
                     }
                     continue 'fiber_loop;
@@ -888,11 +896,12 @@ pub fn eval_in_vm(
     let fiber = vm.gc.alloc_fiber();
     unsafe {
         (*fiber).header.class = vm.fiber_class;
+        let reg_file = new_register_file(func);
         (*fiber).mir_frames.push(MirCallFrame {
             func_id,
             current_block: BlockId(0),
             ip: 0,
-            values: HashMap::new(),
+            values: reg_file,
             module_name: module_name.clone(),
             return_dst: None,
             closure: None,
@@ -918,31 +927,46 @@ pub fn eval_in_vm(
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[inline(always)]
 fn get_val(
-    values: &HashMap<ValueId, InterpValue>,
+    values: &[InterpValue],
     id: ValueId,
 ) -> Result<InterpValue, RuntimeError> {
-    values
-        .get(&id)
-        .copied()
-        .ok_or_else(|| RuntimeError::Error(format!("undefined value {:?}", id)))
+    let idx = id.0 as usize;
+    if idx < values.len() {
+        Ok(values[idx])
+    } else {
+        Err(RuntimeError::Error(format!("undefined value {:?}", id)))
+    }
+}
+
+/// Store a value into the register file, growing it if necessary.
+#[inline(always)]
+fn set_val(values: &mut Vec<InterpValue>, id: ValueId, val: InterpValue) {
+    let idx = id.0 as usize;
+    if idx >= values.len() {
+        values.resize(idx + 1, UNDEF);
+    }
+    values[idx] = val;
+}
+
+/// Create a register file pre-sized for a MIR function.
+#[inline]
+fn new_register_file(mir: &MirFunction) -> Vec<InterpValue> {
+    vec![UNDEF; mir.next_value as usize]
 }
 
 fn bind_block_params(
-    values: &mut HashMap<ValueId, InterpValue>,
+    values: &mut Vec<InterpValue>,
     target_block: &crate::mir::BasicBlock,
     args: &[ValueId],
 ) -> Result<(), RuntimeError> {
-    let arg_vals: Vec<InterpValue> = args
-        .iter()
-        .map(|a| get_val(values, *a))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // First try .params (used by for-loops, ternary merges, etc.)
+    // Direct single-pass: read each arg and store into the target param slot.
     if !target_block.params.is_empty() {
         for (i, (dst, _ty)) in target_block.params.iter().enumerate() {
-            if i < arg_vals.len() {
-                values.insert(*dst, arg_vals[i]);
+            if i < args.len() {
+                let val = get_val(values, args[i])?;
+                set_val(values, *dst, val);
             }
         }
         return Ok(());
@@ -952,8 +976,9 @@ fn bind_block_params(
     for (dst, inst) in &target_block.instructions {
         if let Instruction::BlockParam(param_idx) = inst {
             let idx = *param_idx as usize;
-            if idx < arg_vals.len() {
-                values.insert(*dst, arg_vals[idx]);
+            if idx < args.len() {
+                let val = get_val(values, args[idx])?;
+                set_val(values, *dst, val);
             }
         }
     }
@@ -969,7 +994,7 @@ fn dispatch_closure(
     arg_vals: &[Value],
     current_block: &mut BlockId,
     ip: usize,
-    values: HashMap<ValueId, InterpValue>,
+    values: Vec<InterpValue>,
     module_name: &str,
     return_dst: ValueId,
 ) -> Result<(), RuntimeError> {
@@ -996,7 +1021,7 @@ fn dispatch_closure_with_class(
     arg_vals: &[Value],
     current_block: &mut BlockId,
     ip: usize,
-    values: HashMap<ValueId, InterpValue>,
+    values: Vec<InterpValue>,
     module_name: &str,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
@@ -1019,12 +1044,12 @@ fn dispatch_closure_with_class(
 
     // Bind args to entry block params using BlockParam index
     let entry_block = &target_mir.blocks[0];
-    let mut new_values: HashMap<ValueId, InterpValue> = HashMap::new();
+    let mut new_values = new_register_file(&target_mir);
     for (dst, inst) in &entry_block.instructions {
         if let Instruction::BlockParam(param_idx) = inst {
             let idx = *param_idx as usize;
             if idx < arg_vals.len() {
-                new_values.insert(*dst, InterpValue::Boxed(arg_vals[idx]));
+                set_val(&mut new_values, *dst, InterpValue::Boxed(arg_vals[idx]));
             }
         }
     }
@@ -1066,7 +1091,7 @@ fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
     unsafe {
         if let Some(dst) = (*caller).resume_value_dst.take() {
             if let Some(frame) = (*caller).mir_frames.last_mut() {
-                frame.values.insert(dst, InterpValue::Boxed(value));
+                set_val(&mut frame.values, dst, InterpValue::Boxed(value));
             }
         }
     }
@@ -1081,7 +1106,7 @@ fn handle_fiber_action(
     action: FiberAction,
     current_block: BlockId,
     ip: usize,
-    values: HashMap<ValueId, InterpValue>,
+    values: Vec<InterpValue>,
     call_dst: ValueId,
 ) -> Result<(), RuntimeError> {
     // Save current fiber's execution state
@@ -1107,7 +1132,7 @@ fn handle_fiber_action(
                 unsafe {
                     if let Some(dst) = (*target).resume_value_dst.take() {
                         if let Some(frame) = (*target).mir_frames.last_mut() {
-                            frame.values.insert(dst, InterpValue::Boxed(value));
+                            set_val(&mut frame.values, dst, InterpValue::Boxed(value));
                         }
                     }
                 }
@@ -1145,7 +1170,7 @@ fn handle_fiber_action(
                 unsafe {
                     if let Some(dst) = (*target).resume_value_dst.take() {
                         if let Some(frame) = (*target).mir_frames.last_mut() {
-                            frame.values.insert(dst, InterpValue::Boxed(value));
+                            set_val(&mut frame.values, dst, InterpValue::Boxed(value));
                         }
                     }
                 }
@@ -1199,20 +1224,53 @@ fn operator_dispatch_info(inst: &Instruction) -> Option<(ValueId, &'static str, 
     }
 }
 
-/// Walk the class hierarchy starting from `cls` to find which class owns `method`.
-/// Returns `Some(cls)` for the class that has the method in its own table.
-unsafe fn find_method_class(
+/// Walk the class hierarchy starting from `cls` to find the method and its defining class
+/// in a single pass. Returns `(Method, *mut ObjClass)` or None.
+unsafe fn find_method_with_class(
     cls: *mut ObjClass,
     method: crate::intern::SymbolId,
-) -> Option<*mut ObjClass> {
+) -> Option<(Method, *mut ObjClass)> {
     let mut c = cls;
     while !c.is_null() {
-        if (*c).methods.contains_key(&method) {
-            return Some(c);
+        if let Some(m) = (*c).methods.get(&method) {
+            return Some((m.clone(), c));
         }
         c = (*c).superclass;
     }
     None
+}
+
+/// Return the interned SymbolId for a subscript-get signature of the given arity.
+/// Uses static strings for arities 1-4 to avoid `format!` allocation on the hot path.
+#[inline]
+fn subscript_get_sym(vm: &mut VM, arity: usize) -> crate::intern::SymbolId {
+    let sig: &str = match arity {
+        1 => "[_]",
+        2 => "[_,_]",
+        3 => "[_,_,_]",
+        4 => "[_,_,_,_]",
+        _ => {
+            let s = format!("[{}]", vec!["_"; arity].join(","));
+            return vm.interner.intern(&s);
+        }
+    };
+    vm.interner.intern(sig)
+}
+
+/// Return the interned SymbolId for a subscript-set signature of the given arity.
+#[inline]
+fn subscript_set_sym(vm: &mut VM, arity: usize) -> crate::intern::SymbolId {
+    let sig: &str = match arity {
+        1 => "[_]=(_)",
+        2 => "[_,_]=(_)",
+        3 => "[_,_,_]=(_)",
+        4 => "[_,_,_,_]=(_)",
+        _ => {
+            let s = format!("[{}]=(_)", vec!["_"; arity].join(","));
+            return vm.interner.intern(&s);
+        }
+    };
+    vm.interner.intern(sig)
 }
 
 pub fn value_to_string(vm: &VM, value: Value) -> String {
@@ -1549,6 +1607,7 @@ mod tests {
             .push((v0, Instruction::ConstNum(77.0)));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
+        let reg_size = f.next_value as usize;
         let func_id = vm.engine.register_function(f);
         let fiber = vm.gc.alloc_fiber();
         unsafe {
@@ -1557,7 +1616,7 @@ mod tests {
                 func_id,
                 current_block: BlockId(0),
                 ip: 0,
-                values: HashMap::new(),
+                values: vec![UNDEF; reg_size],
                 module_name: "__test__".to_string(),
                 return_dst: None,
                 closure: None,
@@ -1579,6 +1638,7 @@ mod tests {
         let bb = f.new_block();
         f.block_mut(bb).terminator = Terminator::ReturnNull;
 
+        let reg_size = f.next_value as usize;
         let func_id = vm.engine.register_function(f);
         let fiber = vm.gc.alloc_fiber();
         unsafe {
@@ -1588,7 +1648,7 @@ mod tests {
                 func_id,
                 current_block: BlockId(0),
                 ip: 0,
-                values: HashMap::new(),
+                values: vec![UNDEF; reg_size],
                 module_name: "__test__".to_string(),
                 return_dst: None,
                 closure: None,

@@ -35,6 +35,9 @@ const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 pub struct Value(u64);
 
 impl Value {
+    /// Compile-time undefined sentinel for use in const contexts.
+    pub const UNDEFINED: Value = Value(TAG_UNDEFINED);
+
     // -- Constructors -------------------------------------------------------
 
     /// Box an f64 number.

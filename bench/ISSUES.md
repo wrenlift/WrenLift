@@ -2,33 +2,75 @@
 
 Discovered during benchmark comparison against standard Wren 0.4.0.
 
-## Current Results (Apple M3, release build, best of 5 runs)
+## Current Results (Apple M3, release build, best of 3 runs)
 
 | Benchmark       | WrenLift   | Wren 0.4 | Ratio  | Status               |
 |-----------------|------------|----------|--------|----------------------|
-| Recursive Fib   | 4.76s      | 0.17s    | 27.2x  | Runs, but very slow  |
-| Method Call     | 2.51s      | 0.08s    | 29.8x  | Runs, but very slow  |
+| Recursive Fib   | 2.16s      | 0.17s    | 12.4x  | Runs, improving      |
+| Method Call     | 1.14s      | 0.08s    | 13.5x  | Runs, improving      |
 | Binary Trees    | CRASH      | 0.98s    | —      | SIGABRT at depth ~10 |
 | DeltaBlue       | COMPILE_ERR| —        | —      | Blocked by Issue 4   |
 
+*History: original 27.2x/29.8x → P2 hot-path fixes 24.0x/25.4x → Vec registers 12.4x/13.5x*
+
 ---
 
-## Issue 1: MIR interpreter is ~30x slower than Wren's bytecode VM
+## Issue 1: MIR interpreter is ~13x slower than Wren's bytecode VM
 
 **Severity:** Performance
 **Benchmarks affected:** All
 
-**Root cause:** The MIR interpreter (`vm_interp.rs`) uses `HashMap<ValueId, InterpValue>` for each call frame's register file. Every instruction does multiple hash lookups (get operands, insert result). Standard Wren uses a compact bytecode VM with a flat value stack — no hash lookups, pure array indexing.
+### 1a. HashMap register file (highest impact)
 
-**Fix plan (ordered by impact):**
+**File:** `src/runtime/object.rs:721` — `MirCallFrame.values: HashMap<ValueId, InterpValue>`
+**Hot path:** `vm_interp.rs:752` `values.insert()` per instruction, `vm_interp.rs:928` `values.get()` per operand.
 
-1. **Replace HashMap with Vec-based register file.** Assign each `ValueId` a dense u32 index during MIR construction (they're already sequential). Use `Vec<InterpValue>` indexed by that u32. Eliminates the #1 bottleneck — hash map operations account for the majority of interpreter time.
+Every instruction does 2-4 HashMap lookups (get operands + insert result). ValueId is a dense u32.
 
-2. **Flatten MIR to linear bytecode.** Currently walking `block.instructions` (a `Vec<(ValueId, Instruction)>`) with pattern-matching on enum variants. A flat bytecode representation with opcode bytes and operand slots would enable faster dispatch (computed goto / match on u8 instead of large enum).
+**Fix:** Replace `HashMap<ValueId, InterpValue>` with `Vec<InterpValue>` indexed by `ValueId.0 as usize`. O(1) array index vs O(1)-amortized hash probe (~3-4x speedup on value access alone).
 
-3. **Tier up earlier for hot loops.** The JIT already works for arithmetic-heavy code. Lower the default `jit_threshold` so hot functions like `Fib.calc` compile to native code within the first few iterations, eliminating interpreter overhead entirely for the hot path.
+### 1b. String allocations in dispatch hot path
 
-**Expected impact:** Step 1 alone should bring the ratio from ~30x to ~5-8x. Steps 1+3 together should approach parity on numeric benchmarks.
+Every method call allocates strings that could be avoided:
+
+| Location | Pattern | Why unnecessary |
+|----------|---------|-----------------|
+| `vm_interp.rs:222` | `vm.interner.resolve(*method).to_string()` for `starts_with("call")` check | Compare against interned "call" SymbolId instead |
+| `vm_interp.rs:254` | `format!("static:{}", method_name_str)` | Pre-intern static prefixed symbols at class bind time |
+| `vm_interp.rs:450` | `format!("[{}]", vec!["_"; n].join(","))` per subscript | Cache the 5 common signatures `[_]`..`[_,_,_,_,_]` |
+| `vm_interp.rs:489` | `format!("[{}]=(_)", ...)` per subscript set | Same — pre-intern |
+| `vm_interp.rs:569` | `to_string()` per class in IsType hierarchy walk | Compare `SymbolId` (u32 ==) instead of String == |
+
+### 1c. Double method lookup per call
+
+`vm_interp.rs:245-248` — calls `find_method()` then `find_method_class()`, both walking the full superclass chain with HashMap lookups.
+
+**Fix:** Single `find_method_with_class()` that returns `(Method, *mut ObjClass)` in one pass.
+
+### 1d. Vec allocation per method call
+
+`vm_interp.rs:216-219` — `vec![recv_val]` + push args for every call. `vm_interp.rs:328` — `arg_vals.clone()` for constructors.
+
+**Fix:** Use a reusable `SmallVec<[Value; 8]>` or a thread-local scratch buffer. Most Wren methods have ≤4 args.
+
+### 1e. Block param binding allocations
+
+`vm_interp.rs:936` — `collect()` args into intermediate Vec, then insert each into HashMap.
+
+**Fix:** Direct single-pass: read each arg from values and insert the target param in one loop.
+
+### Expected impact
+
+| Fix | Estimated speedup | Effort |
+|-----|-------------------|--------|
+| 1a (Vec registers) | 3-5x | Medium — touch MirCallFrame + all access sites |
+| 1b (kill string allocs) | 1.5-2x | Small — targeted changes |
+| 1c (single method walk) | 1.1-1.3x | Small — refactor one function |
+| 1d (SmallVec args) | 1.1-1.2x | Small — swap Vec for SmallVec |
+| 1e (block param pass) | 1.05x | Trivial |
+| **Combined** | **~5-10x** | |
+
+Steps 1a+1b alone should bring ratio from 30x → ~5-8x. JIT tier-up would eliminate the remaining gap.
 
 ---
 
@@ -116,4 +158,6 @@ In standard Wren, bare identifiers inside a method body that don't match any loc
 | **P0** | Issue 4 (implicit this) | Blocks most real-world Wren programs |
 | **P0** | Issue 2 (super arity) | Blocks inheritance, a core language feature |
 | **P1** | Issue 3 (GC crash) | Blocks allocation-heavy workloads |
-| **P2** | Issue 1 (performance) | 30x gap, but correctness comes first |
+| **P2** | Issue 1b (string allocs) | Low-hanging fruit, ~2x improvement |
+| **P2** | Issue 1c-1e (dispatch overhead) | Small targeted fixes, ~1.3x combined |
+| **P3** | Issue 1a (Vec registers) | Biggest perf win but most invasive change |
