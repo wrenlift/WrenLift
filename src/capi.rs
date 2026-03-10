@@ -27,6 +27,7 @@
 use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
 use std::ptr;
 
+use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use crate::runtime::value::Value;
 use crate::runtime::vm::{VMConfig, VM};

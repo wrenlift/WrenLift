@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::ptr;
 
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
-use super::gc::Gc;
+use super::gc_trait::{GcAllocator, GcImpl, GcStrategy};
 use super::object::*;
 use super::value::Value;
 use crate::intern::{Interner, SymbolId};
@@ -84,6 +84,8 @@ pub struct VMConfig {
     pub step_limit: usize,
     /// Maximum call frame depth before aborting (default: 1024).
     pub max_call_depth: usize,
+    /// GC strategy to use.
+    pub gc_strategy: GcStrategy,
 }
 
 impl Default for VMConfig {
@@ -103,6 +105,7 @@ impl Default for VMConfig {
             fiber_stack_traces: false,
             step_limit: 1_000_000_000,
             max_call_depth: 1024,
+            gc_strategy: GcStrategy::default(),
         }
     }
 }
@@ -122,7 +125,7 @@ pub struct WrenHandle {
 
 pub struct VM {
     // -- Memory --
-    pub gc: Gc,
+    pub gc: GcImpl,
     pub interner: Interner,
 
     // -- Core classes --
@@ -203,7 +206,7 @@ impl VM {
     /// Create a new VM with the given configuration.
     pub fn new(config: VMConfig) -> Self {
         let mut vm = Self {
-            gc: Gc::new(),
+            gc: GcImpl::new(config.gc_strategy),
             interner: Interner::new(),
 
             object_class: ptr::null_mut(),

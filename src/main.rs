@@ -11,6 +11,7 @@ use wren_lift::mir::opt::{
 };
 use wren_lift::parse::{lexer, parser};
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
+use wren_lift::runtime::gc_trait::{GcAllocator, GcStrategy};
 use wren_lift::runtime::vm::{VMConfig, VM};
 use wren_lift::sema;
 
@@ -69,6 +70,20 @@ struct Cli {
     /// Defaults to 1B (interpreter) or 10B (tiered/jit).
     #[arg(long)]
     step_limit: Option<usize>,
+
+    /// Garbage collector strategy.
+    #[arg(long, value_enum, default_value_t = GcMode::Generational)]
+    gc: GcMode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GcMode {
+    /// Generational nursery + old gen mark-sweep (default).
+    Generational,
+    /// Allocate-only, free on drop. Best for short-lived scripts / benchmarks.
+    Arena,
+    /// Simple non-generational mark-sweep.
+    MarkSweep,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -107,9 +122,15 @@ fn make_vm(cli: &Cli) -> VM {
         ExecutionMode::Interpreter => 1_000_000_000,
         _ => 10_000_000_000, // tiered/jit: 10x headroom since JIT code doesn't count steps
     });
+    let gc_strategy = match cli.gc {
+        GcMode::Generational => GcStrategy::Generational,
+        GcMode::Arena => GcStrategy::Arena,
+        GcMode::MarkSweep => GcStrategy::MarkSweep,
+    };
     let config = VMConfig {
         execution_mode: mode,
         step_limit,
+        gc_strategy,
         ..VMConfig::default()
     };
     VM::new(config)
@@ -194,7 +215,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
     }
 
     if cli.gc_stats {
-        let stats = &vm.gc.stats;
+        let stats = vm.gc.stats();
         eprintln!("--- GC Stats ---");
         eprintln!("  minor collections: {}", stats.minor_collections);
         eprintln!("  major collections: {}", stats.major_collections);

@@ -1,3 +1,4 @@
+use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::object::{
     MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjList, ObjMap, ObjString, ObjType,
 };
