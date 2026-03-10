@@ -170,6 +170,37 @@ fn insert_speculative_guards(mir: &mut MirFunction) {
     }
 }
 
+/// Check if a MIR function is a "leaf" — no instructions that generate runtime calls.
+/// Leaf functions only do inline operations (field access, arithmetic, comparisons)
+/// so they don't need GC root pushing or JIT context setup.
+fn is_mir_leaf(mir: &MirFunction) -> bool {
+    use crate::mir::Instruction;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            match inst {
+                // These generate runtime calls (allocation, dispatch, context access):
+                Instruction::Call { .. }
+                | Instruction::SuperCall { .. }
+                | Instruction::MakeList(_)
+                | Instruction::MakeMap(_)
+                | Instruction::MakeRange { .. }
+                | Instruction::MakeClosure { .. }
+                | Instruction::StringConcat(_)
+                | Instruction::ToString(_)
+                | Instruction::GetUpvalue(_)
+                | Instruction::SetUpvalue(_, _)
+                | Instruction::GetModuleVar(_)
+                | Instruction::SetModuleVar(_, _)
+                | Instruction::GetStaticField(_)
+                | Instruction::SetStaticField(_, _) => return false,
+                // Everything else is inline (field access, arithmetic, guards, etc.)
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 /// The execution engine: owns all function bodies, dispatches calls,
 /// and manages tiered compilation.
 ///
@@ -196,6 +227,12 @@ pub struct ExecutionEngine {
     pending_count: u32,
     /// Join handle for the current compilation thread (at most 1 at a time).
     compile_handle: Option<std::thread::JoinHandle<()>>,
+    /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
+    /// null_ptr entries mean the function is not yet compiled.
+    pub jit_code: Vec<*const u8>,
+    /// Whether each JIT-compiled function is a "leaf" (no runtime calls).
+    /// Leaf functions don't need GC root pushing or JIT context setup.
+    pub jit_leaf: Vec<bool>,
 }
 
 /// Per-module execution state.
@@ -230,6 +267,8 @@ impl ExecutionEngine {
             compiling: Vec::new(),
             pending_count: 0,
             compile_handle: None,
+            jit_code: Vec::new(),
+            jit_leaf: Vec::new(),
         }
     }
 
@@ -242,6 +281,8 @@ impl ExecutionEngine {
             call_count: 0,
         });
         self.compiling.push(false);
+        self.jit_code.push(std::ptr::null());
+        self.jit_leaf.push(false);
         id
     }
 
@@ -441,11 +482,27 @@ impl ExecutionEngine {
         while let Ok(result) = self.compilation_rx.try_recv() {
             let idx = result.id.0 as usize;
             if idx < self.functions.len() {
+                // Cache native code pointer for O(1) dispatch lookup.
+                let native_ptr = if result.executable.is_native() {
+                    result.executable.native_ptr()
+                } else {
+                    std::ptr::null()
+                };
                 self.functions[idx] = FuncBody::Compiled {
                     executable: result.executable,
                     mir: result.mir,
                     bytecode: result.bytecode,
                 };
+                // Grow jit_code/jit_leaf if needed (shouldn't be, but defensive).
+                if idx >= self.jit_code.len() {
+                    self.jit_code.resize(idx + 1, std::ptr::null());
+                    self.jit_leaf.resize(idx + 1, false);
+                }
+                self.jit_code[idx] = native_ptr;
+                // Detect leaf functions: no runtime calls needed → skip GC roots + JIT context.
+                if let Some(body) = self.functions.get(idx) {
+                    self.jit_leaf[idx] = is_mir_leaf(body.mir());
+                }
             }
             if idx < self.compiling.len() {
                 self.compiling[idx] = false;

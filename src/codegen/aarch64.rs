@@ -297,15 +297,18 @@ fn emit_inst(
         }
 
         FMSub { dst, a, b, c } => {
-            dynasm!(asm ; fmsub D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
+            // MachInst: dst = a*b - c → ARM64 fnmsub: Fn*Fm - Fa
+            dynasm!(asm ; fnmsub D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
         }
 
         FNMAdd { dst, a, b, c } => {
-            dynasm!(asm ; fnmadd D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
+            // MachInst: dst = -(a*b) + c = c - a*b → ARM64 fmsub: Fa - Fn*Fm
+            dynasm!(asm ; fmsub D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
         }
 
         FNMSub { dst, a, b, c } => {
-            dynasm!(asm ; fnmsub D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
+            // MachInst: dst = -(a*b) - c → ARM64 fnmadd: -(Fa + Fn*Fm)
+            dynasm!(asm ; fnmadd D(fp(*dst)), D(fp(*a)), D(fp(*b)), D(fp(*c)));
         }
 
         // =================================================================

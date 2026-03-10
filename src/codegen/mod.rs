@@ -1608,6 +1608,10 @@ struct LowerCtx<'a> {
     interner: &'a crate::intern::Interner,
     /// Whether we're currently lowering the entry block (block 0).
     in_entry_block: bool,
+    /// MIR ValueId → defining Instruction, indexed by ValueId.0 (for FMA pattern detection).
+    def_map: Vec<Option<Instruction>>,
+    /// MIR ValueId → use count, indexed by ValueId.0 (for FMA: only fold if mul has single use).
+    use_count: Vec<u32>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1622,6 +1626,32 @@ impl<'a> LowerCtx<'a> {
             let label = mf.new_label();
             block_labels.insert(block.id, label);
         }
+        // Build def-map and use-count for FMA pattern detection.
+        // Vec indexed by ValueId.0 for O(1) lookup.
+        let max_val = mir.next_value as usize;
+        let mut def_map: Vec<Option<Instruction>> = vec![None; max_val];
+        let mut use_count: Vec<u32> = vec![0; max_val];
+        for block in &mir.blocks {
+            for (vid, inst) in &block.instructions {
+                let idx = vid.0 as usize;
+                if idx < max_val {
+                    def_map[idx] = Some(inst.clone());
+                }
+                for op in inst.operands() {
+                    let oi = op.0 as usize;
+                    if oi < max_val {
+                        use_count[oi] += 1;
+                    }
+                }
+            }
+            for op in block.terminator.operands() {
+                let oi = op.0 as usize;
+                if oi < max_val {
+                    use_count[oi] += 1;
+                }
+            }
+        }
+
         Self {
             mf,
             mir,
@@ -1629,6 +1659,8 @@ impl<'a> LowerCtx<'a> {
             block_labels,
             interner,
             in_entry_block: false,
+            def_map,
+            use_count,
         }
     }
 
@@ -2822,7 +2854,65 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// Check if a ValueId is defined by MulF64 and has exactly one use (fusable).
+    fn try_fma_mul(&self, val: ValueId) -> Option<(ValueId, ValueId)> {
+        let idx = val.0 as usize;
+        if idx >= self.use_count.len() || self.use_count[idx] != 1 {
+            return None;
+        }
+        match self.def_map.get(idx)?.as_ref()? {
+            Instruction::MulF64(a, b) => Some((*a, *b)),
+            _ => None,
+        }
+    }
+
     fn emit_fp_binop(&mut self, dst_val: ValueId, a: ValueId, b: ValueId, op: FpBinOp) {
+        // FMA pattern detection: fold mul+add/sub into fused multiply-add.
+        // Only when the mul result has a single use (otherwise keep separate).
+        match op {
+            FpBinOp::Add => {
+                // AddF64(MulF64(x, y), c) → FMAdd(x, y, c)
+                if let Some((mx, my)) = self.try_fma_mul(a) {
+                    let lx = self.fp_vreg_for(mx);
+                    let ly = self.fp_vreg_for(my);
+                    let lc = self.fp_vreg_for(b);
+                    let dst = self.fp_vreg_for(dst_val);
+                    self.mf.emit(MachInst::FMAdd { dst, a: lx, b: ly, c: lc });
+                    return;
+                }
+                // AddF64(c, MulF64(x, y)) → FMAdd(x, y, c)
+                if let Some((mx, my)) = self.try_fma_mul(b) {
+                    let lx = self.fp_vreg_for(mx);
+                    let ly = self.fp_vreg_for(my);
+                    let lc = self.fp_vreg_for(a);
+                    let dst = self.fp_vreg_for(dst_val);
+                    self.mf.emit(MachInst::FMAdd { dst, a: lx, b: ly, c: lc });
+                    return;
+                }
+            }
+            FpBinOp::Sub => {
+                // SubF64(MulF64(x, y), c) → FMSub(x, y, c): x*y - c
+                if let Some((mx, my)) = self.try_fma_mul(a) {
+                    let lx = self.fp_vreg_for(mx);
+                    let ly = self.fp_vreg_for(my);
+                    let lc = self.fp_vreg_for(b);
+                    let dst = self.fp_vreg_for(dst_val);
+                    self.mf.emit(MachInst::FMSub { dst, a: lx, b: ly, c: lc });
+                    return;
+                }
+                // SubF64(c, MulF64(x, y)) → FNMAdd(x, y, c): -(x*y) + c = c - x*y
+                if let Some((mx, my)) = self.try_fma_mul(b) {
+                    let lx = self.fp_vreg_for(mx);
+                    let ly = self.fp_vreg_for(my);
+                    let lc = self.fp_vreg_for(a);
+                    let dst = self.fp_vreg_for(dst_val);
+                    self.mf.emit(MachInst::FNMAdd { dst, a: lx, b: ly, c: lc });
+                    return;
+                }
+            }
+            _ => {}
+        }
+
         let la = self.fp_vreg_for(a);
         let lb = self.fp_vreg_for(b);
         let dst = self.fp_vreg_for(dst_val);
@@ -4259,8 +4349,40 @@ mod tests {
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn test_jit_execute_mul_sub() {
-        // MIR: (10.0 * 3.0) - 5.0 = 25.0
+    fn test_jit_execute_fma_add() {
+        // MIR: (2.0 * 3.0) + 1.0 = 7.0, should fuse to FMADD
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        let v3 = f.new_value();
+        let v4 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(2.0)));
+            b.instructions.push((v1, Instruction::ConstF64(3.0)));
+            b.instructions.push((v2, Instruction::MulF64(v0, v1)));
+            b.instructions.push((v3, Instruction::ConstF64(1.0)));
+            b.instructions.push((v4, Instruction::AddF64(v2, v3)));
+            b.terminator = Terminator::Return(v4);
+        }
+
+        let compiled = compile_function(&f, Target::Aarch64).unwrap();
+        let exec = compiled.into_executable().unwrap();
+
+        unsafe {
+            let func: extern "C" fn() -> u64 = exec.as_fn();
+            let result = f64::from_bits(func());
+            assert_eq!(result, 7.0, "JIT: (2*3)+1 should be 7 (FMADD), got {}", result);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_jit_execute_fma_sub() {
+        // MIR: (10.0 * 3.0) - 5.0 = 25.0, should fuse to FMSUB
         let mut interner = Interner::new();
         let mut f = make_mir(&mut interner);
         let bb = f.new_block();
@@ -4285,7 +4407,39 @@ mod tests {
         unsafe {
             let func: extern "C" fn() -> u64 = exec.as_fn();
             let result = f64::from_bits(func());
-            assert_eq!(result, 25.0, "JIT: (10*3)-5 should be 25, got {}", result);
+            assert_eq!(result, 25.0, "JIT: (10*3)-5 should be 25 (FMSUB), got {}", result);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_jit_execute_fma_neg_add() {
+        // MIR: 100.0 - (10.0 * 3.0) = 70.0, should fuse to FNMADD (c - a*b)
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        let bb = f.new_block();
+        let v0 = f.new_value();
+        let v1 = f.new_value();
+        let v2 = f.new_value();
+        let v3 = f.new_value();
+        let v4 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((v0, Instruction::ConstF64(10.0)));
+            b.instructions.push((v1, Instruction::ConstF64(3.0)));
+            b.instructions.push((v2, Instruction::MulF64(v0, v1)));
+            b.instructions.push((v3, Instruction::ConstF64(100.0)));
+            b.instructions.push((v4, Instruction::SubF64(v3, v2)));
+            b.terminator = Terminator::Return(v4);
+        }
+
+        let compiled = compile_function(&f, Target::Aarch64).unwrap();
+        let exec = compiled.into_executable().unwrap();
+
+        unsafe {
+            let func: extern "C" fn() -> u64 = exec.as_fn();
+            let result = f64::from_bits(func());
+            assert_eq!(result, 70.0, "JIT: 100-(10*3) should be 70 (FNMADD), got {}", result);
         }
     }
 

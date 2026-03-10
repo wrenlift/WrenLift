@@ -1512,59 +1512,56 @@ fn dispatch_closure_bc(
 ) -> Result<(), RuntimeError> {
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
+    let fn_idx = target_func_id.0 as usize;
 
-    // Tier-up profiling: request background compilation so compile time doesn't block execution.
-    if vm.engine.mode != ExecutionMode::Interpreter {
-        let should_tier_up = vm.engine.record_call(target_func_id);
-        if should_tier_up {
-            vm.engine.request_tier_up(target_func_id, &vm.interner);
-        }
-        // Install completed compilations so JIT dispatch can fire.
-        vm.engine.poll_compilations();
-    }
-
-    // JIT dispatch: if the function is compiled to native code and has ≤4 args,
-    // call it directly instead of pushing a bytecode frame.
+    // Fast JIT dispatch: check the Vec-indexed jit_code array (O(1) lookup).
+    // Skip tier-up profiling entirely for already-compiled functions.
     if vm.engine.mode != ExecutionMode::Interpreter && arg_vals.len() <= 4 {
-        // Extract native fn pointer first, then drop the borrow on vm.engine.
-        let native_fn_ptr: Option<*const u8> =
-            if let Some(crate::runtime::engine::FuncBody::Compiled { executable, .. }) =
-                vm.engine.get_function(target_func_id)
-            {
-                if executable.is_native() {
-                    Some(executable.native_ptr())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+        let native_fn_ptr = vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null());
 
-        if let Some(fn_ptr_raw) = native_fn_ptr {
-            // Root all argument values so GC can find them during native execution.
-            for &arg in arg_vals {
-                crate::codegen::runtime_fns::push_jit_root(arg);
+        if native_fn_ptr.is_null() {
+            // Not yet compiled: do tier-up profiling.
+            let should_tier_up = vm.engine.record_call(target_func_id);
+            if should_tier_up {
+                vm.engine.request_tier_up(target_func_id, &vm.interner);
             }
+            vm.engine.poll_compilations();
+        }
 
-            // Set up JIT context for runtime helpers.
-            let (module_vars_ptr, module_var_count) = vm
-                .engine
-                .modules
-                .get(module_name.as_str())
-                .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
-                .unwrap_or((std::ptr::null_mut(), 0));
-            crate::codegen::runtime_fns::set_jit_context(
-                crate::codegen::runtime_fns::JitContext {
-                    module_vars: module_vars_ptr,
-                    module_var_count,
-                    vm: vm as *mut VM as *mut u8,
-                    module_name: module_name.as_ptr(),
-                    module_name_len: module_name.len() as u32,
-                    closure: closure_ptr as *mut u8,
-                    defining_class: defining_class
-                        .unwrap_or(std::ptr::null_mut()) as *mut u8,
-                },
-            );
+        // Re-check after poll (might have just been installed).
+        let fn_ptr_raw = if native_fn_ptr.is_null() {
+            vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null())
+        } else {
+            native_fn_ptr
+        };
+
+        if !fn_ptr_raw.is_null() {
+            let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+
+            if !is_leaf {
+                // Non-leaf: full setup — GC roots + JIT context needed for runtime calls.
+                for &arg in arg_vals {
+                    crate::codegen::runtime_fns::push_jit_root(arg);
+                }
+                let (module_vars_ptr, module_var_count) = vm
+                    .engine
+                    .modules
+                    .get(module_name.as_str())
+                    .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+                    .unwrap_or((std::ptr::null_mut(), 0));
+                crate::codegen::runtime_fns::set_jit_context(
+                    crate::codegen::runtime_fns::JitContext {
+                        module_vars: module_vars_ptr,
+                        module_var_count,
+                        vm: vm as *mut VM as *mut u8,
+                        module_name: module_name.as_ptr(),
+                        module_name_len: module_name.len() as u32,
+                        closure: closure_ptr as *mut u8,
+                        defining_class: defining_class
+                            .unwrap_or(std::ptr::null_mut()) as *mut u8,
+                    },
+                );
+            }
 
             // Call native code with args as NaN-boxed u64 values.
             let result_bits = unsafe {
@@ -1606,8 +1603,9 @@ fn dispatch_closure_bc(
                 }
             };
 
-            // Native call returned — clear JIT roots, values are back in interpreter.
-            crate::codegen::runtime_fns::clear_jit_roots();
+            if !is_leaf {
+                crate::codegen::runtime_fns::clear_jit_roots();
+            }
 
             let result_val = Value::from_bits(result_bits);
             // Store result in caller's return_dst register
@@ -1624,6 +1622,16 @@ fn dispatch_closure_bc(
             }
             return Ok(());
         }
+    }
+
+    // Tier-up profiling for functions that didn't take the JIT fast path above
+    // (either >4 args, or interpreter mode).
+    if vm.engine.mode != ExecutionMode::Interpreter {
+        let should_tier_up = vm.engine.record_call(target_func_id);
+        if should_tier_up {
+            vm.engine.request_tier_up(target_func_id, &vm.interner);
+        }
+        vm.engine.poll_compilations();
     }
 
     // Get bytecode for target function (lazily compiled, survives tier-up).

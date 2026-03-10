@@ -21,6 +21,7 @@ use crate::runtime::value::Value;
 /// Context passed to JIT-compiled code via thread-local storage.
 /// Set by the interpreter before calling native code, read by runtime functions.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct JitContext {
     /// Pointer to module variable storage (Vec<Value> data pointer).
     pub module_vars: *mut u64,
@@ -54,15 +55,48 @@ impl Default for JitContext {
     }
 }
 
+// ---------------------------------------------------------------------------
+// JIT context and root set — using Cell/UnsafeCell for zero-overhead access.
+// thread_local! ensures test parallelism safety; Cell/UnsafeCell eliminates
+// RefCell borrow-checking overhead on the hot path.
+// ---------------------------------------------------------------------------
+
 thread_local! {
-    /// Thread-local JIT context — set before calling compiled code.
-    pub static JIT_CONTEXT: std::cell::RefCell<JitContext> = std::cell::RefCell::new(JitContext::default());
+    /// JIT context — Cell<JitContext> for zero-overhead get/set (JitContext is Copy).
+    static JIT_CTX: std::cell::Cell<JitContext> = const { std::cell::Cell::new(JitContext {
+        module_vars: std::ptr::null_mut(),
+        module_var_count: 0,
+        vm: std::ptr::null_mut(),
+        module_name: std::ptr::null(),
+        module_name_len: 0,
+        closure: std::ptr::null_mut(),
+        defining_class: std::ptr::null_mut(),
+    }) };
+
+    /// JIT root set — UnsafeCell for zero-overhead Vec mutation.
+    /// SAFETY: single-threaded access within each thread (no concurrent borrows).
+    static JIT_ROOTS_STORE: std::cell::UnsafeCell<Vec<Value>> = const { std::cell::UnsafeCell::new(Vec::new()) };
 }
 
-/// Set up the JIT context for the current thread before calling compiled code.
+/// Set up the JIT context before calling compiled code.
+#[inline(always)]
 pub fn set_jit_context(ctx: JitContext) {
-    JIT_CONTEXT.with(|c| {
-        *c.borrow_mut() = ctx;
+    JIT_CTX.with(|c| c.set(ctx));
+}
+
+/// Read the current JIT context.
+#[inline(always)]
+fn read_jit_ctx() -> JitContext {
+    JIT_CTX.with(|c| c.get())
+}
+
+/// Mutate the JIT context in place.
+#[inline(always)]
+fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
+    JIT_CTX.with(|c| {
+        let mut ctx = c.get();
+        f(&mut ctx);
+        c.set(ctx);
     });
 }
 
@@ -70,77 +104,61 @@ pub fn set_jit_context(ctx: JitContext) {
 // JIT root set — GC-visible heap pointers held by native frames
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// Values reachable only from JIT-compiled native frames.
-    /// GC scans this during collection so objects aren't freed while native code
-    /// holds them in registers/spill slots.
-    static JIT_ROOTS: std::cell::RefCell<Vec<Value>> = std::cell::RefCell::new(Vec::new());
-}
-
 /// Push a value into the JIT root set so GC can see it.
+#[inline(always)]
 pub fn push_jit_root(v: Value) {
-    JIT_ROOTS.with(|r| r.borrow_mut().push(v));
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).push(v) });
 }
 
 /// Take all JIT roots for GC scanning. Returns the values (caller must write back
 /// after collection via `set_jit_roots` for nursery forwarding).
 pub fn take_jit_roots() -> Vec<Value> {
-    JIT_ROOTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    JIT_ROOTS_STORE.with(|r| unsafe { std::mem::take(&mut *r.get()) })
 }
 
 /// Write back JIT roots after GC (with nursery-forwarded pointers).
 pub fn set_jit_roots(roots: Vec<Value>) {
-    JIT_ROOTS.with(|r| *r.borrow_mut() = roots);
+    JIT_ROOTS_STORE.with(|r| unsafe { *r.get() = roots });
 }
 
 /// Clear JIT roots (called after native code returns to interpreter).
+#[inline(always)]
 pub fn clear_jit_roots() {
-    JIT_ROOTS.with(|r| r.borrow_mut().clear());
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).clear() });
 }
 
 /// Get current JIT roots count (for save/restore around re-entrant calls).
-#[inline]
+#[inline(always)]
 fn jit_roots_len() -> usize {
-    JIT_ROOTS.with(|r| {
-        // SAFETY: We only access this from the main execution thread.
-        // Using try_borrow to avoid RefCell overhead in the fast path.
-        r.try_borrow().map(|v| v.len()).unwrap_or(0)
-    })
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).len() })
 }
 
 /// Truncate JIT roots back to a saved length (pop roots added by this frame).
-#[inline]
+#[inline(always)]
 fn jit_roots_truncate(len: usize) {
-    JIT_ROOTS.with(|r| {
-        if let Ok(mut v) = r.try_borrow_mut() {
-            v.truncate(len);
-        }
-    });
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).truncate(len) });
 }
 
 /// Read JitContext's GC-managed pointers as Values for root scanning.
 /// Returns (closure_val, defining_class_val) — null if not set.
 pub fn jit_context_roots() -> (Value, Value) {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        let closure = if ctx.closure.is_null() {
-            Value::null()
-        } else {
-            Value::object(ctx.closure)
-        };
-        let defining_class = if ctx.defining_class.is_null() {
-            Value::null()
-        } else {
-            Value::object(ctx.defining_class)
-        };
-        (closure, defining_class)
-    })
+    let ctx = read_jit_ctx();
+    let closure = if ctx.closure.is_null() {
+        Value::null()
+    } else {
+        Value::object(ctx.closure)
+    };
+    let defining_class = if ctx.defining_class.is_null() {
+        Value::null()
+    } else {
+        Value::object(ctx.defining_class)
+    };
+    (closure, defining_class)
 }
 
 /// Write back JitContext's GC-managed pointers after collection (nursery forwarding).
 pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
-    JIT_CONTEXT.with(|c| {
-        let mut ctx = c.borrow_mut();
+    mutate_jit_ctx(|ctx| {
         ctx.closure = closure.as_object().unwrap_or(std::ptr::null_mut());
         ctx.defining_class = defining_class
             .as_object()
@@ -149,29 +167,27 @@ pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
 }
 
 /// Access the JIT context. Returns None if not set (vm is null).
+#[inline(always)]
 fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.vm.is_null() {
-            None
-        } else {
-            Some(f(&ctx))
-        }
-    })
+    let ctx = read_jit_ctx();
+    if ctx.vm.is_null() {
+        None
+    } else {
+        Some(f(&ctx))
+    }
 }
 
 /// Get the VM pointer from the JIT context.
 /// # Safety
 /// Caller must ensure the VM pointer is valid.
+#[inline(always)]
 unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.vm.is_null() {
-            None
-        } else {
-            Some(&mut *(ctx.vm as *mut crate::runtime::vm::VM))
-        }
-    })
+    let ctx = read_jit_ctx();
+    if ctx.vm.is_null() {
+        None
+    } else {
+        Some(&mut *(ctx.vm as *mut crate::runtime::vm::VM))
+    }
 }
 
 /// Refresh JitContext's module_vars pointer from the VM's engine.
@@ -180,38 +196,36 @@ unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
 fn refresh_module_vars() {
     let vm = unsafe { vm_ref() };
     if let Some(vm) = vm {
-        JIT_CONTEXT.with(|c| {
-            let mut ctx = c.borrow_mut();
-            if !ctx.module_name.is_null() {
-                let name = unsafe {
-                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        ctx.module_name,
-                        ctx.module_name_len as usize,
-                    ))
-                };
-                if let Some(m) = vm.engine.modules.get(name) {
-                    ctx.module_vars = m.vars.as_ptr() as *mut u64;
-                    ctx.module_var_count = m.vars.len() as u32;
-                }
+        let ctx = read_jit_ctx();
+        if !ctx.module_name.is_null() {
+            let name = unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    ctx.module_name,
+                    ctx.module_name_len as usize,
+                ))
+            };
+            if let Some(m) = vm.engine.modules.get(name) {
+                mutate_jit_ctx(|c| {
+                    c.module_vars = m.vars.as_ptr() as *mut u64;
+                    c.module_var_count = m.vars.len() as u32;
+                });
             }
-        });
+        }
     }
 }
 
 /// Get the module name from the JIT context.
 pub fn module_name() -> String {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.module_name.is_null() || ctx.module_name_len == 0 {
-            String::new()
-        } else {
-            unsafe {
-                let slice =
-                    std::slice::from_raw_parts(ctx.module_name, ctx.module_name_len as usize);
-                String::from_utf8_lossy(slice).into_owned()
-            }
+    let ctx = read_jit_ctx();
+    if ctx.module_name.is_null() || ctx.module_name_len == 0 {
+        String::new()
+    } else {
+        unsafe {
+            let slice =
+                std::slice::from_raw_parts(ctx.module_name, ctx.module_name_len as usize);
+            String::from_utf8_lossy(slice).into_owned()
         }
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -792,81 +806,73 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
 
 /// Get an upvalue by index from the current closure in JitContext.
 pub extern "C" fn wren_get_upvalue(index: u64) -> u64 {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.closure.is_null() {
-            return Value::null().to_bits();
+    let ctx = read_jit_ctx();
+    if ctx.closure.is_null() {
+        return Value::null().to_bits();
+    }
+    let closure = ctx.closure as *const ObjClosure;
+    let idx = index as usize;
+    unsafe {
+        let upvalues = &(*closure).upvalues;
+        if idx < upvalues.len() {
+            let uv = upvalues[idx];
+            (*uv).get().to_bits()
+        } else {
+            Value::null().to_bits()
         }
-        let closure = ctx.closure as *const ObjClosure;
-        let idx = index as usize;
-        unsafe {
-            let upvalues = &(*closure).upvalues;
-            if idx < upvalues.len() {
-                let uv = upvalues[idx];
-                (*uv).get().to_bits()
-            } else {
-                Value::null().to_bits()
-            }
-        }
-    })
+    }
 }
 
 /// Set an upvalue by index on the current closure in JitContext.
 pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.closure.is_null() {
-            return value;
+    let ctx = read_jit_ctx();
+    if ctx.closure.is_null() {
+        return value;
+    }
+    let closure = ctx.closure as *const ObjClosure;
+    let idx = index as usize;
+    unsafe {
+        let upvalues = &(*closure).upvalues;
+        if idx < upvalues.len() {
+            let uv = upvalues[idx];
+            (*uv).set(Value::from_bits(value));
         }
-        let closure = ctx.closure as *const ObjClosure;
-        let idx = index as usize;
-        unsafe {
-            let upvalues = &(*closure).upvalues;
-            if idx < upvalues.len() {
-                let uv = upvalues[idx];
-                (*uv).set(Value::from_bits(value));
-            }
-        }
-        value
-    })
+    }
+    value
 }
 
 /// Get a static field from the defining class.
 /// field_sym is the raw SymbolId index.
 pub extern "C" fn wren_get_static_field(field_sym: u64) -> u64 {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.defining_class.is_null() {
-            return Value::null().to_bits();
-        }
-        let class = ctx.defining_class as *const ObjClass;
-        let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
-        unsafe {
-            (*class)
-                .static_fields
-                .get(&sym)
-                .copied()
-                .unwrap_or(Value::null())
-                .to_bits()
-        }
-    })
+    let ctx = read_jit_ctx();
+    if ctx.defining_class.is_null() {
+        return Value::null().to_bits();
+    }
+    let class = ctx.defining_class as *const ObjClass;
+    let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+    unsafe {
+        (*class)
+            .static_fields
+            .get(&sym)
+            .copied()
+            .unwrap_or(Value::null())
+            .to_bits()
+    }
 }
 
 /// Set a static field on the defining class.
 /// field_sym is the raw SymbolId index, value is the NaN-boxed value.
 pub extern "C" fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
-    JIT_CONTEXT.with(|c| {
-        let ctx = c.borrow();
-        if ctx.defining_class.is_null() {
-            return value;
-        }
-        let class = ctx.defining_class as *mut ObjClass;
-        let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
-        unsafe {
-            (*class).static_fields.insert(sym, Value::from_bits(value));
-        }
-        value
-    })
+    let ctx = read_jit_ctx();
+    if ctx.defining_class.is_null() {
+        return value;
+    }
+    let class = ctx.defining_class as *mut ObjClass;
+    let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+    unsafe {
+        (*class).static_fields.insert(sym, Value::from_bits(value));
+    }
+    value
 }
 
 /// Guard: check that value is an instance of the expected class.
