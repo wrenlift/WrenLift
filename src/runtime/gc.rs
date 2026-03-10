@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use super::object::*;
 use super::value::Value;
 use crate::intern::SymbolId;
-use crate::mir::interp::InterpValue;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -722,10 +721,8 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
             }
             // Trace MIR interpreter frames (SSA value maps, closures, classes).
             for frame in &fiber.mir_frames {
-                for interp_val in &frame.values {
-                    if let InterpValue::Boxed(val) = interp_val {
-                        mark_value(*val, gray_stack);
-                    }
+                for val in &frame.values {
+                    mark_value(*val, gray_stack);
                 }
                 if let Some(closure) = frame.closure {
                     if !closure.is_null() {
@@ -861,10 +858,8 @@ unsafe fn update_pointers_in_object(
             }
             // Update MIR interpreter frames.
             for frame in &mut fiber.mir_frames {
-                for interp_val in frame.values.iter_mut() {
-                    if let InterpValue::Boxed(ref mut val) = interp_val {
-                        update_value(val, forwards);
-                    }
+                for val in frame.values.iter_mut() {
+                    update_value(val, forwards);
                 }
                 if let Some(ref mut closure) = frame.closure {
                     update_raw_ptr(closure, forwards);

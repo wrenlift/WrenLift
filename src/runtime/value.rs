@@ -125,6 +125,12 @@ impl Value {
         (self.0 & TAG_OBJ) == TAG_OBJ
     }
 
+    /// Wren truthiness: everything is truthy except `false` and `null`.
+    #[inline(always)]
+    pub fn is_truthy_wren(self) -> bool {
+        self.0 != TAG_FALSE && self.0 != TAG_NULL
+    }
+
     /// Is this the internal undefined sentinel?
     #[inline(always)]
     pub fn is_undefined(self) -> bool {

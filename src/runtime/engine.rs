@@ -233,6 +233,9 @@ pub struct ExecutionEngine {
     /// Whether each JIT-compiled function is a "leaf" (no runtime calls).
     /// Leaf functions don't need GC root pushing or JIT context setup.
     pub jit_leaf: Vec<bool>,
+    /// Bytecode pointers indexed by FuncId. O(1) lookup for bytecode dispatch.
+    /// null entries mean bytecode not yet compiled for this function.
+    pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
 }
 
 /// Per-module execution state.
@@ -269,6 +272,7 @@ impl ExecutionEngine {
             compile_handle: None,
             jit_code: Vec::new(),
             jit_leaf: Vec::new(),
+            bc_cache: Vec::new(),
         }
     }
 
@@ -312,9 +316,7 @@ impl ExecutionEngine {
     /// across tier-up so the interpreter can continue as a fallback).
     pub fn get_bytecode(&mut self, id: FuncId) -> Option<Arc<BytecodeFunction>> {
         match self.functions.get_mut(id.0 as usize)? {
-            FuncBody::Interpreted {
-                mir, bytecode, ..
-            } => {
+            FuncBody::Interpreted { mir, bytecode, .. } => {
                 if bytecode.is_none() {
                     let bc = crate::mir::bytecode::lower(mir);
                     *bytecode = Some(Arc::new(bc));
@@ -336,22 +338,39 @@ impl ExecutionEngine {
     /// (bytecode is never freed once compiled). Use this in the hot interpreter loop
     /// to avoid Arc clone overhead.
     pub fn ensure_bytecode(&mut self, id: FuncId) -> Option<*const BytecodeFunction> {
-        match self.functions.get_mut(id.0 as usize)? {
+        let idx = id.0 as usize;
+        // Fast path: check bc_cache first (O(1), no enum match)
+        if idx < self.bc_cache.len() {
+            let cached = self.bc_cache[idx];
+            if !cached.is_null() {
+                return Some(cached);
+            }
+        }
+        // Slow path: compile bytecode if needed
+        let ptr = match self.functions.get_mut(idx)? {
             FuncBody::Interpreted { mir, bytecode, .. } => {
                 if bytecode.is_none() {
                     let bc = crate::mir::bytecode::lower(mir);
                     *bytecode = Some(Arc::new(bc));
                 }
-                bytecode.as_ref().map(|arc| Arc::as_ptr(arc))
+                bytecode.as_ref().map(Arc::as_ptr)
             }
             FuncBody::Compiled { bytecode, mir, .. } => {
                 if bytecode.is_none() {
                     let bc = crate::mir::bytecode::lower(mir);
                     *bytecode = Some(Arc::new(bc));
                 }
-                bytecode.as_ref().map(|arc| Arc::as_ptr(arc))
+                bytecode.as_ref().map(Arc::as_ptr)
             }
+        };
+        // Populate bc_cache for future O(1) lookups
+        if let Some(p) = ptr {
+            if idx >= self.bc_cache.len() {
+                self.bc_cache.resize(idx + 1, std::ptr::null());
+            }
+            self.bc_cache[idx] = p;
         }
+        ptr
     }
 
     /// Record a call to a function. Returns true if the function should
@@ -393,8 +412,11 @@ impl ExecutionEngine {
                     } else {
                         std::ptr::null()
                     };
-                    self.functions[idx] =
-                        FuncBody::Compiled { executable, mir, bytecode };
+                    self.functions[idx] = FuncBody::Compiled {
+                        executable,
+                        mir,
+                        bytecode,
+                    };
                     // Update jit_code/jit_leaf arrays
                     if idx >= self.jit_code.len() {
                         self.jit_code.resize(idx + 1, std::ptr::null());
@@ -523,7 +545,10 @@ impl ExecutionEngine {
                         let name = &body.mir().name;
                         eprintln!(
                             "  installed FuncId({}) '{}' native={} leaf={}",
-                            idx, name, !native_ptr.is_null(), leaf,
+                            idx,
+                            name,
+                            !native_ptr.is_null(),
+                            leaf,
                         );
                     }
                 }

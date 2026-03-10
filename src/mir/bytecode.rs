@@ -6,7 +6,6 @@
 ///
 /// Encoding: little-endian, register indices are u16, branch targets are u32
 /// byte offsets, constants live in a side pool indexed by u16.
-
 use std::collections::HashMap;
 
 use crate::ast::Span;
@@ -104,16 +103,19 @@ pub enum Op {
     SubscriptSet = 0x40,
 
     // -- Terminators --
-    Return = 0x41,    // 3B: op + src(2)
-    ReturnNull = 0x42, // 1B
+    Return = 0x41,      // 3B: op + src(2)
+    ReturnNull = 0x42,  // 1B
     Unreachable = 0x43, // 1B
-    Branch = 0x44,     // variable: op + target(4) + argc(1) + [dst(2),src(2)]*argc
-    CondBranch = 0x45, // variable: op + cond(2) + true_off(4) + t_argc(1) + [dst,src]*t_argc
-                       //           + false_off(4) + f_argc(1) + [dst,src]*f_argc
+    Branch = 0x44,      // variable: op + target(4) + argc(1) + [dst(2),src(2)]*argc
+    CondBranch = 0x45,  // variable: op + cond(2) + true_off(4) + t_argc(1) + [dst,src]*t_argc
+                        //           + false_off(4) + f_argc(1) + [dst,src]*f_argc
 }
 
 impl Op {
     /// Convert a raw u8 to an Op. Only valid for values produced by our encoder.
+    ///
+    /// # Safety
+    /// The caller must ensure `v` is a valid Op discriminant produced by our encoder.
     #[inline(always)]
     pub unsafe fn from_u8_unchecked(v: u8) -> Op {
         std::mem::transmute(v)
@@ -630,10 +632,9 @@ impl<'a> Encoder<'a> {
         if !target_block.params.is_empty() {
             let param_count = target_block.params.len().min(args.len());
             self.emit_u8(param_count as u8);
-            for i in 0..param_count {
-                let (param_vid, _) = target_block.params[i];
+            for (arg, &(param_vid, _)) in args.iter().zip(target_block.params.iter()).take(param_count) {
                 self.emit_reg(param_vid); // dst
-                self.emit_reg(args[i]); // src
+                self.emit_reg(*arg); // src
             }
         } else {
             let block_params = Self::collect_block_params(target_block);
@@ -739,9 +740,10 @@ impl<'a> Encoder<'a> {
             block_offsets: self.block_offsets,
             register_count: self.mir.next_value,
             param_offsets,
-            ic_table: std::cell::UnsafeCell::new(
-                vec![CallSiteIC::default(); self.call_site_count as usize],
-            ),
+            ic_table: std::cell::UnsafeCell::new(vec![
+                CallSiteIC::default();
+                self.call_site_count as usize
+            ]),
         }
     }
 }
@@ -1031,26 +1033,20 @@ mod tests {
         f.block_mut(bb)
             .instructions
             .push((v_arg, Instruction::ConstNum(1.0)));
-        f.block_mut(bb)
-            .instructions
-            .push((
-                v_result,
-                Instruction::Call {
-                    receiver: v_recv,
-                    method,
-                    args: vec![v_arg],
-                },
-            ));
+        f.block_mut(bb).instructions.push((
+            v_result,
+            Instruction::Call {
+                receiver: v_recv,
+                method,
+                args: vec![v_arg],
+            },
+        ));
         f.block_mut(bb).terminator = Terminator::Return(v_result);
 
         let bc = lower(&f);
 
         // Find Call opcode
-        let call_start = bc
-            .code
-            .iter()
-            .position(|&b| b == Op::Call as u8)
-            .unwrap();
+        let call_start = bc.code.iter().position(|&b| b == Op::Call as u8).unwrap();
         // Call: op(1) + dst(2) + recv(2) + sym(2) + ic_idx(2) + argc(1) + args(2*1) = 12
         assert_eq!(bc.code[call_start + 9], 1); // argc = 1
     }

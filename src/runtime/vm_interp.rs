@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 /// Fiber-based MIR interpreter with bytecode dispatch.
 ///
 /// All execution happens within a Fiber context. The interpreter loop
@@ -12,15 +13,14 @@
 /// VM-specific instructions (calls, collections, module vars, string
 /// allocation, fields, closures) have full VM access.
 use std::rc::Rc;
-use smallvec::SmallVec;
 
 use crate::intern::SymbolId;
 use crate::mir::bytecode::{read_u16, read_u32, read_u8, BcConst, BytecodeFunction, Op};
-use crate::mir::interp::{InterpError, InterpValue};
+use crate::mir::interp::InterpError;
 use crate::mir::{BlockId, ValueId};
+use crate::runtime::engine::ExecutionMode;
 use crate::runtime::engine::FuncId;
 use crate::runtime::object::*;
-use crate::runtime::engine::ExecutionMode;
 use crate::runtime::value::Value;
 use crate::runtime::vm::{FiberAction, VM};
 
@@ -41,6 +41,12 @@ struct MethodCacheEntry {
 
 pub struct MethodCache {
     entries: Vec<Option<MethodCacheEntry>>,
+}
+
+impl Default for MethodCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MethodCache {
@@ -90,7 +96,7 @@ impl MethodCache {
 }
 
 /// Sentinel value for uninitialized register slots.
-const UNDEF: InterpValue = InterpValue::Boxed(Value::UNDEFINED);
+const UNDEF: Value = Value::UNDEFINED;
 
 // ---------------------------------------------------------------------------
 // Runtime errors
@@ -146,22 +152,21 @@ impl From<InterpError> for RuntimeError {
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
-fn get_reg(values: &[InterpValue], idx: u16) -> InterpValue {
+fn get_reg(values: &[Value], idx: u16) -> Value {
     unsafe { *values.get_unchecked(idx as usize) }
 }
 
 #[inline(always)]
-fn get_reg_val(values: &[InterpValue], idx: u16) -> Value {
-    unsafe { values.get_unchecked(idx as usize).to_value() }
-}
-
-#[inline(always)]
-fn set_reg(values: &mut Vec<InterpValue>, idx: u16, val: InterpValue) {
+fn set_reg(values: &mut Vec<Value>, idx: u16, val: Value) {
     let i = idx as usize;
-    if i >= values.len() {
+    if i < values.len() {
+        unsafe {
+            *values.get_unchecked_mut(i) = val;
+        }
+    } else {
         values.resize(i + 1, UNDEF);
+        values[i] = val;
     }
-    unsafe { *values.get_unchecked_mut(i) = val; }
 }
 
 /// Read a u16 at a fixed bytecode offset without advancing pc.
@@ -183,14 +188,14 @@ fn build_arg_vals(
     code: &[u8],
     arg_regs_pc: u32,
     argc: usize,
-    values: &[InterpValue],
+    values: &[Value],
 ) -> SmallVec<[Value; 8]> {
     let mut arg_vals: SmallVec<[Value; 8]> = SmallVec::with_capacity(1 + argc);
     arg_vals.push(recv);
     let mut apc = arg_regs_pc;
     for _ in 0..argc {
         let arg_reg = read_u16(code, &mut apc);
-        arg_vals.push(get_reg_val(values, arg_reg));
+        arg_vals.push(get_reg(values, arg_reg));
     }
     arg_vals
 }
@@ -209,18 +214,26 @@ macro_rules! bc_boxed_binop {
         let rhs_reg = read_u16(code, $pc);
         let a = get_reg($values, lhs_reg);
         let b = get_reg($values, rhs_reg);
-        match (a.as_f64(), b.as_f64()) {
-            (Ok(x), Ok(y)) => {
+        match (a.as_num(), b.as_num()) {
+            (Some(x), Some(y)) => {
                 let f: fn(f64, f64) -> f64 = $op;
-                set_reg($values, dst, InterpValue::Boxed(Value::num(f(x, y))));
+                set_reg($values, dst, Value::num(f(x, y)));
                 false
             }
             _ => {
-                let recv = a.to_value();
-                let arg = b.to_value();
+                let recv = a;
+                let arg = b;
                 try_operator_dispatch(
-                    $vm, $fiber, recv, $method, &[arg], $pc, $values, dst,
-                    $module_name, $bc,
+                    $vm,
+                    $fiber,
+                    recv,
+                    $method,
+                    &[arg],
+                    $pc,
+                    $values,
+                    dst,
+                    $module_name,
+                    $bc,
                 )?
             }
         }
@@ -234,10 +247,14 @@ macro_rules! bc_f64_binop {
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
-        let a = get_reg($values, lhs_reg).as_f64().map_err(RuntimeError::from)?;
-        let b = get_reg($values, rhs_reg).as_f64().map_err(RuntimeError::from)?;
+        let a = get_reg($values, lhs_reg)
+            .as_num()
+            .ok_or(RuntimeError::GuardFailed("num"))?;
+        let b = get_reg($values, rhs_reg)
+            .as_num()
+            .ok_or(RuntimeError::GuardFailed("num"))?;
         let f: fn(f64, f64) -> f64 = $op;
-        set_reg($values, dst, InterpValue::F64(f(a, b)));
+        set_reg($values, dst, Value::num(f(a, b)));
     }};
 }
 
@@ -251,18 +268,26 @@ macro_rules! bc_boxed_cmp {
         let rhs_reg = read_u16(code, $pc);
         let a = get_reg($values, lhs_reg);
         let b = get_reg($values, rhs_reg);
-        match (a.as_f64(), b.as_f64()) {
-            (Ok(x), Ok(y)) => {
+        match (a.as_num(), b.as_num()) {
+            (Some(x), Some(y)) => {
                 let f: fn(f64, f64) -> bool = $op;
-                set_reg($values, dst, InterpValue::Boxed(Value::bool(f(x, y))));
+                set_reg($values, dst, Value::bool(f(x, y)));
                 false
             }
             _ => {
-                let recv = a.to_value();
-                let arg = b.to_value();
+                let recv = a;
+                let arg = b;
                 try_operator_dispatch(
-                    $vm, $fiber, recv, $method, &[arg], $pc, $values, dst,
-                    $module_name, $bc,
+                    $vm,
+                    $fiber,
+                    recv,
+                    $method,
+                    &[arg],
+                    $pc,
+                    $values,
+                    dst,
+                    $module_name,
+                    $bc,
                 )?
             }
         }
@@ -276,10 +301,14 @@ macro_rules! bc_f64_cmp {
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
-        let a = get_reg($values, lhs_reg).as_f64().map_err(RuntimeError::from)?;
-        let b = get_reg($values, rhs_reg).as_f64().map_err(RuntimeError::from)?;
+        let a = get_reg($values, lhs_reg)
+            .as_num()
+            .ok_or(RuntimeError::GuardFailed("num"))?;
+        let b = get_reg($values, rhs_reg)
+            .as_num()
+            .ok_or(RuntimeError::GuardFailed("num"))?;
         let f: fn(f64, f64) -> bool = $op;
-        set_reg($values, dst, InterpValue::Bool(f(a, b)));
+        set_reg($values, dst, Value::bool(f(a, b)));
     }};
 }
 
@@ -293,18 +322,26 @@ macro_rules! bc_bitwise_binop {
         let rhs_reg = read_u16(code, $pc);
         let a = get_reg($values, lhs_reg);
         let b = get_reg($values, rhs_reg);
-        match (a.as_f64(), b.as_f64()) {
-            (Ok(x), Ok(y)) => {
+        match (a.as_num(), b.as_num()) {
+            (Some(x), Some(y)) => {
                 let f: fn(i32, i32) -> i32 = $op;
-                set_reg($values, dst, InterpValue::Boxed(Value::num(f(x as i32, y as i32) as f64)));
+                set_reg($values, dst, Value::num(f(x as i32, y as i32) as f64));
                 false
             }
             _ => {
-                let recv = a.to_value();
-                let arg = b.to_value();
+                let recv = a;
+                let arg = b;
                 try_operator_dispatch(
-                    $vm, $fiber, recv, $method, &[arg], $pc, $values, dst,
-                    $module_name, $bc,
+                    $vm,
+                    $fiber,
+                    recv,
+                    $method,
+                    &[arg],
+                    $pc,
+                    $values,
+                    dst,
+                    $module_name,
+                    $bc,
                 )?
             }
         }
@@ -342,7 +379,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
         }
 
         // Load execution state from the top frame into locals.
-        let (func_id, mut pc, mut values, module_name) = unsafe {
+        // These are mutable so that inline call/return can update them
+        // without restarting the fiber loop.
+        let (mut func_id, mut pc, mut values, module_name) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
             (
                 frame.func_id,
@@ -354,13 +393,13 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
         // Get bytecode (lazily compiled on first use).
         // Use raw pointer to avoid Arc clone overhead in the hot loop.
-        let bc_ptr = vm
+        let mut bc_ptr = vm
             .engine
             .ensure_bytecode(func_id)
             .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
         // SAFETY: bc_ptr is stable — bytecode is never freed once compiled.
-        let bc = unsafe { &*bc_ptr };
-        let code = &bc.code;
+        let mut bc = unsafe { &*bc_ptr };
+        let mut code: &[u8] = &bc.code;
 
         // Cache raw pointer to module vars — eliminates HashMap lookup per
         // GetModuleVar/SetModuleVar (was 42% of runtime in method_call).
@@ -409,22 +448,22 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 // =============================================================
                 Op::ConstNull => {
                     let dst = read_u16(code, &mut pc);
-                    set_reg(&mut values, dst, InterpValue::Boxed(Value::null()));
+                    set_reg(&mut values, dst, Value::null());
                 }
                 Op::ConstTrue => {
                     let dst = read_u16(code, &mut pc);
-                    set_reg(&mut values, dst, InterpValue::Boxed(Value::bool(true)));
+                    set_reg(&mut values, dst, Value::bool(true));
                 }
                 Op::ConstFalse => {
                     let dst = read_u16(code, &mut pc);
-                    set_reg(&mut values, dst, InterpValue::Boxed(Value::bool(false)));
+                    set_reg(&mut values, dst, Value::bool(false));
                 }
                 Op::ConstNum => {
                     let dst = read_u16(code, &mut pc);
                     let idx = read_u16(code, &mut pc);
                     let val = match bc.constants[idx as usize] {
-                        BcConst::F64(n) => InterpValue::Boxed(Value::num(n)),
-                        BcConst::I64(n) => InterpValue::Boxed(Value::num(n as f64)),
+                        BcConst::F64(n) => Value::num(n),
+                        BcConst::I64(n) => Value::num(n as f64),
                     };
                     set_reg(&mut values, dst, val);
                 }
@@ -432,8 +471,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let idx = read_u16(code, &mut pc);
                     let val = match bc.constants[idx as usize] {
-                        BcConst::F64(n) => InterpValue::F64(n),
-                        BcConst::I64(n) => InterpValue::F64(n as f64),
+                        BcConst::F64(n) => Value::num(n),
+                        BcConst::I64(n) => Value::num(n as f64),
                     };
                     set_reg(&mut values, dst, val);
                 }
@@ -441,8 +480,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let idx = read_u16(code, &mut pc);
                     let val = match bc.constants[idx as usize] {
-                        BcConst::I64(n) => InterpValue::I64(n),
-                        BcConst::F64(n) => InterpValue::I64(n as i64),
+                        BcConst::I64(n) => Value::num(n as f64),
+                        BcConst::F64(n) => Value::num(n),
                     };
                     set_reg(&mut values, dst, val);
                 }
@@ -451,7 +490,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let sym_idx = read_u16(code, &mut pc);
                     let sym = SymbolId::from_raw(sym_idx as u32);
                     let s = vm.interner.resolve(sym).to_string();
-                    set_reg(&mut values, dst, InterpValue::Boxed(vm.new_string(s)));
+                    set_reg(&mut values, dst, vm.new_string(s));
                 }
 
                 // =============================================================
@@ -466,13 +505,13 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     } else {
                         Value::null()
                     };
-                    set_reg(&mut values, dst, InterpValue::Boxed(val));
+                    set_reg(&mut values, dst, val);
                 }
                 Op::SetModuleVar => {
                     let dst = read_u16(code, &mut pc);
                     let val_reg = read_u16(code, &mut pc);
                     let slot = read_u16(code, &mut pc) as usize;
-                    let v = get_reg_val(&values, val_reg);
+                    let v = get_reg(&values, val_reg);
                     if !module_vars_ptr.is_null() {
                         let vars = unsafe { &mut *module_vars_ptr };
                         while vars.len() <= slot {
@@ -480,7 +519,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                         vars[slot] = v;
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(v));
+                    set_reg(&mut values, dst, v);
                 }
 
                 // =============================================================
@@ -489,8 +528,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 Op::GetUpvalue => {
                     let dst = read_u16(code, &mut pc);
                     let idx = read_u16(code, &mut pc) as usize;
-                    let frame_closure =
-                        unsafe { (*fiber).mir_frames.last().unwrap().closure };
+                    let frame_closure = unsafe { (*fiber).mir_frames.last().unwrap().closure };
                     let val = if let Some(closure_ptr) = frame_closure {
                         let upvalues = unsafe { &(*closure_ptr).upvalues };
                         if idx < upvalues.len() {
@@ -501,22 +539,21 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     } else {
                         Value::null()
                     };
-                    set_reg(&mut values, dst, InterpValue::Boxed(val));
+                    set_reg(&mut values, dst, val);
                 }
                 Op::SetUpvalue => {
                     let dst = read_u16(code, &mut pc);
                     let val_reg = read_u16(code, &mut pc);
                     let idx = read_u16(code, &mut pc) as usize;
-                    let v = get_reg_val(&values, val_reg);
-                    let frame_closure =
-                        unsafe { (*fiber).mir_frames.last().unwrap().closure };
+                    let v = get_reg(&values, val_reg);
+                    let frame_closure = unsafe { (*fiber).mir_frames.last().unwrap().closure };
                     if let Some(closure_ptr) = frame_closure {
                         let upvalues = unsafe { &mut (*closure_ptr).upvalues };
                         if idx < upvalues.len() {
                             unsafe { (*upvalues[idx]).set(v) };
                         }
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(v));
+                    set_reg(&mut values, dst, v);
                 }
 
                 // =============================================================
@@ -527,12 +564,10 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let _param_idx = read_u16(code, &mut pc);
                     // Already bound by branch instruction, skip if set
                     let idx = dst as usize;
-                    if idx < values.len()
-                        && !matches!(values[idx], InterpValue::Boxed(v) if v.is_undefined())
-                    {
+                    if idx < values.len() && !matches!(values[idx], v if v.is_undefined()) {
                         continue;
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(Value::null()));
+                    set_reg(&mut values, dst, Value::null());
                 }
 
                 // =============================================================
@@ -554,21 +589,21 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     } else {
                         Value::null()
                     };
-                    set_reg(&mut values, dst, InterpValue::Boxed(val));
+                    set_reg(&mut values, dst, val);
                 }
                 Op::SetStaticField => {
                     let dst = read_u16(code, &mut pc);
                     let val_reg = read_u16(code, &mut pc);
                     let sym_idx = read_u16(code, &mut pc);
                     let sym = SymbolId::from_raw(sym_idx as u32);
-                    let v = get_reg_val(&values, val_reg);
+                    let v = get_reg(&values, val_reg);
                     let frame = unsafe { (*fiber).mir_frames.last().unwrap() };
                     if let Some(class_ptr) = frame.defining_class {
                         unsafe {
                             (*class_ptr).static_fields.insert(sym, v);
                         }
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(v));
+                    set_reg(&mut values, dst, v);
                 }
 
                 // =============================================================
@@ -578,83 +613,87 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
                     let a = get_reg(&values, src);
-                    match a.as_f64() {
-                        Ok(n) => set_reg(&mut values, dst, InterpValue::Boxed(Value::num(-n))),
-                        Err(_) => {
-                            let recv = a.to_value();
+                    match a.as_num() {
+                        Some(n) => set_reg(&mut values, dst, Value::num(-n)),
+                        None => {
+                            let recv = a;
                             let result = try_operator_dispatch(
-                                vm, fiber, recv, "-", &[], &mut pc, &mut values, dst,
-                                &module_name, &bc,
+                                vm,
+                                fiber,
+                                recv,
+                                "-",
+                                &[],
+                                &mut pc,
+                                &mut values,
+                                dst,
+                                &module_name,
+                                bc,
                             )?;
-                            if result { continue 'fiber_loop; }
+                            if result {
+                                continue 'fiber_loop;
+                            }
                         }
                     }
                 }
                 Op::NegF64 => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
-                    let n = get_reg(&values, src).as_f64().map_err(RuntimeError::from)?;
-                    set_reg(&mut values, dst, InterpValue::F64(-n));
+                    let n = get_reg(&values, src)
+                        .as_num()
+                        .ok_or(RuntimeError::GuardFailed("num"))?;
+                    set_reg(&mut values, dst, Value::num(-n));
                 }
                 Op::Not => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
                     let a = get_reg(&values, src);
-                    set_reg(
-                        &mut values,
-                        dst,
-                        InterpValue::Boxed(Value::bool(!a.is_truthy())),
-                    );
+                    set_reg(&mut values, dst, Value::bool(!a.is_truthy_wren()));
                 }
                 Op::BitNot => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
                     let a = get_reg(&values, src);
-                    match a.as_f64() {
-                        Ok(n) => {
+                    match a.as_num() {
+                        Some(n) => {
                             let i = n as i32;
-                            set_reg(
+                            set_reg(&mut values, dst, Value::num((!i) as f64));
+                        }
+                        None => {
+                            let recv = a;
+                            let result = try_operator_dispatch(
+                                vm,
+                                fiber,
+                                recv,
+                                "~",
+                                &[],
+                                &mut pc,
                                 &mut values,
                                 dst,
-                                InterpValue::Boxed(Value::num((!i) as f64)),
-                            );
-                        }
-                        Err(_) => {
-                            let recv = a.to_value();
-                            let result = try_operator_dispatch(
-                                vm, fiber, recv, "~", &[], &mut pc, &mut values, dst,
-                                &module_name, &bc,
+                                &module_name,
+                                bc,
                             )?;
-                            if result { continue 'fiber_loop; }
+                            if result {
+                                continue 'fiber_loop;
+                            }
                         }
                     }
                 }
                 Op::Unbox => {
+                    // With NaN-boxed Values, unbox is a no-op (value is already boxed).
+                    // Just verify it's a number and copy.
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
                     let a = get_reg(&values, src);
-                    let result = match a {
-                        InterpValue::Boxed(val) => match val.as_num() {
-                            Some(n) => InterpValue::F64(n),
-                            None => {
-                                return Err(RuntimeError::Error(
-                                    "unbox: not a number".into(),
-                                ))
-                            }
-                        },
-                        InterpValue::F64(n) => InterpValue::F64(n),
-                        InterpValue::I64(n) => InterpValue::F64(n as f64),
-                        InterpValue::Bool(_) => {
-                            return Err(RuntimeError::Error("unbox: bool".into()))
-                        }
-                    };
-                    set_reg(&mut values, dst, result);
+                    if a.as_num().is_none() {
+                        return Err(RuntimeError::Error("unbox: not a number".into()));
+                    }
+                    set_reg(&mut values, dst, a);
                 }
                 Op::BoxOp => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
-                    let val = get_reg(&values, src).to_value();
-                    set_reg(&mut values, dst, InterpValue::Boxed(val));
+                    let val = get_reg(&values, src);
+                    set_reg(&mut values, dst, val);
                 }
                 Op::Move => {
                     let dst = read_u16(code, &mut pc);
@@ -665,36 +704,26 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 Op::ToStringOp => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
-                    let s = value_to_string(vm, get_reg_val(&values, src));
-                    set_reg(&mut values, dst, InterpValue::Boxed(vm.new_string(s)));
+                    let s = value_to_string(vm, get_reg(&values, src));
+                    set_reg(&mut values, dst, vm.new_string(s));
                 }
                 Op::GuardNum => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
                     let v = get_reg(&values, src);
-                    match v {
-                        InterpValue::Boxed(val) if val.is_num() => {
-                            set_reg(&mut values, dst, v);
-                        }
-                        InterpValue::F64(_) | InterpValue::I64(_) => {
-                            set_reg(&mut values, dst, v);
-                        }
-                        _ => return Err(RuntimeError::GuardFailed("Num")),
+                    if !v.is_num() {
+                        return Err(RuntimeError::GuardFailed("Num"));
                     }
+                    set_reg(&mut values, dst, v);
                 }
                 Op::GuardBool => {
                     let dst = read_u16(code, &mut pc);
                     let src = read_u16(code, &mut pc);
                     let v = get_reg(&values, src);
-                    match v {
-                        InterpValue::Boxed(val) if val.is_bool() => {
-                            set_reg(&mut values, dst, v);
-                        }
-                        InterpValue::Bool(_) => {
-                            set_reg(&mut values, dst, v);
-                        }
-                        _ => return Err(RuntimeError::GuardFailed("Bool")),
+                    if !v.is_bool() {
+                        return Err(RuntimeError::GuardFailed("Bool"));
                     }
+                    set_reg(&mut values, dst, v);
                 }
 
                 // =============================================================
@@ -719,7 +748,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let val_reg = read_u16(code, &mut pc);
                     let class_sym_idx = read_u16(code, &mut pc);
                     let class_sym = SymbolId::from_raw(class_sym_idx as u32);
-                    let value = get_reg_val(&values, val_reg);
+                    let value = get_reg(&values, val_reg);
                     let mut cls = vm.class_of(value);
                     let mut matched = false;
                     while !cls.is_null() {
@@ -729,7 +758,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                         cls = unsafe { (*cls).superclass };
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(Value::bool(matched)));
+                    set_reg(&mut values, dst, Value::bool(matched));
                 }
 
                 // =============================================================
@@ -739,27 +768,27 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let recv_reg = read_u16(code, &mut pc);
                     let field_idx = read_u16(code, &mut pc) as usize;
-                    let recv = get_reg_val(&values, recv_reg);
+                    let recv = get_reg(&values, recv_reg);
                     let val = if let Some(ptr) = recv.as_object() {
                         let inst = ptr as *const ObjInstance;
                         unsafe { (*inst).get_field(field_idx) }.unwrap_or(Value::null())
                     } else {
                         Value::null()
                     };
-                    set_reg(&mut values, dst, InterpValue::Boxed(val));
+                    set_reg(&mut values, dst, val);
                 }
                 Op::SetField => {
                     let dst = read_u16(code, &mut pc);
                     let recv_reg = read_u16(code, &mut pc);
                     let field_idx = read_u16(code, &mut pc) as usize;
                     let val_reg = read_u16(code, &mut pc);
-                    let recv = get_reg_val(&values, recv_reg);
-                    let val = get_reg_val(&values, val_reg);
+                    let recv = get_reg(&values, recv_reg);
+                    let val = get_reg(&values, val_reg);
                     if let Some(ptr) = recv.as_object() {
                         let inst = ptr as *mut ObjInstance;
                         unsafe { (*inst).set_field(field_idx, val) };
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(val));
+                    set_reg(&mut values, dst, val);
                 }
 
                 // =============================================================
@@ -771,8 +800,10 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let math_op_byte = read_u8(code, &mut pc);
                     let _pad = read_u8(code, &mut pc); // alignment pad
                     let math_op = crate::mir::bytecode::u8_to_math_unary(math_op_byte);
-                    let n = get_reg(&values, src).as_f64().map_err(RuntimeError::from)?;
-                    set_reg(&mut values, dst, InterpValue::F64(math_op.apply(n)));
+                    let n = get_reg(&values, src)
+                        .as_num()
+                        .ok_or(RuntimeError::GuardFailed("num"))?;
+                    set_reg(&mut values, dst, Value::num(math_op.apply(n)));
                 }
                 Op::MathBinaryF64 => {
                     let dst = read_u16(code, &mut pc);
@@ -780,39 +811,170 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let rhs = read_u16(code, &mut pc);
                     let math_op_byte = read_u8(code, &mut pc);
                     let math_op = crate::mir::bytecode::u8_to_math_binary(math_op_byte);
-                    let a = get_reg(&values, lhs).as_f64().map_err(RuntimeError::from)?;
-                    let b = get_reg(&values, rhs).as_f64().map_err(RuntimeError::from)?;
-                    set_reg(&mut values, dst, InterpValue::F64(math_op.apply(a, b)));
+                    let a = get_reg(&values, lhs)
+                        .as_num()
+                        .ok_or(RuntimeError::GuardFailed("num"))?;
+                    let b = get_reg(&values, rhs)
+                        .as_num()
+                        .ok_or(RuntimeError::GuardFailed("num"))?;
+                    set_reg(&mut values, dst, Value::num(math_op.apply(a, b)));
                 }
 
                 // =============================================================
                 // Binary arithmetic (7B: op + dst + lhs + rhs)
                 // =============================================================
-                Op::Add => { if bc_boxed_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x + y, "+(_)") { continue 'fiber_loop; } }
-                Op::Sub => { if bc_boxed_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x - y, "-(_)") { continue 'fiber_loop; } }
-                Op::Mul => { if bc_boxed_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x * y, "*(_)") { continue 'fiber_loop; } }
-                Op::Div => { if bc_boxed_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x / y, "/(_)") { continue 'fiber_loop; } }
-                Op::Mod => { if bc_boxed_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x % y, "%(_)") { continue 'fiber_loop; } }
+                Op::Add => {
+                    if bc_boxed_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x + y,
+                        "+(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::Sub => {
+                    if bc_boxed_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x - y,
+                        "-(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::Mul => {
+                    if bc_boxed_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x * y,
+                        "*(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::Div => {
+                    if bc_boxed_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x / y,
+                        "/(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::Mod => {
+                    if bc_boxed_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x % y,
+                        "%(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
 
-                Op::AddF64 => { bc_f64_binop!(&mut pc, &mut values, |x, y| x + y, &bc); }
-                Op::SubF64 => { bc_f64_binop!(&mut pc, &mut values, |x, y| x - y, &bc); }
-                Op::MulF64 => { bc_f64_binop!(&mut pc, &mut values, |x, y| x * y, &bc); }
-                Op::DivF64 => { bc_f64_binop!(&mut pc, &mut values, |x, y| x / y, &bc); }
-                Op::ModF64 => { bc_f64_binop!(&mut pc, &mut values, |x, y| x % y, &bc); }
+                Op::AddF64 => {
+                    bc_f64_binop!(&mut pc, &mut values, |x, y| x + y, &bc);
+                }
+                Op::SubF64 => {
+                    bc_f64_binop!(&mut pc, &mut values, |x, y| x - y, &bc);
+                }
+                Op::MulF64 => {
+                    bc_f64_binop!(&mut pc, &mut values, |x, y| x * y, &bc);
+                }
+                Op::DivF64 => {
+                    bc_f64_binop!(&mut pc, &mut values, |x, y| x / y, &bc);
+                }
+                Op::ModF64 => {
+                    bc_f64_binop!(&mut pc, &mut values, |x, y| x % y, &bc);
+                }
 
                 // =============================================================
                 // Comparisons
                 // =============================================================
-                Op::CmpLt => { if bc_boxed_cmp!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x < y, "<(_)") { continue 'fiber_loop; } }
-                Op::CmpGt => { if bc_boxed_cmp!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x > y, ">(_)") { continue 'fiber_loop; } }
-                Op::CmpLe => { if bc_boxed_cmp!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x <= y, "<=(_)") { continue 'fiber_loop; } }
-                Op::CmpGe => { if bc_boxed_cmp!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: f64, y: f64| x >= y, ">=(_)") { continue 'fiber_loop; } }
+                Op::CmpLt => {
+                    if bc_boxed_cmp!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x < y,
+                        "<(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::CmpGt => {
+                    if bc_boxed_cmp!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x > y,
+                        ">(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::CmpLe => {
+                    if bc_boxed_cmp!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x <= y,
+                        "<=(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::CmpGe => {
+                    if bc_boxed_cmp!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: f64, y: f64| x >= y,
+                        ">=(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
                 Op::CmpEq => {
                     let dst = read_u16(code, &mut pc);
                     let lhs_reg = read_u16(code, &mut pc);
                     let rhs_reg = read_u16(code, &mut pc);
-                    let lhs = get_reg_val(&values, lhs_reg);
-                    let rhs = get_reg_val(&values, rhs_reg);
+                    let lhs = get_reg(&values, lhs_reg);
+                    let rhs = get_reg(&values, rhs_reg);
                     // For non-instance objects, try operator dispatch
                     if lhs.is_object()
                         && !lhs.is_string_object()
@@ -821,20 +983,30 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         && !rhs.is_num()
                     {
                         let result = try_operator_dispatch(
-                            vm, fiber, lhs, "==(_)", &[rhs], &mut pc, &mut values, dst,
-                            &module_name, &bc,
+                            vm,
+                            fiber,
+                            lhs,
+                            "==(_)",
+                            &[rhs],
+                            &mut pc,
+                            &mut values,
+                            dst,
+                            &module_name,
+                            bc,
                         )?;
-                        if result { continue 'fiber_loop; }
+                        if result {
+                            continue 'fiber_loop;
+                        }
                     } else {
-                        set_reg(&mut values, dst, InterpValue::Boxed(Value::bool(lhs == rhs)));
+                        set_reg(&mut values, dst, Value::bool(lhs == rhs));
                     }
                 }
                 Op::CmpNe => {
                     let dst = read_u16(code, &mut pc);
                     let lhs_reg = read_u16(code, &mut pc);
                     let rhs_reg = read_u16(code, &mut pc);
-                    let lhs = get_reg_val(&values, lhs_reg);
-                    let rhs = get_reg_val(&values, rhs_reg);
+                    let lhs = get_reg(&values, lhs_reg);
+                    let rhs = get_reg(&values, rhs_reg);
                     if lhs.is_object()
                         && !lhs.is_string_object()
                         && !rhs.is_null()
@@ -842,42 +1014,116 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         && !rhs.is_num()
                     {
                         let result = try_operator_dispatch(
-                            vm, fiber, lhs, "!=(_)", &[rhs], &mut pc, &mut values, dst,
-                            &module_name, &bc,
+                            vm,
+                            fiber,
+                            lhs,
+                            "!=(_)",
+                            &[rhs],
+                            &mut pc,
+                            &mut values,
+                            dst,
+                            &module_name,
+                            bc,
                         )?;
-                        if result { continue 'fiber_loop; }
+                        if result {
+                            continue 'fiber_loop;
+                        }
                     } else {
-                        set_reg(&mut values, dst, InterpValue::Boxed(Value::bool(lhs != rhs)));
+                        set_reg(&mut values, dst, Value::bool(lhs != rhs));
                     }
                 }
 
-                Op::CmpLtF64 => { bc_f64_cmp!(&mut pc, &mut values, |x, y| x < y, &bc); }
-                Op::CmpGtF64 => { bc_f64_cmp!(&mut pc, &mut values, |x, y| x > y, &bc); }
-                Op::CmpLeF64 => { bc_f64_cmp!(&mut pc, &mut values, |x, y| x <= y, &bc); }
-                Op::CmpGeF64 => { bc_f64_cmp!(&mut pc, &mut values, |x, y| x >= y, &bc); }
+                Op::CmpLtF64 => {
+                    bc_f64_cmp!(&mut pc, &mut values, |x, y| x < y, &bc);
+                }
+                Op::CmpGtF64 => {
+                    bc_f64_cmp!(&mut pc, &mut values, |x, y| x > y, &bc);
+                }
+                Op::CmpLeF64 => {
+                    bc_f64_cmp!(&mut pc, &mut values, |x, y| x <= y, &bc);
+                }
+                Op::CmpGeF64 => {
+                    bc_f64_cmp!(&mut pc, &mut values, |x, y| x >= y, &bc);
+                }
 
                 // =============================================================
                 // Bitwise ops
                 // =============================================================
-                Op::BitAnd => { if bc_bitwise_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: i32, y: i32| x & y, "&(_)") { continue 'fiber_loop; } }
-                Op::BitOr => { if bc_bitwise_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: i32, y: i32| x | y, "|(_)") { continue 'fiber_loop; } }
+                Op::BitAnd => {
+                    if bc_bitwise_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: i32, y: i32| x & y,
+                        "&(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::BitOr => {
+                    if bc_bitwise_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: i32, y: i32| x | y,
+                        "|(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
                 Op::BitXor => {
                     let dst = read_u16(code, &mut pc);
                     let lhs_reg = read_u16(code, &mut pc);
                     let rhs_reg = read_u16(code, &mut pc);
                     let a = get_reg(&values, lhs_reg);
                     let b = get_reg(&values, rhs_reg);
-                    match (a.as_f64(), b.as_f64()) {
-                        (Ok(x), Ok(y)) => {
-                            set_reg(&mut values, dst, InterpValue::Boxed(Value::num(((x as i32) ^ (y as i32)) as f64)));
+                    match (a.as_num(), b.as_num()) {
+                        (Some(x), Some(y)) => {
+                            set_reg(
+                                &mut values,
+                                dst,
+                                Value::num(((x as i32) ^ (y as i32)) as f64),
+                            );
                         }
                         _ => {
                             return Err(RuntimeError::Error("bitwise xor: not numbers".into()));
                         }
                     }
                 }
-                Op::Shl => { if bc_bitwise_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: i32, y: i32| x << (y & 31), "<<(_)") { continue 'fiber_loop; } }
-                Op::Shr => { if bc_bitwise_binop!(vm, fiber, &mut pc, &mut values, &module_name, &bc, |x: i32, y: i32| x >> (y & 31), ">>(_)") { continue 'fiber_loop; } }
+                Op::Shl => {
+                    if bc_bitwise_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: i32, y: i32| x << (y & 31),
+                        "<<(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
+                Op::Shr => {
+                    if bc_bitwise_binop!(
+                        vm,
+                        fiber,
+                        &mut pc,
+                        &mut values,
+                        &module_name,
+                        &bc,
+                        |x: i32, y: i32| x >> (y & 31),
+                        ">>(_)"
+                    ) {
+                        continue 'fiber_loop;
+                    }
+                }
 
                 // =============================================================
                 // Range
@@ -888,16 +1134,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let to_reg = read_u16(code, &mut pc);
                     let inclusive = read_u8(code, &mut pc) != 0;
                     let f = get_reg(&values, from_reg)
-                        .as_f64()
-                        .map_err(RuntimeError::from)?;
+                        .as_num()
+                        .ok_or(RuntimeError::GuardFailed("num"))?;
                     let t = get_reg(&values, to_reg)
-                        .as_f64()
-                        .map_err(RuntimeError::from)?;
-                    set_reg(
-                        &mut values,
-                        dst,
-                        InterpValue::Boxed(vm.new_range(f, t, inclusive)),
-                    );
+                        .as_num()
+                        .ok_or(RuntimeError::GuardFailed("num"))?;
+                    set_reg(&mut values, dst, vm.new_range(f, t, inclusive));
                 }
 
                 // =============================================================
@@ -911,7 +1153,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let argc = read_u8(code, &mut pc) as usize;
                     let method = SymbolId::from_raw(method_idx as u32);
 
-                    let recv_val = get_reg_val(&values, recv_reg);
+                    let recv_val = get_reg(&values, recv_reg);
 
                     // Record where arg register indices start in bytecode,
                     // then advance pc past them. Args are read lazily.
@@ -929,7 +1171,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             // JIT leaf IC hit check: compare cached class
                             let recv_class = if recv_val.is_object() {
                                 let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
-                                unsafe { (*( obj_ptr as *const ObjHeader)).class as usize }
+                                unsafe { (*(obj_ptr as *const ObjHeader)).class as usize }
                             } else {
                                 0
                             };
@@ -947,7 +1189,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                             let a1 = read_u16_at(code, arg_regs_pc);
                                             let f: extern "C" fn(u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
-                                            f(recv_bits, get_reg_val(&values, a1).to_bits())
+                                            f(recv_bits, get_reg(&values, a1).to_bits())
                                         }
                                         2 => {
                                             let a1 = read_u16_at(code, arg_regs_pc);
@@ -956,8 +1198,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                                 std::mem::transmute(jit_ptr);
                                             f(
                                                 recv_bits,
-                                                get_reg_val(&values, a1).to_bits(),
-                                                get_reg_val(&values, a2).to_bits(),
+                                                get_reg(&values, a1).to_bits(),
+                                                get_reg(&values, a2).to_bits(),
                                             )
                                         }
                                         _ => {
@@ -968,18 +1210,14 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                                 std::mem::transmute(jit_ptr);
                                             f(
                                                 recv_bits,
-                                                get_reg_val(&values, a1).to_bits(),
-                                                get_reg_val(&values, a2).to_bits(),
-                                                get_reg_val(&values, a3).to_bits(),
+                                                get_reg(&values, a1).to_bits(),
+                                                get_reg(&values, a2).to_bits(),
+                                                get_reg(&values, a3).to_bits(),
                                             )
                                         }
                                     }
                                 };
-                                set_reg(
-                                    &mut values,
-                                    dst,
-                                    InterpValue::Boxed(Value::from_bits(result_bits)),
-                                );
+                                set_reg(&mut values, dst, Value::from_bits(result_bits));
                                 steps += 1;
                                 continue;
                             }
@@ -1000,11 +1238,18 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         let header = ptr as *const ObjHeader;
                         if unsafe { (*header).obj_type } == ObjType::Closure {
                             let closure_ptr = ptr as *mut ObjClosure;
-                            let arg_vals = build_arg_vals(recv_val, code, arg_regs_pc, argc, &values);
+                            let arg_vals =
+                                build_arg_vals(recv_val, code, arg_regs_pc, argc, &values);
                             dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &arg_vals[1..],
-                                pc, values, &module_name,
-                                ValueId(dst as u32), None,
+                                vm,
+                                fiber,
+                                closure_ptr,
+                                &arg_vals[1..],
+                                pc,
+                                values,
+                                &module_name,
+                                ValueId(dst as u32),
+                                None,
                             )?;
                             continue 'fiber_loop;
                         }
@@ -1012,21 +1257,6 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                     // Build arg values for the slow path
                     let arg_vals = build_arg_vals(recv_val, code, arg_regs_pc, argc, &values);
-
-                    // Closure call dispatch
-                    if vm.is_call_sym(method) && recv_val.is_object() {
-                        let ptr = recv_val.as_object().unwrap();
-                        let header = ptr as *const ObjHeader;
-                        if unsafe { (*header).obj_type } == ObjType::Closure {
-                            let closure_ptr = ptr as *mut ObjClosure;
-                            dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &arg_vals[1..],
-                                pc, values, &module_name,
-                                ValueId(dst as u32), None,
-                            )?;
-                            continue 'fiber_loop;
-                        }
-                    }
 
                     let class = vm.class_of(recv_val);
 
@@ -1048,11 +1278,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 let mut buf = [0u8; 128];
                                 let found = if total <= buf.len() {
                                     buf[..prefix.len()].copy_from_slice(prefix);
-                                    buf[prefix.len()..total]
-                                        .copy_from_slice(method_str.as_bytes());
-                                    let static_str = unsafe {
-                                        std::str::from_utf8_unchecked(&buf[..total])
-                                    };
+                                    buf[prefix.len()..total].copy_from_slice(method_str.as_bytes());
+                                    let static_str =
+                                        unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
                                     vm.interner.lookup(static_str).and_then(|sym| {
                                         unsafe { (*recv_class_ptr).find_method(sym).cloned() }
                                             .map(|m| (m, recv_class_ptr))
@@ -1060,14 +1288,13 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 } else {
                                     None
                                 };
-                                found.or_else(|| unsafe {
-                                    find_method_with_class(class, method)
-                                })
+                                found.or_else(|| unsafe { find_method_with_class(class, method) })
                             } else {
                                 unsafe { find_method_with_class(class, method) }
                             };
                             if let Some((ref m, dc)) = result {
-                                vm.method_cache.insert(cache_key_class, method, m.clone(), dc);
+                                vm.method_cache
+                                    .insert(cache_key_class, method, m.clone(), dc);
                             }
                             match result {
                                 Some((m, c)) => (Some(m), Some(c)),
@@ -1082,8 +1309,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 vm.has_error = false;
                                 let fiber_is_try = unsafe { (*fiber).is_try };
                                 if fiber_is_try {
-                                    let err_msg =
-                                        vm.last_error.take().unwrap_or_default();
+                                    let err_msg = vm.last_error.take().unwrap_or_default();
                                     let err_val = vm.new_string(err_msg);
                                     unsafe {
                                         (*fiber).error = err_val;
@@ -1106,21 +1332,27 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             }
                             if let Some(action) = vm.pending_fiber_action.take() {
                                 handle_fiber_action_bc(
-                                    vm, fiber, action, pc, values,
+                                    vm,
+                                    fiber,
+                                    action,
+                                    pc,
+                                    values,
                                     ValueId(dst as u32),
                                 )?;
                                 continue 'fiber_loop;
                             }
-                            set_reg(&mut values, dst, InterpValue::Boxed(result));
+                            set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
                             // Try to populate IC for JIT leaf methods.
-                            if vm.engine.mode != ExecutionMode::Interpreter
-                                && argc <= 3
-                            {
+                            if vm.engine.mode != ExecutionMode::Interpreter && argc <= 3 {
                                 let fn_ptr = unsafe { (*closure_ptr).function };
                                 let fn_idx = unsafe { (*fn_ptr).fn_id } as usize;
-                                let jit_ptr = vm.engine.jit_code.get(fn_idx).copied()
+                                let jit_ptr = vm
+                                    .engine
+                                    .jit_code
+                                    .get(fn_idx)
+                                    .copied()
                                     .unwrap_or(std::ptr::null());
                                 if !jit_ptr.is_null()
                                     && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
@@ -1170,39 +1402,137 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                             }
                                         }
                                     };
-                                    set_reg(
-                                        &mut values,
-                                        dst,
-                                        InterpValue::Boxed(Value::from_bits(result_bits)),
-                                    );
+                                    set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
                                     continue;
                                 }
                             }
-                            dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &arg_vals,
-                                pc, values, &module_name,
-                                ValueId(dst as u32), defining_class,
-                            )?;
-                            continue 'fiber_loop;
+                            // ── Inline closure dispatch ──
+                            let target_fn_ptr = unsafe { (*closure_ptr).function };
+                            let target_func_id = FuncId(unsafe { (*target_fn_ptr).fn_id });
+                            let fn_idx = target_func_id.0 as usize;
+
+                            // Check if already JIT-compiled → use dispatch_closure_bc for JIT path
+                            if vm.engine.mode != ExecutionMode::Interpreter {
+                                let jit_ptr = vm
+                                    .engine
+                                    .jit_code
+                                    .get(fn_idx)
+                                    .copied()
+                                    .unwrap_or(std::ptr::null());
+                                if !jit_ptr.is_null() || {
+                                    let should_tier_up = vm.engine.record_call(target_func_id);
+                                    if should_tier_up {
+                                        vm.engine.request_tier_up(target_func_id, &vm.interner);
+                                    }
+                                    vm.engine.poll_compilations();
+                                    // Re-check after poll
+                                    !vm.engine
+                                        .jit_code
+                                        .get(fn_idx)
+                                        .copied()
+                                        .unwrap_or(std::ptr::null())
+                                        .is_null()
+                                } {
+                                    dispatch_closure_bc(
+                                        vm,
+                                        fiber,
+                                        closure_ptr,
+                                        &arg_vals,
+                                        pc,
+                                        values,
+                                        &module_name,
+                                        ValueId(dst as u32),
+                                        defining_class,
+                                    )?;
+                                    continue 'fiber_loop;
+                                }
+                            }
+
+                            // ── Inline frame push: avoid fiber_loop restart ──
+                            let target_bc_ptr =
+                                vm.engine.ensure_bytecode(target_func_id).ok_or_else(|| {
+                                    RuntimeError::Error("invalid closure func_id".into())
+                                })?;
+                            let target_bc = unsafe { &*target_bc_ptr };
+
+                            // Allocate register file
+                            let reg_count = target_bc.register_count as usize;
+                            let mut new_values = if let Some(mut recycled) = vm.register_pool.pop()
+                            {
+                                recycled.resize(reg_count, UNDEF);
+                                new_values_fill_undef(&mut recycled, reg_count);
+                                recycled
+                            } else {
+                                vec![UNDEF; reg_count]
+                            };
+                            // Bind params
+                            for &(dst_reg, param_idx) in target_bc.param_offsets.iter() {
+                                if (param_idx as usize) < arg_vals.len()
+                                    && (dst_reg as usize) < reg_count
+                                {
+                                    new_values[dst_reg as usize] = arg_vals[param_idx as usize];
+                                }
+                            }
+
+                            // Check call depth
+                            let depth = unsafe { (*fiber).mir_frames.len() };
+                            if depth >= vm.config.max_call_depth {
+                                return Err(RuntimeError::StackOverflow);
+                            }
+
+                            // Save caller frame
+                            unsafe {
+                                let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                frame.pc = pc;
+                                frame.values = values;
+                            }
+
+                            // Push new frame
+                            unsafe {
+                                (*fiber).mir_frames.push(MirCallFrame {
+                                    func_id: target_func_id,
+                                    current_block: BlockId(0),
+                                    ip: 0,
+                                    pc: 0,
+                                    values: new_values,
+                                    module_name: Rc::clone(&module_name),
+                                    return_dst: Some(ValueId(dst as u32)),
+                                    closure: Some(closure_ptr),
+                                    defining_class,
+                                });
+                            }
+
+                            // Update locals to execute callee inline (skip fiber_loop restart)
+                            pc = 0;
+                            values = unsafe {
+                                std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
+                            };
+                            bc = unsafe { &*target_bc_ptr };
+                            code = &bc.code;
+                            continue;
                         }
                         Some(Method::Constructor(closure_ptr)) => {
-                            let recv_class =
-                                recv_val.as_object().unwrap() as *mut ObjClass;
+                            let recv_class = recv_val.as_object().unwrap() as *mut ObjClass;
                             let instance = vm.gc.alloc_instance(recv_class);
                             let instance_val = Value::object(instance as *mut u8);
                             let mut ctor_args = arg_vals.clone();
                             ctor_args[0] = instance_val;
                             dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &ctor_args,
-                                pc, values, &module_name,
-                                ValueId(dst as u32), defining_class,
+                                vm,
+                                fiber,
+                                closure_ptr,
+                                &ctor_args,
+                                pc,
+                                values,
+                                &module_name,
+                                ValueId(dst as u32),
+                                defining_class,
                             )?;
                             continue 'fiber_loop;
                         }
                         None => {
-                            let method_name =
-                                vm.interner.resolve(method).to_string();
+                            let method_name = vm.interner.resolve(method).to_string();
                             let class_name = vm.class_name_of(recv_val);
                             return Err(RuntimeError::MethodNotFound {
                                 class_name,
@@ -1218,34 +1548,31 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let argc = read_u8(code, &mut pc) as usize;
                     let method = SymbolId::from_raw(method_idx as u32);
 
-                    let mut arg_vals: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(argc);
+                    let mut arg_vals: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
                     for _ in 0..argc {
                         let arg_reg = read_u16(code, &mut pc);
-                        arg_vals.push(get_reg_val(&values, arg_reg));
+                        arg_vals.push(get_reg(&values, arg_reg));
                     }
 
-                    let defining =
-                        unsafe { (*fiber).mir_frames.last().unwrap().defining_class };
+                    let defining = unsafe { (*fiber).mir_frames.last().unwrap().defining_class };
                     let superclass = defining.and_then(|cls| {
                         let sup = unsafe { (*cls).superclass };
-                        if sup.is_null() { None } else { Some(sup) }
+                        if sup.is_null() {
+                            None
+                        } else {
+                            Some(sup)
+                        }
                     });
 
                     if let Some(super_cls) = superclass {
-                        let found =
-                            unsafe { find_method_with_class(super_cls, method) };
+                        let found = unsafe { find_method_with_class(super_cls, method) };
                         let (method_entry, found_class) = match found {
                             Some((m, c)) => (Some(m), Some(c)),
                             None => {
-                                let method_name =
-                                    vm.interner.resolve(method).to_string();
-                                let static_name =
-                                    format!("static:{}", method_name);
+                                let method_name = vm.interner.resolve(method).to_string();
+                                let static_name = format!("static:{}", method_name);
                                 let static_sym = vm.interner.intern(&static_name);
-                                match unsafe {
-                                    find_method_with_class(super_cls, static_sym)
-                                } {
+                                match unsafe { find_method_with_class(super_cls, static_sym) } {
                                     Some((m, c)) => (Some(m), Some(c)),
                                     None => (None, None),
                                 }
@@ -1253,34 +1580,40 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         };
                         match method_entry {
                             Some(Method::Native(func)) => {
-                                set_reg(
-                                    &mut values,
-                                    dst,
-                                    InterpValue::Boxed(func(vm, &arg_vals)),
-                                );
+                                set_reg(&mut values, dst, func(vm, &arg_vals));
                             }
                             Some(Method::Closure(closure_ptr)) => {
                                 dispatch_closure_bc(
-                                    vm, fiber, closure_ptr, &arg_vals,
-                                    pc, values, &module_name,
-                                    ValueId(dst as u32), found_class,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &arg_vals,
+                                    pc,
+                                    values,
+                                    &module_name,
+                                    ValueId(dst as u32),
+                                    found_class,
                                 )?;
                                 continue 'fiber_loop;
                             }
                             Some(Method::Constructor(closure_ptr)) => {
                                 dispatch_closure_bc(
-                                    vm, fiber, closure_ptr, &arg_vals,
-                                    pc, values, &module_name,
-                                    ValueId(dst as u32), found_class,
+                                    vm,
+                                    fiber,
+                                    closure_ptr,
+                                    &arg_vals,
+                                    pc,
+                                    values,
+                                    &module_name,
+                                    ValueId(dst as u32),
+                                    found_class,
                                 )?;
                                 continue 'fiber_loop;
                             }
                             None => {
-                                let method_name =
-                                    vm.interner.resolve(method).to_string();
-                                let class_name = unsafe {
-                                    vm.interner.resolve((*super_cls).name).to_string()
-                                };
+                                let method_name = vm.interner.resolve(method).to_string();
+                                let class_name =
+                                    unsafe { vm.interner.resolve((*super_cls).name).to_string() };
                                 return Err(RuntimeError::MethodNotFound {
                                     class_name,
                                     method: method_name,
@@ -1301,29 +1634,30 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let recv_reg = read_u16(code, &mut pc);
                     let argc = read_u8(code, &mut pc) as usize;
-                    let recv = get_reg_val(&values, recv_reg);
-                    let mut all_args: SmallVec<[Value; 4]> =
-                        SmallVec::with_capacity(1 + argc);
+                    let recv = get_reg(&values, recv_reg);
+                    let mut all_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + argc);
                     all_args.push(recv);
                     for _ in 0..argc {
                         let arg_reg = read_u16(code, &mut pc);
-                        all_args.push(get_reg_val(&values, arg_reg));
+                        all_args.push(get_reg(&values, arg_reg));
                     }
                     let class = vm.class_of(recv);
                     let sym = subscript_get_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(Method::Native(func)) => {
-                            set_reg(
-                                &mut values,
-                                dst,
-                                InterpValue::Boxed(func(vm, &all_args)),
-                            );
+                            set_reg(&mut values, dst, func(vm, &all_args));
                         }
                         Some(Method::Closure(closure_ptr)) => {
                             dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &all_args,
-                                pc, values, &module_name,
-                                ValueId(dst as u32), None,
+                                vm,
+                                fiber,
+                                closure_ptr,
+                                &all_args,
+                                pc,
+                                values,
+                                &module_name,
+                                ValueId(dst as u32),
+                                None,
                             )?;
                             continue 'fiber_loop;
                         }
@@ -1339,31 +1673,32 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let recv_reg = read_u16(code, &mut pc);
                     let argc = read_u8(code, &mut pc) as usize;
-                    let recv = get_reg_val(&values, recv_reg);
-                    let mut all_args: SmallVec<[Value; 4]> =
-                        SmallVec::with_capacity(2 + argc);
+                    let recv = get_reg(&values, recv_reg);
+                    let mut all_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(2 + argc);
                     all_args.push(recv);
                     for _ in 0..argc {
                         let arg_reg = read_u16(code, &mut pc);
-                        all_args.push(get_reg_val(&values, arg_reg));
+                        all_args.push(get_reg(&values, arg_reg));
                     }
                     let val_reg = read_u16(code, &mut pc);
-                    all_args.push(get_reg_val(&values, val_reg));
+                    all_args.push(get_reg(&values, val_reg));
                     let class = vm.class_of(recv);
                     let sym = subscript_set_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(Method::Native(func)) => {
-                            set_reg(
-                                &mut values,
-                                dst,
-                                InterpValue::Boxed(func(vm, &all_args)),
-                            );
+                            set_reg(&mut values, dst, func(vm, &all_args));
                         }
                         Some(Method::Closure(closure_ptr)) => {
                             dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &all_args,
-                                pc, values, &module_name,
-                                ValueId(dst as u32), None,
+                                vm,
+                                fiber,
+                                closure_ptr,
+                                &all_args,
+                                pc,
+                                values,
+                                &module_name,
+                                ValueId(dst as u32),
+                                None,
                             )?;
                             continue 'fiber_loop;
                         }
@@ -1385,30 +1720,26 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let mut elements = Vec::with_capacity(count);
                     for _ in 0..count {
                         let reg = read_u16(code, &mut pc);
-                        elements.push(get_reg_val(&values, reg));
+                        elements.push(get_reg(&values, reg));
                     }
-                    set_reg(
-                        &mut values,
-                        dst,
-                        InterpValue::Boxed(vm.new_list(elements)),
-                    );
+                    set_reg(&mut values, dst, vm.new_list(elements));
                 }
                 Op::MakeMap => {
                     let dst = read_u16(code, &mut pc);
                     let count = read_u8(code, &mut pc) as usize;
                     let map_val = vm.new_map();
                     if count > 0 {
-                        let map_ptr = map_val.as_object().unwrap()
-                            as *mut crate::runtime::object::ObjMap;
+                        let map_ptr =
+                            map_val.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
                         for _ in 0..count {
                             let k_reg = read_u16(code, &mut pc);
                             let v_reg = read_u16(code, &mut pc);
-                            let key = get_reg_val(&values, k_reg);
-                            let val = get_reg_val(&values, v_reg);
+                            let key = get_reg(&values, k_reg);
+                            let val = get_reg(&values, v_reg);
                             unsafe { (*map_ptr).set(key, val) };
                         }
                     }
-                    set_reg(&mut values, dst, InterpValue::Boxed(map_val));
+                    set_reg(&mut values, dst, map_val);
                 }
                 Op::StringConcat => {
                     let dst = read_u16(code, &mut pc);
@@ -1416,16 +1747,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let mut result = String::new();
                     for _ in 0..count {
                         let reg = read_u16(code, &mut pc);
-                        result.push_str(&value_to_string(
-                            vm,
-                            get_reg_val(&values, reg),
-                        ));
+                        result.push_str(&value_to_string(vm, get_reg(&values, reg)));
                     }
-                    set_reg(
-                        &mut values,
-                        dst,
-                        InterpValue::Boxed(vm.new_string(result)),
-                    );
+                    set_reg(&mut values, dst, vm.new_string(result));
                 }
 
                 // =============================================================
@@ -1442,9 +1766,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         .get_mir(FuncId(fn_id))
                         .map(|mir| mir.arity)
                         .unwrap_or(0);
-                    let fn_ptr =
-                        vm.gc
-                            .alloc_fn(closure_name, arity, uv_count as u16, fn_id);
+                    let fn_ptr = vm.gc.alloc_fn(closure_name, arity, uv_count as u16, fn_id);
                     unsafe {
                         (*fn_ptr).header.class = vm.fn_class;
                     }
@@ -1455,7 +1777,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                     for i in 0..uv_count {
                         let uv_reg = read_u16(code, &mut pc);
-                        let captured_val = get_reg_val(&values, uv_reg);
+                        let captured_val = get_reg(&values, uv_reg);
                         let uv_obj = vm.gc.alloc_upvalue(std::ptr::null_mut());
                         unsafe {
                             (*uv_obj).closed = captured_val;
@@ -1466,11 +1788,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                     }
 
-                    set_reg(
-                        &mut values,
-                        dst,
-                        InterpValue::Boxed(Value::object(closure_ptr as *mut u8)),
-                    );
+                    set_reg(&mut values, dst, Value::object(closure_ptr as *mut u8));
                 }
 
                 // =============================================================
@@ -1478,9 +1796,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 // =============================================================
                 Op::Return => {
                     let src = read_u16(code, &mut pc);
-                    let return_val = get_reg_val(&values, src);
-                    let return_dst =
-                        unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
+                    let return_val = get_reg(&values, src);
+                    let return_dst = unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
                     unsafe { (*fiber).mir_frames.pop() };
                     // Recycle the callee's register file
                     values.clear();
@@ -1495,21 +1812,27 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                         return Ok(return_val);
                     }
-                    if let Some(dst) = return_dst {
-                        unsafe {
-                            let frame = (*fiber).mir_frames.last_mut().unwrap();
-                            set_reg(
-                                &mut frame.values,
-                                dst.0 as u16,
-                                InterpValue::Boxed(return_val),
-                            );
+                    // ── Inline return: restore caller state without fiber_loop restart ──
+                    unsafe {
+                        let frame = (*fiber).mir_frames.last_mut().unwrap();
+                        if let Some(dst) = return_dst {
+                            set_reg(&mut frame.values, dst.0 as u16, return_val);
                         }
+                        func_id = frame.func_id;
+                        pc = frame.pc;
+                        values = std::mem::take(&mut frame.values);
                     }
-                    continue 'fiber_loop;
+                    // Reload bytecode pointers for the caller
+                    bc_ptr = vm
+                        .engine
+                        .ensure_bytecode(func_id)
+                        .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
+                    bc = unsafe { &*bc_ptr };
+                    code = &bc.code;
+                    continue;
                 }
                 Op::ReturnNull => {
-                    let return_dst =
-                        unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
+                    let return_dst = unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
                     unsafe { (*fiber).mir_frames.pop() };
                     // Recycle the callee's register file
                     values.clear();
@@ -1524,17 +1847,24 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                         return Ok(Value::null());
                     }
-                    if let Some(dst) = return_dst {
-                        unsafe {
-                            let frame = (*fiber).mir_frames.last_mut().unwrap();
-                            set_reg(
-                                &mut frame.values,
-                                dst.0 as u16,
-                                InterpValue::Boxed(Value::null()),
-                            );
+                    // ── Inline return: restore caller state without fiber_loop restart ──
+                    unsafe {
+                        let frame = (*fiber).mir_frames.last_mut().unwrap();
+                        if let Some(dst) = return_dst {
+                            set_reg(&mut frame.values, dst.0 as u16, Value::null());
                         }
+                        func_id = frame.func_id;
+                        pc = frame.pc;
+                        values = std::mem::take(&mut frame.values);
                     }
-                    continue 'fiber_loop;
+                    // Reload bytecode pointers for the caller
+                    bc_ptr = vm
+                        .engine
+                        .ensure_bytecode(func_id)
+                        .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
+                    bc = unsafe { &*bc_ptr };
+                    code = &bc.code;
+                    continue;
                 }
                 Op::Unreachable => {
                     return Err(RuntimeError::Unreachable);
@@ -1568,7 +1898,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let false_params_start = pc;
                     // Don't need to advance pc — both branches jump to target offset
 
-                    if cond.is_truthy() {
+                    if cond.is_truthy_wren() {
                         // Bind true params
                         let mut p = true_params_start;
                         for _ in 0..t_argc {
@@ -1667,13 +1997,13 @@ pub fn eval_in_vm(
 
 /// Create a register file pre-sized for a MIR function.
 #[inline]
-pub fn new_register_file(mir: &crate::mir::MirFunction) -> Vec<InterpValue> {
+pub fn new_register_file(mir: &crate::mir::MirFunction) -> Vec<Value> {
     vec![UNDEF; mir.next_value as usize]
 }
 
 /// Fill a recycled register file with UNDEF up to `count` slots.
 #[inline(always)]
-fn new_values_fill_undef(values: &mut [InterpValue], count: usize) {
+fn new_values_fill_undef(values: &mut [Value], count: usize) {
     for v in values[..count].iter_mut() {
         *v = UNDEF;
     }
@@ -1687,7 +2017,7 @@ fn dispatch_closure_bc(
     closure_ptr: *mut ObjClosure,
     arg_vals: &[Value],
     pc: u32,
-    mut values: Vec<InterpValue>,
+    mut values: Vec<Value>,
     module_name: &Rc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
@@ -1699,7 +2029,12 @@ fn dispatch_closure_bc(
     // Fast JIT dispatch: check the Vec-indexed jit_code array (O(1) lookup).
     // Skip tier-up profiling entirely for already-compiled functions.
     if vm.engine.mode != ExecutionMode::Interpreter && arg_vals.len() <= 4 {
-        let native_fn_ptr = vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null());
+        let native_fn_ptr = vm
+            .engine
+            .jit_code
+            .get(fn_idx)
+            .copied()
+            .unwrap_or(std::ptr::null());
 
         if native_fn_ptr.is_null() {
             // Not yet compiled: do tier-up profiling.
@@ -1712,7 +2047,11 @@ fn dispatch_closure_bc(
 
         // Re-check after poll (might have just been installed).
         let fn_ptr_raw = if native_fn_ptr.is_null() {
-            vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null())
+            vm.engine
+                .jit_code
+                .get(fn_idx)
+                .copied()
+                .unwrap_or(std::ptr::null())
         } else {
             native_fn_ptr
         };
@@ -1739,8 +2078,7 @@ fn dispatch_closure_bc(
                         module_name: module_name.as_ptr(),
                         module_name_len: module_name.len() as u32,
                         closure: closure_ptr as *mut u8,
-                        defining_class: defining_class
-                            .unwrap_or(std::ptr::null_mut()) as *mut u8,
+                        defining_class: defining_class.unwrap_or(std::ptr::null_mut()) as *mut u8,
                     },
                 );
             }
@@ -1749,18 +2087,15 @@ fn dispatch_closure_bc(
             let result_bits = unsafe {
                 match arg_vals.len() {
                     0 => {
-                        let f: extern "C" fn() -> u64 =
-                            std::mem::transmute(fn_ptr_raw);
+                        let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr_raw);
                         f()
                     }
                     1 => {
-                        let f: extern "C" fn(u64) -> u64 =
-                            std::mem::transmute(fn_ptr_raw);
+                        let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr_raw);
                         f(arg_vals[0].to_bits())
                     }
                     2 => {
-                        let f: extern "C" fn(u64, u64) -> u64 =
-                            std::mem::transmute(fn_ptr_raw);
+                        let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr_raw);
                         f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
                     }
                     3 => {
@@ -1791,11 +2126,7 @@ fn dispatch_closure_bc(
 
             let result_val = Value::from_bits(result_bits);
             // Store result in caller's return_dst register
-            set_reg(
-                &mut values,
-                return_dst.0 as u16,
-                InterpValue::Boxed(result_val),
-            );
+            set_reg(&mut values, return_dst.0 as u16, result_val);
             // Save caller frame state
             unsafe {
                 let frame = (*fiber).mir_frames.last_mut().unwrap();
@@ -1837,7 +2168,7 @@ fn dispatch_closure_bc(
     };
     for &(dst_reg, param_idx) in target_bc.param_offsets.iter() {
         if (param_idx as usize) < arg_vals.len() && (dst_reg as usize) < reg_count {
-            new_values[dst_reg as usize] = InterpValue::Boxed(arg_vals[param_idx as usize]);
+            new_values[dst_reg as usize] = arg_vals[param_idx as usize];
         }
     }
 
@@ -1877,7 +2208,7 @@ fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
     unsafe {
         if let Some(dst) = (*caller).resume_value_dst.take() {
             if let Some(frame) = (*caller).mir_frames.last_mut() {
-                set_reg(&mut frame.values, dst.0 as u16, InterpValue::Boxed(value));
+                set_reg(&mut frame.values, dst.0 as u16, value);
             }
         }
     }
@@ -1890,7 +2221,7 @@ fn handle_fiber_action_bc(
     fiber: *mut ObjFiber,
     action: FiberAction,
     pc: u32,
-    values: Vec<InterpValue>,
+    values: Vec<Value>,
     call_dst: ValueId,
 ) -> Result<(), RuntimeError> {
     // Save current fiber's execution state
@@ -1913,11 +2244,7 @@ fn handle_fiber_action_bc(
                 unsafe {
                     if let Some(dst) = (*target).resume_value_dst.take() {
                         if let Some(frame) = (*target).mir_frames.last_mut() {
-                            set_reg(
-                                &mut frame.values,
-                                dst.0 as u16,
-                                InterpValue::Boxed(value),
-                            );
+                            set_reg(&mut frame.values, dst.0 as u16, value);
                         }
                     }
                 }
@@ -1952,11 +2279,7 @@ fn handle_fiber_action_bc(
                 unsafe {
                     if let Some(dst) = (*target).resume_value_dst.take() {
                         if let Some(frame) = (*target).mir_frames.last_mut() {
-                            set_reg(
-                                &mut frame.values,
-                                dst.0 as u16,
-                                InterpValue::Boxed(value),
-                            );
+                            set_reg(&mut frame.values, dst.0 as u16, value);
                         }
                     }
                 }
@@ -1992,7 +2315,7 @@ fn try_operator_dispatch(
     method_str: &str,
     args: &[Value],
     pc: &mut u32,
-    values: &mut Vec<InterpValue>,
+    values: &mut Vec<Value>,
     dst: u16,
     module_name: &Rc<String>,
     _bc: &BytecodeFunction,
@@ -2015,7 +2338,7 @@ fn try_operator_dispatch(
             arg_vals.push(recv);
             arg_vals.extend_from_slice(args);
             let result = func(vm, &arg_vals);
-            set_reg(values, dst, InterpValue::Boxed(result));
+            set_reg(values, dst, result);
             Ok(false)
         }
         Some(Method::Closure(closure_ptr)) => {

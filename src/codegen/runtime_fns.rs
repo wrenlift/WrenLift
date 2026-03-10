@@ -129,12 +129,14 @@ pub fn clear_jit_roots() {
 
 /// Get current JIT roots count (for save/restore around re-entrant calls).
 #[inline(always)]
+#[allow(dead_code)]
 fn jit_roots_len() -> usize {
     JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).len() })
 }
 
 /// Truncate JIT roots back to a saved length (pop roots added by this frame).
 #[inline(always)]
+#[allow(dead_code)]
 fn jit_roots_truncate(len: usize) {
     JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).truncate(len) });
 }
@@ -160,9 +162,7 @@ pub fn jit_context_roots() -> (Value, Value) {
 pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
     mutate_jit_ctx(|ctx| {
         ctx.closure = closure.as_object().unwrap_or(std::ptr::null_mut());
-        ctx.defining_class = defining_class
-            .as_object()
-            .unwrap_or(std::ptr::null_mut());
+        ctx.defining_class = defining_class.as_object().unwrap_or(std::ptr::null_mut());
     });
 }
 
@@ -193,6 +193,7 @@ unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
 /// Refresh JitContext's module_vars pointer from the VM's engine.
 /// Must be called after any operation that might reallocate the module's
 /// variable Vec (e.g., call_closure_sync which can import modules).
+#[allow(dead_code)]
 fn refresh_module_vars() {
     let vm = unsafe { vm_ref() };
     if let Some(vm) = vm {
@@ -221,8 +222,7 @@ pub fn module_name() -> String {
         String::new()
     } else {
         unsafe {
-            let slice =
-                std::slice::from_raw_parts(ctx.module_name, ctx.module_name_len as usize);
+            let slice = std::slice::from_raw_parts(ctx.module_name, ctx.module_name_len as usize);
             String::from_utf8_lossy(slice).into_owned()
         }
     }
@@ -267,21 +267,20 @@ fn call_closure_jit_or_sync(
     // Install completed compilations so we can dispatch natively.
     vm.engine.poll_compilations();
     if args.len() <= 4 {
-        let func_id =
-            crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+        let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
         // Check if this function has been compiled to native code.
-        let native_fn_ptr: Option<*const u8> = if let Some(
-            crate::runtime::engine::FuncBody::Compiled { executable, .. },
-        ) = vm.engine.get_function(func_id)
-        {
-            if executable.is_native() {
-                Some(executable.native_ptr())
+        let native_fn_ptr: Option<*const u8> =
+            if let Some(crate::runtime::engine::FuncBody::Compiled { executable, .. }) =
+                vm.engine.get_function(func_id)
+            {
+                if executable.is_native() {
+                    Some(executable.native_ptr())
+                } else {
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         if let Some(fn_ptr) = native_fn_ptr {
             // Native-to-native dispatch: call compiled code directly.
@@ -296,13 +295,11 @@ fn call_closure_jit_or_sync(
                         f(args[0].to_bits())
                     }
                     2 => {
-                        let f: extern "C" fn(u64, u64) -> u64 =
-                            std::mem::transmute(fn_ptr);
+                        let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
                         f(args[0].to_bits(), args[1].to_bits())
                     }
                     3 => {
-                        let f: extern "C" fn(u64, u64, u64) -> u64 =
-                            std::mem::transmute(fn_ptr);
+                        let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
                         f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
                     }
                     _ => {
@@ -355,7 +352,8 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
 
     match method_entry {
         Some(m) => {
-            vm.method_cache.insert(cache_key_class, method_sym, m.clone(), class);
+            vm.method_cache
+                .insert(cache_key_class, method_sym, m.clone(), class);
             dispatch_method(vm, m, args)
         }
         None => {
@@ -369,16 +367,16 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
                 let found = if total <= buf.len() {
                     buf[..prefix.len()].copy_from_slice(prefix);
                     buf[prefix.len()..total].copy_from_slice(method_str.as_bytes());
-                    let static_str =
-                        unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
-                    vm.interner.lookup(static_str).and_then(|sym| unsafe {
-                        (*cache_key_class).find_method(sym).cloned()
-                    })
+                    let static_str = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+                    vm.interner
+                        .lookup(static_str)
+                        .and_then(|sym| unsafe { (*cache_key_class).find_method(sym).cloned() })
                 } else {
                     None
                 };
                 if let Some(m) = found {
-                    vm.method_cache.insert(cache_key_class, method_sym, m.clone(), cache_key_class);
+                    vm.method_cache
+                        .insert(cache_key_class, method_sym, m.clone(), cache_key_class);
                     dispatch_method(vm, m, args)
                 } else {
                     Value::null().to_bits()
@@ -483,9 +481,7 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
     match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
         Some(Method::Closure(closure_ptr)) => call_closure_jit_or_sync(vm, closure_ptr, args),
-        Some(Method::Constructor(closure_ptr)) => {
-            call_closure_jit_or_sync(vm, closure_ptr, args)
-        }
+        Some(Method::Constructor(closure_ptr)) => call_closure_jit_or_sync(vm, closure_ptr, args),
         None => Value::null().to_bits(),
     }
 }
@@ -970,7 +966,11 @@ pub extern "C" fn wren_not(a: u64) -> u64 {
 pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
     let v = Value::from_bits(value);
     // Return raw 0/1 (not NaN-boxed) so JmpZero can branch correctly.
-    if v.is_falsy() { 0u64 } else { 1u64 }
+    if v.is_falsy() {
+        0u64
+    } else {
+        1u64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,9 +1193,8 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
                 // in that case the pop would overwrite the call result. When
                 // ret_vreg != abi_ret, the result Mov happens before pops, so
                 // popping abi_ret safely restores the old live value.
-                let mut excluded: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-                if ret.map_or(true, |rv| rv.index == abi_ret) {
+                let mut excluded: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                if ret.is_none_or(|rv| rv.index == abi_ret) {
                     excluded.insert(abi_ret);
                 }
                 excluded.insert(call_scratch);
@@ -1217,9 +1216,7 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
 
                 // 0. Push caller-saved live registers
                 for &reg in &save_regs {
-                    new_insts.push(MachInst::Push {
-                        src: VReg::gp(reg),
-                    });
+                    new_insts.push(MachInst::Push { src: VReg::gp(reg) });
                 }
 
                 // 1. Build (src_phys, dst_abi) move pairs and resolve in parallel
@@ -1260,9 +1257,7 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
 
                 // 5. Pop caller-saved live registers (reverse order)
                 for &reg in save_regs.iter().rev() {
-                    new_insts.push(MachInst::Pop {
-                        dst: VReg::gp(reg),
-                    });
+                    new_insts.push(MachInst::Pop { dst: VReg::gp(reg) });
                 }
 
                 let seq_len = new_insts.len();

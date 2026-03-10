@@ -187,7 +187,7 @@ pub struct VM {
     pub gc_requested: bool,
 
     /// Pool of reusable register files to avoid per-call heap allocation.
-    pub register_pool: Vec<Vec<crate::mir::interp::InterpValue>>,
+    pub register_pool: Vec<Vec<Value>>,
 
     /// Global inline method cache for fast monomorphic dispatch.
     pub method_cache: super::vm_interp::MethodCache,
@@ -575,7 +575,9 @@ impl VM {
 
         // 9. Create a fiber and push the initial call frame
         let fiber = self.gc.alloc_fiber();
-        let reg_size = self.engine.get_mir(func_id)
+        let reg_size = self
+            .engine
+            .get_mir(func_id)
             .map(|m| m.next_value as usize)
             .unwrap_or(0);
         unsafe {
@@ -585,7 +587,7 @@ impl VM {
                 current_block: BlockId(0),
                 ip: 0,
                 pc: 0,
-                values: vec![crate::mir::interp::InterpValue::Boxed(Value::UNDEFINED); reg_size],
+                values: vec![Value::UNDEFINED; reg_size],
                 module_name: std::rc::Rc::new(module_key.clone()),
                 return_dst: None,
                 closure: None,
@@ -1336,7 +1338,6 @@ impl NativeContext for VM {
     }
 
     fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value> {
-        use crate::mir::interp::InterpValue;
         use crate::mir::{BlockId, Instruction};
 
         // Special-case: calling a closure/function via call(...)
@@ -1394,7 +1395,7 @@ impl NativeContext for VM {
                     let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
                     let mir = self.engine.get_mir(func_id)?;
-                    let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
+                    let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
                     let block = &mir.blocks[0];
 
@@ -1404,8 +1405,10 @@ impl NativeContext for VM {
                             let idx = *param_idx as usize;
                             if idx < all_args.len() {
                                 let i = vid.0 as usize;
-                                if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
-                                values[i] = InterpValue::Boxed(all_args[idx]);
+                                if i >= values.len() {
+                                    values.resize(i + 1, Value::UNDEFINED);
+                                }
+                                values[i] = all_args[idx];
                             }
                         } else {
                             break;
@@ -1440,15 +1443,17 @@ impl NativeContext for VM {
                     let fn_ptr = (*closure_ptr).function;
                     let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
                     let mir = self.engine.get_mir(func_id)?;
-                    let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
+                    let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
                     let block = &mir.blocks[0];
                     for (vid, inst) in &block.instructions {
                         if let Instruction::BlockParam(param_idx) = inst {
                             let idx = *param_idx as usize;
                             if idx < all_args.len() {
                                 let i = vid.0 as usize;
-                                if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
-                                values[i] = InterpValue::Boxed(all_args[idx]);
+                                if i >= values.len() {
+                                    values.resize(i + 1, Value::UNDEFINED);
+                                }
+                                values[i] = all_args[idx];
                             }
                         } else {
                             break;
@@ -1693,7 +1698,9 @@ impl VM {
         );
 
         let fiber = self.gc.alloc_fiber();
-        let reg_size = self.engine.get_mir(func_id)
+        let reg_size = self
+            .engine
+            .get_mir(func_id)
             .map(|m| m.next_value as usize)
             .unwrap_or(0);
         unsafe {
@@ -1703,7 +1710,7 @@ impl VM {
                 current_block: crate::mir::BlockId(0),
                 ip: 0,
                 pc: 0,
-                values: vec![crate::mir::interp::InterpValue::Boxed(Value::UNDEFINED); reg_size],
+                values: vec![Value::UNDEFINED; reg_size],
                 module_name: std::rc::Rc::new(eval_module_name.clone()),
                 return_dst: None,
                 closure: None,
@@ -1839,7 +1846,6 @@ impl VM {
         closure_ptr: *mut ObjClosure,
         args: &[Value],
     ) -> Option<Value> {
-        use crate::mir::interp::InterpValue;
         use crate::mir::{BlockId, Instruction};
 
         let temp_fiber = self.gc.alloc_fiber();
@@ -1850,7 +1856,7 @@ impl VM {
             let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
             let mir = self.engine.get_mir(func_id)?;
-            let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
+            let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
             // Bind block params using the actual BlockParam index (not a
             // sequential counter), because unused params may be eliminated.
@@ -1860,8 +1866,10 @@ impl VM {
                     let param_i = *idx as usize;
                     if param_i < args.len() {
                         let i = vid.0 as usize;
-                        if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
-                        values[i] = InterpValue::Boxed(args[param_i]);
+                        if i >= values.len() {
+                            values.resize(i + 1, Value::UNDEFINED);
+                        }
+                        values[i] = args[param_i];
                     }
                 } else {
                     break;
@@ -1871,7 +1879,9 @@ impl VM {
             // Resolve module_name from the current fiber's frame (avoids
             // reading a potentially stale JIT context pointer).
             let mod_name = if !self.fiber.is_null() {
-                (*self.fiber).mir_frames.last()
+                (*self.fiber)
+                    .mir_frames
+                    .last()
                     .map(|f| f.module_name.clone())
                     .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
             } else {
@@ -1896,9 +1906,7 @@ impl VM {
         // calls (it holds roots from the outer native/interpreter frame).
         // We can't use fiber.caller because that has semantic meaning (fiber resumption).
         if !saved_fiber.is_null() {
-            crate::codegen::runtime_fns::push_jit_root(Value::object(
-                saved_fiber as *mut u8,
-            ));
+            crate::codegen::runtime_fns::push_jit_root(Value::object(saved_fiber as *mut u8));
         }
         self.fiber = temp_fiber;
         let result = super::vm_interp::run_fiber(self);

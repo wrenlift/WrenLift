@@ -720,8 +720,8 @@ pub struct MirCallFrame {
     /// Flat bytecode program counter (bytecode path).
     pub pc: u32,
     /// SSA register file for this frame. Indexed by ValueId.0.
-    /// Uninitialized slots hold InterpValue::Boxed(Value::undefined()).
-    pub values: Vec<crate::mir::interp::InterpValue>,
+    /// Uninitialized slots hold Value::UNDEFINED.
+    pub values: Vec<crate::runtime::value::Value>,
     /// Module variable storage for this frame's module (Rc to avoid clone per call).
     pub module_name: std::rc::Rc<String>,
     /// The ValueId in the *caller* frame that should receive our return value.

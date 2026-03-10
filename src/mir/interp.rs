@@ -436,7 +436,8 @@ impl<'a> Interp<'a> {
                 let val = self.eval_instruction(inst)?;
                 let idx = result_id.0 as usize;
                 if idx >= self.values.len() {
-                    self.values.resize(idx + 1, InterpValue::Boxed(Value::UNDEFINED));
+                    self.values
+                        .resize(idx + 1, InterpValue::Boxed(Value::UNDEFINED));
                 }
                 self.values[idx] = val;
             }
@@ -506,7 +507,8 @@ impl<'a> Interp<'a> {
             let val = self.get(*arg_id)?;
             let idx = param_id.0 as usize;
             if idx >= self.values.len() {
-                self.values.resize(idx + 1, InterpValue::Boxed(Value::UNDEFINED));
+                self.values
+                    .resize(idx + 1, InterpValue::Boxed(Value::UNDEFINED));
             }
             self.values[idx] = val;
         }
