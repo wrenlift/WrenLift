@@ -749,7 +749,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
             if !class.superclass.is_null() {
                 mark_gray(class.superclass as *mut ObjHeader, gray_stack);
             }
-            for method in class.methods.values() {
+            for method in class.methods.iter().flatten() {
                 match method {
                     Method::Closure(ptr) | Method::Constructor(ptr) => {
                         if !ptr.is_null() {
@@ -880,7 +880,7 @@ unsafe fn update_pointers_in_object(
         ObjType::Class => {
             let class = &mut *(header as *mut ObjClass);
             update_raw_ptr(&mut class.superclass, forwards);
-            for method in class.methods.values_mut() {
+            for method in class.methods.iter_mut().flatten() {
                 match method {
                     Method::Closure(ref mut ptr) | Method::Constructor(ref mut ptr) => {
                         update_raw_ptr(ptr, forwards);

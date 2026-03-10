@@ -61,5 +61,12 @@ pub fn bind(vm: &mut VM) {
 
     for sig in &call_signatures {
         vm.primitive(class, sig, fn_call_stub);
+        // Mark this symbol for O(1) "is call?" checks in the dispatch hot path.
+        let sym = vm.interner.intern(sig);
+        vm.mark_call_symbol(sym);
     }
+
+    // Also mark the bare "call" getter (used as `fn.call` without parens in Wren).
+    let call_bare = vm.interner.intern("call");
+    vm.mark_call_symbol(call_bare);
 }

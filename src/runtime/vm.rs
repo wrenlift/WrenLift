@@ -191,6 +191,10 @@ pub struct VM {
 
     /// Global inline method cache for fast monomorphic dispatch.
     pub method_cache: super::vm_interp::MethodCache,
+
+    /// Bitset: `call_sym_flags[sym.index()]` is true for call()/call(_)/... symbols.
+    /// Used for O(1) "is this a closure call?" check in the dispatch hot path.
+    pub call_sym_flags: Vec<bool>,
 }
 
 impl VM {
@@ -246,6 +250,7 @@ impl VM {
             gc_requested: false,
             register_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
+            call_sym_flags: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -547,7 +552,12 @@ impl VM {
                     } else {
                         Method::Closure(closure_ptr)
                     };
-                    (*class_ptr).methods.insert(bind_sym, method);
+                    let idx = bind_sym.index() as usize;
+                    let cls = &mut *class_ptr;
+                    if idx >= cls.methods.len() {
+                        cls.methods.resize(idx + 1, None);
+                    }
+                    cls.methods[idx] = Some(method);
                 }
             }
 
@@ -907,6 +917,22 @@ impl VM {
         unsafe {
             (*class).bind_native(sym, func);
         }
+    }
+
+    /// Mark a symbol as a call() family symbol for fast dispatch checks.
+    pub fn mark_call_symbol(&mut self, sym: SymbolId) {
+        let idx = sym.index() as usize;
+        if idx >= self.call_sym_flags.len() {
+            self.call_sym_flags.resize(idx + 1, false);
+        }
+        self.call_sym_flags[idx] = true;
+    }
+
+    /// Check if a method symbol is a call() family symbol (O(1) array lookup).
+    #[inline(always)]
+    pub fn is_call_sym(&self, sym: SymbolId) -> bool {
+        let idx = sym.index() as usize;
+        idx < self.call_sym_flags.len() && unsafe { *self.call_sym_flags.get_unchecked(idx) }
     }
 
     /// Look up a static method on a class.

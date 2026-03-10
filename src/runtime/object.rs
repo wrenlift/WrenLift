@@ -856,8 +856,8 @@ pub struct ObjClass {
     pub name: SymbolId,
     /// Superclass (null for Object).
     pub superclass: *mut ObjClass,
-    /// Method table: symbol → closure/native.
-    pub methods: HashMap<SymbolId, Method>,
+    /// Flat method table: indexed by `SymbolId.0` for O(1) dispatch.
+    pub methods: Vec<Option<Method>>,
     /// Number of instance fields.
     pub num_fields: u16,
     /// Is this a foreign class?
@@ -974,17 +974,17 @@ pub trait NativeContext {
 impl ObjClass {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(name: SymbolId, superclass: *mut ObjClass) -> Self {
-        let mut methods = HashMap::new();
+        let mut methods;
         let mut protocols = crate::sema::protocol::ProtocolSet::EMPTY;
 
         // Inherit methods and protocols from superclass.
         if !superclass.is_null() {
             unsafe {
-                for (sym, method) in &(*superclass).methods {
-                    methods.insert(*sym, method.clone());
-                }
+                methods = (*superclass).methods.clone();
                 protocols = (*superclass).protocols;
             }
+        } else {
+            methods = Vec::new();
         }
 
         Self {
@@ -999,30 +999,39 @@ impl ObjClass {
         }
     }
 
+    /// Ensure the method table is large enough for the given symbol.
+    #[inline]
+    /// Ensure the method table is large enough for the given symbol.
+    #[inline]
+    fn ensure_capacity(&mut self, sym: SymbolId) {
+        let idx = sym.index() as usize;
+        if idx >= self.methods.len() {
+            self.methods.resize(idx + 1, None);
+        }
+    }
+
     /// Bind a closure method to this class.
     pub fn bind_method(&mut self, name: SymbolId, closure: *mut ObjClosure) {
-        self.methods.insert(name, Method::Closure(closure));
+        self.ensure_capacity(name);
+        self.methods[name.index() as usize] = Some(Method::Closure(closure));
     }
 
     /// Bind a native method to this class.
     pub fn bind_native(&mut self, name: SymbolId, func: NativeFn) {
-        self.methods.insert(name, Method::Native(func));
+        self.ensure_capacity(name);
+        self.methods[name.index() as usize] = Some(Method::Native(func));
     }
 
-    /// Look up a method by symbol. Walks superclass chain.
+    /// Look up a method by symbol. O(1) flat array access.
+    /// Since all inherited methods are copied at class creation, no superclass walk needed.
+    #[inline]
     pub fn find_method(&self, name: SymbolId) -> Option<&Method> {
-        if let Some(m) = self.methods.get(&name) {
-            return Some(m);
+        let idx = name.index() as usize;
+        if idx < self.methods.len() {
+            self.methods[idx].as_ref()
+        } else {
+            None
         }
-        let mut cls = self.superclass;
-        while !cls.is_null() {
-            let parent = unsafe { &*cls };
-            if let Some(m) = parent.methods.get(&name) {
-                return Some(m);
-            }
-            cls = parent.superclass;
-        }
-        None
     }
 }
 
@@ -1032,7 +1041,7 @@ impl fmt::Debug for ObjClass {
             f,
             "ObjClass({:?}, {} methods)",
             self.name,
-            self.methods.len()
+            self.methods.iter().filter(|m| m.is_some()).count()
         )
     }
 }

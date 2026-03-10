@@ -886,23 +886,18 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
 
                     // Fast path: if receiver is a closure and method is call(...),
-                    // dispatch directly. Check first char 'c' to avoid interning.
-                    if recv_val.is_object() {
-                        let method_str = vm.interner.resolve(method);
-                        if method_str.as_bytes().first() == Some(&b'c')
-                            && method_str.starts_with("call")
-                        {
-                            let ptr = recv_val.as_object().unwrap();
-                            let header = ptr as *const ObjHeader;
-                            if unsafe { (*header).obj_type } == ObjType::Closure {
-                                let closure_ptr = ptr as *mut ObjClosure;
-                                dispatch_closure_bc(
-                                    vm, fiber, closure_ptr, &arg_vals[1..],
-                                    pc, values, &module_name,
-                                    ValueId(dst as u32), None,
-                                )?;
-                                continue 'fiber_loop;
-                            }
+                    // dispatch directly. O(1) symbol check avoids string resolve.
+                    if vm.is_call_sym(method) && recv_val.is_object() {
+                        let ptr = recv_val.as_object().unwrap();
+                        let header = ptr as *const ObjHeader;
+                        if unsafe { (*header).obj_type } == ObjType::Closure {
+                            let closure_ptr = ptr as *mut ObjClosure;
+                            dispatch_closure_bc(
+                                vm, fiber, closure_ptr, &arg_vals[1..],
+                                pc, values, &module_name,
+                                ValueId(dst as u32), None,
+                            )?;
+                            continue 'fiber_loop;
                         }
                     }
 
@@ -997,12 +992,69 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             set_reg(&mut values, dst, InterpValue::Boxed(result));
                         }
                         Some(Method::Closure(closure_ptr)) => {
-                            dispatch_closure_bc(
-                                vm, fiber, closure_ptr, &arg_vals,
-                                pc, values, &module_name,
-                                ValueId(dst as u32), defining_class,
-                            )?;
-                            continue 'fiber_loop;
+                            // Inline JIT leaf dispatch: call native directly without
+                            // dispatch_closure_bc overhead (no frame save/restore, no
+                            // function call, no GC roots for leaf methods).
+                            let mut inlined = false;
+                            if vm.engine.mode != ExecutionMode::Interpreter
+                                && arg_vals.len() <= 4
+                            {
+                                let fn_ptr = unsafe { (*closure_ptr).function };
+                                let fn_idx = unsafe { (*fn_ptr).fn_id } as usize;
+                                let jit_ptr = vm.engine.jit_code.get(fn_idx).copied()
+                                    .unwrap_or(std::ptr::null());
+                                if !jit_ptr.is_null()
+                                    && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
+                                {
+                                    let result_bits = unsafe {
+                                        match arg_vals.len() {
+                                            1 => {
+                                                let f: extern "C" fn(u64) -> u64 =
+                                                    std::mem::transmute(jit_ptr);
+                                                f(arg_vals[0].to_bits())
+                                            }
+                                            2 => {
+                                                let f: extern "C" fn(u64, u64) -> u64 =
+                                                    std::mem::transmute(jit_ptr);
+                                                f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
+                                            }
+                                            3 => {
+                                                let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                                    std::mem::transmute(jit_ptr);
+                                                f(
+                                                    arg_vals[0].to_bits(),
+                                                    arg_vals[1].to_bits(),
+                                                    arg_vals[2].to_bits(),
+                                                )
+                                            }
+                                            _ => {
+                                                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                                    std::mem::transmute(jit_ptr);
+                                                f(
+                                                    arg_vals[0].to_bits(),
+                                                    arg_vals[1].to_bits(),
+                                                    arg_vals[2].to_bits(),
+                                                    arg_vals[3].to_bits(),
+                                                )
+                                            }
+                                        }
+                                    };
+                                    set_reg(
+                                        &mut values,
+                                        dst,
+                                        InterpValue::Boxed(Value::from_bits(result_bits)),
+                                    );
+                                    inlined = true;
+                                }
+                            }
+                            if !inlined {
+                                dispatch_closure_bc(
+                                    vm, fiber, closure_ptr, &arg_vals,
+                                    pc, values, &module_name,
+                                    ValueId(dst as u32), defining_class,
+                                )?;
+                                continue 'fiber_loop;
+                            }
                         }
                         Some(Method::Constructor(closure_ptr)) => {
                             let recv_class =
@@ -1866,10 +1918,14 @@ unsafe fn find_method_with_class(
     cls: *mut ObjClass,
     method: SymbolId,
 ) -> Option<(Method, *mut ObjClass)> {
+    let idx = method.index() as usize;
     let mut c = cls;
     while !c.is_null() {
-        if let Some(m) = (*c).methods.get(&method) {
-            return Some((m.clone(), c));
+        let cls = &*c;
+        if idx < cls.methods.len() {
+            if let Some(m) = &cls.methods[idx] {
+                return Some((m.clone(), c));
+            }
         }
         c = (*c).superclass;
     }
