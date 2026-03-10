@@ -101,8 +101,14 @@ impl MirPass for TypeSpecialize {
 
             for (val_id, inst) in &old_instructions {
                 match inst {
-                    Instruction::ConstNum(_) | Instruction::GuardNum(_) | Instruction::Box(_) => {
+                    Instruction::ConstNum(_) | Instruction::Box(_) => {
                         known_nums.insert(*val_id);
+                        new_instructions.push((*val_id, inst.clone()));
+                    }
+                    Instruction::GuardNum(src) => {
+                        // Both the guard output AND the guarded source are known-Num.
+                        known_nums.insert(*val_id);
+                        known_nums.insert(*src);
                         new_instructions.push((*val_id, inst.clone()));
                     }
 

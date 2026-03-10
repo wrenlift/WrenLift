@@ -1816,11 +1816,11 @@ impl<'a> LowerCtx<'a> {
                 self.mf.emit(MachInst::Mov { dst, src });
             }
 
-            // -- Boxed arithmetic → runtime calls --
-            Instruction::Add(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_num_add"),
-            Instruction::Sub(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_num_sub"),
-            Instruction::Mul(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_num_mul"),
-            Instruction::Div(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_num_div"),
+            // -- Boxed arithmetic with inline number fast-path --
+            Instruction::Add(a, b) => self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Add, "wren_num_add"),
+            Instruction::Sub(a, b) => self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Sub, "wren_num_sub"),
+            Instruction::Mul(a, b) => self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Mul, "wren_num_mul"),
+            Instruction::Div(a, b) => self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Div, "wren_num_div"),
             Instruction::Mod(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_num_mod"),
             Instruction::Neg(a) => {
                 let la = self.vreg_for(*a);
@@ -1832,11 +1832,11 @@ impl<'a> LowerCtx<'a> {
                 });
             }
 
-            // -- Boxed comparisons → runtime calls --
-            Instruction::CmpLt(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_lt"),
-            Instruction::CmpGt(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_gt"),
-            Instruction::CmpLe(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_le"),
-            Instruction::CmpGe(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_ge"),
+            // -- Boxed comparisons with inline number fast-path --
+            Instruction::CmpLt(a, b) => self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Lt, "wren_cmp_lt"),
+            Instruction::CmpGt(a, b) => self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Gt, "wren_cmp_gt"),
+            Instruction::CmpLe(a, b) => self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Le, "wren_cmp_le"),
+            Instruction::CmpGe(a, b) => self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Ge, "wren_cmp_ge"),
             Instruction::CmpEq(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_eq"),
             Instruction::CmpNe(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_ne"),
 
@@ -2873,6 +2873,125 @@ impl<'a> LowerCtx<'a> {
             args: vec![la, lb],
             ret: Some(dst),
         });
+    }
+
+    /// Emit inline number fast-path for boxed arithmetic (Add/Sub/Mul/Div/Mod).
+    /// Checks both operands are NaN-boxed numbers, does f64 op directly,
+    /// falls back to CallRuntime for non-numeric types.
+    fn emit_boxed_arith_inline(
+        &mut self,
+        dst_val: ValueId,
+        a: ValueId,
+        b: ValueId,
+        fp_op: FpBinOp,
+        runtime_fn: &'static str,
+    ) {
+        const QNAN: u64 = 0x7FFC_0000_0000_0000;
+
+        let la = self.vreg_for(a);
+        let lb = self.vreg_for(b);
+        let dst = self.vreg_for(dst_val);
+
+        let slow_label = self.mf.new_label();
+        let done_label = self.mf.new_label();
+
+        // Check a: (a & QNAN) == QNAN → not a number → slow path
+        let tmp_a = self.mf.new_gp();
+        self.mf.emit(MachInst::AndImm { dst: tmp_a, src: la, imm: QNAN });
+        self.mf.emit(MachInst::ICmpImm { lhs: tmp_a, imm: QNAN });
+        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: slow_label });
+
+        // Check b: (b & QNAN) == QNAN → not a number → slow path
+        let tmp_b = self.mf.new_gp();
+        self.mf.emit(MachInst::AndImm { dst: tmp_b, src: lb, imm: QNAN });
+        self.mf.emit(MachInst::ICmpImm { lhs: tmp_b, imm: QNAN });
+        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: slow_label });
+
+        // Fast path: bitcast to f64, operate, bitcast back
+        let fa = self.mf.new_fp();
+        let fb = self.mf.new_fp();
+        let fdst = self.mf.new_fp();
+        self.mf.emit(MachInst::BitcastGpToFp { dst: fa, src: la });
+        self.mf.emit(MachInst::BitcastGpToFp { dst: fb, src: lb });
+        let arith = match fp_op {
+            FpBinOp::Add => MachInst::FAdd { dst: fdst, lhs: fa, rhs: fb },
+            FpBinOp::Sub => MachInst::FSub { dst: fdst, lhs: fa, rhs: fb },
+            FpBinOp::Mul => MachInst::FMul { dst: fdst, lhs: fa, rhs: fb },
+            FpBinOp::Div => MachInst::FDiv { dst: fdst, lhs: fa, rhs: fb },
+        };
+        self.mf.emit(arith);
+        self.mf.emit(MachInst::BitcastFpToGp { dst, src: fdst });
+        self.mf.emit(MachInst::Jmp { target: done_label });
+
+        // Slow path: full runtime call
+        self.mf.emit(MachInst::DefLabel(slow_label));
+        self.mf.emit(MachInst::CallRuntime {
+            name: runtime_fn,
+            args: vec![la, lb],
+            ret: Some(dst),
+        });
+
+        self.mf.emit(MachInst::DefLabel(done_label));
+    }
+
+    /// Emit inline number fast-path for boxed comparisons (CmpLt/CmpLe/CmpGt/CmpGe).
+    /// Returns a NaN-boxed boolean (TAG_TRUE/TAG_FALSE).
+    fn emit_boxed_cmp_inline(
+        &mut self,
+        dst_val: ValueId,
+        a: ValueId,
+        b: ValueId,
+        cond: Cond,
+        runtime_fn: &'static str,
+    ) {
+        const QNAN: u64 = 0x7FFC_0000_0000_0000;
+        const TAG_TRUE: u64 = QNAN | 2;
+        const TAG_FALSE: u64 = QNAN | 1;
+
+        let la = self.vreg_for(a);
+        let lb = self.vreg_for(b);
+        let dst = self.vreg_for(dst_val);
+
+        let slow_label = self.mf.new_label();
+        let done_label = self.mf.new_label();
+
+        // Check a is a number
+        let tmp_a = self.mf.new_gp();
+        self.mf.emit(MachInst::AndImm { dst: tmp_a, src: la, imm: QNAN });
+        self.mf.emit(MachInst::ICmpImm { lhs: tmp_a, imm: QNAN });
+        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: slow_label });
+
+        // Check b is a number
+        let tmp_b = self.mf.new_gp();
+        self.mf.emit(MachInst::AndImm { dst: tmp_b, src: lb, imm: QNAN });
+        self.mf.emit(MachInst::ICmpImm { lhs: tmp_b, imm: QNAN });
+        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: slow_label });
+
+        // Fast path: f64 comparison → NaN-boxed boolean
+        let fa = self.mf.new_fp();
+        let fb = self.mf.new_fp();
+        self.mf.emit(MachInst::BitcastGpToFp { dst: fa, src: la });
+        self.mf.emit(MachInst::BitcastGpToFp { dst: fb, src: lb });
+        self.mf.emit(MachInst::FCmp { lhs: fa, rhs: fb });
+        // CSet gives 0 or 1 in a GP register based on the condition
+        let flag = self.mf.new_gp();
+        self.mf.emit(MachInst::CSet { dst: flag, cond });
+        // Convert 0/1 → TAG_FALSE/TAG_TRUE: result = TAG_FALSE + flag
+        // TAG_TRUE = TAG_FALSE + 1, so: dst = TAG_FALSE + flag
+        let base = self.mf.new_gp();
+        self.mf.emit(MachInst::LoadImm { dst: base, bits: TAG_FALSE });
+        self.mf.emit(MachInst::IAdd { dst, lhs: base, rhs: flag });
+        self.mf.emit(MachInst::Jmp { target: done_label });
+
+        // Slow path: full runtime call
+        self.mf.emit(MachInst::DefLabel(slow_label));
+        self.mf.emit(MachInst::CallRuntime {
+            name: runtime_fn,
+            args: vec![la, lb],
+            ret: Some(dst),
+        });
+
+        self.mf.emit(MachInst::DefLabel(done_label));
     }
 
     /// Inline bitwise: unbox both to GP (truncate f64→i32), integer op, rebox.

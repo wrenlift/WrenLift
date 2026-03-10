@@ -1513,12 +1513,14 @@ fn dispatch_closure_bc(
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
 
-    // Tier-up profiling: in Tiered or Jit mode, record calls and compile hot functions.
+    // Tier-up profiling: request background compilation so compile time doesn't block execution.
     if vm.engine.mode != ExecutionMode::Interpreter {
         let should_tier_up = vm.engine.record_call(target_func_id);
         if should_tier_up {
             vm.engine.request_tier_up(target_func_id, &vm.interner);
         }
+        // Install completed compilations so JIT dispatch can fire.
+        vm.engine.poll_compilations();
     }
 
     // JIT dispatch: if the function is compiled to native code and has ≤4 args,

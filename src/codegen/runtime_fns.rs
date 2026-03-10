@@ -98,6 +98,26 @@ pub fn clear_jit_roots() {
     JIT_ROOTS.with(|r| r.borrow_mut().clear());
 }
 
+/// Get current JIT roots count (for save/restore around re-entrant calls).
+#[inline]
+fn jit_roots_len() -> usize {
+    JIT_ROOTS.with(|r| {
+        // SAFETY: We only access this from the main execution thread.
+        // Using try_borrow to avoid RefCell overhead in the fast path.
+        r.try_borrow().map(|v| v.len()).unwrap_or(0)
+    })
+}
+
+/// Truncate JIT roots back to a saved length (pop roots added by this frame).
+#[inline]
+fn jit_roots_truncate(len: usize) {
+    JIT_ROOTS.with(|r| {
+        if let Ok(mut v) = r.try_borrow_mut() {
+            v.truncate(len);
+        }
+    });
+}
+
 /// Read JitContext's GC-managed pointers as Values for root scanning.
 /// Returns (closure_val, defining_class_val) — null if not set.
 pub fn jit_context_roots() -> (Value, Value) {
@@ -224,6 +244,75 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     value
 }
 
+/// Try to call a closure via native code if it's compiled; fall back to interpreter.
+fn call_closure_jit_or_sync(
+    vm: &mut crate::runtime::vm::VM,
+    closure_ptr: *mut ObjClosure,
+    args: &[Value],
+) -> u64 {
+    // Install completed compilations so we can dispatch natively.
+    vm.engine.poll_compilations();
+    if args.len() <= 4 {
+        let func_id =
+            crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+        // Check if this function has been compiled to native code.
+        let native_fn_ptr: Option<*const u8> = if let Some(
+            crate::runtime::engine::FuncBody::Compiled { executable, .. },
+        ) = vm.engine.get_function(func_id)
+        {
+            if executable.is_native() {
+                Some(executable.native_ptr())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(fn_ptr) = native_fn_ptr {
+            // Native-to-native dispatch: call compiled code directly.
+            let result = unsafe {
+                match args.len() {
+                    0 => {
+                        let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+                        f()
+                    }
+                    1 => {
+                        let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+                        f(args[0].to_bits())
+                    }
+                    2 => {
+                        let f: extern "C" fn(u64, u64) -> u64 =
+                            std::mem::transmute(fn_ptr);
+                        f(args[0].to_bits(), args[1].to_bits())
+                    }
+                    3 => {
+                        let f: extern "C" fn(u64, u64, u64) -> u64 =
+                            std::mem::transmute(fn_ptr);
+                        f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+                    }
+                    _ => {
+                        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                            std::mem::transmute(fn_ptr);
+                        f(
+                            args[0].to_bits(),
+                            args[1].to_bits(),
+                            args[2].to_bits(),
+                            args[3].to_bits(),
+                        )
+                    }
+                }
+            };
+            return result;
+        }
+    }
+
+    // Fall back to interpreter.
+    vm.call_closure_sync(closure_ptr, args)
+        .map(|v| v.to_bits())
+        .unwrap_or(Value::null().to_bits())
+}
+
 /// Internal: dispatch a method call with a pre-built args slice.
 fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
     let vm = unsafe { vm_ref() };
@@ -232,40 +321,51 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
         None => return Value::null().to_bits(),
     };
 
-    // Root receiver and args before potential re-entrant interpreter calls
-    // that could trigger GC.
-    push_jit_root(recv);
-    for a in args {
-        push_jit_root(*a);
+    let class = vm.class_of(recv);
+
+    // For class receivers, use the actual class object as cache key
+    // (not class_class, since all classes share that metaclass).
+    let cache_key_class = if class == vm.class_class {
+        recv.as_object().unwrap_or(std::ptr::null_mut()) as *mut ObjClass
+    } else {
+        class
+    };
+
+    // Check method cache first (avoids find_method + static symbol resolution).
+    if let Some((m, _dc)) = vm.method_cache.lookup(cache_key_class, method_sym) {
+        return dispatch_method(vm, m, args);
     }
 
-    let class = vm.class_of(recv);
+    // Cache miss: full lookup.
     let method_entry = unsafe { (*class).find_method(method_sym).cloned() };
 
-    let result = match method_entry {
-        Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-        Some(Method::Closure(closure_ptr)) => vm
-            .call_closure_sync(closure_ptr, args)
-            .map(|v| v.to_bits())
-            .unwrap_or(Value::null().to_bits()),
-        Some(Method::Constructor(closure_ptr)) => vm
-            .call_closure_sync(closure_ptr, args)
-            .map(|v| v.to_bits())
-            .unwrap_or(Value::null().to_bits()),
+    match method_entry {
+        Some(m) => {
+            vm.method_cache.insert(cache_key_class, method_sym, m.clone(), class);
+            dispatch_method(vm, m, args)
+        }
         None => {
             // Try static method dispatch (receiver IS a class object)
-            if class == vm.class_class {
-                let method_name = vm.interner.resolve(method_sym).to_string();
-                let static_name = format!("static:{}", method_name);
-                let static_sym = vm.interner.intern(&static_name);
-                if let Some(recv_ptr) = recv.as_object() {
-                    let recv_class_ptr = recv_ptr as *mut ObjClass;
-                    let static_entry =
-                        unsafe { (*recv_class_ptr).find_method(static_sym).cloned() };
-                    match static_entry {
-                        Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-                        _ => Value::null().to_bits(),
-                    }
+            if class == vm.class_class && !cache_key_class.is_null() {
+                // Stack-allocated buffer to build "static:method" without heap alloc.
+                let method_str = vm.interner.resolve(method_sym);
+                let prefix = b"static:";
+                let total = prefix.len() + method_str.len();
+                let mut buf = [0u8; 128];
+                let found = if total <= buf.len() {
+                    buf[..prefix.len()].copy_from_slice(prefix);
+                    buf[prefix.len()..total].copy_from_slice(method_str.as_bytes());
+                    let static_str =
+                        unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+                    vm.interner.lookup(static_str).and_then(|sym| unsafe {
+                        (*cache_key_class).find_method(sym).cloned()
+                    })
+                } else {
+                    None
+                };
+                if let Some(m) = found {
+                    vm.method_cache.insert(cache_key_class, method_sym, m.clone(), cache_key_class);
+                    dispatch_method(vm, m, args)
                 } else {
                     Value::null().to_bits()
                 }
@@ -273,13 +373,17 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
                 Value::null().to_bits()
             }
         }
-    };
+    }
+}
 
-    // Refresh module_vars pointer — call_closure_sync may have modified
-    // the module's variable Vec (imports, new definitions).
-    refresh_module_vars();
-
-    result
+/// Dispatch a resolved method entry.
+#[inline(always)]
+fn dispatch_method(vm: &mut crate::runtime::vm::VM, method: Method, args: &[Value]) -> u64 {
+    match method {
+        Method::Native(native_fn) => native_fn(vm, args).to_bits(),
+        Method::Closure(cp) => call_closure_jit_or_sync(vm, cp, args),
+        Method::Constructor(cp) => call_closure_jit_or_sync(vm, cp, args),
+    }
 }
 
 /// Call a method with 0 extra args. Codegen: [receiver, method_sym]
@@ -355,12 +459,6 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
         None => return Value::null().to_bits(),
     };
 
-    // Root receiver and args before potential re-entrant interpreter calls.
-    push_jit_root(recv);
-    for a in args {
-        push_jit_root(*a);
-    }
-
     let class = vm.class_of(recv);
     let superclass = unsafe { (*class).superclass };
     if superclass.is_null() {
@@ -368,21 +466,14 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
     }
 
     let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
-    let result = match method_entry {
+    match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-        Some(Method::Closure(closure_ptr)) => vm
-            .call_closure_sync(closure_ptr, args)
-            .map(|v| v.to_bits())
-            .unwrap_or(Value::null().to_bits()),
-        Some(Method::Constructor(closure_ptr)) => vm
-            .call_closure_sync(closure_ptr, args)
-            .map(|v| v.to_bits())
-            .unwrap_or(Value::null().to_bits()),
+        Some(Method::Closure(closure_ptr)) => call_closure_jit_or_sync(vm, closure_ptr, args),
+        Some(Method::Constructor(closure_ptr)) => {
+            call_closure_jit_or_sync(vm, closure_ptr, args)
+        }
         None => Value::null().to_bits(),
-    };
-
-    refresh_module_vars();
-    result
+    }
 }
 
 /// Super call with 0 args. Codegen: [method_sym] (no receiver — shouldn't happen in practice)
@@ -872,7 +963,8 @@ pub extern "C" fn wren_not(a: u64) -> u64 {
 
 pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
     let v = Value::from_bits(value);
-    Value::bool(!v.is_falsy()).to_bits()
+    // Return raw 0/1 (not NaN-boxed) so JmpZero can branch correctly.
+    if v.is_falsy() { 0u64 } else { 1u64 }
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,16 +1178,20 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
                     }
                 }
 
-                // Only save caller-saved regs that are live, excluding ABI regs
-                // used for this call's args/ret/scratch (they're already managed).
+                // Only save caller-saved regs that are live, excluding scratch and
+                // result registers. ABI arg registers are NOT excluded because
+                // they may hold live values that the parallel copy will overwrite
+                // (e.g., n sits in x1 and x1 is also the second ABI arg slot).
+                //
+                // abi_ret (x0) is only excluded when ret_vreg == abi_ret, because
+                // in that case the pop would overwrite the call result. When
+                // ret_vreg != abi_ret, the result Mov happens before pops, so
+                // popping abi_ret safely restores the old live value.
                 let mut excluded: std::collections::HashSet<u32> =
                     std::collections::HashSet::new();
-                for (idx, _) in args.iter().enumerate() {
-                    if idx < abi_args.len() {
-                        excluded.insert(abi_args[idx]);
-                    }
+                if ret.map_or(true, |rv| rv.index == abi_ret) {
+                    excluded.insert(abi_ret);
                 }
-                excluded.insert(abi_ret);
                 excluded.insert(call_scratch);
                 excluded.insert(copy_scratch);
                 // Also exclude the destination register — pop must not overwrite

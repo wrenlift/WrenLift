@@ -105,6 +105,71 @@ struct CompilationResult {
     bytecode: Option<Arc<BytecodeFunction>>,
 }
 
+/// Run the optimization pipeline on MIR for JIT compilation.
+/// Same passes as the AOT pipeline: ConstFold, DCE, CSE, TypeSpecialize, LICM, SRA.
+fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interner) {
+    use crate::mir::opt::{
+        self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+        sra::Sra, MirPass,
+    };
+    let constfold = ConstFold;
+    let dce = Dce;
+    let cse = Cse;
+    let type_spec = TypeSpecialize::with_math(interner);
+    let licm = Licm;
+    let sra = Sra;
+
+    let passes: Vec<&dyn MirPass> = vec![
+        &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+    ];
+    opt::run_to_fixpoint(mir, &passes, 10);
+}
+
+/// Insert speculative GuardNum instructions for all non-this BlockParam
+/// parameters. This tells TypeSpecialize that parameters are numbers,
+/// enabling unboxed f64 arithmetic in the JIT-compiled code.
+/// If the guard fails at runtime, the function falls back to the interpreter.
+fn insert_speculative_guards(mir: &mut MirFunction) {
+    use crate::mir::Instruction;
+    if mir.blocks.is_empty() {
+        return;
+    }
+    // Collect BlockParams from block 0 (function entry).
+    let params: Vec<(crate::mir::ValueId, u16)> = mir.blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|(vid, inst)| {
+            if let Instruction::BlockParam(idx) = inst {
+                Some((*vid, *idx))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Insert GuardNum after each non-this parameter (idx > 0).
+    // We insert after all BlockParams to maintain SSA ordering.
+    let insert_pos = mir.blocks[0]
+        .instructions
+        .iter()
+        .position(|(_, inst)| !matches!(inst, Instruction::BlockParam(_)))
+        .unwrap_or(mir.blocks[0].instructions.len());
+
+    let mut guards = Vec::new();
+    for (vid, idx) in &params {
+        if *idx == 0 {
+            continue; // Skip 'this' — it's a class/instance, not a number
+        }
+        let guard_vid = mir.new_value();
+        guards.push((guard_vid, Instruction::GuardNum(*vid)));
+    }
+
+    // Insert guards at the position after all BlockParams.
+    for (i, guard) in guards.into_iter().enumerate() {
+        mir.blocks[0].instructions.insert(insert_pos + i, guard);
+    }
+}
+
 /// The execution engine: owns all function bodies, dispatches calls,
 /// and manages tiered compilation.
 ///
@@ -127,6 +192,10 @@ pub struct ExecutionEngine {
     compilation_rx: mpsc::Receiver<CompilationResult>,
     /// Per-function flag: true while a background compilation is in flight.
     compiling: Vec<bool>,
+    /// Number of compilations currently in flight (fast check for poll_compilations).
+    pending_count: u32,
+    /// Join handle for the current compilation thread (at most 1 at a time).
+    compile_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Per-module execution state.
@@ -159,6 +228,8 @@ impl ExecutionEngine {
             compilation_tx: tx,
             compilation_rx: rx,
             compiling: Vec::new(),
+            pending_count: 0,
+            compile_handle: None,
         }
     }
 
@@ -287,6 +358,7 @@ impl ExecutionEngine {
     /// Submit a function for background JIT compilation.
     /// The interpreter keeps running bytecode; the compiled result is installed
     /// when `poll_compilations` is called at the next safepoint.
+    /// At most one compilation thread runs at a time to bound memory usage.
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         let idx = id.0 as usize;
         // Guard: already compiled or already in-flight
@@ -295,6 +367,17 @@ impl ExecutionEngine {
         }
         if self.compiling[idx] {
             return;
+        }
+        // Only one compilation thread at a time. If the previous thread is still
+        // running, skip this request — it will be retried on the next hot call.
+        if let Some(ref handle) = self.compile_handle {
+            if !handle.is_finished() {
+                return;
+            }
+            // Thread finished — join to reclaim resources.
+            if let Some(h) = self.compile_handle.take() {
+                let _ = h.join();
+            }
         }
         let (mir, bytecode) = match self.functions.get(idx) {
             Some(FuncBody::Interpreted { mir, bytecode, .. }) => {
@@ -305,13 +388,29 @@ impl ExecutionEngine {
         };
 
         self.compiling[idx] = true;
+        self.pending_count += 1;
         let tx = self.compilation_tx.clone();
         let target = Self::native_target();
         let interner_clone = interner.clone();
 
-        std::thread::spawn(move || {
+        // Clone MIR for speculative optimization: insert GuardNum for all
+        // non-this BlockParam parameters, then run the full optimization
+        // pipeline. This enables TypeSpecialize to convert boxed arithmetic
+        // to unboxed f64 ops in the JIT path.
+        let speculative_mir = {
+            let mut spec = (*mir).clone();
+            insert_speculative_guards(&mut spec);
+            spec
+        };
+
+        self.compile_handle = Some(std::thread::spawn(move || {
+            // Run optimization pipeline with speculative type guards.
+            let mut opt_mir = speculative_mir;
+            run_jit_opt_pipeline(&mut opt_mir, &interner_clone);
+            let opt_mir = Arc::new(opt_mir);
+
             let result =
-                crate::codegen::compile_function_with_interner(&mir, target, &interner_clone)
+                crate::codegen::compile_function_with_interner(&opt_mir, target, &interner_clone)
                     .ok()
                     .and_then(|c| c.into_executable().ok());
             if let Some(executable) = result {
@@ -322,12 +421,16 @@ impl ExecutionEngine {
                     bytecode,
                 });
             }
-        });
+        }));
     }
 
     /// Install any completed background compilations.
-    /// Call this at GC safepoints so the interpreter picks up native code.
+    /// Call this at GC safepoints and before JIT dispatch checks.
+    #[inline]
     pub fn poll_compilations(&mut self) {
+        if self.pending_count == 0 {
+            return;
+        }
         while let Ok(result) = self.compilation_rx.try_recv() {
             let idx = result.id.0 as usize;
             if idx < self.functions.len() {
@@ -340,6 +443,7 @@ impl ExecutionEngine {
             if idx < self.compiling.len() {
                 self.compiling[idx] = false;
             }
+            self.pending_count = self.pending_count.saturating_sub(1);
         }
     }
 
@@ -357,6 +461,17 @@ impl ExecutionEngine {
         {
             crate::codegen::Target::Wasm
         }
+    }
+}
+
+impl Drop for ExecutionEngine {
+    fn drop(&mut self) {
+        // Join the compilation thread so it doesn't outlive the VM.
+        if let Some(handle) = self.compile_handle.take() {
+            let _ = handle.join();
+        }
+        // Drain any pending results so compiled code buffers are freed.
+        while self.compilation_rx.try_recv().is_ok() {}
     }
 }
 

@@ -1826,21 +1826,31 @@ impl VM {
             let mir = self.engine.get_mir(func_id)?;
             let mut values = vec![InterpValue::Boxed(Value::UNDEFINED); mir.next_value as usize];
 
-            // Bind block params
+            // Bind block params using the actual BlockParam index (not a
+            // sequential counter), because unused params may be eliminated.
             let block = &mir.blocks[0];
-            let mut param_idx = 0;
             for (vid, inst) in &block.instructions {
-                if matches!(inst, Instruction::BlockParam(_)) {
-                    if param_idx < args.len() {
+                if let Instruction::BlockParam(idx) = inst {
+                    let param_i = *idx as usize;
+                    if param_i < args.len() {
                         let i = vid.0 as usize;
                         if i >= values.len() { values.resize(i + 1, InterpValue::Boxed(Value::UNDEFINED)); }
-                        values[i] = InterpValue::Boxed(args[param_idx]);
+                        values[i] = InterpValue::Boxed(args[param_i]);
                     }
-                    param_idx += 1;
                 } else {
                     break;
                 }
             }
+
+            // Resolve module_name from the current fiber's frame (avoids
+            // reading a potentially stale JIT context pointer).
+            let mod_name = if !self.fiber.is_null() {
+                (*self.fiber).mir_frames.last()
+                    .map(|f| f.module_name.clone())
+                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
+            } else {
+                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+            };
 
             (*temp_fiber).mir_frames.push(MirCallFrame {
                 func_id,
@@ -1848,7 +1858,7 @@ impl VM {
                 ip: 0,
                 pc: 0,
                 values,
-                module_name: std::rc::Rc::new(crate::codegen::runtime_fns::module_name()),
+                module_name: mod_name,
                 return_dst: None,
                 closure: Some(closure_ptr),
                 defining_class: None,
