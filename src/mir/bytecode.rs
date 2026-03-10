@@ -632,7 +632,11 @@ impl<'a> Encoder<'a> {
         if !target_block.params.is_empty() {
             let param_count = target_block.params.len().min(args.len());
             self.emit_u8(param_count as u8);
-            for (arg, &(param_vid, _)) in args.iter().zip(target_block.params.iter()).take(param_count) {
+            for (arg, &(param_vid, _)) in args
+                .iter()
+                .zip(target_block.params.iter())
+                .take(param_count)
+            {
                 self.emit_reg(param_vid); // dst
                 self.emit_reg(*arg); // src
             }
