@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::ptr;
 
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
-use super::gc_trait::{GcAllocator, GcImpl, GcStrategy};
+use super::gc_trait::{GcImpl, GcStrategy};
 use super::object::*;
 use super::value::Value;
 use crate::intern::{Interner, SymbolId};

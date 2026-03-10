@@ -11,7 +11,7 @@ use wren_lift::mir::opt::{
 };
 use wren_lift::parse::{lexer, parser};
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
-use wren_lift::runtime::gc_trait::{GcAllocator, GcStrategy};
+use wren_lift::runtime::gc_trait::GcStrategy;
 use wren_lift::runtime::vm::{VMConfig, VM};
 use wren_lift::sema;
 

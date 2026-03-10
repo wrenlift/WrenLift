@@ -18,7 +18,6 @@ use crate::intern::SymbolId;
 use crate::mir::bytecode::{read_u16, read_u32, read_u8, BcConst, BytecodeFunction, Op};
 use crate::mir::interp::InterpError;
 use crate::mir::{BlockId, ValueId};
-use crate::runtime::gc_trait::GcAllocator;
 use crate::runtime::engine::ExecutionMode;
 use crate::runtime::engine::FuncId;
 use crate::runtime::object::*;

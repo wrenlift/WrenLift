@@ -431,6 +431,7 @@ impl Gc {
         self.alloc(ObjClass::new(name, superclass))
     }
 
+    #[inline(always)]
     pub fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
         let num_fields = if class.is_null() {
             0
@@ -1369,18 +1370,23 @@ fn fnv1a_hash_bytes(bytes: &[u8]) -> u64 {
 // ---------------------------------------------------------------------------
 
 impl super::gc_trait::GcAllocator for Gc {
+    #[inline(always)]
     fn alloc_string(&mut self, s: String) -> *mut ObjString {
         self.alloc_string(s)
     }
+    #[inline(always)]
     fn alloc_list(&mut self) -> *mut ObjList {
         self.alloc_list()
     }
+    #[inline(always)]
     fn alloc_map(&mut self) -> *mut ObjMap {
         self.alloc_map()
     }
+    #[inline(always)]
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange {
         self.alloc_range(from, to, inclusive)
     }
+    #[inline(always)]
     fn alloc_fn(
         &mut self,
         name: SymbolId,
@@ -1390,39 +1396,51 @@ impl super::gc_trait::GcAllocator for Gc {
     ) -> *mut ObjFn {
         self.alloc_fn(name, arity, upvalue_count, fn_id)
     }
+    #[inline(always)]
     fn alloc_closure(&mut self, function: *mut ObjFn) -> *mut ObjClosure {
         self.alloc_closure(function)
     }
+    #[inline(always)]
     fn alloc_upvalue(&mut self, location: *mut Value) -> *mut ObjUpvalue {
         self.alloc_upvalue(location)
     }
+    #[inline(always)]
     fn alloc_fiber(&mut self) -> *mut ObjFiber {
         self.alloc_fiber()
     }
+    #[inline(always)]
     fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
         self.alloc_class(name, superclass)
     }
+    #[inline(always)]
     fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
         self.alloc_instance(class)
     }
+    #[inline(always)]
     fn alloc_foreign(&mut self, data: Vec<u8>) -> *mut ObjForeign {
         self.alloc_foreign(data)
     }
+    #[inline(always)]
     fn alloc_module(&mut self, name: SymbolId) -> *mut ObjModule {
         self.alloc_module(name)
     }
+    #[inline(always)]
     fn intern_string(&mut self, s: String) -> *mut ObjString {
         self.intern_string(s)
     }
+    #[inline(always)]
     fn write_barrier(&mut self, source: *mut ObjHeader, value: Value) {
         self.write_barrier(source, value)
     }
+    #[inline(always)]
     fn collect(&mut self, roots: &mut [Value]) {
         self.collect(roots)
     }
+    #[inline(always)]
     fn should_collect(&self) -> bool {
         self.should_collect()
     }
+    #[inline(always)]
     fn stats(&self) -> &GcStats {
         &self.stats
     }
