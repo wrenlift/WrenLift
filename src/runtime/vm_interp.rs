@@ -164,6 +164,33 @@ fn set_reg(values: &mut Vec<InterpValue>, idx: u16, val: InterpValue) {
     unsafe { *values.get_unchecked_mut(i) = val; }
 }
 
+/// Read a u16 at a fixed bytecode offset without advancing pc.
+#[inline(always)]
+fn read_u16_at(code: &[u8], offset: u32) -> u16 {
+    let i = offset as usize;
+    u16::from_le_bytes([code[i], code[i + 1]])
+}
+
+/// Build a SmallVec of arg values from bytecode arg register indices.
+/// Used by the slow path after the fast path declines.
+#[inline]
+fn build_arg_vals(
+    recv: Value,
+    code: &[u8],
+    arg_regs_pc: u32,
+    argc: usize,
+    values: &[InterpValue],
+) -> SmallVec<[Value; 8]> {
+    let mut arg_vals: SmallVec<[Value; 8]> = SmallVec::with_capacity(1 + argc);
+    arg_vals.push(recv);
+    let mut apc = arg_regs_pc;
+    for _ in 0..argc {
+        let arg_reg = read_u16(code, &mut apc);
+        arg_vals.push(get_reg_val(values, arg_reg));
+    }
+    arg_vals
+}
+
 // ---------------------------------------------------------------------------
 // Macros for repetitive opcode patterns (must precede run_fiber)
 // ---------------------------------------------------------------------------
@@ -866,17 +893,16 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let dst = read_u16(code, &mut pc);
                     let recv_reg = read_u16(code, &mut pc);
                     let method_idx = read_u16(code, &mut pc);
+                    let ic_idx = read_u16(code, &mut pc) as usize;
                     let argc = read_u8(code, &mut pc) as usize;
                     let method = SymbolId::from_raw(method_idx as u32);
 
                     let recv_val = get_reg_val(&values, recv_reg);
-                    let mut arg_vals: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(1 + argc);
-                    arg_vals.push(recv_val);
-                    for _ in 0..argc {
-                        let arg_reg = read_u16(code, &mut pc);
-                        arg_vals.push(get_reg_val(&values, arg_reg));
-                    }
+
+                    // Record where arg register indices start in bytecode,
+                    // then advance pc past them. Args are read lazily.
+                    let arg_regs_pc = pc;
+                    pc += (argc as u32) * 2;
 
                     // Save pc before any call dispatch (for error reporting)
                     unsafe {
@@ -885,8 +911,95 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         }
                     }
 
-                    // Fast path: if receiver is a closure and method is call(...),
-                    // dispatch directly. O(1) symbol check avoids string resolve.
+                    // ── IC fast path: monomorphic inline cache ──────────────
+                    // After warmup, each call site caches (class, jit_ptr).
+                    // On hit: single class compare → direct native call.
+                    // No method lookup, no SmallVec, no branch chain.
+                    let ic_table = unsafe { &mut *bc.ic_table.get() };
+                    if ic_idx < ic_table.len() {
+                        let ic = &ic_table[ic_idx];
+                        if ic.kind == 1 {
+                            // JIT leaf IC hit check: compare cached class
+                            let recv_class = if recv_val.is_object() {
+                                let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
+                                unsafe { (*( obj_ptr as *const ObjHeader)).class as usize }
+                            } else {
+                                0
+                            };
+                            if recv_class == ic.class && recv_class != 0 {
+                                let jit_ptr = ic.jit_ptr;
+                                let recv_bits = recv_val.to_bits();
+                                let result_bits = unsafe {
+                                    match argc {
+                                        0 => {
+                                            let f: extern "C" fn(u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(recv_bits)
+                                        }
+                                        1 => {
+                                            let a1 = read_u16_at(code, arg_regs_pc);
+                                            let f: extern "C" fn(u64, u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(recv_bits, get_reg_val(&values, a1).to_bits())
+                                        }
+                                        2 => {
+                                            let a1 = read_u16_at(code, arg_regs_pc);
+                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                            let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(
+                                                recv_bits,
+                                                get_reg_val(&values, a1).to_bits(),
+                                                get_reg_val(&values, a2).to_bits(),
+                                            )
+                                        }
+                                        _ => {
+                                            let a1 = read_u16_at(code, arg_regs_pc);
+                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                            let a3 = read_u16_at(code, arg_regs_pc + 4);
+                                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(
+                                                recv_bits,
+                                                get_reg_val(&values, a1).to_bits(),
+                                                get_reg_val(&values, a2).to_bits(),
+                                                get_reg_val(&values, a3).to_bits(),
+                                            )
+                                        }
+                                    }
+                                };
+                                set_reg(
+                                    &mut values,
+                                    dst,
+                                    InterpValue::Boxed(Value::from_bits(result_bits)),
+                                );
+                                steps += 1;
+                                continue;
+                            }
+                        }
+                    }
+
+                    // ── Full dispatch (populates IC on miss) ─────────────────
+                    // Closure call() fast path
+                    if vm.is_call_sym(method) && recv_val.is_object() {
+                        let ptr = recv_val.as_object().unwrap();
+                        let header = ptr as *const ObjHeader;
+                        if unsafe { (*header).obj_type } == ObjType::Closure {
+                            let closure_ptr = ptr as *mut ObjClosure;
+                            let arg_vals = build_arg_vals(recv_val, code, arg_regs_pc, argc, &values);
+                            dispatch_closure_bc(
+                                vm, fiber, closure_ptr, &arg_vals[1..],
+                                pc, values, &module_name,
+                                ValueId(dst as u32), None,
+                            )?;
+                            continue 'fiber_loop;
+                        }
+                    }
+
+                    // Build arg values for the slow path
+                    let arg_vals = build_arg_vals(recv_val, code, arg_regs_pc, argc, &values);
+
+                    // Closure call dispatch
                     if vm.is_call_sym(method) && recv_val.is_object() {
                         let ptr = recv_val.as_object().unwrap();
                         let header = ptr as *const ObjHeader;
@@ -903,22 +1016,18 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                     let class = vm.class_of(recv_val);
 
-                    // For class receivers, use the actual class object as cache key
-                    // (not class_class, since all classes share that metaclass).
                     let cache_key_class = if class == vm.class_class {
                         recv_val.as_object().unwrap() as *mut ObjClass
                     } else {
                         class
                     };
 
-                    // Inline method cache: check cache first, fall back to full lookup.
                     let (method_entry, defining_class) =
                         if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method) {
                             (Some(m), Some(dc))
                         } else {
                             let result = if class == vm.class_class {
                                 let recv_class_ptr = cache_key_class;
-                                // Static method: construct "static:method" and probe
                                 let method_str = vm.interner.resolve(method);
                                 let prefix = b"static:";
                                 let total = prefix.len() + method_str.len();
@@ -943,7 +1052,6 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             } else {
                                 unsafe { find_method_with_class(class, method) }
                             };
-                            // Populate cache on successful lookup
                             if let Some((ref m, dc)) = result {
                                 vm.method_cache.insert(cache_key_class, method, m.clone(), dc);
                             }
@@ -992,12 +1100,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             set_reg(&mut values, dst, InterpValue::Boxed(result));
                         }
                         Some(Method::Closure(closure_ptr)) => {
-                            // Inline JIT leaf dispatch: call native directly without
-                            // dispatch_closure_bc overhead (no frame save/restore, no
-                            // function call, no GC roots for leaf methods).
-                            let mut inlined = false;
+                            // Try to populate IC for JIT leaf methods.
                             if vm.engine.mode != ExecutionMode::Interpreter
-                                && arg_vals.len() <= 4
+                                && argc <= 3
                             {
                                 let fn_ptr = unsafe { (*closure_ptr).function };
                                 let fn_idx = unsafe { (*fn_ptr).fn_id } as usize;
@@ -1006,19 +1111,31 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 if !jit_ptr.is_null()
                                     && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
                                 {
+                                    // Populate IC for this call site
+                                    let ic_table = unsafe { &mut *bc.ic_table.get() };
+                                    if ic_idx < ic_table.len() {
+                                        ic_table[ic_idx] = crate::mir::bytecode::CallSiteIC {
+                                            class: cache_key_class as usize,
+                                            jit_ptr,
+                                            closure: closure_ptr as *const u8,
+                                            kind: 1, // JIT leaf
+                                        };
+                                    }
+                                    // Execute inline for this call too
+                                    let recv_bits = recv_val.to_bits();
                                     let result_bits = unsafe {
-                                        match arg_vals.len() {
-                                            1 => {
+                                        match argc {
+                                            0 => {
                                                 let f: extern "C" fn(u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
-                                                f(arg_vals[0].to_bits())
+                                                f(recv_bits)
                                             }
-                                            2 => {
+                                            1 => {
                                                 let f: extern "C" fn(u64, u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
                                                 f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
                                             }
-                                            3 => {
+                                            2 => {
                                                 let f: extern "C" fn(u64, u64, u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
                                                 f(
@@ -1044,17 +1161,16 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                         dst,
                                         InterpValue::Boxed(Value::from_bits(result_bits)),
                                     );
-                                    inlined = true;
+                                    steps += 1;
+                                    continue;
                                 }
                             }
-                            if !inlined {
-                                dispatch_closure_bc(
-                                    vm, fiber, closure_ptr, &arg_vals,
-                                    pc, values, &module_name,
-                                    ValueId(dst as u32), defining_class,
-                                )?;
-                                continue 'fiber_loop;
-                            }
+                            dispatch_closure_bc(
+                                vm, fiber, closure_ptr, &arg_vals,
+                                pc, values, &module_name,
+                                ValueId(dst as u32), defining_class,
+                            )?;
+                            continue 'fiber_loop;
                         }
                         Some(Method::Constructor(closure_ptr)) => {
                             let recv_class =

@@ -501,7 +501,15 @@ impl ExecutionEngine {
                 self.jit_code[idx] = native_ptr;
                 // Detect leaf functions: no runtime calls needed → skip GC roots + JIT context.
                 if let Some(body) = self.functions.get(idx) {
-                    self.jit_leaf[idx] = is_mir_leaf(body.mir());
+                    let leaf = is_mir_leaf(body.mir());
+                    self.jit_leaf[idx] = leaf;
+                    if std::env::var("WLIFT_JIT_DUMP").is_ok() {
+                        let name = &body.mir().name;
+                        eprintln!(
+                            "  installed FuncId({}) '{}' native={} leaf={}",
+                            idx, name, !native_ptr.is_null(), leaf,
+                        );
+                    }
                 }
             }
             if idx < self.compiling.len() {

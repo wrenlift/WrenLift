@@ -135,8 +135,71 @@ pub enum BcConst {
 // BytecodeFunction
 // ---------------------------------------------------------------------------
 
+/// Monomorphic inline cache entry for a call site.
+/// Caches the resolved (class, native_fn_ptr) for zero-branch dispatch
+/// after warmup. Written on first miss, checked on subsequent calls.
+#[derive(Clone, Copy)]
+pub struct CallSiteIC {
+    /// Cached receiver class pointer (0 = empty).
+    pub class: usize,
+    /// Cached native function pointer (null = not JIT or not leaf).
+    pub jit_ptr: *const u8,
+    /// Cached closure pointer for non-JIT dispatch.
+    pub closure: *const u8,
+    /// Method type: 0 = empty, 1 = JIT leaf, 2 = closure (non-leaf), 3 = native.
+    pub kind: u8,
+}
+
+impl Default for CallSiteIC {
+    fn default() -> Self {
+        Self {
+            class: 0,
+            jit_ptr: std::ptr::null(),
+            closure: std::ptr::null(),
+            kind: 0,
+        }
+    }
+}
+
+// SAFETY: IC entries are only accessed from a single interpreter thread.
+// The UnsafeCell is needed for interior mutability through Arc.
+// Send is needed because BytecodeFunction is sent from the compilation thread.
+unsafe impl Sync for BytecodeFunction {}
+unsafe impl Send for BytecodeFunction {}
+unsafe impl Send for CallSiteIC {}
+unsafe impl Sync for CallSiteIC {}
+
+impl Clone for BytecodeFunction {
+    fn clone(&self) -> Self {
+        Self {
+            code: self.code.clone(),
+            constants: self.constants.clone(),
+            source_map: self.source_map.clone(),
+            block_offsets: self.block_offsets.clone(),
+            register_count: self.register_count,
+            param_offsets: self.param_offsets.clone(),
+            ic_table: std::cell::UnsafeCell::new(unsafe { &*self.ic_table.get() }.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for BytecodeFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BytecodeFunction")
+            .field("code_len", &self.code.len())
+            .field("constants", &self.constants.len())
+            .field("register_count", &self.register_count)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CallSiteIC {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IC(kind={})", self.kind)
+    }
+}
+
 /// A compiled bytecode function ready for interpretation.
-#[derive(Debug, Clone)]
 pub struct BytecodeFunction {
     /// Flat bytecode stream.
     pub code: Vec<u8>,
@@ -151,6 +214,8 @@ pub struct BytecodeFunction {
     /// Cached entry block param layout: [(dst_register, param_index), ...].
     /// Pre-computed during lowering so callers don't need to re-scan bytecode.
     pub param_offsets: Vec<(u16, u16)>,
+    /// Inline cache table for call sites (mutable through Arc via UnsafeCell).
+    pub ic_table: std::cell::UnsafeCell<Vec<CallSiteIC>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +246,7 @@ struct Encoder<'a> {
     source_map: Vec<(u32, Span)>,
     block_offsets: Vec<u32>,
     patches: Vec<PatchSite>,
+    call_site_count: u16,
 }
 
 impl<'a> Encoder<'a> {
@@ -193,6 +259,7 @@ impl<'a> Encoder<'a> {
             source_map: Vec::new(),
             block_offsets: vec![0u32; mir.blocks.len()],
             patches: Vec::new(),
+            call_site_count: 0,
         }
     }
 
@@ -461,6 +528,9 @@ impl<'a> Encoder<'a> {
                 self.emit_reg(dst);
                 self.emit_reg(*receiver);
                 self.emit_u16(method.index() as u16);
+                let ic_idx = self.call_site_count;
+                self.call_site_count += 1;
+                self.emit_u16(ic_idx);
                 self.emit_u8(args.len() as u8);
                 for a in args {
                     self.emit_reg(*a);
@@ -669,6 +739,9 @@ impl<'a> Encoder<'a> {
             block_offsets: self.block_offsets,
             register_count: self.mir.next_value,
             param_offsets,
+            ic_table: std::cell::UnsafeCell::new(
+                vec![CallSiteIC::default(); self.call_site_count as usize],
+            ),
         }
     }
 }
@@ -965,8 +1038,8 @@ mod tests {
             .iter()
             .position(|&b| b == Op::Call as u8)
             .unwrap();
-        // Call: op(1) + dst(2) + recv(2) + sym(2) + argc(1) + args(2*1) = 10
-        assert_eq!(bc.code[call_start + 7], 1); // argc = 1
+        // Call: op(1) + dst(2) + recv(2) + sym(2) + ic_idx(2) + argc(1) + args(2*1) = 12
+        assert_eq!(bc.code[call_start + 9], 1); // argc = 1
     }
 
     #[test]

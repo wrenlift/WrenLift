@@ -974,7 +974,7 @@ pub trait NativeContext {
 impl ObjClass {
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(name: SymbolId, superclass: *mut ObjClass) -> Self {
-        let mut methods;
+        let methods;
         let mut protocols = crate::sema::protocol::ProtocolSet::EMPTY;
 
         // Inherit methods and protocols from superclass.
@@ -999,8 +999,6 @@ impl ObjClass {
         }
     }
 
-    /// Ensure the method table is large enough for the given symbol.
-    #[inline]
     /// Ensure the method table is large enough for the given symbol.
     #[inline]
     fn ensure_capacity(&mut self, sym: SymbolId) {
