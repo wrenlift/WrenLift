@@ -1505,7 +1505,7 @@ fn dispatch_closure_bc(
     closure_ptr: *mut ObjClosure,
     arg_vals: &[Value],
     pc: u32,
-    values: Vec<InterpValue>,
+    mut values: Vec<InterpValue>,
     module_name: &Rc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
@@ -1513,11 +1513,109 @@ fn dispatch_closure_bc(
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
 
-    // Tier-up profiling: only in Tiered mode
-    if vm.engine.mode == ExecutionMode::Tiered {
+    // Tier-up profiling: in Tiered or Jit mode, record calls and compile hot functions.
+    if vm.engine.mode != ExecutionMode::Interpreter {
         let should_tier_up = vm.engine.record_call(target_func_id);
         if should_tier_up {
             vm.engine.request_tier_up(target_func_id, &vm.interner);
+        }
+    }
+
+    // JIT dispatch: if the function is compiled to native code and has ≤4 args,
+    // call it directly instead of pushing a bytecode frame.
+    // Tiered mode still compiles but doesn't dispatch — codegen doesn't yet handle
+    // all MIR ops (GC safepoints, runtime callbacks, fiber ops). Remove this guard
+    // once codegen is complete.
+    if vm.engine.mode == ExecutionMode::Jit && arg_vals.len() <= 4 {
+        // Extract native fn pointer first, then drop the borrow on vm.engine.
+        let native_fn_ptr: Option<*const u8> =
+            if let Some(crate::runtime::engine::FuncBody::Compiled { executable, .. }) =
+                vm.engine.get_function(target_func_id)
+            {
+                if executable.is_native() {
+                    Some(executable.native_ptr())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(fn_ptr_raw) = native_fn_ptr {
+            // Set up JIT context for runtime helpers.
+            let (module_vars_ptr, module_var_count) = vm
+                .engine
+                .modules
+                .get(module_name.as_str())
+                .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+                .unwrap_or((std::ptr::null_mut(), 0));
+            crate::codegen::runtime_fns::set_jit_context(
+                crate::codegen::runtime_fns::JitContext {
+                    module_vars: module_vars_ptr,
+                    module_var_count,
+                    vm: vm as *mut VM as *mut u8,
+                    module_name: module_name.as_ptr(),
+                    module_name_len: module_name.len() as u32,
+                    closure: closure_ptr as *mut u8,
+                    defining_class: defining_class
+                        .unwrap_or(std::ptr::null_mut()) as *mut u8,
+                },
+            );
+
+            // Call native code with args as NaN-boxed u64 values.
+            let result_bits = unsafe {
+                match arg_vals.len() {
+                    0 => {
+                        let f: extern "C" fn() -> u64 =
+                            std::mem::transmute(fn_ptr_raw);
+                        f()
+                    }
+                    1 => {
+                        let f: extern "C" fn(u64) -> u64 =
+                            std::mem::transmute(fn_ptr_raw);
+                        f(arg_vals[0].to_bits())
+                    }
+                    2 => {
+                        let f: extern "C" fn(u64, u64) -> u64 =
+                            std::mem::transmute(fn_ptr_raw);
+                        f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
+                    }
+                    3 => {
+                        let f: extern "C" fn(u64, u64, u64) -> u64 =
+                            std::mem::transmute(fn_ptr_raw);
+                        f(
+                            arg_vals[0].to_bits(),
+                            arg_vals[1].to_bits(),
+                            arg_vals[2].to_bits(),
+                        )
+                    }
+                    _ => {
+                        let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                            std::mem::transmute(fn_ptr_raw);
+                        f(
+                            arg_vals[0].to_bits(),
+                            arg_vals[1].to_bits(),
+                            arg_vals[2].to_bits(),
+                            arg_vals[3].to_bits(),
+                        )
+                    }
+                }
+            };
+
+            let result_val = Value::from_bits(result_bits);
+            // Store result in caller's return_dst register
+            set_reg(
+                &mut values,
+                return_dst.0 as u16,
+                InterpValue::Boxed(result_val),
+            );
+            // Save caller frame state
+            unsafe {
+                let frame = (*fiber).mir_frames.last_mut().unwrap();
+                frame.pc = pc;
+                frame.values = values;
+            }
+            return Ok(());
         }
     }
 

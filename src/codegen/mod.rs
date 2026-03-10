@@ -261,6 +261,11 @@ pub enum MachInst {
     /// FP → FP register move.
     FMov { dst: VReg, src: VReg },
 
+    /// Load a function argument from the ABI argument register.
+    /// `index` is the 0-based argument position (maps to x0/rdi for 0, x1/rsi for 1, etc.)
+    /// Emitted for entry block parameters so regalloc gives them a proper def.
+    FuncArg { dst: VReg, index: u32 },
+
     /// Bitwise transfer GP → FP (e.g. NaN-boxed Value → f64 for unboxing).
     /// ARM64: `fmov d0, x0`; x86_64: `movq xmm0, rax`
     BitcastGpToFp { dst: VReg, src: VReg },
@@ -689,7 +694,7 @@ impl MachInst {
             | CallInd { target: src, .. }
             | Push { src } => vec![*src],
 
-            Pop { .. } => vec![],
+            Pop { .. } | FuncArg { .. } => vec![],
 
             IAddImm { src, .. } | AndImm { src, .. } | OrImm { src, .. } => vec![*src],
 
@@ -811,7 +816,8 @@ impl MachInst {
             | CSet { dst, .. }
             | Ldr { dst, .. }
             | FLdr { dst, .. }
-            | Pop { dst } => Some(*dst),
+            | Pop { dst }
+            | FuncArg { dst, .. } => Some(*dst),
 
             CallRuntime { ret, .. } => *ret,
 
@@ -1341,6 +1347,11 @@ impl ExecutableFunction {
         }
     }
 
+    /// Get the raw function pointer for use with `std::mem::transmute`.
+    pub fn native_ptr(&self) -> *const u8 {
+        unsafe { self.as_fn::<*const u8>() }
+    }
+
     /// Whether this function can be called on the current host.
     pub fn is_native(&self) -> bool {
         match self {
@@ -1442,7 +1453,9 @@ fn fixup_vreg_sentinels(
     // Apply to all register fields in the instruction.
     // We use the mutable visitor pattern since MachInst fields are public.
     match inst {
-        MachInst::LoadImm { dst, .. } | MachInst::LoadFpImm { dst, .. } => fix(dst),
+        MachInst::LoadImm { dst, .. }
+        | MachInst::LoadFpImm { dst, .. }
+        | MachInst::FuncArg { dst, .. } => fix(dst),
         MachInst::Mov { dst, src }
         | MachInst::FMov { dst, src }
         | MachInst::BitcastGpToFp { dst, src }
@@ -1650,8 +1663,16 @@ impl<'a> LowerCtx<'a> {
             self.mf.emit(MachInst::DefLabel(label));
 
             // Block parameters are pre-assigned vregs by predecessors.
-            for (val, _ty) in &block.params {
-                self.vreg_for(*val);
+            // For the entry block (block 0), emit FuncArg to load from
+            // ABI argument registers so regalloc gives them proper defs.
+            for (i, (val, _ty)) in block.params.iter().enumerate() {
+                let vreg = self.vreg_for(*val);
+                if block_idx == 0 {
+                    self.mf.emit(MachInst::FuncArg {
+                        dst: vreg,
+                        index: i as u32,
+                    });
+                }
             }
 
             let insts: Vec<_> = block.instructions.clone();
@@ -2935,6 +2956,7 @@ fn format_inst(inst: &MachInst) -> String {
         FMov { dst, src } => format!("{} = fmov {}", dst, src),
         BitcastGpToFp { dst, src } => format!("{} = bitcast_gp_to_fp {}", dst, src),
         BitcastFpToGp { dst, src } => format!("{} = bitcast_fp_to_gp {}", dst, src),
+        FuncArg { dst, index } => format!("{} = func_arg {}", dst, index),
 
         IAdd { dst, lhs, rhs } => format!("{} = iadd {}, {}", dst, lhs, rhs),
         IAddImm { dst, src, imm } => format!("{} = iadd_imm {}, {}", dst, src, imm),

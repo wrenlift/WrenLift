@@ -594,6 +594,14 @@ impl X64Emitter {
                 self.emit_movsd_rr(fp(*dst), fp(*src));
             }
 
+            FuncArg { dst, index } => {
+                // Move from ABI argument register to allocated dst register.
+                // System V AMD64: rdi(7), rsi(6), rdx(2), rcx(1), r8(8), r9(9)
+                const ARG_REGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
+                let s = ARG_REGS[*index as usize] as u32;
+                self.emit_mov_rr(gp(*dst), s);
+            }
+
             BitcastGpToFp { dst, src } => {
                 self.emit_movq_gp_to_xmm(fp(*dst), gp(*src));
             }

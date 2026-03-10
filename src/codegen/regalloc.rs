@@ -392,6 +392,10 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
             value: *value,
         },
         Pop { dst } => Pop { dst: m(*dst) },
+        FuncArg { dst, index } => FuncArg {
+            dst: m(*dst),
+            index: *index,
+        },
 
         // Single src
         Push { src } => Push { src: m(*src) },

@@ -141,6 +141,15 @@ fn emit_inst(
             }
         }
 
+        FuncArg { dst, index } => {
+            // Move from ABI argument register (x0-x7) to allocated dst register.
+            let d = gp(*dst);
+            let s = *index; // x0=0, x1=1, ...
+            if d != s {
+                dynasm!(asm ; mov X(d), X(s));
+            }
+        }
+
         BitcastGpToFp { dst, src } => {
             dynasm!(asm ; fmov D(fp(*dst)), X(gp(*src)));
         }
