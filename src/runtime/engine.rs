@@ -407,6 +407,13 @@ impl ExecutionEngine {
             // Run optimization pipeline with speculative type guards.
             let mut opt_mir = speculative_mir;
             run_jit_opt_pipeline(&mut opt_mir, &interner_clone);
+
+            // Debug: dump optimized MIR for each JIT-compiled function.
+            if std::env::var("WLIFT_JIT_DUMP").is_ok() {
+                eprintln!("=== JIT compile FuncId({}) ===", id.0);
+                eprintln!("{}", opt_mir.pretty_print(&interner_clone));
+            }
+
             let opt_mir = Arc::new(opt_mir);
 
             let result =
