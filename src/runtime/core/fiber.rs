@@ -46,6 +46,7 @@ unsafe fn setup_fiber_from_closure(fiber: *mut ObjFiber, closure: *mut ObjClosur
         return_dst: None,
         closure: Some(closure),
         defining_class: None,
+        bc_ptr: std::ptr::null(),
     });
     (*fiber).state = FiberState::New;
 }

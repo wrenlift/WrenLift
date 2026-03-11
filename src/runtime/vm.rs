@@ -597,6 +597,7 @@ impl VM {
                 return_dst: None,
                 closure: None,
                 defining_class: None,
+                bc_ptr: std::ptr::null(),
             });
         }
 
@@ -1434,6 +1435,7 @@ impl NativeContext for VM {
                         return_dst: None,
                         closure: Some(closure_ptr),
                         defining_class: None,
+                        bc_ptr: std::ptr::null(),
                     });
                 }
 
@@ -1478,6 +1480,7 @@ impl NativeContext for VM {
                         return_dst: None,
                         closure: Some(closure_ptr),
                         defining_class: None,
+                        bc_ptr: std::ptr::null(),
                     });
                 }
                 let saved_fiber = self.fiber;
@@ -1724,6 +1727,7 @@ impl VM {
                 return_dst: None,
                 closure: None,
                 defining_class: None,
+                bc_ptr: std::ptr::null(),
             });
         }
 
@@ -1907,6 +1911,7 @@ impl VM {
                 return_dst: None,
                 closure: Some(closure_ptr),
                 defining_class: None,
+                bc_ptr: std::ptr::null(),
             });
         }
 

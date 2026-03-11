@@ -730,6 +730,8 @@ pub struct MirCallFrame {
     pub closure: Option<*mut ObjClosure>,
     /// The class that defines the current method (for super dispatch).
     pub defining_class: Option<*mut ObjClass>,
+    /// Cached bytecode pointer — avoids ensure_bytecode lookup on return.
+    pub bc_ptr: *const crate::mir::bytecode::BytecodeFunction,
 }
 
 impl fmt::Debug for MirCallFrame {
@@ -1112,12 +1114,26 @@ impl ObjInstance {
         }
     }
 
+    /// # Safety
+    /// Caller must ensure `index < self.num_fields`.
+    #[inline(always)]
+    pub unsafe fn get_field_unchecked(&self, index: usize) -> Value {
+        *self.fields.add(index)
+    }
+
     pub fn set_field(&mut self, index: usize, value: Value) {
         if index < self.num_fields as usize {
             unsafe {
                 self.fields.add(index).write(value);
             }
         }
+    }
+
+    /// # Safety
+    /// Caller must ensure `index < self.num_fields`.
+    #[inline(always)]
+    pub unsafe fn set_field_unchecked(&mut self, index: usize, value: Value) {
+        self.fields.add(index).write(value);
     }
 }
 

@@ -215,8 +215,8 @@ fn build_arg_vals(
 /// Boxed binary arithmetic: try numeric, fall back to operator dispatch.
 /// Returns true if a closure frame was pushed (caller should continue 'fiber_loop).
 macro_rules! bc_boxed_binop {
-    ($vm:expr, $fiber:expr, $pc:expr, $values:expr, $module_name:expr, $bc:expr, $op:expr, $method:expr) => {{
-        let code = &$bc.code;
+    ($vm:expr, $fiber:expr, $pc:expr, $values:expr, $module_name:expr, $bc_ptr:expr, $op:expr, $method:expr) => {{
+        let code = &unsafe { &*$bc_ptr }.code;
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
@@ -241,7 +241,7 @@ macro_rules! bc_boxed_binop {
                     $values,
                     dst,
                     $module_name,
-                    $bc,
+                    $bc_ptr,
                 )?
             }
         }
@@ -269,8 +269,8 @@ macro_rules! bc_f64_binop {
 /// Boxed comparison: try numeric, fall back to operator dispatch.
 /// Returns true if a closure frame was pushed.
 macro_rules! bc_boxed_cmp {
-    ($vm:expr, $fiber:expr, $pc:expr, $values:expr, $module_name:expr, $bc:expr, $op:expr, $method:expr) => {{
-        let code = &$bc.code;
+    ($vm:expr, $fiber:expr, $pc:expr, $values:expr, $module_name:expr, $bc_ptr:expr, $op:expr, $method:expr) => {{
+        let code = &unsafe { &*$bc_ptr }.code;
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
@@ -295,7 +295,7 @@ macro_rules! bc_boxed_cmp {
                     $values,
                     dst,
                     $module_name,
-                    $bc,
+                    $bc_ptr,
                 )?
             }
         }
@@ -323,8 +323,8 @@ macro_rules! bc_f64_cmp {
 /// Bitwise binary op: try numeric, fall back to operator dispatch.
 /// Returns true if a closure frame was pushed.
 macro_rules! bc_bitwise_binop {
-    ($vm:expr, $fiber:expr, $pc:expr, $values:expr, $module_name:expr, $bc:expr, $op:expr, $method:expr) => {{
-        let code = &$bc.code;
+    ($vm:expr, $fiber:expr, $pc:expr, $values:expr, $module_name:expr, $bc_ptr:expr, $op:expr, $method:expr) => {{
+        let code = &unsafe { &*$bc_ptr }.code;
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
@@ -349,7 +349,7 @@ macro_rules! bc_bitwise_binop {
                     $values,
                     dst,
                     $module_name,
-                    $bc,
+                    $bc_ptr,
                 )?
             }
         }
@@ -639,7 +639,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 &mut values,
                                 dst,
                                 &module_name,
-                                bc,
+                                bc_ptr,
                             )?;
                             if result {
                                 continue 'fiber_loop;
@@ -682,7 +682,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 &mut values,
                                 dst,
                                 &module_name,
-                                bc,
+                                bc_ptr,
                             )?;
                             if result {
                                 continue 'fiber_loop;
@@ -783,7 +783,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let recv = get_reg(&values, recv_reg);
                     let val = if let Some(ptr) = recv.as_object() {
                         let inst = ptr as *const ObjInstance;
-                        unsafe { (*inst).get_field(field_idx) }.unwrap_or(Value::null())
+                        unsafe { (*inst).get_field_unchecked(field_idx) }
                     } else {
                         Value::null()
                     };
@@ -798,9 +798,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let val = get_reg(&values, val_reg);
                     if let Some(ptr) = recv.as_object() {
                         let inst = ptr as *mut ObjInstance;
-                        unsafe { (*inst).set_field(field_idx, val) };
-                        // Write barrier: if old-gen instance stores a young pointer,
-                        // add to remembered set so GC can find it during minor collection.
+                        unsafe { (*inst).set_field_unchecked(field_idx, val) };
                         vm.gc.write_barrier(ptr as *mut ObjHeader, val);
                     }
                     set_reg(&mut values, dst, val);
@@ -845,7 +843,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x + y,
                         "+(_)"
                     ) {
@@ -859,7 +857,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x - y,
                         "-(_)"
                     ) {
@@ -873,7 +871,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x * y,
                         "*(_)"
                     ) {
@@ -887,7 +885,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x / y,
                         "/(_)"
                     ) {
@@ -901,7 +899,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x % y,
                         "%(_)"
                     ) {
@@ -935,7 +933,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x < y,
                         "<(_)"
                     ) {
@@ -949,7 +947,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x > y,
                         ">(_)"
                     ) {
@@ -963,7 +961,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x <= y,
                         "<=(_)"
                     ) {
@@ -977,7 +975,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: f64, y: f64| x >= y,
                         ">=(_)"
                     ) {
@@ -1007,7 +1005,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             &mut values,
                             dst,
                             &module_name,
-                            bc,
+                            bc_ptr,
                         )?;
                         if result {
                             continue 'fiber_loop;
@@ -1038,7 +1036,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             &mut values,
                             dst,
                             &module_name,
-                            bc,
+                            bc_ptr,
                         )?;
                         if result {
                             continue 'fiber_loop;
@@ -1071,7 +1069,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: i32, y: i32| x & y,
                         "&(_)"
                     ) {
@@ -1085,7 +1083,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: i32, y: i32| x | y,
                         "|(_)"
                     ) {
@@ -1118,7 +1116,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: i32, y: i32| x << (y & 31),
                         "<<(_)"
                     ) {
@@ -1132,7 +1130,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         &mut pc,
                         &mut values,
                         &module_name,
-                        &bc,
+                        bc_ptr,
                         |x: i32, y: i32| x >> (y & 31),
                         ">>(_)"
                     ) {
@@ -1264,6 +1262,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 &module_name,
                                 ValueId(dst as u32),
                                 None,
+                                bc_ptr,
                             )?;
                             continue 'fiber_loop;
                         }
@@ -1459,6 +1458,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                         &module_name,
                                         ValueId(dst as u32),
                                         defining_class,
+                                        bc_ptr,
                                     )?;
                                     continue 'fiber_loop;
                                 }
@@ -1503,6 +1503,11 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 frame.values = values;
                             }
 
+                            // Save caller's bc_ptr before pushing new frame
+                            unsafe {
+                                (*fiber).mir_frames.last_mut().unwrap().bc_ptr = bc_ptr;
+                            }
+
                             // Push new frame
                             unsafe {
                                 (*fiber).mir_frames.push(MirCallFrame {
@@ -1515,6 +1520,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                     return_dst: Some(ValueId(dst as u32)),
                                     closure: Some(closure_ptr),
                                     defining_class,
+                                    bc_ptr: target_bc_ptr,
                                 });
                             }
 
@@ -1523,6 +1529,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             values = unsafe {
                                 std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
                             };
+                            bc_ptr = target_bc_ptr;
                             bc = unsafe { &*target_bc_ptr };
                             code = &bc.code;
                             continue;
@@ -1531,7 +1538,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let recv_class = recv_val.as_object().unwrap() as *mut ObjClass;
                             let instance = vm.gc.alloc_instance(recv_class);
                             let instance_val = Value::object(instance as *mut u8);
-                            vm.gc.write_barrier(instance as *mut ObjHeader, recv_val);
+                            // No write_barrier needed: instance was just allocated (always young-gen),
+                            // so source.generation != GEN_OLD and barrier would be a no-op.
 
                             let target_fn_ptr = unsafe { (*closure_ptr).function };
                             let target_func_id = FuncId(unsafe { (*target_fn_ptr).fn_id });
@@ -1583,6 +1591,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 let frame = (*fiber).mir_frames.last_mut().unwrap();
                                 frame.pc = pc;
                                 frame.values = values;
+                                frame.bc_ptr = bc_ptr;
                             }
 
                             unsafe {
@@ -1596,6 +1605,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                     return_dst: Some(ValueId(dst as u32)),
                                     closure: Some(closure_ptr),
                                     defining_class,
+                                    bc_ptr: target_bc_ptr,
                                 });
                             }
 
@@ -1603,6 +1613,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             values = unsafe {
                                 std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
                             };
+                            bc_ptr = target_bc_ptr;
                             bc = unsafe { &*target_bc_ptr };
                             code = &bc.code;
                             continue;
@@ -1669,6 +1680,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                     &module_name,
                                     ValueId(dst as u32),
                                     found_class,
+                                    bc_ptr,
                                 )?;
                                 continue 'fiber_loop;
                             }
@@ -1683,6 +1695,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                     &module_name,
                                     ValueId(dst as u32),
                                     found_class,
+                                    bc_ptr,
                                 )?;
                                 continue 'fiber_loop;
                             }
@@ -1734,6 +1747,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 &module_name,
                                 ValueId(dst as u32),
                                 None,
+                                bc_ptr,
                             )?;
                             continue 'fiber_loop;
                         }
@@ -1775,6 +1789,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 &module_name,
                                 ValueId(dst as u32),
                                 None,
+                                bc_ptr,
                             )?;
                             continue 'fiber_loop;
                         }
@@ -1897,12 +1912,14 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         func_id = frame.func_id;
                         pc = frame.pc;
                         values = std::mem::take(&mut frame.values);
+                        bc_ptr = if !frame.bc_ptr.is_null() {
+                            frame.bc_ptr
+                        } else {
+                            vm.engine
+                                .ensure_bytecode(func_id)
+                                .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?
+                        };
                     }
-                    // Reload bytecode pointers for the caller
-                    bc_ptr = vm
-                        .engine
-                        .ensure_bytecode(func_id)
-                        .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
                     bc = unsafe { &*bc_ptr };
                     code = &bc.code;
                     continue;
@@ -1932,12 +1949,14 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         func_id = frame.func_id;
                         pc = frame.pc;
                         values = std::mem::take(&mut frame.values);
+                        bc_ptr = if !frame.bc_ptr.is_null() {
+                            frame.bc_ptr
+                        } else {
+                            vm.engine
+                                .ensure_bytecode(func_id)
+                                .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?
+                        };
                     }
-                    // Reload bytecode pointers for the caller
-                    bc_ptr = vm
-                        .engine
-                        .ensure_bytecode(func_id)
-                        .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
                     bc = unsafe { &*bc_ptr };
                     code = &bc.code;
                     continue;
@@ -2050,6 +2069,7 @@ pub fn eval_in_vm(
             return_dst: None,
             closure: None,
             defining_class: None,
+            bc_ptr: std::ptr::null(),
         });
     }
 
@@ -2097,6 +2117,7 @@ fn dispatch_closure_bc(
     module_name: &Rc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
+    caller_bc_ptr: *const BytecodeFunction,
 ) -> Result<(), RuntimeError> {
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
@@ -2269,6 +2290,7 @@ fn dispatch_closure_bc(
         let frame = (*fiber).mir_frames.last_mut().unwrap();
         frame.pc = pc;
         frame.values = values;
+        frame.bc_ptr = caller_bc_ptr;
     }
 
     // Push new frame (Rc::clone is cheap — just refcount bump)
@@ -2283,6 +2305,7 @@ fn dispatch_closure_bc(
             return_dst: Some(return_dst),
             closure: Some(closure_ptr),
             defining_class,
+            bc_ptr: target_bc_ptr,
         });
     }
 
@@ -2404,7 +2427,7 @@ fn try_operator_dispatch(
     values: &mut Vec<Value>,
     dst: u16,
     module_name: &Rc<String>,
-    _bc: &BytecodeFunction,
+    caller_bc_ptr: *const BytecodeFunction,
 ) -> Result<bool, RuntimeError> {
     let method_sym = vm.interner.intern(method_str);
     let class = vm.class_of(recv);
@@ -2441,6 +2464,7 @@ fn try_operator_dispatch(
                 module_name,
                 ValueId(dst as u32),
                 None,
+                caller_bc_ptr,
             )?;
             Ok(true)
         }
@@ -2852,6 +2876,7 @@ mod tests {
                 return_dst: None,
                 closure: None,
                 defining_class: None,
+                bc_ptr: std::ptr::null(),
             });
         }
         vm.fiber = fiber;
@@ -2885,6 +2910,7 @@ mod tests {
                 return_dst: None,
                 closure: None,
                 defining_class: None,
+                bc_ptr: std::ptr::null(),
             });
         }
         vm.fiber = fiber;
