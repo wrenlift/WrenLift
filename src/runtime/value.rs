@@ -171,14 +171,7 @@ impl Value {
     #[inline(always)]
     pub fn as_object(self) -> Option<*mut u8> {
         if self.is_object() {
-            // Sign-extend from 48 bits for canonical pointer form.
-            let raw = self.0 & PTR_MASK;
-            // If bit 47 is set, sign-extend upper bits (kernel pointers).
-            let ptr = if raw & (1 << 47) != 0 {
-                raw | !PTR_MASK
-            } else {
-                raw
-            };
+            let ptr = self.0 & PTR_MASK;
             Some(ptr as *mut u8)
         } else {
             None
