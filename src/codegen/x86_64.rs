@@ -940,6 +940,14 @@ impl X64Emitter {
                 self.emit_pop(gp(*dst));
             }
 
+            StackAlloc { bytes } => {
+                self.emit_sub_imm32(4, *bytes as i32); // sub rsp, bytes
+            }
+
+            StackFree { bytes } => {
+                self.emit_add_imm32(4, *bytes as i32); // add rsp, bytes
+            }
+
             // ── Pseudo-instructions ──
             DefLabel(l) => {
                 self.define_label(*l);

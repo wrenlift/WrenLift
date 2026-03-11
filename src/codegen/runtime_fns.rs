@@ -1319,7 +1319,16 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
 
                 let mut new_insts: Vec<MachInst> = Vec::new();
 
-                // 0. Push caller-saved live registers
+                // 0. Push caller-saved live registers.
+                // x86_64 System V ABI requires 16-byte stack alignment before `call`.
+                // After prologue (push rbp), RSP is 16-byte aligned. Each push
+                // subtracts 8 bytes, so an odd number of pushes misaligns the stack.
+                // Insert a dummy push to re-align when needed.
+                let needs_align_pad =
+                    target == super::Target::X86_64 && !save_regs.len().is_multiple_of(2);
+                if needs_align_pad {
+                    new_insts.push(MachInst::StackAlloc { bytes: 8 });
+                }
                 for &reg in &save_regs {
                     new_insts.push(MachInst::Push { src: VReg::gp(reg) });
                 }
@@ -1363,6 +1372,9 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
                 // 5. Pop caller-saved live registers (reverse order)
                 for &reg in save_regs.iter().rev() {
                     new_insts.push(MachInst::Pop { dst: VReg::gp(reg) });
+                }
+                if needs_align_pad {
+                    new_insts.push(MachInst::StackFree { bytes: 8 });
                 }
 
                 let seq_len = new_insts.len();

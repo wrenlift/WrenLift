@@ -474,6 +474,14 @@ fn emit_inst(
             dynasm!(asm ; ldr X(gp(*dst)), [sp], 16);
         }
 
+        StackAlloc { bytes } => {
+            dynasm!(asm ; sub sp, sp, *bytes);
+        }
+
+        StackFree { bytes } => {
+            dynasm!(asm ; add sp, sp, *bytes);
+        }
+
         // =================================================================
         // Pseudo-instructions
         // =================================================================

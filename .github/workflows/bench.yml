@@ -42,6 +42,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq luajit ruby
 
+      - name: Build standard Wren
+        run: |
+          git clone --depth 1 https://github.com/wren-lang/wren-cli.git /tmp/wren-cli
+          cd /tmp/wren-cli
+          make -j$(nproc)
+          sudo cp bin/wren_cli /usr/local/bin/wren_cli
+
       - name: Build release
         run: cargo build --release
 
@@ -77,16 +84,18 @@ jobs:
           for bench in $BENCHMARKS; do
             BENCH_RESULTS="{}"
 
-            # WrenLift — try tiered (JIT) first, fall back to interpreter if it crashes
+            # WrenLift
             t=$(best_of $WLIFT "bench/${bench}.wren")
-            if [ -z "$t" ]; then
-              echo "  [wrenlift] tiered mode failed for $bench, trying interpreter..."
-              t=$(best_of $WLIFT --mode interpreter "bench/${bench}.wren")
-            fi
             if [ -n "$t" ]; then
               BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {wrenlift: ($v | tonumber)}')
             else
-              echo "  [wrenlift] FAILED for $bench (both tiered and interpreter)"
+              echo "  [wrenlift] FAILED for $bench"
+            fi
+
+            # Standard Wren
+            t=$(best_of wren_cli "bench/${bench}.wren")
+            if [ -n "$t" ]; then
+              BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {wren: ($v | tonumber)}')
             fi
 
             # Python3

@@ -381,6 +381,8 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
         Nop => Nop,
         Trap => Trap,
         Ret => Ret,
+        StackAlloc { bytes } => StackAlloc { bytes: *bytes },
+        StackFree { bytes } => StackFree { bytes: *bytes },
 
         // Single dst
         LoadImm { dst, bits } => LoadImm {

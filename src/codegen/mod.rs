@@ -629,6 +629,12 @@ pub enum MachInst {
     /// Pop from the stack into a GP register (callee-save restore).
     Pop { dst: VReg },
 
+    /// Allocate stack space: `sub rsp, bytes` (x86_64) / `sub sp, sp, bytes` (aarch64).
+    StackAlloc { bytes: u32 },
+
+    /// Deallocate stack space: `add rsp, bytes` (x86_64) / `add sp, sp, bytes` (aarch64).
+    StackFree { bytes: u32 },
+
     // =====================================================================
     // Pseudo-instructions
     // =====================================================================
@@ -694,7 +700,7 @@ impl MachInst {
             | CallInd { target: src, .. }
             | Push { src } => vec![*src],
 
-            Pop { .. } | FuncArg { .. } => vec![],
+            Pop { .. } | FuncArg { .. } | StackAlloc { .. } | StackFree { .. } => vec![],
 
             IAddImm { src, .. } | AndImm { src, .. } | OrImm { src, .. } => vec![*src],
 
@@ -1588,6 +1594,8 @@ fn fixup_vreg_sentinels(
         }
         MachInst::Prologue { .. }
         | MachInst::Epilogue { .. }
+        | MachInst::StackAlloc { .. }
+        | MachInst::StackFree { .. }
         | MachInst::Jmp { .. }
         | MachInst::JmpIf { .. }
         | MachInst::DefLabel(_)
@@ -3466,6 +3474,8 @@ fn format_inst(inst: &MachInst) -> String {
         Epilogue { frame_size } => format!("epilogue frame_size={}", frame_size),
         Push { src } => format!("push {}", src),
         Pop { dst } => format!("pop {}", dst),
+        StackAlloc { bytes } => format!("stack_alloc {}", bytes),
+        StackFree { bytes } => format!("stack_free {}", bytes),
 
         DefLabel(l) => format!("{}:", l),
         Nop => "nop".to_string(),
