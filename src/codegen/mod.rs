@@ -3333,7 +3333,10 @@ impl<'a> LowerCtx<'a> {
         // x86_64 ucomisd sets CF/ZF/PF, not SF/OF — must use unsigned conditions.
         let fp_cond = fp_condition(cond);
         let flag = self.mf.new_gp();
-        self.mf.emit(MachInst::CSet { dst: flag, cond: fp_cond });
+        self.mf.emit(MachInst::CSet {
+            dst: flag,
+            cond: fp_cond,
+        });
         // Convert 0/1 → TAG_FALSE/TAG_TRUE: result = TAG_FALSE + flag
         // TAG_TRUE = TAG_FALSE + 1, so: dst = TAG_FALSE + flag
         let base = self.mf.new_gp();
