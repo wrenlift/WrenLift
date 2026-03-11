@@ -248,8 +248,7 @@ impl Gc {
     #[cfg(debug_assertions)]
     pub fn validate_write_barriers(&self) {
         use std::collections::HashSet;
-        let remembered: HashSet<usize> =
-            self.remembered_set.iter().map(|&p| p as usize).collect();
+        let remembered: HashSet<usize> = self.remembered_set.iter().map(|&p| p as usize).collect();
         let mut current = self.old_objects;
         while !current.is_null() {
             unsafe {
@@ -268,26 +267,25 @@ impl Gc {
         let check_val = |val: Value, desc: &str| {
             if let Some(ptr) = val.as_object() {
                 let target = ptr as *mut ObjHeader;
-                if !target.is_null() && (*target).generation == GEN_YOUNG {
-                    if !remembered.contains(&(header as usize)) {
-                        panic!(
+                if !target.is_null()
+                    && (*target).generation == GEN_YOUNG
+                    && !remembered.contains(&(header as usize))
+                {
+                    panic!(
                             "WRITE BARRIER BUG: old {:?} ({:?}) → young {:?}, not in remembered set. desc: {}",
                             header, (*header).obj_type, target, desc
                         );
-                    }
                 }
             }
         };
         let check_raw = |ptr: *const u8, desc: &str| {
             if !ptr.is_null() && self.nursery.contains(ptr) {
                 let target = ptr as *mut ObjHeader;
-                if (*target).generation == GEN_YOUNG {
-                    if !remembered.contains(&(header as usize)) {
-                        panic!(
+                if (*target).generation == GEN_YOUNG && !remembered.contains(&(header as usize)) {
+                    panic!(
                             "WRITE BARRIER BUG: old {:?} ({:?}) → young raw {:?}, not in remembered set. desc: {}",
                             header, (*header).obj_type, ptr, desc
                         );
-                    }
                 }
             }
         };
@@ -333,7 +331,10 @@ impl Gc {
                         check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
                     }
                     if let Some(c) = frame.defining_class {
-                        check_raw(c as *const u8, &format!("fiber.frame[{}].defining_class", fi));
+                        check_raw(
+                            c as *const u8,
+                            &format!("fiber.frame[{}].defining_class", fi),
+                        );
                     }
                 }
                 check_raw(fiber.caller as *const u8, "fiber.caller");
@@ -432,6 +433,7 @@ impl Gc {
     }
 
     #[inline(always)]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
         let num_fields = if class.is_null() {
             0
@@ -441,20 +443,25 @@ impl Gc {
 
         // Fast path: bump-allocate both instance and fields in nursery.
         if self.nursery.has_space_for_instance(num_fields) {
-            let inst_ptr = self.nursery.try_alloc(ObjInstance::new_with_fields(
-                class,
-                num_fields as u32,
-                std::ptr::null_mut(), // fields set below
-            )).unwrap();
+            let inst_ptr = self
+                .nursery
+                .try_alloc(ObjInstance::new_with_fields(
+                    class,
+                    num_fields as u32,
+                    std::ptr::null_mut(), // fields set below
+                ))
+                .unwrap();
             self.nursery_objects.push(inst_ptr as *mut ObjHeader);
 
             if num_fields > 0 {
                 let fields_ptr = self.nursery.try_alloc_values(num_fields).unwrap();
-                unsafe { (*inst_ptr).fields = fields_ptr; }
+                unsafe {
+                    (*inst_ptr).fields = fields_ptr;
+                }
             }
 
-            let size = std::mem::size_of::<ObjInstance>()
-                + std::mem::size_of::<Value>() * num_fields;
+            let size =
+                std::mem::size_of::<ObjInstance>() + std::mem::size_of::<Value>() * num_fields;
             self.track_alloc(size);
             return inst_ptr;
         }
@@ -791,10 +798,7 @@ impl Gc {
         for (i, val) in roots.iter().enumerate() {
             if let Some(ptr) = val.as_object() {
                 if self.nursery.contains(ptr) {
-                    panic!(
-                        "GC BUG: root[{}] contains stale nursery ptr {:?}",
-                        i, ptr
-                    );
+                    panic!("GC BUG: root[{}] contains stale nursery ptr {:?}", i, ptr);
                 }
             }
         }
@@ -812,7 +816,10 @@ impl Gc {
                 if self.nursery.contains(ptr) {
                     panic!(
                         "GC BUG: {:?} ({:?}) contains stale nursery ptr {:?}, desc: {}",
-                        header, (*header).obj_type, ptr, desc
+                        header,
+                        (*header).obj_type,
+                        ptr,
+                        desc
                     );
                 }
             }
@@ -821,7 +828,10 @@ impl Gc {
             if !ptr.is_null() && self.nursery.contains(ptr) {
                 panic!(
                     "GC BUG: {:?} ({:?}) contains stale nursery raw ptr {:?}, desc: {}",
-                    header, (*header).obj_type, ptr, desc
+                    header,
+                    (*header).obj_type,
+                    ptr,
+                    desc
                 );
             }
         };
@@ -867,7 +877,10 @@ impl Gc {
                         check_raw(c as *const u8, &format!("fiber.frame[{}].closure", fi));
                     }
                     if let Some(c) = frame.defining_class {
-                        check_raw(c as *const u8, &format!("fiber.frame[{}].defining_class", fi));
+                        check_raw(
+                            c as *const u8,
+                            &format!("fiber.frame[{}].defining_class", fi),
+                        );
                     }
                 }
                 check_raw(fiber.caller as *const u8, "fiber.caller");
@@ -931,9 +944,7 @@ impl Gc {
             for ptr in ptrs.iter_mut() {
                 let hdr = *ptr as *mut ObjHeader;
                 unsafe {
-                    if self.nursery.contains(hdr as *const u8)
-                        && (*hdr).gc_mark == FORWARDED
-                    {
+                    if self.nursery.contains(hdr as *const u8) && (*hdr).gc_mark == FORWARDED {
                         *ptr = (*hdr).next as *mut ObjString;
                     }
                 }
@@ -1134,7 +1145,6 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
 // ---------------------------------------------------------------------------
 // Pointer forwarding helpers
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Inline forwarding helpers (read forwarding ptr from nursery header)

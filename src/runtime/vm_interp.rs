@@ -561,8 +561,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         if idx < upvalues.len() {
                             let uv_ptr = upvalues[idx];
                             unsafe { (*uv_ptr).set(v) };
-                            vm.gc
-                                .write_barrier(uv_ptr as *mut ObjHeader, v);
+                            vm.gc.write_barrier(uv_ptr as *mut ObjHeader, v);
                         }
                     }
                     set_reg(&mut values, dst, v);
@@ -614,8 +613,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         unsafe {
                             (*class_ptr).static_fields.insert(sym, v);
                         }
-                        vm.gc
-                            .write_barrier(class_ptr as *mut ObjHeader, v);
+                        vm.gc.write_barrier(class_ptr as *mut ObjHeader, v);
                     }
                     set_reg(&mut values, dst, v);
                 }
@@ -1178,14 +1176,13 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     pc += (argc as u32) * 2;
 
                     // ── IC fast path: monomorphic inline cache ──────────────
-                    // After warmup, each call site caches (class, jit_ptr).
-                    // On hit: single class compare → direct native call.
-                    // No method lookup, no SmallVec, no branch chain.
+                    // Only kind 1 (JIT leaf) is inlined here. Adding more IC
+                    // kinds inline causes LLVM to bloat the dispatch loop and
+                    // regress performance on tight method-call benchmarks.
                     let ic_table = unsafe { &mut *bc.ic_table.get() };
                     if ic_idx < ic_table.len() {
                         let ic = &ic_table[ic_idx];
                         if ic.kind == 1 {
-                            // JIT leaf IC hit check: compare cached class
                             let recv_class = if recv_val.is_object() {
                                 let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
                                 unsafe { (*(obj_ptr as *const ObjHeader)).class as usize }
@@ -1381,6 +1378,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                             class: cache_key_class as usize,
                                             jit_ptr,
                                             closure: closure_ptr as *const u8,
+                                            func_id: fn_idx as u32,
                                             kind: 1, // JIT leaf
                                         };
                                     }
@@ -1533,27 +1531,20 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let recv_class = recv_val.as_object().unwrap() as *mut ObjClass;
                             let instance = vm.gc.alloc_instance(recv_class);
                             let instance_val = Value::object(instance as *mut u8);
-                            // Write barrier: instance may be old-gen if nursery overflowed
-                            vm.gc.write_barrier(
-                                instance as *mut ObjHeader,
-                                recv_val, // class ref
-                            );
+                            vm.gc.write_barrier(instance as *mut ObjHeader, recv_val);
 
                             let target_fn_ptr = unsafe { (*closure_ptr).function };
                             let target_func_id = FuncId(unsafe { (*target_fn_ptr).fn_id });
 
-                            // Tier-up profiling (but always use interpreter dispatch
-                            // to avoid GC root issues with recursive constructors).
+                            // Tier-up profiling (interpreter dispatch only for constructors)
                             if vm.engine.mode != ExecutionMode::Interpreter {
                                 let should_tier_up = vm.engine.record_call(target_func_id);
                                 if should_tier_up {
-                                    vm.engine
-                                        .request_tier_up(target_func_id, &vm.interner);
+                                    vm.engine.request_tier_up(target_func_id, &vm.interner);
                                 }
                                 vm.engine.poll_compilations();
                             }
 
-                            // ── Inline constructor frame push (interpreter path) ──
                             let target_bc_ptr =
                                 vm.engine.ensure_bytecode(target_func_id).ok_or_else(|| {
                                     RuntimeError::Error("invalid ctor func_id".into())
@@ -1561,8 +1552,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             let target_bc = unsafe { &*target_bc_ptr };
 
                             let reg_count = target_bc.register_count as usize;
-                            let mut new_values = if let Some(mut recycled) =
-                                vm.register_pool.pop()
+                            let mut new_values = if let Some(mut recycled) = vm.register_pool.pop()
                             {
                                 recycled.resize(reg_count, UNDEF);
                                 new_values_fill_undef(&mut recycled, reg_count);
@@ -1570,20 +1560,17 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             } else {
                                 vec![UNDEF; reg_count]
                             };
-                            // Bind params: arg[0] = instance, rest from arg_vals
-                            // Build ctor args inline to avoid SmallVec clone
-                            let mut ctor_args: SmallVec<[Value; 8]> =
-                                SmallVec::with_capacity(arg_vals.len());
-                            ctor_args.push(instance_val);
-                            if arg_vals.len() > 1 {
-                                ctor_args.extend_from_slice(&arg_vals[1..]);
-                            }
+                            // Bind params directly: arg[0]=instance, rest from arg_vals
                             for &(dst_reg, param_idx) in target_bc.param_offsets.iter() {
-                                if (param_idx as usize) < ctor_args.len()
-                                    && (dst_reg as usize) < reg_count
-                                {
-                                    new_values[dst_reg as usize] =
-                                        ctor_args[param_idx as usize];
+                                let val = if param_idx == 0 {
+                                    instance_val
+                                } else if (param_idx as usize) < arg_vals.len() {
+                                    arg_vals[param_idx as usize]
+                                } else {
+                                    UNDEF
+                                };
+                                if (dst_reg as usize) < reg_count {
+                                    new_values[dst_reg as usize] = val;
                                 }
                             }
 
@@ -1592,14 +1579,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 return Err(RuntimeError::StackOverflow);
                             }
 
-                            // Save caller frame
                             unsafe {
                                 let frame = (*fiber).mir_frames.last_mut().unwrap();
                                 frame.pc = pc;
                                 frame.values = values;
                             }
 
-                            // Push constructor frame
                             unsafe {
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
@@ -1616,9 +1601,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                             pc = 0;
                             values = unsafe {
-                                std::mem::take(
-                                    &mut (*fiber).mir_frames.last_mut().unwrap().values,
-                                )
+                                std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
                             };
                             bc = unsafe { &*target_bc_ptr };
                             code = &bc.code;
@@ -2175,7 +2158,8 @@ fn dispatch_closure_bc(
                             module_name: module_name.as_ptr(),
                             module_name_len: module_name.len() as u32,
                             closure: closure_ptr as *mut u8,
-                            defining_class: defining_class.unwrap_or(std::ptr::null_mut()) as *mut u8,
+                            defining_class: defining_class.unwrap_or(std::ptr::null_mut())
+                                as *mut u8,
                         },
                     );
                 }

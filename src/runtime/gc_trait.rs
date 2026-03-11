@@ -22,13 +22,8 @@ pub trait GcAllocator {
     fn alloc_list(&mut self) -> *mut ObjList;
     fn alloc_map(&mut self) -> *mut ObjMap;
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange;
-    fn alloc_fn(
-        &mut self,
-        name: SymbolId,
-        arity: u8,
-        upvalue_count: u16,
-        fn_id: u32,
-    ) -> *mut ObjFn;
+    fn alloc_fn(&mut self, name: SymbolId, arity: u8, upvalue_count: u16, fn_id: u32)
+        -> *mut ObjFn;
     fn alloc_closure(&mut self, function: *mut ObjFn) -> *mut ObjClosure;
     fn alloc_upvalue(&mut self, location: *mut Value) -> *mut ObjUpvalue;
     fn alloc_fiber(&mut self) -> *mut ObjFiber;
@@ -82,20 +77,15 @@ pub enum GcImpl {
 }
 
 /// Which GC strategy to use. Selectable via CLI `--gc` flag.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GcStrategy {
     /// Generational nursery + old gen mark-sweep (default).
+    #[default]
     Generational,
     /// Allocate-only, free on drop. For benchmarks / short-lived scripts.
     Arena,
     /// Simple non-generational mark-sweep.
     MarkSweep,
-}
-
-impl Default for GcStrategy {
-    fn default() -> Self {
-        GcStrategy::Generational
-    }
 }
 
 /// Macro to dispatch a method call to the inner GC implementation.

@@ -1051,8 +1051,8 @@ impl fmt::Debug for ObjClass {
 /// A class instance with a fixed number of fields.
 #[repr(C)]
 pub struct ObjInstance {
-    pub header: ObjHeader, // offset 0, 24 bytes
-    pub num_fields: u32,   // offset 24
+    pub header: ObjHeader,  // offset 0, 24 bytes
+    pub num_fields: u32,    // offset 24
     pub fields_owned: bool, // offset 28 (in padding before *mut)
     pub fields: *mut Value, // offset 32, heap-allocated or nursery-bump-allocated
                             // total: 40 bytes

@@ -140,15 +140,24 @@ pub enum BcConst {
 /// Monomorphic inline cache entry for a call site.
 /// Caches the resolved (class, native_fn_ptr) for zero-branch dispatch
 /// after warmup. Written on first miss, checked on subsequent calls.
+///
+/// Kinds:
+///   0 = empty
+///   1 = JIT leaf (direct native call)
+///   2 = interpreted closure (skip method lookup, inline frame push)
+///   3 = constructor (skip method lookup, alloc instance, inline frame push)
+///   4 = native method (direct fn pointer call)
 #[derive(Clone, Copy)]
 pub struct CallSiteIC {
     /// Cached receiver class pointer (0 = empty).
     pub class: usize,
-    /// Cached native function pointer (null = not JIT or not leaf).
+    /// Kind 1: JIT fn ptr. Kind 2/3: defining_class ptr (reused).
     pub jit_ptr: *const u8,
-    /// Cached closure pointer for non-JIT dispatch.
+    /// Cached closure pointer for dispatch.
     pub closure: *const u8,
-    /// Method type: 0 = empty, 1 = JIT leaf, 2 = closure (non-leaf), 3 = native.
+    /// Cached func_id for quick bytecode lookup (kinds 2/3).
+    pub func_id: u32,
+    /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native.
     pub kind: u8,
 }
 
@@ -158,6 +167,7 @@ impl Default for CallSiteIC {
             class: 0,
             jit_ptr: std::ptr::null(),
             closure: std::ptr::null(),
+            func_id: 0,
             kind: 0,
         }
     }

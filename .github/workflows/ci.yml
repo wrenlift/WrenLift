@@ -37,13 +37,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --release --all-targets
 
       - name: Unit tests
-        run: cargo test --lib
+        run: cargo test --release --lib
 
       - name: E2E tests
-        run: cargo test --test e2e
+        run: cargo test --release --test e2e
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

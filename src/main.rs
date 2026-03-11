@@ -225,7 +225,10 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         eprintln!("  peak objects:       {}", stats.peak_objects);
         eprintln!("  total allocated:    {} KB", stats.total_allocated / 1024);
         eprintln!("  total freed:        {} KB", stats.total_freed / 1024);
-        eprintln!("  gc time:            {:.3}s", stats.gc_time_ns as f64 / 1e9);
+        eprintln!(
+            "  gc time:            {:.3}s",
+            stats.gc_time_ns as f64 / 1e9
+        );
     }
 }
 
