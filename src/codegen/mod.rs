@@ -234,6 +234,21 @@ impl Cond {
     }
 }
 
+/// Map signed integer conditions to unsigned conditions for use after x86_64
+/// `ucomisd` (FP compare), which sets CF/ZF/PF but NOT SF/OF.
+/// On aarch64, `fcmp` uses the standard NZCV flags, so Lt/Gt/Le/Ge work
+/// directly, but Below/Above also work, so this is safe on both targets.
+fn fp_condition(cond: Cond) -> Cond {
+    match cond {
+        Cond::Lt => Cond::Below,
+        Cond::Le => Cond::BelowEq,
+        Cond::Gt => Cond::Above,
+        Cond::Ge => Cond::AboveEq,
+        // Eq/Ne/unsigned conditions are already correct after ucomisd.
+        other => other,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Machine Instruction ADT
 // ---------------------------------------------------------------------------
@@ -2745,13 +2760,13 @@ impl<'a> LowerCtx<'a> {
                         self.mf.emit(MachInst::FCmp { lhs: la, rhs: zero });
                         self.mf.emit(MachInst::CSet {
                             dst: is_pos,
-                            cond: Cond::Gt,
+                            cond: fp_condition(Cond::Gt),
                         });
                         // is_neg = la < 0.0
                         self.mf.emit(MachInst::FCmp { lhs: la, rhs: zero });
                         self.mf.emit(MachInst::CSet {
                             dst: is_neg,
-                            cond: Cond::Lt,
+                            cond: fp_condition(Cond::Lt),
                         });
                         // result = is_pos ? 1.0 : (is_neg ? -1.0 : 0.0)
                         // Use: pos_fp = is_pos * 1.0, neg_fp = is_neg * (-1.0), result = pos_fp + neg_fp
@@ -3138,7 +3153,9 @@ impl<'a> LowerCtx<'a> {
         let lb = self.fp_vreg_for(b);
         let dst = self.vreg_for(dst_val);
         self.mf.emit(MachInst::FCmp { lhs: la, rhs: lb });
-        self.mf.emit(MachInst::CSet { dst, cond });
+        // x86_64 ucomisd sets CF/ZF/PF, not SF/OF — must use unsigned conditions.
+        let fp_cond = fp_condition(cond);
+        self.mf.emit(MachInst::CSet { dst, cond: fp_cond });
     }
 
     fn emit_boxed_binop(
@@ -3312,9 +3329,11 @@ impl<'a> LowerCtx<'a> {
         self.mf.emit(MachInst::BitcastGpToFp { dst: fa, src: la });
         self.mf.emit(MachInst::BitcastGpToFp { dst: fb, src: lb });
         self.mf.emit(MachInst::FCmp { lhs: fa, rhs: fb });
-        // CSet gives 0 or 1 in a GP register based on the condition
+        // CSet gives 0 or 1 in a GP register based on the condition.
+        // x86_64 ucomisd sets CF/ZF/PF, not SF/OF — must use unsigned conditions.
+        let fp_cond = fp_condition(cond);
         let flag = self.mf.new_gp();
-        self.mf.emit(MachInst::CSet { dst: flag, cond });
+        self.mf.emit(MachInst::CSet { dst: flag, cond: fp_cond });
         // Convert 0/1 → TAG_FALSE/TAG_TRUE: result = TAG_FALSE + flag
         // TAG_TRUE = TAG_FALSE + 1, so: dst = TAG_FALSE + flag
         let base = self.mf.new_gp();
