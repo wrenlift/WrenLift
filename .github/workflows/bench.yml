@@ -55,7 +55,7 @@ jobs:
       - name: Run benchmarks
         run: |
           WLIFT="./target/release/wlift"
-          RUNS=10
+          RUNS=10000
 
           # Helper: run a command N times, extract best "elapsed: X" time
           best_of() {
