@@ -37,6 +37,11 @@ jobs:
           key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-bench-
 
+      - name: Install interpreters
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq luajit ruby
+
       - name: Build release
         run: cargo build --release
 
@@ -44,13 +49,14 @@ jobs:
         run: |
           WLIFT="./target/release/wlift"
           RUNS=5
-          RESULTS="{}"
 
-          for bench in fib method_call binary_trees; do
-            script="bench/${bench}.wren"
-            best=""
+          # Helper: run a command N times, extract best "elapsed: X" time
+          best_of() {
+            local best=""
             for i in $(seq 1 $RUNS); do
-              output=$($WLIFT "$script" 2>/dev/null) || true
+              local output
+              output=$("$@" 2>/dev/null) || true
+              local t
               t=$(echo "$output" | grep -oE 'elapsed: [0-9]+\.?[0-9]*' | tail -1 | awk '{print $2}')
               if [ -n "$t" ]; then
                 if [ -z "$best" ] || [ "$(echo "$t < $best" | bc -l)" = "1" ]; then
@@ -58,9 +64,46 @@ jobs:
                 fi
               fi
             done
-            if [ -n "$best" ]; then
-              RESULTS=$(echo "$RESULTS" | jq --arg k "$bench" --arg v "$best" '. + {($k): ($v | tonumber)}')
+            echo "$best"
+          }
+
+          BENCHMARKS="fib method_call binary_trees"
+          RESULTS="{}"
+
+          for bench in $BENCHMARKS; do
+            BENCH_RESULTS="{}"
+
+            # WrenLift
+            t=$(best_of $WLIFT "bench/${bench}.wren")
+            if [ -n "$t" ]; then
+              BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {wrenlift: ($v | tonumber)}')
             fi
+
+            # Python3
+            t=$(best_of python3 "bench/lang/${bench}.py")
+            if [ -n "$t" ]; then
+              BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {python3: ($v | tonumber)}')
+            fi
+
+            # Ruby
+            t=$(best_of ruby "bench/lang/${bench}.rb")
+            if [ -n "$t" ]; then
+              BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {ruby: ($v | tonumber)}')
+            fi
+
+            # LuaJIT (JIT enabled)
+            t=$(best_of luajit "bench/lang/${bench}.lua")
+            if [ -n "$t" ]; then
+              BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {"luajit": ($v | tonumber)}')
+            fi
+
+            # LuaJIT (-joff = interpreter only)
+            t=$(best_of luajit -joff "bench/lang/${bench}.lua")
+            if [ -n "$t" ]; then
+              BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {"luajit (-joff)": ($v | tonumber)}')
+            fi
+
+            RESULTS=$(echo "$RESULTS" | jq --arg k "$bench" --argjson v "$BENCH_RESULTS" '. + {($k): $v}')
           done
 
           # Add metadata

@@ -10,9 +10,7 @@
     --text: #1a1a2e;
     --muted: #6b7280;
     --bar-wlift: #2563eb;
-    --bar-wren: #64748b;
-    --bar-other: #94a3b8;
-    --bar-wlift-label: #1d4ed8;
+    --bar-other: #7bafd4;
     --border: #e5e7eb;
     --card-bg: #f9fafb;
   }
@@ -22,9 +20,7 @@
       --text: #e2e8f0;
       --muted: #94a3b8;
       --bar-wlift: #3b82f6;
-      --bar-wren: #64748b;
-      --bar-other: #475569;
-      --bar-wlift-label: #60a5fa;
+      --bar-other: #5883a7;
       --border: #1e293b;
       --card-bg: #1e293b;
     }
@@ -54,7 +50,7 @@
   .section-title {
     font-size: 1.5rem;
     font-weight: 600;
-    color: var(--bar-wlift-label);
+    color: var(--bar-wlift);
     margin-bottom: 1rem;
     margin-top: 2.5rem;
   }
@@ -68,7 +64,7 @@
     height: 2rem;
   }
   .bar-label {
-    width: 120px;
+    width: 130px;
     font-weight: 600;
     font-size: 0.9rem;
     flex-shrink: 0;
@@ -87,11 +83,8 @@
     min-width: 2px;
     transition: width 0.6s ease-out;
   }
-  .bar-fill.wlift {
+  .bar-fill.wrenlift {
     background: var(--bar-wlift);
-  }
-  .bar-fill.wren {
-    background: var(--bar-wren);
   }
   .bar-fill.other {
     background: var(--bar-other);
@@ -139,46 +132,14 @@
 <h1>Performance</h1>
 <p class="subtitle">
   <a href="https://github.com/wrenlift/WrenLift">WrenLift</a> benchmarks
-  compared against standard <a href="https://wren.io">Wren</a> and other scripting languages.
+  compared against other scripting language interpreters.
+  All results from the same CI machine.
 </p>
 
 <div id="charts"><p class="loading">Loading benchmark results...</p></div>
 <div id="meta"></div>
 
 <script>
-// Reference times (seconds) from standard interpreters.
-// Measured on comparable hardware; these are representative baselines.
-const REFERENCES = {
-  method_call: [
-    { name: "luajit (-joff)", time: 0.16 },
-    { name: "ruby",           time: 0.20 },
-    { name: "lua",            time: 0.35 },
-    { name: "python3",        time: 0.78 },
-    { name: "python",         time: 0.85 },
-  ],
-  fib: [
-    { name: "luajit (-joff)", time: 0.10 },
-    { name: "ruby",           time: 0.22 },
-    { name: "lua",            time: 0.28 },
-    { name: "python",         time: 0.51 },
-    { name: "python3",        time: 0.57 },
-  ],
-  binary_trees: [
-    { name: "luajit (-joff)", time: 0.11 },
-    { name: "ruby",           time: 0.24 },
-    { name: "python",         time: 0.37 },
-    { name: "python3",        time: 0.38 },
-    { name: "lua",            time: 0.52 },
-  ],
-};
-
-// Standard Wren reference times (wren_cli 0.4, same benchmark suite).
-const WREN_REF = {
-  method_call: 0.12,
-  fib: 0.20,
-  binary_trees: 0.22,
-};
-
 const CHART_TITLES = {
   method_call: "Method Call",
   fib: "Recursive Fibonacci",
@@ -187,29 +148,28 @@ const CHART_TITLES = {
 
 const BENCH_ORDER = ["method_call", "binary_trees", "fib"];
 
-function buildChart(name, wliftTime) {
+function buildChart(name, data) {
   const title = CHART_TITLES[name] || name;
-  const wrenTime = WREN_REF[name];
-  const refs = REFERENCES[name] || [];
 
-  // Build sorted entries: WrenLift, Wren, then references
+  // Build sorted entries
   let entries = [];
-  if (wliftTime != null) entries.push({ name: "wrenlift", time: wliftTime, cls: "wlift" });
-  if (wrenTime != null) entries.push({ name: "wren", time: wrenTime, cls: "wren" });
-  refs.forEach(r => entries.push({ name: r.name, time: r.time, cls: "other" }));
-
+  for (const [lang, time] of Object.entries(data)) {
+    entries.push({ name: lang, time: time });
+  }
   entries.sort((a, b) => a.time - b.time);
+
   const maxTime = Math.max(...entries.map(e => e.time));
 
   let html = `<h2 class="section-title">${title}</h2><div class="chart">`;
   entries.forEach(e => {
     const pct = (e.time / maxTime) * 75; // max bar = 75% of track width
-    const label = e.name === "wrenlift" ? "<strong>wrenlift</strong>" : e.name;
+    const cls = e.name === "wrenlift" ? "wrenlift" : "other";
+    const label = e.name === "wrenlift" ? `<strong>${e.name}</strong>` : e.name;
     html += `
       <div class="bar-row">
         <div class="bar-label">${label}</div>
         <div class="bar-track">
-          <div class="bar-fill ${e.cls}" style="width: ${pct}%">
+          <div class="bar-fill ${cls}" style="width: ${pct}%">
             <span class="bar-time">${e.time.toFixed(2)}s</span>
           </div>
         </div>
@@ -230,16 +190,20 @@ async function main() {
       results = await resp.json();
     }
   } catch (e) {
-    // Use fallback values if results.json is not available.
+    container.innerHTML = `<p class="loading">Failed to load results. Run the benchmark workflow first.</p>`;
+    return;
   }
 
-  // If no CI results, use memory-based reference values for WrenLift.
-  const fallback = { fib: 0.085, method_call: 0.057, binary_trees: 0.88 };
+  if (!results || Object.keys(results).length === 0) {
+    container.innerHTML = `<p class="loading">No results available yet. Run the benchmark workflow first.</p>`;
+    return;
+  }
 
   let html = "";
   BENCH_ORDER.forEach(name => {
-    const wliftTime = results[name] || fallback[name];
-    html += buildChart(name, wliftTime);
+    if (results[name] && typeof results[name] === "object") {
+      html += buildChart(name, results[name]);
+    }
   });
 
   html += `
@@ -247,9 +211,7 @@ async function main() {
       <strong>Shorter bars are better.</strong>
       Each benchmark is run five times and the best time is kept.
       It only measures the time taken to execute the benchmarked code itself, not interpreter startup.
-      Reference times for other languages are from the
-      <a href="https://wren.io/performance.html" style="color: var(--bar-wlift);">Wren performance page</a>,
-      measured on comparable hardware.
+      All results are from the same GitHub Actions runner for a fair comparison.
     </div>`;
 
   container.innerHTML = html;
@@ -257,12 +219,12 @@ async function main() {
   // Metadata
   if (results.meta) {
     const m = results.meta;
-    const sha = m.commit ? m.commit.substring(0, 7) : "—";
+    const sha = m.commit ? m.commit.substring(0, 7) : "\u2014";
     metaEl.innerHTML = `
       <div class="meta">
-        Last updated: ${m.date || "—"} &middot;
+        Last updated: ${m.date || "\u2014"} &middot;
         Commit: <code>${sha}</code> &middot;
-        Arch: ${m.arch || "—"} &middot;
+        Arch: ${m.arch || "\u2014"} &middot;
         Best of ${m.runs || 5} runs
       </div>`;
   }
