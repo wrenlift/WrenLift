@@ -338,14 +338,6 @@ impl X64Emitter {
 
     /// setcc r8 + zero-extend → materialize condition into full 64-bit register.
     fn emit_setcc_full(&mut self, cc: u8, dst: u32) {
-        // xor Rd32, Rd32 (zero-extends, clears upper 32 bits)
-        let need_rx = dst >= 8;
-        if need_rx {
-            self.push(0x40 | ((dst >> 3) << 2) as u8 | (dst >> 3) as u8);
-        }
-        self.push(0x31);
-        self.push(Self::modrm(3, dst, dst));
-
         // setcc r8 — need REX for uniform byte registers (SPL+)
         if dst >= 4 {
             self.push(0x40 | if dst >= 8 { 0x01 } else { 0 });
@@ -353,6 +345,12 @@ impl X64Emitter {
         self.push(0x0F);
         self.push(0x90 | cc);
         self.push(Self::modrm(3, 0, dst));
+
+        // movzx r64, r8 — zero-extend byte to 64-bit (preserves flags, unlike xor)
+        self.push(Self::rex(true, dst, 0, dst));
+        self.push(0x0F);
+        self.push(0xB6);
+        self.push(Self::modrm(3, dst, dst));
     }
 
     // ── Memory (GP) ──
@@ -1366,8 +1364,8 @@ mod tests {
         e.emit_setcc_full(cond_code(&Cond::Lt), 0);
         let asm = disasm(&e.code);
         assert_eq!(asm[0].0, "cmp");
-        assert_eq!(asm[1].0, "xor");
-        assert_eq!(asm[2].0, "setl");
+        assert_eq!(asm[1].0, "setl");
+        assert_eq!(asm[2].0, "movzx");
     }
 
     #[test]
