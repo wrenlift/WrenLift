@@ -5,7 +5,7 @@
 <h1 align="center">WrenLift</h1>
 
 <p align="center">
-Lightning fast JIT runtime for the <a href="https://wren.io">Wren</a> programming language.
+Fast JIT runtime for the <a href="https://wren.io">Wren</a> programming language.
 </p>
 
 <p align="center">

@@ -1,0 +1,97 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-bench-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run benchmarks
+        run: |
+          WLIFT="./target/release/wlift"
+          RUNS=5
+          RESULTS="{}"
+
+          for bench in fib method_call binary_trees; do
+            script="bench/${bench}.wren"
+            best=""
+            for i in $(seq 1 $RUNS); do
+              output=$($WLIFT "$script" 2>/dev/null) || true
+              t=$(echo "$output" | grep -oE 'elapsed: [0-9]+\.?[0-9]*' | tail -1 | awk '{print $2}')
+              if [ -n "$t" ]; then
+                if [ -z "$best" ] || [ "$(echo "$t < $best" | bc -l)" = "1" ]; then
+                  best="$t"
+                fi
+              fi
+            done
+            if [ -n "$best" ]; then
+              RESULTS=$(echo "$RESULTS" | jq --arg k "$bench" --arg v "$best" '. + {($k): ($v | tonumber)}')
+            fi
+          done
+
+          # Add metadata
+          RESULTS=$(echo "$RESULTS" | jq \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg sha "${{ github.sha }}" \
+            --arg ref "${{ github.ref_name }}" \
+            --arg runner "$(uname -m)" \
+            '. + {meta: {date: $date, commit: $sha, branch: $ref, arch: $runner, runs: 5}}')
+
+          echo "$RESULTS" | jq .
+          echo "$RESULTS" > bench/site/results.json
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: bench/site
+
+  deploy:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
