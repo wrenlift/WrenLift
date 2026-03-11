@@ -48,14 +48,18 @@ jobs:
       - name: Run benchmarks
         run: |
           WLIFT="./target/release/wlift"
-          RUNS=5
+          RUNS=10
 
           # Helper: run a command N times, extract best "elapsed: X" time
           best_of() {
             local best=""
             for i in $(seq 1 $RUNS); do
-              local output
-              output=$("$@" 2>/dev/null) || true
+              local output exit_code
+              output=$("$@" 2>&1) && exit_code=$? || exit_code=$?
+              if [ $exit_code -ne 0 ] && [ $i -eq 1 ]; then
+                echo "  [debug] exit=$exit_code for: $*" >&2
+                echo "  [debug] output: $(echo "$output" | tail -3)" >&2
+              fi
               local t
               t=$(echo "$output" | grep -oE 'elapsed: [0-9]+\.?[0-9]*' | tail -1 | awk '{print $2}')
               if [ -n "$t" ]; then
@@ -73,10 +77,16 @@ jobs:
           for bench in $BENCHMARKS; do
             BENCH_RESULTS="{}"
 
-            # WrenLift
+            # WrenLift — try tiered (JIT) first, fall back to interpreter if it crashes
             t=$(best_of $WLIFT "bench/${bench}.wren")
+            if [ -z "$t" ]; then
+              echo "  [wrenlift] tiered mode failed for $bench, trying interpreter..."
+              t=$(best_of $WLIFT --mode interpreter "bench/${bench}.wren")
+            fi
             if [ -n "$t" ]; then
               BENCH_RESULTS=$(echo "$BENCH_RESULTS" | jq --arg v "$t" '. + {wrenlift: ($v | tonumber)}')
+            else
+              echo "  [wrenlift] FAILED for $bench (both tiered and interpreter)"
             fi
 
             # Python3
@@ -112,7 +122,7 @@ jobs:
             --arg sha "${{ github.sha }}" \
             --arg ref "${{ github.ref_name }}" \
             --arg runner "$(uname -m)" \
-            '. + {meta: {date: $date, commit: $sha, branch: $ref, arch: $runner, runs: 5}}')
+            '. + {meta: {date: $date, commit: $sha, branch: $ref, arch: $runner, runs: 10}}')
 
           echo "$RESULTS" | jq .
           echo "$RESULTS" > bench/site/results.json
