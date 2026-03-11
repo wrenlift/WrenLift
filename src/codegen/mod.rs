@@ -1400,6 +1400,8 @@ pub fn compile_function_with_interner(
             };
             regalloc::allocate_registers(&mut mach, &target_regs);
             fixup_sentinels(&mut mach, target);
+            // Insert callee-saved register saves/restores after regalloc.
+            insert_callee_saves(&mut mach, target);
             // Link runtime calls AFTER regalloc + fixup so all vregs are
             // physical registers. Uses parallel copy to avoid clobbering.
             runtime_fns::link_runtime_calls(&mut mach, target);
@@ -1603,6 +1605,76 @@ fn fixup_vreg_sentinels(
         | MachInst::Trap
         | MachInst::Ret => {}
     }
+}
+
+/// After register allocation, insert push/pop for callee-saved registers that
+/// were assigned by the allocator. Without this, JIT code clobbers the caller's
+/// preserved registers (RBX, R12-R15 on x86_64) causing SIGSEGV on return.
+fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
+    let callee_saved: &[PhysReg] = match target {
+        Target::X86_64 => phys_x86_64::ABI.gp_callee_saved,
+        Target::Aarch64 => return, // aarch64 prologue already handles this via stp/ldp
+        Target::Wasm => return,
+    };
+
+    // Scan all instructions for GP registers that are in the callee-saved set.
+    // Build set of callee-saved hw_enc values for fast lookup.
+    let cs_set: std::collections::BTreeSet<u32> =
+        callee_saved.iter().map(|r| r.hw_enc as u32).collect();
+
+    let mut used_callee_saved = std::collections::BTreeSet::new();
+    for inst in &mach.insts {
+        for vreg in inst.uses().iter().chain(inst.defs().iter()) {
+            if vreg.class == RegClass::Gp && cs_set.contains(&vreg.index) {
+                used_callee_saved.insert(vreg.index);
+            }
+        }
+    }
+
+    if used_callee_saved.is_empty() {
+        return;
+    }
+
+    let saves: Vec<u32> = used_callee_saved.into_iter().collect();
+
+    // On x86_64, after `push rbp` (Prologue), the stack is 16-byte aligned
+    // (return addr + push rbp = 2 pushes = 16 bytes). An odd number of
+    // callee-save pushes would misalign; add padding if needed.
+    let needs_align_pad = target == Target::X86_64 && !saves.len().is_multiple_of(2);
+
+    // Rebuild instruction list with callee-save push/pop inserted.
+    let old_insts = std::mem::take(&mut mach.insts);
+    let mut new_insts = Vec::with_capacity(old_insts.len() + saves.len() * 2 + 2);
+
+    for inst in old_insts {
+        match &inst {
+            MachInst::Prologue { .. } => {
+                new_insts.push(inst);
+                // Push callee-saved registers right after prologue
+                if needs_align_pad {
+                    new_insts.push(MachInst::StackAlloc { bytes: 8 });
+                }
+                for &reg in &saves {
+                    new_insts.push(MachInst::Push { src: VReg::gp(reg) });
+                }
+            }
+            MachInst::Epilogue { .. } => {
+                // Pop callee-saved registers right before epilogue (reverse order)
+                for &reg in saves.iter().rev() {
+                    new_insts.push(MachInst::Pop { dst: VReg::gp(reg) });
+                }
+                if needs_align_pad {
+                    new_insts.push(MachInst::StackFree { bytes: 8 });
+                }
+                new_insts.push(inst);
+            }
+            _ => {
+                new_insts.push(inst);
+            }
+        }
+    }
+
+    mach.insts = new_insts;
 }
 
 struct LowerCtx<'a> {
