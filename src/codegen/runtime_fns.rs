@@ -918,6 +918,75 @@ pub extern "C" fn wren_guard_protocol(value: u64, protocol_id: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Guard deoptimization — invalidate JIT + re-execute via interpreter
+// ---------------------------------------------------------------------------
+
+/// Common deopt implementation: invalidate JIT code for the current function
+/// and re-execute it via the interpreter with the given args.
+fn deopt_impl(args: &[u64]) -> u64 {
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+    let ctx = read_jit_ctx();
+    let closure_ptr = ctx.closure as *mut ObjClosure;
+    if closure_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let func_id = unsafe { (*(*closure_ptr).function).fn_id } as usize;
+
+    // Invalidate JIT code pointer so future calls go to interpreter.
+    if func_id < vm.engine.jit_code.len() {
+        vm.engine.jit_code[func_id] = std::ptr::null();
+    }
+
+    // Revert FuncBody from Compiled → Interpreted (keeps mir + bytecode).
+    if let Some(body) = vm.engine.functions.get_mut(func_id) {
+        if let crate::runtime::engine::FuncBody::Compiled { mir, bytecode, .. } = body {
+            let mir = mir.clone();
+            let bytecode = bytecode.clone();
+            *body = crate::runtime::engine::FuncBody::Interpreted {
+                mir,
+                bytecode,
+                call_count: 0,
+            };
+        }
+    }
+
+    // Re-execute via interpreter with the original args.
+    let values: Vec<Value> = args.iter().map(|&a| Value::from_bits(a)).collect();
+    vm.call_closure_sync(closure_ptr, &values)
+        .map(|v| v.to_bits())
+        .unwrap_or(Value::null().to_bits())
+}
+
+/// Deopt with 0 args (standalone function, no receiver).
+pub extern "C" fn wren_deopt_0() -> u64 {
+    deopt_impl(&[])
+}
+
+/// Deopt with 1 arg (e.g. standalone function with 1 param, or method with `this` only).
+pub extern "C" fn wren_deopt_1(a0: u64) -> u64 {
+    deopt_impl(&[a0])
+}
+
+/// Deopt with 2 args (e.g. method with `this` + 1 param).
+pub extern "C" fn wren_deopt_2(a0: u64, a1: u64) -> u64 {
+    deopt_impl(&[a0, a1])
+}
+
+/// Deopt with 3 args.
+pub extern "C" fn wren_deopt_3(a0: u64, a1: u64, a2: u64) -> u64 {
+    deopt_impl(&[a0, a1, a2])
+}
+
+/// Deopt with 4 args.
+pub extern "C" fn wren_deopt_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    deopt_impl(&[a0, a1, a2, a3])
+}
+
+// ---------------------------------------------------------------------------
 // Boxed NaN-boxed arithmetic runtime functions
 // ---------------------------------------------------------------------------
 
@@ -1112,6 +1181,12 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_is_type" => Some(wren_is_type as *const () as usize),
         "wren_guard_class" => Some(wren_guard_class as *const () as usize),
         "wren_guard_protocol" => Some(wren_guard_protocol as *const () as usize),
+        // Guard deoptimization (arity-specific)
+        "wren_deopt_0" => Some(wren_deopt_0 as *const () as usize),
+        "wren_deopt_1" => Some(wren_deopt_1 as *const () as usize),
+        "wren_deopt_2" => Some(wren_deopt_2 as *const () as usize),
+        "wren_deopt_3" => Some(wren_deopt_3 as *const () as usize),
+        "wren_deopt_4" => Some(wren_deopt_4 as *const () as usize),
         // Subscript
         "wren_subscript_get" => Some(wren_subscript_get as *const () as usize),
         "wren_subscript_set" => Some(wren_subscript_set as *const () as usize),

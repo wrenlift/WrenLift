@@ -1612,6 +1612,10 @@ struct LowerCtx<'a> {
     def_map: Vec<Option<Instruction>>,
     /// MIR ValueId → use count, indexed by ValueId.0 (for FMA: only fold if mul has single use).
     use_count: Vec<u32>,
+    /// Shared deopt label — all guard failures branch here. `None` until first guard.
+    deopt_label: Option<Label>,
+    /// VRegs for entry block parameters (function args), in ABI order.
+    entry_param_vregs: Vec<VReg>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1661,6 +1665,8 @@ impl<'a> LowerCtx<'a> {
             in_entry_block: false,
             def_map,
             use_count,
+            deopt_label: None,
+            entry_param_vregs: Vec::new(),
         }
     }
 
@@ -1710,6 +1716,28 @@ impl<'a> LowerCtx<'a> {
 
             let term = block.terminator.clone();
             self.lower_terminator(&term);
+        }
+
+        // Emit shared deopt epilogue: call wren_deopt_N with all entry args, return result.
+        if let Some(deopt) = self.deopt_label {
+            self.mf.emit(MachInst::DefLabel(deopt));
+            let arity = self.entry_param_vregs.len();
+            let deopt_fn = match arity {
+                0 => "wren_deopt_0",
+                1 => "wren_deopt_1",
+                2 => "wren_deopt_2",
+                3 => "wren_deopt_3",
+                _ => "wren_deopt_4",
+            };
+            let args: Vec<VReg> = self.entry_param_vregs.iter().take(4).copied().collect();
+            let ret_reg = VReg::gp(0);
+            self.mf.emit(MachInst::CallRuntime {
+                name: deopt_fn,
+                args,
+                ret: Some(ret_reg),
+            });
+            self.mf.emit(MachInst::Epilogue { frame_size: 0 });
+            self.mf.emit(MachInst::Ret);
         }
     }
 
@@ -1833,18 +1861,61 @@ impl<'a> LowerCtx<'a> {
 
             // -- Guards --
             Instruction::GuardNum(a) => {
-                // A NaN-boxed number is any f64 that is NOT one of our tagged
-                // special values. Check: bits & QNAN_MASK != QNAN_MASK, or
-                // more precisely: (bits + 0x0004_0000_0000_0000) >> 63 == 0
-                // For now, emit a runtime call as placeholder.
+                // Inline type check: a number has (bits & QNAN) != QNAN.
+                // If (bits & QNAN) == QNAN, it's NOT a number → deopt.
+                const QNAN: u64 = 0x7FFC_0000_0000_0000;
+
                 let src = self.vreg_for(*a);
                 let dst = self.vreg_for(dst_val);
+
+                // Get or create the shared deopt label.
+                let deopt = self.deopt_label.unwrap_or_else(|| self.mf.new_label());
+                self.deopt_label = Some(deopt);
+
+                let tmp = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: tmp,
+                    src,
+                    imm: QNAN,
+                });
+                self.mf.emit(MachInst::ICmpImm {
+                    lhs: tmp,
+                    imm: QNAN,
+                });
+                self.mf.emit(MachInst::JmpIf {
+                    cond: Cond::Eq,
+                    target: deopt,
+                });
+                // Guard passed — value is a number, pass through.
                 self.mf.emit(MachInst::Mov { dst, src });
-                // TODO: inline guard check + branch to deopt
             }
             Instruction::GuardBool(a) => {
+                // Inline type check: a bool is TAG_FALSE (QNAN|1) or TAG_TRUE (QNAN|2).
+                // Check: (bits & ~3) == QNAN → it's a bool. Otherwise deopt.
+                const QNAN: u64 = 0x7FFC_0000_0000_0000;
+
                 let src = self.vreg_for(*a);
                 let dst = self.vreg_for(dst_val);
+
+                let deopt = self.deopt_label.unwrap_or_else(|| self.mf.new_label());
+                self.deopt_label = Some(deopt);
+
+                // Mask off the low 2 bits and check if the rest == QNAN.
+                let tmp = self.mf.new_gp();
+                self.mf.emit(MachInst::AndImm {
+                    dst: tmp,
+                    src,
+                    imm: !3u64,
+                });
+                self.mf.emit(MachInst::ICmpImm {
+                    lhs: tmp,
+                    imm: QNAN,
+                });
+                self.mf.emit(MachInst::JmpIf {
+                    cond: Cond::Ne,
+                    target: deopt,
+                });
+                // Guard passed — value is a bool, pass through.
                 self.mf.emit(MachInst::Mov { dst, src });
             }
 
@@ -2715,6 +2786,12 @@ impl<'a> LowerCtx<'a> {
                         dst: vreg,
                         index: *idx as u32,
                     });
+                    // Track entry param VRegs for guard deopt calls.
+                    let idx = *idx as usize;
+                    if idx >= self.entry_param_vregs.len() {
+                        self.entry_param_vregs.resize(idx + 1, VReg::gp(0));
+                    }
+                    self.entry_param_vregs[idx] = vreg;
                 }
             }
 
