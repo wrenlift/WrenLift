@@ -541,16 +541,6 @@ impl ExecutionEngine {
                 if let Some(body) = self.functions.get(idx) {
                     let leaf = is_mir_leaf(body.mir());
                     self.jit_leaf[idx] = leaf;
-                    if std::env::var("WLIFT_JIT_DUMP").is_ok() {
-                        let name = &body.mir().name;
-                        eprintln!(
-                            "  installed FuncId({}) '{}' native={} leaf={}",
-                            idx,
-                            name,
-                            !native_ptr.is_null(),
-                            leaf,
-                        );
-                    }
                 }
             }
             if idx < self.compiling.len() {

@@ -29,6 +29,9 @@ pub enum ResolvedName {
     Local(u16),
     Upvalue(u16),
     ModuleVar(u16),
+    /// Bare identifier inside a method body that didn't resolve to any variable.
+    /// Treated as an implicit `this.name` getter call at runtime.
+    ImplicitThis(SymbolId),
 }
 
 /// The result of a successful resolution pass.
@@ -509,13 +512,20 @@ impl<'a> Resolver<'a> {
 
             Expr::Ident(name) => {
                 if self.resolve_name(*name, &expr.1).is_none() {
-                    self.errors.push(
-                        Diagnostic::error(format!(
-                            "undefined variable '{}'",
-                            self.interner.resolve(*name)
-                        ))
-                        .with_label(expr.1.clone(), "not found"),
-                    );
+                    if self.in_method {
+                        // Bare identifier in a method that doesn't resolve to any
+                        // variable — treat as implicit `this.name` getter call.
+                        let resolved = ResolvedName::ImplicitThis(*name);
+                        self.resolutions.insert(expr.1.start, resolved);
+                    } else {
+                        self.errors.push(
+                            Diagnostic::error(format!(
+                                "undefined variable '{}'",
+                                self.interner.resolve(*name)
+                            ))
+                            .with_label(expr.1.clone(), "not found"),
+                        );
+                    }
                 }
             }
 

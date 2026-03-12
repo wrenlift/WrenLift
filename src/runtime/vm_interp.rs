@@ -1,4 +1,5 @@
 use smallvec::SmallVec;
+
 /// Fiber-based MIR interpreter with bytecode dispatch.
 ///
 /// All execution happens within a Fiber context. The interpreter loop
@@ -2153,37 +2154,15 @@ fn dispatch_closure_bc(
             native_fn_ptr
         };
 
-        if !fn_ptr_raw.is_null() {
-            // Guard native recursion depth.
+        let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+        // Only dispatch leaf JIT functions (pure field access, arithmetic).
+        // Non-leaf functions (containing Call, GetModuleVar, etc.) require
+        // JIT context + GC root setup that currently causes hangs and wrong
+        // results, so they fall through to the interpreter path.
+        if !fn_ptr_raw.is_null() && is_leaf {
             let jit_depth = crate::codegen::runtime_fns::jit_depth();
             if jit_depth < crate::codegen::runtime_fns::MAX_JIT_DEPTH {
                 crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-                let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-
-                if !is_leaf {
-                    // Non-leaf: full setup — GC roots + JIT context needed for runtime calls.
-                    for &arg in arg_vals {
-                        crate::codegen::runtime_fns::push_jit_root(arg);
-                    }
-                    let (module_vars_ptr, module_var_count) = vm
-                        .engine
-                        .modules
-                        .get(module_name.as_str())
-                        .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
-                        .unwrap_or((std::ptr::null_mut(), 0));
-                    crate::codegen::runtime_fns::set_jit_context(
-                        crate::codegen::runtime_fns::JitContext {
-                            module_vars: module_vars_ptr,
-                            module_var_count,
-                            vm: vm as *mut VM as *mut u8,
-                            module_name: module_name.as_ptr(),
-                            module_name_len: module_name.len() as u32,
-                            closure: closure_ptr as *mut u8,
-                            defining_class: defining_class.unwrap_or(std::ptr::null_mut())
-                                as *mut u8,
-                        },
-                    );
-                }
 
                 // Call native code with args as NaN-boxed u64 values.
                 let result_bits = unsafe {
@@ -2222,21 +2201,17 @@ fn dispatch_closure_bc(
                     }
                 };
 
-                // Restore depth counter.
                 crate::codegen::runtime_fns::set_jit_depth(jit_depth);
-
-                if !is_leaf {
-                    crate::codegen::runtime_fns::clear_jit_roots();
-                }
-
                 let result_val = Value::from_bits(result_bits);
+
                 // Store result in caller's return_dst register
                 set_reg(&mut values, return_dst.0 as u16, result_val);
                 // Save caller frame state
                 unsafe {
-                    let frame = (*fiber).mir_frames.last_mut().unwrap();
-                    frame.pc = pc;
-                    frame.values = values;
+                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                        frame.pc = pc;
+                        frame.values = values;
+                    }
                 }
                 return Ok(());
             }

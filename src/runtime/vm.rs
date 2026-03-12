@@ -1360,7 +1360,7 @@ impl NativeContext for VM {
             let is_closure = unsafe { (*header).obj_type == ObjType::Closure };
             if is_closure {
                 let closure_ptr = ptr as *mut ObjClosure;
-                return self.call_closure_sync(closure_ptr, args);
+                return self.call_closure_sync(closure_ptr, args, None);
             }
         }
 
@@ -1858,6 +1858,7 @@ impl VM {
         &mut self,
         closure_ptr: *mut ObjClosure,
         args: &[Value],
+        defining_class: Option<*mut crate::runtime::object::ObjClass>,
     ) -> Option<Value> {
         use crate::mir::{BlockId, Instruction};
 
@@ -1910,7 +1911,7 @@ impl VM {
                 module_name: mod_name,
                 return_dst: None,
                 closure: Some(closure_ptr),
-                defining_class: None,
+                defining_class,
                 bc_ptr: std::ptr::null(),
             });
         }
@@ -1927,6 +1928,117 @@ impl VM {
         self.fiber = saved_fiber;
 
         result.ok()
+    }
+
+    /// Dispatch a constructor call from JIT code safely.
+    ///
+    /// When a constructor's JIT code is called, it would receive the CLASS as
+    /// `this` (arg 0) instead of a newly allocated instance, causing SIGSEGV.
+    /// This function allocates the instance, roots it across GC, and runs the
+    /// constructor body in the interpreter.
+    pub fn call_constructor_sync(
+        &mut self,
+        class_ptr: *mut crate::runtime::object::ObjClass,
+        closure_ptr: *mut ObjClosure,
+        ctor_args: &[Value], // args WITHOUT the class receiver (just the user args)
+    ) -> Value {
+        use crate::mir::{BlockId, Instruction};
+
+        // Allocate the new instance. This may trigger a minor GC.
+        let instance_raw = self.gc.alloc_instance(class_ptr);
+        let instance_val = Value::object(instance_raw as *mut u8);
+
+        // Root the instance across any GC that may occur inside alloc_fiber below.
+        let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+        crate::codegen::runtime_fns::push_jit_root(instance_val);
+
+        let func_id = crate::runtime::engine::FuncId(unsafe {
+            let fn_ptr = (*closure_ptr).function;
+            (*fn_ptr).fn_id
+        });
+
+        let mir = self.engine.get_mir(func_id);
+        if mir.is_none() {
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return instance_val;
+        }
+        let mir = mir.unwrap();
+
+        // alloc_fiber may trigger GC — read back the (possibly forwarded) instance
+        // from the JIT root AFTER allocation so we always have the live pointer.
+        let temp_fiber = self.gc.alloc_fiber();
+        let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+        crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+
+        unsafe {
+            (*temp_fiber).header.class = self.fiber_class;
+
+            let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
+
+            // Bind BlockParam(0) = instance (this), BlockParam(1..N) = ctor_args
+            let block = &mir.blocks[0];
+            for (vid, inst) in &block.instructions {
+                if let Instruction::BlockParam(idx) = inst {
+                    let param_i = *idx as usize;
+                    let val = if param_i == 0 {
+                        live_instance
+                    } else if param_i - 1 < ctor_args.len() {
+                        ctor_args[param_i - 1]
+                    } else {
+                        Value::UNDEFINED
+                    };
+                    let i = vid.0 as usize;
+                    if i >= values.len() {
+                        values.resize(i + 1, Value::UNDEFINED);
+                    }
+                    values[i] = val;
+                } else {
+                    break;
+                }
+            }
+
+            let mod_name = if !self.fiber.is_null() {
+                (*self.fiber)
+                    .mir_frames
+                    .last()
+                    .map(|f| f.module_name.clone())
+                    .unwrap_or_else(|| {
+                        std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                    })
+            } else {
+                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+            };
+
+            (*temp_fiber).mir_frames.push(MirCallFrame {
+                func_id,
+                current_block: BlockId(0),
+                ip: 0,
+                pc: 0,
+                values,
+                module_name: mod_name,
+                return_dst: None,
+                closure: Some(closure_ptr),
+                defining_class: Some(class_ptr),
+                bc_ptr: std::ptr::null(),
+            });
+        }
+
+        let saved_fiber = self.fiber;
+        if !saved_fiber.is_null() {
+            crate::codegen::runtime_fns::push_jit_root(Value::object(
+                saved_fiber as *mut u8,
+            ));
+        }
+        self.fiber = temp_fiber;
+        let result = super::vm_interp::run_fiber(self);
+        self.fiber = saved_fiber;
+
+        // The constructor body returns `this` (the instance). If it returns null
+        // or errors, fall back to live_instance.
+        match result {
+            Ok(v) if !v.is_null() => v,
+            _ => live_instance,
+        }
     }
 }
 
@@ -2504,7 +2616,7 @@ class Animal {
 }
 class Dog is Animal {
   construct new(name) {
-    _name = name
+    super(name)
   }
   bark() { "woof" }
 }

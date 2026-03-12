@@ -86,6 +86,16 @@ fn get_label(labels: &HashMap<Label, DynamicLabel>, l: &Label) -> DynamicLabel {
     *labels.get(l).expect("unresolved label")
 }
 
+/// Choose a scratch register for loading an immediate, avoiding conflict with
+/// the source register. On AArch64 we have two intra-procedure-call scratch
+/// registers: x16 (IP0) and x17 (IP1). Neither is allocatable, so both are
+/// always free to use as temporaries within a single instruction's emission.
+/// We prefer x16; if the source is already x16, we use x17.
+#[inline(always)]
+fn imm_scratch(src_hw: u32) -> u32 {
+    if src_hw == 16 { 17 } else { 16 }
+}
+
 /// Compute effective address for a Mem operand.
 /// If offset is 0, returns the base register index directly.
 /// Otherwise, loads base + offset into x17 (IP1 scratch) and returns 17.
@@ -166,9 +176,11 @@ fn emit_inst(
         }
 
         IAddImm { dst, src, imm } => {
-            // Load immediate into scratch x16, use register form.
-            emit_load_imm64(asm, 16, *imm as i64 as u64);
-            dynasm!(asm ; add X(gp(*dst)), X(gp(*src)), X(16));
+            // Load immediate into a scratch register. Use x17 if source is x16
+            // (the spill scratch) to avoid clobbering it before the add.
+            let scratch = imm_scratch(gp(*src));
+            emit_load_imm64(asm, scratch, *imm as i64 as u64);
+            dynasm!(asm ; add X(gp(*dst)), X(gp(*src)), X(scratch));
         }
 
         ISub { dst, lhs, rhs } => {
@@ -201,8 +213,10 @@ fn emit_inst(
         AndImm { dst, src, imm } => {
             // ARM64 logical immediates are encoded specially; fall back to
             // loading the immediate into a scratch register.
-            emit_load_imm64(asm, 16, *imm);
-            dynasm!(asm ; and X(gp(*dst)), X(gp(*src)), X(16));
+            // Use x17 if source is already in x16 to avoid clobbering it.
+            let scratch = imm_scratch(gp(*src));
+            emit_load_imm64(asm, scratch, *imm);
+            dynasm!(asm ; and X(gp(*dst)), X(gp(*src)), X(scratch));
         }
 
         Or { dst, lhs, rhs } => {
@@ -210,8 +224,9 @@ fn emit_inst(
         }
 
         OrImm { dst, src, imm } => {
-            emit_load_imm64(asm, 16, *imm);
-            dynasm!(asm ; orr X(gp(*dst)), X(gp(*src)), X(16));
+            let scratch = imm_scratch(gp(*src));
+            emit_load_imm64(asm, scratch, *imm);
+            dynasm!(asm ; orr X(gp(*dst)), X(gp(*src)), X(scratch));
         }
 
         Xor { dst, lhs, rhs } => {
@@ -330,8 +345,9 @@ fn emit_inst(
         }
 
         ICmpImm { lhs, imm } => {
-            emit_load_imm64(asm, 16, *imm);
-            dynasm!(asm ; cmp X(gp(*lhs)), X(16));
+            let scratch = imm_scratch(gp(*lhs));
+            emit_load_imm64(asm, scratch, *imm);
+            dynasm!(asm ; cmp X(gp(*lhs)), X(scratch));
         }
 
         FCmp { lhs, rhs } => {
@@ -449,12 +465,17 @@ fn emit_inst(
         // Stack Frame
         // =================================================================
         Prologue { frame_size } => {
-            // Save frame pointer and link register, set up frame.
+            // Allocate frame: save x29/x30 at bottom, set x29 = old_sp (above frame).
+            // Spill slots use negative offsets from x29 (e.g. [x29-8]).
+            // With x29 = old_sp, these offsets land within [sp, old_sp) — the frame.
+            // Push/Pop instructions (used by link_runtime_calls to save live regs
+            // across calls) decrement sp further below the frame, never overlapping
+            // with the spill slots.
             let fs = *frame_size as i32;
             let total: u32 = (if fs < 16 { 16 } else { (fs + 15) & !15 }) as u32;
             dynasm!(asm
                 ; stp x29, x30, [sp, -(total as i32)]!
-                ; mov x29, sp
+                ; add x29, sp, total
             );
         }
 

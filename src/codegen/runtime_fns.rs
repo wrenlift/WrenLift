@@ -113,7 +113,7 @@ fn read_jit_ctx() -> JitContext {
 
 /// Mutate the JIT context in place.
 #[inline(always)]
-fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
+pub fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
     JIT_CTX.with(|c| {
         let mut ctx = c.get();
         f(&mut ctx);
@@ -159,6 +159,24 @@ fn jit_roots_len() -> usize {
 #[inline(always)]
 #[allow(dead_code)]
 fn jit_roots_truncate(len: usize) {
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).truncate(len) });
+}
+
+/// Get the current JIT roots length for save/restore by external callers.
+#[inline(always)]
+pub fn jit_roots_snapshot_len() -> usize {
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).len() })
+}
+
+/// Read the JIT root at the given index (for reading GC-forwarded pointers).
+#[inline(always)]
+pub fn jit_root_at(idx: usize) -> crate::runtime::value::Value {
+    JIT_ROOTS_STORE.with(|r| unsafe { (&(*r.get()))[idx] })
+}
+
+/// Truncate JIT roots to the given length (public version for external callers).
+#[inline(always)]
+pub fn jit_roots_restore_len(len: usize) {
     JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).truncate(len) });
 }
 
@@ -284,24 +302,30 @@ fn call_closure_jit_or_sync(
     vm: &mut crate::runtime::vm::VM,
     closure_ptr: *mut ObjClosure,
     args: &[Value],
+    defining_class: Option<*mut crate::runtime::object::ObjClass>,
 ) -> u64 {
+    // Save the caller's JIT context so we can restore it after the nested call.
+    // Without this, interpreter fallback paths (call_closure_sync → run_fiber)
+    // can overwrite the context via dispatch_closure_bc, corrupting the caller's
+    // module_vars / closure / defining_class when control returns.
+    let saved_ctx = read_jit_ctx();
+
+    // Update context for the callee: set closure and defining_class.
+    mutate_jit_ctx(|ctx| {
+        ctx.closure = closure_ptr as *mut u8;
+        ctx.defining_class = defining_class
+            .map(|p| p as *mut u8)
+            .unwrap_or(std::ptr::null_mut());
+    });
+
     // Install completed compilations so we can dispatch natively.
     vm.engine.poll_compilations();
     if args.len() <= 4 {
-        let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
-        // Check if this function has been compiled to native code.
-        let native_fn_ptr: Option<*const u8> =
-            if let Some(crate::runtime::engine::FuncBody::Compiled { executable, .. }) =
-                vm.engine.get_function(func_id)
-            {
-                if executable.is_native() {
-                    Some(executable.native_ptr())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+        let _func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+
+        // DISABLED: JIT-to-JIT dispatch causes hangs — force interpreter fallback.
+        // All nested calls go through call_closure_sync instead.
+        let native_fn_ptr: Option<*const u8> = None;
 
         if let Some(fn_ptr) = native_fn_ptr {
             // Guard: check native recursion depth to prevent stack overflow.
@@ -342,6 +366,8 @@ fn call_closure_jit_or_sync(
                     }
                 };
                 JIT_DEPTH.with(|d| d.set(depth));
+                // Restore caller's JIT context.
+                set_jit_context(saved_ctx);
                 return result;
             }
             // depth >= MAX_JIT_DEPTH: fall through to interpreter path.
@@ -349,9 +375,12 @@ fn call_closure_jit_or_sync(
     }
 
     // Fall back to interpreter.
-    vm.call_closure_sync(closure_ptr, args)
+    let result = vm.call_closure_sync(closure_ptr, args, defining_class)
         .map(|v| v.to_bits())
-        .unwrap_or(Value::null().to_bits())
+        .unwrap_or(Value::null().to_bits());
+    // Restore caller's JIT context.
+    set_jit_context(saved_ctx);
+    result
 }
 
 /// Internal: dispatch a method call with a pre-built args slice.
@@ -373,8 +402,8 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
     };
 
     // Check method cache first (avoids find_method + static symbol resolution).
-    if let Some((m, _dc)) = vm.method_cache.lookup(cache_key_class, method_sym) {
-        return dispatch_method(vm, m, args);
+    if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method_sym) {
+        return dispatch_method(vm, m, args, Some(dc));
     }
 
     // Cache miss: full lookup.
@@ -384,7 +413,7 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
         Some(m) => {
             vm.method_cache
                 .insert(cache_key_class, method_sym, m.clone(), class);
-            dispatch_method(vm, m, args)
+            dispatch_method(vm, m, args, Some(class))
         }
         None => {
             // Try static method dispatch (receiver IS a class object)
@@ -407,7 +436,7 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
                 if let Some(m) = found {
                     vm.method_cache
                         .insert(cache_key_class, method_sym, m.clone(), cache_key_class);
-                    dispatch_method(vm, m, args)
+                    dispatch_method(vm, m, args, Some(cache_key_class))
                 } else {
                     Value::null().to_bits()
                 }
@@ -420,11 +449,31 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
 
 /// Dispatch a resolved method entry.
 #[inline(always)]
-fn dispatch_method(vm: &mut crate::runtime::vm::VM, method: Method, args: &[Value]) -> u64 {
+fn dispatch_method(
+    vm: &mut crate::runtime::vm::VM,
+    method: Method,
+    args: &[Value],
+    defining_class: Option<*mut crate::runtime::object::ObjClass>,
+) -> u64 {
     match method {
         Method::Native(native_fn) => native_fn(vm, args).to_bits(),
-        Method::Closure(cp) => call_closure_jit_or_sync(vm, cp, args),
-        Method::Constructor(cp) => call_closure_jit_or_sync(vm, cp, args),
+        Method::Closure(cp) => call_closure_jit_or_sync(vm, cp, args, defining_class),
+        Method::Constructor(cp) => {
+            // Constructor: never use JIT dispatch — the compiled code would receive
+            // the CLASS as `this` instead of a newly-allocated instance, causing SIGSEGV.
+            // Always allocate the instance and run the constructor body in interpreter.
+            let class_ptr = args
+                .first()
+                .and_then(|v| v.as_object())
+                .map(|p| p as *mut crate::runtime::object::ObjClass)
+                .unwrap_or(std::ptr::null_mut());
+            if class_ptr.is_null() {
+                return Value::null().to_bits();
+            }
+            // args[1..] are the user-visible constructor arguments (args[0] is the class)
+            let instance = vm.call_constructor_sync(class_ptr, cp, &args[1..]);
+            instance.to_bits()
+        }
     }
 }
 
@@ -501,8 +550,31 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
         None => return Value::null().to_bits(),
     };
 
-    let class = vm.class_of(recv);
-    let superclass = unsafe { (*class).superclass };
+    // Use defining_class from JIT context to find the correct superclass.
+    // class_of(recv) gives the runtime class (e.g. EqualityConstraint when
+    // super() is called from BinaryConstraint.new), which is wrong — it would
+    // look up EqualityConstraint.superclass = BinaryConstraint instead of
+    // BinaryConstraint.superclass = Constraint.
+    let ctx = read_jit_ctx();
+    let defining_class = if !ctx.defining_class.is_null() {
+        ctx.defining_class as *mut crate::runtime::object::ObjClass
+    } else {
+        // Fallback: try the fiber's current frame's defining_class
+        let fiber = vm.fiber;
+        if !fiber.is_null() {
+            unsafe {
+                (*fiber)
+                    .mir_frames
+                    .last()
+                    .and_then(|f| f.defining_class)
+                    .unwrap_or_else(|| vm.class_of(recv))
+            }
+        } else {
+            vm.class_of(recv)
+        }
+    };
+
+    let superclass = unsafe { (*defining_class).superclass };
     if superclass.is_null() {
         return Value::null().to_bits();
     }
@@ -510,8 +582,21 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
     let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
     match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-        Some(Method::Closure(closure_ptr)) => call_closure_jit_or_sync(vm, closure_ptr, args),
-        Some(Method::Constructor(closure_ptr)) => call_closure_jit_or_sync(vm, closure_ptr, args),
+        Some(Method::Closure(closure_ptr)) => {
+            call_closure_jit_or_sync(vm, closure_ptr, args, Some(superclass))
+        }
+        Some(Method::Constructor(closure_ptr)) => {
+            // Super constructor calls are correct: args[0] is already 'this' (the
+            // newly allocated instance), not the class. Use call_closure_sync to
+            // avoid GC-unsafe JIT dispatch with potentially stale 'this' pointer.
+            // args[0] = this (instance), args[1..] = user constructor args.
+            if args.is_empty() {
+                return Value::null().to_bits();
+            }
+            vm.call_closure_sync(closure_ptr, args, Some(superclass))
+                .map(|v| v.to_bits())
+                .unwrap_or(args[0].to_bits())
+        }
         None => Value::null().to_bits(),
     }
 }
@@ -956,7 +1041,7 @@ fn deopt_impl(args: &[u64]) -> u64 {
 
     // Re-execute via interpreter with the original args.
     let values: Vec<Value> = args.iter().map(|&a| Value::from_bits(a)).collect();
-    vm.call_closure_sync(closure_ptr, &values)
+    vm.call_closure_sync(closure_ptr, &values, None)
         .map(|v| v.to_bits())
         .unwrap_or(Value::null().to_bits())
 }
@@ -1233,6 +1318,120 @@ pub fn resolve(name: &str) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Liveness analysis for post-regalloc instruction stream
+// ---------------------------------------------------------------------------
+
+/// Compute live-out GP registers for every instruction via iterative dataflow.
+///
+/// Returns a Vec where `result[i]` is the set of GP register indices that are
+/// live immediately after instruction `i` executes.
+fn compute_live_out(insts: &[MachInst]) -> Vec<std::collections::HashSet<u32>> {
+    use std::collections::{HashMap, HashSet};
+
+    let n = insts.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Map label id → instruction index
+    let mut label_to_idx: HashMap<u32, usize> = HashMap::new();
+    for (i, inst) in insts.iter().enumerate() {
+        if let MachInst::DefLabel(lbl) = inst {
+            label_to_idx.insert(lbl.0, i);
+        }
+    }
+
+    // Helper: get jump targets for an instruction
+    fn jump_targets(inst: &MachInst) -> Vec<u32> {
+        match inst {
+            MachInst::Jmp { target } => vec![target.0],
+            MachInst::JmpIf { target, .. } => vec![target.0],
+            MachInst::JmpZero { target, .. } => vec![target.0],
+            MachInst::JmpNonZero { target, .. } => vec![target.0],
+            MachInst::TestBitJmpZero { target, .. } => vec![target.0],
+            MachInst::TestBitJmpNonZero { target, .. } => vec![target.0],
+            _ => vec![],
+        }
+    }
+
+    // Determine if instruction falls through to the next
+    fn falls_through(inst: &MachInst) -> bool {
+        !matches!(inst, MachInst::Jmp { .. } | MachInst::Ret | MachInst::Trap)
+    }
+
+    // Precompute uses/defs per instruction (GP only)
+    let mut inst_uses: Vec<HashSet<u32>> = Vec::with_capacity(n);
+    let mut inst_defs: Vec<HashSet<u32>> = Vec::with_capacity(n);
+    for inst in insts {
+        let mut uses = HashSet::new();
+        for u in inst.uses() {
+            if u.class == super::RegClass::Gp {
+                uses.insert(u.index);
+            }
+        }
+        inst_uses.push(uses);
+
+        let mut defs = HashSet::new();
+        if let Some(d) = inst.def() {
+            if d.class == super::RegClass::Gp {
+                defs.insert(d.index);
+            }
+        }
+        inst_defs.push(defs);
+    }
+
+    // Build successor map
+    let mut successors: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for (i, inst) in insts.iter().enumerate() {
+        let mut succs = Vec::new();
+        for t in jump_targets(inst) {
+            if let Some(&idx) = label_to_idx.get(&t) {
+                succs.push(idx);
+            }
+        }
+        if falls_through(inst) && i + 1 < n {
+            succs.push(i + 1);
+        }
+        successors.push(succs);
+    }
+
+    // Iterative dataflow: live_in[i] = use[i] ∪ (live_out[i] - def[i])
+    //                     live_out[i] = ∪ live_in[s] for s in succ(i)
+    let mut live_in: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+
+    loop {
+        let mut changed = false;
+        // Process in reverse for faster convergence
+        for i in (0..n).rev() {
+            // live_out[i] = union of live_in[succ]
+            let mut new_out = HashSet::new();
+            for &s in &successors[i] {
+                new_out.extend(&live_in[s]);
+            }
+
+            // live_in[i] = use[i] ∪ (live_out[i] - def[i])
+            let mut new_in = new_out.clone();
+            for d in &inst_defs[i] {
+                new_in.remove(d);
+            }
+            new_in.extend(&inst_uses[i]);
+
+            if new_in != live_in[i] || new_out != live_out[i] {
+                live_in[i] = new_in;
+                live_out[i] = new_out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    live_out
+}
+
+// ---------------------------------------------------------------------------
 // CallRuntime → ABI setup + CallInd lowering pass
 // ---------------------------------------------------------------------------
 
@@ -1264,128 +1463,103 @@ pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
     let caller_saved_set: std::collections::HashSet<u32> =
         caller_saved.iter().map(|r| r.hw_enc as u32).collect();
 
-    let mut i = 0;
-    while i < mf.insts.len() {
-        if let MachInst::CallRuntime { name, args, ret } = &mf.insts[i] {
-            let name = *name;
-            let args = args.clone();
-            let ret = *ret;
+    // Compute precise per-instruction liveness via iterative dataflow.
+    // This correctly handles loops (backward edges) unlike a forward-only scan.
+    // We pre-collect liveness data keyed by ORIGINAL instruction index, since
+    // splicing new instructions shifts positions.
+    let live_out_per_inst = compute_live_out(&mf.insts);
 
-            if let Some(addr) = resolve(name) {
-                // Compute which caller-saved GP registers are live across this call:
-                // any register referenced (used or defined) by instructions after this call.
-                let mut live_across: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-                for j in (i + 1)..mf.insts.len() {
-                    for u in mf.insts[j].uses() {
-                        if u.class == super::RegClass::Gp {
-                            live_across.insert(u.index);
-                        }
-                    }
-                    if let Some(d) = mf.insts[j].def() {
-                        if d.class == super::RegClass::Gp {
-                            live_across.insert(d.index);
-                        }
-                    }
-                }
-
-                // Only save caller-saved regs that are live, excluding scratch and
-                // result registers. ABI arg registers are NOT excluded because
-                // they may hold live values that the parallel copy will overwrite
-                // (e.g., n sits in x1 and x1 is also the second ABI arg slot).
-                //
-                // abi_ret (x0) is only excluded when ret_vreg == abi_ret, because
-                // in that case the pop would overwrite the call result. When
-                // ret_vreg != abi_ret, the result Mov happens before pops, so
-                // popping abi_ret safely restores the old live value.
-                let mut excluded: std::collections::HashSet<u32> = std::collections::HashSet::new();
-                if ret.is_none_or(|rv| rv.index == abi_ret) {
-                    excluded.insert(abi_ret);
-                }
-                excluded.insert(call_scratch);
-                excluded.insert(copy_scratch);
-                // Also exclude the destination register — pop must not overwrite
-                // the call result that was moved there.
-                if let Some(rv) = ret {
-                    excluded.insert(rv.index);
-                }
-
-                let mut save_regs: Vec<u32> = caller_saved_set
-                    .intersection(&live_across)
-                    .copied()
-                    .filter(|r| !excluded.contains(r))
-                    .collect();
-                save_regs.sort(); // deterministic order
-
-                let mut new_insts: Vec<MachInst> = Vec::new();
-
-                // 0. Push caller-saved live registers.
-                // x86_64 System V ABI requires 16-byte stack alignment before `call`.
-                // After prologue (push rbp), RSP is 16-byte aligned. Each push
-                // subtracts 8 bytes, so an odd number of pushes misaligns the stack.
-                // Insert a dummy push to re-align when needed.
-                let needs_align_pad =
-                    target == super::Target::X86_64 && !save_regs.len().is_multiple_of(2);
-                if needs_align_pad {
-                    new_insts.push(MachInst::StackAlloc { bytes: 8 });
-                }
-                for &reg in &save_regs {
-                    new_insts.push(MachInst::Push { src: VReg::gp(reg) });
-                }
-
-                // 1. Build (src_phys, dst_abi) move pairs and resolve in parallel
-                let moves: Vec<(u32, u32)> = args
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| *idx < abi_args.len())
-                    .map(|(idx, vreg)| (vreg.index, abi_args[idx]))
-                    .collect();
-
-                for (src, dst) in resolve_parallel_copy(&moves, copy_scratch) {
-                    new_insts.push(MachInst::Mov {
-                        dst: VReg::gp(dst),
-                        src: VReg::gp(src),
-                    });
-                }
-
-                // 2. Load function address into scratch register
-                new_insts.push(MachInst::LoadImm {
-                    dst: VReg::gp(call_scratch),
-                    bits: addr as u64,
-                });
-
-                // 3. Indirect call
-                new_insts.push(MachInst::CallInd {
-                    target: VReg::gp(call_scratch),
-                });
-
-                // 4. Move return value from ABI return register
-                if let Some(ret_vreg) = ret {
-                    if ret_vreg.index != abi_ret {
-                        new_insts.push(MachInst::Mov {
-                            dst: ret_vreg,
-                            src: VReg::gp(abi_ret),
-                        });
-                    }
-                }
-
-                // 5. Pop caller-saved live registers (reverse order)
-                for &reg in save_regs.iter().rev() {
-                    new_insts.push(MachInst::Pop { dst: VReg::gp(reg) });
-                }
-                if needs_align_pad {
-                    new_insts.push(MachInst::StackFree { bytes: 8 });
-                }
-
-                let seq_len = new_insts.len();
-                mf.insts.splice(i..=i, new_insts);
-                i += seq_len;
-            } else {
-                i += 1;
-            }
-        } else {
-            i += 1;
+    // Pre-collect all CallRuntime data keyed by original index.
+    let mut call_sites: Vec<(usize, &'static str, Vec<VReg>, Option<VReg>, std::collections::HashSet<u32>)> = Vec::new();
+    for (orig_i, inst) in mf.insts.iter().enumerate() {
+        if let MachInst::CallRuntime { name, args, ret } = inst {
+            call_sites.push((orig_i, *name, args.clone(), *ret, live_out_per_inst[orig_i].clone()));
         }
+    }
+
+    // Process call sites in reverse order so splicing doesn't affect earlier indices.
+    for (orig_i, name, args, ret, live_across) in call_sites.into_iter().rev() {
+        let addr = match resolve(name) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Only save caller-saved regs that are live, excluding scratch and
+        // result registers.
+        let mut excluded: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        if ret.is_none_or(|rv| rv.index == abi_ret) {
+            excluded.insert(abi_ret);
+        }
+        excluded.insert(call_scratch);
+        excluded.insert(copy_scratch);
+        if let Some(rv) = ret {
+            excluded.insert(rv.index);
+        }
+
+        let mut save_regs: Vec<u32> = caller_saved_set
+            .intersection(&live_across)
+            .copied()
+            .filter(|r| !excluded.contains(r))
+            .collect();
+        save_regs.sort();
+
+        let mut new_insts: Vec<MachInst> = Vec::new();
+
+        // 0. Push caller-saved live registers.
+        let needs_align_pad =
+            target == super::Target::X86_64 && !save_regs.len().is_multiple_of(2);
+        if needs_align_pad {
+            new_insts.push(MachInst::StackAlloc { bytes: 8 });
+        }
+        for &reg in &save_regs {
+            new_insts.push(MachInst::Push { src: VReg::gp(reg) });
+        }
+
+        // 1. Build (src_phys, dst_abi) move pairs and resolve in parallel
+        let moves: Vec<(u32, u32)> = args
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx < abi_args.len())
+            .map(|(idx, vreg)| (vreg.index, abi_args[idx]))
+            .collect();
+
+        for (src, dst) in resolve_parallel_copy(&moves, copy_scratch) {
+            new_insts.push(MachInst::Mov {
+                dst: VReg::gp(dst),
+                src: VReg::gp(src),
+            });
+        }
+
+        // 2. Load function address into scratch register
+        new_insts.push(MachInst::LoadImm {
+            dst: VReg::gp(call_scratch),
+            bits: addr as u64,
+        });
+
+        // 3. Indirect call
+        new_insts.push(MachInst::CallInd {
+            target: VReg::gp(call_scratch),
+        });
+
+        // 4. Move return value from ABI return register
+        if let Some(ret_vreg) = ret {
+            if ret_vreg.index != abi_ret {
+                new_insts.push(MachInst::Mov {
+                    dst: ret_vreg,
+                    src: VReg::gp(abi_ret),
+                });
+            }
+        }
+
+        // 5. Pop caller-saved live registers (reverse order)
+        for &reg in save_regs.iter().rev() {
+            new_insts.push(MachInst::Pop { dst: VReg::gp(reg) });
+        }
+        if needs_align_pad {
+            new_insts.push(MachInst::StackFree { bytes: 8 });
+        }
+
+        mf.insts.splice(orig_i..=orig_i, new_insts);
     }
 }
 
@@ -1431,12 +1605,22 @@ fn resolve_parallel_copy(moves: &[(u32, u32)], scratch: u32) -> Vec<(u32, u32)> 
         // Save first source to scratch so its register can be overwritten.
         result.push((first_src, scratch));
 
-        // Follow the cycle chain.
+        // Follow the cycle chain, collecting moves.
+        let mut chain = Vec::new();
         let mut current = first_dst;
         while let Some(idx) = remaining.iter().position(|(s, _)| *s == current) {
             let (_, next_dst) = remaining.remove(idx);
-            result.push((current, next_dst));
+            chain.push((current, next_dst));
             current = next_dst;
+        }
+
+        // Emit chain moves in REVERSE order so each destination is written
+        // before its register is read as a source by a subsequent move.
+        // Example cycle r2→r0→r1→r2: after saving r2 to scratch,
+        // chain = [(r0,r1), (r1,r2)]. Reversed: (r1,r2) then (r0,r1).
+        // This writes r2=r1 first (r2 is free), then r1=r0 (r1 is free).
+        for &(src, dst) in chain.iter().rev() {
+            result.push((src, dst));
         }
 
         // Close the cycle: move from scratch to the first destination.

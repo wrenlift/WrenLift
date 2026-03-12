@@ -24,8 +24,10 @@ pub struct MirBuilder<'a> {
     upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
     current_block: BlockId,
     variables: HashMap<SymbolId, ValueId>,
-    break_targets: Vec<BlockId>,
-    continue_targets: Vec<BlockId>,
+    /// Break targets: (exit_block, tracked variable names for phi propagation)
+    break_targets: Vec<(BlockId, Vec<SymbolId>)>,
+    /// Continue targets: (header_block, tracked variable names for phi propagation)
+    continue_targets: Vec<(BlockId, Vec<SymbolId>)>,
     /// Field name → index mapping for the current class (None if not in a method).
     field_map: Option<HashMap<SymbolId, u16>>,
     /// Compiled closure bodies collected during lowering.
@@ -34,6 +36,8 @@ pub struct MirBuilder<'a> {
     closure_base: u32,
     /// Current method signature (for `super(args)` — uses same name as enclosing method).
     current_method_sig: Option<SymbolId>,
+    /// Bare method name without arity suffix (e.g., "new" not "new(_,_)").
+    current_method_base_name: Option<SymbolId>,
     /// Stack of shadowed variables per block scope.
     /// Each entry: (var name, previous value or None if newly introduced).
     block_shadows: Vec<Vec<(SymbolId, Option<ValueId>)>>,
@@ -64,6 +68,7 @@ impl<'a> MirBuilder<'a> {
             closures: Vec::new(),
             closure_base: 0,
             current_method_sig: None,
+            current_method_base_name: None,
             block_shadows: Vec::new(),
         }
     }
@@ -230,22 +235,26 @@ impl<'a> MirBuilder<'a> {
             }
 
             Stmt::Break => {
-                if let Some(&target) = self.break_targets.last() {
-                    self.set_terminator(Terminator::Branch {
-                        target,
-                        args: vec![],
-                    });
+                if let Some((target, tracked_vars)) = self.break_targets.last() {
+                    let target = *target;
+                    let args: Vec<ValueId> = tracked_vars
+                        .iter()
+                        .map(|name| self.variables[name])
+                        .collect();
+                    self.set_terminator(Terminator::Branch { target, args });
                     let dead = self.new_block();
                     self.switch_to(dead);
                 }
             }
 
             Stmt::Continue => {
-                if let Some(&target) = self.continue_targets.last() {
-                    self.set_terminator(Terminator::Branch {
-                        target,
-                        args: vec![],
-                    });
+                if let Some((target, tracked_vars)) = self.continue_targets.last() {
+                    let target = *target;
+                    let args: Vec<ValueId> = tracked_vars
+                        .iter()
+                        .map(|name| self.variables[name])
+                        .collect();
+                    self.set_terminator(Terminator::Branch { target, args });
                     let dead = self.new_block();
                     self.switch_to(dead);
                 }
@@ -407,6 +416,7 @@ impl<'a> MirBuilder<'a> {
 
         let mut entry_args = Vec::new();
         let mut phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
+        let tracked_names: Vec<SymbolId> = vars_snapshot.iter().map(|&(k, _)| k).collect();
 
         for &(name, initial_val) in &vars_snapshot {
             let phi = self.func.new_value();
@@ -419,6 +429,18 @@ impl<'a> MirBuilder<'a> {
             self.variables.insert(name, phi);
         }
 
+        // Also create phi params in exit_bb so break and normal exit can
+        // propagate variable values to post-loop code.
+        let mut exit_phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
+        for &(name, _) in &vars_snapshot {
+            let exit_phi = self.func.new_value();
+            self.func
+                .block_mut(exit_bb)
+                .params
+                .push((exit_phi, MirType::Value));
+            exit_phi_map.push((name, exit_phi));
+        }
+
         // Branch from current block to cond_bb with initial values
         self.set_terminator(Terminator::Branch {
             target: cond_bb,
@@ -428,18 +450,22 @@ impl<'a> MirBuilder<'a> {
         // Lower condition (uses phi values)
         self.switch_to(cond_bb);
         let cond_val = self.lower_expr(condition);
+        // Normal loop exit passes current (phi) values to exit_bb
+        let exit_args: Vec<ValueId> = phi_map.iter().map(|&(_, phi)| phi).collect();
         self.set_terminator(Terminator::CondBranch {
             condition: cond_val,
             true_target: body_bb,
             true_args: vec![],
             false_target: exit_bb,
-            false_args: vec![],
+            false_args: exit_args,
         });
 
         // Lower body (cond_bb dominates body_bb, so phi values are accessible)
         self.switch_to(body_bb);
-        self.break_targets.push(exit_bb);
-        self.continue_targets.push(cond_bb);
+        self.break_targets
+            .push((exit_bb, tracked_names.clone()));
+        self.continue_targets
+            .push((cond_bb, tracked_names));
         self.lower_stmt(body);
         self.break_targets.pop();
         self.continue_targets.pop();
@@ -460,12 +486,16 @@ impl<'a> MirBuilder<'a> {
             });
         }
 
-        // Restore variables to phi values for post-loop code
-        for &(name, phi) in &phi_map {
-            self.variables.insert(name, phi);
+        // Use exit_bb phi values for post-loop code (these receive values
+        // from both the normal condition-false exit and any break statements).
+        for &(name, exit_phi) in &exit_phi_map {
+            self.variables.insert(name, exit_phi);
         }
 
         self.switch_to(exit_bb);
+        // Emit a null so the while-statement "evaluates" to null (not a
+        // variable phi).  Ensures closure implicit-return picks up null.
+        self.emit(Instruction::ConstNull);
     }
 
     fn lower_for(
@@ -492,23 +522,59 @@ impl<'a> MirBuilder<'a> {
         let body_bb = self.new_block();
         let exit_bb = self.new_block();
 
+        // Create phi block params in cond_bb for the iterator state AND all
+        // live variables, so mutations in the body propagate through the
+        // back-edge (same approach as lower_while).
+        let vars_snapshot: Vec<(SymbolId, ValueId)> =
+            self.variables.iter().map(|(&k, &v)| (k, v)).collect();
+        let tracked_names: Vec<SymbolId> = vars_snapshot.iter().map(|&(k, _)| k).collect();
+
+        // First param: iterator state
         let iter_param = self.func.new_value();
         self.func
             .block_mut(cond_bb)
             .params
             .push((iter_param, MirType::Value));
 
+        // Additional params: one per live variable
+        let mut entry_args = vec![iter_val];
+        let mut phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
+
+        for &(name, initial_val) in &vars_snapshot {
+            let phi = self.func.new_value();
+            self.func
+                .block_mut(cond_bb)
+                .params
+                .push((phi, MirType::Value));
+            entry_args.push(initial_val);
+            phi_map.push((name, phi));
+            self.variables.insert(name, phi);
+        }
+
+        // Create phi params in exit_bb for variable propagation from break + normal exit
+        let mut exit_phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
+        for &(name, _) in &vars_snapshot {
+            let exit_phi = self.func.new_value();
+            self.func
+                .block_mut(exit_bb)
+                .params
+                .push((exit_phi, MirType::Value));
+            exit_phi_map.push((name, exit_phi));
+        }
+
         self.set_terminator(Terminator::Branch {
             target: cond_bb,
-            args: vec![iter_val],
+            args: entry_args,
         });
 
         self.switch_to(cond_bb);
         let is_falsy = self.emit(Instruction::Not(iter_param));
+        // Normal exit passes current phi values to exit_bb
+        let exit_args: Vec<ValueId> = phi_map.iter().map(|&(_, phi)| phi).collect();
         self.set_terminator(Terminator::CondBranch {
             condition: is_falsy,
             true_target: exit_bb,
-            true_args: vec![],
+            true_args: exit_args,
             false_target: body_bb,
             false_args: vec![],
         });
@@ -521,8 +587,10 @@ impl<'a> MirBuilder<'a> {
         });
         self.variables.insert(variable.0, elem_val);
 
-        self.break_targets.push(exit_bb);
-        self.continue_targets.push(cond_bb);
+        self.break_targets
+            .push((exit_bb, tracked_names.clone()));
+        self.continue_targets
+            .push((cond_bb, tracked_names));
         self.lower_stmt(body);
         self.break_targets.pop();
         self.continue_targets.pop();
@@ -533,17 +601,31 @@ impl<'a> MirBuilder<'a> {
             args: vec![iter_param],
         });
 
+        // Back-edge: pass iterator state + current (possibly mutated) variable values
+        let mut backedge_args = vec![next_iter];
+        for &(name, _) in &phi_map {
+            backedge_args.push(self.variables[&name]);
+        }
+
         if matches!(
             self.func.block(self.current_block).terminator,
             Terminator::Unreachable
         ) {
             self.set_terminator(Terminator::Branch {
                 target: cond_bb,
-                args: vec![next_iter],
+                args: backedge_args,
             });
         }
 
+        // Use exit_bb phi values for post-loop code
+        for &(name, exit_phi) in &exit_phi_map {
+            self.variables.insert(name, exit_phi);
+        }
+
         self.switch_to(exit_bb);
+        // Emit a null so the for-statement "evaluates" to null (not a
+        // variable phi).  Ensures closure implicit-return picks up null.
+        self.emit(Instruction::ConstNull);
     }
 
     // -- Expression lowering ------------------------------------------------
@@ -578,6 +660,20 @@ impl<'a> MirBuilder<'a> {
                     match resolved {
                         ResolvedName::ModuleVar(idx) => self.emit(Instruction::GetModuleVar(*idx)),
                         ResolvedName::Upvalue(idx) => self.emit(Instruction::GetUpvalue(*idx)),
+                        ResolvedName::ImplicitThis(method_name) => {
+                            // Bare identifier in a method → implicit `this.name` getter.
+                            let this_sym = self.intern("this");
+                            let recv = self
+                                .variables
+                                .get(&this_sym)
+                                .copied()
+                                .unwrap_or_else(|| self.emit(Instruction::ConstNull));
+                            self.emit(Instruction::Call {
+                                receiver: recv,
+                                method: *method_name,
+                                args: vec![],
+                            })
+                        }
                         ResolvedName::Local(_) => {
                             // Local should have been in variables map; fallback
                             self.emit(Instruction::ConstNull)
@@ -736,9 +832,15 @@ impl<'a> MirBuilder<'a> {
                     // super.method(args) or super.getter
                     self.method_sig_with_parens(m.0, args.len(), *has_parens)
                 } else {
-                    // super(args) — call same-named constructor/method on super
-                    self.current_method_sig
-                        .unwrap_or_else(|| self.intern("init"))
+                    // super(args) — call same-named constructor/method on super.
+                    // Use the base name with the CALLER's arg count, not the
+                    // current method's full signature (which may have different arity).
+                    if let Some(base) = self.current_method_base_name {
+                        self.method_sig_with_parens(base, args.len(), *has_parens)
+                    } else {
+                        self.current_method_sig
+                            .unwrap_or_else(|| self.intern("init"))
+                    }
                 };
                 self.emit(Instruction::SuperCall {
                     method: method_sym,
@@ -936,6 +1038,25 @@ impl<'a> MirBuilder<'a> {
                         }
                         ResolvedName::Upvalue(idx) => {
                             self.emit(Instruction::SetUpvalue(*idx, value));
+                        }
+                        ResolvedName::ImplicitThis(method_name) => {
+                            // Bare identifier assignment in a method → `this.name=(value)`
+                            let this_sym = self.intern("this");
+                            let recv = self
+                                .variables
+                                .get(&this_sym)
+                                .copied()
+                                .unwrap_or_else(|| self.emit(Instruction::ConstNull));
+                            let setter_name = format!(
+                                "{}=(_)",
+                                self.interner.resolve(*method_name)
+                            );
+                            let setter_sym = self.intern(&setter_name);
+                            self.emit(Instruction::Call {
+                                receiver: recv,
+                                method: setter_sym,
+                                args: vec![value],
+                            });
                         }
                         _ => {
                             self.variables.insert(*name, value);
@@ -1144,6 +1265,17 @@ fn wren_signature(sig: &MethodSig, interner: &Interner) -> String {
 }
 
 /// Get the parameter list from a MethodSig for compiling the body.
+/// Extract the bare method name (without arity) from a method signature.
+fn method_base_name(sig: &MethodSig) -> Option<SymbolId> {
+    match sig {
+        MethodSig::Named { name, .. }
+        | MethodSig::Construct { name, .. }
+        | MethodSig::Getter(name)
+        | MethodSig::Setter { name, .. } => Some(*name),
+        _ => None,
+    }
+}
+
 fn method_params(sig: &MethodSig) -> Vec<&Spanned<SymbolId>> {
     match sig {
         MethodSig::Named { params, .. }
@@ -1178,11 +1310,21 @@ pub fn lower_module(
     let (top_level, closures) = builder.build_module(module);
 
     // Compile class definitions
+    // Track each class's total field count (own + inherited) so subclasses can offset their field indices.
+    let mut class_field_counts: HashMap<SymbolId, u16> = HashMap::new();
     let mut classes = Vec::new();
     let mut all_closures = closures;
     for stmt in module {
         if let Stmt::Class(decl) = &stmt.0 {
-            let (class_mir, method_closures) = compile_class(decl, interner, resolve);
+            let inherited_fields = decl
+                .superclass
+                .as_ref()
+                .and_then(|s| class_field_counts.get(&s.0).copied())
+                .unwrap_or(0);
+            let (class_mir, method_closures) =
+                compile_class(decl, interner, resolve, inherited_fields, all_closures.len() as u32);
+            let total_fields = class_mir.num_fields + inherited_fields;
+            class_field_counts.insert(decl.name.0, total_fields);
             classes.push(class_mir);
             all_closures.extend(method_closures);
         }
@@ -1200,6 +1342,8 @@ fn compile_class(
     decl: &ClassDecl,
     interner: &mut Interner,
     resolve: &ResolveResult,
+    inherited_field_offset: u16,
+    closure_base_offset: u32,
 ) -> (ClassMir, Vec<MirFunction>) {
     let mut methods = Vec::new();
     let mut field_names: Vec<SymbolId> = Vec::new();
@@ -1235,15 +1379,18 @@ fn compile_class(
             &resolve.module_vars,
             &resolve.upvalues,
         );
+        builder.closure_base = closure_base_offset + all_closures.len() as u32;
 
-        // Set field map for this class
+        // Set field map for this class (offset by inherited fields so subclass fields
+        // don't collide with superclass field slots)
         let fmap: HashMap<SymbolId, u16> = field_names
             .iter()
             .enumerate()
-            .map(|(i, &sym)| (sym, i as u16))
+            .map(|(i, &sym)| (sym, i as u16 + inherited_field_offset))
             .collect();
         builder.field_map = Some(fmap);
         builder.current_method_sig = Some(method_name);
+        builder.current_method_base_name = method_base_name(&method.signature);
 
         // Bind 'this' as first block param (param index 0)
         let this_sym = builder.intern("this");

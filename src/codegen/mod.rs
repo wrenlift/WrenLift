@@ -1417,6 +1417,7 @@ pub fn compile_function_with_interner(
             fixup_sentinels(&mut mach, target);
             // Insert callee-saved register saves/restores after regalloc.
             insert_callee_saves(&mut mach, target);
+
             // Link runtime calls AFTER regalloc + fixup so all vregs are
             // physical registers. Uses parallel copy to avoid clobbering.
             runtime_fns::link_runtime_calls(&mut mach, target);

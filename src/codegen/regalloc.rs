@@ -53,8 +53,9 @@ pub struct RegAllocResult {
 
 /// Build live intervals by scanning instructions forward.
 pub fn compute_live_intervals(func: &MachFunc) -> Vec<LiveInterval> {
-    // Track first def and last use for each vreg.
+    // Track first def, first use, and last use for each vreg.
     let mut first_def: HashMap<VReg, u32> = HashMap::new();
+    let mut first_use: HashMap<VReg, u32> = HashMap::new();
     let mut last_use: HashMap<VReg, u32> = HashMap::new();
 
     for (i, inst) in func.insts.iter().enumerate() {
@@ -69,15 +70,37 @@ pub fn compute_live_intervals(func: &MachFunc) -> Vec<LiveInterval> {
 
         // Record uses.
         for u in inst.uses() {
+            first_use.entry(u).or_insert(idx);
             last_use.insert(u, idx);
         }
     }
 
+    let func_end = func.insts.len() as u32;
+
     let mut intervals: Vec<LiveInterval> = first_def
         .into_iter()
-        .map(|(vreg, start)| {
-            let end = last_use.get(&vreg).copied().unwrap_or(start) + 1;
-            LiveInterval { vreg, start, end }
+        .map(|(vreg, def_pos)| {
+            let use_end = last_use.get(&vreg).copied().unwrap_or(def_pos) + 1;
+            let use_start = first_use.get(&vreg).copied().unwrap_or(def_pos);
+
+            // If a vreg is used before its first definition (in linear order),
+            // it's a loop-carried value (e.g., a block parameter in a loop
+            // header whose definition is at a back-edge ParallelCopy placed
+            // later in the instruction stream). Extend the interval to cover
+            // the full function so the regalloc keeps it live across the loop.
+            if use_start < def_pos {
+                LiveInterval {
+                    vreg,
+                    start: use_start,
+                    end: func_end.max(use_end),
+                }
+            } else {
+                LiveInterval {
+                    vreg,
+                    start: def_pos,
+                    end: use_end,
+                }
+            }
         })
         .collect();
 
@@ -129,6 +152,13 @@ pub struct TargetRegs {
     pub gp_allocatable: Vec<PhysReg>,
     /// FP/Vec registers available for allocation (excludes scratch).
     pub fp_allocatable: Vec<PhysReg>,
+    /// Caller-saved registers (clobbered by any function call).
+    /// Values in these registers that are live across a call must be spilled.
+    pub caller_saved: Vec<PhysReg>,
+    /// Bytes to reserve in the frame for target-specific saved registers.
+    /// AArch64: 16 (stp x29/x30 saved at bottom of frame).
+    /// x86_64: 0 (push rbp is handled outside frame_size).
+    pub frame_reserved: u32,
 }
 
 /// Build the default aarch64 allocatable set.
@@ -137,9 +167,18 @@ pub fn aarch64_target_regs() -> TargetRegs {
     let gp: Vec<PhysReg> = (0..16).map(PhysReg::gp).collect();
     // d0-d15 allocatable (d16-d31 exist but we keep it simple; d16/d17 scratch)
     let fp: Vec<PhysReg> = (0..16).map(PhysReg::fp).collect();
+    // On AArch64: x0-x17 are caller-saved; we allocate x0-x15 so all are caller-saved.
+    // d0-d7 are caller-saved; d8-d15 are callee-saved.
+    let cs_gp: Vec<PhysReg> = (0u8..16).map(PhysReg::gp).collect();
+    let cs_fp: Vec<PhysReg> = (0u8..8).map(PhysReg::fp).collect();
     TargetRegs {
         gp_allocatable: gp,
         fp_allocatable: fp,
+        caller_saved: cs_gp.into_iter().chain(cs_fp).collect(),
+        // AArch64 prologue does `stp x29, x30, [sp, -total]!; add x29, sp, total`
+        // so x29 points to old_sp. Spill slots use negative offsets from x29
+        // and must fit above the 16-byte saved-pair area at the bottom of the frame.
+        frame_reserved: 16,
     }
 }
 
@@ -152,9 +191,18 @@ pub fn x86_64_target_regs() -> TargetRegs {
         .collect();
     // XMM0-XMM14 (XMM15 is scratch)
     let fp: Vec<PhysReg> = (0..15).map(PhysReg::fp).collect();
+    // x86_64 System V caller-saved GP: rax(0), rcx(1), rdx(2), rsi(6), rdi(7), r8(8), r9(9), r10(10)
+    // All XMM registers are caller-saved in System V ABI.
+    let cs_gp: Vec<PhysReg> = [0u8, 1, 2, 6, 7, 8, 9, 10]
+        .iter()
+        .map(|&e| PhysReg::gp(e))
+        .collect();
+    let cs_fp: Vec<PhysReg> = (0u8..15).map(PhysReg::fp).collect();
     TargetRegs {
         gp_allocatable: gp,
         fp_allocatable: fp,
+        caller_saved: cs_gp.into_iter().chain(cs_fp).collect(),
+        frame_reserved: 0, // x86_64: push rbp is outside frame_size
     }
 }
 
@@ -257,12 +305,14 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
 
 /// Rewrite a `MachFunc` in-place, replacing virtual register indices with
 /// physical register encodings. Inserts spill stores and reload loads as needed.
-pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult) {
+pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_reserved: u32) {
     let mut new_insts: Vec<MachInst> = Vec::with_capacity(func.insts.len() * 2);
 
-    // Update frame size to include spill slots (aligned to 16 bytes).
+    // Update frame size to include spill slots and any target-reserved bytes.
+    // `frame_reserved` is 16 on AArch64 (space for stp x29/x30 at frame bottom)
+    // so that negative spill offsets from x29 land within the frame.
     let spill_bytes = result.num_spill_slots * 8;
-    let aligned = (func.frame_size + spill_bytes + 15) & !15;
+    let aligned = (func.frame_size + frame_reserved + spill_bytes + 15) & !15;
     func.frame_size = aligned;
 
     for inst in &func.insts {
@@ -771,21 +821,97 @@ fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachI
 }
 
 // ---------------------------------------------------------------------------
+// Call-boundary spilling
+// ---------------------------------------------------------------------------
+
+/// Post-allocation pass: any vreg whose live interval spans a call instruction
+/// AND is assigned to a caller-saved physical register must be spilled.
+/// Without this, the call would clobber the register and corrupt the live value.
+///
+/// A vreg at interval [s, e) with `e = last_use + 1` is spilled when:
+///   - It is defined BEFORE the call: `s < call_pos`
+///   - It is used AFTER the call: `e > call_pos + 1` (equivalently, last_use > call_pos)
+///
+/// Values whose last use IS the call (e.g., call arguments) must NOT be spilled
+/// here — they are consumed by the call itself and `link_runtime_calls` handles
+/// placing them in the correct ABI registers. Spilling them would cause multiple
+/// args to share the same scratch register (x16), corrupting all but the last.
+pub fn respill_caller_saved_across_calls(
+    func: &MachFunc,
+    result: &mut RegAllocResult,
+    caller_saved: &[PhysReg],
+) {
+    // Collect call instruction positions.
+    let call_positions: Vec<u32> = func
+        .insts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, inst)| {
+            if matches!(inst, MachInst::CallInd { .. } | MachInst::CallRuntime { .. }) {
+                Some(i as u32)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if call_positions.is_empty() {
+        return;
+    }
+
+    // Build a quick-lookup set: (class, hw_enc) for caller-saved registers.
+    let cs_set: std::collections::HashSet<(RegClass, u8)> = caller_saved
+        .iter()
+        .map(|r| (r.class, r.hw_enc))
+        .collect();
+
+    // For each interval assigned to a caller-saved register, check if any
+    // call falls strictly inside the interval.
+    let intervals = result.intervals.clone();
+    for iv in &intervals {
+        if let Some(&Location::Reg(phys)) = result.assignments.get(&iv.vreg) {
+            if !cs_set.contains(&(phys.class, phys.hw_enc)) {
+                continue;
+            }
+            // Value must be defined BEFORE the call AND used AFTER it.
+            // - cp > iv.start: call is after the vreg's definition
+            // - iv.end > cp + 1: last_use (= iv.end - 1) > cp, i.e. used after call
+            // Values whose last use IS the call (args) have iv.end == cp+1 → not spilled.
+            // Values defined AT the call (return value) have iv.start == cp → not spilled.
+            // Values that are the RETURN VALUE of the call are re-defined by the call
+            // itself, so even though their interval spans it, they don't need preservation.
+            let spans = call_positions.iter().any(|&cp| {
+                if cp <= iv.start || iv.end <= cp + 1 {
+                    return false;
+                }
+                // Don't spill if the call at `cp` is what defines this vreg (return value).
+                !func.insts[cp as usize].defs().contains(&iv.vreg)
+            });
+            if spans {
+                let slot = -((result.num_spill_slots as i32 + 1) * 8);
+                result.num_spill_slots += 1;
+                result.assignments.insert(iv.vreg, Location::Spill(slot));
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Convenience: full pipeline
 // ---------------------------------------------------------------------------
 
 /// Run the full register allocation pipeline on a MachFunc.
 ///
 /// 1. Resolve parallel copies
-/// 2. Compute live intervals
-/// 3. Linear scan allocation
+/// 2. Compute live intervals + linear scan allocation
+/// 3. Respill caller-saved registers that are live across calls
 /// 4. Rewrite VRegs to PhysRegs with spill/reload insertion
 pub fn allocate_registers(func: &mut MachFunc, target: &TargetRegs) -> RegAllocResult {
     // Parallel copies should already be resolved, but be safe.
     super::resolve_parallel_copies(func);
 
     let result = linear_scan(func, target);
-    apply_allocation(func, &result);
+    apply_allocation(func, &result, target.frame_reserved);
     result
 }
 
@@ -1092,7 +1218,7 @@ mod tests {
         });
         let target = x86_64_target_regs();
         let result = linear_scan(&mf, &target);
-        apply_allocation(&mut mf, &result);
+        apply_allocation(&mut mf, &result, 0);
 
         // After rewrite, the first inst's dst should be a physical reg encoding.
         if let MachInst::LoadImm { dst, .. } = &mf.insts[0] {
@@ -1127,7 +1253,7 @@ mod tests {
 
         let target = x86_64_target_regs();
         let result = linear_scan(&mf, &target);
-        apply_allocation(&mut mf, &result);
+        apply_allocation(&mut mf, &result, 0);
 
         // Should have spill stores (Str) or reloads (Ldr) inserted.
         let has_spill_ops = mf

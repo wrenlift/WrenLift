@@ -2094,3 +2094,56 @@ System.writeObject_(42)
 "#;
     assert_output(source, "42");
 }
+
+// ---------------------------------------------------------------------------
+// DeltaBlue benchmark
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_delta_blue() {
+    let source = std::fs::read_to_string("bench/delta_blue.wren")
+        .expect("bench/delta_blue.wren must exist");
+
+    // Run with interpreter only (no JIT) to verify the program is correct
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Interpreter,
+        ..VMConfig::default()
+    });
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret("main", &source);
+    let output = vm.take_output();
+    eprintln!("delta_blue interpreter output: {:?}", output.trim_end());
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "delta_blue interpreter failed: {:?}\nOutput:\n{}",
+        result,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "delta_blue interpreter has projection failures:\n{}",
+        output
+    );
+    assert!(
+        output.contains("14065400"),
+        "delta_blue interpreter wrong total:\n{}",
+        output
+    );
+
+    // Run with default JIT (skip known buggy non-leaf funcs)
+    // No skip — run with JIT normally (IC fast path disabled in vm_interp.rs)
+    let (result2, output2, elapsed2) = run(&source);
+    let t2 = fmt_elapsed(elapsed2);
+    eprintln!("delta_blue JIT output: {:?} ({})", output2.trim_end(), t2);
+    assert!(
+        matches!(result2, InterpretResult::Success),
+        "delta_blue JIT failed: {:?}\nOutput:\n{}",
+        result2,
+        output2
+    );
+    assert!(
+        !output2.contains("failed"),
+        "delta_blue JIT has projection failures:\n{}",
+        output2
+    );
+}
