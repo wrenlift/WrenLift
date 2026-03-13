@@ -1893,7 +1893,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     unsafe { (*fiber).mir_frames.pop() };
                     // Recycle the callee's register file
                     values.clear();
-                    vm.register_pool.push(values);
+                    if vm.register_pool.len() < 128 {
+                        vm.register_pool.push(values);
+                    }
                     if unsafe { (*fiber).mir_frames.is_empty() } {
                         unsafe { (*fiber).state = FiberState::Done };
                         let caller = unsafe { (*fiber).caller };
@@ -1930,7 +1932,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     unsafe { (*fiber).mir_frames.pop() };
                     // Recycle the callee's register file
                     values.clear();
-                    vm.register_pool.push(values);
+                    if vm.register_pool.len() < 128 {
+                        vm.register_pool.push(values);
+                    }
                     if unsafe { (*fiber).mir_frames.is_empty() } {
                         unsafe { (*fiber).state = FiberState::Done };
                         let caller = unsafe { (*fiber).caller };
@@ -2155,58 +2159,55 @@ fn dispatch_closure_bc(
         };
 
         let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-        // Only dispatch leaf JIT functions (pure field access, arithmetic).
-        // Non-leaf functions (containing Call, GetModuleVar, etc.) require
-        // JIT context + GC root setup that currently causes hangs and wrong
-        // results, so they fall through to the interpreter path.
         if !fn_ptr_raw.is_null() && is_leaf {
             let jit_depth = crate::codegen::runtime_fns::jit_depth();
             if jit_depth < crate::codegen::runtime_fns::MAX_JIT_DEPTH {
+                // Save caller's frame for GC tracing.
+                unsafe {
+                    let frame = (*fiber).mir_frames.last_mut().unwrap();
+                    frame.pc = pc;
+                    frame.values = values;
+                }
+
+                // Set up base JitContext (module_vars, vm, module_name).
+                let vm_ptr = vm as *mut VM as *mut u8;
+                let mod_name_bytes = module_name.as_bytes();
+                let (mv_ptr, mv_count) = vm
+                    .engine
+                    .modules
+                    .get(module_name.as_str())
+                    .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+                    .unwrap_or((std::ptr::null_mut(), 0));
+                crate::codegen::runtime_fns::set_jit_context(
+                    crate::codegen::runtime_fns::JitContext {
+                        module_vars: mv_ptr,
+                        module_var_count: mv_count,
+                        vm: vm_ptr,
+                        module_name: mod_name_bytes.as_ptr(),
+                        module_name_len: mod_name_bytes.len() as u32,
+                        closure: closure_ptr as *mut u8,
+                        defining_class: defining_class
+                            .map(|p| p as *mut u8)
+                            .unwrap_or(std::ptr::null_mut()),
+                    },
+                );
+
+                // Leaf: direct JIT call (no runtime calls, no deopt possible).
                 crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-
-                // Call native code with args as NaN-boxed u64 values.
-                let result_bits = unsafe {
-                    match arg_vals.len() {
-                        0 => {
-                            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr_raw);
-                            f()
-                        }
-                        1 => {
-                            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr_raw);
-                            f(arg_vals[0].to_bits())
-                        }
-                        2 => {
-                            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr_raw);
-                            f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
-                        }
-                        3 => {
-                            let f: extern "C" fn(u64, u64, u64) -> u64 =
-                                std::mem::transmute(fn_ptr_raw);
-                            f(
-                                arg_vals[0].to_bits(),
-                                arg_vals[1].to_bits(),
-                                arg_vals[2].to_bits(),
-                            )
-                        }
-                        _ => {
-                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                                std::mem::transmute(fn_ptr_raw);
-                            f(
-                                arg_vals[0].to_bits(),
-                                arg_vals[1].to_bits(),
-                                arg_vals[2].to_bits(),
-                                arg_vals[3].to_bits(),
-                            )
-                        }
-                    }
-                };
-
+                let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
                 crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+
+                // Take values back from frame (GC may have moved objects).
+                let mut values = unsafe {
+                    (*fiber)
+                        .mir_frames
+                        .last_mut()
+                        .map(|f| std::mem::take(&mut f.values))
+                        .unwrap_or_default()
+                };
                 let result_val = Value::from_bits(result_bits);
 
-                // Store result in caller's return_dst register
                 set_reg(&mut values, return_dst.0 as u16, result_val);
-                // Save caller frame state
                 unsafe {
                     if let Some(frame) = (*fiber).mir_frames.last_mut() {
                         frame.pc = pc;
@@ -2215,7 +2216,6 @@ fn dispatch_closure_bc(
                 }
                 return Ok(());
             }
-            // Depth exceeded — fall through to interpreter path below.
         }
     }
 
@@ -2285,6 +2285,33 @@ fn dispatch_closure_bc(
     }
 
     Ok(())
+}
+
+/// Transmute and call a JIT function pointer with the given args (max 4).
+#[inline(always)]
+unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    match args.len() {
+        0 => {
+            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+            f()
+        }
+        1 => {
+            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits())
+        }
+        2 => {
+            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits(), args[1].to_bits())
+        }
+        3 => {
+            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+        }
+        _ => {
+            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits())
+        }
+    }
 }
 
 /// Resume a caller fiber with a value.

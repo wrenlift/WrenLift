@@ -175,6 +175,19 @@ fn insert_speculative_guards(mir: &mut MirFunction) {
 /// so they don't need GC root pushing or JIT context setup.
 fn is_mir_leaf(mir: &MirFunction) -> bool {
     use crate::mir::Instruction;
+    // A function with non-this BlockParams (idx > 0) will get speculative
+    // GuardNum instructions during JIT compilation. Guard failures deopt to
+    // wren_deopt_N (a runtime call), so such functions are NOT leaf-safe
+    // for inline dispatch without JitContext.
+    if !mir.blocks.is_empty() {
+        for (_, inst) in &mir.blocks[0].instructions {
+            match inst {
+                Instruction::BlockParam(idx) if *idx > 0 => return false,
+                Instruction::BlockParam(_) => {}
+                _ => break,
+            }
+        }
+    }
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
@@ -192,7 +205,9 @@ fn is_mir_leaf(mir: &MirFunction) -> bool {
                 | Instruction::GetModuleVar(_)
                 | Instruction::SetModuleVar(_, _)
                 | Instruction::GetStaticField(_)
-                | Instruction::SetStaticField(_, _) => return false,
+                | Instruction::SetStaticField(_, _)
+                | Instruction::GuardNum(_)
+                | Instruction::GuardBool(_) => return false,
                 // Everything else is inline (field access, arithmetic, guards, etc.)
                 _ => {}
             }

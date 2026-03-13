@@ -1422,6 +1422,16 @@ pub fn compile_function_with_interner(
             // physical registers. Uses parallel copy to avoid clobbering.
             runtime_fns::link_runtime_calls(&mut mach, target);
 
+            // Debug: dump machine instructions after link_runtime_calls
+            if std::env::var("WLIFT_MACH_DUMP").is_ok() {
+                let pretty = interner.resolve(mir.name);
+                eprintln!("=== MachInst dump for {} ({}) ===", pretty, mach.name);
+                for (i, inst) in mach.insts.iter().enumerate() {
+                    eprintln!("  [{:4}] {:?}", i, inst);
+                }
+                eprintln!("=== end ===");
+            }
+
             match target {
                 Target::X86_64 => {
                     let emitted = x86_64::emit(&mach)?;
@@ -2291,8 +2301,15 @@ impl<'a> LowerCtx<'a> {
             Instruction::MakeList(elems) => {
                 let dst = self.vreg_for(dst_val);
                 let args: Vec<VReg> = elems.iter().map(|e| self.vreg_for(*e)).collect();
+                let name = match elems.len() {
+                    0 => "wren_make_list",
+                    1 => "wren_make_list_1",
+                    2 => "wren_make_list_2",
+                    3 => "wren_make_list_3",
+                    _ => "wren_make_list_4",
+                };
                 self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_make_list",
+                    name,
                     args,
                     ret: Some(dst),
                 });

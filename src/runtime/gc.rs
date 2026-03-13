@@ -983,6 +983,9 @@ impl Drop for Gc {
             }
         }
         self.nursery_objects.clear();
+        if self.nursery_objects.capacity() > 4096 {
+            self.nursery_objects.shrink_to(4096);
+        }
 
         // Drop old gen objects (Box-allocated).
         let mut current = self.old_objects;

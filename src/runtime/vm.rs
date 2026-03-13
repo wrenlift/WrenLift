@@ -1920,12 +1920,26 @@ impl VM {
         // Root the saved fiber so GC can trace it during re-entrant interpreter
         // calls (it holds roots from the outer native/interpreter frame).
         // We can't use fiber.caller because that has semantic meaning (fiber resumption).
-        if !saved_fiber.is_null() {
+        let jit_root_idx = if !saved_fiber.is_null() {
+            let idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
             crate::codegen::runtime_fns::push_jit_root(Value::object(saved_fiber as *mut u8));
-        }
+            Some(idx)
+        } else {
+            None
+        };
         self.fiber = temp_fiber;
         let result = super::vm_interp::run_fiber(self);
-        self.fiber = saved_fiber;
+        // Restore fiber — read from JIT roots in case GC forwarded the pointer.
+        if let Some(idx) = jit_root_idx {
+            let forwarded = crate::codegen::runtime_fns::jit_root_at(idx);
+            self.fiber = forwarded
+                .as_object()
+                .map(|p| p as *mut super::object::ObjFiber)
+                .unwrap_or(saved_fiber);
+            crate::codegen::runtime_fns::jit_roots_restore_len(idx);
+        } else {
+            self.fiber = saved_fiber;
+        }
 
         result.ok()
     }
@@ -2024,14 +2038,28 @@ impl VM {
         }
 
         let saved_fiber = self.fiber;
-        if !saved_fiber.is_null() {
+        let jit_root_idx = if !saved_fiber.is_null() {
+            let idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
             crate::codegen::runtime_fns::push_jit_root(Value::object(
                 saved_fiber as *mut u8,
             ));
-        }
+            Some(idx)
+        } else {
+            None
+        };
         self.fiber = temp_fiber;
         let result = super::vm_interp::run_fiber(self);
-        self.fiber = saved_fiber;
+        // Restore fiber — read from JIT roots in case GC forwarded the pointer.
+        if let Some(idx) = jit_root_idx {
+            let forwarded = crate::codegen::runtime_fns::jit_root_at(idx);
+            self.fiber = forwarded
+                .as_object()
+                .map(|p| p as *mut super::object::ObjFiber)
+                .unwrap_or(saved_fiber);
+            crate::codegen::runtime_fns::jit_roots_restore_len(idx);
+        } else {
+            self.fiber = saved_fiber;
+        }
 
         // The constructor body returns `this` (the instance). If it returns null
         // or errors, fall back to live_instance.

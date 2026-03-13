@@ -107,7 +107,7 @@ pub fn set_jit_context(ctx: JitContext) {
 
 /// Read the current JIT context.
 #[inline(always)]
-fn read_jit_ctx() -> JitContext {
+pub fn read_jit_ctx() -> JitContext {
     JIT_CTX.with(|c| c.get())
 }
 
@@ -145,7 +145,14 @@ pub fn set_jit_roots(roots: Vec<Value>) {
 /// Clear JIT roots (called after native code returns to interpreter).
 #[inline(always)]
 pub fn clear_jit_roots() {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).clear() });
+    JIT_ROOTS_STORE.with(|r| unsafe {
+        let v = &mut *r.get();
+        v.clear();
+        // Prevent capacity from growing unboundedly after root spikes.
+        if v.capacity() > 256 {
+            v.shrink_to(256);
+        }
+    });
 }
 
 /// Get current JIT roots count (for save/restore around re-entrant calls).
@@ -298,7 +305,7 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
 }
 
 /// Try to call a closure via native code if it's compiled; fall back to interpreter.
-fn call_closure_jit_or_sync(
+pub fn call_closure_jit_or_sync(
     vm: &mut crate::runtime::vm::VM,
     closure_ptr: *mut ObjClosure,
     args: &[Value],
@@ -321,11 +328,15 @@ fn call_closure_jit_or_sync(
     // Install completed compilations so we can dispatch natively.
     vm.engine.poll_compilations();
     if args.len() <= 4 {
-        let _func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+        let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
 
-        // DISABLED: JIT-to-JIT dispatch causes hangs — force interpreter fallback.
-        // All nested calls go through call_closure_sync instead.
-        let native_fn_ptr: Option<*const u8> = None;
+        let native_fn_ptr: Option<*const u8> = vm
+            .engine
+            .jit_code
+            .get(func_id.0 as usize)
+            .copied()
+            .filter(|p| !p.is_null())
+            .map(|p| p as *const u8);
 
         if let Some(fn_ptr) = native_fn_ptr {
             // Guard: check native recursion depth to prevent stack overflow.
@@ -579,7 +590,17 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
         return Value::null().to_bits();
     }
 
-    let method_entry = unsafe { (*superclass).find_method(method_sym).cloned() };
+    // Try direct lookup first, then fall back to "static:" prefix.
+    // Constructors are registered under "static:new(_)" etc., but super calls
+    // use the bare method symbol "new(_)".
+    let method_entry = unsafe {
+        (*superclass).find_method(method_sym).cloned().or_else(|| {
+            let method_name = vm.interner.resolve(method_sym);
+            let static_name = format!("static:{}", method_name);
+            let static_sym = vm.interner.intern(&static_name);
+            (*superclass).find_method(static_sym).cloned()
+        })
+    };
     match method_entry {
         Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
         Some(Method::Closure(closure_ptr)) => {
@@ -645,7 +666,8 @@ pub extern "C" fn wren_super_call_4(method: u64, this: u64, a0: u64, a1: u64, a2
 }
 
 /// Allocate a new empty list.
-pub extern "C" fn wren_make_list() -> u64 {
+/// Create a list and populate it with the given elements.
+fn make_list_impl(elements: &[u64]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
@@ -655,10 +677,33 @@ pub extern "C" fn wren_make_list() -> u64 {
     let list_ptr = vm.gc.alloc_list();
     unsafe {
         (*list_ptr).header.class = vm.list_class;
+        for &elem in elements {
+            (*list_ptr).add(Value::from_bits(elem));
+        }
     }
     let val = Value::object(list_ptr as *mut u8);
     push_jit_root(val);
     val.to_bits()
+}
+
+pub extern "C" fn wren_make_list() -> u64 {
+    make_list_impl(&[])
+}
+
+pub extern "C" fn wren_make_list_1(a0: u64) -> u64 {
+    make_list_impl(&[a0])
+}
+
+pub extern "C" fn wren_make_list_2(a0: u64, a1: u64) -> u64 {
+    make_list_impl(&[a0, a1])
+}
+
+pub extern "C" fn wren_make_list_3(a0: u64, a1: u64, a2: u64) -> u64 {
+    make_list_impl(&[a0, a1, a2])
+}
+
+pub extern "C" fn wren_make_list_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    make_list_impl(&[a0, a1, a2, a3])
 }
 
 /// Allocate a new empty map.
@@ -1040,8 +1085,13 @@ fn deopt_impl(args: &[u64]) -> u64 {
     }
 
     // Re-execute via interpreter with the original args.
+    let defining_class = if ctx.defining_class.is_null() {
+        None
+    } else {
+        Some(ctx.defining_class as *mut crate::runtime::object::ObjClass)
+    };
     let values: Vec<Value> = args.iter().map(|&a| Value::from_bits(a)).collect();
-    vm.call_closure_sync(closure_ptr, &values, None)
+    vm.call_closure_sync(closure_ptr, &values, defining_class)
         .map(|v| v.to_bits())
         .unwrap_or(Value::null().to_bits())
 }
@@ -1251,6 +1301,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_super_call_4" => Some(wren_super_call_4 as *const () as usize),
         // Collections
         "wren_make_list" => Some(wren_make_list as *const () as usize),
+        "wren_make_list_1" => Some(wren_make_list_1 as *const () as usize),
+        "wren_make_list_2" => Some(wren_make_list_2 as *const () as usize),
+        "wren_make_list_3" => Some(wren_make_list_3 as *const () as usize),
+        "wren_make_list_4" => Some(wren_make_list_4 as *const () as usize),
         "wren_make_map" => Some(wren_make_map as *const () as usize),
         "wren_make_range" => Some(wren_make_range as *const () as usize),
         // Arity-specific closure creation
