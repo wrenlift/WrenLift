@@ -1820,7 +1820,7 @@ fn abi_regs(target: super::Target) -> (&'static [u32], u32, u32, u32) {
             &[7, 6, 2, 1, 8, 9], // RDI, RSI, RDX, RCX, R8, R9
             0,                   // return in RAX
             11,                  // R11 for function pointer
-            11,                  // R11 for cycle breaking (safe: copy resolves before ptr load)
+            10,                  // R10 for cycle breaking / second spill scratch
         ),
         super::Target::Wasm => (&[], 0, 0, 0),
     }

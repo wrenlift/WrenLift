@@ -1778,7 +1778,7 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
         u32,
         u32,
     ) = match target {
-        Target::X86_64 => (5, 11, 15, 0, [7, 6, 2, 1, 8, 9], 11, 11),
+        Target::X86_64 => (5, 11, 15, 0, [7, 6, 2, 1, 8, 9], 11, 10),
         Target::Aarch64 => (29, 16, 16, 0, [0, 1, 2, 3, 4, 5], 16, 17),
         Target::Wasm => return,
     };

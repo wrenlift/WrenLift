@@ -116,7 +116,7 @@ fn is_spill_safe_nonleaf(
                     && matches!(alloc.assignments.get(vreg), Some(Location::Spill(_)))
             })
             .count();
-        if spilled_gp_uses + spilled_gp_defs > 1 {
+        if spilled_gp_uses + spilled_gp_defs > 2 {
             return false;
         }
 

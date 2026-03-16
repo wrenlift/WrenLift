@@ -204,9 +204,9 @@ pub fn aarch64_target_regs() -> TargetRegs {
 
 /// Build the default x86_64 allocatable set.
 pub fn x86_64_target_regs() -> TargetRegs {
-    // All GP except RSP(4), RBP(5), R11(11=scratch)
+    // All GP except RSP(4), RBP(5), R10(10=copy/spill scratch), R11(11=call/spill scratch)
     let gp: Vec<PhysReg> = (0..16)
-        .filter(|&r| r != 4 && r != 5 && r != 11)
+        .filter(|&r| r != 4 && r != 5 && r != 10 && r != 11)
         .map(PhysReg::gp)
         .collect();
     // XMM0-XMM14 (XMM15 is scratch)
@@ -343,9 +343,21 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
 
         // For spilled uses: insert reload before the instruction.
         let uses = inst.uses();
+        let defs = inst.defs();
+        let mut spill_overrides: HashMap<VReg, VReg> = HashMap::new();
+        let mut gp_scratch_uses = 0usize;
         for u in &uses {
             if let Some(&Location::Spill(offset)) = result.assignments.get(u) {
-                let scratch = spill_scratch(*u);
+                let scratch = *spill_overrides.entry(*u).or_insert_with(|| {
+                    let slot = if u.class == RegClass::Gp {
+                        let slot = gp_scratch_uses.min(1);
+                        gp_scratch_uses += 1;
+                        slot
+                    } else {
+                        0
+                    };
+                    spill_scratch(*u, slot)
+                });
                 if u.class == RegClass::Fp || u.class == RegClass::Vec {
                     new_insts.push(MachInst::FLdr {
                         dst: scratch,
@@ -360,15 +372,24 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
             }
         }
 
+        for d in &defs {
+            if matches!(result.assignments.get(d), Some(Location::Spill(_))) {
+                spill_overrides
+                    .entry(*d)
+                    .or_insert_with(|| spill_scratch(*d, 0));
+            }
+        }
+
         // Rewrite the instruction's registers.
-        let rewritten = rewrite_inst(inst, &result.assignments);
+        let rewritten = rewrite_inst(inst, &result.assignments, &spill_overrides);
         new_insts.push(rewritten);
 
         // For spilled defs: insert store after the instruction.
-        let defs = inst.defs();
         for d in &defs {
             if let Some(&Location::Spill(offset)) = result.assignments.get(d) {
-                let scratch = spill_scratch(*d);
+                let scratch = *spill_overrides
+                    .get(d)
+                    .unwrap_or(&spill_scratch(*d, 0));
                 if d.class == RegClass::Fp || d.class == RegClass::Vec {
                     new_insts.push(MachInst::FStr {
                         src: scratch,
@@ -406,16 +427,29 @@ fn frame_ptr_vreg() -> VReg {
 }
 
 /// Scratch register for spill/reload. Uses the reserved scratch slot per class.
-fn spill_scratch(vreg: VReg) -> VReg {
+fn spill_scratch(vreg: VReg, slot: usize) -> VReg {
     match vreg.class {
-        RegClass::Gp => VReg::gp(SPILL_SCRATCH_SENTINEL), // rewritten to target scratch
+        RegClass::Gp => {
+            if slot == 0 {
+                VReg::gp(SPILL_SCRATCH_SENTINEL)
+            } else {
+                VReg::gp(COPY_SCRATCH_SENTINEL)
+            }
+        }
         RegClass::Fp | RegClass::Vec => VReg::fp(SPILL_SCRATCH_SENTINEL),
     }
 }
 
 /// Map a single VReg through the allocation, returning a VReg whose `index`
 /// is the physical register encoding.
-fn map_vreg(vreg: VReg, assignments: &HashMap<VReg, Location>) -> VReg {
+fn map_vreg(
+    vreg: VReg,
+    assignments: &HashMap<VReg, Location>,
+    spill_overrides: &HashMap<VReg, VReg>,
+) -> VReg {
+    if let Some(&override_vreg) = spill_overrides.get(&vreg) {
+        return override_vreg;
+    }
     // Sentinel: frame pointer
     if vreg.index == FRAME_PTR_SENTINEL && vreg.class == RegClass::Gp {
         return vreg; // stays as-is, patched by target-specific fixup
@@ -443,16 +477,20 @@ fn map_vreg(vreg: VReg, assignments: &HashMap<VReg, Location>) -> VReg {
         },
         Some(&Location::Spill(_)) => {
             // Spilled registers use scratch for the actual instruction.
-            spill_scratch(vreg)
+            spill_scratch(vreg, 0)
         }
         None => vreg, // Already physical or not tracked (e.g., label-only pseudo-insts)
     }
 }
 
 /// Rewrite all VRegs in a single instruction.
-fn rewrite_inst(inst: &MachInst, assignments: &HashMap<VReg, Location>) -> MachInst {
+fn rewrite_inst(
+    inst: &MachInst,
+    assignments: &HashMap<VReg, Location>,
+    spill_overrides: &HashMap<VReg, VReg>,
+) -> MachInst {
     use MachInst::*;
-    let m = |v: VReg| map_vreg(v, assignments);
+    let m = |v: VReg| map_vreg(v, assignments, spill_overrides);
     let mm = |mem: &Mem| Mem::new(m(mem.base), mem.offset);
 
     match inst {
@@ -1263,10 +1301,11 @@ mod tests {
 
         // After rewrite, the first inst's dst should be a physical reg encoding.
         if let MachInst::LoadImm { dst, .. } = &mf.insts[0] {
-            // Index should be a valid x86_64 GP encoding (0-15, not 4/5/11).
+            // Index should be a valid x86_64 GP encoding (0-15, not 4/5/10/11).
             assert!(dst.index < 16, "expected physical register, got {:?}", dst);
             assert_ne!(dst.index, 4, "should not use RSP");
             assert_ne!(dst.index, 5, "should not use RBP");
+            assert_ne!(dst.index, 10, "should not use R10 scratch");
             assert_ne!(dst.index, 11, "should not use R11 scratch");
         }
     }
