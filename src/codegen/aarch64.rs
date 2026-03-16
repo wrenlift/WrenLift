@@ -93,7 +93,11 @@ fn get_label(labels: &HashMap<Label, DynamicLabel>, l: &Label) -> DynamicLabel {
 /// We prefer x16; if the source is already x16, we use x17.
 #[inline(always)]
 fn imm_scratch(src_hw: u32) -> u32 {
-    if src_hw == 16 { 17 } else { 16 }
+    if src_hw == 16 {
+        17
+    } else {
+        16
+    }
 }
 
 /// Compute effective address for a Mem operand.

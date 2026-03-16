@@ -32,6 +32,19 @@ fn decode_method_and_ic(packed: u64) -> (crate::intern::SymbolId, Option<usize>)
     (method, ic_idx)
 }
 
+fn with_rooted_args<T>(args: &[Value], f: impl FnOnce(&[Value]) -> T) -> T {
+    let root_len_before = jit_roots_snapshot_len();
+    for &arg in args {
+        push_jit_root(arg);
+    }
+    let rooted_args: Vec<Value> = (0..args.len())
+        .map(|idx| jit_root_at(root_len_before + idx))
+        .collect();
+    let result = f(&rooted_args);
+    jit_roots_restore_len(root_len_before);
+    result
+}
+
 #[inline(always)]
 fn cache_key_class(
     vm: &crate::runtime::vm::VM,
@@ -755,6 +768,13 @@ unsafe fn find_method_with_class(
 
 /// Internal: dispatch a method call with a pre-built args slice.
 fn dispatch_call(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
+    with_rooted_args(args, |args| {
+        let recv = args.first().copied().unwrap_or(recv);
+        dispatch_call_rooted(recv, method_packed, args)
+    })
+}
+
+fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
@@ -929,6 +949,17 @@ pub extern "C" fn wren_call_4(
 
 /// Internal: dispatch a super call. Walks to superclass and dispatches method.
 fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
+    with_rooted_args(args, |args| {
+        let recv = args.first().copied().unwrap_or(recv);
+        dispatch_super_call_rooted(recv, method_sym, args)
+    })
+}
+
+fn dispatch_super_call_rooted(
+    recv: Value,
+    method_sym: crate::intern::SymbolId,
+    args: &[Value],
+) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,

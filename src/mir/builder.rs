@@ -462,10 +462,8 @@ impl<'a> MirBuilder<'a> {
 
         // Lower body (cond_bb dominates body_bb, so phi values are accessible)
         self.switch_to(body_bb);
-        self.break_targets
-            .push((exit_bb, tracked_names.clone()));
-        self.continue_targets
-            .push((cond_bb, tracked_names));
+        self.break_targets.push((exit_bb, tracked_names.clone()));
+        self.continue_targets.push((cond_bb, tracked_names));
         self.lower_stmt(body);
         self.break_targets.pop();
         self.continue_targets.pop();
@@ -587,10 +585,8 @@ impl<'a> MirBuilder<'a> {
         });
         self.variables.insert(variable.0, elem_val);
 
-        self.break_targets
-            .push((exit_bb, tracked_names.clone()));
-        self.continue_targets
-            .push((cond_bb, tracked_names));
+        self.break_targets.push((exit_bb, tracked_names.clone()));
+        self.continue_targets.push((cond_bb, tracked_names));
         self.lower_stmt(body);
         self.break_targets.pop();
         self.continue_targets.pop();
@@ -1047,10 +1043,8 @@ impl<'a> MirBuilder<'a> {
                                 .get(&this_sym)
                                 .copied()
                                 .unwrap_or_else(|| self.emit(Instruction::ConstNull));
-                            let setter_name = format!(
-                                "{}=(_)",
-                                self.interner.resolve(*method_name)
-                            );
+                            let setter_name =
+                                format!("{}=(_)", self.interner.resolve(*method_name));
                             let setter_sym = self.intern(&setter_name);
                             self.emit(Instruction::Call {
                                 receiver: recv,
@@ -1321,8 +1315,13 @@ pub fn lower_module(
                 .as_ref()
                 .and_then(|s| class_field_counts.get(&s.0).copied())
                 .unwrap_or(0);
-            let (class_mir, method_closures) =
-                compile_class(decl, interner, resolve, inherited_fields, all_closures.len() as u32);
+            let (class_mir, method_closures) = compile_class(
+                decl,
+                interner,
+                resolve,
+                inherited_fields,
+                all_closures.len() as u32,
+            );
             let total_fields = class_mir.num_fields + inherited_fields;
             class_field_counts.insert(decl.name.0, total_fields);
             classes.push(class_mir);

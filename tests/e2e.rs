@@ -2707,6 +2707,101 @@ fn e2e_delta_blue_mark_sweep_tiered_stress_smoke() {
 }
 
 #[test]
+#[ignore = "debugging full delta_blue under mark-sweep tiered execution"]
+fn e2e_delta_blue_mark_sweep_tiered_full() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+
+    let (result, output, elapsed) = run_with_config(
+        &source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::MarkSweep,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "mark-sweep tiered full delta_blue failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "mark-sweep tiered full delta_blue has projection failures:\n{}",
+        output
+    );
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("14065400"),
+        "mark-sweep tiered full delta_blue total mismatch ({})",
+        t
+    );
+}
+
+#[test]
+#[ignore = "debugging repeated where-sequence reassignment under mark-sweep tiered execution"]
+fn e2e_tiered_mark_sweep_repeated_where_sequence_reassignment() {
+    let source = r#"
+class Holder {
+  construct new(values) {
+    _constraints = values
+  }
+
+  constraints { _constraints }
+  constraints=(value) { _constraints = value }
+}
+
+var run = Fn.new {
+  var holder = Holder.new([1, 2, 3, 4])
+  for (i in 0...40) {
+    holder.constraints = holder.constraints.where { |x| x > 0 }
+    var total = 0
+    for (value in holder.constraints) {
+      total = total + value
+    }
+    if (total != 10) {
+      System.print("bad")
+      System.print(total)
+    }
+  }
+}
+
+for (i in 0...40) {
+  run.call()
+}
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::MarkSweep,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "mark-sweep repeated where-sequence reassignment failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "",
+        "mark-sweep repeated where-sequence reassignment output mismatch ({})",
+        t
+    );
+}
+
+#[test]
 #[ignore = "debugging chainTest -> projectionTest value drift under tiered non-leaf execution"]
 fn e2e_delta_blue_chain_then_projection_debug_values() {
     let mut source =

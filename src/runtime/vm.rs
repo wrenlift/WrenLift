@@ -1410,8 +1410,23 @@ impl NativeContext for VM {
         all_args.extend_from_slice(args);
 
         match method_entry {
-            Method::Native(func) => Some(func(self, &all_args)),
+            Method::Native(func) => {
+                let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                for &arg in &all_args {
+                    crate::codegen::runtime_fns::push_jit_root(arg);
+                }
+                let rooted_args: Vec<Value> = (0..all_args.len())
+                    .map(|idx| crate::codegen::runtime_fns::jit_root_at(root_len_before + idx))
+                    .collect();
+                let result = Some(func(self, &rooted_args));
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                result
+            }
             Method::Closure(closure_ptr) => {
+                let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                for &arg in &all_args {
+                    crate::codegen::runtime_fns::push_jit_root(arg);
+                }
                 // Run closure on a temporary fiber to avoid re-entrancy issues.
                 let temp_fiber = self.gc.alloc_fiber();
                 unsafe {
@@ -1420,7 +1435,13 @@ impl NativeContext for VM {
                     let fn_ptr = (*closure_ptr).function;
                     let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
-                    let mir = self.engine.get_mir(func_id)?;
+                    let mir = match self.engine.get_mir(func_id) {
+                        Some(mir) => mir,
+                        None => {
+                            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                            return None;
+                        }
+                    };
                     let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
                     let block = &mir.blocks[0];
@@ -1434,7 +1455,8 @@ impl NativeContext for VM {
                                 if i >= values.len() {
                                     values.resize(i + 1, Value::UNDEFINED);
                                 }
-                                values[i] = all_args[idx];
+                                values[i] =
+                                    crate::codegen::runtime_fns::jit_root_at(root_len_before + idx);
                             }
                         } else {
                             break;
@@ -1459,17 +1481,27 @@ impl NativeContext for VM {
                 self.fiber = temp_fiber;
                 let result = super::vm_interp::run_fiber(self);
                 self.fiber = saved_fiber;
-
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 result.ok()
             }
             Method::Constructor(closure_ptr) => {
+                let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                for &arg in &all_args {
+                    crate::codegen::runtime_fns::push_jit_root(arg);
+                }
                 // Constructors are called like closures
                 let temp_fiber = self.gc.alloc_fiber();
                 unsafe {
                     (*temp_fiber).header.class = self.fiber_class;
                     let fn_ptr = (*closure_ptr).function;
                     let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
-                    let mir = self.engine.get_mir(func_id)?;
+                    let mir = match self.engine.get_mir(func_id) {
+                        Some(mir) => mir,
+                        None => {
+                            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                            return None;
+                        }
+                    };
                     let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
                     let block = &mir.blocks[0];
                     for (vid, inst) in &block.instructions {
@@ -1480,7 +1512,8 @@ impl NativeContext for VM {
                                 if i >= values.len() {
                                     values.resize(i + 1, Value::UNDEFINED);
                                 }
-                                values[i] = all_args[idx];
+                                values[i] =
+                                    crate::codegen::runtime_fns::jit_root_at(root_len_before + idx);
                             }
                         } else {
                             break;
@@ -1503,6 +1536,7 @@ impl NativeContext for VM {
                 self.fiber = temp_fiber;
                 let result = super::vm_interp::run_fiber(self);
                 self.fiber = saved_fiber;
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 result.ok()
             }
         }
