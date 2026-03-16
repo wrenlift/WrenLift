@@ -330,6 +330,9 @@ pub fn eval_pure_instruction(
         Instruction::SubscriptSet { .. } => Err(InterpError::Unsupported("SubscriptSet".into())),
         Instruction::GetStaticField(_) => Err(InterpError::Unsupported("GetStaticField".into())),
         Instruction::SetStaticField(_, _) => Err(InterpError::Unsupported("SetStaticField".into())),
+        Instruction::CallStaticSelf { .. } => {
+            Err(InterpError::Unsupported("CallStaticSelf".into()))
+        }
     }
 }
 

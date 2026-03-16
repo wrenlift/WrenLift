@@ -265,6 +265,17 @@ impl<'a> MirWasmEmitter<'a> {
                         let params = vec![ValType::I64; args.len() + 2];
                         self.register_import("wren_call", &params, &[ValType::I64]);
                     }
+                    Instruction::CallStaticSelf { args } => {
+                        let name = match args.len() {
+                            0 => "wren_call_static_self_0",
+                            1 => "wren_call_static_self_1",
+                            2 => "wren_call_static_self_2",
+                            3 => "wren_call_static_self_3",
+                            _ => "wren_call_static_self_4",
+                        };
+                        let params = vec![ValType::I64; args.len()];
+                        self.register_import(name, &params, &[ValType::I64]);
+                    }
                     Instruction::SuperCall { args, .. } => {
                         let params = vec![ValType::I64; args.len() + 1];
                         self.register_import("wren_super_call", &params, &[ValType::I64]);
@@ -829,6 +840,20 @@ impl<'a> MirWasmEmitter<'a> {
                     func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 }
                 func.instruction(&WasmInst::Call(self.runtime_imports["wren_call"]));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
+            Instruction::CallStaticSelf { args } => {
+                let name = match args.len() {
+                    0 => "wren_call_static_self_0",
+                    1 => "wren_call_static_self_1",
+                    2 => "wren_call_static_self_2",
+                    3 => "wren_call_static_self_3",
+                    _ => "wren_call_static_self_4",
+                };
+                for a in args {
+                    func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                }
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::SuperCall { method, args } => {

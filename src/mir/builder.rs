@@ -34,10 +34,14 @@ pub struct MirBuilder<'a> {
     closures: Vec<MirFunction>,
     /// Base index for closure fn_ids (offset into module's closure list).
     closure_base: u32,
+    /// Current enclosing class name when lowering a method body.
+    current_class_name: Option<SymbolId>,
     /// Current method signature (for `super(args)` — uses same name as enclosing method).
     current_method_sig: Option<SymbolId>,
     /// Bare method name without arity suffix (e.g., "new" not "new(_,_)").
     current_method_base_name: Option<SymbolId>,
+    /// Whether the current method is static.
+    current_method_is_static: bool,
     /// Stack of shadowed variables per block scope.
     /// Each entry: (var name, previous value or None if newly introduced).
     block_shadows: Vec<Vec<(SymbolId, Option<ValueId>)>>,
@@ -67,8 +71,10 @@ impl<'a> MirBuilder<'a> {
             field_map: None,
             closures: Vec::new(),
             closure_base: 0,
+            current_class_name: None,
             current_method_sig: None,
             current_method_base_name: None,
+            current_method_is_static: false,
             block_shadows: Vec::new(),
         }
     }
@@ -785,6 +791,25 @@ impl<'a> MirBuilder<'a> {
                 block_arg,
                 has_parens,
             } => {
+                let mut arg_vals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
+                if let Some(block) = block_arg {
+                    let block_val = self.lower_expr(block);
+                    arg_vals.push(block_val);
+                }
+
+                let sig = self.method_sig_with_parens(method.0, arg_vals.len(), *has_parens);
+                let is_static_self_call = self.current_method_is_static
+                    && self.current_method_sig == Some(sig)
+                    && receiver.as_ref().is_some_and(|recv_expr| {
+                        matches!(
+                            &recv_expr.0,
+                            Expr::Ident(sym) if Some(*sym) == self.current_class_name
+                        )
+                    });
+                if is_static_self_call {
+                    return self.emit(Instruction::CallStaticSelf { args: arg_vals });
+                }
+
                 let recv = if let Some(r) = receiver {
                     self.lower_expr(r)
                 } else {
@@ -794,14 +819,6 @@ impl<'a> MirBuilder<'a> {
                         .copied()
                         .unwrap_or_else(|| self.emit(Instruction::ConstNull))
                 };
-
-                let mut arg_vals: Vec<ValueId> = args.iter().map(|a| self.lower_expr(a)).collect();
-                if let Some(block) = block_arg {
-                    let block_val = self.lower_expr(block);
-                    arg_vals.push(block_val);
-                }
-
-                let sig = self.method_sig_with_parens(method.0, arg_vals.len(), *has_parens);
                 self.emit(Instruction::Call {
                     receiver: recv,
                     method: sig,
@@ -1388,8 +1405,10 @@ fn compile_class(
             .map(|(i, &sym)| (sym, i as u16 + inherited_field_offset))
             .collect();
         builder.field_map = Some(fmap);
+        builder.current_class_name = Some(decl.name.0);
         builder.current_method_sig = Some(method_name);
         builder.current_method_base_name = method_base_name(&method.signature);
+        builder.current_method_is_static = method.is_static;
 
         // Bind 'this' as first block param (param index 0)
         let this_sym = builder.intern("this");

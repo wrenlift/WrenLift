@@ -94,20 +94,21 @@ pub enum Op {
 
     // -- Variable: op + dst(2) + ... + count(1) + regs --
     Call = 0x39,
-    SuperCall = 0x3A,
-    MakeClosure = 0x3B,
-    MakeList = 0x3C,
-    MakeMap = 0x3D,
-    StringConcat = 0x3E,
-    SubscriptGet = 0x3F,
-    SubscriptSet = 0x40,
+    CallStaticSelf = 0x3A,
+    SuperCall = 0x3B,
+    MakeClosure = 0x3C,
+    MakeList = 0x3D,
+    MakeMap = 0x3E,
+    StringConcat = 0x3F,
+    SubscriptGet = 0x40,
+    SubscriptSet = 0x41,
 
     // -- Terminators --
-    Return = 0x41,      // 3B: op + src(2)
-    ReturnNull = 0x42,  // 1B
-    Unreachable = 0x43, // 1B
-    Branch = 0x44,      // variable: op + target(4) + argc(1) + [dst(2),src(2)]*argc
-    CondBranch = 0x45,  // variable: op + cond(2) + true_off(4) + t_argc(1) + [dst,src]*t_argc
+    Return = 0x42,      // 3B: op + src(2)
+    ReturnNull = 0x43,  // 1B
+    Unreachable = 0x44, // 1B
+    Branch = 0x45,      // variable: op + target(4) + argc(1) + [dst(2),src(2)]*argc
+    CondBranch = 0x46,  // variable: op + cond(2) + true_off(4) + t_argc(1) + [dst,src]*t_argc
                         //           + false_off(4) + f_argc(1) + [dst,src]*f_argc
 }
 
@@ -543,6 +544,14 @@ impl<'a> Encoder<'a> {
                 let ic_idx = self.call_site_count;
                 self.call_site_count += 1;
                 self.emit_u16(ic_idx);
+                self.emit_u8(args.len() as u8);
+                for a in args {
+                    self.emit_reg(*a);
+                }
+            }
+            Instruction::CallStaticSelf { args } => {
+                self.emit_op(Op::CallStaticSelf);
+                self.emit_reg(dst);
                 self.emit_u8(args.len() as u8);
                 for a in args {
                     self.emit_reg(*a);

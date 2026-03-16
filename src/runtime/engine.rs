@@ -218,6 +218,23 @@ fn is_mir_leaf(mir: &MirFunction) -> bool {
     true
 }
 
+fn tiered_native_candidate(
+    mode: ExecutionMode,
+    functions: &[FuncBody],
+    id: FuncId,
+) -> bool {
+    if mode != ExecutionMode::Tiered {
+        return false;
+    }
+    if crate::codegen::runtime_fns::shadow_nonleaf_enabled() {
+        return true;
+    }
+    functions
+        .get(id.0 as usize)
+        .map(|body| is_mir_leaf(body.mir()))
+        .unwrap_or(false)
+}
+
 /// The execution engine: owns all function bodies, dispatches calls,
 /// and manages tiered compilation.
 ///
@@ -424,7 +441,7 @@ impl ExecutionEngine {
     /// Record a call to a function. Returns true if the function should
     /// be JIT-compiled (threshold exceeded in Tiered mode).
     pub fn record_call(&mut self, id: FuncId) -> bool {
-        if self.mode != ExecutionMode::Tiered {
+        if !tiered_native_candidate(self.mode, &self.functions, id) {
             return false;
         }
         if let Some(FuncBody::Interpreted { call_count, .. }) =
@@ -492,6 +509,9 @@ impl ExecutionEngine {
     /// when `poll_compilations` is called at the next safepoint.
     /// At most one compilation thread runs at a time to bound memory usage.
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        if !tiered_native_candidate(self.mode, &self.functions, id) {
+            return;
+        }
         let idx = id.0 as usize;
         // Guard: already compiled or already in-flight
         if idx >= self.compiling.len() {

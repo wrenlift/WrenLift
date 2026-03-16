@@ -1064,6 +1064,84 @@ pub extern "C" fn wren_call_4(
     )
 }
 
+fn call_static_self_inner(extra_args: &[u64]) -> u64 {
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+    let ctx = read_jit_ctx();
+    let closure_ptr = ctx.closure as *mut ObjClosure;
+    let defining_class = ctx.defining_class as *mut crate::runtime::object::ObjClass;
+    if closure_ptr.is_null() || defining_class.is_null() {
+        return Value::null().to_bits();
+    }
+
+    let class_val = Value::object(defining_class as *mut u8);
+    match extra_args.len() {
+        0 => call_closure_jit_or_sync(vm, closure_ptr, &[class_val], Some(defining_class)),
+        1 => call_closure_jit_or_sync(
+            vm,
+            closure_ptr,
+            &[class_val, Value::from_bits(extra_args[0])],
+            Some(defining_class),
+        ),
+        2 => call_closure_jit_or_sync(
+            vm,
+            closure_ptr,
+            &[
+                class_val,
+                Value::from_bits(extra_args[0]),
+                Value::from_bits(extra_args[1]),
+            ],
+            Some(defining_class),
+        ),
+        3 => call_closure_jit_or_sync(
+            vm,
+            closure_ptr,
+            &[
+                class_val,
+                Value::from_bits(extra_args[0]),
+                Value::from_bits(extra_args[1]),
+                Value::from_bits(extra_args[2]),
+            ],
+            Some(defining_class),
+        ),
+        _ => call_closure_jit_or_sync(
+            vm,
+            closure_ptr,
+            &[
+                class_val,
+                Value::from_bits(extra_args[0]),
+                Value::from_bits(extra_args[1]),
+                Value::from_bits(extra_args[2]),
+                Value::from_bits(extra_args[3]),
+            ],
+            Some(defining_class),
+        ),
+    }
+}
+
+pub extern "C" fn wren_call_static_self_0() -> u64 {
+    call_static_self_inner(&[])
+}
+
+pub extern "C" fn wren_call_static_self_1(a0: u64) -> u64 {
+    call_static_self_inner(&[a0])
+}
+
+pub extern "C" fn wren_call_static_self_2(a0: u64, a1: u64) -> u64 {
+    call_static_self_inner(&[a0, a1])
+}
+
+pub extern "C" fn wren_call_static_self_3(a0: u64, a1: u64, a2: u64) -> u64 {
+    call_static_self_inner(&[a0, a1, a2])
+}
+
+pub extern "C" fn wren_call_static_self_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    call_static_self_inner(&[a0, a1, a2, a3])
+}
+
 /// Internal: dispatch a super call. Walks to superclass and dispatches method.
 fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
     with_rooted_args(args, |args| {
@@ -1843,6 +1921,11 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_call_2" => Some(wren_call_2 as *const () as usize),
         "wren_call_3" => Some(wren_call_3 as *const () as usize),
         "wren_call_4" => Some(wren_call_4 as *const () as usize),
+        "wren_call_static_self_0" => Some(wren_call_static_self_0 as *const () as usize),
+        "wren_call_static_self_1" => Some(wren_call_static_self_1 as *const () as usize),
+        "wren_call_static_self_2" => Some(wren_call_static_self_2 as *const () as usize),
+        "wren_call_static_self_3" => Some(wren_call_static_self_3 as *const () as usize),
+        "wren_call_static_self_4" => Some(wren_call_static_self_4 as *const () as usize),
         "wren_super_call_0" => Some(wren_super_call_0 as *const () as usize),
         "wren_super_call_1" => Some(wren_super_call_1 as *const () as usize),
         "wren_super_call_2" => Some(wren_super_call_2 as *const () as usize),

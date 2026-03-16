@@ -1672,6 +1672,43 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                 }
 
+                Op::CallStaticSelf => {
+                    let dst = read_u16(code, &mut pc);
+                    let argc = read_u8(code, &mut pc) as usize;
+
+                    let (closure_ptr, defining_class) = unsafe {
+                        let frame = (*fiber).mir_frames.last().unwrap();
+                        (frame.closure, frame.defining_class)
+                    };
+                    let closure_ptr = closure_ptr.ok_or_else(|| {
+                        RuntimeError::Error("static self call outside closure frame".into())
+                    })?;
+                    let defining_class = defining_class.ok_or_else(|| {
+                        RuntimeError::Error("static self call without defining class".into())
+                    })?;
+
+                    let mut arg_vals: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc + 1);
+                    arg_vals.push(Value::object(defining_class as *mut u8));
+                    for _ in 0..argc {
+                        let arg_reg = read_u16(code, &mut pc);
+                        arg_vals.push(get_reg(&values, arg_reg));
+                    }
+
+                    dispatch_closure_bc(
+                        vm,
+                        fiber,
+                        closure_ptr,
+                        &arg_vals,
+                        pc,
+                        values,
+                        &module_name,
+                        ValueId(dst as u32),
+                        Some(defining_class),
+                        bc_ptr,
+                    )?;
+                    continue 'fiber_loop;
+                }
+
                 Op::SuperCall => {
                     let dst = read_u16(code, &mut pc);
                     let method_idx = read_u16(code, &mut pc);

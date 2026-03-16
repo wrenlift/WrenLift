@@ -159,6 +159,11 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
                 *arg = resolve(*arg, map);
             }
         }
+        CallStaticSelf { args } => {
+            for arg in args.iter_mut() {
+                *arg = resolve(*arg, map);
+            }
+        }
         SuperCall { args, .. } => {
             for arg in args.iter_mut() {
                 *arg = resolve(*arg, map);

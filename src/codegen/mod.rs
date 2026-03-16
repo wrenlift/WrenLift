@@ -1442,6 +1442,28 @@ pub enum Target {
 use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 use std::collections::HashMap;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GcValueRep {
+    NonValue,
+    ImmediateValue,
+    MaybeObject,
+}
+
+impl GcValueRep {
+    fn is_gc_root(self) -> bool {
+        matches!(self, Self::MaybeObject)
+    }
+
+    fn join(self, other: Self) -> Self {
+        use GcValueRep::*;
+        match (self, other) {
+            (MaybeObject, _) | (_, MaybeObject) => MaybeObject,
+            (ImmediateValue, _) | (_, ImmediateValue) => ImmediateValue,
+            _ => NonValue,
+        }
+    }
+}
+
 fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
     use crate::mir::MirType;
 
@@ -1471,6 +1493,7 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::GetStaticField(_)
                 | Instruction::GetModuleVar(_)
                 | Instruction::Call { .. }
+                | Instruction::CallStaticSelf { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::MakeClosure { .. }
                 | Instruction::GetUpvalue(_)
@@ -1533,7 +1556,155 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
     value_types
 }
 
+fn infer_mir_gc_value_reps(
+    mir: &MirFunction,
+    _value_types: &[crate::mir::MirType],
+) -> Vec<GcValueRep> {
+    use crate::mir::MirType;
+
+    let mut reps = vec![GcValueRep::NonValue; mir.next_value as usize];
+    for block in &mir.blocks {
+        for &(value, ty) in &block.params {
+            reps[value.0 as usize] = if ty == MirType::Value {
+                GcValueRep::MaybeObject
+            } else {
+                GcValueRep::NonValue
+            };
+        }
+    }
+
+    let mut self_return_rep = GcValueRep::ImmediateValue;
+    loop {
+        let mut changed = false;
+
+        for block in &mir.blocks {
+            for &(dst, ref inst) in &block.instructions {
+                let rep = match inst {
+                    Instruction::ConstNum(_)
+                    | Instruction::ConstBool(_)
+                    | Instruction::ConstNull
+                    | Instruction::Box(_)
+                    | Instruction::GuardNum(_)
+                    | Instruction::GuardBool(_) => GcValueRep::ImmediateValue,
+                    Instruction::ConstString(_)
+                    | Instruction::GetField(..)
+                    | Instruction::GetStaticField(_)
+                    | Instruction::GetModuleVar(_)
+                    | Instruction::Call { .. }
+                    | Instruction::SuperCall { .. }
+                    | Instruction::MakeClosure { .. }
+                    | Instruction::GetUpvalue(_)
+                    | Instruction::MakeList(_)
+                    | Instruction::MakeMap(_)
+                    | Instruction::MakeRange(..)
+                    | Instruction::StringConcat(_)
+                    | Instruction::ToString(_)
+                    | Instruction::SubscriptGet { .. } => GcValueRep::MaybeObject,
+                    Instruction::CallStaticSelf { .. } => self_return_rep,
+                    Instruction::Sub(a, b)
+                    | Instruction::Mul(a, b)
+                    | Instruction::Div(a, b)
+                    | Instruction::Mod(a, b)
+                    | Instruction::BitAnd(a, b)
+                    | Instruction::BitOr(a, b)
+                    | Instruction::BitXor(a, b)
+                    | Instruction::Shl(a, b)
+                    | Instruction::Shr(a, b) => {
+                        if reps[a.0 as usize] == GcValueRep::ImmediateValue
+                            && reps[b.0 as usize] == GcValueRep::ImmediateValue
+                        {
+                            GcValueRep::ImmediateValue
+                        } else {
+                            GcValueRep::MaybeObject
+                        }
+                    }
+                    Instruction::Add(a, b) => {
+                        if reps[a.0 as usize] == GcValueRep::ImmediateValue
+                            && reps[b.0 as usize] == GcValueRep::ImmediateValue
+                        {
+                            GcValueRep::ImmediateValue
+                        } else {
+                            GcValueRep::MaybeObject
+                        }
+                    }
+                    Instruction::Neg(a) => {
+                        if reps[a.0 as usize] == GcValueRep::ImmediateValue {
+                            GcValueRep::ImmediateValue
+                        } else {
+                            GcValueRep::MaybeObject
+                        }
+                    }
+                    Instruction::SetField(_, _, src)
+                    | Instruction::SetStaticField(_, src)
+                    | Instruction::SetModuleVar(_, src)
+                    | Instruction::SetUpvalue(_, src)
+                    | Instruction::GuardClass(src, _)
+                    | Instruction::GuardProtocol(src, _)
+                    | Instruction::Move(src) => reps[src.0 as usize],
+                    Instruction::SubscriptSet { value, .. } => reps[value.0 as usize],
+                    Instruction::BlockParam(idx) => block
+                        .params
+                        .get(*idx as usize)
+                        .map(|(_, ty)| {
+                            if *ty == MirType::Value {
+                                GcValueRep::MaybeObject
+                            } else {
+                                GcValueRep::NonValue
+                            }
+                        })
+                        .unwrap_or(GcValueRep::NonValue),
+                    _ => GcValueRep::NonValue,
+                };
+
+                let slot = &mut reps[dst.0 as usize];
+                if *slot != rep {
+                    *slot = rep;
+                    changed = true;
+                }
+
+                match inst {
+                    Instruction::GuardNum(src) | Instruction::GuardBool(src) => {
+                        let slot = &mut reps[src.0 as usize];
+                        if *slot != GcValueRep::ImmediateValue {
+                            *slot = GcValueRep::ImmediateValue;
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut return_rep = GcValueRep::NonValue;
+        for block in &mir.blocks {
+            match block.terminator {
+                Terminator::Return(val) => {
+                    return_rep = return_rep.join(reps[val.0 as usize]);
+                }
+                Terminator::ReturnNull => {
+                    return_rep = return_rep.join(GcValueRep::ImmediateValue);
+                }
+                _ => {}
+            }
+        }
+
+        if return_rep != self_return_rep {
+            self_return_rep = return_rep;
+            changed = true;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    reps
+}
+
 fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
+    if !crate::codegen::runtime_fns::shadow_nonleaf_enabled() {
+        return false;
+    }
     mach.insts.iter().any(|inst| {
         matches!(
             inst,
@@ -2058,7 +2229,7 @@ fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
 struct LowerCtx<'a> {
     mf: &'a mut MachFunc,
     mir: &'a MirFunction,
-    value_types: Vec<crate::mir::MirType>,
+    gc_value_reps: Vec<GcValueRep>,
     /// MIR ValueId → VReg mapping.
     val_map: HashMap<ValueId, VReg>,
     /// MIR BlockId → Label mapping.
@@ -2117,10 +2288,13 @@ impl<'a> LowerCtx<'a> {
             }
         }
 
+        let value_types = infer_mir_value_types(mir);
+        let gc_value_reps = infer_mir_gc_value_reps(mir, &value_types);
+
         Self {
             mf,
             mir,
-            value_types: infer_mir_value_types(mir),
+            gc_value_reps,
             val_map: HashMap::new(),
             block_labels,
             interner,
@@ -2141,11 +2315,11 @@ impl<'a> LowerCtx<'a> {
         // Default to GP — callers can override for FP values.
         let r = self.mf.new_gp();
         if self
-            .value_types
+            .gc_value_reps
             .get(val.0 as usize)
             .copied()
-            .unwrap_or(crate::mir::MirType::Value)
-            == crate::mir::MirType::Value
+            .unwrap_or(GcValueRep::MaybeObject)
+            .is_gc_root()
         {
             self.mf.mark_boxed_gp(r);
         }
@@ -2525,7 +2699,13 @@ impl<'a> LowerCtx<'a> {
                     mem: Mem::new(fields_ptr, field_offset),
                 });
 
-                if self.value_types.get(val.0 as usize) == Some(&crate::mir::MirType::Value) {
+                if self
+                    .gc_value_reps
+                    .get(val.0 as usize)
+                    .copied()
+                    .unwrap_or(GcValueRep::MaybeObject)
+                    .is_gc_root()
+                {
                     self.mf.emit(MachInst::CallRuntime {
                         name: "wren_write_barrier",
                         args: vec![recv_reg, v],
@@ -2591,6 +2771,25 @@ impl<'a> LowerCtx<'a> {
                     2 => "wren_call_2",
                     3 => "wren_call_3",
                     _ => "wren_call_4",
+                };
+                self.mf.emit(MachInst::CallRuntime {
+                    name: call_name,
+                    args: call_args,
+                    ret: Some(dst),
+                });
+            }
+            Instruction::CallStaticSelf { args } => {
+                let dst = self.vreg_for(dst_val);
+                let mut call_args = Vec::with_capacity(args.len());
+                for a in args {
+                    call_args.push(self.vreg_for(*a));
+                }
+                let call_name = match args.len() {
+                    0 => "wren_call_static_self_0",
+                    1 => "wren_call_static_self_1",
+                    2 => "wren_call_static_self_2",
+                    3 => "wren_call_static_self_3",
+                    _ => "wren_call_static_self_4",
                 };
                 self.mf.emit(MachInst::CallRuntime {
                     name: call_name,

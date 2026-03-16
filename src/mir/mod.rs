@@ -313,6 +313,10 @@ pub enum Instruction {
         method: SymbolId,
         args: Vec<ValueId>,
     },
+    /// Recursive call to the current static method on its defining class.
+    CallStaticSelf {
+        args: Vec<ValueId>,
+    },
     /// Super call: method symbol, args → result.
     SuperCall {
         method: SymbolId,
@@ -376,7 +380,12 @@ impl Instruction {
             self,
             Instruction::SetField(..)
                 | Instruction::SetModuleVar(..)
+                | Instruction::GuardNum(..)
+                | Instruction::GuardBool(..)
+                | Instruction::GuardClass(..)
+                | Instruction::GuardProtocol(..)
                 | Instruction::Call { .. }
+                | Instruction::CallStaticSelf { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::SetUpvalue(..)
                 | Instruction::SubscriptSet { .. }
@@ -451,6 +460,7 @@ impl Instruction {
                 ops.extend(args);
                 ops
             }
+            Instruction::CallStaticSelf { args } => args.clone(),
             Instruction::SuperCall { args, .. } => args.clone(),
 
             Instruction::MakeClosure { upvalues, .. } => upvalues.clone(),
@@ -749,6 +759,7 @@ impl MirFunction {
                     Instruction::Call { method, .. } => {
                         *method = remap(*method);
                     }
+                    Instruction::CallStaticSelf { .. } => {}
                     Instruction::SuperCall { method, .. } => {
                         *method = remap(*method);
                     }
@@ -944,6 +955,9 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
             interner.resolve(*method),
             fmt_val_list(args)
         ),
+        Instruction::CallStaticSelf { args } => {
+            format!("call_static_self({})", fmt_val_list(args))
+        }
         Instruction::SuperCall { method, args } => {
             format!(
                 "super_call %{}({})",
