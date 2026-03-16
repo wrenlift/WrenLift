@@ -5,6 +5,7 @@
 /// (no panics), and profiles execution time.
 use std::time::Instant;
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
+use wren_lift::runtime::gc_trait::GcStrategy;
 use wren_lift::runtime::vm::{VMConfig, VM};
 
 // ---------------------------------------------------------------------------
@@ -14,6 +15,19 @@ use wren_lift::runtime::vm::{VMConfig, VM};
 /// Run a Wren program and return (result, output, elapsed).
 fn run(source: &str) -> (InterpretResult, String, std::time::Duration) {
     let mut vm = VM::new_default();
+    vm.output_buffer = Some(String::new());
+    let start = Instant::now();
+    let result = vm.interpret("main", source);
+    let elapsed = start.elapsed();
+    let output = vm.take_output();
+    (result, output, elapsed)
+}
+
+fn run_with_config(
+    source: &str,
+    config: VMConfig,
+) -> (InterpretResult, String, std::time::Duration) {
+    let mut vm = VM::new(config);
     vm.output_buffer = Some(String::new());
     let start = Instant::now();
     let result = vm.interpret("main", source);
@@ -1656,6 +1670,96 @@ fn e2e_jit_nbody() {
     eprintln!("  [nbody tiered {}]", t);
 }
 
+#[test]
+fn e2e_tiered_closure_call_inside_promoted_function() {
+    let source = r#"
+var apply = Fn.new { |f, x|
+  return f.call(x)
+}
+
+var inc = Fn.new { |x| x + 1 }
+
+var total = 0
+for (i in 0...20) {
+  total = total + apply.call(inc, i)
+}
+
+System.print(total)
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered closure-call promotion failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "210",
+        "tiered closure-call output mismatch ({})",
+        t
+    );
+}
+
+#[test]
+fn e2e_tiered_nested_nonleaf_closure_call_survives_gc_pressure() {
+    let source = r#"
+var outer = Fn.new { |f, list|
+  for (i in 0...400) {
+    var tmp = [i, i + 1, i + 2, i + 3]
+  }
+  return f.call(list)
+}
+
+var inner = Fn.new { |list|
+  list.add(1)
+  return list.count
+}
+
+var list = []
+var total = 0
+for (i in 0...40) {
+  total = total + outer.call(inner, list)
+}
+
+System.print(total)
+System.print(list.count)
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered nested non-leaf closure-call failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "820\n40",
+        "tiered nested non-leaf closure-call output mismatch ({})",
+        t
+    );
+}
+
 // ---------------------------------------------------------------------------
 // JIT tiering e2e: mandelbrot
 // ---------------------------------------------------------------------------
@@ -2101,8 +2205,8 @@ System.writeObject_(42)
 
 #[test]
 fn e2e_delta_blue() {
-    let source = std::fs::read_to_string("bench/delta_blue.wren")
-        .expect("bench/delta_blue.wren must exist");
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
 
     // Run with interpreter only (no JIT) to verify the program is correct
     let mut vm = VM::new(VMConfig {
@@ -2145,5 +2249,149 @@ fn e2e_delta_blue() {
         !output2.contains("failed"),
         "delta_blue JIT has projection failures:\n{}",
         output2
+    );
+}
+
+#[test]
+#[ignore = "debugging tiered promotion regressions in delta_blue"]
+fn e2e_delta_blue_projection_tiered_promotion_smoke() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+    let prefix = source
+        .split("var start = System.clock")
+        .next()
+        .expect("delta_blue benchmark footer must exist");
+    let smoke = format!("{}projectionTest.call(5)\nSystem.print(total)\n", prefix);
+
+    let (result, output, elapsed) = run_with_config(
+        &smoke,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered projection smoke failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "tiered projection smoke has projection failures:\n{}",
+        output
+    );
+}
+
+#[test]
+#[ignore = "debugging tiered promotion regressions in delta_blue"]
+fn e2e_delta_blue_tiered_stress_smoke() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+    let prefix = source
+        .split("var start = System.clock")
+        .next()
+        .expect("delta_blue benchmark footer must exist");
+    let smoke = format!(
+        "{}for (i in 0...5) {{\n  chainTest.call(20)\n  projectionTest.call(20)\n}}\nSystem.print(total)\n",
+        prefix
+    );
+
+    let (result, output, elapsed) = run_with_config(
+        &smoke,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered stress smoke failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "tiered stress smoke has projection failures:\n{}",
+        output
+    );
+}
+
+#[test]
+#[ignore = "debugging full non-leaf tiered execution under mark-sweep GC"]
+fn e2e_delta_blue_mark_sweep_tiered_projection_smoke() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+    let prefix = source
+        .split("var start = System.clock")
+        .next()
+        .expect("delta_blue benchmark footer must exist");
+    let smoke = format!("{}projectionTest.call(5)\nSystem.print(total)\n", prefix);
+
+    let (result, output, elapsed) = run_with_config(
+        &smoke,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::MarkSweep,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "mark-sweep tiered projection smoke failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "mark-sweep tiered projection smoke has projection failures:\n{}",
+        output
+    );
+}
+
+#[test]
+#[ignore = "debugging full non-leaf tiered execution under mark-sweep GC"]
+fn e2e_delta_blue_mark_sweep_tiered_stress_smoke() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+    let prefix = source
+        .split("var start = System.clock")
+        .next()
+        .expect("delta_blue benchmark footer must exist");
+    let smoke = format!(
+        "{}for (i in 0...5) {{\n  chainTest.call(20)\n  projectionTest.call(20)\n}}\nSystem.print(total)\n",
+        prefix
+    );
+
+    let (result, output, elapsed) = run_with_config(
+        &smoke,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::MarkSweep,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "mark-sweep tiered stress smoke failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "mark-sweep tiered stress smoke has projection failures:\n{}",
+        output
     );
 }

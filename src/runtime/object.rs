@@ -871,7 +871,7 @@ pub struct ObjClass {
 }
 
 /// A method entry in the class method table.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Method {
     /// A Wren closure.
     Closure(*mut ObjClosure),

@@ -12,12 +12,14 @@
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 pub mod cfg;
+pub mod native_meta;
 pub mod regalloc;
 pub mod runtime_fns;
 pub mod wasm;
 pub mod x86_64;
 
 use std::fmt;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Virtual Registers
@@ -96,6 +98,20 @@ impl fmt::Display for VReg {
         fmt::Debug::fmt(self, f)
     }
 }
+
+pub(crate) const FRAME_PTR_SENTINEL: u32 = u32::MAX;
+pub(crate) const SPILL_SCRATCH_SENTINEL: u32 = u32::MAX - 1;
+pub(crate) const ABI_RET_SENTINEL: u32 = u32::MAX - 2;
+pub(crate) const ABI_ARG_SENTINELS: [u32; 6] = [
+    u32::MAX - 3,
+    u32::MAX - 4,
+    u32::MAX - 5,
+    u32::MAX - 6,
+    u32::MAX - 7,
+    u32::MAX - 8,
+];
+pub(crate) const CALL_SCRATCH_SENTINEL: u32 = u32::MAX - 9;
+pub(crate) const COPY_SCRATCH_SENTINEL: u32 = u32::MAX - 10;
 
 // ---------------------------------------------------------------------------
 // Labels
@@ -900,6 +916,7 @@ pub struct MachFunc {
     pub name: String,
     pub insts: Vec<MachInst>,
     pub frame_size: u32,
+    boxed_gp_vregs: Vec<bool>,
     next_gp: u32,
     next_fp: u32,
     next_vec: u32,
@@ -912,6 +929,7 @@ impl MachFunc {
             name,
             insts: Vec::new(),
             frame_size: 0,
+            boxed_gp_vregs: Vec::new(),
             next_gp: 0,
             next_fp: 0,
             next_vec: 0,
@@ -923,6 +941,7 @@ impl MachFunc {
     pub fn new_gp(&mut self) -> VReg {
         let r = VReg::gp(self.next_gp);
         self.next_gp += 1;
+        self.boxed_gp_vregs.push(false);
         r
     }
 
@@ -949,6 +968,31 @@ impl MachFunc {
 
     pub fn emit(&mut self, inst: MachInst) {
         self.insts.push(inst);
+    }
+
+    pub fn mark_boxed_gp(&mut self, vreg: VReg) {
+        if vreg.class != RegClass::Gp {
+            return;
+        }
+        if let Some(slot) = self.boxed_gp_vregs.get_mut(vreg.index as usize) {
+            *slot = true;
+        }
+    }
+
+    pub fn is_boxed_gp(&self, vreg: VReg) -> bool {
+        vreg.class == RegClass::Gp
+            && self
+                .boxed_gp_vregs
+                .get(vreg.index as usize)
+                .copied()
+                .unwrap_or(false)
+    }
+
+    pub fn boxed_gp_vregs(&self) -> impl Iterator<Item = VReg> + '_ {
+        self.boxed_gp_vregs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, is_boxed)| is_boxed.then_some(VReg::gp(idx as u32)))
     }
 
     pub fn num_gp_vregs(&self) -> u32 {
@@ -1172,6 +1216,32 @@ pub fn resolve_parallel_copies(mf: &mut MachFunc) {
     mf.insts = resolved;
 }
 
+/// Resolve parallel copies after register allocation and ABI/scratch fixups.
+/// At this point all vregs are physical encodings, so overlap with fixed ABI
+/// registers is visible and copies can be scheduled safely.
+pub fn resolve_parallel_copies_postalloc(mf: &mut MachFunc, target: Target) {
+    let old_insts = std::mem::take(&mut mf.insts);
+    let mut resolved = Vec::with_capacity(old_insts.len());
+    let (gp_copy_scratch, fp_copy_scratch) = match target {
+        Target::X86_64 => (VReg::gp(11), VReg::fp(15)),
+        Target::Aarch64 => (VReg::gp(17), VReg::fp(16)),
+        Target::Wasm => {
+            mf.insts = old_insts;
+            return;
+        }
+    };
+
+    for inst in old_insts {
+        if let MachInst::ParallelCopy { copies } = inst {
+            resolve_one_pcopy_postalloc(&copies, &mut resolved, gp_copy_scratch, fp_copy_scratch);
+        } else {
+            resolved.push(inst);
+        }
+    }
+
+    mf.insts = resolved;
+}
+
 fn resolve_one_pcopy(copies: &[(VReg, VReg)], out: &mut Vec<MachInst>, mf: &mut MachFunc) {
     if copies.is_empty() {
         return;
@@ -1257,7 +1327,90 @@ fn resolve_one_pcopy(copies: &[(VReg, VReg)], out: &mut Vec<MachInst>, mf: &mut 
         }
 
         // Close the cycle: the last dst gets the temp value.
-        emit_mov(out, current_dst, tmp);
+        emit_mov(out, cycle_start_dst, tmp);
+    }
+}
+
+fn resolve_one_pcopy_postalloc(
+    copies: &[(VReg, VReg)],
+    out: &mut Vec<MachInst>,
+    gp_copy_scratch: VReg,
+    fp_copy_scratch: VReg,
+) {
+    if copies.is_empty() {
+        return;
+    }
+
+    let copies: Vec<(VReg, VReg)> = copies
+        .iter()
+        .filter(|(dst, src)| dst != src)
+        .copied()
+        .collect();
+    if copies.is_empty() {
+        return;
+    }
+
+    let pending: Vec<(VReg, VReg)> = copies.clone();
+    let mut emitted = vec![false; pending.len()];
+
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for i in 0..pending.len() {
+            if emitted[i] {
+                continue;
+            }
+            let (dst, _) = pending[i];
+            let blocks_other = pending
+                .iter()
+                .enumerate()
+                .any(|(j, (_, src))| j != i && !emitted[j] && *src == dst);
+            if !blocks_other {
+                let (dst, src) = pending[i];
+                emit_mov(out, dst, src);
+                emitted[i] = true;
+                progress = true;
+            }
+        }
+    }
+
+    for i in 0..pending.len() {
+        if emitted[i] {
+            continue;
+        }
+
+        let cycle_start_dst = pending[i].0;
+        let cycle_start_src = pending[i].1;
+        let tmp = match cycle_start_dst.class {
+            RegClass::Gp => gp_copy_scratch,
+            RegClass::Fp | RegClass::Vec => fp_copy_scratch,
+        };
+
+        emit_mov(out, tmp, cycle_start_src);
+        emitted[i] = true;
+
+        let mut current_dst = cycle_start_dst;
+        let mut chain = Vec::new();
+        loop {
+            let next = pending
+                .iter()
+                .enumerate()
+                .find(|(j, (_, src))| !emitted[*j] && *src == current_dst);
+            match next {
+                Some((j, &(dst, src))) => {
+                    emitted[j] = true;
+                    chain.push((dst, src));
+                    current_dst = dst;
+                }
+                None => break,
+            }
+        }
+
+        for &(dst, src) in chain.iter().rev() {
+            emit_mov(out, dst, src);
+        }
+
+        emit_mov(out, cycle_start_dst, tmp);
     }
 }
 
@@ -1289,6 +1442,142 @@ pub enum Target {
 use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 use std::collections::HashMap;
 
+fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
+    use crate::mir::MirType;
+
+    let mut value_types = vec![MirType::Void; mir.next_value as usize];
+
+    for block in &mir.blocks {
+        for &(value, ty) in &block.params {
+            value_types[value.0 as usize] = ty;
+        }
+    }
+
+    for block in &mir.blocks {
+        for &(dst, ref inst) in &block.instructions {
+            let ty = match inst {
+                Instruction::ConstNum(_)
+                | Instruction::ConstBool(_)
+                | Instruction::ConstNull
+                | Instruction::ConstString(_)
+                | Instruction::Add(..)
+                | Instruction::Sub(..)
+                | Instruction::Mul(..)
+                | Instruction::Div(..)
+                | Instruction::Mod(..)
+                | Instruction::Neg(..)
+                | Instruction::Box(_)
+                | Instruction::GetField(..)
+                | Instruction::GetStaticField(_)
+                | Instruction::GetModuleVar(_)
+                | Instruction::Call { .. }
+                | Instruction::SuperCall { .. }
+                | Instruction::MakeClosure { .. }
+                | Instruction::GetUpvalue(_)
+                | Instruction::MakeList(_)
+                | Instruction::MakeMap(_)
+                | Instruction::MakeRange(..)
+                | Instruction::StringConcat(_)
+                | Instruction::ToString(_)
+                | Instruction::SubscriptGet { .. } => MirType::Value,
+                Instruction::ConstF64(_)
+                | Instruction::MathUnaryF64(..)
+                | Instruction::MathBinaryF64(..)
+                | Instruction::AddF64(..)
+                | Instruction::SubF64(..)
+                | Instruction::MulF64(..)
+                | Instruction::DivF64(..)
+                | Instruction::ModF64(..)
+                | Instruction::NegF64(_)
+                | Instruction::Unbox(_) => MirType::F64,
+                Instruction::ConstI64(_) => MirType::I64,
+                Instruction::CmpLt(..)
+                | Instruction::CmpGt(..)
+                | Instruction::CmpLe(..)
+                | Instruction::CmpGe(..)
+                | Instruction::CmpEq(..)
+                | Instruction::CmpNe(..)
+                | Instruction::CmpLtF64(..)
+                | Instruction::CmpGtF64(..)
+                | Instruction::CmpLeF64(..)
+                | Instruction::CmpGeF64(..)
+                | Instruction::Not(_)
+                | Instruction::IsType(..) => MirType::Bool,
+                Instruction::BitAnd(..)
+                | Instruction::BitOr(..)
+                | Instruction::BitXor(..)
+                | Instruction::BitNot(_)
+                | Instruction::Shl(..)
+                | Instruction::Shr(..) => MirType::Value,
+                Instruction::GuardNum(src)
+                | Instruction::GuardBool(src)
+                | Instruction::Move(src)
+                | Instruction::SetField(_, _, src)
+                | Instruction::SetStaticField(_, src)
+                | Instruction::SetModuleVar(_, src)
+                | Instruction::SetUpvalue(_, src) => value_types[src.0 as usize],
+                Instruction::GuardClass(src, _) | Instruction::GuardProtocol(src, _) => {
+                    value_types[src.0 as usize]
+                }
+                Instruction::SubscriptSet { value, .. } => value_types[value.0 as usize],
+                Instruction::BlockParam(idx) => block
+                    .params
+                    .get(*idx as usize)
+                    .map(|(_, ty)| *ty)
+                    .unwrap_or(MirType::Value),
+            };
+            value_types[dst.0 as usize] = ty;
+        }
+    }
+
+    value_types
+}
+
+fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
+    mach.insts.iter().any(|inst| {
+        matches!(
+            inst,
+            MachInst::CallRuntime { .. } | MachInst::CallInd { .. }
+        )
+    }) && mach.boxed_gp_vregs().next().is_some()
+}
+
+fn instrument_native_shadow_stores(mach: &mut MachFunc) {
+    let boxed_slots: HashMap<VReg, u16> = mach
+        .boxed_gp_vregs()
+        .enumerate()
+        .map(|(slot, vreg)| (vreg, slot as u16))
+        .collect();
+    if boxed_slots.is_empty() {
+        return;
+    }
+
+    let orig_insts = std::mem::take(&mut mach.insts);
+    let mut new_insts = Vec::with_capacity(orig_insts.len() * 2);
+
+    for inst in orig_insts {
+        let boxed_def = inst
+            .def()
+            .filter(|vreg| mach.is_boxed_gp(*vreg))
+            .and_then(|vreg| boxed_slots.get(&vreg).copied().map(|slot| (slot, vreg)));
+        new_insts.push(inst);
+        if let Some((slot, vreg)) = boxed_def {
+            let slot_reg = mach.new_gp();
+            new_insts.push(MachInst::LoadImm {
+                dst: slot_reg,
+                bits: slot as u64,
+            });
+            new_insts.push(MachInst::CallRuntime {
+                name: "wren_shadow_store",
+                args: vec![slot_reg, vreg],
+                ret: None,
+            });
+        }
+    }
+
+    mach.insts = new_insts;
+}
+
 /// Lower a MIR function to platform-agnostic machine instructions.
 pub fn lower_mir(mir: &MirFunction) -> MachFunc {
     let interner = crate::intern::Interner::new();
@@ -1316,6 +1605,15 @@ pub enum CompiledFunction {
     Aarch64(aarch64::CompiledCode),
     /// WebAssembly module bytes.
     Wasm(wasm::WasmModule),
+}
+
+/// Full compilation artifact for native targets.
+///
+/// The metadata is not consumed by the runtime yet, but preserving it now
+/// gives tiered execution a place to hang precise native-frame rooting data.
+pub struct CompiledArtifact {
+    pub code: CompiledFunction,
+    pub native_meta: Option<Arc<native_meta::NativeFrameMetadata>>,
 }
 
 impl CompiledFunction {
@@ -1392,37 +1690,40 @@ pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFun
     compile_function_with_interner(mir, target, &interner)
 }
 
-/// Compile with access to the VM's interner for symbol resolution.
-pub fn compile_function_with_interner(
+/// Compile with access to the VM's interner and preserve native metadata.
+pub fn compile_function_artifact_with_interner(
     mir: &MirFunction,
     target: Target,
     interner: &crate::intern::Interner,
-) -> Result<CompiledFunction, String> {
+) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
-            // WASM: lower directly from MIR, no MachInst layer needed.
             let module = wasm::emit_mir(mir)?;
-            Ok(CompiledFunction::Wasm(module))
+            Ok(CompiledArtifact {
+                code: CompiledFunction::Wasm(module),
+                native_meta: None,
+            })
         }
         _ => {
-            // 1. Lower MIR → MachFunc (virtual registers)
             let mut mach = lower_mir_with_interner(mir, interner);
-            // Native: register allocation + emit.
+            resolve_parallel_copies(&mut mach);
+            if needs_native_shadow_stack(&mach) {
+                instrument_native_shadow_stores(&mut mach);
+            }
             let target_regs = match target {
                 Target::X86_64 => regalloc::x86_64_target_regs(),
                 Target::Aarch64 => regalloc::aarch64_target_regs(),
                 Target::Wasm => unreachable!(),
             };
-            regalloc::allocate_registers(&mut mach, &target_regs);
+            let alloc = regalloc::allocate_registers_result(&mach, &target_regs);
+            let native_meta = Some(Arc::new(native_meta::build_native_frame_metadata(
+                &mach, &alloc,
+            )));
+            regalloc::apply_allocation(&mut mach, &alloc, target_regs.frame_reserved);
             fixup_sentinels(&mut mach, target);
-            // Insert callee-saved register saves/restores after regalloc.
+            runtime_fns::link_runtime_calls(&mut mach, target, &alloc.assignments);
             insert_callee_saves(&mut mach, target);
 
-            // Link runtime calls AFTER regalloc + fixup so all vregs are
-            // physical registers. Uses parallel copy to avoid clobbering.
-            runtime_fns::link_runtime_calls(&mut mach, target);
-
-            // Debug: dump machine instructions after link_runtime_calls
             if std::env::var("WLIFT_MACH_DUMP").is_ok() {
                 let pretty = interner.resolve(mir.name);
                 eprintln!("=== MachInst dump for {} ({}) ===", pretty, mach.name);
@@ -1432,35 +1733,66 @@ pub fn compile_function_with_interner(
                 eprintln!("=== end ===");
             }
 
-            match target {
+            let code = match target {
                 Target::X86_64 => {
                     let emitted = x86_64::emit(&mach)?;
-                    Ok(CompiledFunction::X86_64(emitted))
+                    CompiledFunction::X86_64(emitted)
                 }
                 #[cfg(target_arch = "aarch64")]
                 Target::Aarch64 => {
                     let compiled = aarch64::emit(&mach)?;
-                    Ok(CompiledFunction::Aarch64(compiled))
+                    CompiledFunction::Aarch64(compiled)
                 }
                 #[cfg(not(target_arch = "aarch64"))]
-                Target::Aarch64 => Err("aarch64 codegen is only available on aarch64 hosts".into()),
+                Target::Aarch64 => {
+                    return Err("aarch64 codegen is only available on aarch64 hosts".into())
+                }
                 Target::Wasm => unreachable!(),
-            }
+            };
+
+            Ok(CompiledArtifact { code, native_meta })
         }
     }
+}
+
+/// Compile with access to the VM's interner for symbol resolution.
+pub fn compile_function_with_interner(
+    mir: &MirFunction,
+    target: Target,
+    interner: &crate::intern::Interner,
+) -> Result<CompiledFunction, String> {
+    compile_function_artifact_with_interner(mir, target, interner).map(|artifact| artifact.code)
 }
 
 /// Replace sentinel VReg indices (frame pointer, spill scratch, ABI regs) with
 /// actual hardware register encodings for the target.
 fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
-    let (fp_enc, gp_scratch, fp_scratch): (u32, u32, u32) = match target {
-        Target::X86_64 => (5, 11, 15),   // RBP, R11, XMM15
-        Target::Aarch64 => (29, 16, 16), // X29, X16, D16
-        Target::Wasm => return,          // WASM has no physical registers.
+    let (fp_enc, gp_scratch, fp_scratch, gp_ret, gp_args, call_scratch, copy_scratch): (
+        u32,
+        u32,
+        u32,
+        u32,
+        [u32; 6],
+        u32,
+        u32,
+    ) = match target {
+        Target::X86_64 => (5, 11, 15, 0, [7, 6, 2, 1, 8, 9], 11, 11),
+        Target::Aarch64 => (29, 16, 16, 0, [0, 1, 2, 3, 4, 5], 16, 17),
+        Target::Wasm => return,
     };
 
     for inst in &mut mach.insts {
-        fixup_vreg_sentinels(inst, fp_enc, gp_scratch, fp_scratch, target);
+        fixup_vreg_sentinels(
+            inst,
+            fp_enc,
+            gp_scratch,
+            fp_scratch,
+            gp_ret,
+            gp_args,
+            call_scratch,
+            copy_scratch,
+            target,
+        );
     }
 }
 
@@ -1470,17 +1802,35 @@ fn fixup_vreg_sentinels(
     fp_enc: u32,
     gp_scratch: u32,
     fp_scratch: u32,
+    gp_ret: u32,
+    gp_args: [u32; 6],
+    call_scratch: u32,
+    copy_scratch: u32,
     _target: Target,
 ) {
     // Visit every VReg field in the instruction.
     let fix = |v: &mut VReg| {
-        if v.index == u32::MAX && v.class == RegClass::Gp {
+        if v.index == FRAME_PTR_SENTINEL && v.class == RegClass::Gp {
             v.index = fp_enc; // frame pointer
-        } else if v.index == u32::MAX - 1 {
+        } else if v.index == SPILL_SCRATCH_SENTINEL {
             v.index = match v.class {
                 RegClass::Gp => gp_scratch,
                 RegClass::Fp | RegClass::Vec => fp_scratch,
             };
+        } else if v.index == ABI_RET_SENTINEL && v.class == RegClass::Gp {
+            v.index = gp_ret;
+        } else if v.class == RegClass::Gp {
+            if let Some((idx, _)) = ABI_ARG_SENTINELS
+                .iter()
+                .enumerate()
+                .find(|(_, sym)| v.index == **sym)
+            {
+                v.index = gp_args[idx];
+            } else if v.index == CALL_SCRATCH_SENTINEL {
+                v.index = call_scratch;
+            } else if v.index == COPY_SCRATCH_SENTINEL {
+                v.index = copy_scratch;
+            }
         }
     };
 
@@ -1639,7 +1989,7 @@ fn fixup_vreg_sentinels(
 fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
     let callee_saved: &[PhysReg] = match target {
         Target::X86_64 => phys_x86_64::ABI.gp_callee_saved,
-        Target::Aarch64 => return, // aarch64 prologue already handles this via stp/ldp
+        Target::Aarch64 => phys_aarch64::ABI.gp_callee_saved,
         Target::Wasm => return,
     };
 
@@ -1706,6 +2056,7 @@ fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
 struct LowerCtx<'a> {
     mf: &'a mut MachFunc,
     mir: &'a MirFunction,
+    value_types: Vec<crate::mir::MirType>,
     /// MIR ValueId → VReg mapping.
     val_map: HashMap<ValueId, VReg>,
     /// MIR BlockId → Label mapping.
@@ -1722,6 +2073,8 @@ struct LowerCtx<'a> {
     deopt_label: Option<Label>,
     /// VRegs for entry block parameters (function args), in ABI order.
     entry_param_vregs: Vec<VReg>,
+    /// JIT call-site index mirrored from bytecode lowering order.
+    jit_call_site_count: u32,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -1765,6 +2118,7 @@ impl<'a> LowerCtx<'a> {
         Self {
             mf,
             mir,
+            value_types: infer_mir_value_types(mir),
             val_map: HashMap::new(),
             block_labels,
             interner,
@@ -1773,6 +2127,7 @@ impl<'a> LowerCtx<'a> {
             use_count,
             deopt_label: None,
             entry_param_vregs: Vec::new(),
+            jit_call_site_count: 0,
         }
     }
 
@@ -1783,6 +2138,15 @@ impl<'a> LowerCtx<'a> {
         }
         // Default to GP — callers can override for FP values.
         let r = self.mf.new_gp();
+        if self
+            .value_types
+            .get(val.0 as usize)
+            .copied()
+            .unwrap_or(crate::mir::MirType::Value)
+            == crate::mir::MirType::Value
+        {
+            self.mf.mark_boxed_gp(r);
+        }
         self.val_map.insert(val, r);
         r
     }
@@ -1836,7 +2200,7 @@ impl<'a> LowerCtx<'a> {
                 _ => "wren_deopt_4",
             };
             let args: Vec<VReg> = self.entry_param_vregs.iter().take(4).copied().collect();
-            let ret_reg = VReg::gp(0);
+            let ret_reg = VReg::gp(ABI_RET_SENTINEL);
             self.mf.emit(MachInst::CallRuntime {
                 name: deopt_fn,
                 args,
@@ -2200,9 +2564,12 @@ impl<'a> LowerCtx<'a> {
                 let dst = self.vreg_for(dst_val);
                 let mut call_args = vec![r];
                 let method_reg = self.mf.new_gp();
+                let packed_method =
+                    (method.index() as u64) | (((self.jit_call_site_count + 1) as u64) << 32);
+                self.jit_call_site_count += 1;
                 self.mf.emit(MachInst::LoadImm {
                     dst: method_reg,
-                    bits: method.index() as u64,
+                    bits: packed_method,
                 });
                 call_args.push(method_reg);
                 for a in args {
@@ -2944,7 +3311,7 @@ impl<'a> LowerCtx<'a> {
             Terminator::Return(v) => {
                 let src = self.vreg_for(*v);
                 // Move return value into GP r0 (ABI return register).
-                let ret_reg = VReg::gp(0);
+                let ret_reg = VReg::gp(ABI_RET_SENTINEL);
                 if src.is_fp() {
                     // FP value → GP: bitcast (e.g. unboxed f64 returned as NaN-boxed bits).
                     self.mf.emit(MachInst::BitcastFpToGp { dst: ret_reg, src });
@@ -2955,7 +3322,7 @@ impl<'a> LowerCtx<'a> {
                 self.mf.emit(MachInst::Ret);
             }
             Terminator::ReturnNull => {
-                let ret_reg = VReg::gp(0);
+                let ret_reg = VReg::gp(ABI_RET_SENTINEL);
                 self.mf.emit(MachInst::LoadImm {
                     dst: ret_reg,
                     bits: 0x7FFC_0000_0000_0000,
@@ -4837,8 +5204,8 @@ mod tests {
         let mut mf = MachFunc::new("test".to_string());
         // Simulate a spill load using sentinel registers.
         mf.emit(MachInst::Ldr {
-            dst: VReg::gp(u32::MAX - 1),           // GP scratch sentinel
-            mem: Mem::new(VReg::gp(u32::MAX), -8), // frame ptr sentinel
+            dst: VReg::gp(SPILL_SCRATCH_SENTINEL), // GP scratch sentinel
+            mem: Mem::new(VReg::gp(FRAME_PTR_SENTINEL), -8), // frame ptr sentinel
         });
 
         fixup_sentinels(&mut mf, Target::X86_64);
@@ -4855,8 +5222,8 @@ mod tests {
     fn test_fixup_sentinels_aarch64() {
         let mut mf = MachFunc::new("test".to_string());
         mf.emit(MachInst::FLdr {
-            dst: VReg::fp(u32::MAX - 1),            // FP scratch sentinel
-            mem: Mem::new(VReg::gp(u32::MAX), -16), // frame ptr sentinel
+            dst: VReg::fp(SPILL_SCRATCH_SENTINEL), // FP scratch sentinel
+            mem: Mem::new(VReg::gp(FRAME_PTR_SENTINEL), -16), // frame ptr sentinel
         });
 
         fixup_sentinels(&mut mf, Target::Aarch64);
@@ -4866,6 +5233,56 @@ mod tests {
             assert_eq!(mem.base.index, 29, "frame ptr should be X29 on aarch64");
         } else {
             panic!("expected FLdr");
+        }
+    }
+
+    #[test]
+    fn test_fixup_sentinels_abi_return_reg() {
+        let mut mf = MachFunc::new("test".to_string());
+        mf.emit(MachInst::Mov {
+            dst: VReg::gp(ABI_RET_SENTINEL),
+            src: VReg::gp(SPILL_SCRATCH_SENTINEL),
+        });
+
+        fixup_sentinels(&mut mf, Target::Aarch64);
+
+        if let MachInst::Mov { dst, src } = &mf.insts[0] {
+            assert_eq!(dst.index, 0, "ABI return sentinel should map to X0");
+            assert_eq!(src.index, 16, "spill scratch should map to X16");
+        } else {
+            panic!("expected Mov");
+        }
+    }
+
+    #[test]
+    fn test_return_spilled_value_reloads_into_abi_return_reg() {
+        use crate::codegen::regalloc::{apply_allocation, Location, RegAllocResult};
+
+        let mut mf = MachFunc::new("test".to_string());
+        mf.emit(MachInst::Mov {
+            dst: VReg::gp(ABI_RET_SENTINEL),
+            src: VReg::gp(1),
+        });
+        mf.emit(MachInst::Ret);
+
+        let result = RegAllocResult {
+            assignments: std::collections::HashMap::from([(VReg::gp(1), Location::Spill(-8))]),
+            num_spill_slots: 1,
+            intervals: vec![],
+        };
+
+        apply_allocation(&mut mf, &result, 16);
+        fixup_sentinels(&mut mf, Target::Aarch64);
+
+        assert!(
+            matches!(mf.insts[0], MachInst::Ldr { .. }),
+            "spilled return value should be reloaded before the return move"
+        );
+        if let MachInst::Mov { dst, src } = &mf.insts[1] {
+            assert_eq!(dst.index, 0, "return move should target X0");
+            assert_eq!(src.index, 16, "reloaded spill should come from X16 scratch");
+        } else {
+            panic!("expected return move");
         }
     }
 

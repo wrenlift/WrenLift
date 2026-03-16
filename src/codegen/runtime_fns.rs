@@ -13,6 +13,226 @@ use crate::runtime::object::{
 /// - x86_64: System V ABI (RDI, RSI, RDX, RCX, R8, R9 → RAX)
 /// - aarch64: AAPCS64 (X0-X7 → X0)
 use crate::runtime::value::Value;
+use std::sync::OnceLock;
+
+#[derive(Clone, Default)]
+struct NativeShadowFrame {
+    roots: Vec<Value>,
+}
+
+#[inline(always)]
+fn decode_method_and_ic(packed: u64) -> (crate::intern::SymbolId, Option<usize>) {
+    let method = crate::intern::SymbolId::from_raw(packed as u32);
+    let ic_tag = (packed >> 32) as u32;
+    let ic_idx = if ic_tag == 0 {
+        None
+    } else {
+        Some((ic_tag - 1) as usize)
+    };
+    (method, ic_idx)
+}
+
+#[inline(always)]
+fn cache_key_class(
+    vm: &crate::runtime::vm::VM,
+    recv: Value,
+    class: *mut ObjClass,
+) -> *mut ObjClass {
+    if class == vm.class_class {
+        recv.as_object().unwrap_or(std::ptr::null_mut()) as *mut ObjClass
+    } else {
+        class
+    }
+}
+
+#[inline(always)]
+fn current_jit_callsite_ic(
+    vm: &mut crate::runtime::vm::VM,
+    ic_idx: usize,
+) -> Option<*mut crate::mir::bytecode::CallSiteIC> {
+    let ctx = read_jit_ctx();
+    let closure_ptr = ctx.closure as *mut ObjClosure;
+    if closure_ptr.is_null() {
+        return None;
+    }
+
+    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+    let bc_ptr = vm
+        .engine
+        .bc_cache
+        .get(func_id.0 as usize)
+        .copied()
+        .filter(|p| !p.is_null())
+        .or_else(|| vm.engine.ensure_bytecode(func_id))?;
+    let bc = unsafe { &mut *(bc_ptr as *mut crate::mir::bytecode::BytecodeFunction) };
+    let ic_table = unsafe { &mut *bc.ic_table.get() };
+    ic_table.get_mut(ic_idx).map(|ic| ic as *mut _)
+}
+
+#[inline(always)]
+unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    match args.len() {
+        0 => {
+            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
+            f()
+        }
+        1 => {
+            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits())
+        }
+        2 => {
+            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits(), args[1].to_bits())
+        }
+        3 => {
+            let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+        }
+        _ => {
+            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+            )
+        }
+    }
+}
+
+#[inline(always)]
+fn populate_callsite_ic(
+    vm: &crate::runtime::vm::VM,
+    ic_ptr: *mut crate::mir::bytecode::CallSiteIC,
+    cache_key_class: *mut ObjClass,
+    method: Method,
+    defining_class: *mut ObjClass,
+) {
+    let entry = match method {
+        Method::Closure(closure_ptr) => {
+            let fn_idx = unsafe { (*(*closure_ptr).function).fn_id } as usize;
+            let jit_ptr = vm
+                .engine
+                .jit_code
+                .get(fn_idx)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            if !jit_ptr.is_null()
+                && !jit_disabled()
+                && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
+            {
+                crate::mir::bytecode::CallSiteIC {
+                    class: cache_key_class as usize,
+                    jit_ptr,
+                    closure: closure_ptr as *const u8,
+                    func_id: fn_idx as u32,
+                    kind: 1,
+                }
+            } else {
+                crate::mir::bytecode::CallSiteIC {
+                    class: cache_key_class as usize,
+                    jit_ptr: defining_class as *const u8,
+                    closure: closure_ptr as *const u8,
+                    func_id: fn_idx as u32,
+                    kind: 2,
+                }
+            }
+        }
+        Method::Constructor(closure_ptr) => crate::mir::bytecode::CallSiteIC {
+            class: cache_key_class as usize,
+            jit_ptr: defining_class as *const u8,
+            closure: closure_ptr as *const u8,
+            func_id: unsafe { (*(*closure_ptr).function).fn_id },
+            kind: 3,
+        },
+        Method::Native(native_fn) => crate::mir::bytecode::CallSiteIC {
+            class: cache_key_class as usize,
+            jit_ptr: std::ptr::null(),
+            closure: native_fn as *const () as *const u8,
+            func_id: 0,
+            kind: 4,
+        },
+    };
+
+    unsafe {
+        *ic_ptr = entry;
+    }
+}
+
+#[inline(always)]
+fn try_dispatch_callsite_ic(
+    vm: &mut crate::runtime::vm::VM,
+    ic_ptr: *mut crate::mir::bytecode::CallSiteIC,
+    recv: Value,
+    args: &[Value],
+    cache_key_class: *mut ObjClass,
+) -> Option<u64> {
+    let ic = unsafe { &mut *ic_ptr };
+    if ic.class != cache_key_class as usize || ic.class == 0 {
+        return None;
+    }
+
+    match ic.kind {
+        1 => {
+            if args.len() > 4 {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return None;
+            }
+            let fn_idx = ic.func_id as usize;
+            let live_ptr = vm
+                .engine
+                .jit_code
+                .get(fn_idx)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            if live_ptr.is_null()
+                || live_ptr != ic.jit_ptr
+                || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
+                || jit_disabled()
+            {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return None;
+            }
+            Some(unsafe { call_jit_cached(live_ptr, args) })
+        }
+        2 => {
+            let closure_ptr = ic.closure as *mut ObjClosure;
+            if closure_ptr.is_null() {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return None;
+            }
+            let defining_class = ic.jit_ptr as *mut ObjClass;
+            Some(call_closure_jit_or_sync(
+                vm,
+                closure_ptr,
+                args,
+                if defining_class.is_null() {
+                    None
+                } else {
+                    Some(defining_class)
+                },
+            ))
+        }
+        3 => {
+            let closure_ptr = ic.closure as *mut ObjClosure;
+            let class_ptr = recv.as_object().unwrap_or(std::ptr::null_mut()) as *mut ObjClass;
+            if closure_ptr.is_null() || class_ptr.is_null() || args.is_empty() {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return Some(Value::null().to_bits());
+            }
+            Some(
+                vm.call_constructor_sync(class_ptr, closure_ptr, &args[1..])
+                    .to_bits(),
+            )
+        }
+        4 => {
+            let native_fn: crate::runtime::object::NativeFn =
+                unsafe { std::mem::transmute(ic.closure) };
+            Some(native_fn(vm, args).to_bits())
+        }
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // JIT context — thread-local VM state for runtime functions
@@ -77,9 +297,18 @@ thread_local! {
     /// SAFETY: single-threaded access within each thread (no concurrent borrows).
     static JIT_ROOTS_STORE: std::cell::UnsafeCell<Vec<Value>> = const { std::cell::UnsafeCell::new(Vec::new()) };
 
+    /// Native shadow stack — conservative boxed-value mirrors for active
+    /// compiled frames. Each frame stores one slot per boxed GP vreg.
+    static NATIVE_SHADOW_STACK: std::cell::UnsafeCell<Vec<NativeShadowFrame>> =
+        const { std::cell::UnsafeCell::new(Vec::new()) };
+
     /// JIT native recursion depth — guards against native stack overflow.
     /// When depth exceeds MAX_JIT_DEPTH, calls fall back to interpreter dispatch.
     static JIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+    /// When true, all JIT dispatch is disabled (fall back to interpreter).
+    /// Used by shadow check to run interpreter-only path for comparison.
+    static JIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Maximum native JIT recursion depth before falling back to interpreter.
@@ -97,6 +326,18 @@ pub fn jit_depth() -> u32 {
 #[inline(always)]
 pub fn set_jit_depth(depth: u32) {
     JIT_DEPTH.with(|d| d.set(depth));
+}
+
+/// Check if JIT dispatch is disabled (for shadow check mode).
+#[inline(always)]
+pub fn jit_disabled() -> bool {
+    JIT_DISABLED.with(|d| d.get())
+}
+
+#[inline(always)]
+pub fn shadow_nonleaf_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WLIFT_SHADOW_NONLEAF").is_some())
 }
 
 /// Set up the JIT context before calling compiled code.
@@ -223,6 +464,79 @@ fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
     }
 }
 
+pub fn push_native_shadow_frame(slot_count: usize) {
+    NATIVE_SHADOW_STACK.with(|stack| unsafe {
+        (*stack.get()).push(NativeShadowFrame {
+            roots: vec![Value::null(); slot_count],
+        });
+    });
+}
+
+pub fn pop_native_shadow_frame() {
+    NATIVE_SHADOW_STACK.with(|stack| unsafe {
+        let frames = &mut *stack.get();
+        let _ = frames.pop();
+        if frames.capacity() > 64 && frames.len() < 16 {
+            frames.shrink_to(32);
+        }
+    });
+}
+
+pub fn take_native_shadow_roots() -> (Vec<usize>, Vec<Value>) {
+    NATIVE_SHADOW_STACK.with(|stack| unsafe {
+        let frames = std::mem::take(&mut *stack.get());
+        let mut lengths = Vec::with_capacity(frames.len());
+        let total_roots = frames.iter().map(|frame| frame.roots.len()).sum();
+        let mut roots = Vec::with_capacity(total_roots);
+        for frame in frames {
+            lengths.push(frame.roots.len());
+            roots.extend(frame.roots);
+        }
+        (lengths, roots)
+    })
+}
+
+pub fn set_native_shadow_roots(lengths: Vec<usize>, roots: Vec<Value>) {
+    NATIVE_SHADOW_STACK.with(|stack| unsafe {
+        let mut rebuilt = Vec::with_capacity(lengths.len());
+        let mut offset = 0usize;
+        for len in lengths {
+            let end = offset.saturating_add(len);
+            rebuilt.push(NativeShadowFrame {
+                roots: roots[offset..end].to_vec(),
+            });
+            offset = end;
+        }
+        *stack.get() = rebuilt;
+    });
+}
+
+#[inline(always)]
+fn current_shadow_slot_count(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+) -> usize {
+    vm.engine
+        .jit_metadata
+        .get(func_id.0 as usize)
+        .and_then(|meta| meta.as_ref())
+        .map(|meta| meta.boxed_values.len())
+        .unwrap_or(0)
+}
+
+pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
+    let slot = slot as usize;
+    let value = Value::from_bits(value);
+    NATIVE_SHADOW_STACK.with(|stack| unsafe {
+        if let Some(frame) = (&mut *stack.get()).last_mut() {
+            if slot < frame.roots.len() {
+                frame.roots[slot] = value;
+            }
+        }
+    });
+    value.to_bits()
+}
+
 /// Get the VM pointer from the JIT context.
 /// # Safety
 /// Caller must ensure the VM pointer is valid.
@@ -326,57 +640,64 @@ pub fn call_closure_jit_or_sync(
     });
 
     // Install completed compilations so we can dispatch natively.
-    vm.engine.poll_compilations();
+    if vm.engine.has_pending_compilations() {
+        vm.engine.poll_compilations();
+    }
     if args.len() <= 4 {
         let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
 
-        let native_fn_ptr: Option<*const u8> = vm
-            .engine
-            .jit_code
-            .get(func_id.0 as usize)
-            .copied()
-            .filter(|p| !p.is_null())
-            .map(|p| p as *const u8);
+        let native_fn_ptr: Option<*const u8> = if JIT_DISABLED.with(|d| d.get()) {
+            None
+        } else {
+            vm.engine
+                .jit_code
+                .get(func_id.0 as usize)
+                .copied()
+                .filter(|p| !p.is_null())
+                .map(|p| p as *const u8)
+        };
 
         if let Some(fn_ptr) = native_fn_ptr {
             // Guard: check native recursion depth to prevent stack overflow.
             // Each JIT call level uses ~1-2KB native stack; limit to 256 levels.
             let depth = JIT_DEPTH.with(|d| d.get());
+            let is_leaf = vm
+                .engine
+                .jit_leaf
+                .get(func_id.0 as usize)
+                .copied()
+                .unwrap_or(false);
+            // Nested non-leaf native calls are not safe yet: if the callee
+            // allocates or re-enters the interpreter, the caller's native frame
+            // still has live boxed values with no stack map / root metadata.
+            // That is fatal for moving GC and can still lead to collection of
+            // live objects under non-moving GC. Keep top-level non-leaf native
+            // execution available, but route nested non-leaf calls through the
+            // interpreter until native frame rooting exists.
+            if depth > 0 && !is_leaf && !shadow_nonleaf_enabled() {
+                let result = vm
+                    .call_closure_sync(closure_ptr, args, defining_class)
+                    .map(|v| v.to_bits())
+                    .unwrap_or(Value::null().to_bits());
+                set_jit_context(saved_ctx);
+                return result;
+            }
+
             if depth < MAX_JIT_DEPTH {
                 JIT_DEPTH.with(|d| d.set(depth + 1));
+                let root_len_before = jit_roots_snapshot_len();
+                let shadow_slot_count = current_shadow_slot_count(vm, func_id);
+                if shadow_slot_count > 0 {
+                    push_native_shadow_frame(shadow_slot_count);
+                }
                 // Native-to-native dispatch: call compiled code directly.
-                let result = unsafe {
-                    match args.len() {
-                        0 => {
-                            let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
-                            f()
-                        }
-                        1 => {
-                            let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-                            f(args[0].to_bits())
-                        }
-                        2 => {
-                            let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-                            f(args[0].to_bits(), args[1].to_bits())
-                        }
-                        3 => {
-                            let f: extern "C" fn(u64, u64, u64) -> u64 =
-                                std::mem::transmute(fn_ptr);
-                            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
-                        }
-                        _ => {
-                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                                std::mem::transmute(fn_ptr);
-                            f(
-                                args[0].to_bits(),
-                                args[1].to_bits(),
-                                args[2].to_bits(),
-                                args[3].to_bits(),
-                            )
-                        }
-                    }
-                };
+                let result = unsafe { call_jit_cached(fn_ptr, args) };
                 JIT_DEPTH.with(|d| d.set(depth));
+
+                if shadow_slot_count > 0 {
+                    pop_native_shadow_frame();
+                }
+                jit_roots_restore_len(root_len_before);
                 // Restore caller's JIT context.
                 set_jit_context(saved_ctx);
                 return result;
@@ -386,7 +707,8 @@ pub fn call_closure_jit_or_sync(
     }
 
     // Fall back to interpreter.
-    let result = vm.call_closure_sync(closure_ptr, args, defining_class)
+    let result = vm
+        .call_closure_sync(closure_ptr, args, defining_class)
         .map(|v| v.to_bits())
         .unwrap_or(Value::null().to_bits());
     // Restore caller's JIT context.
@@ -394,37 +716,77 @@ pub fn call_closure_jit_or_sync(
     result
 }
 
+/// Walk the class hierarchy to find the method and its defining class.
+/// Unlike `find_method()` which returns from the flat copied table,
+/// this walks superclass pointers to find the original defining class —
+/// needed for correct super() dispatch and static field access.
+unsafe fn find_method_with_class(
+    cls: *mut ObjClass,
+    method: crate::intern::SymbolId,
+) -> Option<(Method, *mut ObjClass)> {
+    let idx = method.index() as usize;
+    let mut c = cls;
+    while !c.is_null() {
+        let cls_ref = &*c;
+        if idx < cls_ref.methods.len() {
+            if let Some(m) = &cls_ref.methods[idx] {
+                return Some((m.clone(), c));
+            }
+        }
+        c = (*c).superclass;
+    }
+    None
+}
+
 /// Internal: dispatch a method call with a pre-built args slice.
-fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value]) -> u64 {
+fn dispatch_call(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
         None => return Value::null().to_bits(),
     };
+    let (method_sym, ic_idx) = decode_method_and_ic(method_packed);
+
+    // Match the interpreter's closure call fast path. Fn.call(...) is a stub
+    // on the Fn class; actual closure invocation must pass only the user args.
+    if vm.is_call_sym(method_sym) && recv.is_object() {
+        if let Some(ptr) = recv.as_object() {
+            let header = ptr as *const ObjHeader;
+            if unsafe { (*header).obj_type } == ObjType::Closure {
+                let closure_ptr = ptr as *mut ObjClosure;
+                return call_closure_jit_or_sync(vm, closure_ptr, &args[1..], None);
+            }
+        }
+    }
 
     let class = vm.class_of(recv);
+    let cache_key_class = cache_key_class(vm, recv, class);
+    let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, idx));
 
-    // For class receivers, use the actual class object as cache key
-    // (not class_class, since all classes share that metaclass).
-    let cache_key_class = if class == vm.class_class {
-        recv.as_object().unwrap_or(std::ptr::null_mut()) as *mut ObjClass
-    } else {
-        class
-    };
+    if let Some(ic_ptr) = ic_ptr {
+        if let Some(result) = try_dispatch_callsite_ic(vm, ic_ptr, recv, args, cache_key_class) {
+            return result;
+        }
+    }
 
     // Check method cache first (avoids find_method + static symbol resolution).
     if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method_sym) {
+        if let Some(ic_ptr) = ic_ptr {
+            populate_callsite_ic(vm, ic_ptr, cache_key_class, m, dc);
+        }
         return dispatch_method(vm, m, args, Some(dc));
     }
 
-    // Cache miss: full lookup.
-    let method_entry = unsafe { (*class).find_method(method_sym).cloned() };
+    // Cache miss: full hierarchy lookup to get the correct defining class.
+    let lookup = unsafe { find_method_with_class(class, method_sym) };
 
-    match method_entry {
-        Some(m) => {
-            vm.method_cache
-                .insert(cache_key_class, method_sym, m.clone(), class);
-            dispatch_method(vm, m, args, Some(class))
+    match lookup {
+        Some((m, dc)) => {
+            vm.method_cache.insert(cache_key_class, method_sym, m, dc);
+            if let Some(ic_ptr) = ic_ptr {
+                populate_callsite_ic(vm, ic_ptr, cache_key_class, m, dc);
+            }
+            dispatch_method(vm, m, args, Some(dc))
         }
         None => {
             // Try static method dispatch (receiver IS a class object)
@@ -440,14 +802,16 @@ fn dispatch_call(recv: Value, method_sym: crate::intern::SymbolId, args: &[Value
                     let static_str = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
                     vm.interner
                         .lookup(static_str)
-                        .and_then(|sym| unsafe { (*cache_key_class).find_method(sym).cloned() })
+                        .and_then(|sym| unsafe { find_method_with_class(cache_key_class, sym) })
                 } else {
                     None
                 };
-                if let Some(m) = found {
-                    vm.method_cache
-                        .insert(cache_key_class, method_sym, m.clone(), cache_key_class);
-                    dispatch_method(vm, m, args, Some(cache_key_class))
+                if let Some((m, dc)) = found {
+                    vm.method_cache.insert(cache_key_class, method_sym, m, dc);
+                    if let Some(ic_ptr) = ic_ptr {
+                        populate_callsite_ic(vm, ic_ptr, cache_key_class, m, dc);
+                    }
+                    dispatch_method(vm, m, args, Some(dc))
                 } else {
                     Value::null().to_bits()
                 }
@@ -491,24 +855,21 @@ fn dispatch_method(
 /// Call a method with 0 extra args. Codegen: [receiver, method_sym]
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     let recv = Value::from_bits(receiver);
-    let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_call(recv, sym, &[recv])
+    dispatch_call(recv, method, &[recv])
 }
 
 /// Call with 1 extra arg. Codegen: [receiver, method_sym, arg0]
 pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
     let recv = Value::from_bits(receiver);
-    let sym = crate::intern::SymbolId::from_raw(method as u32);
-    dispatch_call(recv, sym, &[recv, Value::from_bits(a0)])
+    dispatch_call(recv, method, &[recv, Value::from_bits(a0)])
 }
 
 /// Call with 2 extra args.
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
     let recv = Value::from_bits(receiver);
-    let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_call(
         recv,
-        sym,
+        method,
         &[recv, Value::from_bits(a0), Value::from_bits(a1)],
     )
 }
@@ -516,10 +877,9 @@ pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u
 /// Call with 3 extra args.
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let recv = Value::from_bits(receiver);
-    let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_call(
         recv,
-        sym,
+        method,
         &[
             recv,
             Value::from_bits(a0),
@@ -539,10 +899,9 @@ pub extern "C" fn wren_call_4(
     a3: u64,
 ) -> u64 {
     let recv = Value::from_bits(receiver);
-    let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_call(
         recv,
-        sym,
+        method,
         &[
             recv,
             Value::from_bits(a0),
@@ -590,23 +949,23 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
         return Value::null().to_bits();
     }
 
-    // Try direct lookup first, then fall back to "static:" prefix.
+    // Walk the superclass hierarchy to find the method and its defining class.
     // Constructors are registered under "static:new(_)" etc., but super calls
     // use the bare method symbol "new(_)".
-    let method_entry = unsafe {
-        (*superclass).find_method(method_sym).cloned().or_else(|| {
+    let lookup = unsafe {
+        find_method_with_class(superclass, method_sym).or_else(|| {
             let method_name = vm.interner.resolve(method_sym);
             let static_name = format!("static:{}", method_name);
             let static_sym = vm.interner.intern(&static_name);
-            (*superclass).find_method(static_sym).cloned()
+            find_method_with_class(superclass, static_sym)
         })
     };
-    match method_entry {
-        Some(Method::Native(native_fn)) => native_fn(vm, args).to_bits(),
-        Some(Method::Closure(closure_ptr)) => {
-            call_closure_jit_or_sync(vm, closure_ptr, args, Some(superclass))
+    match lookup {
+        Some((Method::Native(native_fn), _dc)) => native_fn(vm, args).to_bits(),
+        Some((Method::Closure(closure_ptr), dc)) => {
+            call_closure_jit_or_sync(vm, closure_ptr, args, Some(dc))
         }
-        Some(Method::Constructor(closure_ptr)) => {
+        Some((Method::Constructor(closure_ptr), dc)) => {
             // Super constructor calls are correct: args[0] is already 'this' (the
             // newly allocated instance), not the class. Use call_closure_sync to
             // avoid GC-unsafe JIT dispatch with potentially stale 'this' pointer.
@@ -614,7 +973,7 @@ fn dispatch_super_call(recv: Value, method_sym: crate::intern::SymbolId, args: &
             if args.is_empty() {
                 return Value::null().to_bits();
             }
-            vm.call_closure_sync(closure_ptr, args, Some(superclass))
+            vm.call_closure_sync(closure_ptr, args, Some(dc))
                 .map(|v| v.to_bits())
                 .unwrap_or(args[0].to_bits())
         }
@@ -1259,6 +1618,7 @@ pub extern "C" fn wren_fp_max(a: u64, b: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// ABI argument registers for each target (physical register indices).
+#[allow(dead_code)]
 fn abi_regs(target: super::Target) -> (&'static [u32], u32, u32, u32) {
     // Returns (arg_regs, ret_reg, call_scratch, copy_scratch)
     match target {
@@ -1349,6 +1709,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Upvalues
         "wren_get_upvalue" => Some(wren_get_upvalue as *const () as usize),
         "wren_set_upvalue" => Some(wren_set_upvalue as *const () as usize),
+        "wren_shadow_store" => Some(wren_shadow_store as *const () as usize),
         // Static fields
         "wren_get_static_field" => Some(wren_get_static_field as *const () as usize),
         "wren_set_static_field" => Some(wren_set_static_field as *const () as usize),
@@ -1379,6 +1740,7 @@ pub fn resolve(name: &str) -> Option<usize> {
 ///
 /// Returns a Vec where `result[i]` is the set of GP register indices that are
 /// live immediately after instruction `i` executes.
+#[allow(dead_code)]
 fn compute_live_out(insts: &[MachInst]) -> Vec<std::collections::HashSet<u32>> {
     use std::collections::{HashMap, HashSet};
 
@@ -1489,128 +1851,106 @@ fn compute_live_out(insts: &[MachInst]) -> Vec<std::collections::HashSet<u32>> {
 // CallRuntime → ABI setup + CallInd lowering pass
 // ---------------------------------------------------------------------------
 
-use crate::codegen::{MachFunc, MachInst, VReg};
+use crate::codegen::{MachFunc, MachInst, Mem, VReg};
 
-/// Lower all `CallRuntime` instructions to proper ABI calling sequences.
+/// Lower all `CallRuntime` instructions after register allocation, using the
+/// final register/spill assignments to build correct ABI setup sequences.
 ///
-/// This pass MUST run AFTER register allocation and sentinel fixup, when all
-/// vregs are physical register indices. It uses parallel copy resolution to
-/// avoid the classic register-clobbering problem with sequential moves.
-///
-/// Sequence per call:
-/// 1. Parallel copy: move arguments from their physical registers to ABI arg registers
-/// 2. Load function address into scratch register
-/// 3. Indirect call via scratch
-/// 4. Move return value from ABI return register to destination
-pub fn link_runtime_calls(mf: &mut MachFunc, target: super::Target) {
+/// Register-sourced arguments are scheduled with a physical-register parallel
+/// copy resolver, while spilled arguments are loaded directly from their stack
+/// slots into ABI argument registers after any clobber-sensitive register moves.
+pub fn link_runtime_calls(
+    mf: &mut MachFunc,
+    target: super::Target,
+    assignments: &std::collections::HashMap<VReg, crate::codegen::regalloc::Location>,
+) {
     let (abi_args, abi_ret, call_scratch, copy_scratch) = abi_regs(target);
     if abi_args.is_empty() {
         return;
-    } // Wasm: no runtime calls
-
-    // Build caller-saved register set for this target.
-    let caller_saved: &[super::PhysReg] = match target {
-        super::Target::Aarch64 => super::phys_aarch64::ABI.gp_caller_saved,
-        super::Target::X86_64 => super::phys_x86_64::ABI.gp_caller_saved,
+    }
+    let frame_ptr = match target {
+        super::Target::X86_64 => VReg::gp(5),
+        super::Target::Aarch64 => VReg::gp(29),
         super::Target::Wasm => return,
     };
-    let caller_saved_set: std::collections::HashSet<u32> =
-        caller_saved.iter().map(|r| r.hw_enc as u32).collect();
 
-    // Compute precise per-instruction liveness via iterative dataflow.
-    // This correctly handles loops (backward edges) unlike a forward-only scan.
-    // We pre-collect liveness data keyed by ORIGINAL instruction index, since
-    // splicing new instructions shifts positions.
-    let live_out_per_inst = compute_live_out(&mf.insts);
-
-    // Pre-collect all CallRuntime data keyed by original index.
-    let mut call_sites: Vec<(usize, &'static str, Vec<VReg>, Option<VReg>, std::collections::HashSet<u32>)> = Vec::new();
+    let mut call_sites: Vec<(usize, &'static str, Vec<VReg>, Option<VReg>)> = Vec::new();
     for (orig_i, inst) in mf.insts.iter().enumerate() {
         if let MachInst::CallRuntime { name, args, ret } = inst {
-            call_sites.push((orig_i, *name, args.clone(), *ret, live_out_per_inst[orig_i].clone()));
+            call_sites.push((orig_i, *name, args.clone(), *ret));
         }
     }
 
-    // Process call sites in reverse order so splicing doesn't affect earlier indices.
-    for (orig_i, name, args, ret, live_across) in call_sites.into_iter().rev() {
+    for (orig_i, name, args, ret) in call_sites.into_iter().rev() {
         let addr = match resolve(name) {
             Some(a) => a,
             None => continue,
         };
 
-        // Only save caller-saved regs that are live, excluding scratch and
-        // result registers.
-        let mut excluded: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        if ret.is_none_or(|rv| rv.index == abi_ret) {
-            excluded.insert(abi_ret);
-        }
-        excluded.insert(call_scratch);
-        excluded.insert(copy_scratch);
-        if let Some(rv) = ret {
-            excluded.insert(rv.index);
+        let mut reg_moves: Vec<(u32, u32)> = Vec::new();
+        let mut spill_loads: Vec<(i32, u32)> = Vec::new();
+
+        for (idx, vreg) in args.iter().enumerate().take(abi_args.len()) {
+            let dst = abi_args[idx];
+            match assignments.get(vreg) {
+                Some(crate::codegen::regalloc::Location::Reg(phys)) => {
+                    reg_moves.push((phys.hw_enc as u32, dst));
+                }
+                Some(crate::codegen::regalloc::Location::Spill(offset)) => {
+                    spill_loads.push((*offset, dst));
+                }
+                None => reg_moves.push((vreg.index, dst)),
+            }
         }
 
-        let mut save_regs: Vec<u32> = caller_saved_set
-            .intersection(&live_across)
-            .copied()
-            .filter(|r| !excluded.contains(r))
-            .collect();
-        save_regs.sort();
-
+        let resolved = resolve_parallel_copy(&reg_moves, copy_scratch);
         let mut new_insts: Vec<MachInst> = Vec::new();
-
-        // 0. Push caller-saved live registers.
-        let needs_align_pad =
-            target == super::Target::X86_64 && !save_regs.len().is_multiple_of(2);
-        if needs_align_pad {
-            new_insts.push(MachInst::StackAlloc { bytes: 8 });
-        }
-        for &reg in &save_regs {
-            new_insts.push(MachInst::Push { src: VReg::gp(reg) });
-        }
-
-        // 1. Build (src_phys, dst_abi) move pairs and resolve in parallel
-        let moves: Vec<(u32, u32)> = args
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| *idx < abi_args.len())
-            .map(|(idx, vreg)| (vreg.index, abi_args[idx]))
-            .collect();
-
-        for (src, dst) in resolve_parallel_copy(&moves, copy_scratch) {
+        for (src, dst) in resolved {
             new_insts.push(MachInst::Mov {
                 dst: VReg::gp(dst),
                 src: VReg::gp(src),
             });
         }
 
-        // 2. Load function address into scratch register
+        for (offset, dst) in spill_loads {
+            new_insts.push(MachInst::Ldr {
+                dst: VReg::gp(dst),
+                mem: Mem::new(frame_ptr, offset),
+            });
+        }
+
         new_insts.push(MachInst::LoadImm {
             dst: VReg::gp(call_scratch),
             bits: addr as u64,
         });
-
-        // 3. Indirect call
         new_insts.push(MachInst::CallInd {
             target: VReg::gp(call_scratch),
         });
 
-        // 4. Move return value from ABI return register
         if let Some(ret_vreg) = ret {
-            if ret_vreg.index != abi_ret {
-                new_insts.push(MachInst::Mov {
-                    dst: ret_vreg,
-                    src: VReg::gp(abi_ret),
-                });
+            match assignments.get(&ret_vreg) {
+                Some(crate::codegen::regalloc::Location::Reg(phys))
+                    if phys.hw_enc as u32 != abi_ret =>
+                {
+                    new_insts.push(MachInst::Mov {
+                        dst: VReg::gp(phys.hw_enc as u32),
+                        src: VReg::gp(abi_ret),
+                    });
+                }
+                Some(crate::codegen::regalloc::Location::Spill(offset)) => {
+                    new_insts.push(MachInst::Str {
+                        src: VReg::gp(abi_ret),
+                        mem: Mem::new(frame_ptr, *offset),
+                    });
+                }
+                _ if ret_vreg.index != abi_ret => {
+                    new_insts.push(MachInst::Mov {
+                        dst: ret_vreg,
+                        src: VReg::gp(abi_ret),
+                    });
+                }
+                _ => {}
             }
-        }
-
-        // 5. Pop caller-saved live registers (reverse order)
-        for &reg in save_regs.iter().rev() {
-            new_insts.push(MachInst::Pop { dst: VReg::gp(reg) });
-        }
-        if needs_align_pad {
-            new_insts.push(MachInst::StackFree { bytes: 8 });
         }
 
         mf.insts.splice(orig_i..=orig_i, new_insts);
@@ -1691,6 +2031,8 @@ fn resolve_parallel_copy(moves: &[(u32, u32)], scratch: u32) -> Vec<(u32, u32)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codegen::regalloc::Location;
+    use crate::codegen::{PhysReg, Target};
 
     #[test]
     fn resolve_known_functions() {
@@ -1794,13 +2136,37 @@ mod tests {
     }
 
     #[test]
+    fn test_native_shadow_roots_round_trip() {
+        push_native_shadow_frame(2);
+        assert_eq!(
+            wren_shadow_store(0, Value::num(7.0).to_bits()),
+            Value::num(7.0).to_bits()
+        );
+        assert_eq!(
+            wren_shadow_store(1, Value::bool(true).to_bits()),
+            Value::bool(true).to_bits()
+        );
+
+        let (lengths, roots) = take_native_shadow_roots();
+        assert_eq!(lengths, vec![2]);
+        assert_eq!(roots, vec![Value::num(7.0), Value::bool(true)]);
+
+        set_native_shadow_roots(lengths, vec![Value::null(), Value::num(11.0)]);
+        let (lengths, roots) = take_native_shadow_roots();
+        assert_eq!(lengths, vec![2]);
+        assert_eq!(roots, vec![Value::null(), Value::num(11.0)]);
+
+        set_native_shadow_roots(Vec::new(), Vec::new());
+        pop_native_shadow_frame();
+    }
+
+    #[test]
     fn test_link_inserts_abi_moves_aarch64() {
         // Simulate post-regalloc state: args already in physical registers.
         let mut mf = MachFunc::new("test".into());
-        // Pretend regalloc assigned arg0 to X3, arg1 to X5, ret to X3.
-        let arg0 = VReg::gp(3);
-        let arg1 = VReg::gp(5);
-        let ret = VReg::gp(3);
+        let arg0 = VReg::gp(10);
+        let arg1 = VReg::gp(11);
+        let ret = VReg::gp(12);
 
         mf.emit(MachInst::LoadImm {
             dst: arg0,
@@ -1818,23 +2184,105 @@ mod tests {
         mf.emit(MachInst::Ret);
 
         let before_len = mf.insts.len();
-        link_runtime_calls(&mut mf, crate::codegen::Target::Aarch64);
+        let assignments = std::collections::HashMap::from([
+            (arg0, Location::Reg(PhysReg::gp(3))),
+            (arg1, Location::Reg(PhysReg::gp(5))),
+            (ret, Location::Reg(PhysReg::gp(3))),
+        ]);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
 
         // CallRuntime replaced: 2 arg movs + LoadImm + CallInd + ret mov = 5 new
         assert_eq!(mf.insts.len(), before_len + 4);
 
-        // Verify moves target ABI physical registers (X0=0, X1=1)
-        let has_x0_move = mf
-            .insts
-            .iter()
-            .any(|inst| matches!(inst, MachInst::Mov { dst, .. } if dst.index == 0));
-        assert!(has_x0_move, "should have move to X0");
+        let has_x0_move = mf.insts.iter().any(
+            |inst| matches!(inst, MachInst::Mov { dst, src } if dst.index == 0 && src.index == 3),
+        );
+        assert!(has_x0_move, "should move arg0 into X0");
 
-        let has_x1_move = mf
+        let has_x1_move = mf.insts.iter().any(
+            |inst| matches!(inst, MachInst::Mov { dst, src } if dst.index == 1 && src.index == 5),
+        );
+        assert!(has_x1_move, "should move arg1 into X1");
+    }
+
+    #[test]
+    fn test_link_uses_call_scratch_sentinel() {
+        let mut mf = MachFunc::new("test".into());
+        let arg0 = VReg::gp(10);
+        let arg1 = VReg::gp(11);
+
+        mf.emit(MachInst::CallRuntime {
+            name: "wren_num_add",
+            args: vec![arg0, arg1],
+            ret: None,
+        });
+
+        let assignments = std::collections::HashMap::from([
+            (arg0, Location::Reg(PhysReg::gp(3))),
+            (arg1, Location::Reg(PhysReg::gp(4))),
+        ]);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
+
+        let has_call_scratch = mf
             .insts
             .iter()
-            .any(|inst| matches!(inst, MachInst::Mov { dst, .. } if dst.index == 1));
-        assert!(has_x1_move, "should have move to X1");
+            .any(|inst| matches!(inst, MachInst::LoadImm { dst, .. } if dst.index == 16));
+        let has_call_ind = mf
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, MachInst::CallInd { target } if target.index == 16));
+
+        assert!(
+            has_call_scratch,
+            "call lowering should use the call scratch sentinel"
+        );
+        assert!(
+            has_call_ind,
+            "call lowering should indirect through the call scratch sentinel"
+        );
+    }
+
+    #[test]
+    fn test_runtime_call_parallel_copy_resolves_with_abi_overlap() {
+        let mut mf = MachFunc::new("test".into());
+        let recv = VReg::gp(10);
+        let method = VReg::gp(11);
+        let arg = VReg::gp(12);
+
+        mf.emit(MachInst::CallRuntime {
+            name: "wren_call_1",
+            args: vec![recv, method, arg],
+            ret: None,
+        });
+
+        let assignments = std::collections::HashMap::from([
+            (recv, Location::Reg(PhysReg::gp(2))),
+            (method, Location::Reg(PhysReg::gp(0))),
+            (arg, Location::Reg(PhysReg::gp(1))),
+        ]);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
+
+        let mut regs = std::collections::HashMap::<u32, &'static str>::from([
+            (0, "method"),
+            (1, "arg"),
+            (2, "recv"),
+            (17, "scratch"),
+        ]);
+
+        for inst in &mf.insts {
+            match inst {
+                MachInst::Mov { dst, src } => {
+                    let val = regs.get(&src.index).copied().unwrap_or("unknown");
+                    regs.insert(dst.index, val);
+                }
+                MachInst::LoadImm { dst, .. } if dst.index == 16 => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(regs.get(&0), Some(&"recv"));
+        assert_eq!(regs.get(&1), Some(&"method"));
+        assert_eq!(regs.get(&2), Some(&"arg"));
     }
 
     #[test]

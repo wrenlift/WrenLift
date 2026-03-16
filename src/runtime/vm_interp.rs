@@ -436,6 +436,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     }
                     vm.collect_garbage();
                     vm.method_cache.invalidate();
+                    vm.engine.invalidate_inline_caches();
                     vm.engine.poll_compilations();
                     fiber = vm.fiber;
                     unsafe {
@@ -447,7 +448,20 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
             }
             steps += 1;
 
-            debug_assert!((pc as usize) < code.len());
+            let func_name = vm
+                .engine
+                .get_mir(func_id)
+                .map(|m| vm.interner.resolve(m.name).to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            debug_assert!(
+                (pc as usize) < code.len(),
+                "pc {} out of bounds for code len {} in func {:?} ({}) module {}",
+                pc,
+                code.len(),
+                func_id,
+                func_name,
+                module_name
+            );
             let op = unsafe { *code.get_unchecked(pc as usize) };
             pc += 1;
 
@@ -2130,7 +2144,10 @@ fn dispatch_closure_bc(
 
     // Fast JIT dispatch: check the Vec-indexed jit_code array (O(1) lookup).
     // Skip tier-up profiling entirely for already-compiled functions.
-    if vm.engine.mode != ExecutionMode::Interpreter && arg_vals.len() <= 4 {
+    if vm.engine.mode != ExecutionMode::Interpreter
+        && arg_vals.len() <= 4
+        && !crate::codegen::runtime_fns::jit_disabled()
+    {
         let native_fn_ptr = vm
             .engine
             .jit_code
@@ -2144,22 +2161,25 @@ fn dispatch_closure_bc(
             if should_tier_up {
                 vm.engine.request_tier_up(target_func_id, &vm.interner);
             }
-            vm.engine.poll_compilations();
         }
+        // Always poll — and always re-read jit_code AFTER poll to avoid
+        // use-after-free when poll_compilations replaces a previously-compiled
+        // function with a recompiled version (dropping the old ExecutableBuffer).
+        vm.engine.poll_compilations();
+        let fn_ptr_raw = vm
+            .engine
+            .jit_code
+            .get(fn_idx)
+            .copied()
+            .unwrap_or(std::ptr::null());
 
-        // Re-check after poll (might have just been installed).
-        let fn_ptr_raw = if native_fn_ptr.is_null() {
-            vm.engine
-                .jit_code
-                .get(fn_idx)
-                .copied()
-                .unwrap_or(std::ptr::null())
-        } else {
-            native_fn_ptr
-        };
-
-        let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-        if !fn_ptr_raw.is_null() && is_leaf {
+        if !fn_ptr_raw.is_null() {
+            let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+            let allow_shadow_nonleaf = crate::codegen::runtime_fns::shadow_nonleaf_enabled();
+            // Only dispatch leaf functions via JIT. Non-leaf JIT dispatch is
+            // correct but too slow (each method call pays ~100ns Rust FFI
+            // overhead vs ~5ns interpreter frame push). Needs inline caching
+            // + direct JIT-to-JIT calls to be viable.
             let jit_depth = crate::codegen::runtime_fns::jit_depth();
             if jit_depth < crate::codegen::runtime_fns::MAX_JIT_DEPTH {
                 // Save caller's frame for GC tracing.
@@ -2192,29 +2212,68 @@ fn dispatch_closure_bc(
                     },
                 );
 
-                // Leaf: direct JIT call (no runtime calls, no deopt possible).
-                crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-                let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
-                crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+                if is_leaf {
+                    // Leaf: direct JIT call (no runtime calls, no deopt).
+                    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+                    let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                    let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
+                    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
-                // Take values back from frame (GC may have moved objects).
-                let mut values = unsafe {
+                    // Take values back from frame (GC may have moved objects).
+                    let mut values = unsafe {
+                        (*fiber)
+                            .mir_frames
+                            .last_mut()
+                            .map(|f| std::mem::take(&mut f.values))
+                            .unwrap_or_default()
+                    };
+                    let result_val = Value::from_bits(result_bits);
+
+                    set_reg(&mut values, return_dst.0 as u16, result_val);
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            frame.pc = pc;
+                            frame.values = values;
+                        }
+                    }
+                    return Ok(());
+                }
+                if allow_shadow_nonleaf {
+                    let result_bits = crate::codegen::runtime_fns::call_closure_jit_or_sync(
+                        vm,
+                        closure_ptr,
+                        arg_vals,
+                        defining_class,
+                    );
+
+                    let mut values = unsafe {
+                        (*fiber)
+                            .mir_frames
+                            .last_mut()
+                            .map(|f| std::mem::take(&mut f.values))
+                            .unwrap_or_default()
+                    };
+                    let result_val = Value::from_bits(result_bits);
+
+                    set_reg(&mut values, return_dst.0 as u16, result_val);
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            frame.pc = pc;
+                            frame.values = values;
+                        }
+                    }
+                    return Ok(());
+                }
+                // Non-leaf: fall through to interpreter path.
+                // Restore values from saved frame before continuing.
+                values = unsafe {
                     (*fiber)
                         .mir_frames
                         .last_mut()
                         .map(|f| std::mem::take(&mut f.values))
                         .unwrap_or_default()
                 };
-                let result_val = Value::from_bits(result_bits);
-
-                set_reg(&mut values, return_dst.0 as u16, result_val);
-                unsafe {
-                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
-                        frame.pc = pc;
-                        frame.values = values;
-                    }
-                }
-                return Ok(());
             }
         }
     }
@@ -2309,7 +2368,12 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
         }
         _ => {
             let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits())
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+            )
         }
     }
 }

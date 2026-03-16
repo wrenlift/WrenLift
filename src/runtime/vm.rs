@@ -1149,13 +1149,20 @@ impl VM {
         roots.append(&mut jit_roots);
         let jit_roots_end = roots.len();
 
-        // 6. JitContext GC-managed pointers (closure, defining_class).
+        // 6. Native shadow stack roots for active compiled frames.
+        let native_shadow_start = roots.len();
+        let (native_shadow_lengths, mut native_shadow_roots) =
+            crate::codegen::runtime_fns::take_native_shadow_roots();
+        roots.append(&mut native_shadow_roots);
+        let native_shadow_end = roots.len();
+
+        // 7. JitContext GC-managed pointers (closure, defining_class).
         let jit_ctx_start = roots.len();
         let (jit_closure, jit_class) = crate::codegen::runtime_fns::jit_context_roots();
         roots.push(jit_closure);
         roots.push(jit_class);
 
-        // 6. Module variables
+        // 8. Module variables
         let mut module_ranges: Vec<(String, usize, usize)> = Vec::new();
         for (name, entry) in &self.engine.modules {
             let start = roots.len();
@@ -1208,6 +1215,15 @@ impl VM {
             crate::codegen::runtime_fns::set_jit_roots(
                 roots[jit_roots_start..jit_roots_end].to_vec(),
             );
+        }
+
+        if native_shadow_end > native_shadow_start {
+            crate::codegen::runtime_fns::set_native_shadow_roots(
+                native_shadow_lengths,
+                roots[native_shadow_start..native_shadow_end].to_vec(),
+            );
+        } else if !native_shadow_lengths.is_empty() {
+            crate::codegen::runtime_fns::set_native_shadow_roots(native_shadow_lengths, Vec::new());
         }
 
         // Write back JitContext pointers (nursery forwarding)
@@ -1862,14 +1878,46 @@ impl VM {
     ) -> Option<Value> {
         use crate::mir::{BlockId, Instruction};
 
+        // Root the callee and argument values before alloc_fiber(), which may
+        // trigger GC while these values still live only in the native caller.
+        let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+        crate::codegen::runtime_fns::push_jit_root(Value::object(closure_ptr as *mut u8));
+        crate::codegen::runtime_fns::push_jit_root(
+            defining_class
+                .map(|p| Value::object(p as *mut u8))
+                .unwrap_or(Value::null()),
+        );
+        for &arg in args {
+            crate::codegen::runtime_fns::push_jit_root(arg);
+        }
+
         let temp_fiber = self.gc.alloc_fiber();
+        let live_closure = match crate::codegen::runtime_fns::jit_root_at(root_len_before)
+            .as_object()
+            .map(|p| p as *mut ObjClosure)
+        {
+            Some(ptr) => ptr,
+            None => {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return None;
+            }
+        };
+        let live_defining_class = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1)
+            .as_object()
+            .map(|p| p as *mut crate::runtime::object::ObjClass);
         unsafe {
             (*temp_fiber).header.class = self.fiber_class;
 
-            let fn_ptr = (*closure_ptr).function;
+            let fn_ptr = (*live_closure).function;
             let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
-            let mir = self.engine.get_mir(func_id)?;
+            let mir = match self.engine.get_mir(func_id) {
+                Some(mir) => mir,
+                None => {
+                    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                    return None;
+                }
+            };
             let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
             // Bind block params using the actual BlockParam index (not a
@@ -1883,7 +1931,8 @@ impl VM {
                         if i >= values.len() {
                             values.resize(i + 1, Value::UNDEFINED);
                         }
-                        values[i] = args[param_i];
+                        values[i] =
+                            crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + param_i);
                     }
                 } else {
                     break;
@@ -1910,8 +1959,8 @@ impl VM {
                 values,
                 module_name: mod_name,
                 return_dst: None,
-                closure: Some(closure_ptr),
-                defining_class,
+                closure: Some(live_closure),
+                defining_class: live_defining_class,
                 bc_ptr: std::ptr::null(),
             });
         }
@@ -1940,6 +1989,7 @@ impl VM {
         } else {
             self.fiber = saved_fiber;
         }
+        crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
 
         result.ok()
     }
@@ -2016,9 +2066,7 @@ impl VM {
                     .mir_frames
                     .last()
                     .map(|f| f.module_name.clone())
-                    .unwrap_or_else(|| {
-                        std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
-                    })
+                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
             } else {
                 std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
             };
@@ -2040,9 +2088,7 @@ impl VM {
         let saved_fiber = self.fiber;
         let jit_root_idx = if !saved_fiber.is_null() {
             let idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
-            crate::codegen::runtime_fns::push_jit_root(Value::object(
-                saved_fiber as *mut u8,
-            ));
+            crate::codegen::runtime_fns::push_jit_root(Value::object(saved_fiber as *mut u8));
             Some(idx)
         } else {
             None

@@ -15,9 +15,10 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use crate::codegen::native_meta::NativeFrameMetadata;
 use crate::codegen::ExecutableFunction;
 use crate::intern::SymbolId;
-use crate::mir::bytecode::BytecodeFunction;
+use crate::mir::bytecode::{BytecodeFunction, CallSiteIC};
 use crate::mir::MirFunction;
 
 // ---------------------------------------------------------------------------
@@ -103,6 +104,7 @@ struct CompilationResult {
     executable: ExecutableFunction,
     mir: Arc<MirFunction>,
     bytecode: Option<Arc<BytecodeFunction>>,
+    native_meta: Option<Arc<NativeFrameMetadata>>,
 }
 
 /// Run the optimization pipeline on MIR for JIT compilation.
@@ -248,6 +250,8 @@ pub struct ExecutionEngine {
     /// Whether each JIT-compiled function is a "leaf" (no runtime calls).
     /// Leaf functions don't need GC root pushing or JIT context setup.
     pub jit_leaf: Vec<bool>,
+    /// Preserved native-frame metadata for compiled functions.
+    pub jit_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
     /// Bytecode pointers indexed by FuncId. O(1) lookup for bytecode dispatch.
     /// null entries mean bytecode not yet compiled for this function.
     pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
@@ -287,6 +291,7 @@ impl ExecutionEngine {
             compile_handle: None,
             jit_code: Vec::new(),
             jit_leaf: Vec::new(),
+            jit_metadata: Vec::new(),
             bc_cache: Vec::new(),
         }
     }
@@ -302,6 +307,7 @@ impl ExecutionEngine {
         self.compiling.push(false);
         self.jit_code.push(std::ptr::null());
         self.jit_leaf.push(false);
+        self.jit_metadata.push(None);
         id
     }
 
@@ -388,6 +394,33 @@ impl ExecutionEngine {
         ptr
     }
 
+    /// Whether any background compilations are waiting to be installed.
+    #[inline(always)]
+    pub fn has_pending_compilations(&self) -> bool {
+        self.pending_count != 0
+    }
+
+    /// Invalidate all monomorphic call-site inline caches.
+    ///
+    /// This must run after moving GC because cached class/closure pointers
+    /// may have been relocated.
+    pub fn invalidate_inline_caches(&mut self) {
+        for body in &self.functions {
+            let bytecode = match body {
+                FuncBody::Interpreted { bytecode, .. } | FuncBody::Compiled { bytecode, .. } => {
+                    bytecode.as_ref()
+                }
+            };
+            let Some(bytecode) = bytecode else {
+                continue;
+            };
+            let ic_table = unsafe { &mut *bytecode.ic_table.get() };
+            for entry in ic_table.iter_mut() {
+                *entry = CallSiteIC::default();
+            }
+        }
+    }
+
     /// Record a call to a function. Returns true if the function should
     /// be JIT-compiled (threshold exceeded in Tiered mode).
     pub fn record_call(&mut self, id: FuncId) -> bool {
@@ -417,34 +450,39 @@ impl ExecutionEngine {
             None => return false,
         };
 
-        match crate::codegen::compile_function_with_interner(&mir, target, interner) {
-            Ok(compiled) => match compiled.into_executable() {
-                Ok(executable) => {
-                    let idx = id.0 as usize;
-                    // Cache native code pointer for O(1) dispatch
-                    let native_ptr = if executable.is_native() {
-                        executable.native_ptr()
-                    } else {
-                        std::ptr::null()
-                    };
-                    self.functions[idx] = FuncBody::Compiled {
-                        executable,
-                        mir,
-                        bytecode,
-                    };
-                    // Update jit_code/jit_leaf arrays
-                    if idx >= self.jit_code.len() {
-                        self.jit_code.resize(idx + 1, std::ptr::null());
-                        self.jit_leaf.resize(idx + 1, false);
+        match crate::codegen::compile_function_artifact_with_interner(&mir, target, interner) {
+            Ok(compiled) => {
+                let native_meta = compiled.native_meta;
+                match compiled.code.into_executable() {
+                    Ok(executable) => {
+                        let idx = id.0 as usize;
+                        // Cache native code pointer for O(1) dispatch
+                        let native_ptr = if executable.is_native() {
+                            executable.native_ptr()
+                        } else {
+                            std::ptr::null()
+                        };
+                        self.functions[idx] = FuncBody::Compiled {
+                            executable,
+                            mir,
+                            bytecode,
+                        };
+                        // Update jit_code/jit_leaf arrays
+                        if idx >= self.jit_code.len() {
+                            self.jit_code.resize(idx + 1, std::ptr::null());
+                            self.jit_leaf.resize(idx + 1, false);
+                            self.jit_metadata.resize(idx + 1, None);
+                        }
+                        self.jit_code[idx] = native_ptr;
+                        self.jit_metadata[idx] = native_meta;
+                        if let Some(body) = self.functions.get(idx) {
+                            self.jit_leaf[idx] = is_mir_leaf(body.mir());
+                        }
+                        true
                     }
-                    self.jit_code[idx] = native_ptr;
-                    if let Some(body) = self.functions.get(idx) {
-                        self.jit_leaf[idx] = is_mir_leaf(body.mir());
-                    }
-                    true
+                    Err(_) => false,
                 }
-                Err(_) => false,
-            },
+            }
             Err(_) => false,
         }
     }
@@ -497,10 +535,13 @@ impl ExecutionEngine {
             spec
         };
 
-        self.compile_handle = Some(std::thread::spawn(move || {
+        let compile_fn = move || {
             // Run optimization pipeline with speculative type guards.
-            let mut opt_mir = speculative_mir;
-            run_jit_opt_pipeline(&mut opt_mir, &interner_clone);
+            let opt_mir = {
+                let mut m = speculative_mir;
+                run_jit_opt_pipeline(&mut m, &interner_clone);
+                m
+            };
 
             // Debug: dump optimized MIR for each JIT-compiled function.
             if std::env::var("WLIFT_JIT_DUMP").is_ok() {
@@ -510,19 +551,32 @@ impl ExecutionEngine {
 
             let opt_mir = Arc::new(opt_mir);
 
-            let result =
-                crate::codegen::compile_function_with_interner(&opt_mir, target, &interner_clone)
+            let result = crate::codegen::compile_function_artifact_with_interner(
+                &opt_mir,
+                target,
+                &interner_clone,
+            )
+            .ok()
+            .and_then(|artifact| {
+                let native_meta = artifact.native_meta;
+                artifact
+                    .code
+                    .into_executable()
                     .ok()
-                    .and_then(|c| c.into_executable().ok());
-            if let Some(executable) = result {
+                    .map(|executable| (executable, native_meta))
+            });
+            if let Some((executable, native_meta)) = result {
                 let _ = tx.send(CompilationResult {
                     id,
                     executable,
                     mir,
                     bytecode,
+                    native_meta,
                 });
             }
-        }));
+        };
+
+        self.compile_handle = Some(std::thread::spawn(compile_fn));
     }
 
     /// Install any completed background compilations.
@@ -535,6 +589,13 @@ impl ExecutionEngine {
         while let Ok(result) = self.compilation_rx.try_recv() {
             let idx = result.id.0 as usize;
             if idx < self.functions.len() {
+                let latest_bytecode = match self.functions.get(idx) {
+                    Some(FuncBody::Interpreted { bytecode, .. })
+                    | Some(FuncBody::Compiled { bytecode, .. }) => bytecode.clone(),
+                    None => None,
+                };
+                let bytecode = result.bytecode.or(latest_bytecode);
+
                 // Cache native code pointer for O(1) dispatch lookup.
                 let native_ptr = if result.executable.is_native() {
                     result.executable.native_ptr()
@@ -544,14 +605,28 @@ impl ExecutionEngine {
                 self.functions[idx] = FuncBody::Compiled {
                     executable: result.executable,
                     mir: result.mir,
-                    bytecode: result.bytecode,
+                    bytecode: bytecode.clone(),
                 };
-                // Grow jit_code/jit_leaf if needed (shouldn't be, but defensive).
+                // Grow caches independently if needed (they can get out of sync
+                // when bytecode is lazily materialized before a tier-up lands).
                 if idx >= self.jit_code.len() {
                     self.jit_code.resize(idx + 1, std::ptr::null());
+                }
+                if idx >= self.jit_leaf.len() {
                     self.jit_leaf.resize(idx + 1, false);
                 }
+                if idx >= self.jit_metadata.len() {
+                    self.jit_metadata.resize(idx + 1, None);
+                }
+                if idx >= self.bc_cache.len() {
+                    self.bc_cache.resize(idx + 1, std::ptr::null());
+                }
                 self.jit_code[idx] = native_ptr;
+                self.jit_metadata[idx] = result.native_meta;
+                self.bc_cache[idx] = bytecode
+                    .as_ref()
+                    .map(Arc::as_ptr)
+                    .unwrap_or(std::ptr::null());
                 // Detect leaf functions: no runtime calls needed → skip GC roots + JIT context.
                 if let Some(body) = self.functions.get(idx) {
                     let leaf = is_mir_leaf(body.mir());
