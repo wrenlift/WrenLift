@@ -107,6 +107,33 @@ impl MethodCache {
 /// Sentinel value for uninitialized register slots.
 const UNDEF: Value = Value::UNDEFINED;
 
+#[inline]
+fn call_native_with_frame_sync(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    pc: u32,
+    values: &mut Vec<Value>,
+    func: NativeFn,
+    args: &[Value],
+) -> Value {
+    unsafe {
+        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+            frame.values = std::mem::take(values);
+            frame.pc = pc;
+        }
+    }
+
+    let result = func(vm, args);
+
+    unsafe {
+        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+            *values = std::mem::take(&mut frame.values);
+        }
+    }
+
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Runtime errors
 // ---------------------------------------------------------------------------
@@ -1332,7 +1359,8 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
 
                     match method_entry {
                         Some(Method::Native(func)) => {
-                            let result = func(vm, &arg_vals);
+                            let result =
+                                call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &arg_vals);
                             if vm.has_error {
                                 vm.has_error = false;
                                 let fiber_is_try = unsafe { (*fiber).is_try };
@@ -1682,7 +1710,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                         };
                         match method_entry {
                             Some(Method::Native(func)) => {
-                                set_reg(&mut values, dst, func(vm, &arg_vals));
+                                let result =
+                                    call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &arg_vals);
+                                set_reg(&mut values, dst, result);
                             }
                             Some(Method::Closure(closure_ptr)) => {
                                 dispatch_closure_bc(
@@ -1749,7 +1779,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let sym = subscript_get_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(Method::Native(func)) => {
-                            set_reg(&mut values, dst, func(vm, &all_args));
+                            let result =
+                                call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &all_args);
+                            set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
                             dispatch_closure_bc(
@@ -1791,7 +1823,9 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     let sym = subscript_set_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(Method::Native(func)) => {
-                            set_reg(&mut values, dst, func(vm, &all_args));
+                            let result =
+                                call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &all_args);
+                            set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
                             dispatch_closure_bc(
@@ -1833,18 +1867,34 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                 Op::MakeMap => {
                     let dst = read_u16(code, &mut pc);
                     let count = read_u8(code, &mut pc) as usize;
+                    let mut entries = Vec::with_capacity(count);
+                    let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                    for _ in 0..count {
+                        let k_reg = read_u16(code, &mut pc);
+                        let v_reg = read_u16(code, &mut pc);
+                        let key = get_reg(&values, k_reg);
+                        let val = get_reg(&values, v_reg);
+                        crate::codegen::runtime_fns::push_jit_root(key);
+                        crate::codegen::runtime_fns::push_jit_root(val);
+                        entries.push(());
+                    }
+
                     let map_val = vm.new_map();
+                    crate::codegen::runtime_fns::push_jit_root(map_val);
                     if count > 0 {
                         let map_ptr =
                             map_val.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
-                        for _ in 0..count {
-                            let k_reg = read_u16(code, &mut pc);
-                            let v_reg = read_u16(code, &mut pc);
-                            let key = get_reg(&values, k_reg);
-                            let val = get_reg(&values, v_reg);
+                        for i in 0..entries.len() {
+                            let key = crate::codegen::runtime_fns::jit_root_at(root_len_before + i * 2);
+                            let val =
+                                crate::codegen::runtime_fns::jit_root_at(root_len_before + i * 2 + 1);
                             unsafe { (*map_ptr).set(key, val) };
                         }
                     }
+                    let map_val = crate::codegen::runtime_fns::jit_root_at(
+                        root_len_before + entries.len() * 2,
+                    );
+                    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                     set_reg(&mut values, dst, map_val);
                 }
                 Op::StringConcat => {
@@ -2175,7 +2225,8 @@ fn dispatch_closure_bc(
 
         if !fn_ptr_raw.is_null() {
             let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-            let allow_shadow_nonleaf = crate::codegen::runtime_fns::shadow_nonleaf_enabled();
+            let allow_shadow_nonleaf =
+                crate::codegen::runtime_fns::allow_nonleaf_native(vm, target_func_id);
             // Only dispatch leaf functions via JIT. Non-leaf JIT dispatch is
             // correct but too slow (each method call pays ~100ns Rust FFI
             // overhead vs ~5ns interpreter frame push). Needs inline caching
@@ -2512,7 +2563,7 @@ fn try_operator_dispatch(
             let mut arg_vals: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + args.len());
             arg_vals.push(recv);
             arg_vals.extend_from_slice(args);
-            let result = func(vm, &arg_vals);
+            let result = call_native_with_frame_sync(vm, fiber, *pc, values, func, &arg_vals);
             set_reg(values, dst, result);
             Ok(false)
         }

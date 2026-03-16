@@ -57,18 +57,21 @@ fn list_subscript_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let list = receiver_list_mut(args);
     list.set(index, args[2]);
+    ctx.write_barrier(args[0], args[2]);
     args[2]
 }
 
-fn list_add(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn list_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
     list.add(args[1]);
+    ctx.write_barrier(args[0], args[1]);
     args[0]
 }
 
-fn list_add_core(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn list_add_core(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list_mut(args);
     list.add(args[1]);
+    ctx.write_barrier(args[0], args[1]);
     args[0]
 }
 
@@ -91,6 +94,7 @@ fn list_insert(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let list = receiver_list_mut(args);
     list.insert(index, args[2]);
+    ctx.write_barrier(args[0], args[2]);
     args[2]
 }
 
@@ -186,6 +190,7 @@ fn list_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         }
         let list = receiver_list_mut(args);
         list.add(element);
+        ctx.write_barrier(args[0], element);
     }
     other
 }

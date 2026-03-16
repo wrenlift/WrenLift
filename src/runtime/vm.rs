@@ -868,14 +868,24 @@ impl VM {
 
     /// Allocate a GC-managed list and return it as a Value.
     pub fn new_list(&mut self, elements: Vec<Value>) -> Value {
+        let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+        for &elem in &elements {
+            crate::codegen::runtime_fns::push_jit_root(elem);
+        }
+
         let obj = self.gc.alloc_list();
+        let list_val = Value::object(obj as *mut u8);
+        crate::codegen::runtime_fns::push_jit_root(list_val);
         unsafe {
             (*obj).header.class = self.list_class;
-            for elem in elements {
+            for idx in 0..elements.len() {
+                let elem = crate::codegen::runtime_fns::jit_root_at(root_len_before + idx);
                 (*obj).add(elem);
             }
         }
-        Value::object(obj as *mut u8)
+        let list_val = crate::codegen::runtime_fns::jit_root_at(root_len_before + elements.len());
+        crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+        list_val
     }
 
     /// Allocate a GC-managed range and return it as a Value.
@@ -1111,10 +1121,10 @@ impl VM {
             roots.push(h.value);
         }
 
-        // 3. Core class pointers (13 classes) — may be nursery-allocated,
-        //    so they can be promoted/forwarded during GC.
+        // 3. VM-owned class pointers — may be nursery-allocated, so they can
+        //    be promoted/forwarded during GC.
         let classes_start = roots.len();
-        let core_classes: [*mut ObjClass; 13] = [
+        let core_classes: [*mut ObjClass; 20] = [
             self.object_class,
             self.class_class,
             self.bool_class,
@@ -1128,6 +1138,13 @@ impl VM {
             self.fiber_class,
             self.system_class,
             self.sequence_class,
+            self.map_sequence_class,
+            self.skip_sequence_class,
+            self.take_sequence_class,
+            self.where_sequence_class,
+            self.string_byte_seq_class,
+            self.string_code_point_seq_class,
+            self.map_entry_class,
         ];
         for &ptr in &core_classes {
             if !ptr.is_null() {
@@ -1170,6 +1187,11 @@ impl VM {
             module_ranges.push((name.clone(), start, roots.len()));
         }
 
+        #[cfg(debug_assertions)]
+        if std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some() {
+            self.gc.validate_write_barriers();
+        }
+
         // Collect
         self.gc.collect(&mut roots);
 
@@ -1180,7 +1202,7 @@ impl VM {
         }
 
         // Write back core class pointers
-        let class_fields: [&mut *mut ObjClass; 13] = [
+        let class_fields: [&mut *mut ObjClass; 20] = [
             &mut self.object_class,
             &mut self.class_class,
             &mut self.bool_class,
@@ -1194,6 +1216,13 @@ impl VM {
             &mut self.fiber_class,
             &mut self.system_class,
             &mut self.sequence_class,
+            &mut self.map_sequence_class,
+            &mut self.skip_sequence_class,
+            &mut self.take_sequence_class,
+            &mut self.where_sequence_class,
+            &mut self.string_byte_seq_class,
+            &mut self.string_code_point_seq_class,
+            &mut self.map_entry_class,
         ];
         for (i, field) in class_fields.into_iter().enumerate() {
             let val = roots[classes_start + i];
@@ -1364,8 +1393,6 @@ impl NativeContext for VM {
     }
 
     fn call_method_on(&mut self, receiver: Value, method: &str, args: &[Value]) -> Option<Value> {
-        use crate::mir::{BlockId, Instruction};
-
         // Special-case: calling a closure/function via call(...)
         // Pass only the call arguments (not the closure receiver) — closures
         // don't have a "self" block param; their block params map directly to
@@ -1423,121 +1450,18 @@ impl NativeContext for VM {
                 result
             }
             Method::Closure(closure_ptr) => {
-                let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
-                for &arg in &all_args {
-                    crate::codegen::runtime_fns::push_jit_root(arg);
-                }
-                // Run closure on a temporary fiber to avoid re-entrancy issues.
-                let temp_fiber = self.gc.alloc_fiber();
-                unsafe {
-                    (*temp_fiber).header.class = self.fiber_class;
-
-                    let fn_ptr = (*closure_ptr).function;
-                    let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
-
-                    let mir = match self.engine.get_mir(func_id) {
-                        Some(mir) => mir,
-                        None => {
-                            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-                            return None;
-                        }
-                    };
-                    let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
-
-                    let block = &mir.blocks[0];
-
-                    // Bind block params using their declared index
-                    for (vid, inst) in &block.instructions {
-                        if let Instruction::BlockParam(param_idx) = inst {
-                            let idx = *param_idx as usize;
-                            if idx < all_args.len() {
-                                let i = vid.0 as usize;
-                                if i >= values.len() {
-                                    values.resize(i + 1, Value::UNDEFINED);
-                                }
-                                values[i] =
-                                    crate::codegen::runtime_fns::jit_root_at(root_len_before + idx);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-
-                    (*temp_fiber).mir_frames.push(MirCallFrame {
-                        func_id,
-                        current_block: BlockId(0),
-                        ip: 0,
-                        pc: 0,
-                        values,
-                        module_name: std::rc::Rc::new("core".to_string()),
-                        return_dst: None,
-                        closure: Some(closure_ptr),
-                        defining_class: None,
-                        bc_ptr: std::ptr::null(),
-                    });
-                }
-
-                let saved_fiber = self.fiber;
-                self.fiber = temp_fiber;
-                let result = super::vm_interp::run_fiber(self);
-                self.fiber = saved_fiber;
-                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-                result.ok()
+                self.call_closure_sync(closure_ptr, &all_args, None)
             }
             Method::Constructor(closure_ptr) => {
-                let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
-                for &arg in &all_args {
-                    crate::codegen::runtime_fns::push_jit_root(arg);
+                let class_ptr = receiver
+                    .as_object()
+                    .map(|p| p as *mut ObjClass)
+                    .unwrap_or(std::ptr::null_mut());
+                if class_ptr.is_null() {
+                    None
+                } else {
+                    Some(self.call_constructor_sync(class_ptr, closure_ptr, args))
                 }
-                // Constructors are called like closures
-                let temp_fiber = self.gc.alloc_fiber();
-                unsafe {
-                    (*temp_fiber).header.class = self.fiber_class;
-                    let fn_ptr = (*closure_ptr).function;
-                    let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
-                    let mir = match self.engine.get_mir(func_id) {
-                        Some(mir) => mir,
-                        None => {
-                            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-                            return None;
-                        }
-                    };
-                    let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
-                    let block = &mir.blocks[0];
-                    for (vid, inst) in &block.instructions {
-                        if let Instruction::BlockParam(param_idx) = inst {
-                            let idx = *param_idx as usize;
-                            if idx < all_args.len() {
-                                let i = vid.0 as usize;
-                                if i >= values.len() {
-                                    values.resize(i + 1, Value::UNDEFINED);
-                                }
-                                values[i] =
-                                    crate::codegen::runtime_fns::jit_root_at(root_len_before + idx);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    (*temp_fiber).mir_frames.push(MirCallFrame {
-                        func_id,
-                        current_block: BlockId(0),
-                        ip: 0,
-                        pc: 0,
-                        values,
-                        module_name: std::rc::Rc::new("core".to_string()),
-                        return_dst: None,
-                        closure: Some(closure_ptr),
-                        defining_class: None,
-                        bc_ptr: std::ptr::null(),
-                    });
-                }
-                let saved_fiber = self.fiber;
-                self.fiber = temp_fiber;
-                let result = super::vm_interp::run_fiber(self);
-                self.fiber = saved_fiber;
-                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-                result.ok()
             }
         }
     }
@@ -1618,6 +1542,12 @@ impl NativeContext for VM {
 
     fn trigger_gc(&mut self) {
         self.gc_requested = true;
+    }
+
+    fn write_barrier(&mut self, source: Value, value: Value) {
+        if let Some(ptr) = source.as_object() {
+            self.gc.write_barrier(ptr as *mut ObjHeader, value);
+        }
     }
 }
 

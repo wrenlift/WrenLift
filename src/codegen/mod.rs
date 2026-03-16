@@ -2525,8 +2525,16 @@ impl<'a> LowerCtx<'a> {
                     mem: Mem::new(fields_ptr, field_offset),
                 });
 
-                // SetField result is the stored value
-                self.mf.emit(MachInst::Mov { dst, src: v });
+                if self.value_types.get(val.0 as usize) == Some(&crate::mir::MirType::Value) {
+                    self.mf.emit(MachInst::CallRuntime {
+                        name: "wren_write_barrier",
+                        args: vec![recv_reg, v],
+                        ret: Some(dst),
+                    });
+                } else {
+                    // SetField result is the stored value.
+                    self.mf.emit(MachInst::Mov { dst, src: v });
+                }
             }
             Instruction::GetModuleVar(idx) => {
                 let dst = self.vreg_for(dst_val);

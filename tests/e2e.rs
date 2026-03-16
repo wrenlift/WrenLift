@@ -2634,6 +2634,78 @@ fn e2e_delta_blue_tiered_stress_smoke() {
 }
 
 #[test]
+#[ignore = "debugging full delta_blue under generational tiered promotion"]
+fn e2e_delta_blue_generational_tiered_full_default_threshold() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+
+    let (result, output, elapsed) = run_with_config(
+        &source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 100,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "generational tiered full delta_blue failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "generational tiered full delta_blue has projection failures:\n{}",
+        output
+    );
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("14065400"),
+        "generational tiered full delta_blue total mismatch ({})",
+        t
+    );
+}
+
+#[test]
+#[ignore = "debugging full delta_blue under generational tiered execution"]
+fn e2e_delta_blue_generational_tiered_full_threshold_one() {
+    let source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+
+    let (result, output, elapsed) = run_with_config(
+        &source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "generational tiered full delta_blue threshold-one failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert!(
+        !output.contains("failed"),
+        "generational tiered full delta_blue threshold-one has projection failures:\n{}",
+        output
+    );
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("14065400"),
+        "generational tiered full delta_blue threshold-one total mismatch ({})",
+        t
+    );
+}
+
+#[test]
 #[ignore = "debugging full non-leaf tiered execution under mark-sweep GC"]
 fn e2e_delta_blue_mark_sweep_tiered_projection_smoke() {
     let source =
@@ -2739,6 +2811,58 @@ fn e2e_delta_blue_mark_sweep_tiered_full() {
         lines.first().copied(),
         Some("14065400"),
         "mark-sweep tiered full delta_blue total mismatch ({})",
+        t
+    );
+}
+
+#[test]
+fn e2e_tiered_mark_sweep_where_predicate_survives_explicit_gc() {
+    let source = r#"
+class Holder {
+  construct new(values) {
+    _constraints = values
+  }
+
+  constraints { _constraints }
+  constraints=(value) { _constraints = value }
+}
+
+var holder = Holder.new([1, 2, 3, 4])
+for (i in 0...10) {
+  holder.constraints = holder.constraints.where { |x|
+    System.gc()
+    x > 0
+  }
+  var total = 0
+  for (value in holder.constraints) {
+    total = total + value
+  }
+  System.print(total)
+}
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::MarkSweep,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "mark-sweep where predicate GC failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    let expected = (0..10).map(|_| "10").collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        output.trim(),
+        expected,
+        "mark-sweep where predicate GC output mismatch ({})",
         t
     );
 }

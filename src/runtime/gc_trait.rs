@@ -185,6 +185,14 @@ impl GcImpl {
     pub fn stats(&self) -> &GcStats {
         gc_dispatch!(self, stats)
     }
+
+    #[cfg(debug_assertions)]
+    #[inline(always)]
+    pub fn validate_write_barriers(&self) {
+        if let GcImpl::Generational(gc) = self {
+            gc.validate_write_barriers();
+        }
+    }
 }
 
 impl GcAllocator for GcImpl {

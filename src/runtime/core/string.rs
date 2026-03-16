@@ -373,14 +373,14 @@ use super::sequence::{instance_field, set_instance_field};
 fn bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let class = ctx.lookup_class("StringByteSequence").unwrap();
     let inst = ctx.alloc_instance(class);
-    set_instance_field(inst, 0, args[0]); // _string
+    set_instance_field(ctx, inst, 0, args[0]); // _string
     inst
 }
 
 fn code_points(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let class = ctx.lookup_class("StringCodePointSequence").unwrap();
     let inst = ctx.alloc_instance(class);
-    set_instance_field(inst, 0, args[0]); // _string
+    set_instance_field(ctx, inst, 0, args[0]); // _string
     inst
 }
 

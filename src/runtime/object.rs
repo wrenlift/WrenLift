@@ -971,6 +971,7 @@ pub trait NativeContext {
 
     // -- Garbage collection --
     fn trigger_gc(&mut self);
+    fn write_barrier(&mut self, source: Value, value: Value);
 }
 
 impl ObjClass {

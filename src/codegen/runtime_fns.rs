@@ -466,6 +466,35 @@ pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
     });
 }
 
+#[inline(always)]
+fn root_saved_jit_context(ctx: JitContext) -> usize {
+    let root_len_before = jit_roots_snapshot_len();
+    push_jit_root(if ctx.closure.is_null() {
+        Value::null()
+    } else {
+        Value::object(ctx.closure)
+    });
+    push_jit_root(if ctx.defining_class.is_null() {
+        Value::null()
+    } else {
+        Value::object(ctx.defining_class)
+    });
+    root_len_before
+}
+
+#[inline(always)]
+fn restore_rooted_jit_context(mut saved_ctx: JitContext, root_len_before: usize) {
+    saved_ctx.closure = jit_root_at(root_len_before)
+        .as_object()
+        .unwrap_or(std::ptr::null_mut());
+    saved_ctx.defining_class = jit_root_at(root_len_before + 1)
+        .as_object()
+        .unwrap_or(std::ptr::null_mut());
+    jit_roots_restore_len(root_len_before);
+    set_jit_context(saved_ctx);
+    refresh_module_vars();
+}
+
 /// Access the JIT context. Returns None if not set (vm is null).
 #[inline(always)]
 fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
@@ -550,6 +579,78 @@ fn nonleaf_shadow_safe(
         .unwrap_or(false)
 }
 
+#[inline(always)]
+fn nonleaf_moving_gc_safe(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+) -> bool {
+    vm.engine
+        .jit_metadata
+        .get(func_id.0 as usize)
+        .and_then(|meta| meta.as_ref())
+        .map(|meta| meta.spill_safe_nonleaf && meta.safepoints.iter().all(|sp| sp.live_roots.is_empty()))
+        .unwrap_or(false)
+}
+
+fn trace_nonleaf_gate(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+    allow_nonleaf_native: bool,
+) {
+    if std::env::var_os("WLIFT_TRACE_NONLEAF").is_none() {
+        return;
+    }
+
+    let (boxed_values, safepoints, max_live_roots, spill_safe_nonleaf) = vm
+        .engine
+        .jit_metadata
+        .get(func_id.0 as usize)
+        .and_then(|meta| meta.as_ref())
+        .map(|meta| {
+            (
+                meta.boxed_values.len(),
+                meta.safepoints.len(),
+                meta.safepoints
+                    .iter()
+                    .map(|sp| sp.live_roots.len())
+                    .max()
+                    .unwrap_or(0),
+                meta.spill_safe_nonleaf,
+            )
+        })
+        .unwrap_or((0, 0, 0, false));
+    let name = vm
+        .engine
+        .get_mir(func_id)
+        .map(|mir| vm.interner.resolve(mir.name).to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    eprintln!(
+        "nonleaf gate: FuncId({}) {} allow={} spill_safe={} boxed={} safepoints={} max_live_roots={}",
+        func_id.0,
+        name,
+        allow_nonleaf_native,
+        spill_safe_nonleaf,
+        boxed_values,
+        safepoints,
+        max_live_roots
+    );
+}
+
+pub fn allow_nonleaf_native(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+) -> bool {
+    let allow_nonleaf_native = shadow_nonleaf_enabled()
+        && match vm.config.gc_strategy {
+            crate::runtime::gc_trait::GcStrategy::Generational => {
+                nonleaf_moving_gc_safe(vm, func_id)
+            }
+            _ => nonleaf_shadow_safe(vm, func_id),
+        };
+    trace_nonleaf_gate(vm, func_id, allow_nonleaf_native);
+    allow_nonleaf_native
+}
+
 pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
     let slot = slot as usize;
     let value = Value::from_bits(value);
@@ -581,22 +682,24 @@ unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
 /// variable Vec (e.g., call_closure_sync which can import modules).
 #[allow(dead_code)]
 fn refresh_module_vars() {
+    let ctx = read_jit_ctx();
+    if ctx.module_name.is_null() {
+        return;
+    }
+
     let vm = unsafe { vm_ref() };
     if let Some(vm) = vm {
-        let ctx = read_jit_ctx();
-        if !ctx.module_name.is_null() {
-            let name = unsafe {
-                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                    ctx.module_name,
-                    ctx.module_name_len as usize,
-                ))
-            };
-            if let Some(m) = vm.engine.modules.get(name) {
-                mutate_jit_ctx(|c| {
-                    c.module_vars = m.vars.as_ptr() as *mut u64;
-                    c.module_var_count = m.vars.len() as u32;
-                });
-            }
+        let name = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                ctx.module_name,
+                ctx.module_name_len as usize,
+            ))
+        };
+        if let Some(m) = vm.engine.modules.get(name) {
+            mutate_jit_ctx(|c| {
+                c.module_vars = m.vars.as_ptr() as *mut u64;
+                c.module_var_count = m.vars.len() as u32;
+            });
         }
     }
 }
@@ -644,6 +747,20 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     value
 }
 
+/// Record an old->young edge for a just-performed object write.
+pub extern "C" fn wren_write_barrier(source: u64, value: u64) -> u64 {
+    let source = Value::from_bits(source);
+    let value = Value::from_bits(value);
+    if let Some(ptr) = source.as_object() {
+        unsafe {
+            if let Some(vm) = vm_ref() {
+                vm.gc.write_barrier(ptr as *mut ObjHeader, value);
+            }
+        }
+    }
+    value.to_bits()
+}
+
 /// Try to call a closure via native code if it's compiled; fall back to interpreter.
 pub fn call_closure_jit_or_sync(
     vm: &mut crate::runtime::vm::VM,
@@ -656,6 +773,7 @@ pub fn call_closure_jit_or_sync(
     // can overwrite the context via dispatch_closure_bc, corrupting the caller's
     // module_vars / closure / defining_class when control returns.
     let saved_ctx = read_jit_ctx();
+    let saved_ctx_root_len = root_saved_jit_context(saved_ctx);
 
     // Update context for the callee: set closure and defining_class.
     mutate_jit_ctx(|ctx| {
@@ -693,8 +811,7 @@ pub fn call_closure_jit_or_sync(
                 .get(func_id.0 as usize)
                 .copied()
                 .unwrap_or(false);
-            let allow_nonleaf_native =
-                shadow_nonleaf_enabled() && nonleaf_shadow_safe(vm, func_id);
+            let allow_nonleaf_native = allow_nonleaf_native(vm, func_id);
             // Nested non-leaf native calls are not safe yet: if the callee
             // allocates or re-enters the interpreter, the caller's native frame
             // still has live boxed values with no stack map / root metadata.
@@ -707,7 +824,7 @@ pub fn call_closure_jit_or_sync(
                     .call_closure_sync(closure_ptr, args, defining_class)
                     .map(|v| v.to_bits())
                     .unwrap_or(Value::null().to_bits());
-                set_jit_context(saved_ctx);
+                restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
                 return result;
             }
 
@@ -727,7 +844,7 @@ pub fn call_closure_jit_or_sync(
                 }
                 jit_roots_restore_len(root_len_before);
                 // Restore caller's JIT context.
-                set_jit_context(saved_ctx);
+                restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
                 return result;
             }
             // depth >= MAX_JIT_DEPTH: fall through to interpreter path.
@@ -740,7 +857,7 @@ pub fn call_closure_jit_or_sync(
         .map(|v| v.to_bits())
         .unwrap_or(Value::null().to_bits());
     // Restore caller's JIT context.
-    set_jit_context(saved_ctx);
+    restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
     result
 }
 
@@ -1079,14 +1196,23 @@ fn make_list_impl(elements: &[u64]) -> u64 {
         None => return Value::null().to_bits(),
     };
 
+    let root_len_before = jit_roots_snapshot_len();
+    for &elem in elements {
+        push_jit_root(Value::from_bits(elem));
+    }
+
     let list_ptr = vm.gc.alloc_list();
+    let list_val = Value::object(list_ptr as *mut u8);
+    push_jit_root(list_val);
     unsafe {
         (*list_ptr).header.class = vm.list_class;
-        for &elem in elements {
-            (*list_ptr).add(Value::from_bits(elem));
+        for idx in 0..elements.len() {
+            let elem = jit_root_at(root_len_before + idx);
+            (*list_ptr).add(elem);
         }
     }
-    let val = Value::object(list_ptr as *mut u8);
+    let val = jit_root_at(root_len_before + elements.len());
+    jit_roots_restore_len(root_len_before);
     push_jit_root(val);
     val.to_bits()
 }
@@ -1331,6 +1457,7 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
 pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u64 {
     let recv = Value::from_bits(receiver);
     let idx = Value::from_bits(index);
+    let value = Value::from_bits(value);
 
     if recv.is_object() {
         let ptr = recv.as_object().unwrap();
@@ -1345,9 +1472,12 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                     let count = unsafe { (*list).count as usize };
                     if i < count {
                         unsafe {
-                            (*list).set(i, Value::from_bits(value));
+                            (*list).set(i, value);
+                            if let Some(vm) = vm_ref() {
+                                vm.gc.write_barrier(ptr as *mut ObjHeader, value);
+                            }
                         }
-                        return value;
+                        return value.to_bits();
                     }
                 }
             }
@@ -1355,14 +1485,18 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                 let map = ptr as *mut ObjMap;
                 let map_key = MapKey::new(idx);
                 unsafe {
-                    (*map).entries.insert(map_key, Value::from_bits(value));
+                    (*map).entries.insert(map_key, value);
+                    if let Some(vm) = vm_ref() {
+                        vm.gc.write_barrier(ptr as *mut ObjHeader, idx);
+                        vm.gc.write_barrier(ptr as *mut ObjHeader, value);
+                    }
                 }
-                return value;
+                return value.to_bits();
             }
             _ => {}
         }
     }
-    value
+    value.to_bits()
 }
 
 /// Get an upvalue by index from the current closure in JitContext.
@@ -1392,14 +1526,18 @@ pub extern "C" fn wren_set_upvalue(index: u64, value: u64) -> u64 {
     }
     let closure = ctx.closure as *const ObjClosure;
     let idx = index as usize;
+    let value = Value::from_bits(value);
     unsafe {
         let upvalues = &(*closure).upvalues;
         if idx < upvalues.len() {
             let uv = upvalues[idx];
-            (*uv).set(Value::from_bits(value));
+            (*uv).set(value);
+            if let Some(vm) = vm_ref() {
+                vm.gc.write_barrier(uv as *mut ObjHeader, value);
+            }
         }
     }
-    value
+    value.to_bits()
 }
 
 /// Get a static field from the defining class.
@@ -1430,10 +1568,14 @@ pub extern "C" fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
     }
     let class = ctx.defining_class as *mut ObjClass;
     let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+    let value = Value::from_bits(value);
     unsafe {
-        (*class).static_fields.insert(sym, Value::from_bits(value));
+        (*class).static_fields.insert(sym, value);
+        if let Some(vm) = vm_ref() {
+            vm.gc.write_barrier(class as *mut ObjHeader, value);
+        }
     }
-    value
+    value.to_bits()
 }
 
 /// Guard: check that value is an instance of the expected class.
@@ -1694,6 +1836,7 @@ pub fn resolve(name: &str) -> Option<usize> {
     match name {
         "wren_get_module_var" => Some(wren_get_module_var as *const () as usize),
         "wren_set_module_var" => Some(wren_set_module_var as *const () as usize),
+        "wren_write_barrier" => Some(wren_write_barrier as *const () as usize),
         // Arity-specific call dispatch
         "wren_call_0" => Some(wren_call_0 as *const () as usize),
         "wren_call_1" => Some(wren_call_1 as *const () as usize),
@@ -2204,6 +2347,42 @@ mod tests {
 
         set_native_shadow_roots(Vec::new(), Vec::new());
         pop_native_shadow_frame();
+    }
+
+    #[test]
+    fn test_saved_jit_context_roots_round_trip() {
+        clear_jit_roots();
+
+        let mut dummy_vm = [0u8; 8];
+        let mut old_closure = [0u8; 8];
+        let mut old_class = [0u8; 8];
+        let saved_ctx = JitContext {
+            module_vars: std::ptr::null_mut(),
+            module_var_count: 0,
+            vm: dummy_vm.as_mut_ptr(),
+            module_name: std::ptr::null(),
+            module_name_len: 0,
+            closure: old_closure.as_mut_ptr(),
+            defining_class: old_class.as_mut_ptr(),
+        };
+
+        let root_len_before = root_saved_jit_context(saved_ctx);
+        let mut forwarded_closure = [0u8; 8];
+        let mut forwarded_class = [0u8; 8];
+        let mut roots = take_jit_roots();
+        roots[root_len_before] = Value::object(forwarded_closure.as_mut_ptr());
+        roots[root_len_before + 1] = Value::object(forwarded_class.as_mut_ptr());
+        set_jit_roots(roots);
+
+        restore_rooted_jit_context(saved_ctx, root_len_before);
+
+        let restored = read_jit_ctx();
+        assert_eq!(restored.closure, forwarded_closure.as_mut_ptr());
+        assert_eq!(restored.defining_class, forwarded_class.as_mut_ptr());
+        assert_eq!(jit_roots_snapshot_len(), 0);
+
+        clear_jit_roots();
+        set_jit_context(JitContext::default());
     }
 
     #[test]

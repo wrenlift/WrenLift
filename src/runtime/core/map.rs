@@ -28,17 +28,21 @@ fn map_subscript(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 }
 
-fn map_subscript_set(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn map_subscript_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let map = receiver_map_mut(args);
     let key = MapKey::new(args[1]);
     map.entries.insert(key, args[2]);
+    ctx.write_barrier(args[0], args[1]);
+    ctx.write_barrier(args[0], args[2]);
     args[2]
 }
 
-fn map_add_core(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn map_add_core(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let map = receiver_map_mut(args);
     let key = MapKey::new(args[1]);
     map.entries.insert(key, args[2]);
+    ctx.write_barrier(args[0], args[1]);
+    ctx.write_barrier(args[0], args[2]);
     args[0]
 }
 
@@ -130,8 +134,8 @@ fn map_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let class = ctx.lookup_class("MapEntry").unwrap();
     let entry = ctx.alloc_instance(class);
     use super::sequence::set_instance_field;
-    set_instance_field(entry, 0, key_val);
-    set_instance_field(entry, 1, value);
+    set_instance_field(ctx, entry, 0, key_val);
+    set_instance_field(ctx, entry, 1, value);
     entry
 }
 
