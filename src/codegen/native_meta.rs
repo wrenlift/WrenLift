@@ -35,6 +35,10 @@ pub struct NativeFrameMetadata {
     pub boxed_values: Vec<VReg>,
     /// All recognized safepoints and their live boxed roots.
     pub safepoints: Vec<SafepointMetadata>,
+    /// Whether the current post-regalloc spill rewriting can execute this
+    /// non-leaf function safely without aliasing multiple spilled operands
+    /// through a single scratch register.
+    pub spill_safe_nonleaf: bool,
 }
 
 pub fn build_native_frame_metadata(
@@ -83,7 +87,61 @@ pub fn build_native_frame_metadata(
     NativeFrameMetadata {
         boxed_values,
         safepoints,
+        spill_safe_nonleaf: is_spill_safe_nonleaf(mach, alloc),
     }
+}
+
+fn is_spill_safe_nonleaf(
+    mach: &MachFunc,
+    alloc: &crate::codegen::regalloc::RegAllocResult,
+) -> bool {
+    for inst in &mach.insts {
+        if matches!(inst, MachInst::CallRuntime { .. }) {
+            continue;
+        }
+
+        let spilled_gp_uses = inst
+            .uses()
+            .into_iter()
+            .filter(|vreg| {
+                vreg.class == crate::codegen::RegClass::Gp
+                    && matches!(alloc.assignments.get(vreg), Some(Location::Spill(_)))
+            })
+            .count();
+        let spilled_gp_defs = inst
+            .defs()
+            .into_iter()
+            .filter(|vreg| {
+                vreg.class == crate::codegen::RegClass::Gp
+                    && matches!(alloc.assignments.get(vreg), Some(Location::Spill(_)))
+            })
+            .count();
+        if spilled_gp_uses + spilled_gp_defs > 1 {
+            return false;
+        }
+
+        let spilled_fp_uses = inst
+            .uses()
+            .into_iter()
+            .filter(|vreg| {
+                vreg.class != crate::codegen::RegClass::Gp
+                    && matches!(alloc.assignments.get(vreg), Some(Location::Spill(_)))
+            })
+            .count();
+        let spilled_fp_defs = inst
+            .defs()
+            .into_iter()
+            .filter(|vreg| {
+                vreg.class != crate::codegen::RegClass::Gp
+                    && matches!(alloc.assignments.get(vreg), Some(Location::Spill(_)))
+            })
+            .count();
+        if spilled_fp_uses + spilled_fp_defs > 1 {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn safepoint_kind(inst: &MachInst) -> Option<SafepointKind> {

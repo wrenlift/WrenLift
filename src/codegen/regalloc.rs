@@ -7,7 +7,10 @@
 /// 3. Walk intervals, assigning physical registers from a free pool
 /// 4. When no register is free, spill the interval ending latest
 /// 5. Rewrite all VRegs to assigned PhysRegs, inserting spill/reload as needed
-use super::{MachFunc, MachInst, Mem, PhysReg, RegClass, VReg};
+use super::{
+    MachFunc, MachInst, Mem, PhysReg, RegClass, VReg, ABI_RET_SENTINEL, CALL_SCRATCH_SENTINEL,
+    COPY_SCRATCH_SENTINEL, FRAME_PTR_SENTINEL, SPILL_SCRATCH_SENTINEL,
+};
 use std::collections::{BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -63,6 +66,9 @@ pub fn compute_live_intervals(func: &MachFunc) -> Vec<LiveInterval> {
 
         // Record definitions.
         for d in inst.defs() {
+            if is_fixed_sentinel(d) {
+                continue;
+            }
             first_def.entry(d).or_insert(idx);
             // A def also extends the interval (needed for single-point intervals).
             last_use.entry(d).or_insert(idx);
@@ -70,6 +76,9 @@ pub fn compute_live_intervals(func: &MachFunc) -> Vec<LiveInterval> {
 
         // Record uses.
         for u in inst.uses() {
+            if is_fixed_sentinel(u) {
+                continue;
+            }
             first_use.entry(u).or_insert(idx);
             last_use.insert(u, idx);
         }
@@ -107,6 +116,14 @@ pub fn compute_live_intervals(func: &MachFunc) -> Vec<LiveInterval> {
     // Sort by start point (primary), then by vreg index (stable).
     intervals.sort_by_key(|iv| (iv.start, iv.vreg.index));
     intervals
+}
+
+#[inline]
+fn is_fixed_sentinel(vreg: VReg) -> bool {
+    match vreg.class {
+        RegClass::Gp => vreg.index >= COPY_SCRATCH_SENTINEL,
+        RegClass::Fp | RegClass::Vec => vreg.index == SPILL_SCRATCH_SENTINEL,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +180,10 @@ pub struct TargetRegs {
 
 /// Build the default aarch64 allocatable set.
 pub fn aarch64_target_regs() -> TargetRegs {
-    // x0-x15 allocatable (x16/x17 are scratch, x18 platform, x29 FP, x30 LR, x31 SP)
+    // x0-x15 (caller-saved) only. Callee-saved x19-x28 are excluded because
+    // our JIT prologue doesn't save/restore them yet (insert_callee_saves
+    // Push/Pop conflicts with the frame layout on aarch64).
+    // x16/x17 are scratch, x18 is platform-reserved, x29 is FP, x30 is LR, x31 is SP.
     let gp: Vec<PhysReg> = (0..16).map(PhysReg::gp).collect();
     // d0-d15 allocatable (d16-d31 exist but we keep it simple; d16/d17 scratch)
     let fp: Vec<PhysReg> = (0..16).map(PhysReg::fp).collect();
@@ -316,6 +336,11 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
     func.frame_size = aligned;
 
     for inst in &func.insts {
+        if matches!(inst, MachInst::CallRuntime { .. }) {
+            new_insts.push(inst.clone());
+            continue;
+        }
+
         // For spilled uses: insert reload before the instruction.
         let uses = inst.uses();
         for u in &uses {
@@ -377,14 +402,14 @@ fn frame_ptr_vreg() -> VReg {
     // RBP on x86_64 (encoding 5), X29 on aarch64 (encoding 29).
     // We use a sentinel GP vreg. The actual encoding is set during rewrite.
     // Convention: frame_ptr uses the reserved GP index u32::MAX.
-    VReg::gp(u32::MAX)
+    VReg::gp(FRAME_PTR_SENTINEL)
 }
 
 /// Scratch register for spill/reload. Uses the reserved scratch slot per class.
 fn spill_scratch(vreg: VReg) -> VReg {
     match vreg.class {
-        RegClass::Gp => VReg::gp(u32::MAX - 1), // will be rewritten to target scratch
-        RegClass::Fp | RegClass::Vec => VReg::fp(u32::MAX - 1),
+        RegClass::Gp => VReg::gp(SPILL_SCRATCH_SENTINEL), // rewritten to target scratch
+        RegClass::Fp | RegClass::Vec => VReg::fp(SPILL_SCRATCH_SENTINEL),
     }
 }
 
@@ -392,12 +417,24 @@ fn spill_scratch(vreg: VReg) -> VReg {
 /// is the physical register encoding.
 fn map_vreg(vreg: VReg, assignments: &HashMap<VReg, Location>) -> VReg {
     // Sentinel: frame pointer
-    if vreg.index == u32::MAX && vreg.class == RegClass::Gp {
+    if vreg.index == FRAME_PTR_SENTINEL && vreg.class == RegClass::Gp {
         return vreg; // stays as-is, patched by target-specific fixup
     }
     // Sentinel: spill scratch
-    if vreg.index == u32::MAX - 1 {
+    if vreg.index == SPILL_SCRATCH_SENTINEL {
         return vreg; // stays as-is, patched by target-specific fixup
+    }
+    // Sentinel: ABI return register
+    if vreg.index == ABI_RET_SENTINEL && vreg.class == RegClass::Gp {
+        return vreg; // stays as-is, patched by target-specific fixup
+    }
+    if vreg.class == RegClass::Gp
+        && (vreg.index == CALL_SCRATCH_SENTINEL || vreg.index == COPY_SCRATCH_SENTINEL)
+    {
+        return vreg; // stays as-is, patched by target-specific fixup
+    }
+    if vreg.class == RegClass::Gp && vreg.index >= COPY_SCRATCH_SENTINEL {
+        return vreg; // fixed ABI arg/call sentinel
     }
     match assignments.get(&vreg) {
         Some(&Location::Reg(phys)) => VReg {
@@ -847,7 +884,10 @@ pub fn respill_caller_saved_across_calls(
         .iter()
         .enumerate()
         .filter_map(|(i, inst)| {
-            if matches!(inst, MachInst::CallInd { .. } | MachInst::CallRuntime { .. }) {
+            if matches!(
+                inst,
+                MachInst::CallInd { .. } | MachInst::CallRuntime { .. }
+            ) {
                 Some(i as u32)
             } else {
                 None
@@ -860,10 +900,8 @@ pub fn respill_caller_saved_across_calls(
     }
 
     // Build a quick-lookup set: (class, hw_enc) for caller-saved registers.
-    let cs_set: std::collections::HashSet<(RegClass, u8)> = caller_saved
-        .iter()
-        .map(|r| (r.class, r.hw_enc))
-        .collect();
+    let cs_set: std::collections::HashSet<(RegClass, u8)> =
+        caller_saved.iter().map(|r| (r.class, r.hw_enc)).collect();
 
     // For each interval assigned to a caller-saved register, check if any
     // call falls strictly inside the interval.
@@ -906,11 +944,14 @@ pub fn respill_caller_saved_across_calls(
 /// 2. Compute live intervals + linear scan allocation
 /// 3. Respill caller-saved registers that are live across calls
 /// 4. Rewrite VRegs to PhysRegs with spill/reload insertion
-pub fn allocate_registers(func: &mut MachFunc, target: &TargetRegs) -> RegAllocResult {
-    // Parallel copies should already be resolved, but be safe.
-    super::resolve_parallel_copies(func);
+pub fn allocate_registers_result(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
+    let mut result = linear_scan(func, target);
+    respill_caller_saved_across_calls(func, &mut result, &target.caller_saved);
+    result
+}
 
-    let result = linear_scan(func, target);
+pub fn allocate_registers(func: &mut MachFunc, target: &TargetRegs) -> RegAllocResult {
+    let result = allocate_registers_result(func, target);
     apply_allocation(func, &result, target.frame_reserved);
     result
 }
@@ -1309,9 +1350,48 @@ mod tests {
     }
 
     #[test]
+    fn test_allocate_registers_respills_values_live_across_calls() {
+        let mut mf = build(|mf| {
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 42,
+            });
+            mf.emit(MachInst::CallRuntime {
+                name: "dummy_call",
+                args: vec![],
+                ret: Some(VReg::gp(1)),
+            });
+            mf.emit(MachInst::Mov {
+                dst: VReg::gp(2),
+                src: VReg::gp(0),
+            });
+            mf.emit(MachInst::Ret);
+        });
+        let target = aarch64_target_regs();
+        let result = allocate_registers(&mut mf, &target);
+
+        assert!(
+            matches!(
+                result.assignments.get(&VReg::gp(0)),
+                Some(Location::Spill(_))
+            ),
+            "value live across a call should be respilled on aarch64 caller-saved regs"
+        );
+
+        let has_spill_ops = mf
+            .insts
+            .iter()
+            .any(|inst| matches!(inst, MachInst::Str { .. } | MachInst::Ldr { .. }));
+        assert!(
+            has_spill_ops,
+            "respilling should insert spill/reload instructions around the call"
+        );
+    }
+
+    #[test]
     fn test_aarch64_target_regs() {
         let target = aarch64_target_regs();
-        assert_eq!(target.gp_allocatable.len(), 16); // x0-x15
+        assert_eq!(target.gp_allocatable.len(), 16); // x0-x15 only
         assert_eq!(target.fp_allocatable.len(), 16); // d0-d15
     }
 

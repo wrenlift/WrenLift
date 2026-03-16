@@ -1556,12 +1556,14 @@ fn instrument_native_shadow_stores(mach: &mut MachFunc) {
     let mut new_insts = Vec::with_capacity(orig_insts.len() * 2);
 
     for inst in orig_insts {
-        let boxed_def = inst
-            .def()
+        let boxed_defs: Vec<(u16, VReg)> = inst
+            .defs()
+            .into_iter()
             .filter(|vreg| mach.is_boxed_gp(*vreg))
-            .and_then(|vreg| boxed_slots.get(&vreg).copied().map(|slot| (slot, vreg)));
+            .filter_map(|vreg| boxed_slots.get(&vreg).copied().map(|slot| (slot, vreg)))
+            .collect();
         new_insts.push(inst);
-        if let Some((slot, vreg)) = boxed_def {
+        for (slot, vreg) in boxed_defs {
             let slot_reg = mach.new_gp();
             new_insts.push(MachInst::LoadImm {
                 dst: slot_reg,

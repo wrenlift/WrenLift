@@ -1760,6 +1760,316 @@ System.print(list.count)
     );
 }
 
+#[test]
+#[ignore = "debugging non-leaf tiered locals across loop-carried calls"]
+fn e2e_tiered_nonleaf_loop_preserves_object_local() {
+    let source = r#"
+class Keeper {
+  construct new(tag) {
+    _tag = tag
+  }
+
+  tag { _tag }
+}
+
+var noop = Fn.new {}
+
+var run = Fn.new { |keep, other|
+  var saved = keep
+  var noise = other
+  for (i in 0...20) {
+    noop.call()
+  }
+  System.print(saved.tag)
+  System.print(noise.tag)
+}
+
+for (i in 0...20) {
+  run.call(Keeper.new("keep"), Keeper.new("noise"))
+}
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::Arena,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered non-leaf local preservation failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    let expected = (0..20)
+        .map(|_| "keep\nnoise")
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        output.trim(),
+        expected,
+        "tiered non-leaf local preservation output mismatch ({})",
+        t
+    );
+}
+
+#[test]
+#[ignore = "debugging change()-shaped non-leaf tiered local corruption"]
+fn e2e_tiered_nonleaf_change_shape_preserves_receiver() {
+    let source = r#"
+class Variable {
+  construct new(tag, value) {
+    _tag = tag
+    _value = value
+  }
+
+  tag { _tag }
+  value { _value }
+  value=(newValue) { _value = newValue }
+}
+
+class Edit {
+  construct new(v) {
+    _target = v
+  }
+
+  destroy() {
+    System.print(_target.tag)
+  }
+}
+
+class Plan {
+  construct new(v, value) {
+    _target = v
+    _value = value
+  }
+
+  execute() {
+    _target.value = _value
+  }
+}
+
+var change = Fn.new { |v, newValue|
+  var edit = Edit.new(v)
+  var plan = Plan.new(v, newValue)
+  for (i in 0...10) {
+    plan.execute()
+  }
+  edit.destroy()
+  System.print(v.value)
+}
+
+for (i in 0...20) {
+  var v = Variable.new("var", 0)
+  change.call(v, i)
+}
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::Arena,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered change-shape preservation failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    let expected = (0..20)
+        .flat_map(|i| ["var".to_string(), i.to_string()])
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        output.trim(),
+        expected,
+        "tiered change-shape preservation output mismatch ({})",
+        t
+    );
+}
+
+#[test]
+#[ignore = "debugging list iteration inside non-leaf tiered methods"]
+fn e2e_tiered_nonleaf_plan_execute_list_iteration() {
+    let source = r#"
+class Variable {
+  construct new(value) {
+    _value = value
+  }
+
+  value { _value }
+  value=(newValue) { _value = newValue }
+}
+
+class Worker {
+  construct new(v, value) {
+    _target = v
+    _value = value
+  }
+
+  execute() {
+    _target.value = _value
+  }
+}
+
+class Plan {
+  construct new(worker) {
+    _list = [worker]
+  }
+
+  execute() {
+    for (constraint in _list) {
+      constraint.execute()
+    }
+  }
+}
+
+var run = Fn.new { |value|
+  var v = Variable.new(0)
+  var worker = Worker.new(v, value)
+  var plan = Plan.new(worker)
+  for (i in 0...10) {
+    plan.execute()
+  }
+  System.print(v.value)
+}
+
+for (i in 0...20) {
+  run.call(i)
+}
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::Arena,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered list-iteration execute failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    let expected = (0..20).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        output.trim(),
+        expected,
+        "tiered list-iteration execute output mismatch ({})",
+        t
+    );
+}
+
+#[test]
+#[ignore = "debugging inherited-method dispatch in non-leaf tiered mode"]
+fn e2e_tiered_nonleaf_inherited_destroy_after_loop() {
+    let source = r#"
+class Constraint {
+  destroy() {
+    removeFromGraph()
+  }
+}
+
+class UnaryConstraint is Constraint {
+  construct new(output) {
+    _myOutput = output
+  }
+
+  removeFromGraph() {
+    _myOutput.removeConstraint(this)
+  }
+}
+
+class EditConstraint is UnaryConstraint {
+  construct new(output) {
+    super(output)
+  }
+}
+
+class Variable {
+  construct new(tag) {
+    _tag = tag
+  }
+
+  removeConstraint(constraint) {
+    System.print(_tag)
+  }
+}
+
+class Worker {
+  construct new() {}
+
+  execute() {}
+}
+
+class Plan {
+  construct new() {
+    _list = [Worker.new()]
+  }
+
+  execute() {
+    for (constraint in _list) {
+      constraint.execute()
+    }
+  }
+}
+
+var change = Fn.new { |v|
+  var edit = EditConstraint.new(v)
+  var plan = Plan.new()
+  for (i in 0...10) {
+    plan.execute()
+  }
+  edit.destroy()
+}
+
+for (i in 0...20) {
+  change.call(Variable.new("ok"))
+}
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::Arena,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered inherited destroy failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    let expected = (0..20).map(|_| "ok").collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        output.trim(),
+        expected,
+        "tiered inherited destroy output mismatch ({})",
+        t
+    );
+}
+
 // ---------------------------------------------------------------------------
 // JIT tiering e2e: mandelbrot
 // ---------------------------------------------------------------------------
@@ -2394,4 +2704,52 @@ fn e2e_delta_blue_mark_sweep_tiered_stress_smoke() {
         "mark-sweep tiered stress smoke has projection failures:\n{}",
         output
     );
+}
+
+#[test]
+#[ignore = "debugging chainTest -> projectionTest value drift under tiered non-leaf execution"]
+fn e2e_delta_blue_chain_then_projection_debug_values() {
+    let mut source =
+        std::fs::read_to_string("bench/delta_blue.wren").expect("bench/delta_blue.wren must exist");
+    source = source
+        .replace(
+            r#"  if (dst.value != 1170) System.print("Projection 1 failed")"#,
+            r#"  System.print("p1 dst=%(dst.value)")
+  if (dst.value != 1170) System.print("Projection 1 failed")"#,
+        )
+        .replace(
+            r#"  if (src.value != 5) System.print("Projection 2 failed")"#,
+            r#"  System.print("p2 src=%(src.value)")
+  if (src.value != 5) System.print("Projection 2 failed")"#,
+        )
+        .replace(
+            r#"    if (dests[i].value != i * 5 + 1000) System.print("Projection 3 failed")"#,
+            r#"    if (i < 3) System.print("p3 i=%(i) value=%(dests[i].value)")
+    if (dests[i].value != i * 5 + 1000) System.print("Projection 3 failed")"#,
+        )
+        .replace(
+            r#"    if (dests[i].value != i * 5 + 2000) System.print("Projection 4 failed")"#,
+            r#"    if (i < 3) System.print("p4 i=%(i) value=%(dests[i].value)")
+    if (dests[i].value != i * 5 + 2000) System.print("Projection 4 failed")"#,
+        );
+    let prefix = source
+        .split("var start = System.clock")
+        .next()
+        .expect("delta_blue benchmark footer must exist");
+    let smoke = format!(
+        "{}chainTest.call(20)\nprojectionTest.call(20)\nSystem.print(total)\n",
+        prefix
+    );
+
+    let (_result, output, _elapsed) = run_with_config(
+        &smoke,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            gc_strategy: GcStrategy::MarkSweep,
+            ..VMConfig::default()
+        },
+    );
+
+    eprintln!("{}", output);
 }

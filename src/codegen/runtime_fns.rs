@@ -524,6 +524,19 @@ fn current_shadow_slot_count(
         .unwrap_or(0)
 }
 
+#[inline(always)]
+fn nonleaf_shadow_safe(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+) -> bool {
+    vm.engine
+        .jit_metadata
+        .get(func_id.0 as usize)
+        .and_then(|meta| meta.as_ref())
+        .map(|meta| meta.spill_safe_nonleaf)
+        .unwrap_or(false)
+}
+
 pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
     let slot = slot as usize;
     let value = Value::from_bits(value);
@@ -667,6 +680,8 @@ pub fn call_closure_jit_or_sync(
                 .get(func_id.0 as usize)
                 .copied()
                 .unwrap_or(false);
+            let allow_nonleaf_native =
+                shadow_nonleaf_enabled() && nonleaf_shadow_safe(vm, func_id);
             // Nested non-leaf native calls are not safe yet: if the callee
             // allocates or re-enters the interpreter, the caller's native frame
             // still has live boxed values with no stack map / root metadata.
@@ -674,7 +689,7 @@ pub fn call_closure_jit_or_sync(
             // live objects under non-moving GC. Keep top-level non-leaf native
             // execution available, but route nested non-leaf calls through the
             // interpreter until native frame rooting exists.
-            if depth > 0 && !is_leaf && !shadow_nonleaf_enabled() {
+            if !is_leaf && !allow_nonleaf_native {
                 let result = vm
                     .call_closure_sync(closure_ptr, args, defining_class)
                     .map(|v| v.to_bits())
