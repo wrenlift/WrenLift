@@ -628,6 +628,18 @@ pub enum MachInst {
     /// ARM64: `blr`; x86_64: `call *reg`
     CallInd { target: VReg },
 
+    /// Direct native call to another label in the same function buffer.
+    /// Used for compiled-to-compiled recursion without going through a runtime trampoline.
+    CallLabel { target: Label },
+
+    /// Pseudo-instruction for a direct local call that still needs ABI arg/ret
+    /// setup after register allocation.
+    CallLocal {
+        target: Label,
+        args: Vec<VReg>,
+        ret: Option<VReg>,
+    },
+
     /// Direct call to a named runtime function (resolved at link/patch time).
     /// The caller is responsible for setting up arguments in the correct ABI
     /// registers beforehand.
@@ -731,6 +743,8 @@ impl MachInst {
             | CallInd { target: src, .. }
             | Push { src } => vec![*src],
 
+            CallLabel { .. } => vec![],
+
             Pop { .. } | FuncArg { .. } | StackAlloc { .. } | StackFree { .. } => vec![],
 
             IAddImm { src, .. } | AndImm { src, .. } | OrImm { src, .. } => vec![*src],
@@ -787,7 +801,7 @@ impl MachInst {
             CSet { .. } | JmpIf { .. } => vec![],
 
             // Runtime calls
-            CallRuntime { args, .. } => args.clone(),
+            CallLocal { args, .. } | CallRuntime { args, .. } => args.clone(),
 
             // Parallel copy: all sources are uses
             ParallelCopy { copies } => copies.iter().map(|(_, src)| *src).collect(),
@@ -856,7 +870,7 @@ impl MachInst {
             | Pop { dst }
             | FuncArg { dst, .. } => Some(*dst),
 
-            CallRuntime { ret, .. } => *ret,
+            CallLocal { ret, .. } | CallRuntime { ret, .. } => *ret,
 
             // ParallelCopy defines multiple — return None; regalloc handles specially.
             ParallelCopy { .. } => None,
@@ -900,6 +914,8 @@ impl MachInst {
                 | MachInst::CallRuntime { .. }
                 | MachInst::Push { .. }
                 | MachInst::Pop { .. }
+                | MachInst::CallLabel { .. }
+                | MachInst::CallLocal { .. }
                 | MachInst::Prologue { .. }
                 | MachInst::Epilogue { .. }
                 | MachInst::Trap
@@ -1435,6 +1451,15 @@ pub enum Target {
     Wasm,
 }
 
+/// Native compilation tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileTier {
+    /// Baseline native code: preserve semantics, avoid speculative guards.
+    Baseline,
+    /// Optimized native code: allows speculative guards and heavier MIR opts.
+    Optimized,
+}
+
 // ---------------------------------------------------------------------------
 // MIR → Machine IR lowering
 // ---------------------------------------------------------------------------
@@ -1754,13 +1779,17 @@ fn instrument_native_shadow_stores(mach: &mut MachFunc) {
 /// Lower a MIR function to platform-agnostic machine instructions.
 pub fn lower_mir(mir: &MirFunction) -> MachFunc {
     let interner = crate::intern::Interner::new();
-    lower_mir_with_interner(mir, &interner)
+    lower_mir_with_interner(mir, &interner, CompileTier::Baseline)
 }
 
 /// Lower a MIR function with access to an interner for symbol resolution.
-pub fn lower_mir_with_interner(mir: &MirFunction, interner: &crate::intern::Interner) -> MachFunc {
+pub fn lower_mir_with_interner(
+    mir: &MirFunction,
+    interner: &crate::intern::Interner,
+    compile_tier: CompileTier,
+) -> MachFunc {
     let mut mf = MachFunc::new(format!("fn_{}", mir.name.index()));
-    let mut ctx = LowerCtx::new(&mut mf, mir, interner);
+    let mut ctx = LowerCtx::new(&mut mf, mir, interner, compile_tier);
     ctx.lower();
     mf
 }
@@ -1868,6 +1897,7 @@ pub fn compile_function_artifact_with_interner(
     mir: &MirFunction,
     target: Target,
     interner: &crate::intern::Interner,
+    compile_tier: CompileTier,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
@@ -1878,7 +1908,7 @@ pub fn compile_function_artifact_with_interner(
             })
         }
         _ => {
-            let mut mach = lower_mir_with_interner(mir, interner);
+            let mut mach = lower_mir_with_interner(mir, interner, compile_tier);
             resolve_parallel_copies(&mut mach);
             if needs_native_shadow_stack(&mach) {
                 instrument_native_shadow_stores(&mut mach);
@@ -1934,7 +1964,8 @@ pub fn compile_function_with_interner(
     target: Target,
     interner: &crate::intern::Interner,
 ) -> Result<CompiledFunction, String> {
-    compile_function_artifact_with_interner(mir, target, interner).map(|artifact| artifact.code)
+    compile_function_artifact_with_interner(mir, target, interner, CompileTier::Baseline)
+        .map(|artifact| artifact.code)
 }
 
 /// Replace sentinel VReg indices (frame pointer, spill scratch, ABI regs) with
@@ -2127,6 +2158,14 @@ fn fixup_vreg_sentinels(
             fix(src);
         }
         MachInst::CallInd { target } => fix(target),
+        MachInst::CallLocal { args, ret, .. } => {
+            for a in args.iter_mut() {
+                fix(a);
+            }
+            if let Some(r) = ret {
+                fix(r);
+            }
+        }
         MachInst::Push { src } => fix(src),
         MachInst::Pop { dst } => fix(dst),
         MachInst::CallRuntime { args, ret, .. } => {
@@ -2149,6 +2188,7 @@ fn fixup_vreg_sentinels(
         | MachInst::StackFree { .. }
         | MachInst::Jmp { .. }
         | MachInst::JmpIf { .. }
+        | MachInst::CallLabel { .. }
         | MachInst::DefLabel(_)
         | MachInst::Nop
         | MachInst::Trap
@@ -2229,6 +2269,7 @@ fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
 struct LowerCtx<'a> {
     mf: &'a mut MachFunc,
     mir: &'a MirFunction,
+    compile_tier: CompileTier,
     gc_value_reps: Vec<GcValueRep>,
     /// MIR ValueId → VReg mapping.
     val_map: HashMap<ValueId, VReg>,
@@ -2255,6 +2296,7 @@ impl<'a> LowerCtx<'a> {
         mf: &'a mut MachFunc,
         mir: &'a MirFunction,
         interner: &'a crate::intern::Interner,
+        compile_tier: CompileTier,
     ) -> Self {
         // Pre-allocate labels for each block.
         let mut block_labels = HashMap::new();
@@ -2294,6 +2336,7 @@ impl<'a> LowerCtx<'a> {
         Self {
             mf,
             mir,
+            compile_tier,
             gc_value_reps,
             val_map: HashMap::new(),
             block_labels,
@@ -2780,22 +2823,40 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::CallStaticSelf { args } => {
                 let dst = self.vreg_for(dst_val);
-                let mut call_args = Vec::with_capacity(args.len());
-                for a in args {
-                    call_args.push(self.vreg_for(*a));
+                let direct_arg_count = args.len() + 1;
+                let direct_target = self.label_for(self.mir.blocks[0].id);
+                if self.compile_tier == CompileTier::Baseline
+                    && direct_arg_count <= ABI_ARG_SENTINELS.len()
+                    && !self.entry_param_vregs.is_empty()
+                {
+                    let mut call_args = Vec::with_capacity(direct_arg_count);
+                    call_args.push(self.entry_param_vregs[0]);
+                    for a in args {
+                        call_args.push(self.vreg_for(*a));
+                    }
+                    self.mf.emit(MachInst::CallLocal {
+                        target: direct_target,
+                        args: call_args,
+                        ret: Some(dst),
+                    });
+                } else {
+                    let mut call_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        call_args.push(self.vreg_for(*a));
+                    }
+                    let call_name = match args.len() {
+                        0 => "wren_call_static_self_0",
+                        1 => "wren_call_static_self_1",
+                        2 => "wren_call_static_self_2",
+                        3 => "wren_call_static_self_3",
+                        _ => "wren_call_static_self_4",
+                    };
+                    self.mf.emit(MachInst::CallRuntime {
+                        name: call_name,
+                        args: call_args,
+                        ret: Some(dst),
+                    });
                 }
-                let call_name = match args.len() {
-                    0 => "wren_call_static_self_0",
-                    1 => "wren_call_static_self_1",
-                    2 => "wren_call_static_self_2",
-                    3 => "wren_call_static_self_3",
-                    _ => "wren_call_static_self_4",
-                };
-                self.mf.emit(MachInst::CallRuntime {
-                    name: call_name,
-                    args: call_args,
-                    ret: Some(dst),
-                });
             }
             Instruction::SuperCall { method, args } => {
                 let dst = self.vreg_for(dst_val);
@@ -4149,6 +4210,14 @@ fn format_inst(inst: &MachInst) -> String {
         }
 
         CallInd { target } => format!("call_ind {}", target),
+        CallLabel { target } => format!("call_label {}", target),
+        CallLocal { target, args, ret } => {
+            let args_str: Vec<String> = args.iter().map(|r| format!("{}", r)).collect();
+            match ret {
+                Some(r) => format!("{} = call_local {}({})", r, target, args_str.join(", ")),
+                None => format!("call_local {}({})", target, args_str.join(", ")),
+            }
+        }
         CallRuntime { name, args, ret } => {
             let args_str: Vec<String> = args.iter().map(|r| format!("{}", r)).collect();
             match ret {
@@ -5566,7 +5635,7 @@ mod tests {
                 .push((v_result, Instruction::IsType(v_val, num_sym)));
             b.terminator = Terminator::Return(v_result);
         }
-        let mf = lower_mir_with_interner(&f, &interner);
+        let mf = lower_mir_with_interner(&f, &interner, CompileTier::Baseline);
         let output = mf.display();
         // Should use inline tag check (and_imm + icmp + cset) not CallRuntime
         assert!(
@@ -5602,7 +5671,7 @@ mod tests {
                 .push((v_result, Instruction::IsType(v_val, null_sym)));
             b.terminator = Terminator::Return(v_result);
         }
-        let mf = lower_mir_with_interner(&f, &interner);
+        let mf = lower_mir_with_interner(&f, &interner, CompileTier::Baseline);
         let output = mf.display();
         assert!(
             !output.contains("call_runtime"),

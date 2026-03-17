@@ -14,9 +14,10 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::codegen::native_meta::NativeFrameMetadata;
-use crate::codegen::ExecutableFunction;
+use crate::codegen::{CompileTier, ExecutableFunction};
 use crate::intern::SymbolId;
 use crate::mir::bytecode::{BytecodeFunction, CallSiteIC};
 use crate::mir::MirFunction;
@@ -56,14 +57,17 @@ pub enum FuncBody {
         mir: Arc<MirFunction>,
         /// Lazily-lowered compact bytecode for the bytecode VM.
         bytecode: Option<Arc<BytecodeFunction>>,
-        /// Number of times this function has been called (for tier-up).
+        /// Number of interpreted calls seen before baseline tier-up.
         call_count: u32,
     },
-    /// JIT-compiled native code. MIR + bytecode retained for fallback/debugging.
-    Compiled {
-        executable: ExecutableFunction,
+    /// Baseline native code is resident; optimized code may be installed later.
+    Native {
+        baseline_executable: ExecutableFunction,
+        optimized_executable: Option<ExecutableFunction>,
         mir: Arc<MirFunction>,
         bytecode: Option<Arc<BytecodeFunction>>,
+        /// Number of baseline-native calls seen before optimize tier-up.
+        opt_call_count: u32,
     },
 }
 
@@ -72,14 +76,38 @@ impl FuncBody {
     /// Returns an Arc so callers can hold the MIR independently of the engine.
     pub fn mir(&self) -> &Arc<MirFunction> {
         match self {
-            FuncBody::Interpreted { mir, .. } | FuncBody::Compiled { mir, .. } => mir,
+            FuncBody::Interpreted { mir, .. } | FuncBody::Native { mir, .. } => mir,
         }
     }
 
     /// Whether this function has been compiled to native code.
     pub fn is_compiled(&self) -> bool {
-        matches!(self, FuncBody::Compiled { .. })
+        matches!(self, FuncBody::Native { .. })
     }
+}
+
+/// Currently active execution tier for a function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TierState {
+    #[default]
+    Interpreted,
+    BaselineNative,
+    OptimizedNative,
+}
+
+/// Per-function tiering and dispatch counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FuncTierStats {
+    pub interpreted_entries: u64,
+    pub baseline_entries: u64,
+    pub optimized_entries: u64,
+    pub compile_attempts: u64,
+    pub compile_successes: u64,
+    pub ic_hits: u64,
+    pub ic_misses: u64,
+    pub native_to_native_calls: u64,
+    pub deopts_to_baseline: u64,
+    pub fallbacks_to_interpreter: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,12 +127,17 @@ pub struct CompiledModule {
 // ---------------------------------------------------------------------------
 
 /// A completed background compilation ready to be installed.
-struct CompilationResult {
-    id: FuncId,
-    executable: ExecutableFunction,
-    mir: Arc<MirFunction>,
-    bytecode: Option<Arc<BytecodeFunction>>,
-    native_meta: Option<Arc<NativeFrameMetadata>>,
+enum CompilationResult {
+    Compiled {
+        id: FuncId,
+        tier: CompileTier,
+        executable: ExecutableFunction,
+        native_meta: Option<Arc<NativeFrameMetadata>>,
+        inline_safe: bool,
+    },
+    Failed {
+        id: FuncId,
+    },
 }
 
 /// Run the optimization pipeline on MIR for JIT compilation.
@@ -172,24 +205,15 @@ fn insert_speculative_guards(mir: &mut MirFunction) {
     }
 }
 
-/// Check if a MIR function is a "leaf" — no instructions that generate runtime calls.
-/// Leaf functions only do inline operations (field access, arithmetic, comparisons)
-/// so they don't need GC root pushing or JIT context setup.
-fn is_mir_leaf(mir: &MirFunction) -> bool {
+fn tier_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
+}
+
+/// Check if a MIR function can stay on the direct native fast path for the
+/// given compilation tier.
+fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
     use crate::mir::Instruction;
-    // A function with non-this BlockParams (idx > 0) will get speculative
-    // GuardNum instructions during JIT compilation. Guard failures deopt to
-    // wren_deopt_N (a runtime call), so such functions are NOT leaf-safe
-    // for inline dispatch without JitContext.
-    if !mir.blocks.is_empty() {
-        for (_, inst) in &mir.blocks[0].instructions {
-            match inst {
-                Instruction::BlockParam(idx) if *idx > 0 => return false,
-                Instruction::BlockParam(_) => {}
-                _ => break,
-            }
-        }
-    }
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
@@ -210,29 +234,17 @@ fn is_mir_leaf(mir: &MirFunction) -> bool {
                 | Instruction::SetStaticField(_, _)
                 | Instruction::GuardNum(_)
                 | Instruction::GuardBool(_) => return false,
+                Instruction::CallStaticSelf { .. } if compile_tier == CompileTier::Optimized => {
+                    // Optimized-tier recursive direct calls still deopt through a
+                    // runtime helper today, so keep them off the leaf fast path.
+                    return false;
+                }
                 // Everything else is inline (field access, arithmetic, guards, etc.)
                 _ => {}
             }
         }
     }
     true
-}
-
-fn tiered_native_candidate(
-    mode: ExecutionMode,
-    functions: &[FuncBody],
-    id: FuncId,
-) -> bool {
-    if mode != ExecutionMode::Tiered {
-        return false;
-    }
-    if crate::codegen::runtime_fns::shadow_nonleaf_enabled() {
-        return true;
-    }
-    functions
-        .get(id.0 as usize)
-        .map(|body| is_mir_leaf(body.mir()))
-        .unwrap_or(false)
 }
 
 /// The execution engine: owns all function bodies, dispatches calls,
@@ -245,18 +257,22 @@ fn tiered_native_candidate(
 pub struct ExecutionEngine {
     /// Current execution mode.
     pub mode: ExecutionMode,
+    /// Whether to collect per-call tier telemetry.
+    pub collect_tier_stats: bool,
     /// All registered functions, indexed by FuncId.
     pub functions: Vec<FuncBody>,
-    /// Profiling threshold: calls before JIT compilation triggers.
+    /// Profiling threshold: interpreted calls before baseline compilation triggers.
     pub jit_threshold: u32,
+    /// Profiling threshold: baseline-native calls before optimize tier-up triggers.
+    pub opt_threshold: u32,
     /// Module registry: module name → (top_level FuncId, module var storage).
     pub modules: HashMap<String, ModuleEntry>,
     /// Sender cloned into each background compilation thread.
     compilation_tx: mpsc::Sender<CompilationResult>,
     /// Receiver polled at safepoints to install completed compilations.
     compilation_rx: mpsc::Receiver<CompilationResult>,
-    /// Per-function flag: true while a background compilation is in flight.
-    compiling: Vec<bool>,
+    /// Per-function compile tier currently in flight, if any.
+    compiling_tier: Vec<Option<CompileTier>>,
     /// Number of compilations currently in flight (fast check for poll_compilations).
     pending_count: u32,
     /// Join handle for the current compilation thread (at most 1 at a time).
@@ -264,11 +280,26 @@ pub struct ExecutionEngine {
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
-    /// Whether each JIT-compiled function is a "leaf" (no runtime calls).
-    /// Leaf functions don't need GC root pushing or JIT context setup.
+    /// Whether the currently active native tier can use the direct fast path.
     pub jit_leaf: Vec<bool>,
     /// Preserved native-frame metadata for compiled functions.
     pub jit_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
+    /// Active execution tier for each function.
+    pub tier_states: Vec<TierState>,
+    /// Per-function tier and dispatch statistics.
+    pub tier_stats: Vec<FuncTierStats>,
+    /// Baseline native code pointers indexed by FuncId.
+    pub baseline_code: Vec<*const u8>,
+    /// Whether baseline-native code can use the direct fast path.
+    pub baseline_leaf: Vec<bool>,
+    /// Baseline native metadata indexed by FuncId.
+    pub baseline_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
+    /// Optimized native code pointers indexed by FuncId.
+    pub optimized_code: Vec<*const u8>,
+    /// Whether optimized-native code can use the direct fast path.
+    pub optimized_leaf: Vec<bool>,
+    /// Optimized native metadata indexed by FuncId.
+    pub optimized_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
     /// Bytecode pointers indexed by FuncId. O(1) lookup for bytecode dispatch.
     /// null entries mean bytecode not yet compiled for this function.
     pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
@@ -298,17 +329,27 @@ impl ExecutionEngine {
         let (tx, rx) = mpsc::channel();
         Self {
             mode,
+            collect_tier_stats: std::env::var_os("WLIFT_TIER_STATS").is_some(),
             functions: Vec::new(),
             jit_threshold: 100,
+            opt_threshold: 1000,
             modules: HashMap::new(),
             compilation_tx: tx,
             compilation_rx: rx,
-            compiling: Vec::new(),
+            compiling_tier: Vec::new(),
             pending_count: 0,
             compile_handle: None,
             jit_code: Vec::new(),
             jit_leaf: Vec::new(),
             jit_metadata: Vec::new(),
+            tier_states: Vec::new(),
+            tier_stats: Vec::new(),
+            baseline_code: Vec::new(),
+            baseline_leaf: Vec::new(),
+            baseline_metadata: Vec::new(),
+            optimized_code: Vec::new(),
+            optimized_leaf: Vec::new(),
+            optimized_metadata: Vec::new(),
             bc_cache: Vec::new(),
         }
     }
@@ -321,10 +362,19 @@ impl ExecutionEngine {
             bytecode: None,
             call_count: 0,
         });
-        self.compiling.push(false);
+        self.compiling_tier.push(None);
         self.jit_code.push(std::ptr::null());
         self.jit_leaf.push(false);
         self.jit_metadata.push(None);
+        self.tier_states.push(TierState::Interpreted);
+        self.tier_stats.push(FuncTierStats::default());
+        self.baseline_code.push(std::ptr::null());
+        self.baseline_leaf.push(false);
+        self.baseline_metadata.push(None);
+        self.optimized_code.push(std::ptr::null());
+        self.optimized_leaf.push(false);
+        self.optimized_metadata.push(None);
+        self.bc_cache.push(std::ptr::null());
         id
     }
 
@@ -345,7 +395,7 @@ impl ExecutionEngine {
     pub fn peek_bytecode(&self, id: FuncId) -> Option<Arc<BytecodeFunction>> {
         match self.functions.get(id.0 as usize)? {
             FuncBody::Interpreted { bytecode, .. } => bytecode.clone(),
-            FuncBody::Compiled { bytecode, .. } => bytecode.clone(),
+            FuncBody::Native { bytecode, .. } => bytecode.clone(),
         }
     }
 
@@ -361,7 +411,7 @@ impl ExecutionEngine {
                 }
                 bytecode.clone()
             }
-            FuncBody::Compiled { bytecode, mir, .. } => {
+            FuncBody::Native { bytecode, mir, .. } => {
                 if bytecode.is_none() {
                     let bc = crate::mir::bytecode::lower(mir);
                     *bytecode = Some(Arc::new(bc));
@@ -393,7 +443,7 @@ impl ExecutionEngine {
                 }
                 bytecode.as_ref().map(Arc::as_ptr)
             }
-            FuncBody::Compiled { bytecode, mir, .. } => {
+            FuncBody::Native { bytecode, mir, .. } => {
                 if bytecode.is_none() {
                     let bc = crate::mir::bytecode::lower(mir);
                     *bytecode = Some(Arc::new(bc));
@@ -424,7 +474,7 @@ impl ExecutionEngine {
     pub fn invalidate_inline_caches(&mut self) {
         for body in &self.functions {
             let bytecode = match body {
-                FuncBody::Interpreted { bytecode, .. } | FuncBody::Compiled { bytecode, .. } => {
+                FuncBody::Interpreted { bytecode, .. } | FuncBody::Native { bytecode, .. } => {
                     bytecode.as_ref()
                 }
             };
@@ -438,223 +488,439 @@ impl ExecutionEngine {
         }
     }
 
-    /// Record a call to a function. Returns true if the function should
-    /// be JIT-compiled (threshold exceeded in Tiered mode).
-    pub fn record_call(&mut self, id: FuncId) -> bool {
-        if !tiered_native_candidate(self.mode, &self.functions, id) {
-            return false;
-        }
-        if let Some(FuncBody::Interpreted { call_count, .. }) =
-            self.functions.get_mut(id.0 as usize)
-        {
-            *call_count += 1;
-            *call_count >= self.jit_threshold
-        } else {
-            false
+    fn sync_active_tier_cache(&mut self, idx: usize) {
+        let state = self
+            .tier_states
+            .get(idx)
+            .copied()
+            .unwrap_or(TierState::Interpreted);
+        match state {
+            TierState::Interpreted => {
+                self.jit_code[idx] = std::ptr::null();
+                self.jit_leaf[idx] = false;
+                self.jit_metadata[idx] = None;
+            }
+            TierState::BaselineNative => {
+                self.jit_code[idx] = self.baseline_code[idx];
+                self.jit_leaf[idx] = self.baseline_leaf[idx];
+                self.jit_metadata[idx] = self.baseline_metadata[idx].clone();
+            }
+            TierState::OptimizedNative => {
+                self.jit_code[idx] = self.optimized_code[idx];
+                self.jit_leaf[idx] = self.optimized_leaf[idx];
+                self.jit_metadata[idx] = self.optimized_metadata[idx].clone();
+            }
         }
     }
 
-    /// Compile a function to native code and replace its body.
-    /// Preserves bytecode so the interpreter can continue as a fallback.
-    /// Returns true if compilation succeeded.
-    pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
-        let target = Self::native_target();
-        let (mir, bytecode) = match self.functions.get(id.0 as usize) {
-            Some(FuncBody::Interpreted { mir, bytecode, .. }) => {
-                (Arc::clone(mir), bytecode.clone())
-            }
-            Some(FuncBody::Compiled { .. }) => return true, // already compiled
-            None => return false,
-        };
+    pub fn tier_state(&self, id: FuncId) -> TierState {
+        self.tier_states
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(TierState::Interpreted)
+    }
 
-        match crate::codegen::compile_function_artifact_with_interner(&mir, target, interner) {
-            Ok(compiled) => {
-                let native_meta = compiled.native_meta;
-                match compiled.code.into_executable() {
-                    Ok(executable) => {
-                        let idx = id.0 as usize;
-                        // Cache native code pointer for O(1) dispatch
-                        let native_ptr = if executable.is_native() {
-                            executable.native_ptr()
-                        } else {
-                            std::ptr::null()
-                        };
-                        self.functions[idx] = FuncBody::Compiled {
-                            executable,
-                            mir,
-                            bytecode,
-                        };
-                        // Update jit_code/jit_leaf arrays
-                        if idx >= self.jit_code.len() {
-                            self.jit_code.resize(idx + 1, std::ptr::null());
-                            self.jit_leaf.resize(idx + 1, false);
-                            self.jit_metadata.resize(idx + 1, None);
-                        }
-                        self.jit_code[idx] = native_ptr;
-                        self.jit_metadata[idx] = native_meta;
-                        if let Some(body) = self.functions.get(idx) {
-                            self.jit_leaf[idx] = is_mir_leaf(body.mir());
-                        }
-                        true
-                    }
-                    Err(_) => false,
-                }
-            }
-            Err(_) => false,
+    pub fn note_interpreted_entry(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
+            return;
+        }
+        if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
+            stats.interpreted_entries += 1;
         }
     }
 
-    /// Submit a function for background JIT compilation.
-    /// The interpreter keeps running bytecode; the compiled result is installed
-    /// when `poll_compilations` is called at the next safepoint.
-    /// At most one compilation thread runs at a time to bound memory usage.
-    pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
-        if !tiered_native_candidate(self.mode, &self.functions, id) {
+    pub fn note_native_entry(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
             return;
         }
         let idx = id.0 as usize;
-        // Guard: already compiled or already in-flight
-        if idx >= self.compiling.len() {
+        if let Some(stats) = self.tier_stats.get_mut(idx) {
+            match self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted) {
+                TierState::BaselineNative => stats.baseline_entries += 1,
+                TierState::OptimizedNative => stats.optimized_entries += 1,
+                TierState::Interpreted => {}
+            }
+        }
+    }
+
+    pub fn note_native_to_native_call(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
             return;
         }
-        if self.compiling[idx] {
+        if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
+            stats.native_to_native_calls += 1;
+        }
+    }
+
+    pub fn note_fallback_to_interpreter(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
             return;
         }
-        // Only one compilation thread at a time. If the previous thread is still
-        // running, skip this request — it will be retried on the next hot call.
+        if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
+            stats.fallbacks_to_interpreter += 1;
+        }
+    }
+
+    pub fn note_deopt_to_baseline(&mut self, id: FuncId) {
+        let idx = id.0 as usize;
+        if idx >= self.tier_states.len() {
+            return;
+        }
+        self.tier_states[idx] = if self.baseline_code[idx].is_null() {
+            TierState::Interpreted
+        } else {
+            TierState::BaselineNative
+        };
+        self.sync_active_tier_cache(idx);
+        if !self.collect_tier_stats {
+            return;
+        }
+        if let Some(stats) = self.tier_stats.get_mut(idx) {
+            stats.deopts_to_baseline += 1;
+        }
+    }
+
+    pub fn note_ic_hit(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
+            return;
+        }
+        if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
+            stats.ic_hits += 1;
+        }
+    }
+
+    pub fn note_ic_miss(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
+            return;
+        }
+        if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
+            stats.ic_misses += 1;
+        }
+    }
+
+    pub fn dump_tier_stats(&self, interner: &crate::intern::Interner) {
+        eprintln!("=== WLIFT tier stats ===");
+        for (idx, body) in self.functions.iter().enumerate() {
+            let stats = self.tier_stats.get(idx).copied().unwrap_or_default();
+            if stats == FuncTierStats::default() {
+                continue;
+            }
+            let name = interner.resolve(body.mir().name);
+            eprintln!(
+                "FuncId({idx}) {name} tier={:?} interp={} baseline={} opt={} compiles={}/{} ic={}/{} native2native={} deopts={} fallbacks={}",
+                self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted),
+                stats.interpreted_entries,
+                stats.baseline_entries,
+                stats.optimized_entries,
+                stats.compile_successes,
+                stats.compile_attempts,
+                stats.ic_hits,
+                stats.ic_misses,
+                stats.native_to_native_calls,
+                stats.deopts_to_baseline,
+                stats.fallbacks_to_interpreter,
+            );
+        }
+    }
+
+    fn next_compile_tier(&self, idx: usize) -> Option<CompileTier> {
+        if self.mode != ExecutionMode::Tiered && self.mode != ExecutionMode::Jit {
+            return None;
+        }
+        match self.functions.get(idx)? {
+            FuncBody::Interpreted { .. } => Some(CompileTier::Baseline),
+            FuncBody::Native {
+                optimized_executable,
+                ..
+            } if optimized_executable.is_none() => Some(CompileTier::Optimized),
+            _ => None,
+        }
+    }
+
+    fn build_compile_mir(
+        mir: &Arc<MirFunction>,
+        tier: CompileTier,
+        interner: &crate::intern::Interner,
+    ) -> Arc<MirFunction> {
+        match tier {
+            CompileTier::Baseline => Arc::clone(mir),
+            CompileTier::Optimized => {
+                let mut spec = (**mir).clone();
+                insert_speculative_guards(&mut spec);
+                run_jit_opt_pipeline(&mut spec, interner);
+                Arc::new(spec)
+            }
+        }
+    }
+
+    fn install_compiled_tier(
+        &mut self,
+        idx: usize,
+        tier: CompileTier,
+        executable: ExecutableFunction,
+        native_meta: Option<Arc<NativeFrameMetadata>>,
+        inline_safe: bool,
+    ) {
+        let native_ptr = if executable.is_native() {
+            executable.native_ptr()
+        } else {
+            std::ptr::null()
+        };
+
+        match tier {
+            CompileTier::Baseline => {
+                let body = match std::mem::replace(
+                    &mut self.functions[idx],
+                    FuncBody::Interpreted {
+                        mir: Arc::new(MirFunction::new(SymbolId::from_raw(0), 0)),
+                        bytecode: None,
+                        call_count: 0,
+                    },
+                ) {
+                    FuncBody::Interpreted {
+                        mir,
+                        bytecode,
+                        ..
+                    } => FuncBody::Native {
+                        baseline_executable: executable,
+                        optimized_executable: None,
+                        mir,
+                        bytecode,
+                        opt_call_count: 0,
+                    },
+                    native @ FuncBody::Native { .. } => native,
+                };
+                self.functions[idx] = body;
+                self.baseline_code[idx] = native_ptr;
+                self.baseline_leaf[idx] = inline_safe;
+                self.baseline_metadata[idx] = native_meta;
+                self.tier_states[idx] = TierState::BaselineNative;
+            }
+            CompileTier::Optimized => {
+                if let Some(FuncBody::Native {
+                    optimized_executable,
+                    ..
+                }) = self.functions.get_mut(idx)
+                {
+                    *optimized_executable = Some(executable);
+                }
+                self.optimized_code[idx] = native_ptr;
+                self.optimized_leaf[idx] = inline_safe;
+                self.optimized_metadata[idx] = native_meta;
+                self.tier_states[idx] = TierState::OptimizedNative;
+            }
+        }
+
+        if let Some(bytecode) = self.peek_bytecode(FuncId(idx as u32)) {
+            self.bc_cache[idx] = Arc::as_ptr(&bytecode);
+        }
+        self.sync_active_tier_cache(idx);
+        if self.collect_tier_stats {
+            if let Some(stats) = self.tier_stats.get_mut(idx) {
+                stats.compile_successes += 1;
+            }
+        }
+    }
+
+    /// Record a call to a function. Returns true if the next tier should be
+    /// requested now.
+    pub fn record_call(&mut self, id: FuncId) -> bool {
+        if self.mode != ExecutionMode::Tiered {
+            return false;
+        }
+        let idx = id.0 as usize;
+        match self.functions.get_mut(idx) {
+            Some(FuncBody::Interpreted { call_count, .. }) => {
+                *call_count += 1;
+                *call_count >= self.jit_threshold
+            }
+            Some(FuncBody::Native {
+                opt_call_count,
+                optimized_executable,
+                ..
+            }) if optimized_executable.is_none()
+                && self.tier_states.get(idx).copied() == Some(TierState::BaselineNative) =>
+            {
+                *opt_call_count += 1;
+                *opt_call_count >= self.opt_threshold
+            }
+            _ => false,
+        }
+    }
+
+    /// Compile the next tier synchronously and install it.
+    pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
+        let idx = id.0 as usize;
+        let Some(tier) = self.next_compile_tier(idx) else {
+            return self.tier_state(id) != TierState::Interpreted;
+        };
+        let Some(body) = self.functions.get(idx) else {
+            return false;
+        };
+        let mir = Arc::clone(body.mir());
+        if self.collect_tier_stats {
+            if let Some(stats) = self.tier_stats.get_mut(idx) {
+                stats.compile_attempts += 1;
+            }
+        }
+        let compile_mir = Self::build_compile_mir(&mir, tier, interner);
+        if std::env::var("WLIFT_JIT_DUMP").is_ok() {
+            eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
+            eprintln!("{}", compile_mir.pretty_print(interner));
+        }
+        let target = Self::native_target();
+        let compiled = match crate::codegen::compile_function_artifact_with_interner(
+            &compile_mir,
+            target,
+            interner,
+            tier,
+        ) {
+            Ok(compiled) => compiled,
+            Err(_) => return false,
+        };
+        let inline_safe = is_mir_inline_safe(&compile_mir, tier);
+        let native_meta = compiled.native_meta;
+        let executable = match compiled.code.into_executable() {
+            Ok(executable) => executable,
+            Err(_) => return false,
+        };
+        self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
+        true
+    }
+
+    /// Submit the next tier for background compilation.
+    /// The interpreter keeps running bytecode; the compiled result is installed
+    /// when `poll_compilations` is called at the next safepoint.
+    pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        if self.mode != ExecutionMode::Tiered {
+            return;
+        }
+        let idx = id.0 as usize;
+        let Some(tier) = self.next_compile_tier(idx) else {
+            return;
+        };
+        if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
+            return;
+        }
         if let Some(ref handle) = self.compile_handle {
             if !handle.is_finished() {
                 return;
             }
-            // Thread finished — join to reclaim resources.
             if let Some(h) = self.compile_handle.take() {
                 let _ = h.join();
             }
         }
-        let (mir, bytecode) = match self.functions.get(idx) {
-            Some(FuncBody::Interpreted { mir, bytecode, .. }) => {
-                (Arc::clone(mir), bytecode.clone())
-            }
-            Some(FuncBody::Compiled { .. }) => return,
-            None => return,
+        let Some(body) = self.functions.get(idx) else {
+            return;
         };
+        let mir = Arc::clone(body.mir());
+        let trace_name = self
+            .functions
+            .get(idx)
+            .map(|body| interner.resolve(body.mir().name).to_string())
+            .unwrap_or_else(|| format!("FuncId({})", id.0));
+        if self.collect_tier_stats {
+            if let Some(stats) = self.tier_stats.get_mut(idx) {
+                stats.compile_attempts += 1;
+            }
+        }
 
-        self.compiling[idx] = true;
+        self.compiling_tier[idx] = Some(tier);
         self.pending_count += 1;
         let tx = self.compilation_tx.clone();
         let target = Self::native_target();
         let interner_clone = interner.clone();
+        let trace_name_clone = trace_name.clone();
 
-        // Clone MIR for speculative optimization: insert GuardNum for all
-        // non-this BlockParam parameters, then run the full optimization
-        // pipeline. This enables TypeSpecialize to convert boxed arithmetic
-        // to unboxed f64 ops in the JIT path.
-        let speculative_mir = {
-            let mut spec = (*mir).clone();
-            insert_speculative_guards(&mut spec);
-            spec
-        };
+        if tier_trace_enabled() {
+            eprintln!("tier-trace: queue {:?} FuncId({}) {}", tier, id.0, trace_name);
+        }
 
         let compile_fn = move || {
-            // Run optimization pipeline with speculative type guards.
-            let opt_mir = {
-                let mut m = speculative_mir;
-                run_jit_opt_pipeline(&mut m, &interner_clone);
-                m
-            };
-
-            // Debug: dump optimized MIR for each JIT-compiled function.
-            if std::env::var("WLIFT_JIT_DUMP").is_ok() {
-                eprintln!("=== JIT compile FuncId({}) ===", id.0);
-                eprintln!("{}", opt_mir.pretty_print(&interner_clone));
+            if tier_trace_enabled() {
+                eprintln!(
+                    "tier-trace: start {:?} FuncId({}) {}",
+                    tier, id.0, trace_name_clone
+                );
             }
-
-            let opt_mir = Arc::new(opt_mir);
-
+            let compile_mir = Self::build_compile_mir(&mir, tier, &interner_clone);
+            if std::env::var("WLIFT_JIT_DUMP").is_ok() {
+                eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
+                eprintln!("{}", compile_mir.pretty_print(&interner_clone));
+            }
             let result = crate::codegen::compile_function_artifact_with_interner(
-                &opt_mir,
+                &compile_mir,
                 target,
                 &interner_clone,
+                tier,
             )
             .ok()
             .and_then(|artifact| {
+                let inline_safe = is_mir_inline_safe(&compile_mir, tier);
                 let native_meta = artifact.native_meta;
                 artifact
                     .code
                     .into_executable()
                     .ok()
-                    .map(|executable| (executable, native_meta))
+                    .map(|executable| CompilationResult::Compiled {
+                        id,
+                        tier,
+                        executable,
+                        native_meta,
+                        inline_safe,
+                    })
             });
-            if let Some((executable, native_meta)) = result {
-                let _ = tx.send(CompilationResult {
-                    id,
-                    executable,
-                    mir,
-                    bytecode,
-                    native_meta,
-                });
+            if tier_trace_enabled() {
+                eprintln!(
+                    "tier-trace: finish {:?} FuncId({}) {} success={}",
+                    tier,
+                    id.0,
+                    trace_name_clone,
+                    result.is_some()
+                );
             }
+            let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
         };
 
         self.compile_handle = Some(std::thread::spawn(compile_fn));
     }
 
     /// Install any completed background compilations.
-    /// Call this at GC safepoints and before JIT dispatch checks.
     #[inline]
     pub fn poll_compilations(&mut self) {
         if self.pending_count == 0 {
             return;
         }
         while let Ok(result) = self.compilation_rx.try_recv() {
-            let idx = result.id.0 as usize;
-            if idx < self.functions.len() {
-                let latest_bytecode = match self.functions.get(idx) {
-                    Some(FuncBody::Interpreted { bytecode, .. })
-                    | Some(FuncBody::Compiled { bytecode, .. }) => bytecode.clone(),
-                    None => None,
-                };
-                let bytecode = result.bytecode.or(latest_bytecode);
-
-                // Cache native code pointer for O(1) dispatch lookup.
-                let native_ptr = if result.executable.is_native() {
-                    result.executable.native_ptr()
-                } else {
-                    std::ptr::null()
-                };
-                self.functions[idx] = FuncBody::Compiled {
-                    executable: result.executable,
-                    mir: result.mir,
-                    bytecode: bytecode.clone(),
-                };
-                // Grow caches independently if needed (they can get out of sync
-                // when bytecode is lazily materialized before a tier-up lands).
-                if idx >= self.jit_code.len() {
-                    self.jit_code.resize(idx + 1, std::ptr::null());
+            let idx = match result {
+                CompilationResult::Compiled { id, .. } | CompilationResult::Failed { id, .. } => {
+                    id.0 as usize
                 }
-                if idx >= self.jit_leaf.len() {
-                    self.jit_leaf.resize(idx + 1, false);
-                }
-                if idx >= self.jit_metadata.len() {
-                    self.jit_metadata.resize(idx + 1, None);
-                }
-                if idx >= self.bc_cache.len() {
-                    self.bc_cache.resize(idx + 1, std::ptr::null());
-                }
-                self.jit_code[idx] = native_ptr;
-                self.jit_metadata[idx] = result.native_meta;
-                self.bc_cache[idx] = bytecode
-                    .as_ref()
-                    .map(Arc::as_ptr)
-                    .unwrap_or(std::ptr::null());
-                // Detect leaf functions: no runtime calls needed → skip GC roots + JIT context.
-                if let Some(body) = self.functions.get(idx) {
-                    let leaf = is_mir_leaf(body.mir());
-                    self.jit_leaf[idx] = leaf;
+            };
+            if tier_trace_enabled() {
+                match &result {
+                    CompilationResult::Compiled { id, tier, .. } => {
+                        eprintln!("tier-trace: install {:?} FuncId({})", tier, id.0);
+                    }
+                    CompilationResult::Failed { id } => {
+                        eprintln!("tier-trace: install failed FuncId({})", id.0);
+                    }
                 }
             }
-            if idx < self.compiling.len() {
-                self.compiling[idx] = false;
+            if idx < self.functions.len() {
+                if let CompilationResult::Compiled {
+                    tier,
+                    executable,
+                    native_meta,
+                    inline_safe,
+                    ..
+                } = result
+                {
+                    self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
+                }
+            }
+            if idx < self.compiling_tier.len() {
+                self.compiling_tier[idx] = None;
             }
             self.pending_count = self.pending_count.saturating_sub(1);
         }
@@ -679,9 +945,22 @@ impl ExecutionEngine {
 
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
-        // Join the compilation thread so it doesn't outlive the VM.
+        // Only join a finished compilation thread. Waiting for a live tier-up
+        // worker here can stall process exit long after the program has already
+        // printed its result, especially if an optimize-tier compile started
+        // right before shutdown. Dropping the JoinHandle detaches the worker.
         if let Some(handle) = self.compile_handle.take() {
-            let _ = handle.join();
+            if handle.is_finished() {
+                if tier_trace_enabled() {
+                    eprintln!("tier-trace: drop joining finished compile thread");
+                }
+                let _ = handle.join();
+                if tier_trace_enabled() {
+                    eprintln!("tier-trace: drop compile thread joined");
+                }
+            } else if tier_trace_enabled() {
+                eprintln!("tier-trace: drop detaching live compile thread");
+            }
         }
         // Drain any pending results so compiled code buffers are freed.
         while self.compilation_rx.try_recv().is_ok() {}

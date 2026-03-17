@@ -42,6 +42,9 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
             MachInst::DefLabel(l) => {
                 labels.entry(*l).or_insert_with(|| asm.new_dynamic_label());
             }
+            MachInst::CallLabel { target } | MachInst::CallLocal { target, .. } => {
+                labels.entry(*target).or_insert_with(|| asm.new_dynamic_label());
+            }
             MachInst::Jmp { target }
             | MachInst::JmpIf { target, .. }
             | MachInst::JmpZero { target, .. }
@@ -450,6 +453,15 @@ fn emit_inst(
         // =================================================================
         CallInd { target } => {
             dynasm!(asm ; blr X(gp(*target)));
+        }
+
+        CallLabel { target } => {
+            let lbl = get_label(labels, target);
+            dynasm!(asm ; bl =>lbl);
+        }
+
+        CallLocal { .. } => {
+            return Err("CallLocal not yet linked — use CallLabel with ABI setup".to_string());
         }
 
         CallRuntime { .. } => {

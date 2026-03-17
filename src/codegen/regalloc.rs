@@ -336,7 +336,7 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
     func.frame_size = aligned;
 
     for inst in &func.insts {
-        if matches!(inst, MachInst::CallRuntime { .. }) {
+        if matches!(inst, MachInst::CallRuntime { .. } | MachInst::CallLocal { .. }) {
             new_insts.push(inst.clone());
             continue;
         }
@@ -527,6 +527,7 @@ fn rewrite_inst(
         // Single src
         Push { src } => Push { src: m(*src) },
         CallInd { target } => CallInd { target: m(*target) },
+        CallLabel { target } => CallLabel { target: *target },
 
         // dst, src
         Mov { dst, src } => Mov {
@@ -882,6 +883,11 @@ fn rewrite_inst(
         },
 
         // Runtime calls
+        CallLocal { target, args, ret } => CallLocal {
+            target: *target,
+            args: args.iter().map(|a| m(*a)).collect(),
+            ret: ret.map(&m),
+        },
         CallRuntime { name, args, ret } => CallRuntime {
             name,
             args: args.iter().map(|a| m(*a)).collect(),
@@ -924,7 +930,10 @@ pub fn respill_caller_saved_across_calls(
         .filter_map(|(i, inst)| {
             if matches!(
                 inst,
-                MachInst::CallInd { .. } | MachInst::CallRuntime { .. }
+                MachInst::CallInd { .. }
+                    | MachInst::CallLabel { .. }
+                    | MachInst::CallLocal { .. }
+                    | MachInst::CallRuntime { .. }
             ) {
                 Some(i as u32)
             } else {

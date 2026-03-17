@@ -905,6 +905,17 @@ impl X64Emitter {
                 self.emit_call_ind(gp(*target));
             }
 
+            CallLabel { target } => {
+                self.push(0xE8);
+                self.emit_rel32_fixup(*target);
+            }
+
+            CallLocal { .. } => {
+                return Err(
+                    "CallLocal not yet linked — use CallLabel with ABI setup".to_string(),
+                );
+            }
+
             CallRuntime { .. } => {
                 return Err(
                     "CallRuntime not yet linked — use CallInd with resolved address".to_string(),

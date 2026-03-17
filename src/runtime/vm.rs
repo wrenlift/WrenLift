@@ -73,8 +73,10 @@ pub struct VMConfig {
     pub heap_growth_percent: u32,
     /// Execution mode: Interpreter, Tiered (default), or Jit.
     pub execution_mode: ExecutionMode,
-    /// Call count threshold before JIT compilation in Tiered mode.
+    /// Call count threshold before baseline native compilation in Tiered mode.
     pub jit_threshold: u32,
+    /// Baseline-native call count threshold before optimize tier-up.
+    pub opt_threshold: u32,
     /// Enable fiber stack trace tracking (opt-in, not standard Wren behavior).
     /// When enabled, cross-fiber stack traces include spawn sites and caller chains.
     pub fiber_stack_traces: bool,
@@ -102,6 +104,7 @@ impl Default for VMConfig {
             heap_growth_percent: 50,
             execution_mode: ExecutionMode::default(),
             jit_threshold: 100,
+            opt_threshold: 1000,
             fiber_stack_traces: false,
             step_limit: 1_000_000_000,
             max_call_depth: 1024,
@@ -237,6 +240,7 @@ impl VM {
             engine: {
                 let mut e = ExecutionEngine::new(config.execution_mode);
                 e.jit_threshold = config.jit_threshold;
+                e.opt_threshold = config.opt_threshold;
                 e
             },
 
@@ -2076,6 +2080,14 @@ impl VM {
         match result {
             Ok(v) if !v.is_null() => v,
             _ => live_instance,
+        }
+    }
+}
+
+impl Drop for VM {
+    fn drop(&mut self) {
+        if std::env::var_os("WLIFT_TIER_STATS").is_some() {
+            self.engine.dump_tier_stats(&self.interner);
         }
     }
 }

@@ -1232,6 +1232,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             if recv_class == ic.class && recv_class != 0 {
                                 let jit_ptr = ic.jit_ptr;
                                 let recv_bits = recv_val.to_bits();
+                                vm.engine.note_ic_hit(FuncId(ic.func_id));
                                 let result_bits = unsafe {
                                     match argc {
                                         0 => {
@@ -1271,9 +1272,12 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                         }
                                     }
                                 };
+                                vm.engine.note_native_entry(FuncId(ic.func_id));
                                 set_reg(&mut values, dst, Value::from_bits(result_bits));
                                 steps += 1;
                                 continue;
+                            } else {
+                                vm.engine.note_ic_miss(FuncId(ic.func_id));
                             }
                         }
                     }
@@ -1459,6 +1463,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                             }
                                         }
                                     };
+                                    vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
                                     continue;
@@ -1552,6 +1557,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             }
 
                             // Push new frame
+                            vm.engine.note_interpreted_entry(target_func_id);
                             unsafe {
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
@@ -1638,6 +1644,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                             }
 
                             unsafe {
+                                vm.engine.note_interpreted_entry(target_func_id);
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
                                     current_block: BlockId(0),
@@ -2302,6 +2309,7 @@ fn dispatch_closure_bc(
 
                 if is_leaf {
                     // Leaf: direct JIT call (no runtime calls, no deopt).
+                    vm.engine.note_native_entry(target_func_id);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
                     let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                     let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
@@ -2353,6 +2361,7 @@ fn dispatch_closure_bc(
                     }
                     return Ok(());
                 }
+                vm.engine.note_fallback_to_interpreter(target_func_id);
                 // Non-leaf: fall through to interpreter path.
                 // Restore values from saved frame before continuing.
                 values = unsafe {
@@ -2375,6 +2384,7 @@ fn dispatch_closure_bc(
         }
         vm.engine.poll_compilations();
     }
+    vm.engine.note_interpreted_entry(target_func_id);
 
     // Get bytecode for target function (lazily compiled, survives tier-up).
     // Use raw pointer to avoid Arc clone overhead.

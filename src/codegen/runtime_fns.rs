@@ -182,6 +182,10 @@ fn try_dispatch_callsite_ic(
 ) -> Option<u64> {
     let ic = unsafe { &mut *ic_ptr };
     if ic.class != cache_key_class as usize || ic.class == 0 {
+        if ic.func_id != 0 {
+            vm.engine
+                .note_ic_miss(crate::runtime::engine::FuncId(ic.func_id));
+        }
         return None;
     }
 
@@ -206,6 +210,8 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
+            vm.engine
+                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
             Some(unsafe { call_jit_cached(live_ptr, args) })
         }
         2 => {
@@ -214,6 +220,8 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
+            vm.engine
+                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
             let defining_class = ic.jit_ptr as *mut ObjClass;
             Some(call_closure_jit_or_sync(
                 vm,
@@ -233,6 +241,8 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return Some(Value::null().to_bits());
             }
+            vm.engine
+                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
             Some(
                 vm.call_constructor_sync(class_ptr, closure_ptr, &args[1..])
                     .to_bits(),
@@ -787,6 +797,7 @@ pub fn call_closure_jit_or_sync(
     if vm.engine.has_pending_compilations() {
         vm.engine.poll_compilations();
     }
+    let mut had_native_candidate = false;
     if args.len() <= 4 {
         let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
 
@@ -802,6 +813,7 @@ pub fn call_closure_jit_or_sync(
         };
 
         if let Some(fn_ptr) = native_fn_ptr {
+            had_native_candidate = true;
             // Guard: check native recursion depth to prevent stack overflow.
             // Each JIT call level uses ~1-2KB native stack; limit to 256 levels.
             let depth = JIT_DEPTH.with(|d| d.get());
@@ -820,6 +832,7 @@ pub fn call_closure_jit_or_sync(
             // execution available, but route nested non-leaf calls through the
             // interpreter until native frame rooting exists.
             if !is_leaf && !allow_nonleaf_native {
+                vm.engine.note_fallback_to_interpreter(func_id);
                 let result = vm
                     .call_closure_sync(closure_ptr, args, defining_class)
                     .map(|v| v.to_bits())
@@ -829,6 +842,8 @@ pub fn call_closure_jit_or_sync(
             }
 
             if depth < MAX_JIT_DEPTH {
+                vm.engine.note_native_entry(func_id);
+                vm.engine.note_native_to_native_call(func_id);
                 JIT_DEPTH.with(|d| d.set(depth + 1));
                 let root_len_before = jit_roots_snapshot_len();
                 let shadow_slot_count = current_shadow_slot_count(vm, func_id);
@@ -852,6 +867,10 @@ pub fn call_closure_jit_or_sync(
     }
 
     // Fall back to interpreter.
+    if had_native_candidate {
+        let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+        vm.engine.note_fallback_to_interpreter(func_id);
+    }
     let result = vm
         .call_closure_sync(closure_ptr, args, defining_class)
         .map(|v| v.to_bits())
@@ -1691,23 +1710,8 @@ fn deopt_impl(args: &[u64]) -> u64 {
     }
     let func_id = unsafe { (*(*closure_ptr).function).fn_id } as usize;
 
-    // Invalidate JIT code pointer so future calls go to interpreter.
-    if func_id < vm.engine.jit_code.len() {
-        vm.engine.jit_code[func_id] = std::ptr::null();
-    }
-
-    // Revert FuncBody from Compiled → Interpreted (keeps mir + bytecode).
-    if let Some(body) = vm.engine.functions.get_mut(func_id) {
-        if let crate::runtime::engine::FuncBody::Compiled { mir, bytecode, .. } = body {
-            let mir = mir.clone();
-            let bytecode = bytecode.clone();
-            *body = crate::runtime::engine::FuncBody::Interpreted {
-                mir,
-                bytecode,
-                call_count: 0,
-            };
-        }
-    }
+    vm.engine
+        .note_deopt_to_baseline(crate::runtime::engine::FuncId(func_id as u32));
 
     // Re-execute via interpreter with the original args.
     let defining_class = if ctx.defining_class.is_null() {
@@ -2123,7 +2127,7 @@ fn compute_live_out(insts: &[MachInst]) -> Vec<std::collections::HashSet<u32>> {
 // CallRuntime → ABI setup + CallInd lowering pass
 // ---------------------------------------------------------------------------
 
-use crate::codegen::{MachFunc, MachInst, Mem, VReg};
+use crate::codegen::{Label, MachFunc, MachInst, Mem, VReg};
 
 /// Lower all `CallRuntime` instructions after register allocation, using the
 /// final register/spill assignments to build correct ABI setup sequences.
@@ -2146,87 +2150,152 @@ pub fn link_runtime_calls(
         super::Target::Wasm => return,
     };
 
-    let mut call_sites: Vec<(usize, &'static str, Vec<VReg>, Option<VReg>)> = Vec::new();
+    enum PendingCall {
+        Runtime(usize, &'static str, Vec<VReg>, Option<VReg>),
+        Local(usize, Label, Vec<VReg>, Option<VReg>),
+    }
+
+    let mut call_sites: Vec<PendingCall> = Vec::new();
     for (orig_i, inst) in mf.insts.iter().enumerate() {
-        if let MachInst::CallRuntime { name, args, ret } = inst {
-            call_sites.push((orig_i, *name, args.clone(), *ret));
+        match inst {
+            MachInst::CallRuntime { name, args, ret } => {
+                call_sites.push(PendingCall::Runtime(orig_i, *name, args.clone(), *ret));
+            }
+            MachInst::CallLocal { target, args, ret } => {
+                call_sites.push(PendingCall::Local(orig_i, *target, args.clone(), *ret));
+            }
+            _ => {}
         }
     }
 
-    for (orig_i, name, args, ret) in call_sites.into_iter().rev() {
-        let addr = match resolve(name) {
-            Some(a) => a,
-            None => continue,
+    for call_site in call_sites.into_iter().rev() {
+        let (orig_i, new_insts) = match call_site {
+            PendingCall::Runtime(orig_i, name, args, ret) => {
+                let Some(addr) = resolve(name) else {
+                    continue;
+                };
+                let new_insts = lower_linked_call(
+                    &args,
+                    ret,
+                    abi_args,
+                    abi_ret,
+                    call_scratch,
+                    copy_scratch,
+                    frame_ptr,
+                    assignments,
+                    LinkedCallTarget::Runtime(addr as u64),
+                );
+                (orig_i, new_insts)
+            }
+            PendingCall::Local(orig_i, label, args, ret) => {
+                let new_insts = lower_linked_call(
+                    &args,
+                    ret,
+                    abi_args,
+                    abi_ret,
+                    call_scratch,
+                    copy_scratch,
+                    frame_ptr,
+                    assignments,
+                    LinkedCallTarget::Local(label),
+                );
+                (orig_i, new_insts)
+            }
         };
-
-        let mut reg_moves: Vec<(u32, u32)> = Vec::new();
-        let mut spill_loads: Vec<(i32, u32)> = Vec::new();
-
-        for (idx, vreg) in args.iter().enumerate().take(abi_args.len()) {
-            let dst = abi_args[idx];
-            match assignments.get(vreg) {
-                Some(crate::codegen::regalloc::Location::Reg(phys)) => {
-                    reg_moves.push((phys.hw_enc as u32, dst));
-                }
-                Some(crate::codegen::regalloc::Location::Spill(offset)) => {
-                    spill_loads.push((*offset, dst));
-                }
-                None => reg_moves.push((vreg.index, dst)),
-            }
-        }
-
-        let resolved = resolve_parallel_copy(&reg_moves, copy_scratch);
-        let mut new_insts: Vec<MachInst> = Vec::new();
-        for (src, dst) in resolved {
-            new_insts.push(MachInst::Mov {
-                dst: VReg::gp(dst),
-                src: VReg::gp(src),
-            });
-        }
-
-        for (offset, dst) in spill_loads {
-            new_insts.push(MachInst::Ldr {
-                dst: VReg::gp(dst),
-                mem: Mem::new(frame_ptr, offset),
-            });
-        }
-
-        new_insts.push(MachInst::LoadImm {
-            dst: VReg::gp(call_scratch),
-            bits: addr as u64,
-        });
-        new_insts.push(MachInst::CallInd {
-            target: VReg::gp(call_scratch),
-        });
-
-        if let Some(ret_vreg) = ret {
-            match assignments.get(&ret_vreg) {
-                Some(crate::codegen::regalloc::Location::Reg(phys))
-                    if phys.hw_enc as u32 != abi_ret =>
-                {
-                    new_insts.push(MachInst::Mov {
-                        dst: VReg::gp(phys.hw_enc as u32),
-                        src: VReg::gp(abi_ret),
-                    });
-                }
-                Some(crate::codegen::regalloc::Location::Spill(offset)) => {
-                    new_insts.push(MachInst::Str {
-                        src: VReg::gp(abi_ret),
-                        mem: Mem::new(frame_ptr, *offset),
-                    });
-                }
-                _ if ret_vreg.index != abi_ret => {
-                    new_insts.push(MachInst::Mov {
-                        dst: ret_vreg,
-                        src: VReg::gp(abi_ret),
-                    });
-                }
-                _ => {}
-            }
-        }
 
         mf.insts.splice(orig_i..=orig_i, new_insts);
     }
+}
+
+enum LinkedCallTarget {
+    Runtime(u64),
+    Local(Label),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_linked_call(
+    args: &[VReg],
+    ret: Option<VReg>,
+    abi_args: &[u32],
+    abi_ret: u32,
+    call_scratch: u32,
+    copy_scratch: u32,
+    frame_ptr: VReg,
+    assignments: &std::collections::HashMap<VReg, crate::codegen::regalloc::Location>,
+    target: LinkedCallTarget,
+) -> Vec<MachInst> {
+    let mut reg_moves: Vec<(u32, u32)> = Vec::new();
+    let mut spill_loads: Vec<(i32, u32)> = Vec::new();
+
+    for (idx, vreg) in args.iter().enumerate().take(abi_args.len()) {
+        let dst = abi_args[idx];
+        match assignments.get(vreg) {
+            Some(crate::codegen::regalloc::Location::Reg(phys)) => {
+                reg_moves.push((phys.hw_enc as u32, dst));
+            }
+            Some(crate::codegen::regalloc::Location::Spill(offset)) => {
+                spill_loads.push((*offset, dst));
+            }
+            None => reg_moves.push((vreg.index, dst)),
+        }
+    }
+
+    let resolved = resolve_parallel_copy(&reg_moves, copy_scratch);
+    let mut new_insts: Vec<MachInst> = Vec::new();
+    for (src, dst) in resolved {
+        new_insts.push(MachInst::Mov {
+            dst: VReg::gp(dst),
+            src: VReg::gp(src),
+        });
+    }
+
+    for (offset, dst) in spill_loads {
+        new_insts.push(MachInst::Ldr {
+            dst: VReg::gp(dst),
+            mem: Mem::new(frame_ptr, offset),
+        });
+    }
+
+    match target {
+        LinkedCallTarget::Runtime(addr) => {
+            new_insts.push(MachInst::LoadImm {
+                dst: VReg::gp(call_scratch),
+                bits: addr,
+            });
+            new_insts.push(MachInst::CallInd {
+                target: VReg::gp(call_scratch),
+            });
+        }
+        LinkedCallTarget::Local(label) => {
+            new_insts.push(MachInst::CallLabel { target: label });
+        }
+    }
+
+    if let Some(ret_vreg) = ret {
+        match assignments.get(&ret_vreg) {
+            Some(crate::codegen::regalloc::Location::Reg(phys)) if phys.hw_enc as u32 != abi_ret => {
+                new_insts.push(MachInst::Mov {
+                    dst: VReg::gp(phys.hw_enc as u32),
+                    src: VReg::gp(abi_ret),
+                });
+            }
+            Some(crate::codegen::regalloc::Location::Spill(offset)) => {
+                new_insts.push(MachInst::Str {
+                    src: VReg::gp(abi_ret),
+                    mem: Mem::new(frame_ptr, *offset),
+                });
+            }
+            _ if ret_vreg.index != abi_ret => {
+                new_insts.push(MachInst::Mov {
+                    dst: ret_vreg,
+                    src: VReg::gp(abi_ret),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    new_insts
 }
 
 /// Resolve a set of parallel register moves so no source is clobbered before

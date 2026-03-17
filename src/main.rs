@@ -71,6 +71,10 @@ struct Cli {
     #[arg(long)]
     step_limit: Option<usize>,
 
+    /// Baseline warmup threshold before optimize-tier compilation.
+    #[arg(long)]
+    opt_threshold: Option<u32>,
+
     /// Garbage collector strategy.
     #[arg(long, value_enum, default_value_t = GcMode::Generational)]
     gc: GcMode,
@@ -131,6 +135,7 @@ fn make_vm(cli: &Cli) -> VM {
         execution_mode: mode,
         step_limit,
         gc_strategy,
+        opt_threshold: cli.opt_threshold.unwrap_or(VMConfig::default().opt_threshold),
         ..VMConfig::default()
     };
     VM::new(config)
