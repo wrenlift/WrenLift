@@ -1003,8 +1003,73 @@ fn dispatch_method(
 ) -> u64 {
     match method {
         Method::Native(native_fn) => native_fn(vm, args).to_bits(),
-        Method::Closure(cp) => call_closure_jit_or_sync(vm, cp, args, defining_class),
+        Method::Closure(cp) => {
+            let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
+            let fn_idx = func_id.0 as usize;
+            if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter {
+                let needs_tier_up = vm
+                    .engine
+                    .jit_code
+                    .get(fn_idx)
+                    .copied()
+                    .unwrap_or(std::ptr::null())
+                    .is_null();
+                if needs_tier_up {
+                    let should_tier_up = vm.engine.record_call(func_id);
+                    if should_tier_up {
+                        vm.engine.request_tier_up(func_id, &vm.interner);
+                    }
+                }
+            }
+
+            if args.len() <= 4 && !jit_disabled() {
+                let fn_ptr = vm
+                    .engine
+                    .jit_code
+                    .get(fn_idx)
+                    .copied()
+                    .unwrap_or(std::ptr::null());
+                let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+                if !fn_ptr.is_null() && is_leaf {
+                    let saved_ctx = read_jit_ctx();
+                    let depth = jit_depth();
+                    if depth < MAX_JIT_DEPTH {
+                        mutate_jit_ctx(|ctx| {
+                            ctx.closure = cp as *mut u8;
+                            ctx.defining_class = defining_class
+                                .map(|p| p as *mut u8)
+                                .unwrap_or(std::ptr::null_mut());
+                        });
+                        vm.engine.note_native_entry(func_id);
+                        vm.engine.note_native_to_native_call(func_id);
+                        set_jit_depth(depth + 1);
+                        let result = unsafe { call_jit_cached(fn_ptr, args) };
+                        set_jit_depth(depth);
+                        set_jit_context(saved_ctx);
+                        return result;
+                    }
+                }
+            }
+            call_closure_jit_or_sync(vm, cp, args, defining_class)
+        }
         Method::Constructor(cp) => {
+            if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter {
+                let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
+                let fn_idx = func_id.0 as usize;
+                let needs_tier_up = vm
+                    .engine
+                    .jit_code
+                    .get(fn_idx)
+                    .copied()
+                    .unwrap_or(std::ptr::null())
+                    .is_null();
+                if needs_tier_up {
+                    let should_tier_up = vm.engine.record_call(func_id);
+                    if should_tier_up {
+                        vm.engine.request_tier_up(func_id, &vm.interner);
+                    }
+                }
+            }
             // Constructor: never use JIT dispatch — the compiled code would receive
             // the CLASS as `this` instead of a newly-allocated instance, causing SIGSEGV.
             // Always allocate the instance and run the constructor body in interpreter.
@@ -1470,6 +1535,20 @@ pub extern "C" fn wren_to_string(val: u64) -> u64 {
 
     let s = crate::runtime::vm_interp::value_to_string(vm, v);
     let val = vm.new_string(s);
+    push_jit_root(val);
+    val.to_bits()
+}
+
+/// Materialize a string literal from its interned symbol id.
+pub extern "C" fn wren_const_string(sym_idx: u64) -> u64 {
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+
+    let sym = crate::intern::SymbolId::from_raw(sym_idx as u32);
+    let val = vm.new_string(vm.interner.resolve(sym).to_string());
     push_jit_root(val);
     val.to_bits()
 }
@@ -1952,6 +2031,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Strings
         "wren_string_concat" => Some(wren_string_concat as *const () as usize),
         "wren_to_string" => Some(wren_to_string as *const () as usize),
+        "wren_const_string" => Some(wren_const_string as *const () as usize),
         // Type checks & guards
         "wren_is_type" => Some(wren_is_type as *const () as usize),
         "wren_guard_class" => Some(wren_guard_class as *const () as usize),

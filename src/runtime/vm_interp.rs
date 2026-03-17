@@ -134,6 +134,110 @@ fn call_native_with_frame_sync(
     result
 }
 
+fn try_run_root_frame_native(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    func_id: FuncId,
+    module_name: &Rc<String>,
+) -> Result<Option<Value>, RuntimeError> {
+    if vm.engine.mode == ExecutionMode::Interpreter || crate::codegen::runtime_fns::jit_disabled() {
+        return Ok(None);
+    }
+
+    let fn_idx = func_id.0 as usize;
+    let native_fn_ptr = vm
+        .engine
+        .jit_code
+        .get(fn_idx)
+        .copied()
+        .unwrap_or(std::ptr::null());
+    if native_fn_ptr.is_null() {
+        return Ok(None);
+    }
+
+    let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+    let spill_safe_nonleaf = vm
+        .engine
+        .jit_metadata
+        .get(fn_idx)
+        .and_then(|meta| meta.as_ref())
+        .map(|meta| meta.spill_safe_nonleaf)
+        .unwrap_or(false);
+    if !is_leaf && !spill_safe_nonleaf {
+        return Ok(None);
+    }
+
+    let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+    if !saved_ctx.vm.is_null() {
+        return Ok(None);
+    }
+
+    let jit_depth = crate::codegen::runtime_fns::jit_depth();
+    if jit_depth >= crate::codegen::runtime_fns::MAX_JIT_DEPTH {
+        return Ok(None);
+    }
+
+    let vm_ptr = vm as *mut VM as *mut u8;
+    let mod_name_bytes = module_name.as_bytes();
+    let (mv_ptr, mv_count) = vm
+        .engine
+        .modules
+        .get(module_name.as_str())
+        .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+        .unwrap_or((std::ptr::null_mut(), 0));
+    let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    crate::codegen::runtime_fns::push_jit_root(Value::object(fiber as *mut u8));
+    crate::codegen::runtime_fns::set_jit_context(crate::codegen::runtime_fns::JitContext {
+        module_vars: mv_ptr,
+        module_var_count: mv_count,
+        vm: vm_ptr,
+        module_name: mod_name_bytes.as_ptr(),
+        module_name_len: mod_name_bytes.len() as u32,
+        closure: std::ptr::null_mut(),
+        defining_class: std::ptr::null_mut(),
+    });
+
+    vm.engine.note_native_entry(func_id);
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+    let shadow_slot_count = if is_leaf {
+        0
+    } else {
+        vm.engine
+            .jit_metadata
+            .get(fn_idx)
+            .and_then(|meta| meta.as_ref())
+            .map(|meta| meta.boxed_values.len())
+            .unwrap_or(0)
+    };
+    if shadow_slot_count > 0 {
+        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slot_count);
+    }
+    let result_bits = unsafe { call_jit_fn(native_fn_ptr, &[]) };
+    if shadow_slot_count > 0 {
+        crate::codegen::runtime_fns::pop_native_shadow_frame();
+    }
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+
+    let live_fiber = crate::codegen::runtime_fns::jit_root_at(root_len_before)
+        .as_object()
+        .map(|p| p as *mut ObjFiber)
+        .unwrap_or(fiber);
+    vm.fiber = live_fiber;
+    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+
+    if vm.has_error {
+        vm.has_error = false;
+        let err = vm
+            .last_error
+            .take()
+            .unwrap_or_else(|| "runtime error in native entry".to_string());
+        return Err(RuntimeError::Error(err));
+    }
+
+    Ok(Some(Value::from_bits(result_bits)))
+}
+
 // ---------------------------------------------------------------------------
 // Runtime errors
 // ---------------------------------------------------------------------------
@@ -417,15 +521,41 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
         // Load execution state from the top frame into locals.
         // These are mutable so that inline call/return can update them
         // without restarting the fiber loop.
-        let (mut func_id, mut pc, mut values, module_name) = unsafe {
+        let (mut func_id, mut pc, mut values, module_name, closure, return_dst) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
             (
                 frame.func_id,
                 frame.pc,
                 std::mem::take(&mut frame.values),
                 frame.module_name.clone(),
+                frame.closure,
+                frame.return_dst,
             )
         };
+
+        if pc == 0 && closure.is_none() && return_dst.is_none() {
+            if let Some(return_val) = try_run_root_frame_native(vm, fiber, func_id, &module_name)?
+            {
+                fiber = vm.fiber;
+                unsafe {
+                    (*fiber).mir_frames.pop();
+                    (*fiber).state = FiberState::Done;
+                }
+                values.clear();
+                if vm.register_pool.len() < 128 {
+                    vm.register_pool.push(values);
+                }
+                let caller = unsafe { (*fiber).caller };
+                if !caller.is_null() {
+                    unsafe {
+                        (*fiber).caller = std::ptr::null_mut();
+                    }
+                    resume_caller(vm, caller, return_val);
+                    continue 'fiber_loop;
+                }
+                return Ok(return_val);
+            }
+        }
 
         // Get bytecode (lazily compiled on first use).
         // Use raw pointer to avoid Arc clone overhead in the hot loop.

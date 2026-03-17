@@ -582,6 +582,21 @@ impl VM {
             }
         }
 
+        // The module entry runs exactly once, so entry-count tiering can never
+        // make it hot enough on its own. Baseline-compile it up front for
+        // method-heavy scripts, but avoid constructor-heavy entry functions for
+        // now since they still route through the slow temp-fiber bridge.
+        if self.config.execution_mode != super::engine::ExecutionMode::Interpreter
+            && self
+                .engine
+                .get_mir(func_id)
+                .as_deref()
+                .map(|mir| should_eager_compile_entry(mir, &self.interner))
+                .unwrap_or(false)
+        {
+            let _ = self.engine.tier_up(func_id, &self.interner);
+        }
+
         // 9. Create a fiber and push the initial call frame
         let fiber = self.gc.alloc_fiber();
         let reg_size = self
@@ -2107,6 +2122,27 @@ fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32
             }
         }
     }
+}
+
+fn should_eager_compile_entry(
+    mir: &crate::mir::MirFunction,
+    interner: &crate::intern::Interner,
+) -> bool {
+    let constructor_calls = mir
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|(_, inst)| match inst {
+            crate::mir::Instruction::Call { method, .. } => Some(*method),
+            _ => None,
+        })
+        .filter(|method| {
+            let name = interner.resolve(*method);
+            name == "new" || name.starts_with("new(")
+        })
+        .count();
+
+    constructor_calls <= 2
 }
 
 // ---------------------------------------------------------------------------

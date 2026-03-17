@@ -2457,11 +2457,16 @@ impl<'a> LowerCtx<'a> {
                 });
             }
             Instruction::ConstString(idx) => {
-                // Load address from string table (placeholder: index as immediate)
                 let dst = self.vreg_for(dst_val);
+                let sym_reg = self.mf.new_gp();
                 self.mf.emit(MachInst::LoadImm {
-                    dst,
+                    dst: sym_reg,
                     bits: *idx as u64,
+                });
+                self.mf.emit(MachInst::CallRuntime {
+                    name: "wren_const_string",
+                    args: vec![sym_reg],
+                    ret: Some(dst),
                 });
             }
 
@@ -2981,12 +2986,37 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::StringConcat(parts) => {
                 let dst = self.vreg_for(dst_val);
-                let args: Vec<VReg> = parts.iter().map(|p| self.vreg_for(*p)).collect();
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_string_concat",
-                    args,
-                    ret: Some(dst),
-                });
+                match parts.as_slice() {
+                    [] => {
+                        self.mf.emit(MachInst::LoadImm {
+                            dst,
+                            bits: 0x7FFC_0000_0000_0000,
+                        });
+                    }
+                    [only] => {
+                        let src = self.vreg_for(*only);
+                        if src != dst {
+                            self.mf.emit(MachInst::Mov { dst, src });
+                        }
+                    }
+                    [first, rest @ ..] => {
+                        let mut acc = self.vreg_for(*first);
+                        for (idx, part) in rest.iter().enumerate() {
+                            let rhs = self.vreg_for(*part);
+                            let out = if idx + 1 == rest.len() {
+                                dst
+                            } else {
+                                self.mf.new_gp()
+                            };
+                            self.mf.emit(MachInst::CallRuntime {
+                                name: "wren_string_concat",
+                                args: vec![acc, rhs],
+                                ret: Some(out),
+                            });
+                            acc = out;
+                        }
+                    }
+                }
             }
             Instruction::ToString(a) => {
                 let la = self.vreg_for(*a);
