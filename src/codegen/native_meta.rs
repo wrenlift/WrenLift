@@ -9,11 +9,18 @@ pub enum RootLocation {
     Spill(i32),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveRootMetadata {
+    pub slot: u16,
+    pub location: RootLocation,
+}
+
 /// Kind of native safepoint currently recognized by the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafepointKind {
     CallRuntime,
     CallIndirect,
+    CallLocal,
 }
 
 /// Metadata for a single safepoint in a compiled function.
@@ -25,7 +32,7 @@ pub struct SafepointMetadata {
     pub inst_index: u32,
     pub kind: SafepointKind,
     /// All boxed MIR values live across this safepoint after regalloc.
-    pub live_roots: Vec<RootLocation>,
+    pub live_roots: Vec<LiveRootMetadata>,
 }
 
 /// Per-function native-frame metadata retained alongside compiled code.
@@ -58,17 +65,26 @@ pub fn build_native_frame_metadata(
         let Some(kind) = safepoint_kind(inst) else {
             continue;
         };
+        let inst_defs = inst.defs();
 
         let live_roots = boxed_values
             .iter()
-            .filter_map(|vreg| {
+            .enumerate()
+            .filter_map(|(slot, vreg)| {
                 let interval = intervals.get(vreg)?;
                 let idx = inst_index as u32;
-                if interval.start <= idx && idx < interval.end {
-                    match alloc.assignments.get(vreg)? {
-                        Location::Reg(phys) => Some(RootLocation::Reg(phys.hw_enc)),
-                        Location::Spill(offset) => Some(RootLocation::Spill(*offset)),
-                    }
+                if interval.start <= idx
+                    && idx < interval.end
+                    && !inst_defs.contains(vreg)
+                {
+                    let location = match alloc.assignments.get(vreg)? {
+                        Location::Reg(phys) => RootLocation::Reg(phys.hw_enc),
+                        Location::Spill(offset) => RootLocation::Spill(*offset),
+                    };
+                    Some(LiveRootMetadata {
+                        slot: slot as u16,
+                        location,
+                    })
                 } else {
                     None
                 }
@@ -146,10 +162,11 @@ fn is_spill_safe_nonleaf(
 
 fn safepoint_kind(inst: &MachInst) -> Option<SafepointKind> {
     match inst {
-        MachInst::CallRuntime { name, .. } if *name != "wren_shadow_store" => {
+        MachInst::CallRuntime { name, .. } if *name != "wren_shadow_store" && *name != "wren_shadow_load" => {
             Some(SafepointKind::CallRuntime)
         }
         MachInst::CallInd { .. } => Some(SafepointKind::CallIndirect),
+        MachInst::CallLocal { .. } => Some(SafepointKind::CallLocal),
         _ => None,
     }
 }
@@ -199,6 +216,6 @@ mod tests {
         assert_eq!(safepoint.kind, SafepointKind::CallRuntime);
         assert_eq!(safepoint.ordinal, 0);
         assert_eq!(safepoint.inst_index, 3);
-        assert_eq!(safepoint.live_roots.len(), 1);
+        assert!(safepoint.live_roots.is_empty());
     }
 }

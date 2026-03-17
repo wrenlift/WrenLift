@@ -105,16 +105,17 @@ fn imm_scratch(src_hw: u32) -> u32 {
 
 /// Compute effective address for a Mem operand.
 /// If offset is 0, returns the base register index directly.
-/// Otherwise, loads base + offset into x17 (IP1 scratch) and returns 17.
+/// Otherwise, materializes `base + offset` in an IP scratch register.
+/// When the base is already in x17, use x16 to avoid clobbering it.
 fn emit_addr(asm: &mut Assembler, mem: &Mem) -> u32 {
     let b = gp(mem.base);
     if mem.offset == 0 {
         b
     } else {
-        // Use x17 (IP1) as address scratch to avoid conflict with x16 (IP0).
-        emit_load_imm64(asm, 17, mem.offset as i64 as u64);
-        dynasm!(asm ; add X(17), X(b), X(17));
-        17
+        let scratch = if b == 17 { 16 } else { 17 };
+        emit_load_imm64(asm, scratch, mem.offset as i64 as u64);
+        dynasm!(asm ; add X(scratch), X(b), X(scratch));
+        scratch
     }
 }
 

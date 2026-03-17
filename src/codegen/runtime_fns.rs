@@ -20,6 +20,15 @@ struct NativeShadowFrame {
     roots: Vec<Value>,
 }
 
+static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
+
+#[inline(always)]
+fn trace_jit_ic(msg: impl FnOnce() -> String) {
+    if std::env::var_os("WLIFT_TRACE_JIT_IC").is_some() {
+        eprintln!("{}", msg());
+    }
+}
+
 #[inline(always)]
 fn decode_method_and_ic(packed: u64) -> (crate::intern::SymbolId, Option<usize>) {
     let method = crate::intern::SymbolId::from_raw(packed as u32);
@@ -64,12 +73,15 @@ fn current_jit_callsite_ic(
     ic_idx: usize,
 ) -> Option<*mut crate::mir::bytecode::CallSiteIC> {
     let ctx = read_jit_ctx();
-    let closure_ptr = ctx.closure as *mut ObjClosure;
-    if closure_ptr.is_null() {
-        return None;
-    }
-
-    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+    let func_id = if ctx.current_func_id != u32::MAX {
+        crate::runtime::engine::FuncId(ctx.current_func_id)
+    } else {
+        let closure_ptr = ctx.closure as *mut ObjClosure;
+        if closure_ptr.is_null() {
+            return None;
+        }
+        crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id })
+    };
     let bc_ptr = vm
         .engine
         .bc_cache
@@ -79,6 +91,15 @@ fn current_jit_callsite_ic(
         .or_else(|| vm.engine.ensure_bytecode(func_id))?;
     let bc = unsafe { &mut *(bc_ptr as *mut crate::mir::bytecode::BytecodeFunction) };
     let ic_table = unsafe { &mut *bc.ic_table.get() };
+    trace_jit_ic(|| {
+        format!(
+            "jit-ic: func={} ic_idx={} table_len={} closure_null={}",
+            func_id.0,
+            ic_idx,
+            ic_table.len(),
+            ctx.closure.is_null()
+        )
+    });
     ic_table.get_mut(ic_idx).map(|ic| ic as *mut _)
 }
 
@@ -170,6 +191,78 @@ fn populate_callsite_ic(
     unsafe {
         *ic_ptr = entry;
     }
+    trace_jit_ic(|| format!("jit-ic: populate kind={}", unsafe { (*ic_ptr).kind }));
+}
+
+#[inline(always)]
+fn maybe_upgrade_closure_ic_to_leaf(
+    vm: &mut crate::runtime::vm::VM,
+    ic_ptr: *mut crate::mir::bytecode::CallSiteIC,
+    cache_key_class: *mut ObjClass,
+    closure_ptr: *mut ObjClosure,
+    args_len: usize,
+) -> bool {
+    if args_len > 4 || jit_disabled() || vm.engine.mode == crate::runtime::engine::ExecutionMode::Interpreter {
+        return false;
+    }
+
+    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+    let fn_idx = func_id.0 as usize;
+
+    let mut jit_ptr = vm
+        .engine
+        .jit_code
+        .get(fn_idx)
+        .copied()
+        .unwrap_or(std::ptr::null());
+    if jit_ptr.is_null() {
+        let should_tier_up = vm.engine.record_call(func_id);
+        if should_tier_up {
+            vm.engine.request_tier_up(func_id, &vm.interner);
+        }
+        if vm.engine.has_pending_compilations() {
+            vm.engine.poll_compilations();
+        }
+        jit_ptr = vm
+            .engine
+            .jit_code
+            .get(fn_idx)
+            .copied()
+            .unwrap_or(std::ptr::null());
+    }
+
+    if jit_ptr.is_null() || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false) {
+        return false;
+    }
+
+    unsafe {
+        *ic_ptr = crate::mir::bytecode::CallSiteIC {
+            class: cache_key_class as usize,
+            jit_ptr,
+            closure: closure_ptr as *const u8,
+            func_id: func_id.0,
+            kind: 1,
+        };
+    }
+    trace_jit_ic(|| format!("jit-ic: upgrade kind=1 func={}", func_id.0));
+    true
+}
+
+#[inline(always)]
+fn maybe_request_next_tier(
+    vm: &mut crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+) {
+    if vm.engine.mode != crate::runtime::engine::ExecutionMode::Tiered {
+        return;
+    }
+    let should_tier_up = vm.engine.record_call(func_id);
+    if should_tier_up {
+        vm.engine.request_tier_up(func_id, &vm.interner);
+    }
+    if vm.engine.has_pending_compilations() {
+        vm.engine.poll_compilations();
+    }
 }
 
 #[inline(always)]
@@ -196,6 +289,8 @@ fn try_dispatch_callsite_ic(
                 return None;
             }
             let fn_idx = ic.func_id as usize;
+            let func_id = crate::runtime::engine::FuncId(ic.func_id);
+            maybe_request_next_tier(vm, func_id);
             let live_ptr = vm
                 .engine
                 .jit_code
@@ -210,8 +305,8 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
-            vm.engine
-                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
+            vm.engine.note_ic_hit(func_id);
+            trace_jit_ic(|| format!("jit-ic: hit kind=1 func={}", ic.func_id));
             Some(unsafe { call_jit_cached(live_ptr, args) })
         }
         2 => {
@@ -220,8 +315,29 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
-            vm.engine
-                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
+            let func_id = crate::runtime::engine::FuncId(ic.func_id);
+            maybe_request_next_tier(vm, func_id);
+            if maybe_upgrade_closure_ic_to_leaf(
+                vm,
+                ic_ptr,
+                cache_key_class,
+                closure_ptr,
+                args.len(),
+            ) {
+                let live_ptr = unsafe { (*ic_ptr).jit_ptr };
+                vm.engine.note_ic_hit(crate::runtime::engine::FuncId(unsafe {
+                    (*ic_ptr).func_id
+                }));
+                trace_jit_ic(|| {
+                    format!(
+                        "jit-ic: hit upgraded kind=1 func={}",
+                        unsafe { (*ic_ptr).func_id }
+                    )
+                });
+                return Some(unsafe { call_jit_cached(live_ptr, args) });
+            }
+            vm.engine.note_ic_hit(func_id);
+            trace_jit_ic(|| format!("jit-ic: hit kind=2 func={}", ic.func_id));
             let defining_class = ic.jit_ptr as *mut ObjClass;
             Some(call_closure_jit_or_sync(
                 vm,
@@ -243,12 +359,14 @@ fn try_dispatch_callsite_ic(
             }
             vm.engine
                 .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
+            trace_jit_ic(|| format!("jit-ic: hit kind=3 func={}", ic.func_id));
             Some(
                 vm.call_constructor_sync(class_ptr, closure_ptr, &args[1..])
                     .to_bits(),
             )
         }
         4 => {
+            trace_jit_ic(|| "jit-ic: hit kind=4".to_string());
             let native_fn: crate::runtime::object::NativeFn =
                 unsafe { std::mem::transmute(ic.closure) };
             Some(native_fn(vm, args).to_bits())
@@ -276,6 +394,8 @@ pub struct JitContext {
     pub module_name: *const u8,
     /// Module name length.
     pub module_name_len: u32,
+    /// Currently executing function id, used to find per-function call-site ICs.
+    pub current_func_id: u32,
     /// Current closure pointer (for upvalue access from JIT-compiled closure bodies).
     pub closure: *mut u8,
     /// The class that defines the current method (for static field access).
@@ -292,6 +412,7 @@ impl Default for JitContext {
             vm: std::ptr::null_mut(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            current_func_id: u32::MAX,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         }
@@ -312,6 +433,7 @@ thread_local! {
         vm: std::ptr::null_mut(),
         module_name: std::ptr::null(),
         module_name_len: 0,
+        current_func_id: u32::MAX,
         closure: std::ptr::null_mut(),
         defining_class: std::ptr::null_mut(),
     }) };
@@ -332,6 +454,27 @@ thread_local! {
     /// When true, all JIT dispatch is disabled (fall back to interpreter).
     /// Used by shadow check to run interpreter-only path for comparison.
     static JIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline(always)]
+fn set_current_native_shadow_roots_ptr(ptr: *mut Value) {
+    unsafe {
+        CURRENT_NATIVE_SHADOW_ROOTS = ptr;
+    }
+}
+
+#[inline(always)]
+pub fn current_native_shadow_roots_ptr() -> *mut Value {
+    unsafe { CURRENT_NATIVE_SHADOW_ROOTS }
+}
+
+#[inline(always)]
+fn sync_current_native_shadow_roots(frames: &mut [NativeShadowFrame]) {
+    let ptr = frames
+        .last_mut()
+        .and_then(|frame| (!frame.roots.is_empty()).then(|| frame.roots.as_mut_ptr()))
+        .unwrap_or(std::ptr::null_mut());
+    set_current_native_shadow_roots_ptr(ptr);
 }
 
 /// Maximum native JIT recursion depth before falling back to interpreter.
@@ -404,6 +547,12 @@ pub fn take_jit_roots() -> Vec<Value> {
 /// Write back JIT roots after GC (with nursery-forwarded pointers).
 pub fn set_jit_roots(roots: Vec<Value>) {
     JIT_ROOTS_STORE.with(|r| unsafe { *r.get() = roots });
+}
+
+/// Pop and return the last JIT root, if any.
+#[inline(always)]
+pub fn pop_jit_root() -> Option<Value> {
+    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).pop() })
 }
 
 /// Clear JIT roots (called after native code returns to interpreter).
@@ -518,16 +667,25 @@ fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
 
 pub fn push_native_shadow_frame(slot_count: usize) {
     NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        (*stack.get()).push(NativeShadowFrame {
+        let frames = &mut *stack.get();
+        frames.push(NativeShadowFrame {
             roots: vec![Value::null(); slot_count],
         });
+        sync_current_native_shadow_roots(frames);
     });
 }
 
 pub fn pop_native_shadow_frame() {
     NATIVE_SHADOW_STACK.with(|stack| unsafe {
         let frames = &mut *stack.get();
-        let _ = frames.pop();
+        if std::env::var_os("WLIFT_DEBUG_LEAK_NATIVE_SHADOW").is_some() {
+            if let Some(frame) = frames.pop() {
+                std::mem::forget(frame);
+            }
+        } else {
+            let _ = frames.pop();
+        }
+        sync_current_native_shadow_roots(frames);
         if frames.capacity() > 64 && frames.len() < 16 {
             frames.shrink_to(32);
         }
@@ -537,6 +695,7 @@ pub fn pop_native_shadow_frame() {
 pub fn take_native_shadow_roots() -> (Vec<usize>, Vec<Value>) {
     NATIVE_SHADOW_STACK.with(|stack| unsafe {
         let frames = std::mem::take(&mut *stack.get());
+        set_current_native_shadow_roots_ptr(std::ptr::null_mut());
         let mut lengths = Vec::with_capacity(frames.len());
         let total_roots = frames.iter().map(|frame| frame.roots.len()).sum();
         let mut roots = Vec::with_capacity(total_roots);
@@ -559,6 +718,7 @@ pub fn set_native_shadow_roots(lengths: Vec<usize>, roots: Vec<Value>) {
             });
             offset = end;
         }
+        sync_current_native_shadow_roots(&mut rebuilt);
         *stack.get() = rebuilt;
     });
 }
@@ -598,7 +758,17 @@ fn nonleaf_moving_gc_safe(
         .jit_metadata
         .get(func_id.0 as usize)
         .and_then(|meta| meta.as_ref())
-        .map(|meta| meta.spill_safe_nonleaf && meta.safepoints.iter().all(|sp| sp.live_roots.is_empty()))
+        .map(|meta| {
+            meta.spill_safe_nonleaf
+                && meta.safepoints.iter().all(|sp| {
+                    sp.live_roots.iter().all(|root| {
+                        matches!(
+                            root.location,
+                            crate::codegen::native_meta::RootLocation::Spill(_)
+                        )
+                    })
+                })
+        })
         .unwrap_or(false)
 }
 
@@ -672,6 +842,17 @@ pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
         }
     });
     value.to_bits()
+}
+
+pub extern "C" fn wren_shadow_load(slot: u64) -> u64 {
+    let slot = slot as usize;
+    NATIVE_SHADOW_STACK.with(|stack| unsafe {
+        (&*stack.get())
+            .last()
+            .and_then(|frame| frame.roots.get(slot).copied())
+            .unwrap_or(Value::null())
+            .to_bits()
+    })
 }
 
 /// Get the VM pointer from the JIT context.
@@ -787,6 +968,7 @@ pub fn call_closure_jit_or_sync(
 
     // Update context for the callee: set closure and defining_class.
     mutate_jit_ctx(|ctx| {
+        ctx.current_func_id = unsafe { (*(*closure_ptr).function).fn_id };
         ctx.closure = closure_ptr as *mut u8;
         ctx.defining_class = defining_class
             .map(|p| p as *mut u8)
@@ -1035,6 +1217,7 @@ fn dispatch_method(
                     let depth = jit_depth();
                     if depth < MAX_JIT_DEPTH {
                         mutate_jit_ctx(|ctx| {
+                            ctx.current_func_id = unsafe { (*(*cp).function).fn_id };
                             ctx.closure = cp as *mut u8;
                             ctx.defining_class = defining_class
                                 .map(|p| p as *mut u8)
@@ -2066,6 +2249,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_get_upvalue" => Some(wren_get_upvalue as *const () as usize),
         "wren_set_upvalue" => Some(wren_set_upvalue as *const () as usize),
         "wren_shadow_store" => Some(wren_shadow_store as *const () as usize),
+        "wren_shadow_load" => Some(wren_shadow_load as *const () as usize),
+        "wren_current_shadow_roots_ptr" => {
+            Some(std::ptr::addr_of_mut!(CURRENT_NATIVE_SHADOW_ROOTS) as usize)
+        }
         // Static fields
         "wren_get_static_field" => Some(wren_get_static_field as *const () as usize),
         "wren_set_static_field" => Some(wren_set_static_field as *const () as usize),
@@ -2219,6 +2406,7 @@ pub fn link_runtime_calls(
     mf: &mut MachFunc,
     target: super::Target,
     assignments: &std::collections::HashMap<VReg, crate::codegen::regalloc::Location>,
+    native_meta: Option<&crate::codegen::native_meta::NativeFrameMetadata>,
 ) {
     let (abi_args, abi_ret, call_scratch, copy_scratch) = abi_regs(target);
     if abi_args.is_empty() {
@@ -2231,18 +2419,53 @@ pub fn link_runtime_calls(
     };
 
     enum PendingCall {
-        Runtime(usize, &'static str, Vec<VReg>, Option<VReg>),
-        Local(usize, Label, Vec<VReg>, Option<VReg>),
+        Runtime(
+            usize,
+            &'static str,
+            Vec<VReg>,
+            Option<VReg>,
+            Option<Vec<crate::codegen::native_meta::LiveRootMetadata>>,
+        ),
+        Local(
+            usize,
+            Label,
+            Vec<VReg>,
+            Option<VReg>,
+            Option<Vec<crate::codegen::native_meta::LiveRootMetadata>>,
+        ),
     }
 
     let mut call_sites: Vec<PendingCall> = Vec::new();
+    let mut safepoint_iter = native_meta
+        .map(|meta| meta.safepoints.iter())
+        .into_iter()
+        .flatten();
     for (orig_i, inst) in mf.insts.iter().enumerate() {
         match inst {
             MachInst::CallRuntime { name, args, ret } => {
-                call_sites.push(PendingCall::Runtime(orig_i, *name, args.clone(), *ret));
+                let live_roots =
+                    if *name != "wren_shadow_store" && *name != "wren_shadow_load" {
+                        safepoint_iter.next().map(|sp| sp.live_roots.clone())
+                    } else {
+                        None
+                    };
+                call_sites.push(PendingCall::Runtime(
+                    orig_i,
+                    *name,
+                    args.clone(),
+                    *ret,
+                    live_roots,
+                ));
             }
             MachInst::CallLocal { target, args, ret } => {
-                call_sites.push(PendingCall::Local(orig_i, *target, args.clone(), *ret));
+                let live_roots = safepoint_iter.next().map(|sp| sp.live_roots.clone());
+                call_sites.push(PendingCall::Local(
+                    orig_i,
+                    *target,
+                    args.clone(),
+                    *ret,
+                    live_roots,
+                ));
             }
             _ => {}
         }
@@ -2250,7 +2473,7 @@ pub fn link_runtime_calls(
 
     for call_site in call_sites.into_iter().rev() {
         let (orig_i, new_insts) = match call_site {
-            PendingCall::Runtime(orig_i, name, args, ret) => {
+            PendingCall::Runtime(orig_i, name, args, ret, live_roots) => {
                 let Some(addr) = resolve(name) else {
                     continue;
                 };
@@ -2264,10 +2487,11 @@ pub fn link_runtime_calls(
                     frame_ptr,
                     assignments,
                     LinkedCallTarget::Runtime(addr as u64),
+                    live_roots.as_deref(),
                 );
                 (orig_i, new_insts)
             }
-            PendingCall::Local(orig_i, label, args, ret) => {
+            PendingCall::Local(orig_i, label, args, ret, live_roots) => {
                 let new_insts = lower_linked_call(
                     &args,
                     ret,
@@ -2278,6 +2502,7 @@ pub fn link_runtime_calls(
                     frame_ptr,
                     assignments,
                     LinkedCallTarget::Local(label),
+                    live_roots.as_deref(),
                 );
                 (orig_i, new_insts)
             }
@@ -2303,6 +2528,7 @@ fn lower_linked_call(
     frame_ptr: VReg,
     assignments: &std::collections::HashMap<VReg, crate::codegen::regalloc::Location>,
     target: LinkedCallTarget,
+    live_roots: Option<&[crate::codegen::native_meta::LiveRootMetadata]>,
 ) -> Vec<MachInst> {
     let mut reg_moves: Vec<(u32, u32)> = Vec::new();
     let mut spill_loads: Vec<(i32, u32)> = Vec::new();
@@ -2365,17 +2591,63 @@ fn lower_linked_call(
                     mem: Mem::new(frame_ptr, *offset),
                 });
             }
-            _ if ret_vreg.index != abi_ret => {
-                new_insts.push(MachInst::Mov {
-                    dst: ret_vreg,
-                    src: VReg::gp(abi_ret),
-                });
-            }
             _ => {}
         }
     }
 
+    if let Some(live_roots) = live_roots {
+        append_shadow_reloads(
+            &mut new_insts,
+            target_data_addr("wren_current_shadow_roots_ptr"),
+            abi_ret,
+            call_scratch,
+            copy_scratch,
+            frame_ptr,
+            live_roots,
+        );
+    }
+
     new_insts
+}
+
+fn target_data_addr(name: &'static str) -> u64 {
+    resolve(name).unwrap_or(0) as u64
+}
+
+fn append_shadow_reloads(
+    new_insts: &mut Vec<MachInst>,
+    shadow_roots_ptr_addr: u64,
+    abi_ret: u32,
+    call_scratch: u32,
+    copy_scratch: u32,
+    frame_ptr: VReg,
+    live_roots: &[crate::codegen::native_meta::LiveRootMetadata],
+) {
+    if shadow_roots_ptr_addr == 0 {
+        return;
+    }
+
+    for root in live_roots {
+        let crate::codegen::native_meta::RootLocation::Spill(offset) = root.location else {
+            continue;
+        };
+        new_insts.push(MachInst::LoadImm {
+            dst: VReg::gp(call_scratch),
+            bits: shadow_roots_ptr_addr,
+        });
+        new_insts.push(MachInst::Ldr {
+            dst: VReg::gp(copy_scratch),
+            mem: Mem::new(VReg::gp(call_scratch), 0),
+        });
+        new_insts.push(MachInst::Ldr {
+            dst: VReg::gp(abi_ret),
+            mem: Mem::new(VReg::gp(copy_scratch), (root.slot as i32) * 8),
+        });
+        new_insts.push(MachInst::Str {
+            src: VReg::gp(abi_ret),
+            mem: Mem::new(frame_ptr, offset),
+        });
+    }
 }
 
 /// Resolve a set of parallel register moves so no source is clobbered before
@@ -2487,6 +2759,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            current_func_id: u32::MAX,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         });
@@ -2511,6 +2784,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            current_func_id: u32::MAX,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         });
@@ -2542,6 +2816,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            current_func_id: u32::MAX,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         });
@@ -2594,6 +2869,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
+            current_func_id: 7,
             closure: old_closure.as_mut_ptr(),
             defining_class: old_class.as_mut_ptr(),
         };
@@ -2646,7 +2922,7 @@ mod tests {
             (arg1, Location::Reg(PhysReg::gp(5))),
             (ret, Location::Reg(PhysReg::gp(3))),
         ]);
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, None);
 
         // CallRuntime replaced: 2 arg movs + LoadImm + CallInd + ret mov = 5 new
         assert_eq!(mf.insts.len(), before_len + 4);
@@ -2678,7 +2954,7 @@ mod tests {
             (arg0, Location::Reg(PhysReg::gp(3))),
             (arg1, Location::Reg(PhysReg::gp(4))),
         ]);
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, None);
 
         let has_call_scratch = mf
             .insts
@@ -2717,7 +2993,7 @@ mod tests {
             (method, Location::Reg(PhysReg::gp(0))),
             (arg, Location::Reg(PhysReg::gp(1))),
         ]);
-        link_runtime_calls(&mut mf, Target::Aarch64, &assignments);
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, None);
 
         let mut regs = std::collections::HashMap::<u32, &'static str>::from([
             (0, "method"),

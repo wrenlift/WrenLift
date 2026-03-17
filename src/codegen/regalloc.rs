@@ -248,6 +248,13 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
     let mut next_spill_slot: u32 = 0;
 
     for iv in &intervals {
+        if func.force_boxed_gp_spills() && func.is_boxed_gp(iv.vreg) {
+            let slot_offset = -((next_spill_slot as i32 + 1) * 8);
+            next_spill_slot += 1;
+            assignments.insert(iv.vreg, Location::Spill(slot_offset));
+            continue;
+        }
+
         // Expire old intervals that ended before this one starts.
         let start = iv.start;
         let mut expired = Vec::new();

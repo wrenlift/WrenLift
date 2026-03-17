@@ -140,6 +140,13 @@ fn try_run_root_frame_native(
     func_id: FuncId,
     module_name: &Rc<String>,
 ) -> Result<Option<Value>, RuntimeError> {
+    #[inline(always)]
+    fn trace_root_native(msg: impl FnOnce() -> String) {
+        if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
+            eprintln!("{}", msg());
+        }
+    }
+
     if vm.engine.mode == ExecutionMode::Interpreter || crate::codegen::runtime_fns::jit_disabled() {
         return Ok(None);
     }
@@ -156,14 +163,9 @@ fn try_run_root_frame_native(
     }
 
     let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-    let spill_safe_nonleaf = vm
-        .engine
-        .jit_metadata
-        .get(fn_idx)
-        .and_then(|meta| meta.as_ref())
-        .map(|meta| meta.spill_safe_nonleaf)
-        .unwrap_or(false);
-    if !is_leaf && !spill_safe_nonleaf {
+    let allow_nonleaf_native =
+        crate::codegen::runtime_fns::allow_nonleaf_native(vm, func_id);
+    if !is_leaf && !allow_nonleaf_native {
         return Ok(None);
     }
 
@@ -185,7 +187,7 @@ fn try_run_root_frame_native(
         .get(module_name.as_str())
         .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
         .unwrap_or((std::ptr::null_mut(), 0));
-    let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    let fiber_root_idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
     crate::codegen::runtime_fns::push_jit_root(Value::object(fiber as *mut u8));
     crate::codegen::runtime_fns::set_jit_context(crate::codegen::runtime_fns::JitContext {
         module_vars: mv_ptr,
@@ -193,6 +195,7 @@ fn try_run_root_frame_native(
         vm: vm_ptr,
         module_name: mod_name_bytes.as_ptr(),
         module_name_len: mod_name_bytes.len() as u32,
+        current_func_id: func_id.0,
         closure: std::ptr::null_mut(),
         defining_class: std::ptr::null_mut(),
     });
@@ -212,18 +215,50 @@ fn try_run_root_frame_native(
     if shadow_slot_count > 0 {
         crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slot_count);
     }
+    trace_root_native(|| {
+        format!(
+            "root-native: enter func={} fiber={:p} vm_fiber={:p} shadow_slots={} shadow_base={:p}",
+            func_id.0,
+            fiber,
+            vm.fiber,
+            shadow_slot_count,
+            crate::codegen::runtime_fns::current_native_shadow_roots_ptr()
+        )
+    });
     let result_bits = unsafe { call_jit_fn(native_fn_ptr, &[]) };
+    trace_root_native(|| {
+        format!(
+            "root-native: post-call func={} fiber={:p} vm_fiber={:p} result_bits={:#x}",
+            func_id.0,
+            fiber,
+            vm.fiber,
+            result_bits
+        )
+    });
     if shadow_slot_count > 0 {
         crate::codegen::runtime_fns::pop_native_shadow_frame();
     }
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
-    let live_fiber = crate::codegen::runtime_fns::jit_root_at(root_len_before)
-        .as_object()
-        .map(|p| p as *mut ObjFiber)
-        .unwrap_or(fiber);
+    let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
+        crate::codegen::runtime_fns::jit_root_at(fiber_root_idx)
+            .as_object()
+            .map(|p| p as *mut ObjFiber)
+            .unwrap_or(fiber)
+    } else {
+        fiber
+    };
+    crate::codegen::runtime_fns::jit_roots_restore_len(fiber_root_idx);
+    trace_root_native(|| {
+        format!(
+            "root-native: return func={} fiber={:p} live_fiber={:p} vm_fiber_before={:p}",
+            func_id.0,
+            fiber,
+            live_fiber,
+            vm.fiber
+        )
+    });
     vm.fiber = live_fiber;
-    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
     crate::codegen::runtime_fns::set_jit_context(saved_ctx);
 
     if vm.has_error {
@@ -537,6 +572,25 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
             if let Some(return_val) = try_run_root_frame_native(vm, fiber, func_id, &module_name)?
             {
                 fiber = vm.fiber;
+                if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
+                    let frame_count = if fiber.is_null() {
+                        0
+                    } else {
+                        unsafe { (*fiber).mir_frames.len() }
+                    };
+                    eprintln!(
+                        "root-native: handoff func={} fiber={:p} vm_fiber={:p} frames={} caller={:p}",
+                        func_id.0,
+                        fiber,
+                        vm.fiber,
+                        frame_count,
+                        if fiber.is_null() {
+                            std::ptr::null_mut()
+                        } else {
+                            unsafe { (*fiber).caller }
+                        }
+                    );
+                }
                 unsafe {
                     (*fiber).mir_frames.pop();
                     (*fiber).state = FiberState::Done;
@@ -1351,8 +1405,18 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     // regress performance on tight method-call benchmarks.
                     let ic_table = unsafe { &mut *bc.ic_table.get() };
                     if ic_idx < ic_table.len() {
-                        let ic = &ic_table[ic_idx];
+                        let ic = &mut ic_table[ic_idx];
                         if ic.kind == 1 {
+                            let func_id = FuncId(ic.func_id);
+                            if vm.engine.mode == ExecutionMode::Tiered {
+                                let should_tier_up = vm.engine.record_call(func_id);
+                                if should_tier_up {
+                                    vm.engine.request_tier_up(func_id, &vm.interner);
+                                }
+                                if vm.engine.has_pending_compilations() {
+                                    vm.engine.poll_compilations();
+                                }
+                            }
                             let recv_class = if recv_val.is_object() {
                                 let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
                                 unsafe { (*(obj_ptr as *const ObjHeader)).class as usize }
@@ -1360,54 +1424,67 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                 0
                             };
                             if recv_class == ic.class && recv_class != 0 {
-                                let jit_ptr = ic.jit_ptr;
-                                let recv_bits = recv_val.to_bits();
-                                vm.engine.note_ic_hit(FuncId(ic.func_id));
-                                let result_bits = unsafe {
-                                    match argc {
-                                        0 => {
-                                            let f: extern "C" fn(u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(recv_bits)
+                                let fn_idx = ic.func_id as usize;
+                                let live_ptr = vm
+                                    .engine
+                                    .jit_code
+                                    .get(fn_idx)
+                                    .copied()
+                                    .unwrap_or(std::ptr::null());
+                                if live_ptr.is_null()
+                                    || live_ptr != ic.jit_ptr
+                                    || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
+                                {
+                                    *ic = crate::mir::bytecode::CallSiteIC::default();
+                                } else {
+                                    let recv_bits = recv_val.to_bits();
+                                    vm.engine.note_ic_hit(func_id);
+                                    let result_bits = unsafe {
+                                        match argc {
+                                            0 => {
+                                                let f: extern "C" fn(u64) -> u64 =
+                                                    std::mem::transmute(live_ptr);
+                                                f(recv_bits)
+                                            }
+                                            1 => {
+                                                let a1 = read_u16_at(code, arg_regs_pc);
+                                                let f: extern "C" fn(u64, u64) -> u64 =
+                                                    std::mem::transmute(live_ptr);
+                                                f(recv_bits, get_reg(&values, a1).to_bits())
+                                            }
+                                            2 => {
+                                                let a1 = read_u16_at(code, arg_regs_pc);
+                                                let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                                let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                                    std::mem::transmute(live_ptr);
+                                                f(
+                                                    recv_bits,
+                                                    get_reg(&values, a1).to_bits(),
+                                                    get_reg(&values, a2).to_bits(),
+                                                )
+                                            }
+                                            _ => {
+                                                let a1 = read_u16_at(code, arg_regs_pc);
+                                                let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                                let a3 = read_u16_at(code, arg_regs_pc + 4);
+                                                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                                    std::mem::transmute(live_ptr);
+                                                f(
+                                                    recv_bits,
+                                                    get_reg(&values, a1).to_bits(),
+                                                    get_reg(&values, a2).to_bits(),
+                                                    get_reg(&values, a3).to_bits(),
+                                                )
+                                            }
                                         }
-                                        1 => {
-                                            let a1 = read_u16_at(code, arg_regs_pc);
-                                            let f: extern "C" fn(u64, u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(recv_bits, get_reg(&values, a1).to_bits())
-                                        }
-                                        2 => {
-                                            let a1 = read_u16_at(code, arg_regs_pc);
-                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                            let f: extern "C" fn(u64, u64, u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(
-                                                recv_bits,
-                                                get_reg(&values, a1).to_bits(),
-                                                get_reg(&values, a2).to_bits(),
-                                            )
-                                        }
-                                        _ => {
-                                            let a1 = read_u16_at(code, arg_regs_pc);
-                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                            let a3 = read_u16_at(code, arg_regs_pc + 4);
-                                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                                                std::mem::transmute(jit_ptr);
-                                            f(
-                                                recv_bits,
-                                                get_reg(&values, a1).to_bits(),
-                                                get_reg(&values, a2).to_bits(),
-                                                get_reg(&values, a3).to_bits(),
-                                            )
-                                        }
-                                    }
-                                };
-                                vm.engine.note_native_entry(FuncId(ic.func_id));
-                                set_reg(&mut values, dst, Value::from_bits(result_bits));
-                                steps += 1;
-                                continue;
+                                    };
+                                    vm.engine.note_native_entry(func_id);
+                                    set_reg(&mut values, dst, Value::from_bits(result_bits));
+                                    steps += 1;
+                                    continue;
+                                }
                             } else {
-                                vm.engine.note_ic_miss(FuncId(ic.func_id));
+                                vm.engine.note_ic_miss(func_id);
                             }
                         }
                     }
@@ -2430,6 +2507,7 @@ fn dispatch_closure_bc(
                         vm: vm_ptr,
                         module_name: mod_name_bytes.as_ptr(),
                         module_name_len: mod_name_bytes.len() as u32,
+                        current_func_id: target_func_id.0,
                         closure: closure_ptr as *mut u8,
                         defining_class: defining_class
                             .map(|p| p as *mut u8)

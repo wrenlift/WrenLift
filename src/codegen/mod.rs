@@ -933,6 +933,7 @@ pub struct MachFunc {
     pub insts: Vec<MachInst>,
     pub frame_size: u32,
     boxed_gp_vregs: Vec<bool>,
+    force_boxed_gp_spills: bool,
     next_gp: u32,
     next_fp: u32,
     next_vec: u32,
@@ -946,6 +947,7 @@ impl MachFunc {
             insts: Vec::new(),
             frame_size: 0,
             boxed_gp_vregs: Vec::new(),
+            force_boxed_gp_spills: false,
             next_gp: 0,
             next_fp: 0,
             next_vec: 0,
@@ -1009,6 +1011,14 @@ impl MachFunc {
             .iter()
             .enumerate()
             .filter_map(|(idx, is_boxed)| is_boxed.then_some(VReg::gp(idx as u32)))
+    }
+
+    pub fn force_boxed_gp_spills(&self) -> bool {
+        self.force_boxed_gp_spills
+    }
+
+    pub fn set_force_boxed_gp_spills(&mut self, enabled: bool) {
+        self.force_boxed_gp_spills = enabled;
     }
 
     pub fn num_gp_vregs(&self) -> u32 {
@@ -1747,6 +1757,12 @@ fn instrument_native_shadow_stores(mach: &mut MachFunc) {
     if boxed_slots.is_empty() {
         return;
     }
+    let shadow_roots_ptr_addr =
+        crate::codegen::runtime_fns::resolve("wren_current_shadow_roots_ptr")
+            .unwrap_or(0) as u64;
+    if shadow_roots_ptr_addr == 0 {
+        return;
+    }
 
     let orig_insts = std::mem::take(&mut mach.insts);
     let mut new_insts = Vec::with_capacity(orig_insts.len() * 2);
@@ -1760,15 +1776,19 @@ fn instrument_native_shadow_stores(mach: &mut MachFunc) {
             .collect();
         new_insts.push(inst);
         for (slot, vreg) in boxed_defs {
-            let slot_reg = mach.new_gp();
+            let ptr_addr_reg = mach.new_gp();
+            let base_reg = mach.new_gp();
             new_insts.push(MachInst::LoadImm {
-                dst: slot_reg,
-                bits: slot as u64,
+                dst: ptr_addr_reg,
+                bits: shadow_roots_ptr_addr,
             });
-            new_insts.push(MachInst::CallRuntime {
-                name: "wren_shadow_store",
-                args: vec![slot_reg, vreg],
-                ret: None,
+            new_insts.push(MachInst::Ldr {
+                dst: base_reg,
+                mem: Mem::new(ptr_addr_reg, 0),
+            });
+            new_insts.push(MachInst::Str {
+                src: vreg,
+                mem: Mem::new(base_reg, (slot as i32) * 8),
             });
         }
     }
@@ -1911,6 +1931,7 @@ pub fn compile_function_artifact_with_interner(
             let mut mach = lower_mir_with_interner(mir, interner, compile_tier);
             resolve_parallel_copies(&mut mach);
             if needs_native_shadow_stack(&mach) {
+                mach.set_force_boxed_gp_spills(true);
                 instrument_native_shadow_stores(&mut mach);
             }
             let target_regs = match target {
@@ -1924,7 +1945,12 @@ pub fn compile_function_artifact_with_interner(
             )));
             regalloc::apply_allocation(&mut mach, &alloc, target_regs.frame_reserved);
             fixup_sentinels(&mut mach, target);
-            runtime_fns::link_runtime_calls(&mut mach, target, &alloc.assignments);
+            runtime_fns::link_runtime_calls(
+                &mut mach,
+                target,
+                &alloc.assignments,
+                native_meta.as_deref(),
+            );
             insert_callee_saves(&mut mach, target);
 
             if std::env::var("WLIFT_MACH_DUMP").is_ok() {
