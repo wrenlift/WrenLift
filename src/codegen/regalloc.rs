@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn test_x86_64_target_regs() {
         let target = x86_64_target_regs();
-        assert_eq!(target.gp_allocatable.len(), 13); // 16 - RSP(4) - RBP(5) - R11(11)
+        assert_eq!(target.gp_allocatable.len(), 12); // 16 - RSP(4) - RBP(5) - R10(10) - R11(11)
         assert_eq!(target.fp_allocatable.len(), 15); // XMM0-XMM14
                                                      // Verify excluded registers.
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 4)); // no RSP

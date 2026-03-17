@@ -2289,6 +2289,9 @@ struct LowerCtx<'a> {
     entry_param_vregs: Vec<VReg>,
     /// JIT call-site index mirrored from bytecode lowering order.
     jit_call_site_count: u32,
+    /// Label placed before the prologue — used as CallLocal target so each
+    /// recursive call gets its own stack frame.
+    fn_entry_label: Label,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -2333,6 +2336,8 @@ impl<'a> LowerCtx<'a> {
         let value_types = infer_mir_value_types(mir);
         let gc_value_reps = infer_mir_gc_value_reps(mir, &value_types);
 
+        let fn_entry_label = mf.new_label();
+
         Self {
             mf,
             mir,
@@ -2347,6 +2352,7 @@ impl<'a> LowerCtx<'a> {
             deopt_label: None,
             entry_param_vregs: Vec::new(),
             jit_call_site_count: 0,
+            fn_entry_label,
         }
     }
 
@@ -2385,6 +2391,9 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn lower(&mut self) {
+        // Place function entry label before prologue so CallLocal (recursive
+        // self-calls) re-execute the prologue, allocating a fresh stack frame.
+        self.mf.emit(MachInst::DefLabel(self.fn_entry_label));
         self.mf.emit(MachInst::Prologue { frame_size: 0 });
 
         for block_idx in 0..self.mir.blocks.len() {
@@ -2829,7 +2838,7 @@ impl<'a> LowerCtx<'a> {
             Instruction::CallStaticSelf { args } => {
                 let dst = self.vreg_for(dst_val);
                 let direct_arg_count = args.len() + 1;
-                let direct_target = self.label_for(self.mir.blocks[0].id);
+                let direct_target = self.fn_entry_label;
                 if self.compile_tier == CompileTier::Baseline
                     && direct_arg_count <= ABI_ARG_SENTINELS.len()
                     && !self.entry_param_vregs.is_empty()
