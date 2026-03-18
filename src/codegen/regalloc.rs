@@ -180,11 +180,16 @@ pub struct TargetRegs {
 
 /// Build the default aarch64 allocatable set.
 pub fn aarch64_target_regs() -> TargetRegs {
-    // x0-x15 (caller-saved) only. Callee-saved x19-x28 are excluded because
-    // our JIT prologue doesn't save/restore them yet (insert_callee_saves
-    // Push/Pop conflicts with the frame layout on aarch64).
+    // x0-x15 plus x19-x28. x16/x17 are scratch, x18 is platform-reserved,
+    // x29 is FP, x30 is LR, x31 is SP.
+    //
+    // GP callee-saved regs are now handled by insert_callee_saves(), which
+    // makes the larger set worthwhile for spill-heavy non-leaf module bodies.
     // x16/x17 are scratch, x18 is platform-reserved, x29 is FP, x30 is LR, x31 is SP.
-    let gp: Vec<PhysReg> = (0..16).map(PhysReg::gp).collect();
+    let gp: Vec<PhysReg> = (0u8..16)
+        .chain(19u8..29)
+        .map(PhysReg::gp)
+        .collect();
     // d0-d15 allocatable (d16-d31 exist but we keep it simple; d16/d17 scratch)
     let fp: Vec<PhysReg> = (0..16).map(PhysReg::fp).collect();
     // On AArch64: x0-x17 are caller-saved; we allocate x0-x15 so all are caller-saved.
@@ -343,7 +348,12 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
     func.frame_size = aligned;
 
     for inst in &func.insts {
-        if matches!(inst, MachInst::CallRuntime { .. } | MachInst::CallLocal { .. }) {
+        if matches!(
+            inst,
+            MachInst::CallRuntime { .. }
+                | MachInst::CallLocal { .. }
+                | MachInst::CallIndirectAbi { .. }
+        ) {
             new_insts.push(inst.clone());
             continue;
         }
@@ -895,6 +905,11 @@ fn rewrite_inst(
             args: args.iter().map(|a| m(*a)).collect(),
             ret: ret.map(&m),
         },
+        CallIndirectAbi { target, args, ret } => CallIndirectAbi {
+            target: m(*target),
+            args: args.iter().map(|a| m(*a)).collect(),
+            ret: ret.map(&m),
+        },
         CallRuntime { name, args, ret } => CallRuntime {
             name,
             args: args.iter().map(|a| m(*a)).collect(),
@@ -940,6 +955,7 @@ pub fn respill_caller_saved_across_calls(
                 MachInst::CallInd { .. }
                     | MachInst::CallLabel { .. }
                     | MachInst::CallLocal { .. }
+                    | MachInst::CallIndirectAbi { .. }
                     | MachInst::CallRuntime { .. }
             ) {
                 Some(i as u32)

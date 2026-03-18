@@ -111,8 +111,9 @@ fn is_spill_safe_nonleaf(
     mach: &MachFunc,
     alloc: &crate::codegen::regalloc::RegAllocResult,
 ) -> bool {
+    let trace = std::env::var_os("WLIFT_TRACE_SPILLSAFE").is_some();
     for inst in &mach.insts {
-        if matches!(inst, MachInst::CallRuntime { .. }) {
+        if matches!(inst, MachInst::CallRuntime { .. } | MachInst::CallIndirectAbi { .. }) {
             continue;
         }
 
@@ -133,6 +134,12 @@ fn is_spill_safe_nonleaf(
             })
             .count();
         if spilled_gp_uses + spilled_gp_defs > 2 {
+            if trace {
+                eprintln!(
+                    "spill-safe: gp fail inst={:?} spilled_gp_uses={} spilled_gp_defs={}",
+                    inst, spilled_gp_uses, spilled_gp_defs
+                );
+            }
             return false;
         }
 
@@ -153,6 +160,12 @@ fn is_spill_safe_nonleaf(
             })
             .count();
         if spilled_fp_uses + spilled_fp_defs > 1 {
+            if trace {
+                eprintln!(
+                    "spill-safe: fp fail inst={:?} spilled_fp_uses={} spilled_fp_defs={}",
+                    inst, spilled_fp_uses, spilled_fp_defs
+                );
+            }
             return false;
         }
     }

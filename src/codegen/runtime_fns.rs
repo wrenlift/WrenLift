@@ -46,10 +46,15 @@ fn with_rooted_args<T>(args: &[Value], f: impl FnOnce(&[Value]) -> T) -> T {
     for &arg in args {
         push_jit_root(arg);
     }
-    let rooted_args: Vec<Value> = (0..args.len())
-        .map(|idx| jit_root_at(root_len_before + idx))
-        .collect();
-    let result = f(&rooted_args);
+    debug_assert!(
+        args.len() <= 8,
+        "compiled runtime helpers only support small fixed arg lists"
+    );
+    let mut rooted_args = [Value::null(); 8];
+    for (idx, slot) in rooted_args.iter_mut().take(args.len()).enumerate() {
+        *slot = jit_root_at(root_len_before + idx);
+    }
+    let result = f(&rooted_args[..args.len()]);
     jit_roots_restore_len(root_len_before);
     result
 }
@@ -159,7 +164,7 @@ fn populate_callsite_ic(
                     class: cache_key_class as usize,
                     jit_ptr,
                     closure: closure_ptr as *const u8,
-                    func_id: fn_idx as u32,
+                    func_id: fn_idx as u64,
                     kind: 1,
                 }
             } else {
@@ -167,7 +172,7 @@ fn populate_callsite_ic(
                     class: cache_key_class as usize,
                     jit_ptr: defining_class as *const u8,
                     closure: closure_ptr as *const u8,
-                    func_id: fn_idx as u32,
+                    func_id: fn_idx as u64,
                     kind: 2,
                 }
             }
@@ -176,7 +181,7 @@ fn populate_callsite_ic(
             class: cache_key_class as usize,
             jit_ptr: defining_class as *const u8,
             closure: closure_ptr as *const u8,
-            func_id: unsafe { (*(*closure_ptr).function).fn_id },
+            func_id: unsafe { (*(*closure_ptr).function).fn_id as u64 },
             kind: 3,
         },
         Method::Native(native_fn) => crate::mir::bytecode::CallSiteIC {
@@ -240,7 +245,7 @@ fn maybe_upgrade_closure_ic_to_leaf(
             class: cache_key_class as usize,
             jit_ptr,
             closure: closure_ptr as *const u8,
-            func_id: func_id.0,
+            func_id: func_id.0 as u64,
             kind: 1,
         };
     }
@@ -277,7 +282,7 @@ fn try_dispatch_callsite_ic(
     if ic.class != cache_key_class as usize || ic.class == 0 {
         if ic.func_id != 0 {
             vm.engine
-                .note_ic_miss(crate::runtime::engine::FuncId(ic.func_id));
+                .note_ic_miss(crate::runtime::engine::FuncId(ic.func_id as u32));
         }
         return None;
     }
@@ -289,7 +294,7 @@ fn try_dispatch_callsite_ic(
                 return None;
             }
             let fn_idx = ic.func_id as usize;
-            let func_id = crate::runtime::engine::FuncId(ic.func_id);
+            let func_id = crate::runtime::engine::FuncId(ic.func_id as u32);
             maybe_request_next_tier(vm, func_id);
             let live_ptr = vm
                 .engine
@@ -315,7 +320,7 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
-            let func_id = crate::runtime::engine::FuncId(ic.func_id);
+            let func_id = crate::runtime::engine::FuncId(ic.func_id as u32);
             maybe_request_next_tier(vm, func_id);
             if maybe_upgrade_closure_ic_to_leaf(
                 vm,
@@ -326,7 +331,7 @@ fn try_dispatch_callsite_ic(
             ) {
                 let live_ptr = unsafe { (*ic_ptr).jit_ptr };
                 vm.engine.note_ic_hit(crate::runtime::engine::FuncId(unsafe {
-                    (*ic_ptr).func_id
+                    (*ic_ptr).func_id as u32
                 }));
                 trace_jit_ic(|| {
                     format!(
@@ -358,7 +363,7 @@ fn try_dispatch_callsite_ic(
                 return Some(Value::null().to_bits());
             }
             vm.engine
-                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id));
+                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id as u32));
             trace_jit_ic(|| format!("jit-ic: hit kind=3 func={}", ic.func_id));
             Some(
                 vm.call_constructor_sync(class_ptr, closure_ptr, &args[1..])
@@ -760,6 +765,13 @@ fn nonleaf_moving_gc_safe(
         .and_then(|meta| meta.as_ref())
         .map(|meta| {
             meta.spill_safe_nonleaf
+                && meta
+                    .safepoints
+                    .iter()
+                    .map(|sp| sp.live_roots.len())
+                    .max()
+                    .unwrap_or(0)
+                    <= 5
                 && meta.safepoints.iter().all(|sp| {
                     sp.live_roots.iter().all(|root| {
                         matches!(
@@ -829,6 +841,35 @@ pub fn allow_nonleaf_native(
         };
     trace_nonleaf_gate(vm, func_id, allow_nonleaf_native);
     allow_nonleaf_native
+}
+
+pub fn allow_root_nonleaf_native(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+) -> bool {
+    let allow_root_nonleaf_native = match vm.config.gc_strategy {
+        crate::runtime::gc_trait::GcStrategy::Generational => nonleaf_moving_gc_safe(vm, func_id),
+        _ => nonleaf_shadow_safe(vm, func_id),
+    };
+    trace_nonleaf_gate(vm, func_id, allow_root_nonleaf_native);
+    allow_root_nonleaf_native
+}
+
+#[inline(always)]
+fn trace_native_entry(
+    vm: &crate::runtime::vm::VM,
+    func_id: crate::runtime::engine::FuncId,
+    kind: &str,
+) {
+    if std::env::var_os("WLIFT_TRACE_NATIVE_ENTRY").is_none() {
+        return;
+    }
+    let name = vm
+        .engine
+        .get_mir(func_id)
+        .map(|mir| vm.interner.resolve(mir.name).to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    eprintln!("native-entry: {kind} FuncId({}) {}", func_id.0, name);
 }
 
 pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
@@ -1024,6 +1065,7 @@ pub fn call_closure_jit_or_sync(
             }
 
             if depth < MAX_JIT_DEPTH {
+                trace_native_entry(vm, func_id, if is_leaf { "leaf-nested" } else { "nonleaf-nested" });
                 vm.engine.note_native_entry(func_id);
                 vm.engine.note_native_to_native_call(func_id);
                 JIT_DEPTH.with(|d| d.set(depth + 1));
@@ -2433,6 +2475,7 @@ pub fn link_runtime_calls(
             Option<VReg>,
             Option<Vec<crate::codegen::native_meta::LiveRootMetadata>>,
         ),
+        Indirect(usize, VReg, Vec<VReg>, Option<VReg>),
     }
 
     let mut call_sites: Vec<PendingCall> = Vec::new();
@@ -2466,6 +2509,9 @@ pub fn link_runtime_calls(
                     *ret,
                     live_roots,
                 ));
+            }
+            MachInst::CallIndirectAbi { target, args, ret } => {
+                call_sites.push(PendingCall::Indirect(orig_i, *target, args.clone(), *ret));
             }
             _ => {}
         }
@@ -2506,6 +2552,21 @@ pub fn link_runtime_calls(
                 );
                 (orig_i, new_insts)
             }
+            PendingCall::Indirect(orig_i, target_vreg, args, ret) => {
+                let new_insts = lower_linked_call(
+                    &args,
+                    ret,
+                    abi_args,
+                    abi_ret,
+                    call_scratch,
+                    copy_scratch,
+                    frame_ptr,
+                    assignments,
+                    LinkedCallTarget::Indirect(target_vreg),
+                    None,
+                );
+                (orig_i, new_insts)
+            }
         };
 
         mf.insts.splice(orig_i..=orig_i, new_insts);
@@ -2515,6 +2576,7 @@ pub fn link_runtime_calls(
 enum LinkedCallTarget {
     Runtime(u64),
     Local(Label),
+    Indirect(VReg),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2574,6 +2636,34 @@ fn lower_linked_call(
         }
         LinkedCallTarget::Local(label) => {
             new_insts.push(MachInst::CallLabel { target: label });
+        }
+        LinkedCallTarget::Indirect(target_vreg) => {
+            match assignments.get(&target_vreg) {
+                Some(crate::codegen::regalloc::Location::Reg(phys))
+                    if phys.hw_enc as u32 != call_scratch =>
+                {
+                    new_insts.insert(
+                        0,
+                        MachInst::Mov {
+                            dst: VReg::gp(call_scratch),
+                            src: VReg::gp(phys.hw_enc as u32),
+                        },
+                    );
+                }
+                Some(crate::codegen::regalloc::Location::Spill(offset)) => {
+                    new_insts.insert(
+                        0,
+                        MachInst::Ldr {
+                            dst: VReg::gp(call_scratch),
+                            mem: Mem::new(frame_ptr, *offset),
+                        },
+                    );
+                }
+                _ => {}
+            }
+            new_insts.push(MachInst::CallInd {
+                target: VReg::gp(call_scratch),
+            });
         }
     }
 

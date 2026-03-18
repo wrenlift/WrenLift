@@ -488,6 +488,12 @@ fn emit_inst(
             return Err("CallLocal not yet linked — use CallLabel with ABI setup".to_string());
         }
 
+        CallIndirectAbi { .. } => {
+            return Err(
+                "CallIndirectAbi not yet linked — use CallInd with ABI setup".to_string(),
+            );
+        }
+
         CallRuntime { .. } => {
             // Runtime calls require the address to be loaded into a register
             // and called via blr. The actual address patching happens at link time.

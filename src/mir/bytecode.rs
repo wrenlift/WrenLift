@@ -148,6 +148,7 @@ pub enum BcConst {
 ///   2 = interpreted closure (skip method lookup, inline frame push)
 ///   3 = constructor (skip method lookup, alloc instance, inline frame push)
 ///   4 = native method (direct fn pointer call)
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CallSiteIC {
     /// Cached receiver class pointer (0 = empty).
@@ -157,10 +158,17 @@ pub struct CallSiteIC {
     /// Cached closure pointer for dispatch.
     pub closure: *const u8,
     /// Cached func_id for quick bytecode lookup (kinds 2/3).
-    pub func_id: u32,
+    pub func_id: u64,
     /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native.
-    pub kind: u8,
+    pub kind: u64,
 }
+
+pub const CALLSITE_IC_CLASS: i32 = 0;
+pub const CALLSITE_IC_JIT_PTR: i32 = 8;
+pub const CALLSITE_IC_CLOSURE: i32 = 16;
+pub const CALLSITE_IC_FUNC_ID: i32 = 24;
+pub const CALLSITE_IC_KIND: i32 = 32;
+pub const CALLSITE_IC_SIZE: i32 = 40;
 
 impl Default for CallSiteIC {
     fn default() -> Self {
@@ -898,6 +906,31 @@ impl BytecodeFunction {
             Err(i) => Some(&self.source_map[i - 1].1),
         }
     }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn verify_callsite_ic_layout() {
+        assert_eq!(std::mem::size_of::<CallSiteIC>(), CALLSITE_IC_SIZE as usize);
+        assert_eq!(memoffset_of!(CallSiteIC, class), CALLSITE_IC_CLASS as usize);
+        assert_eq!(memoffset_of!(CallSiteIC, jit_ptr), CALLSITE_IC_JIT_PTR as usize);
+        assert_eq!(memoffset_of!(CallSiteIC, closure), CALLSITE_IC_CLOSURE as usize);
+        assert_eq!(memoffset_of!(CallSiteIC, func_id), CALLSITE_IC_FUNC_ID as usize);
+        assert_eq!(memoffset_of!(CallSiteIC, kind), CALLSITE_IC_KIND as usize);
+    }
+
+    macro_rules! memoffset_of {
+        ($ty:ty, $field:ident) => {{
+            let uninit = std::mem::MaybeUninit::<$ty>::uninit();
+            let base = uninit.as_ptr();
+            let field_ptr = unsafe { std::ptr::addr_of!((*base).$field) };
+            (field_ptr as usize) - (base as usize)
+        }};
+    }
+    use memoffset_of;
 }
 
 // ---------------------------------------------------------------------------

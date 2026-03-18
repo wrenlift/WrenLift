@@ -461,6 +461,18 @@ impl ExecutionEngine {
         ptr
     }
 
+    fn callsite_ic_ptrs_for_compile(&mut self, id: FuncId) -> Option<Vec<usize>> {
+        let bc_ptr = self.ensure_bytecode(id)?;
+        let bc = unsafe { &mut *(bc_ptr as *mut BytecodeFunction) };
+        let ic_table = unsafe { &mut *bc.ic_table.get() };
+        Some(
+            ic_table
+                .iter_mut()
+                .map(|ic| ic as *mut CallSiteIC as usize)
+                .collect(),
+        )
+    }
+
     /// Whether any background compilations are waiting to be installed.
     #[inline(always)]
     pub fn has_pending_compilations(&self) -> bool {
@@ -715,6 +727,7 @@ impl ExecutionEngine {
             self.bc_cache[idx] = Arc::as_ptr(&bytecode);
         }
         self.sync_active_tier_cache(idx);
+        self.invalidate_inline_caches();
         if self.collect_tier_stats {
             if let Some(stats) = self.tier_stats.get_mut(idx) {
                 stats.compile_successes += 1;
@@ -764,16 +777,18 @@ impl ExecutionEngine {
             }
         }
         let compile_mir = Self::build_compile_mir(&mir, tier, interner);
+        let callsite_ic_ptrs = self.callsite_ic_ptrs_for_compile(id);
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
         }
         let target = Self::native_target();
-        let compiled = match crate::codegen::compile_function_artifact_with_interner(
+        let compiled = match crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
             &compile_mir,
             target,
             interner,
             tier,
+            callsite_ic_ptrs,
         ) {
             Ok(compiled) => compiled,
             Err(_) => return false,
@@ -831,6 +846,7 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let interner_clone = interner.clone();
         let trace_name_clone = trace_name.clone();
+        let callsite_ic_ptrs = self.callsite_ic_ptrs_for_compile(id);
 
         if tier_trace_enabled() {
             eprintln!("tier-trace: queue {:?} FuncId({}) {}", tier, id.0, trace_name);
@@ -848,11 +864,12 @@ impl ExecutionEngine {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
-            let result = crate::codegen::compile_function_artifact_with_interner(
+            let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
                 &interner_clone,
                 tier,
+                callsite_ic_ptrs,
             )
             .ok()
             .and_then(|artifact| {

@@ -164,7 +164,7 @@ fn try_run_root_frame_native(
 
     let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
     let allow_nonleaf_native =
-        crate::codegen::runtime_fns::allow_nonleaf_native(vm, func_id);
+        crate::codegen::runtime_fns::allow_root_nonleaf_native(vm, func_id);
     if !is_leaf && !allow_nonleaf_native {
         return Ok(None);
     }
@@ -201,6 +201,14 @@ fn try_run_root_frame_native(
     });
 
     vm.engine.note_native_entry(func_id);
+    if std::env::var_os("WLIFT_TRACE_NATIVE_ENTRY").is_some() {
+        let name = vm
+            .engine
+            .get_mir(func_id)
+            .map(|mir| vm.interner.resolve(mir.name).to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!("native-entry: root FuncId({}) {}", func_id.0, name);
+    }
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
     let shadow_slot_count = if is_leaf {
         0
@@ -1407,7 +1415,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     if ic_idx < ic_table.len() {
                         let ic = &mut ic_table[ic_idx];
                         if ic.kind == 1 {
-                            let func_id = FuncId(ic.func_id);
+                            let func_id = FuncId(ic.func_id as u32);
                             if vm.engine.mode == ExecutionMode::Tiered {
                                 let should_tier_up = vm.engine.record_call(func_id);
                                 if should_tier_up {
@@ -1631,7 +1639,7 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                                             class: cache_key_class as usize,
                                             jit_ptr,
                                             closure: closure_ptr as *const u8,
-                                            func_id: fn_idx as u32,
+                                            func_id: fn_idx as u64,
                                             kind: 1, // JIT leaf
                                         };
                                     }

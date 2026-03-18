@@ -640,6 +640,14 @@ pub enum MachInst {
         ret: Option<VReg>,
     },
 
+    /// Pseudo-instruction for an indirect call that still needs ABI arg/ret
+    /// setup after register allocation.
+    CallIndirectAbi {
+        target: VReg,
+        args: Vec<VReg>,
+        ret: Option<VReg>,
+    },
+
     /// Direct call to a named runtime function (resolved at link/patch time).
     /// The caller is responsible for setting up arguments in the correct ABI
     /// registers beforehand.
@@ -800,8 +808,14 @@ impl MachInst {
             // Conditional ops use nothing (flags are implicit)
             CSet { .. } | JmpIf { .. } => vec![],
 
-            // Runtime calls
+            // Calls with ABI setup deferred to the linker pass.
             CallLocal { args, .. } | CallRuntime { args, .. } => args.clone(),
+            CallIndirectAbi { target, args, .. } => {
+                let mut uses = Vec::with_capacity(args.len() + 1);
+                uses.push(*target);
+                uses.extend(args.iter().copied());
+                uses
+            }
 
             // Parallel copy: all sources are uses
             ParallelCopy { copies } => copies.iter().map(|(_, src)| *src).collect(),
@@ -870,7 +884,9 @@ impl MachInst {
             | Pop { dst }
             | FuncArg { dst, .. } => Some(*dst),
 
-            CallLocal { ret, .. } | CallRuntime { ret, .. } => *ret,
+            CallLocal { ret, .. } | CallRuntime { ret, .. } | CallIndirectAbi { ret, .. } => {
+                *ret
+            }
 
             // ParallelCopy defines multiple — return None; regalloc handles specially.
             ParallelCopy { .. } => None,
@@ -912,6 +928,7 @@ impl MachInst {
                 | MachInst::VStore { .. }
                 | MachInst::CallInd { .. }
                 | MachInst::CallRuntime { .. }
+                | MachInst::CallIndirectAbi { .. }
                 | MachInst::Push { .. }
                 | MachInst::Pop { .. }
                 | MachInst::CallLabel { .. }
@@ -1737,9 +1754,6 @@ fn infer_mir_gc_value_reps(
 }
 
 fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
-    if !crate::codegen::runtime_fns::shadow_nonleaf_enabled() {
-        return false;
-    }
     mach.insts.iter().any(|inst| {
         matches!(
             inst,
@@ -1808,8 +1822,17 @@ pub fn lower_mir_with_interner(
     interner: &crate::intern::Interner,
     compile_tier: CompileTier,
 ) -> MachFunc {
+    lower_mir_with_interner_and_callsite_ics(mir, interner, compile_tier, None)
+}
+
+pub fn lower_mir_with_interner_and_callsite_ics(
+    mir: &MirFunction,
+    interner: &crate::intern::Interner,
+    compile_tier: CompileTier,
+    callsite_ic_ptrs: Option<Vec<usize>>,
+) -> MachFunc {
     let mut mf = MachFunc::new(format!("fn_{}", mir.name.index()));
-    let mut ctx = LowerCtx::new(&mut mf, mir, interner, compile_tier);
+    let mut ctx = LowerCtx::new(&mut mf, mir, interner, compile_tier, callsite_ic_ptrs);
     ctx.lower();
     mf
 }
@@ -1919,6 +1942,22 @@ pub fn compile_function_artifact_with_interner(
     interner: &crate::intern::Interner,
     compile_tier: CompileTier,
 ) -> Result<CompiledArtifact, String> {
+    compile_function_artifact_with_interner_and_callsite_ics(
+        mir,
+        target,
+        interner,
+        compile_tier,
+        None,
+    )
+}
+
+pub fn compile_function_artifact_with_interner_and_callsite_ics(
+    mir: &MirFunction,
+    target: Target,
+    interner: &crate::intern::Interner,
+    compile_tier: CompileTier,
+    callsite_ic_ptrs: Option<Vec<usize>>,
+) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
             let module = wasm::emit_mir(mir)?;
@@ -1928,7 +1967,12 @@ pub fn compile_function_artifact_with_interner(
             })
         }
         _ => {
-            let mut mach = lower_mir_with_interner(mir, interner, compile_tier);
+            let mut mach = lower_mir_with_interner_and_callsite_ics(
+                mir,
+                interner,
+                compile_tier,
+                callsite_ic_ptrs,
+            );
             resolve_parallel_copies(&mut mach);
             if needs_native_shadow_stack(&mach) {
                 mach.set_force_boxed_gp_spills(true);
@@ -2184,6 +2228,15 @@ fn fixup_vreg_sentinels(
             fix(src);
         }
         MachInst::CallInd { target } => fix(target),
+        MachInst::CallIndirectAbi { target, args, ret } => {
+            fix(target);
+            for a in args.iter_mut() {
+                fix(a);
+            }
+            if let Some(r) = ret {
+                fix(r);
+            }
+        }
         MachInst::CallLocal { args, ret, .. } => {
             for a in args.iter_mut() {
                 fix(a);
@@ -2296,6 +2349,7 @@ struct LowerCtx<'a> {
     mf: &'a mut MachFunc,
     mir: &'a MirFunction,
     compile_tier: CompileTier,
+    callsite_ic_ptrs: Option<Vec<usize>>,
     gc_value_reps: Vec<GcValueRep>,
     /// MIR ValueId → VReg mapping.
     val_map: HashMap<ValueId, VReg>,
@@ -2326,6 +2380,7 @@ impl<'a> LowerCtx<'a> {
         mir: &'a MirFunction,
         interner: &'a crate::intern::Interner,
         compile_tier: CompileTier,
+        callsite_ic_ptrs: Option<Vec<usize>>,
     ) -> Self {
         // Pre-allocate labels for each block.
         let mut block_labels = HashMap::new();
@@ -2368,6 +2423,7 @@ impl<'a> LowerCtx<'a> {
             mf,
             mir,
             compile_tier,
+            callsite_ic_ptrs,
             gc_value_reps,
             val_map: HashMap::new(),
             block_labels,
@@ -2833,21 +2889,125 @@ impl<'a> LowerCtx<'a> {
                 method,
                 args,
             } => {
+                use crate::mir::bytecode::{
+                    CALLSITE_IC_CLASS, CALLSITE_IC_JIT_PTR, CALLSITE_IC_KIND,
+                };
+                use crate::runtime::object_layout::HEADER_CLASS;
+
+                const QNAN: u64 = 0x7FFC_0000_0000_0000;
+                const TAG_OBJ: u64 = (1u64 << 63) | QNAN;
+                const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
                 let r = self.vreg_for(*receiver);
                 let dst = self.vreg_for(dst_val);
-                let mut call_args = vec![r];
-                let method_reg = self.mf.new_gp();
                 let packed_method =
                     (method.index() as u64) | (((self.jit_call_site_count + 1) as u64) << 32);
+                let ic_idx = self.jit_call_site_count as usize;
                 self.jit_call_site_count += 1;
+                let user_args: Vec<VReg> = args.iter().map(|a| self.vreg_for(*a)).collect();
+
+                let done_label = self.mf.new_label();
+                if let Some(ic_ptr) = self
+                    .callsite_ic_ptrs
+                    .as_ref()
+                    .and_then(|ptrs| ptrs.get(ic_idx))
+                    .copied()
+                {
+                    let slow_label = self.mf.new_label();
+                    let masked = self.mf.new_gp();
+                    let tag_obj = self.mf.new_gp();
+                    self.mf.emit(MachInst::AndImm {
+                        dst: masked,
+                        src: r,
+                        imm: TAG_OBJ,
+                    });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: tag_obj,
+                        bits: TAG_OBJ,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: masked,
+                        rhs: tag_obj,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: slow_label,
+                    });
+
+                    let obj_ptr = self.mf.new_gp();
+                    self.mf.emit(MachInst::AndImm {
+                        dst: obj_ptr,
+                        src: r,
+                        imm: PTR_MASK,
+                    });
+                    let recv_class = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr {
+                        dst: recv_class,
+                        mem: Mem::new(obj_ptr, HEADER_CLASS),
+                    });
+                    let ic_base = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: ic_base,
+                        bits: ic_ptr as u64,
+                    });
+                    let cached_class = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr {
+                        dst: cached_class,
+                        mem: Mem::new(ic_base, CALLSITE_IC_CLASS),
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: recv_class,
+                        rhs: cached_class,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: slow_label,
+                    });
+
+                    let kind = self.mf.new_gp();
+                    let leaf_kind = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr {
+                        dst: kind,
+                        mem: Mem::new(ic_base, CALLSITE_IC_KIND),
+                    });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: leaf_kind,
+                        bits: 1,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: leaf_kind,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: slow_label,
+                    });
+
+                    let target_ptr = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr {
+                        dst: target_ptr,
+                        mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
+                    });
+                    let mut direct_args = Vec::with_capacity(user_args.len() + 1);
+                    direct_args.push(r);
+                    direct_args.extend(user_args.iter().copied());
+                    self.mf.emit(MachInst::CallIndirectAbi {
+                        target: target_ptr,
+                        args: direct_args,
+                        ret: Some(dst),
+                    });
+                    self.mf.emit(MachInst::Jmp { target: done_label });
+                    self.mf.emit(MachInst::DefLabel(slow_label));
+                }
+
+                let mut call_args = vec![r];
+                let method_reg = self.mf.new_gp();
                 self.mf.emit(MachInst::LoadImm {
                     dst: method_reg,
                     bits: packed_method,
                 });
                 call_args.push(method_reg);
-                for a in args {
-                    call_args.push(self.vreg_for(*a));
-                }
+                call_args.extend(user_args.iter().copied());
                 let call_name = match args.len() {
                     0 => "wren_call_0",
                     1 => "wren_call_1",
@@ -2860,6 +3020,7 @@ impl<'a> LowerCtx<'a> {
                     args: call_args,
                     ret: Some(dst),
                 });
+                self.mf.emit(MachInst::DefLabel(done_label));
             }
             Instruction::CallStaticSelf { args } => {
                 let dst = self.vreg_for(dst_val);
@@ -4276,6 +4437,13 @@ fn format_inst(inst: &MachInst) -> String {
 
         CallInd { target } => format!("call_ind {}", target),
         CallLabel { target } => format!("call_label {}", target),
+        CallIndirectAbi { target, args, ret } => {
+            let args_str: Vec<String> = args.iter().map(|r| format!("{}", r)).collect();
+            match ret {
+                Some(r) => format!("{} = call_ind_abi {}({})", r, target, args_str.join(", ")),
+                None => format!("call_ind_abi {}({})", target, args_str.join(", ")),
+            }
+        }
         CallLocal { target, args, ret } => {
             let args_str: Vec<String> = args.iter().map(|r| format!("{}", r)).collect();
             match ret {

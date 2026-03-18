@@ -916,6 +916,12 @@ impl X64Emitter {
                 );
             }
 
+            CallIndirectAbi { .. } => {
+                return Err(
+                    "CallIndirectAbi not yet linked — use CallInd with ABI setup".to_string(),
+                );
+            }
+
             CallRuntime { .. } => {
                 return Err(
                     "CallRuntime not yet linked — use CallInd with resolved address".to_string(),
