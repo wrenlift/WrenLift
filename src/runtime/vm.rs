@@ -1933,7 +1933,6 @@ impl VM {
             crate::codegen::runtime_fns::push_jit_root(arg);
         }
 
-        let temp_fiber = self.acquire_sync_fiber();
         let live_closure = match crate::codegen::runtime_fns::jit_root_at(root_len_before)
             .as_object()
             .map(|p| p as *mut ObjClosure)
@@ -1947,6 +1946,71 @@ impl VM {
         let live_defining_class = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1)
             .as_object()
             .map(|p| p as *mut crate::runtime::object::ObjClass);
+        let current_fiber = self.fiber;
+        if !current_fiber.is_null() {
+            let fn_ptr = unsafe { (*live_closure).function };
+            let func_id = crate::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+
+            let mir = match self.engine.get_mir(func_id) {
+                Some(mir) => mir,
+                None => {
+                    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                    return None;
+                }
+            };
+            let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
+
+            let block = &mir.blocks[0];
+            for (vid, inst) in &block.instructions {
+                if let Instruction::BlockParam(idx) = inst {
+                    let param_i = *idx as usize;
+                    if param_i < args.len() {
+                        let i = vid.0 as usize;
+                        if i >= values.len() {
+                            values.resize(i + 1, Value::UNDEFINED);
+                        }
+                        values[i] =
+                            crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + param_i);
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            let mod_name = unsafe {
+                (*current_fiber)
+                    .mir_frames
+                    .last()
+                    .map(|f| f.module_name.clone())
+                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
+            };
+            let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
+            if stop_depth >= self.config.max_call_depth {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return None;
+            }
+
+            unsafe {
+                (*current_fiber).mir_frames.push(MirCallFrame {
+                    func_id,
+                    current_block: BlockId(0),
+                    ip: 0,
+                    pc: 0,
+                    values,
+                    module_name: mod_name,
+                    return_dst: None,
+                    closure: Some(live_closure),
+                    defining_class: live_defining_class,
+                    bc_ptr: std::ptr::null(),
+                });
+            }
+
+            let result = super::vm_interp::run_fiber_until_depth(self, stop_depth);
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return result.ok();
+        }
+
+        let temp_fiber = self.acquire_sync_fiber();
         unsafe {
             (*temp_fiber).header.class = self.fiber_class;
 
@@ -2071,6 +2135,68 @@ impl VM {
             return instance_val;
         }
         let mir = mir.unwrap();
+
+        let current_fiber = self.fiber;
+        if !current_fiber.is_null() {
+            let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+            let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
+
+            let block = &mir.blocks[0];
+            for (vid, inst) in &block.instructions {
+                if let Instruction::BlockParam(idx) = inst {
+                    let param_i = *idx as usize;
+                    let val = if param_i == 0 {
+                        live_instance
+                    } else if param_i - 1 < ctor_args.len() {
+                        ctor_args[param_i - 1]
+                    } else {
+                        Value::UNDEFINED
+                    };
+                    let i = vid.0 as usize;
+                    if i >= values.len() {
+                        values.resize(i + 1, Value::UNDEFINED);
+                    }
+                    values[i] = val;
+                } else {
+                    break;
+                }
+            }
+
+            let mod_name = unsafe {
+                (*current_fiber)
+                    .mir_frames
+                    .last()
+                    .map(|f| f.module_name.clone())
+                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
+            };
+            let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
+            if stop_depth >= self.config.max_call_depth {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return live_instance;
+            }
+
+            unsafe {
+                (*current_fiber).mir_frames.push(MirCallFrame {
+                    func_id,
+                    current_block: BlockId(0),
+                    ip: 0,
+                    pc: 0,
+                    values,
+                    module_name: mod_name,
+                    return_dst: None,
+                    closure: Some(closure_ptr),
+                    defining_class: Some(class_ptr),
+                    bc_ptr: std::ptr::null(),
+                });
+            }
+
+            let result = super::vm_interp::run_fiber_until_depth(self, stop_depth);
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return match result {
+                Ok(v) if !v.is_null() => v,
+                _ => live_instance,
+            };
+        }
 
         // alloc_fiber may trigger GC — read back the (possibly forwarded) instance
         // from the JIT root AFTER allocation so we always have the live pointer.

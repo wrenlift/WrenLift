@@ -148,6 +148,7 @@ pub enum BcConst {
 ///   2 = interpreted closure (skip method lookup, inline frame push)
 ///   3 = constructor (skip method lookup, alloc instance, inline frame push)
 ///   4 = native method (direct fn pointer call)
+///   5 = trivial getter (direct field load; func_id stores field index)
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CallSiteIC {
@@ -157,9 +158,9 @@ pub struct CallSiteIC {
     pub jit_ptr: *const u8,
     /// Cached closure pointer for dispatch.
     pub closure: *const u8,
-    /// Cached func_id for quick bytecode lookup (kinds 2/3).
+    /// Cached func_id for quick bytecode lookup (kinds 2/3) or field index (kind 5).
     pub func_id: u64,
-    /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native.
+    /// Method type: 0 = empty, 1 = JIT leaf, 2 = interp closure, 3 = constructor, 4 = native, 5 = getter.
     pub kind: u64,
 }
 

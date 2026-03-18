@@ -535,11 +535,10 @@ macro_rules! bc_bitwise_binop {
 // Fiber-based bytecode interpreter
 // ---------------------------------------------------------------------------
 
-/// Run the active fiber (vm.fiber) until it finishes, yields, or errors.
-///
-/// The fiber must have at least one MirCallFrame pushed before calling this.
-/// Uses flat bytecode dispatch for efficient interpretation.
-pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
+fn run_fiber_with_stop_depth(
+    vm: &mut VM,
+    stop_depth: Option<usize>,
+) -> Result<Value, RuntimeError> {
     if vm.fiber.is_null() {
         return Err(RuntimeError::Error("no active fiber".into()));
     }
@@ -2219,7 +2218,11 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     if vm.register_pool.len() < 128 {
                         vm.register_pool.push(values);
                     }
-                    if unsafe { (*fiber).mir_frames.is_empty() } {
+                    let remaining_depth = unsafe { (*fiber).mir_frames.len() };
+                    if stop_depth == Some(remaining_depth) {
+                        return Ok(return_val);
+                    }
+                    if remaining_depth == 0 {
                         unsafe { (*fiber).state = FiberState::Done };
                         let caller = unsafe { (*fiber).caller };
                         if !caller.is_null() {
@@ -2258,7 +2261,11 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
                     if vm.register_pool.len() < 128 {
                         vm.register_pool.push(values);
                     }
-                    if unsafe { (*fiber).mir_frames.is_empty() } {
+                    let remaining_depth = unsafe { (*fiber).mir_frames.len() };
+                    if stop_depth == Some(remaining_depth) {
+                        return Ok(Value::null());
+                    }
+                    if remaining_depth == 0 {
                         unsafe { (*fiber).state = FiberState::Done };
                         let caller = unsafe { (*fiber).caller };
                         if !caller.is_null() {
@@ -2431,6 +2438,22 @@ fn new_values_fill_undef(values: &mut [Value], count: usize) {
     for v in values[..count].iter_mut() {
         *v = UNDEF;
     }
+}
+
+/// Run the active fiber (vm.fiber) until it finishes, yields, or errors.
+///
+/// The fiber must have at least one MirCallFrame pushed before calling this.
+/// Uses flat bytecode dispatch for efficient interpretation.
+pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
+    run_fiber_with_stop_depth(vm, None)
+}
+
+/// Run the active fiber until its frame stack shrinks back to `stop_depth`.
+///
+/// Used for synchronous native->interpreter calls that push one callee frame
+/// onto the current fiber and must stop before resuming the native caller.
+pub fn run_fiber_until_depth(vm: &mut VM, stop_depth: usize) -> Result<Value, RuntimeError> {
+    run_fiber_with_stop_depth(vm, Some(stop_depth))
 }
 
 /// Dispatch a closure call in bytecode mode: save current frame, push new frame.
