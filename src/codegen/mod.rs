@@ -2746,13 +2746,37 @@ impl<'a> LowerCtx<'a> {
 
             // -- Logical --
             Instruction::Not(a) => {
+                // Inline boolean not: is_falsy(v) → true, else → false
+                // is_falsy = (v == TAG_FALSE || v == TAG_NULL)
+                // Result: TAG_TRUE if falsy, TAG_FALSE otherwise
                 let la = self.vreg_for(*a);
                 let dst = self.vreg_for(dst_val);
-                self.mf.emit(MachInst::CallRuntime {
-                    name: "wren_not",
-                    args: vec![la],
-                    ret: Some(dst),
-                });
+                let false_bits: u64 = 0x7FFC_0000_0000_0001; // TAG_FALSE
+                let null_bits: u64 = 0x7FFC_0000_0000_0003; // TAG_NULL
+                let true_bits: u64 = 0x7FFC_0000_0000_0002; // TAG_TRUE
+
+                let is_false_label = self.mf.new_label();
+                let done_label = self.mf.new_label();
+
+                let false_imm = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm { dst: false_imm, bits: false_bits });
+                self.mf.emit(MachInst::ICmp { lhs: la, rhs: false_imm });
+                self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: is_false_label });
+
+                let null_imm = self.mf.new_gp();
+                self.mf.emit(MachInst::LoadImm { dst: null_imm, bits: null_bits });
+                self.mf.emit(MachInst::ICmp { lhs: la, rhs: null_imm });
+                self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: is_false_label });
+
+                // Not falsy → return false
+                self.mf.emit(MachInst::LoadImm { dst, bits: false_bits });
+                self.mf.emit(MachInst::Jmp { target: done_label });
+
+                // Falsy → return true
+                self.mf.emit(MachInst::DefLabel(is_false_label));
+                self.mf.emit(MachInst::LoadImm { dst, bits: true_bits });
+
+                self.mf.emit(MachInst::DefLabel(done_label));
             }
 
             // -- Bitwise (truncate to i32, operate, convert back) --
@@ -2890,9 +2914,10 @@ impl<'a> LowerCtx<'a> {
                 args,
             } => {
                 use crate::mir::bytecode::{
-                    CALLSITE_IC_CLASS, CALLSITE_IC_JIT_PTR, CALLSITE_IC_KIND,
+                    CALLSITE_IC_CLASS, CALLSITE_IC_FUNC_ID, CALLSITE_IC_JIT_PTR,
+                    CALLSITE_IC_KIND,
                 };
-                use crate::runtime::object_layout::HEADER_CLASS;
+                use crate::runtime::object_layout::{HEADER_CLASS, INSTANCE_FIELDS};
 
                 const QNAN: u64 = 0x7FFC_0000_0000_0000;
                 const TAG_OBJ: u64 = (1u64 << 63) | QNAN;
@@ -2914,6 +2939,7 @@ impl<'a> LowerCtx<'a> {
                     .copied()
                 {
                     let slow_label = self.mf.new_label();
+                    let getter_label = self.mf.new_label();
                     let masked = self.mf.new_gp();
                     let tag_obj = self.mf.new_gp();
                     self.mf.emit(MachInst::AndImm {
@@ -2965,10 +2991,23 @@ impl<'a> LowerCtx<'a> {
                     });
 
                     let kind = self.mf.new_gp();
+                    let getter_kind = self.mf.new_gp();
                     let leaf_kind = self.mf.new_gp();
                     self.mf.emit(MachInst::Ldr {
                         dst: kind,
                         mem: Mem::new(ic_base, CALLSITE_IC_KIND),
+                    });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: getter_kind,
+                        bits: 5,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: getter_kind,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Eq,
+                        target: getter_label,
                     });
                     self.mf.emit(MachInst::LoadImm {
                         dst: leaf_kind,
@@ -2995,6 +3034,39 @@ impl<'a> LowerCtx<'a> {
                         target: target_ptr,
                         args: direct_args,
                         ret: Some(dst),
+                    });
+                    self.mf.emit(MachInst::Jmp { target: done_label });
+                    self.mf.emit(MachInst::DefLabel(getter_label));
+                    let fields_ptr = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr {
+                        dst: fields_ptr,
+                        mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
+                    });
+                    let field_idx = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr {
+                        dst: field_idx,
+                        mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
+                    });
+                    let shift = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: shift,
+                        bits: 3,
+                    });
+                    let field_offset = self.mf.new_gp();
+                    self.mf.emit(MachInst::Shl {
+                        dst: field_offset,
+                        lhs: field_idx,
+                        rhs: shift,
+                    });
+                    let field_addr = self.mf.new_gp();
+                    self.mf.emit(MachInst::IAdd {
+                        dst: field_addr,
+                        lhs: fields_ptr,
+                        rhs: field_offset,
+                    });
+                    self.mf.emit(MachInst::Ldr {
+                        dst,
+                        mem: Mem::new(field_addr, 0),
                     });
                     self.mf.emit(MachInst::Jmp { target: done_label });
                     self.mf.emit(MachInst::DefLabel(slow_label));

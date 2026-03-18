@@ -1,5 +1,6 @@
 use crate::runtime::object::{
-    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjList, ObjMap, ObjString, ObjType,
+    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap, ObjString,
+    ObjType,
 };
 /// Runtime functions callable from JIT-compiled code.
 ///
@@ -140,6 +141,38 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
 }
 
 #[inline(always)]
+fn trivial_getter_field_index(
+    vm: &crate::runtime::vm::VM,
+    closure_ptr: *mut ObjClosure,
+) -> Option<u16> {
+    use crate::mir::{Instruction, Terminator};
+
+    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+    let mir = vm.engine.get_mir(func_id)?;
+    if mir.blocks.len() != 1 {
+        return None;
+    }
+    let block = &mir.blocks[0];
+    let mut self_param = None;
+    let mut getter = None;
+    for (vid, inst) in &block.instructions {
+        match inst {
+            Instruction::BlockParam(0) if self_param.is_none() => self_param = Some(*vid),
+            Instruction::GetField(recv, idx)
+                if getter.is_none() && Some(*recv) == self_param =>
+            {
+                getter = Some((*vid, *idx));
+            }
+            _ => return None,
+        }
+    }
+    match (getter, &block.terminator) {
+        (Some((ret_vid, field_idx)), Terminator::Return(v)) if *v == ret_vid => Some(field_idx),
+        _ => None,
+    }
+}
+
+#[inline(always)]
 fn populate_callsite_ic(
     vm: &crate::runtime::vm::VM,
     ic_ptr: *mut crate::mir::bytecode::CallSiteIC,
@@ -156,7 +189,15 @@ fn populate_callsite_ic(
                 .get(fn_idx)
                 .copied()
                 .unwrap_or(std::ptr::null());
-            if !jit_ptr.is_null()
+            if let Some(field_idx) = trivial_getter_field_index(vm, closure_ptr) {
+                crate::mir::bytecode::CallSiteIC {
+                    class: cache_key_class as usize,
+                    jit_ptr: std::ptr::null(),
+                    closure: closure_ptr as *const u8,
+                    func_id: field_idx as u64,
+                    kind: 5,
+                }
+            } else if !jit_ptr.is_null()
                 && !jit_disabled()
                 && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
             {
@@ -196,7 +237,7 @@ fn populate_callsite_ic(
     unsafe {
         *ic_ptr = entry;
     }
-    trace_jit_ic(|| format!("jit-ic: populate kind={}", unsafe { (*ic_ptr).kind }));
+    trace_jit_ic(|| format!("jit-ic: populate kind={} ic_ptr=0x{:x}", unsafe { (*ic_ptr).kind }, ic_ptr as usize));
 }
 
 #[inline(always)]
@@ -265,9 +306,10 @@ fn maybe_request_next_tier(
     if should_tier_up {
         vm.engine.request_tier_up(func_id, &vm.interner);
     }
-    if vm.engine.has_pending_compilations() {
-        vm.engine.poll_compilations();
-    }
+    // NOTE: poll_compilations is NOT called here. Installing a new compiled
+    // version during an IC hit path would invalidate the IC entry we just
+    // matched (jit_ptr changes → IC cleared). poll_compilations is called
+    // at safepoints in dispatch_closure_bc and call_closure_jit_or_sync.
 }
 
 #[inline(always)]
@@ -375,6 +417,29 @@ fn try_dispatch_callsite_ic(
             let native_fn: crate::runtime::object::NativeFn =
                 unsafe { std::mem::transmute(ic.closure) };
             Some(native_fn(vm, args).to_bits())
+        }
+        5 => {
+            let instance = recv
+                .as_object()
+                .map(|p| p as *mut ObjInstance)
+                .unwrap_or(std::ptr::null_mut());
+            if instance.is_null() {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return None;
+            }
+            if !ic.closure.is_null() {
+                let func_id = crate::runtime::engine::FuncId(unsafe {
+                    (*(*(ic.closure as *mut ObjClosure)).function).fn_id
+                });
+                vm.engine.note_ic_hit(func_id);
+            }
+            trace_jit_ic(|| format!("jit-ic: hit kind=5 field={}", ic.func_id));
+            let fields_ptr = unsafe { (*instance).fields };
+            if fields_ptr.is_null() {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return None;
+            }
+            Some(unsafe { (*fields_ptr.add(ic.func_id as usize)).to_bits() })
         }
         _ => None,
     }
