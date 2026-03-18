@@ -9,6 +9,7 @@ pub mod devirt;
 pub mod escape;
 pub mod inline;
 pub mod licm;
+pub mod range_loop;
 pub mod sra;
 
 use std::collections::HashMap;

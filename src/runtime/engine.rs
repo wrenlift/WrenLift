@@ -145,8 +145,9 @@ enum CompilationResult {
 fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interner) {
     use crate::mir::opt::{
         self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
-        sra::Sra, MirPass,
+        range_loop::RangeLoop, sra::Sra, MirPass,
     };
+    let range_loop = RangeLoop { interner };
     let constfold = ConstFold;
     let dce = Dce;
     let cse = Cse;
@@ -155,7 +156,7 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     let sra = Sra;
 
     let passes: Vec<&dyn MirPass> = vec![
-        &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+        &range_loop, &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
     ];
     opt::run_to_fixpoint(mir, &passes, 10);
 }
@@ -655,7 +656,17 @@ impl ExecutionEngine {
         interner: &crate::intern::Interner,
     ) -> Arc<MirFunction> {
         match tier {
-            CompileTier::Baseline => Arc::clone(mir),
+            CompileTier::Baseline => {
+                // Run range loop specialization even at Baseline tier — it
+                // eliminates 2 runtime calls per loop iteration with zero risk.
+                let mut baseline_mir = (**mir).clone();
+                {
+                    use crate::mir::opt::{range_loop::RangeLoop, MirPass};
+                    let range_loop = RangeLoop { interner };
+                    range_loop.run(&mut baseline_mir);
+                }
+                Arc::new(baseline_mir)
+            }
             CompileTier::Optimized => {
                 let mut spec = (**mir).clone();
                 insert_speculative_guards(&mut spec);
