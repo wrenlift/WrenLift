@@ -197,6 +197,9 @@ pub struct VM {
     /// Pool of reusable register files to avoid per-call heap allocation.
     pub register_pool: Vec<Vec<Value>>,
 
+    /// Pool of reusable temporary fibers for synchronous closure/constructor calls.
+    pub sync_fiber_pool: Vec<*mut ObjFiber>,
+
     /// Global inline method cache for fast monomorphic dispatch.
     pub method_cache: super::vm_interp::MethodCache,
 
@@ -258,6 +261,7 @@ impl VM {
             loading_modules: HashSet::new(),
             gc_requested: false,
             register_pool: Vec::new(),
+            sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
             call_sym_flags: Vec::new(),
         };
@@ -1126,6 +1130,47 @@ impl VM {
         }
     }
 
+    #[inline]
+    fn reset_sync_fiber(&self, fiber: *mut ObjFiber) {
+        if fiber.is_null() {
+            return;
+        }
+        unsafe {
+            (*fiber).stack.clear();
+            (*fiber).frames.clear();
+            (*fiber).mir_frames.clear();
+            (*fiber).state = FiberState::New;
+            (*fiber).caller = std::ptr::null_mut();
+            (*fiber).error = Value::null();
+            (*fiber).resume_value_dst = None;
+            (*fiber).spawn_trace = None;
+            (*fiber).is_try = false;
+            (*fiber).header.class = self.fiber_class;
+        }
+    }
+
+    #[inline]
+    fn acquire_sync_fiber(&mut self) -> *mut ObjFiber {
+        let fiber = self.sync_fiber_pool.pop().unwrap_or_else(|| {
+            let fiber = self.gc.alloc_fiber();
+            unsafe {
+                (*fiber).header.class = self.fiber_class;
+            }
+            fiber
+        });
+        self.reset_sync_fiber(fiber);
+        fiber
+    }
+
+    #[inline]
+    fn release_sync_fiber(&mut self, fiber: *mut ObjFiber) {
+        if fiber.is_null() {
+            return;
+        }
+        self.reset_sync_fiber(fiber);
+        self.sync_fiber_pool.push(fiber);
+    }
+
     /// Run the garbage collector with complete root gathering.
     pub fn collect_garbage(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
@@ -1179,26 +1224,32 @@ impl VM {
             roots.push(Value::object(self.fiber as *mut u8));
         }
 
-        // 5. JIT roots — values held in native frames invisible to normal root scanning.
+        // 5. Reusable synchronous temp fibers.
+        let sync_fiber_pool_start = roots.len();
+        for &fiber in &self.sync_fiber_pool {
+            roots.push(Value::object(fiber as *mut u8));
+        }
+
+        // 6. JIT roots — values held in native frames invisible to normal root scanning.
         let jit_roots_start = roots.len();
         let mut jit_roots = crate::codegen::runtime_fns::take_jit_roots();
         roots.append(&mut jit_roots);
         let jit_roots_end = roots.len();
 
-        // 6. Native shadow stack roots for active compiled frames.
+        // 7. Native shadow stack roots for active compiled frames.
         let native_shadow_start = roots.len();
         let (native_shadow_lengths, mut native_shadow_roots) =
             crate::codegen::runtime_fns::take_native_shadow_roots();
         roots.append(&mut native_shadow_roots);
         let native_shadow_end = roots.len();
 
-        // 7. JitContext GC-managed pointers (closure, defining_class).
+        // 8. JitContext GC-managed pointers (closure, defining_class).
         let jit_ctx_start = roots.len();
         let (jit_closure, jit_class) = crate::codegen::runtime_fns::jit_context_roots();
         roots.push(jit_closure);
         roots.push(jit_class);
 
-        // 8. Module variables
+        // 9. Module variables
         let mut module_ranges: Vec<(String, usize, usize)> = Vec::new();
         for (name, entry) in &self.engine.modules {
             let start = roots.len();
@@ -1255,6 +1306,14 @@ impl VM {
             let val = roots[fiber_idx];
             if let Some(ptr) = val.as_object() {
                 self.fiber = ptr as *mut ObjFiber;
+            }
+        }
+
+        // Write back pooled sync fibers (nursery forwarding)
+        for (i, fiber) in self.sync_fiber_pool.iter_mut().enumerate() {
+            let val = roots[sync_fiber_pool_start + i];
+            if let Some(ptr) = val.as_object() {
+                *fiber = ptr as *mut ObjFiber;
             }
         }
 
@@ -1874,7 +1933,7 @@ impl VM {
             crate::codegen::runtime_fns::push_jit_root(arg);
         }
 
-        let temp_fiber = self.gc.alloc_fiber();
+        let temp_fiber = self.acquire_sync_fiber();
         let live_closure = match crate::codegen::runtime_fns::jit_root_at(root_len_before)
             .as_object()
             .map(|p| p as *mut ObjClosure)
@@ -1961,6 +2020,7 @@ impl VM {
         };
         self.fiber = temp_fiber;
         let result = super::vm_interp::run_fiber(self);
+        let live_temp_fiber = self.fiber;
         // Restore fiber — read from JIT roots in case GC forwarded the pointer.
         if let Some(idx) = jit_root_idx {
             let forwarded = crate::codegen::runtime_fns::jit_root_at(idx);
@@ -1973,6 +2033,7 @@ impl VM {
             self.fiber = saved_fiber;
         }
         crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+        self.release_sync_fiber(live_temp_fiber);
 
         result.ok()
     }
@@ -2013,7 +2074,7 @@ impl VM {
 
         // alloc_fiber may trigger GC — read back the (possibly forwarded) instance
         // from the JIT root AFTER allocation so we always have the live pointer.
-        let temp_fiber = self.gc.alloc_fiber();
+        let temp_fiber = self.acquire_sync_fiber();
         let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
         crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
 
@@ -2078,6 +2139,7 @@ impl VM {
         };
         self.fiber = temp_fiber;
         let result = super::vm_interp::run_fiber(self);
+        let live_temp_fiber = self.fiber;
         // Restore fiber — read from JIT roots in case GC forwarded the pointer.
         if let Some(idx) = jit_root_idx {
             let forwarded = crate::codegen::runtime_fns::jit_root_at(idx);
@@ -2089,6 +2151,7 @@ impl VM {
         } else {
             self.fiber = saved_fiber;
         }
+        self.release_sync_fiber(live_temp_fiber);
 
         // The constructor body returns `this` (the instance). If it returns null
         // or errors, fall back to live_instance.
@@ -2218,6 +2281,41 @@ mod tests {
         assert!(!vm.fn_class.is_null());
         assert!(!vm.fiber_class.is_null());
         assert!(!vm.system_class.is_null());
+    }
+
+    #[test]
+    fn test_sync_fiber_pool_reuses_and_resets_fibers() {
+        let mut vm = VM::new_default();
+
+        let fiber = vm.acquire_sync_fiber();
+        assert!(!fiber.is_null());
+        unsafe {
+            (*fiber).stack.push(Value::num(42.0));
+            (*fiber).state = FiberState::Running;
+            (*fiber).is_try = true;
+        }
+
+        vm.release_sync_fiber(fiber);
+        assert_eq!(vm.sync_fiber_pool.len(), 1);
+        let pooled = vm.sync_fiber_pool[0];
+        unsafe {
+            assert!((*pooled).stack.is_empty());
+            assert!((*pooled).mir_frames.is_empty());
+            assert_eq!((*pooled).state, FiberState::New);
+            assert!(!(*pooled).is_try);
+        }
+
+        vm.collect_garbage();
+        assert_eq!(vm.sync_fiber_pool.len(), 1);
+
+        let reused = vm.acquire_sync_fiber();
+        assert!(!reused.is_null());
+        unsafe {
+            assert!((*reused).stack.is_empty());
+            assert!((*reused).mir_frames.is_empty());
+            assert_eq!((*reused).state, FiberState::New);
+            assert!(!(*reused).is_try);
+        }
     }
 
     #[test]
