@@ -119,6 +119,29 @@ fn emit_addr(asm: &mut Assembler, mem: &Mem) -> u32 {
     }
 }
 
+fn emit_adjust_sp(asm: &mut Assembler, add: bool, bytes: u32) {
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let chunk = remaining.min(4080);
+        if add {
+            dynasm!(asm ; add sp, sp, chunk);
+        } else {
+            dynasm!(asm ; sub sp, sp, chunk);
+        }
+        remaining -= chunk;
+    }
+}
+
+fn emit_add_imm_reg(asm: &mut Assembler, reg: u32, bytes: u32) {
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let chunk = remaining.min(4080);
+        emit_load_imm64(asm, 16, chunk as u64);
+        dynasm!(asm ; add X(reg), X(reg), X(16));
+        remaining -= chunk;
+    }
+}
+
 fn emit_inst(
     asm: &mut Assembler,
     inst: &MachInst,
@@ -490,18 +513,21 @@ fn emit_inst(
             // with the spill slots.
             let fs = *frame_size as i32;
             let total: u32 = (if fs < 16 { 16 } else { (fs + 15) & !15 }) as u32;
+            emit_adjust_sp(asm, false, total);
             dynasm!(asm
-                ; stp x29, x30, [sp, -(total as i32)]!
-                ; add x29, sp, total
+                ; stp x29, x30, [sp]
+                ; mov x29, sp
             );
+            emit_add_imm_reg(asm, 29, total);
         }
 
         Epilogue { frame_size } => {
             let fs = *frame_size as i32;
             let total: u32 = (if fs < 16 { 16 } else { (fs + 15) & !15 }) as u32;
             dynasm!(asm
-                ; ldp x29, x30, [sp], total as i32
+                ; ldp x29, x30, [sp]
             );
+            emit_adjust_sp(asm, true, total);
         }
 
         Push { src } => {
@@ -777,6 +803,24 @@ mod tests {
                 bits: 42,
             });
             mf.emit(MachInst::Epilogue { frame_size: 0 });
+            mf.emit(MachInst::Ret);
+        });
+        let result: u64 = unsafe {
+            let f: extern "C" fn() -> u64 = code.as_fn();
+            f()
+        };
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_large_frame_prologue_epilogue() {
+        let code = compile(|mf| {
+            mf.emit(MachInst::Prologue { frame_size: 768 });
+            mf.emit(MachInst::LoadImm {
+                dst: VReg::gp(0),
+                bits: 42,
+            });
+            mf.emit(MachInst::Epilogue { frame_size: 768 });
             mf.emit(MachInst::Ret);
         });
         let result: u64 = unsafe {

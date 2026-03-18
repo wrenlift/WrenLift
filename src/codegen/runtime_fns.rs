@@ -2599,7 +2599,6 @@ fn lower_linked_call(
         append_shadow_reloads(
             &mut new_insts,
             target_data_addr("wren_current_shadow_roots_ptr"),
-            abi_ret,
             call_scratch,
             copy_scratch,
             frame_ptr,
@@ -2617,7 +2616,6 @@ fn target_data_addr(name: &'static str) -> u64 {
 fn append_shadow_reloads(
     new_insts: &mut Vec<MachInst>,
     shadow_roots_ptr_addr: u64,
-    abi_ret: u32,
     call_scratch: u32,
     copy_scratch: u32,
     frame_ptr: VReg,
@@ -2640,11 +2638,11 @@ fn append_shadow_reloads(
             mem: Mem::new(VReg::gp(call_scratch), 0),
         });
         new_insts.push(MachInst::Ldr {
-            dst: VReg::gp(abi_ret),
+            dst: VReg::gp(call_scratch),
             mem: Mem::new(VReg::gp(copy_scratch), (root.slot as i32) * 8),
         });
         new_insts.push(MachInst::Str {
-            src: VReg::gp(abi_ret),
+            src: VReg::gp(call_scratch),
             mem: Mem::new(frame_ptr, offset),
         });
     }
@@ -2972,6 +2970,58 @@ mod tests {
         assert!(
             has_call_ind,
             "call lowering should indirect through the call scratch sentinel"
+        );
+    }
+
+    #[test]
+    fn test_shadow_reloads_do_not_use_abi_return_as_scratch() {
+        let ret = VReg::gp(12);
+        let mut mf = MachFunc::new("test".into());
+        mf.emit(MachInst::CallRuntime {
+            name: "wren_not",
+            args: vec![VReg::gp(10)],
+            ret: Some(ret),
+        });
+        mf.emit(MachInst::Ret);
+
+        let assignments = std::collections::HashMap::from([
+            (VReg::gp(10), Location::Reg(PhysReg::gp(3))),
+            (ret, Location::Reg(PhysReg::gp(0))),
+            (VReg::gp(20), Location::Spill(-8)),
+        ]);
+        let native_meta = crate::codegen::native_meta::NativeFrameMetadata {
+            boxed_values: vec![VReg::gp(20)],
+            safepoints: vec![crate::codegen::native_meta::SafepointMetadata {
+                ordinal: 0,
+                inst_index: 0,
+                kind: crate::codegen::native_meta::SafepointKind::CallRuntime,
+                live_roots: vec![crate::codegen::native_meta::LiveRootMetadata {
+                    slot: 0,
+                    location: crate::codegen::native_meta::RootLocation::Spill(-8),
+                }],
+            }],
+            spill_safe_nonleaf: true,
+        };
+
+        link_runtime_calls(&mut mf, Target::Aarch64, &assignments, Some(&native_meta));
+
+        let call_idx = mf
+            .insts
+            .iter()
+            .position(|inst| matches!(inst, MachInst::CallInd { .. }))
+            .expect("linked call should contain CallInd");
+        let clobbers_ret = mf.insts[call_idx + 1..].iter().any(|inst| {
+            matches!(
+                inst,
+                MachInst::Ldr {
+                    dst,
+                    mem: Mem { base, offset: 0 }
+                } if *dst == VReg::gp(0) && *base == VReg::gp(17)
+            )
+        });
+        assert!(
+            !clobbers_ret,
+            "shadow reloads must not reuse the ABI return register as a scratch"
         );
     }
 
