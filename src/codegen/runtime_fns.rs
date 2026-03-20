@@ -499,20 +499,32 @@ fn try_dispatch_callsite_ic(
                 return None;
             }
             vm.engine.note_ic_hit(func_id);
-            trace_jit_ic(|| format!("jit-ic: hit kind=6 func={}", ic.func_id));
-            // Set up JitContext for the callee (closure, defining_class, func_id).
-            let saved_ctx = read_jit_ctx();
-            let closure_ptr = ic.closure as *mut u8;
-            mutate_jit_ctx(|ctx| {
+            // Batch TLS: update func_id + depth in one access each.
+            let saved_func_id = JIT_CTX.with(|c| {
+                let mut ctx = c.get();
+                let old = ctx.current_func_id;
                 ctx.current_func_id = fn_idx as u32;
-                ctx.closure = closure_ptr;
-                // defining_class is not stored in kind=6 IC; leave unchanged
-                // (most methods don't need it for basic dispatch).
+                ctx.closure = ic.closure as *mut u8;
+                c.set(ctx);
+                old
             });
-            set_jit_depth(depth + 1);
-            let result = unsafe { call_jit_with_shadow(vm, live_ptr, func_id, args) };
-            set_jit_depth(depth);
-            set_jit_context(saved_ctx);
+            JIT_DEPTH.with(|d| d.set(depth + 1));
+            let shadow_slots = current_shadow_slot_count(vm, func_id);
+            let pushed = shadow_slots > 0;
+            if pushed {
+                push_native_shadow_frame(shadow_slots);
+            }
+            let result = unsafe { call_jit_cached(live_ptr, args) };
+            if pushed {
+                pop_native_shadow_frame();
+            }
+            // Batch TLS: restore func_id + depth
+            JIT_DEPTH.with(|d| d.set(depth));
+            JIT_CTX.with(|c| {
+                let mut ctx = c.get();
+                ctx.current_func_id = saved_func_id;
+                c.set(ctx);
+            });
             Some(result)
         }
         _ => None,
@@ -590,6 +602,7 @@ thread_local! {
     /// compiled frames. Each frame stores one slot per boxed GP vreg.
     static NATIVE_SHADOW_STACK: std::cell::UnsafeCell<Vec<NativeShadowFrame>> =
         const { std::cell::UnsafeCell::new(Vec::new()) };
+
 
     /// JIT native recursion depth — guards against native stack overflow.
     /// When depth exceeds MAX_JIT_DEPTH, calls fall back to interpreter dispatch.
@@ -828,17 +841,8 @@ pub fn push_native_shadow_frame(slot_count: usize) {
 pub fn pop_native_shadow_frame() {
     NATIVE_SHADOW_STACK.with(|stack| unsafe {
         let frames = &mut *stack.get();
-        if std::env::var_os("WLIFT_DEBUG_LEAK_NATIVE_SHADOW").is_some() {
-            if let Some(frame) = frames.pop() {
-                std::mem::forget(frame);
-            }
-        } else {
-            let _ = frames.pop();
-        }
+        let _ = frames.pop();
         sync_current_native_shadow_roots(frames);
-        if frames.capacity() > 64 && frames.len() < 16 {
-            frames.shrink_to(32);
-        }
     });
 }
 
