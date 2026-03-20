@@ -21,6 +21,8 @@ struct NativeShadowFrame {
     roots: Vec<Value>,
 }
 
+/// Shadow roots pointer — written by Rust, read by JIT-generated code via raw ldr.
+/// Uses volatile read/write to prevent compiler reordering across JIT calls.
 static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
 
 #[inline(always)]
@@ -107,6 +109,27 @@ fn current_jit_callsite_ic(
         )
     });
     ic_table.get_mut(ic_idx).map(|ic| ic as *mut _)
+}
+
+/// Unified JIT dispatch: handles shadow frame push/pop for non-leaf functions.
+/// ALL code paths that call compiled JIT functions should go through this.
+#[inline(always)]
+unsafe fn call_jit_with_shadow(
+    vm: &crate::runtime::vm::VM,
+    fn_ptr: *const u8,
+    func_id: crate::runtime::engine::FuncId,
+    args: &[Value],
+) -> u64 {
+    let shadow_slots = current_shadow_slot_count(vm, func_id);
+    let pushed = shadow_slots > 0;
+    if pushed {
+        push_native_shadow_frame(shadow_slots);
+    }
+    let result = call_jit_cached(fn_ptr, args);
+    if pushed {
+        pop_native_shadow_frame();
+    }
+    result
 }
 
 #[inline(always)]
@@ -207,6 +230,18 @@ fn populate_callsite_ic(
                     closure: closure_ptr as *const u8,
                     func_id: fn_idx as u64,
                     kind: 1,
+                }
+            } else if !jit_ptr.is_null()
+                && !jit_disabled()
+                && allow_nonleaf_native(vm, crate::runtime::engine::FuncId(fn_idx as u32))
+            {
+                // Kind=6: non-leaf direct JIT dispatch (bypasses call_closure_jit_or_sync)
+                crate::mir::bytecode::CallSiteIC {
+                    class: cache_key_class as usize,
+                    jit_ptr,
+                    closure: closure_ptr as *const u8,
+                    func_id: fn_idx as u64,
+                    kind: 6,
                 }
             } else {
                 crate::mir::bytecode::CallSiteIC {
@@ -354,7 +389,7 @@ fn try_dispatch_callsite_ic(
             }
             vm.engine.note_ic_hit(func_id);
             trace_jit_ic(|| format!("jit-ic: hit kind=1 func={}", ic.func_id));
-            Some(unsafe { call_jit_cached(live_ptr, args) })
+            Some(unsafe { call_jit_with_shadow(vm, live_ptr, func_id, args) })
         }
         2 => {
             let closure_ptr = ic.closure as *mut ObjClosure;
@@ -381,7 +416,10 @@ fn try_dispatch_callsite_ic(
                         unsafe { (*ic_ptr).func_id }
                     )
                 });
-                return Some(unsafe { call_jit_cached(live_ptr, args) });
+                let fid = crate::runtime::engine::FuncId(unsafe {
+                    (*ic_ptr).func_id as u32
+                });
+                return Some(unsafe { call_jit_with_shadow(vm, live_ptr, fid, args) });
             }
             vm.engine.note_ic_hit(func_id);
             trace_jit_ic(|| format!("jit-ic: hit kind=2 func={}", ic.func_id));
@@ -440,6 +478,42 @@ fn try_dispatch_callsite_ic(
                 return None;
             }
             Some(unsafe { (*fields_ptr.add(ic.func_id as usize)).to_bits() })
+        }
+        6 => {
+            // Kind=6: non-leaf direct JIT dispatch — bypasses call_closure_jit_or_sync.
+            let depth = jit_depth();
+            if args.len() > 4 || depth >= 32 {
+                return None; // fall through to slow path, keep IC valid
+            }
+            let fn_idx = ic.func_id as usize;
+            let func_id = crate::runtime::engine::FuncId(ic.func_id as u32);
+            maybe_request_next_tier(vm, func_id);
+            let live_ptr = vm
+                .engine
+                .jit_code
+                .get(fn_idx)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            if live_ptr.is_null() || live_ptr != ic.jit_ptr || jit_disabled() {
+                *ic = crate::mir::bytecode::CallSiteIC::default();
+                return None;
+            }
+            vm.engine.note_ic_hit(func_id);
+            trace_jit_ic(|| format!("jit-ic: hit kind=6 func={}", ic.func_id));
+            // Set up JitContext for the callee (closure, defining_class, func_id).
+            let saved_ctx = read_jit_ctx();
+            let closure_ptr = ic.closure as *mut u8;
+            mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = fn_idx as u32;
+                ctx.closure = closure_ptr;
+                // defining_class is not stored in kind=6 IC; leave unchanged
+                // (most methods don't need it for basic dispatch).
+            });
+            set_jit_depth(depth + 1);
+            let result = unsafe { call_jit_with_shadow(vm, live_ptr, func_id, args) };
+            set_jit_depth(depth);
+            set_jit_context(saved_ctx);
+            Some(result)
         }
         _ => None,
     }
@@ -529,13 +603,19 @@ thread_local! {
 #[inline(always)]
 fn set_current_native_shadow_roots_ptr(ptr: *mut Value) {
     unsafe {
-        CURRENT_NATIVE_SHADOW_ROOTS = ptr;
+        std::ptr::write_volatile(
+            std::ptr::addr_of_mut!(CURRENT_NATIVE_SHADOW_ROOTS),
+            ptr,
+        );
     }
+    // Full compiler fence: ensures the store is visible before any
+    // subsequent JIT function call reads the global via raw ldr.
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 #[inline(always)]
 pub fn current_native_shadow_roots_ptr() -> *mut Value {
-    unsafe { CURRENT_NATIVE_SHADOW_ROOTS }
+    unsafe { std::ptr::read_volatile(std::ptr::addr_of!(CURRENT_NATIVE_SHADOW_ROOTS)) }
 }
 
 #[inline(always)]
@@ -802,6 +882,10 @@ fn current_shadow_slot_count(
         .jit_metadata
         .get(func_id.0 as usize)
         .and_then(|meta| meta.as_ref())
+        // Only return nonzero when the function actually has shadow stores
+        // (safepoints). Functions with boxed values but no safepoints (e.g.,
+        // pure arithmetic) don't emit shadow stores and don't need a frame.
+        .filter(|meta| !meta.safepoints.is_empty())
         .map(|meta| meta.boxed_values.len())
         .unwrap_or(0)
 }
@@ -897,8 +981,7 @@ pub fn allow_nonleaf_native(
     vm: &crate::runtime::vm::VM,
     func_id: crate::runtime::engine::FuncId,
 ) -> bool {
-    let allow_nonleaf_native = shadow_nonleaf_enabled()
-        && match vm.config.gc_strategy {
+    let allow_nonleaf_native = match vm.config.gc_strategy {
             crate::runtime::gc_trait::GcStrategy::Generational => {
                 nonleaf_moving_gc_safe(vm, func_id)
             }
@@ -959,6 +1042,19 @@ pub extern "C" fn wren_shadow_load(slot: u64) -> u64 {
             .unwrap_or(Value::null())
             .to_bits()
     })
+}
+
+/// Callee-managed shadow frame: push in JIT prologue.
+pub extern "C" fn wren_enter_shadow_frame(slot_count: u64) {
+    let count = slot_count as usize;
+    if count > 0 {
+        push_native_shadow_frame(count);
+    }
+}
+
+/// Callee-managed shadow frame: pop in JIT epilogue.
+pub extern "C" fn wren_exit_shadow_frame() {
+    pop_native_shadow_frame();
 }
 
 /// Get the VM pointer from the JIT context.
@@ -1135,17 +1231,10 @@ pub fn call_closure_jit_or_sync(
                 vm.engine.note_native_to_native_call(func_id);
                 JIT_DEPTH.with(|d| d.set(depth + 1));
                 let root_len_before = jit_roots_snapshot_len();
-                let shadow_slot_count = current_shadow_slot_count(vm, func_id);
-                if shadow_slot_count > 0 {
-                    push_native_shadow_frame(shadow_slot_count);
-                }
-                // Native-to-native dispatch: call compiled code directly.
-                let result = unsafe { call_jit_cached(fn_ptr, args) };
+                // Shadow frame push/pop handled by call_jit_with_shadow.
+                let result = unsafe { call_jit_with_shadow(vm, fn_ptr, func_id, args) };
                 JIT_DEPTH.with(|d| d.set(depth));
 
-                if shadow_slot_count > 0 {
-                    pop_native_shadow_frame();
-                }
                 jit_roots_restore_len(root_len_before);
                 // Restore caller's JIT context.
                 restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
@@ -1333,7 +1422,7 @@ fn dispatch_method(
                         vm.engine.note_native_entry(func_id);
                         vm.engine.note_native_to_native_call(func_id);
                         set_jit_depth(depth + 1);
-                        let result = unsafe { call_jit_cached(fn_ptr, args) };
+                        let result = unsafe { call_jit_with_shadow(vm, fn_ptr, func_id, args) };
                         set_jit_depth(depth);
                         set_jit_context(saved_ctx);
                         return result;
@@ -2358,8 +2447,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_shadow_store" => Some(wren_shadow_store as *const () as usize),
         "wren_shadow_load" => Some(wren_shadow_load as *const () as usize),
         "wren_current_shadow_roots_ptr" => {
-            Some(std::ptr::addr_of_mut!(CURRENT_NATIVE_SHADOW_ROOTS) as usize)
+            Some(unsafe { std::ptr::addr_of_mut!(CURRENT_NATIVE_SHADOW_ROOTS) as usize })
         }
+        "wren_enter_shadow_frame" => Some(wren_enter_shadow_frame as *const () as usize),
+        "wren_exit_shadow_frame" => Some(wren_exit_shadow_frame as *const () as usize),
         // Static fields
         "wren_get_static_field" => Some(wren_get_static_field as *const () as usize),
         "wren_set_static_field" => Some(wren_set_static_field as *const () as usize),
@@ -2552,7 +2643,11 @@ pub fn link_runtime_calls(
         match inst {
             MachInst::CallRuntime { name, args, ret } => {
                 let live_roots =
-                    if *name != "wren_shadow_store" && *name != "wren_shadow_load" {
+                    if *name != "wren_shadow_store"
+                        && *name != "wren_shadow_load"
+                        && *name != "wren_enter_shadow_frame"
+                        && *name != "wren_exit_shadow_frame"
+                    {
                         safepoint_iter.next().map(|sp| sp.live_roots.clone())
                     } else {
                         None

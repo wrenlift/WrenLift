@@ -1754,11 +1754,21 @@ fn infer_mir_gc_value_reps(
 }
 
 fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
-    mach.insts.iter().any(|inst| {
-        matches!(
-            inst,
-            MachInst::CallRuntime { .. } | MachInst::CallInd { .. }
-        )
+    mach.insts.iter().any(|inst| match inst {
+        // Exclude deopt calls (wren_deopt_*) and shadow management calls —
+        // deopts transfer to interpreter which handles its own rooting.
+        // Also exclude self-call helpers (wren_call_static_self_*) which are
+        // same-function recursion handled by CallLocal at baseline tier.
+        MachInst::CallRuntime { name, .. } => {
+            !name.starts_with("wren_deopt")
+                && !name.starts_with("wren_call_static_self")
+                && *name != "wren_shadow_store"
+                && *name != "wren_shadow_load"
+                && *name != "wren_enter_shadow_frame"
+                && *name != "wren_exit_shadow_frame"
+        }
+        MachInst::CallInd { .. } => true,
+        _ => false,
     }) && mach.boxed_gp_vregs().next().is_some()
 }
 
@@ -1859,6 +1869,9 @@ pub enum CompiledFunction {
 pub struct CompiledArtifact {
     pub code: CompiledFunction,
     pub native_meta: Option<Arc<native_meta::NativeFrameMetadata>>,
+    /// True if the compiled code has shadow stores and needs a shadow frame
+    /// pushed before execution. Determined by `needs_native_shadow_stack`.
+    pub needs_shadow_frame: bool,
 }
 
 impl CompiledFunction {
@@ -1964,6 +1977,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             Ok(CompiledArtifact {
                 code: CompiledFunction::Wasm(module),
                 native_meta: None,
+                needs_shadow_frame: false,
             })
         }
         _ => {
@@ -1974,7 +1988,8 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 callsite_ic_ptrs,
             );
             resolve_parallel_copies(&mut mach);
-            if needs_native_shadow_stack(&mach) {
+            let has_shadow_stores = needs_native_shadow_stack(&mach);
+            if has_shadow_stores {
                 mach.set_force_boxed_gp_spills(true);
                 instrument_native_shadow_stores(&mut mach);
             }
@@ -2023,7 +2038,11 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 Target::Wasm => unreachable!(),
             };
 
-            Ok(CompiledArtifact { code, native_meta })
+            Ok(CompiledArtifact {
+                code,
+                native_meta,
+                needs_shadow_frame: has_shadow_stores,
+            })
         }
     }
 }
@@ -3098,8 +3117,7 @@ impl<'a> LowerCtx<'a> {
                 let dst = self.vreg_for(dst_val);
                 let direct_arg_count = args.len() + 1;
                 let direct_target = self.fn_entry_label;
-                if self.compile_tier == CompileTier::Baseline
-                    && direct_arg_count <= ABI_ARG_SENTINELS.len()
+                if direct_arg_count <= ABI_ARG_SENTINELS.len()
                     && !self.entry_param_vregs.is_empty()
                 {
                     let mut call_args = Vec::with_capacity(direct_arg_count);

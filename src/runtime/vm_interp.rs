@@ -210,39 +210,19 @@ fn try_run_root_frame_native(
         eprintln!("native-entry: root FuncId({}) {}", func_id.0, name);
     }
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-    let shadow_slot_count = if is_leaf {
-        0
-    } else {
-        vm.engine
-            .jit_metadata
-            .get(fn_idx)
-            .and_then(|meta| meta.as_ref())
-            .map(|meta| meta.boxed_values.len())
-            .unwrap_or(0)
-    };
+    // Push shadow frame only when the function has shadow stores (safepoints).
+    let shadow_slot_count = vm
+        .engine
+        .jit_metadata
+        .get(fn_idx)
+        .and_then(|meta| meta.as_ref())
+        .filter(|meta| !meta.safepoints.is_empty())
+        .map(|meta| meta.boxed_values.len())
+        .unwrap_or(0);
     if shadow_slot_count > 0 {
         crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slot_count);
     }
-    trace_root_native(|| {
-        format!(
-            "root-native: enter func={} fiber={:p} vm_fiber={:p} shadow_slots={} shadow_base={:p}",
-            func_id.0,
-            fiber,
-            vm.fiber,
-            shadow_slot_count,
-            crate::codegen::runtime_fns::current_native_shadow_roots_ptr()
-        )
-    });
     let result_bits = unsafe { call_jit_fn(native_fn_ptr, &[]) };
-    trace_root_native(|| {
-        format!(
-            "root-native: post-call func={} fiber={:p} vm_fiber={:p} result_bits={:#x}",
-            func_id.0,
-            fiber,
-            vm.fiber,
-            result_bits
-        )
-    });
     if shadow_slot_count > 0 {
         crate::codegen::runtime_fns::pop_native_shadow_frame();
     }
@@ -1444,6 +1424,18 @@ fn run_fiber_with_stop_depth(
                                 {
                                     *ic = crate::mir::bytecode::CallSiteIC::default();
                                 } else {
+                                    // Push shadow frame if function has shadow stores.
+                                    let shadow_slots = vm
+                                        .engine
+                                        .jit_metadata
+                                        .get(fn_idx)
+                                        .and_then(|m| m.as_ref())
+                                        .filter(|m| !m.safepoints.is_empty())
+                                        .map(|m| m.boxed_values.len())
+                                        .unwrap_or(0);
+                                    if shadow_slots > 0 {
+                                        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
+                                    }
                                     let recv_bits = recv_val.to_bits();
                                     vm.engine.note_ic_hit(func_id);
                                     let result_bits = unsafe {
@@ -1485,6 +1477,9 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
+                                    if shadow_slots > 0 {
+                                        crate::codegen::runtime_fns::pop_native_shadow_frame();
+                                    }
                                     vm.engine.note_native_entry(func_id);
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
@@ -1642,7 +1637,19 @@ fn run_fiber_with_stop_depth(
                                             kind: 1, // JIT leaf
                                         };
                                     }
-                                    // Execute inline for this call too
+                                    // Execute inline for this call too.
+                                    // Push shadow frame if the function has shadow stores.
+                                    let shadow_slots = vm
+                                        .engine
+                                        .jit_metadata
+                                        .get(fn_idx)
+                                        .and_then(|m| m.as_ref())
+                                        .filter(|m| !m.safepoints.is_empty())
+                                        .map(|m| m.boxed_values.len())
+                                        .unwrap_or(0);
+                                    if shadow_slots > 0 {
+                                        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
+                                    }
                                     let recv_bits = recv_val.to_bits();
                                     let result_bits = unsafe {
                                         match argc {
@@ -1677,6 +1684,9 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
+                                    if shadow_slots > 0 {
+                                        crate::codegen::runtime_fns::pop_native_shadow_frame();
+                                    }
                                     vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
@@ -2547,11 +2557,26 @@ fn dispatch_closure_bc(
                 );
 
                 if is_leaf {
-                    // Leaf: direct JIT call (no runtime calls, no deopt).
+                    // Leaf: direct JIT call. Shadow frame push/pop only
+                    // when function actually has shadow stores (safepoints).
+                    let shadow_slots = vm
+                        .engine
+                        .jit_metadata
+                        .get(fn_idx)
+                        .and_then(|m| m.as_ref())
+                        .filter(|m| !m.safepoints.is_empty())
+                        .map(|m| m.boxed_values.len())
+                        .unwrap_or(0);
                     vm.engine.note_native_entry(target_func_id);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
                     let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                    if shadow_slots > 0 {
+                        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
+                    }
                     let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
+                    if shadow_slots > 0 {
+                        crate::codegen::runtime_fns::pop_native_shadow_frame();
+                    }
                     crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 

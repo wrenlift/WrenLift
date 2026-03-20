@@ -1320,27 +1320,46 @@ pub fn lower_module(
     );
     let (top_level, closures) = builder.build_module(module);
 
-    // Compile class definitions
-    // Track each class's total field count (own + inherited) so subclasses can offset their field indices.
-    let mut class_field_counts: HashMap<SymbolId, u16> = HashMap::new();
+    // Compile class definitions.
+    // Track each class's full field map (inherited + own) so subclasses can
+    // inherit correct field indices from their parent without re-assigning them.
+    let mut class_field_maps: HashMap<SymbolId, HashMap<SymbolId, u16>> = HashMap::new();
     let mut classes = Vec::new();
     let mut all_closures = closures;
     for stmt in module {
         if let Stmt::Class(decl) = &stmt.0 {
-            let inherited_fields = decl
+            // Clone parent field map eagerly so there's no lingering borrow of class_field_maps.
+            let parent_field_map: HashMap<SymbolId, u16> = decl
                 .superclass
                 .as_ref()
-                .and_then(|s| class_field_counts.get(&s.0).copied())
-                .unwrap_or(0);
+                .and_then(|s| class_field_maps.get(&s.0).cloned())
+                .unwrap_or_default();
+            let inherited_fields = parent_field_map.len() as u16;
             let (class_mir, method_closures) = compile_class(
                 decl,
                 interner,
                 resolve,
                 inherited_fields,
                 all_closures.len() as u32,
+                &parent_field_map,
             );
-            let total_fields = class_mir.num_fields + inherited_fields;
-            class_field_counts.insert(decl.name.0, total_fields);
+            // Build the full field map for this class (inherited + own) so subclasses
+            // can look up ALL fields (including inherited ones) with correct indices.
+            let mut full_map = parent_field_map;
+            let mut own_idx: u16 = 0;
+            let mut seen: Vec<SymbolId> = Vec::new();
+            for method_spanned in &decl.methods {
+                if let Some(body) = &method_spanned.0.body {
+                    scan_fields(body, interner, &mut seen);
+                }
+            }
+            for sym in seen {
+                if !full_map.contains_key(&sym) {
+                    full_map.insert(sym, inherited_fields + own_idx);
+                    own_idx += 1;
+                }
+            }
+            class_field_maps.insert(decl.name.0, full_map);
             classes.push(class_mir);
             all_closures.extend(method_closures);
         }
@@ -1360,6 +1379,7 @@ fn compile_class(
     resolve: &ResolveResult,
     inherited_field_offset: u16,
     closure_base_offset: u32,
+    parent_field_map: &HashMap<SymbolId, u16>,
 ) -> (ClassMir, Vec<MirFunction>) {
     let mut methods = Vec::new();
     let mut field_names: Vec<SymbolId> = Vec::new();
@@ -1397,13 +1417,18 @@ fn compile_class(
         );
         builder.closure_base = closure_base_offset + all_closures.len() as u32;
 
-        // Set field map for this class (offset by inherited fields so subclass fields
-        // don't collide with superclass field slots)
-        let fmap: HashMap<SymbolId, u16> = field_names
-            .iter()
-            .enumerate()
-            .map(|(i, &sym)| (sym, i as u16 + inherited_field_offset))
-            .collect();
+        // Build the combined field map: inherited fields keep their parent indices;
+        // only NEW fields (not present in parent) get fresh indices starting at
+        // inherited_field_offset. This ensures subclass methods that reference
+        // inherited fields use the correct slot indices.
+        let mut fmap: HashMap<SymbolId, u16> = parent_field_map.clone();
+        let mut own_idx: u16 = 0;
+        for &sym in &field_names {
+            if !fmap.contains_key(&sym) {
+                fmap.insert(sym, inherited_field_offset + own_idx);
+                own_idx += 1;
+            }
+        }
         builder.field_map = Some(fmap);
         builder.current_class_name = Some(decl.name.0);
         builder.current_method_sig = Some(method_name);
@@ -1483,7 +1508,7 @@ fn compile_class(
             name: decl.name.0,
             superclass: decl.superclass.as_ref().map(|s| s.0),
             methods,
-            num_fields: field_names.len() as u16,
+            num_fields: field_names.iter().filter(|s| !parent_field_map.contains_key(s)).count() as u16,
             protocols: conformance.conforms,
         },
         all_closures,

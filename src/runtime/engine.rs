@@ -211,6 +211,23 @@ fn tier_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
 }
 
+/// Determine leaf status from compiled code metadata. A function is leaf if
+/// its only safepoints are self-calls (CallLocal or wren_call_static_self_*).
+/// This replaces MIR-level analysis which can't predict conditional CallRuntime
+/// emission (e.g., SetField with/without write barrier).
+fn is_compiled_leaf(
+    native_meta: &Option<std::sync::Arc<crate::codegen::native_meta::NativeFrameMetadata>>,
+) -> bool {
+    native_meta
+        .as_ref()
+        .map(|meta| {
+            meta.safepoints.iter().all(|sp| {
+                sp.kind == crate::codegen::native_meta::SafepointKind::CallLocal
+            })
+        })
+        .unwrap_or(true)
+}
+
 /// Check if a MIR function can stay on the direct native fast path for the
 /// given compilation tier.
 fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
@@ -804,8 +821,11 @@ impl ExecutionEngine {
             Ok(compiled) => compiled,
             Err(_) => return false,
         };
-        let inline_safe = is_mir_inline_safe(&compile_mir, tier);
         let native_meta = compiled.native_meta;
+        // Use MIR analysis for leaf classification. Shadow frame push/pop
+        // is handled by each dispatch path via metadata checks, so even if
+        // a "leaf" function needs shadow stores, they'll be set up correctly.
+        let inline_safe = is_mir_inline_safe(&compile_mir, tier);
         let executable = match compiled.code.into_executable() {
             Ok(executable) => executable,
             Err(_) => return false,
@@ -884,8 +904,8 @@ impl ExecutionEngine {
             )
             .ok()
             .and_then(|artifact| {
-                let inline_safe = is_mir_inline_safe(&compile_mir, tier);
                 let native_meta = artifact.native_meta;
+                let inline_safe = is_mir_inline_safe(&compile_mir, tier);
                 artifact
                     .code
                     .into_executable()
