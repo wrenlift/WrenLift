@@ -2498,8 +2498,10 @@ fn dispatch_closure_bc(
             .unwrap_or(std::ptr::null());
 
         if native_fn_ptr.is_null() {
-            // Not yet compiled: do tier-up profiling.
+            // Not yet compiled: do tier-up profiling + type sampling.
             let should_tier_up = vm.engine.record_call(target_func_id);
+            // Sample argument types for profile-guided specialization.
+            vm.engine.sample_arg_types(target_func_id, arg_vals);
             if should_tier_up {
                 vm.engine.request_tier_up(target_func_id, &vm.interner);
             }

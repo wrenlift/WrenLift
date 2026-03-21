@@ -51,6 +51,40 @@ pub struct FuncId(pub u32);
 // ---------------------------------------------------------------------------
 
 /// The current executable form of a function.
+/// Runtime type profile for function parameters. Built from sampling
+/// argument types during the first 100 interpreted calls.
+#[derive(Clone, Default, Debug)]
+pub struct TypeProfile {
+    /// Observed type per param index (0 = receiver/this, 1+ = args).
+    /// 0=unseen, 1=Num, 2=Bool, 3=Null, 4=String, 5=Object, 6=Mixed
+    pub param_types: [u8; 8],
+    pub sample_count: u32,
+}
+
+pub const PROFILE_UNSEEN: u8 = 0;
+pub const PROFILE_NUM: u8 = 1;
+pub const PROFILE_BOOL: u8 = 2;
+pub const PROFILE_NULL: u8 = 3;
+pub const PROFILE_STRING: u8 = 4;
+pub const PROFILE_OBJECT: u8 = 5;
+pub const PROFILE_MIXED: u8 = 6;
+
+/// Classify a runtime Value into a profile type tag.
+#[inline(always)]
+pub fn classify_value(v: crate::runtime::value::Value) -> u8 {
+    if v.is_num() {
+        PROFILE_NUM
+    } else if v.as_bool().is_some() {
+        PROFILE_BOOL
+    } else if v.is_null() {
+        PROFILE_NULL
+    } else if v.is_object() {
+        PROFILE_OBJECT
+    } else {
+        PROFILE_MIXED
+    }
+}
+
 pub enum FuncBody {
     /// MIR available for interpretation. Not yet compiled to native.
     Interpreted {
@@ -161,16 +195,16 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     opt::run_to_fixpoint(mir, &passes, 10);
 }
 
-/// Insert speculative GuardNum instructions for all non-this BlockParam
-/// parameters. This tells TypeSpecialize that parameters are numbers,
-/// enabling unboxed f64 arithmetic in the JIT-compiled code.
-/// If the guard fails at runtime, the function falls back to the interpreter.
-fn insert_speculative_guards(mir: &mut MirFunction) {
+/// Insert speculative type guards for function parameters based on runtime
+/// profile data. When profile is available, only guard params that were
+/// observed as Num (avoiding instant deopt for object params like
+/// stronger(s1, s2) where s1/s2 are Strength objects).
+/// When no profile: blind GuardNum for all non-this params (legacy behavior).
+fn insert_speculative_guards(mir: &mut MirFunction, profile: Option<&TypeProfile>) {
     use crate::mir::Instruction;
     if mir.blocks.is_empty() {
         return;
     }
-    // Collect BlockParams from block 0 (function entry).
     let params: Vec<(crate::mir::ValueId, u16)> = mir.blocks[0]
         .instructions
         .iter()
@@ -183,8 +217,6 @@ fn insert_speculative_guards(mir: &mut MirFunction) {
         })
         .collect();
 
-    // Insert GuardNum after each non-this parameter (idx > 0).
-    // We insert after all BlockParams to maintain SSA ordering.
     let insert_pos = mir.blocks[0]
         .instructions
         .iter()
@@ -194,13 +226,31 @@ fn insert_speculative_guards(mir: &mut MirFunction) {
     let mut guards = Vec::new();
     for (vid, idx) in &params {
         if *idx == 0 {
-            continue; // Skip 'this' — it's a class/instance, not a number
+            continue; // Skip 'this'
         }
-        let guard_vid = mir.new_value();
-        guards.push((guard_vid, Instruction::GuardNum(*vid)));
+        // Profile-guided: only guard params observed as Num or Bool.
+        // Object/Mixed/Unseen params → no guard → keep boxed → avoid deopt.
+        let observed = profile
+            .and_then(|p| p.param_types.get(*idx as usize).copied())
+            .unwrap_or(PROFILE_UNSEEN);
+
+        match observed {
+            PROFILE_NUM => {
+                guards.push((mir.new_value(), Instruction::GuardNum(*vid)));
+            }
+            PROFILE_BOOL => {
+                guards.push((mir.new_value(), Instruction::GuardBool(*vid)));
+            }
+            PROFILE_UNSEEN if profile.is_none() => {
+                // No profile at all → blind speculation (legacy)
+                guards.push((mir.new_value(), Instruction::GuardNum(*vid)));
+            }
+            _ => {
+                // Object, Mixed, Null, String, or Unseen-with-profile → no guard
+            }
+        }
     }
 
-    // Insert guards at the position after all BlockParams.
     for (i, guard) in guards.into_iter().enumerate() {
         mir.blocks[0].instructions.insert(insert_pos + i, guard);
     }
@@ -321,6 +371,8 @@ pub struct ExecutionEngine {
     /// Bytecode pointers indexed by FuncId. O(1) lookup for bytecode dispatch.
     /// null entries mean bytecode not yet compiled for this function.
     pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
+    /// Type profiles indexed by FuncId. Persists across tier transitions.
+    pub type_profiles: Vec<Option<TypeProfile>>,
 }
 
 /// Per-module execution state.
@@ -369,6 +421,7 @@ impl ExecutionEngine {
             optimized_leaf: Vec::new(),
             optimized_metadata: Vec::new(),
             bc_cache: Vec::new(),
+            type_profiles: Vec::new(),
         }
     }
 
@@ -393,6 +446,7 @@ impl ExecutionEngine {
         self.optimized_leaf.push(false);
         self.optimized_metadata.push(None);
         self.bc_cache.push(std::ptr::null());
+        self.type_profiles.push(None);
         id
     }
 
@@ -671,11 +725,12 @@ impl ExecutionEngine {
         mir: &Arc<MirFunction>,
         tier: CompileTier,
         interner: &crate::intern::Interner,
+        profile: Option<&TypeProfile>,
     ) -> Arc<MirFunction> {
         match tier {
             CompileTier::Baseline => {
-                // Run range loop specialization even at Baseline tier — it
-                // eliminates 2 runtime calls per loop iteration with zero risk.
+                // Baseline: range loop only. Profile-guided guards are
+                // applied at optimized tier to avoid disrupting leaf classification.
                 let mut baseline_mir = (**mir).clone();
                 {
                     use crate::mir::opt::{range_loop::RangeLoop, MirPass};
@@ -686,7 +741,7 @@ impl ExecutionEngine {
             }
             CompileTier::Optimized => {
                 let mut spec = (**mir).clone();
-                insert_speculative_guards(&mut spec);
+                insert_speculative_guards(&mut spec, profile);
                 run_jit_opt_pipeline(&mut spec, interner);
                 Arc::new(spec)
             }
@@ -789,6 +844,33 @@ impl ExecutionEngine {
         }
     }
 
+    /// Sample argument types during interpretation for profile-guided compilation.
+    pub fn sample_arg_types(&mut self, id: FuncId, args: &[crate::runtime::value::Value]) {
+        let idx = id.0 as usize;
+        if idx >= self.type_profiles.len() {
+            return;
+        }
+        let profile = self.type_profiles[idx].get_or_insert_with(TypeProfile::default);
+        if profile.sample_count >= 32 {
+            return;
+        }
+        profile.sample_count += 1;
+        for (i, arg) in args.iter().enumerate().take(8) {
+            let observed = classify_value(*arg);
+            let slot = &mut profile.param_types[i];
+            if *slot == PROFILE_UNSEEN {
+                *slot = observed;
+            } else if *slot != observed {
+                *slot = PROFILE_MIXED;
+            }
+        }
+    }
+
+    /// Get the type profile for a function (persists across tier transitions).
+    pub fn get_type_profile(&self, id: FuncId) -> Option<&TypeProfile> {
+        self.type_profiles.get(id.0 as usize)?.as_ref()
+    }
+
     /// Compile the next tier synchronously and install it.
     pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
         let idx = id.0 as usize;
@@ -799,12 +881,13 @@ impl ExecutionEngine {
             return false;
         };
         let mir = Arc::clone(body.mir());
+        let profile = self.get_type_profile(id).cloned();
         if self.collect_tier_stats {
             if let Some(stats) = self.tier_stats.get_mut(idx) {
                 stats.compile_attempts += 1;
             }
         }
-        let compile_mir = Self::build_compile_mir(&mir, tier, interner);
+        let compile_mir = Self::build_compile_mir(&mir, tier, interner, profile.as_ref());
         let callsite_ic_ptrs = self.callsite_ic_ptrs_for_compile(id);
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
@@ -825,7 +908,11 @@ impl ExecutionEngine {
         // Use MIR analysis for leaf classification. Shadow frame push/pop
         // is handled by each dispatch path via metadata checks, so even if
         // a "leaf" function needs shadow stores, they'll be set up correctly.
-        let inline_safe = is_mir_inline_safe(&compile_mir, tier);
+        // Leaf = MIR says leaf OR compiled code has no shadow stores.
+        // Profile-guided guards (GuardNum) make is_mir_inline_safe return false,
+        // but if the guards + TypeSpecialize eliminate all CallRuntime → no shadow
+        // stores → the function IS safe for leaf dispatch.
+        let inline_safe = is_mir_inline_safe(&compile_mir, tier) || !compiled.needs_shadow_frame;
         let executable = match compiled.code.into_executable() {
             Ok(executable) => executable,
             Err(_) => return false,
@@ -860,6 +947,7 @@ impl ExecutionEngine {
             return;
         };
         let mir = Arc::clone(body.mir());
+        let profile = self.get_type_profile(id).cloned();
         let trace_name = self
             .functions
             .get(idx)
@@ -890,7 +978,7 @@ impl ExecutionEngine {
                     tier, id.0, trace_name_clone
                 );
             }
-            let compile_mir = Self::build_compile_mir(&mir, tier, &interner_clone);
+            let compile_mir = Self::build_compile_mir(&mir, tier, &interner_clone, profile.as_ref());
             if std::env::var("WLIFT_JIT_DUMP").is_ok() {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
@@ -905,7 +993,8 @@ impl ExecutionEngine {
             .ok()
             .and_then(|artifact| {
                 let native_meta = artifact.native_meta;
-                let inline_safe = is_mir_inline_safe(&compile_mir, tier);
+                let inline_safe = is_mir_inline_safe(&compile_mir, tier)
+                    || !artifact.needs_shadow_frame;
                 artifact
                     .code
                     .into_executable()
