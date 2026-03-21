@@ -167,9 +167,15 @@ impl TypeInferrer {
                 self.env.set_var_type(name.1.start, ty);
             }
 
-            Stmt::Class(_decl) => {
-                // Class declarations define a class type, but we don't
-                // deeply infer method bodies here (done during MIR lowering).
+            Stmt::Class(decl) => {
+                // Infer method bodies so TypeEnv has expression types for
+                // arithmetic operations inside methods. This enables the MIR
+                // builder to emit typed instructions (AddF64 instead of Add).
+                for method in &decl.methods {
+                    if let Some(ref body) = method.0.body {
+                        self.infer_stmt(body);
+                    }
+                }
             }
 
             Stmt::Import { .. } => {}

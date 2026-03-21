@@ -45,6 +45,9 @@ pub struct MirBuilder<'a> {
     /// Stack of shadowed variables per block scope.
     /// Each entry: (var name, previous value or None if newly introduced).
     block_shadows: Vec<Vec<(SymbolId, Option<ValueId>)>>,
+    /// Type environment from sema inference. When present, enables emitting
+    /// typed instructions (AddF64 instead of Add) for known-Num operands.
+    type_env: Option<crate::sema::types::TypeEnv>,
 }
 
 impl<'a> MirBuilder<'a> {
@@ -76,7 +79,14 @@ impl<'a> MirBuilder<'a> {
             current_method_base_name: None,
             current_method_is_static: false,
             block_shadows: Vec::new(),
+            type_env: None,
         }
+    }
+
+    /// Set the type environment for type-directed instruction emission.
+    pub fn with_type_env(mut self, env: crate::sema::types::TypeEnv) -> Self {
+        self.type_env = Some(env);
+        self
     }
 
     pub fn build_module(mut self, module: &Module) -> (MirFunction, Vec<MirFunction>) {
@@ -731,25 +741,76 @@ impl<'a> MirBuilder<'a> {
             Expr::BinaryOp { op, left, right } => {
                 let lhs = self.lower_expr(left);
                 let rhs = self.lower_expr(right);
-                let inst = match op {
-                    BinaryOp::Add => Instruction::Add(lhs, rhs),
-                    BinaryOp::Sub => Instruction::Sub(lhs, rhs),
-                    BinaryOp::Mul => Instruction::Mul(lhs, rhs),
-                    BinaryOp::Div => Instruction::Div(lhs, rhs),
-                    BinaryOp::Mod => Instruction::Mod(lhs, rhs),
-                    BinaryOp::Lt => Instruction::CmpLt(lhs, rhs),
-                    BinaryOp::Gt => Instruction::CmpGt(lhs, rhs),
-                    BinaryOp::LtEq => Instruction::CmpLe(lhs, rhs),
-                    BinaryOp::GtEq => Instruction::CmpGe(lhs, rhs),
-                    BinaryOp::Eq => Instruction::CmpEq(lhs, rhs),
-                    BinaryOp::NotEq => Instruction::CmpNe(lhs, rhs),
-                    BinaryOp::BitAnd => Instruction::BitAnd(lhs, rhs),
-                    BinaryOp::BitOr => Instruction::BitOr(lhs, rhs),
-                    BinaryOp::BitXor => Instruction::BitXor(lhs, rhs),
-                    BinaryOp::Shl => Instruction::Shl(lhs, rhs),
-                    BinaryOp::Shr => Instruction::Shr(lhs, rhs),
-                };
-                self.emit(inst)
+                // Check if both operands are known-Num from type inference.
+                let both_num = self.type_env.as_ref().map_or(false, |env| {
+                    env.get_expr_type(left.1.start).is_num()
+                        && env.get_expr_type(right.1.start).is_num()
+                });
+                if both_num {
+                    // Emit unboxed f64 instructions directly — no CallRuntime.
+                    match op {
+                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
+                        | BinaryOp::Div | BinaryOp::Mod => {
+                            let ua = self.emit(Instruction::Unbox(lhs));
+                            let ub = self.emit(Instruction::Unbox(rhs));
+                            let r = self.emit(match op {
+                                BinaryOp::Add => Instruction::AddF64(ua, ub),
+                                BinaryOp::Sub => Instruction::SubF64(ua, ub),
+                                BinaryOp::Mul => Instruction::MulF64(ua, ub),
+                                BinaryOp::Div => Instruction::DivF64(ua, ub),
+                                BinaryOp::Mod => Instruction::ModF64(ua, ub),
+                                _ => unreachable!(),
+                            });
+                            self.emit(Instruction::Box(r))
+                        }
+                        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq
+                        | BinaryOp::GtEq => {
+                            let ua = self.emit(Instruction::Unbox(lhs));
+                            let ub = self.emit(Instruction::Unbox(rhs));
+                            self.emit(match op {
+                                BinaryOp::Lt => Instruction::CmpLtF64(ua, ub),
+                                BinaryOp::Gt => Instruction::CmpGtF64(ua, ub),
+                                BinaryOp::LtEq => Instruction::CmpLeF64(ua, ub),
+                                BinaryOp::GtEq => Instruction::CmpGeF64(ua, ub),
+                                _ => unreachable!(),
+                            })
+                        }
+                        _ => {
+                            // Eq/NotEq/BitOps: keep boxed (type-safe path)
+                            let inst = match op {
+                                BinaryOp::Eq => Instruction::CmpEq(lhs, rhs),
+                                BinaryOp::NotEq => Instruction::CmpNe(lhs, rhs),
+                                BinaryOp::BitAnd => Instruction::BitAnd(lhs, rhs),
+                                BinaryOp::BitOr => Instruction::BitOr(lhs, rhs),
+                                BinaryOp::BitXor => Instruction::BitXor(lhs, rhs),
+                                BinaryOp::Shl => Instruction::Shl(lhs, rhs),
+                                BinaryOp::Shr => Instruction::Shr(lhs, rhs),
+                                _ => unreachable!(),
+                            };
+                            self.emit(inst)
+                        }
+                    }
+                } else {
+                    let inst = match op {
+                        BinaryOp::Add => Instruction::Add(lhs, rhs),
+                        BinaryOp::Sub => Instruction::Sub(lhs, rhs),
+                        BinaryOp::Mul => Instruction::Mul(lhs, rhs),
+                        BinaryOp::Div => Instruction::Div(lhs, rhs),
+                        BinaryOp::Mod => Instruction::Mod(lhs, rhs),
+                        BinaryOp::Lt => Instruction::CmpLt(lhs, rhs),
+                        BinaryOp::Gt => Instruction::CmpGt(lhs, rhs),
+                        BinaryOp::LtEq => Instruction::CmpLe(lhs, rhs),
+                        BinaryOp::GtEq => Instruction::CmpGe(lhs, rhs),
+                        BinaryOp::Eq => Instruction::CmpEq(lhs, rhs),
+                        BinaryOp::NotEq => Instruction::CmpNe(lhs, rhs),
+                        BinaryOp::BitAnd => Instruction::BitAnd(lhs, rhs),
+                        BinaryOp::BitOr => Instruction::BitOr(lhs, rhs),
+                        BinaryOp::BitXor => Instruction::BitXor(lhs, rhs),
+                        BinaryOp::Shl => Instruction::Shl(lhs, rhs),
+                        BinaryOp::Shr => Instruction::Shr(lhs, rhs),
+                    };
+                    self.emit(inst)
+                }
             }
 
             Expr::LogicalOp { op, left, right } => self.lower_logical(*op, left, right),
@@ -1309,6 +1370,9 @@ pub fn lower_module(
     interner: &mut Interner,
     resolve: &ResolveResult,
 ) -> ModuleMir {
+    // Run type inference to enable typed instruction emission.
+    let type_env = crate::sema::types::infer_types(module);
+
     let name = interner.intern("<module>");
     let builder = MirBuilder::new(
         name,
@@ -1317,7 +1381,8 @@ pub fn lower_module(
         &resolve.resolutions,
         &resolve.module_vars,
         &resolve.upvalues,
-    );
+    )
+    .with_type_env(type_env);
     let (top_level, closures) = builder.build_module(module);
 
     // Compile class definitions.
