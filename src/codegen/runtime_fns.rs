@@ -505,13 +505,12 @@ fn try_dispatch_callsite_ic(
                 return None;
             }
             vm.engine.note_ic_hit(func_id);
-            // Batch TLS: update func_id + depth in one access each.
-            let saved_func_id = JIT_CTX.with(|c| {
-                let mut ctx = c.get();
+            // Direct field access via UnsafeCell — no 48-byte copy.
+            let saved_func_id = JIT_CTX.with(|c| unsafe {
+                let ctx = &mut *c.get();
                 let old = ctx.current_func_id;
                 ctx.current_func_id = fn_idx as u32;
                 ctx.closure = ic.closure as *mut u8;
-                c.set(ctx);
                 old
             });
             JIT_DEPTH.with(|d| d.set(depth + 1));
@@ -524,12 +523,9 @@ fn try_dispatch_callsite_ic(
             if pushed {
                 pop_native_shadow_frame();
             }
-            // Batch TLS: restore func_id + depth
             JIT_DEPTH.with(|d| d.set(depth));
-            JIT_CTX.with(|c| {
-                let mut ctx = c.get();
-                ctx.current_func_id = saved_func_id;
-                c.set(ctx);
+            JIT_CTX.with(|c| unsafe {
+                (*c.get()).current_func_id = saved_func_id;
             });
             Some(result)
         }
@@ -588,8 +584,10 @@ impl Default for JitContext {
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    /// JIT context — Cell<JitContext> for zero-overhead get/set (JitContext is Copy).
-    static JIT_CTX: std::cell::Cell<JitContext> = const { std::cell::Cell::new(JitContext {
+    /// JIT context — UnsafeCell for zero-copy direct field access.
+    /// Cell<JitContext> copies 48 bytes on every get/set. UnsafeCell gives
+    /// direct pointer access with no copying — critical for the hot dispatch path.
+    static JIT_CTX: std::cell::UnsafeCell<JitContext> = const { std::cell::UnsafeCell::new(JitContext {
         module_vars: std::ptr::null_mut(),
         module_var_count: 0,
         vm: std::ptr::null_mut(),
@@ -685,23 +683,19 @@ pub fn shadow_nonleaf_enabled() -> bool {
 /// Set up the JIT context before calling compiled code.
 #[inline(always)]
 pub fn set_jit_context(ctx: JitContext) {
-    JIT_CTX.with(|c| c.set(ctx));
+    JIT_CTX.with(|c| unsafe { *c.get() = ctx });
 }
 
-/// Read the current JIT context.
+/// Read the current JIT context (zero-copy reference via UnsafeCell).
 #[inline(always)]
 pub fn read_jit_ctx() -> JitContext {
-    JIT_CTX.with(|c| c.get())
+    JIT_CTX.with(|c| unsafe { *c.get() })
 }
 
-/// Mutate the JIT context in place.
+/// Mutate the JIT context in place (no copy — direct field access).
 #[inline(always)]
 pub fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
-    JIT_CTX.with(|c| {
-        let mut ctx = c.get();
-        f(&mut ctx);
-        c.set(ctx);
-    });
+    JIT_CTX.with(|c| unsafe { f(&mut *c.get()) });
 }
 
 // ---------------------------------------------------------------------------
