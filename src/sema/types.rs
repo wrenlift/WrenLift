@@ -12,8 +12,13 @@
 /// emitting unboxed f64 arithmetic), not to enforce correctness. Type errors
 /// at this stage are warnings, not hard errors.
 ///
-/// Forward-flow lattice analysis.
-/// The key win: tight numeric loops get unboxed f64 ops in codegen.
+/// Uses a 3-pass approach for class-heavy code:
+///   Pass 1: Collect field types from assignments (_field = value).
+///   Pass 2: Re-infer with field types → record method return types.
+///   Pass 3: Re-infer with field + method types → final TypeEnv.
+///
+/// The key win: tight numeric loops AND class methods with numeric fields
+/// get unboxed f64 ops in codegen.
 use std::collections::HashMap;
 
 use crate::ast::*;
@@ -73,6 +78,10 @@ pub struct TypeEnv {
     vars: HashMap<usize, InferredType>,
     /// Expression types (keyed by expression span start).
     exprs: HashMap<usize, InferredType>,
+    /// Field types per class: class_name → field_name → InferredType.
+    field_types: HashMap<SymbolId, HashMap<SymbolId, InferredType>>,
+    /// Method return types: (class_name, method_name) → InferredType.
+    method_return_types: HashMap<(SymbolId, SymbolId), InferredType>,
 }
 
 impl TypeEnv {
@@ -80,6 +89,8 @@ impl TypeEnv {
         Self {
             vars: HashMap::new(),
             exprs: HashMap::new(),
+            field_types: HashMap::new(),
+            method_return_types: HashMap::new(),
         }
     }
 
@@ -106,6 +117,45 @@ impl TypeEnv {
         self.vars.insert(span_start, widened);
     }
 
+    /// Record a field type for a class (joins with existing type).
+    pub fn record_field_type(&mut self, class: SymbolId, field: SymbolId, ty: &InferredType) {
+        let entry = self.field_types.entry(class).or_default().entry(field);
+        let current = entry.or_insert_with(|| ty.clone());
+        if current != ty {
+            *current = current.join(ty);
+        }
+    }
+
+    /// Get the inferred type for a class field.
+    pub fn get_field_type(&self, class: SymbolId, field: SymbolId) -> &InferredType {
+        self.field_types
+            .get(&class)
+            .and_then(|f| f.get(&field))
+            .unwrap_or(&InferredType::Any)
+    }
+
+    /// Record a method return type (joins with existing).
+    pub fn record_method_return_type(&mut self, class: SymbolId, method: SymbolId, ty: &InferredType) {
+        let entry = self.method_return_types.entry((class, method));
+        let current = entry.or_insert_with(|| ty.clone());
+        if current != ty {
+            *current = current.join(ty);
+        }
+    }
+
+    /// Get the inferred return type for a class method.
+    pub fn get_method_return_type(&self, class: SymbolId, method: SymbolId) -> &InferredType {
+        self.method_return_types
+            .get(&(class, method))
+            .unwrap_or(&InferredType::Any)
+    }
+
+    /// Clear per-expression and per-variable types (keep field + method types).
+    fn clear_ephemeral(&mut self) {
+        self.vars.clear();
+        self.exprs.clear();
+    }
+
     pub fn var_types(&self) -> &HashMap<usize, InferredType> {
         &self.vars
     }
@@ -127,6 +177,10 @@ impl Default for TypeEnv {
 
 pub struct TypeInferrer {
     env: TypeEnv,
+    /// Current class being inferred (for field + method return tracking).
+    current_class: Option<SymbolId>,
+    /// Current method being inferred (for return type recording).
+    current_method: Option<SymbolId>,
 }
 
 impl Default for TypeInferrer {
@@ -139,15 +193,30 @@ impl TypeInferrer {
     pub fn new() -> Self {
         Self {
             env: TypeEnv::new(),
+            current_class: None,
+            current_method: None,
+        }
+    }
+
+    /// Create an inferrer that carries forward field/method type knowledge.
+    fn with_env(env: TypeEnv) -> Self {
+        Self {
+            env,
+            current_class: None,
+            current_method: None,
         }
     }
 
     /// Run type inference on a module, returning the type environment.
     pub fn infer(mut self, module: &Module) -> TypeEnv {
+        self.infer_module(module);
+        self.env
+    }
+
+    fn infer_module(&mut self, module: &Module) {
         for stmt in module {
             self.infer_stmt(stmt);
         }
-        self.env
     }
 
     // -- Statements ---------------------------------------------------------
@@ -168,14 +237,25 @@ impl TypeInferrer {
             }
 
             Stmt::Class(decl) => {
-                // Infer method bodies so TypeEnv has expression types for
-                // arithmetic operations inside methods. This enables the MIR
-                // builder to emit typed instructions (AddF64 instead of Add).
+                let prev_class = self.current_class;
+                self.current_class = Some(decl.name.0);
                 for method in &decl.methods {
+                    // Extract method name for return type tracking.
+                    let method_name = match &method.0.signature {
+                        MethodSig::Named { name, .. } => Some(*name),
+                        MethodSig::Getter(name) => Some(*name),
+                        MethodSig::Construct { name, .. } => Some(*name),
+                        MethodSig::Setter { name, .. } => Some(*name),
+                        _ => None,
+                    };
+                    let prev_method = self.current_method;
+                    self.current_method = method_name;
                     if let Some(ref body) = method.0.body {
                         self.infer_stmt(body);
                     }
+                    self.current_method = prev_method;
                 }
+                self.current_class = prev_class;
             }
 
             Stmt::Import { .. } => {}
@@ -221,8 +301,14 @@ impl TypeInferrer {
             Stmt::Break | Stmt::Continue => {}
 
             Stmt::Return(expr) => {
-                if let Some(e) = expr {
-                    self.infer_expr(e);
+                let ret_ty = if let Some(e) = expr {
+                    self.infer_expr(e)
+                } else {
+                    InferredType::Null
+                };
+                // Record return type for the current method.
+                if let (Some(class), Some(method)) = (self.current_class, self.current_method) {
+                    self.env.record_method_return_type(class, method, &ret_ty);
                 }
             }
         }
@@ -248,14 +334,28 @@ impl TypeInferrer {
             }
             Expr::Bool(_) => InferredType::Bool,
             Expr::Null => InferredType::Null,
-            Expr::This => InferredType::Any,
+            Expr::This => {
+                if let Some(class) = self.current_class {
+                    InferredType::Class(class)
+                } else {
+                    InferredType::Any
+                }
+            }
 
             Expr::Ident(_) => {
                 // Look up from var types if we tracked it.
                 self.env.get_expr_type(expr.1.start).clone()
             }
 
-            Expr::Field(_) | Expr::StaticField(_) => InferredType::Any,
+            Expr::Field(field_name) => {
+                // Return tracked field type if available (from previous pass).
+                if let Some(class) = self.current_class {
+                    self.env.get_field_type(class, *field_name).clone()
+                } else {
+                    InferredType::Any
+                }
+            }
+            Expr::StaticField(_) => InferredType::Any,
 
             Expr::UnaryOp { op, operand } => {
                 let operand_ty = self.infer_expr(operand);
@@ -292,30 +392,58 @@ impl TypeInferrer {
 
             Expr::Assign { target, value } => {
                 let val_ty = self.infer_expr(value);
+                // Track field types when assigning to _field inside a class.
+                if let Expr::Field(field_name) = &target.0 {
+                    if let Some(class) = self.current_class {
+                        self.env.record_field_type(class, *field_name, &val_ty);
+                    }
+                }
                 self.infer_expr(target);
                 val_ty
             }
 
-            Expr::CompoundAssign { target, value, .. } => {
-                self.infer_expr(target);
-                self.infer_expr(value);
-                InferredType::Any
+            Expr::CompoundAssign { op, target, value } => {
+                let target_ty = self.infer_expr(target);
+                let val_ty = self.infer_expr(value);
+                let result_ty = self.infer_binary_op(*op, &target_ty, &val_ty);
+                // Track compound assignment to fields.
+                if let Expr::Field(field_name) = &target.0 {
+                    if let Some(class) = self.current_class {
+                        self.env.record_field_type(class, *field_name, &result_ty);
+                    }
+                }
+                result_ty
             }
 
             Expr::Call {
                 receiver,
+                method,
                 args,
                 block_arg,
                 ..
             } => {
-                if let Some(recv) = receiver {
-                    self.infer_expr(recv);
-                }
+                let recv_ty = if let Some(recv) = receiver {
+                    self.infer_expr(recv)
+                } else {
+                    // Bare call: implicit this.
+                    if let Some(class) = self.current_class {
+                        InferredType::Class(class)
+                    } else {
+                        InferredType::Any
+                    }
+                };
                 for arg in args {
                     self.infer_expr(arg);
                 }
                 if let Some(block) = block_arg {
                     self.infer_expr(block);
+                }
+                // Look up method return type if receiver class is known.
+                if let InferredType::Class(class_sym) = &recv_ty {
+                    let ret_ty = self.env.get_method_return_type(*class_sym, method.0).clone();
+                    if ret_ty.is_known() {
+                        return ret_ty;
+                    }
                 }
                 InferredType::Any
             }
@@ -437,9 +565,27 @@ impl TypeInferrer {
     }
 }
 
-/// Convenience: infer types for a parsed module.
+/// 3-pass type inference for a parsed module.
+///
+/// Pass 1: Walk class bodies to collect field assignment types.
+/// Pass 2: Re-infer with field type knowledge → record method return types.
+/// Pass 3: Re-infer with field + method return types → final TypeEnv.
 pub fn infer_types(module: &Module) -> TypeEnv {
-    TypeInferrer::new().infer(module)
+    // Pass 1: Collect field types + initial method return types.
+    let inferrer1 = TypeInferrer::new();
+    let mut env = inferrer1.infer(module);
+
+    // Pass 2: Re-infer with field types → better method return types.
+    env.clear_ephemeral();
+    let mut inferrer2 = TypeInferrer::with_env(env);
+    inferrer2.infer_module(module);
+    env = inferrer2.env;
+
+    // Pass 3: Re-infer with field + method types → final expression types.
+    env.clear_ephemeral();
+    let mut inferrer3 = TypeInferrer::with_env(env);
+    inferrer3.infer_module(module);
+    inferrer3.env
 }
 
 // ---------------------------------------------------------------------------

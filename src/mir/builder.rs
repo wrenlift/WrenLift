@@ -741,10 +741,18 @@ impl<'a> MirBuilder<'a> {
             Expr::BinaryOp { op, left, right } => {
                 let lhs = self.lower_expr(left);
                 let rhs = self.lower_expr(right);
-                // Check if both operands are known-Num from type inference.
+                // Check if both operands are known-Num. Use AST structure for
+                // literals (immune to span-key collisions in TypeEnv), TypeEnv
+                // for variables/fields/calls.
+                let is_num_expr = |e: &Spanned<Expr>, env: &crate::sema::types::TypeEnv| -> bool {
+                    match &e.0 {
+                        Expr::Num(_) => true,
+                        Expr::UnaryOp { op: UnaryOp::Neg, operand } => matches!(operand.0, Expr::Num(_)),
+                        _ => env.get_expr_type(e.1.start).is_num(),
+                    }
+                };
                 let both_num = self.type_env.as_ref().map_or(false, |env| {
-                    env.get_expr_type(left.1.start).is_num()
-                        && env.get_expr_type(right.1.start).is_num()
+                    is_num_expr(left, env) && is_num_expr(right, env)
                 });
                 if both_num {
                     // Emit unboxed f64 instructions directly — no CallRuntime.
@@ -1790,25 +1798,26 @@ mod tests {
     #[test]
     fn test_lower_add() {
         let (func, _) = lower("1 + 2");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::Add(..)));
+        // With type inference, Num + Num → Unbox + AddF64 + Box
+        assert_has_instruction(&func, |i| matches!(i, Instruction::AddF64(..)));
     }
 
     #[test]
     fn test_lower_sub() {
         let (func, _) = lower("5 - 3");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::Sub(..)));
+        assert_has_instruction(&func, |i| matches!(i, Instruction::SubF64(..)));
     }
 
     #[test]
     fn test_lower_mul() {
         let (func, _) = lower("2 * 3");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::Mul(..)));
+        assert_has_instruction(&func, |i| matches!(i, Instruction::MulF64(..)));
     }
 
     #[test]
     fn test_lower_comparison() {
         let (func, _) = lower("1 < 2");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::CmpLt(..)));
+        assert_has_instruction(&func, |i| matches!(i, Instruction::CmpLtF64(..)));
     }
 
     #[test]
