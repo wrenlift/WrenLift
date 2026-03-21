@@ -206,80 +206,6 @@ fn insert_speculative_guards(mir: &mut MirFunction) {
     }
 }
 
-/// Insert GuardNum only for parameters that flow into arithmetic operations.
-/// Unlike insert_speculative_guards (which guards ALL params), this avoids
-/// deopting functions that receive non-numeric values (booleans, objects).
-fn insert_arithmetic_guards(mir: &mut MirFunction) {
-    use crate::mir::Instruction;
-    if mir.blocks.is_empty() {
-        return;
-    }
-
-    // Collect which ValueIds are used in arithmetic operations.
-    let mut arithmetic_uses = std::collections::HashSet::new();
-    for block in &mir.blocks {
-        for (_, inst) in &block.instructions {
-            match inst {
-                Instruction::Add(a, b)
-                | Instruction::Sub(a, b)
-                | Instruction::Mul(a, b)
-                | Instruction::Div(a, b)
-                | Instruction::Mod(a, b)
-                | Instruction::CmpLt(a, b)
-                | Instruction::CmpGt(a, b)
-                | Instruction::CmpLe(a, b)
-                | Instruction::CmpGe(a, b)
-                | Instruction::BitAnd(a, b)
-                | Instruction::BitOr(a, b)
-                | Instruction::BitXor(a, b)
-                | Instruction::Shl(a, b)
-                | Instruction::Shr(a, b) => {
-                    arithmetic_uses.insert(*a);
-                    arithmetic_uses.insert(*b);
-                }
-                Instruction::Neg(a) | Instruction::BitNot(a) => {
-                    arithmetic_uses.insert(*a);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Collect BlockParams from block 0 that flow into arithmetic.
-    let params: Vec<(crate::mir::ValueId, u16)> = mir.blocks[0]
-        .instructions
-        .iter()
-        .filter_map(|(vid, inst)| {
-            if let Instruction::BlockParam(idx) = inst {
-                if *idx > 0 && arithmetic_uses.contains(vid) {
-                    return Some((*vid, *idx));
-                }
-            }
-            None
-        })
-        .collect();
-
-    if params.is_empty() {
-        return;
-    }
-
-    let insert_pos = mir.blocks[0]
-        .instructions
-        .iter()
-        .position(|(_, inst)| !matches!(inst, Instruction::BlockParam(_)))
-        .unwrap_or(mir.blocks[0].instructions.len());
-
-    let mut guards = Vec::new();
-    for (vid, _) in &params {
-        let guard_vid = mir.new_value();
-        guards.push((guard_vid, Instruction::GuardNum(*vid)));
-    }
-
-    for (i, guard) in guards.into_iter().enumerate() {
-        mir.blocks[0].instructions.insert(insert_pos + i, guard);
-    }
-}
-
 fn tier_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
@@ -748,24 +674,14 @@ impl ExecutionEngine {
     ) -> Arc<MirFunction> {
         match tier {
             CompileTier::Baseline => {
-                // Selective type specialization at baseline: guard only params
-                // used in arithmetic, then run full opt pipeline to monomorphize.
+                // Run range loop specialization even at Baseline tier — it
+                // eliminates 2 runtime calls per loop iteration with zero risk.
                 let mut baseline_mir = (**mir).clone();
-                insert_arithmetic_guards(&mut baseline_mir);
                 {
                     use crate::mir::opt::{range_loop::RangeLoop, MirPass};
                     let range_loop = RangeLoop { interner };
                     range_loop.run(&mut baseline_mir);
                 }
-                // Run TypeSpecialize + basic opts, but keep it lightweight.
-                use crate::mir::opt::{
-                    constfold::ConstFold, dce::Dce, inline::TypeSpecialize, MirPass,
-                };
-                let type_spec = TypeSpecialize::with_math(interner);
-                let passes: Vec<&dyn MirPass> = vec![
-                    &ConstFold, &Dce, &type_spec, &ConstFold, &Dce,
-                ];
-                crate::mir::opt::run_to_fixpoint(&mut baseline_mir, &passes, 5);
                 Arc::new(baseline_mir)
             }
             CompileTier::Optimized => {
