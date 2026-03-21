@@ -16,9 +16,15 @@ use crate::runtime::object::{
 use crate::runtime::value::Value;
 use std::sync::OnceLock;
 
-#[derive(Clone, Default)]
-struct NativeShadowFrame {
+/// Flat shadow root storage. All shadow frames share a single contiguous
+/// Vec<Value>. Push/pop is offset arithmetic — zero heap allocation after
+/// the Vec capacity stabilizes (typically after the first few calls).
+#[derive(Default)]
+struct FlatShadowStack {
+    /// All shadow root values, contiguous. Frames are stacked sequentially.
     roots: Vec<Value>,
+    /// Stack of frame start offsets. boundaries[i] is the start of frame i.
+    boundaries: Vec<u16>,
 }
 
 /// Shadow roots pointer — written by Rust, read by JIT-generated code via raw ldr.
@@ -598,10 +604,12 @@ thread_local! {
     /// SAFETY: single-threaded access within each thread (no concurrent borrows).
     static JIT_ROOTS_STORE: std::cell::UnsafeCell<Vec<Value>> = const { std::cell::UnsafeCell::new(Vec::new()) };
 
-    /// Native shadow stack — conservative boxed-value mirrors for active
-    /// compiled frames. Each frame stores one slot per boxed GP vreg.
-    static NATIVE_SHADOW_STACK: std::cell::UnsafeCell<Vec<NativeShadowFrame>> =
-        const { std::cell::UnsafeCell::new(Vec::new()) };
+    /// Flat shadow root stack — zero-alloc push/pop after warmup.
+    static FLAT_SHADOW: std::cell::UnsafeCell<FlatShadowStack> =
+        const { std::cell::UnsafeCell::new(FlatShadowStack {
+            roots: Vec::new(),
+            boundaries: Vec::new(),
+        }) };
 
 
     /// JIT native recursion depth — guards against native stack overflow.
@@ -632,11 +640,16 @@ pub fn current_native_shadow_roots_ptr() -> *mut Value {
 }
 
 #[inline(always)]
-fn sync_current_native_shadow_roots(frames: &mut [NativeShadowFrame]) {
-    let ptr = frames
-        .last_mut()
-        .and_then(|frame| (!frame.roots.is_empty()).then(|| frame.roots.as_mut_ptr()))
-        .unwrap_or(std::ptr::null_mut());
+fn sync_flat_shadow_ptr(stack: &mut FlatShadowStack) {
+    let ptr = if let Some(&start) = stack.boundaries.last() {
+        if (start as usize) < stack.roots.len() {
+            unsafe { stack.roots.as_mut_ptr().add(start as usize) }
+        } else {
+            std::ptr::null_mut()
+        }
+    } else {
+        std::ptr::null_mut()
+    };
     set_current_native_shadow_roots_ptr(ptr);
 }
 
@@ -829,51 +842,61 @@ fn with_context<T>(f: impl FnOnce(&JitContext) -> T) -> Option<T> {
 }
 
 pub fn push_native_shadow_frame(slot_count: usize) {
-    NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        let frames = &mut *stack.get();
-        frames.push(NativeShadowFrame {
-            roots: vec![Value::null(); slot_count],
-        });
-        sync_current_native_shadow_roots(frames);
+    FLAT_SHADOW.with(|s| unsafe {
+        let stack = &mut *s.get();
+        let start = stack.roots.len();
+        stack.boundaries.push(start as u16);
+        // resize reuses existing capacity after warmup — zero alloc.
+        stack.roots.resize(start + slot_count, Value::null());
+        sync_flat_shadow_ptr(stack);
     });
 }
 
 pub fn pop_native_shadow_frame() {
-    NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        let frames = &mut *stack.get();
-        let _ = frames.pop();
-        sync_current_native_shadow_roots(frames);
+    FLAT_SHADOW.with(|s| unsafe {
+        let stack = &mut *s.get();
+        if let Some(start) = stack.boundaries.pop() {
+            stack.roots.truncate(start as usize);
+        }
+        sync_flat_shadow_ptr(stack);
     });
 }
 
 pub fn take_native_shadow_roots() -> (Vec<usize>, Vec<Value>) {
-    NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        let frames = std::mem::take(&mut *stack.get());
+    FLAT_SHADOW.with(|s| unsafe {
+        let stack = &mut *s.get();
         set_current_native_shadow_roots_ptr(std::ptr::null_mut());
-        let mut lengths = Vec::with_capacity(frames.len());
-        let total_roots = frames.iter().map(|frame| frame.roots.len()).sum();
-        let mut roots = Vec::with_capacity(total_roots);
-        for frame in frames {
-            lengths.push(frame.roots.len());
-            roots.extend(frame.roots);
+        if stack.boundaries.is_empty() {
+            return (Vec::new(), Vec::new());
         }
+        // Build per-frame lengths from boundary offsets.
+        let mut lengths = Vec::with_capacity(stack.boundaries.len());
+        for i in 0..stack.boundaries.len() {
+            let start = stack.boundaries[i] as usize;
+            let end = if i + 1 < stack.boundaries.len() {
+                stack.boundaries[i + 1] as usize
+            } else {
+                stack.roots.len()
+            };
+            lengths.push(end - start);
+        }
+        let roots = std::mem::take(&mut stack.roots);
+        stack.boundaries.clear();
         (lengths, roots)
     })
 }
 
 pub fn set_native_shadow_roots(lengths: Vec<usize>, roots: Vec<Value>) {
-    NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        let mut rebuilt = Vec::with_capacity(lengths.len());
-        let mut offset = 0usize;
-        for len in lengths {
-            let end = offset.saturating_add(len);
-            rebuilt.push(NativeShadowFrame {
-                roots: roots[offset..end].to_vec(),
-            });
-            offset = end;
+    FLAT_SHADOW.with(|s| unsafe {
+        let stack = &mut *s.get();
+        stack.roots = roots;
+        stack.boundaries.clear();
+        let mut offset = 0u16;
+        for len in &lengths {
+            stack.boundaries.push(offset);
+            offset += *len as u16;
         }
-        sync_current_native_shadow_roots(&mut rebuilt);
-        *stack.get() = rebuilt;
+        sync_flat_shadow_ptr(stack);
     });
 }
 
@@ -1027,10 +1050,12 @@ fn trace_native_entry(
 pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
     let slot = slot as usize;
     let value = Value::from_bits(value);
-    NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        if let Some(frame) = (&mut *stack.get()).last_mut() {
-            if slot < frame.roots.len() {
-                frame.roots[slot] = value;
+    FLAT_SHADOW.with(|s| unsafe {
+        let stack = &mut *s.get();
+        if let Some(&start) = stack.boundaries.last() {
+            let idx = start as usize + slot;
+            if idx < stack.roots.len() {
+                stack.roots[idx] = value;
             }
         }
     });
@@ -1039,12 +1064,13 @@ pub extern "C" fn wren_shadow_store(slot: u64, value: u64) -> u64 {
 
 pub extern "C" fn wren_shadow_load(slot: u64) -> u64 {
     let slot = slot as usize;
-    NATIVE_SHADOW_STACK.with(|stack| unsafe {
-        (&*stack.get())
-            .last()
-            .and_then(|frame| frame.roots.get(slot).copied())
-            .unwrap_or(Value::null())
-            .to_bits()
+    FLAT_SHADOW.with(|s| unsafe {
+        let stack = &*s.get();
+        stack.boundaries.last().and_then(|&start| {
+            stack.roots.get(start as usize + slot).copied()
+        })
+        .unwrap_or(Value::null())
+        .to_bits()
     })
 }
 
