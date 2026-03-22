@@ -31,6 +31,39 @@ struct FlatShadowStack {
 /// Uses volatile read/write to prevent compiler reordering across JIT calls.
 static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
 
+/// Stack of active JIT frame pointers for GC stack walking.
+/// Each JIT entry pushes its frame pointer (x29). GC walks this list
+/// instead of the native frame chain (which breaks across Rust→JIT boundaries).
+static mut JIT_FRAME_STACK: [usize; 64] = [0; 64];
+static mut JIT_FRAME_COUNT: u32 = 0;
+
+/// Push a JIT frame pointer for GC visibility.
+#[inline(always)]
+pub fn push_jit_frame(fp: usize) {
+    unsafe {
+        let idx = JIT_FRAME_COUNT as usize;
+        if idx < JIT_FRAME_STACK.len() {
+            JIT_FRAME_STACK[idx] = fp;
+            JIT_FRAME_COUNT += 1;
+        }
+    }
+}
+
+/// Pop a JIT frame pointer.
+#[inline(always)]
+pub fn pop_jit_frame() {
+    unsafe {
+        if JIT_FRAME_COUNT > 0 {
+            JIT_FRAME_COUNT -= 1;
+        }
+    }
+}
+
+/// Get all active JIT frame pointers for GC stack walking.
+pub fn jit_frame_pointers() -> &'static [usize] {
+    unsafe { &JIT_FRAME_STACK[..JIT_FRAME_COUNT as usize] }
+}
+
 #[inline(always)]
 fn trace_jit_ic(msg: impl FnOnce() -> String) {
     if std::env::var_os("WLIFT_TRACE_JIT_IC").is_some() {

@@ -20,6 +20,12 @@ dynasm = "2"
 wasm-encoder = "0.245"
 smallvec = "1"
 
+[profile.release]
+# Force frame pointers for GC stack walking.
+# Without this, the frame pointer chain breaks in optimized code,
+# preventing the GC from finding live roots in JIT frames.
+force-frame-pointers = true
+
 [dev-dependencies]
 capstone = "0.12"
 wasmtime = "31"

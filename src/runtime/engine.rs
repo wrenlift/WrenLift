@@ -876,8 +876,13 @@ impl ExecutionEngine {
                     _ => 0,
                 };
                 if code_size > 0 {
-                    // Remove old range for this function if re-compiled.
                     self.code_ranges.retain(|r| r.func_id != func_id);
+                    if std::env::var_os("WLIFT_TRACE_CODE_RANGE").is_some() {
+                        eprintln!(
+                            "code-range: register f{} {:#x}-{:#x} size={}",
+                            func_id.0, start, start + code_size, code_size
+                        );
+                    }
                     self.register_code_range(func_id, start, start + code_size, meta);
                 }
             }
