@@ -13,6 +13,9 @@ use super::{Cond, Label, MachFunc, MachInst, Mem, VReg, VecWidth};
 pub struct CompiledCode {
     buf: ExecutableBuffer,
     start: AssemblyOffset,
+    /// Code offsets for call instructions: (inst_index, byte_offset_from_start).
+    /// Used to patch SafepointMetadata.code_offset for GC stack walking.
+    pub call_offsets: Vec<(usize, u32)>,
 }
 
 impl CompiledCode {
@@ -66,14 +69,29 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
 
     let start = asm.offset();
 
-    for inst in &func.insts {
+    // Track code offsets for call instructions (safepoints for GC stack maps).
+    let mut call_offsets: Vec<(usize, u32)> = Vec::new(); // (inst_index, code_offset)
+
+    for (inst_idx, inst) in func.insts.iter().enumerate() {
         emit_inst(&mut asm, inst, &labels)?;
+        // Record offset AFTER call instructions (the return address is the safepoint).
+        if matches!(
+            inst,
+            MachInst::CallInd { .. } | MachInst::CallLabel { .. }
+        ) {
+            let offset = (asm.offset().0 - start.0) as u32;
+            call_offsets.push((inst_idx, offset));
+        }
     }
 
     let buf = asm
         .finalize()
         .map_err(|_| "assembler finalize failed".to_string())?;
-    Ok(CompiledCode { buf, start })
+    Ok(CompiledCode {
+        buf,
+        start,
+        call_offsets,
+    })
 }
 
 fn gp(r: VReg) -> u32 {

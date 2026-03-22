@@ -2008,7 +2008,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 Target::Wasm => unreachable!(),
             };
             let alloc = regalloc::allocate_registers_result(&mach, &target_regs);
-            let native_meta = Some(Arc::new(native_meta::build_native_frame_metadata(
+            let mut native_meta = Some(Arc::new(native_meta::build_native_frame_metadata(
                 &mach, &alloc,
             )));
             regalloc::apply_allocation(&mut mach, &alloc, target_regs.frame_reserved);
@@ -2038,6 +2038,17 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 #[cfg(target_arch = "aarch64")]
                 Target::Aarch64 => {
                     let compiled = aarch64::emit(&mach)?;
+                    // Patch safepoint code offsets from emitted call positions.
+                    if let Some(ref mut meta) = native_meta {
+                        let meta = Arc::make_mut(meta);
+                        for &(inst_idx, offset) in &compiled.call_offsets {
+                            for sp in &mut meta.safepoints {
+                                if sp.inst_index == inst_idx as u32 {
+                                    sp.code_offset = offset;
+                                }
+                            }
+                        }
+                    }
                     CompiledFunction::Aarch64(compiled)
                 }
                 #[cfg(not(target_arch = "aarch64"))]
