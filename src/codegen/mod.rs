@@ -1937,6 +1937,15 @@ impl ExecutableFunction {
             ExecutableFunction::Aarch64(_) => true,
         }
     }
+
+    /// Size of the native code in bytes.
+    pub fn code_size(&self) -> usize {
+        match self {
+            ExecutableFunction::X86_64(code) => code.len(),
+            #[cfg(target_arch = "aarch64")]
+            ExecutableFunction::Aarch64(code) => code.code_size(),
+        }
+    }
 }
 
 /// Compile a MIR function to native code or WASM for the given target.

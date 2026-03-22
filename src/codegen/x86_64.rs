@@ -64,6 +64,11 @@ impl ExecutableCode {
         let ptr = self.buf.ptr(dynasmrt::AssemblyOffset(0));
         std::mem::transmute_copy(&ptr)
     }
+
+    /// Size of the native code in bytes.
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
 }
 
 struct Fixup {

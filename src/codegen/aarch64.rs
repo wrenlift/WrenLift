@@ -24,6 +24,11 @@ impl CompiledCode {
         let ptr = self.buf.ptr(self.start);
         std::mem::transmute_copy(&ptr)
     }
+
+    /// Size of the emitted code in bytes.
+    pub fn code_size(&self) -> usize {
+        self.buf.len() - self.start.0
+    }
 }
 
 /// Emit ARM64 machine code from a MachFunc.

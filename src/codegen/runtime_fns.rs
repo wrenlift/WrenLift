@@ -3267,6 +3267,7 @@ mod tests {
             safepoints: vec![crate::codegen::native_meta::SafepointMetadata {
                 ordinal: 0,
                 inst_index: 0,
+                code_offset: 0,
                 kind: crate::codegen::native_meta::SafepointKind::CallRuntime,
                 live_roots: vec![crate::codegen::native_meta::LiveRootMetadata {
                     slot: 0,

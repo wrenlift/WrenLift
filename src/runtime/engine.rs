@@ -373,6 +373,18 @@ pub struct ExecutionEngine {
     pub bc_cache: Vec<*const crate::mir::bytecode::BytecodeFunction>,
     /// Type profiles indexed by FuncId. Persists across tier transitions.
     pub type_profiles: Vec<Option<TypeProfile>>,
+    /// Code ranges for compiled functions, sorted by start address.
+    /// Used by GC stack walker to map return addresses → safepoint metadata.
+    pub code_ranges: Vec<CodeRange>,
+}
+
+/// Address range of a compiled function's native code.
+#[derive(Debug, Clone)]
+pub struct CodeRange {
+    pub start: usize,
+    pub end: usize,
+    pub func_id: FuncId,
+    pub metadata: Arc<NativeFrameMetadata>,
 }
 
 /// Per-module execution state.
@@ -422,6 +434,7 @@ impl ExecutionEngine {
             optimized_metadata: Vec::new(),
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
+            code_ranges: Vec::new(),
         }
     }
 
@@ -448,6 +461,40 @@ impl ExecutionEngine {
         self.bc_cache.push(std::ptr::null());
         self.type_profiles.push(None);
         id
+    }
+
+    /// Register a compiled function's code range for GC stack walking.
+    pub fn register_code_range(
+        &mut self,
+        func_id: FuncId,
+        code_start: usize,
+        code_end: usize,
+        metadata: Arc<NativeFrameMetadata>,
+    ) {
+        self.code_ranges.push(CodeRange {
+            start: code_start,
+            end: code_end,
+            func_id,
+            metadata,
+        });
+        // Keep sorted by start address for binary search.
+        self.code_ranges.sort_by_key(|r| r.start);
+    }
+
+    /// Find the compiled function containing a given return address.
+    /// Used by GC stack walker to look up safepoint metadata.
+    pub fn find_code_range(&self, addr: usize) -> Option<&CodeRange> {
+        // Binary search: find the last range whose start <= addr
+        let idx = self.code_ranges.partition_point(|r| r.start <= addr);
+        if idx == 0 {
+            return None;
+        }
+        let range = &self.code_ranges[idx - 1];
+        if addr < range.end {
+            Some(range)
+        } else {
+            None
+        }
     }
 
     /// Get the MIR for a function by ID.
@@ -810,6 +857,31 @@ impl ExecutionEngine {
             self.bc_cache[idx] = Arc::as_ptr(&bytecode);
         }
         self.sync_active_tier_cache(idx);
+        // Register code range for GC stack walking.
+        if !native_ptr.is_null() {
+            if let Some(meta) = self.jit_metadata.get(idx).and_then(|m| m.clone()) {
+                let func_id = FuncId(idx as u32);
+                let start = native_ptr as usize;
+                // Get code size from the executable stored in functions.
+                let code_size = match self.functions.get(idx) {
+                    Some(FuncBody::Native {
+                        baseline_executable, optimized_executable, ..
+                    }) => {
+                        if let Some(opt) = optimized_executable {
+                            opt.code_size()
+                        } else {
+                            baseline_executable.code_size()
+                        }
+                    }
+                    _ => 0,
+                };
+                if code_size > 0 {
+                    // Remove old range for this function if re-compiled.
+                    self.code_ranges.retain(|r| r.func_id != func_id);
+                    self.register_code_range(func_id, start, start + code_size, meta);
+                }
+            }
+        }
         self.invalidate_inline_caches();
         if self.collect_tier_stats {
             if let Some(stats) = self.tier_stats.get_mut(idx) {

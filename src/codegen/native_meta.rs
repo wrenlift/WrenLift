@@ -30,6 +30,9 @@ pub struct SafepointMetadata {
     pub ordinal: u32,
     /// Instruction index in the pre-rewrite MachInst stream.
     pub inst_index: u32,
+    /// Byte offset in emitted native code (set during aarch64/x86_64 emission).
+    /// Used by GC stack walker to map return addresses → live root info.
+    pub code_offset: u32,
     pub kind: SafepointKind,
     /// All boxed MIR values live across this safepoint after regalloc.
     pub live_roots: Vec<LiveRootMetadata>,
@@ -46,6 +49,14 @@ pub struct NativeFrameMetadata {
     /// non-leaf function safely without aliasing multiple spilled operands
     /// through a single scratch register.
     pub spill_safe_nonleaf: bool,
+}
+
+impl NativeFrameMetadata {
+    /// Find the safepoint metadata for a given code offset (return address).
+    /// Used by GC stack walker to determine live roots at a native call site.
+    pub fn find_safepoint(&self, code_offset: u32) -> Option<&SafepointMetadata> {
+        self.safepoints.iter().find(|sp| sp.code_offset == code_offset)
+    }
 }
 
 pub fn build_native_frame_metadata(
@@ -94,6 +105,7 @@ pub fn build_native_frame_metadata(
         safepoints.push(SafepointMetadata {
             ordinal,
             inst_index: inst_index as u32,
+            code_offset: 0, // patched during native code emission
             kind,
             live_roots,
         });
