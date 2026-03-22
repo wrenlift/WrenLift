@@ -1172,6 +1172,115 @@ impl VM {
     }
 
     /// Run the garbage collector with complete root gathering.
+    /// Scan native stack frames for GC roots using frame pointer chain
+    /// and safepoint metadata (stack maps). Returns discovered root values.
+    #[cfg(target_arch = "aarch64")]
+    fn scan_native_stack_roots(&self) -> Vec<Value> {
+        use crate::codegen::native_meta::RootLocation;
+        let mut found_roots = Vec::new();
+
+        // Read current frame pointer (x29 on aarch64).
+        let mut fp: usize;
+        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)) };
+
+        let mut frames_checked = 0u32;
+        let max_frames = 256;
+
+        while fp != 0 && frames_checked < max_frames {
+            frames_checked += 1;
+            // Return address is at [fp + 8] (LR saved by stp x29, x30, [sp]).
+            let return_addr = unsafe { *((fp + 8) as *const usize) };
+            if return_addr == 0 {
+                break;
+            }
+
+            // Check if this return address falls within a compiled function.
+            if let Some(code_range) = self.engine.find_code_range(return_addr) {
+                let offset = (return_addr - code_range.start) as u32;
+                if let Some(safepoint) = code_range.metadata.find_safepoint(offset) {
+                    for root in &safepoint.live_roots {
+                        match root.location {
+                            RootLocation::Spill(spill_offset) => {
+                                // Read the value from the frame's spill slot.
+                                // FP points to old_sp. Spill offsets are negative
+                                // from FP (allocated below frame pointer).
+                                let addr = (fp as isize + spill_offset as isize) as *const u64;
+                                let bits = unsafe { *addr };
+                                found_roots.push(Value::from_bits(bits));
+                            }
+                            RootLocation::Reg(_hw_enc) => {
+                                // Register values are saved by callee-save push.
+                                // For now, skip register roots — they're more
+                                // complex to locate on the stack.
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Walk to parent frame.
+            fp = unsafe { *(fp as *const usize) };
+        }
+
+        found_roots
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn scan_native_stack_roots_debug(&self) -> (Vec<Value>, u32, u32) {
+        use crate::codegen::native_meta::RootLocation;
+        let mut found_roots = Vec::new();
+        let mut frames_walked = 0u32;
+        let mut jit_frames = 0u32;
+
+        let mut fp: usize;
+        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)) };
+
+        let max_frames = 256;
+
+        while fp != 0 && frames_walked < max_frames {
+            frames_walked += 1;
+            let return_addr = unsafe { *((fp + 8) as *const usize) };
+            if return_addr == 0 {
+                break;
+            }
+
+            if std::env::var_os("WLIFT_TRACE_STACKWALK").is_some() && frames_walked <= 15 {
+                let in_range = self.engine.code_ranges.iter().any(|r| return_addr >= r.start && return_addr < r.end);
+                eprintln!(
+                    "  frame {}: fp={:#x} ret={:#x} in_jit={}",
+                    frames_walked, fp, return_addr, in_range
+                );
+            }
+            if let Some(code_range) = self.engine.find_code_range(return_addr) {
+                jit_frames += 1;
+                let offset = (return_addr - code_range.start) as u32;
+                if let Some(safepoint) = code_range.metadata.find_safepoint(offset) {
+                    for root in &safepoint.live_roots {
+                        if let RootLocation::Spill(spill_offset) = root.location {
+                            let addr = (fp as isize + spill_offset as isize) as *const u64;
+                            let bits = unsafe { *addr };
+                            found_roots.push(Value::from_bits(bits));
+                        }
+                    }
+                }
+            }
+
+            fp = unsafe { *(fp as *const usize) };
+        }
+
+        (found_roots, frames_walked, jit_frames)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn scan_native_stack_roots_debug(&self) -> (Vec<Value>, u32, u32) {
+        (Vec::new(), 0, 0)
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn scan_native_stack_roots(&self) -> Vec<Value> {
+        Vec::new()
+    }
+
     pub fn collect_garbage(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
 
@@ -1242,6 +1351,25 @@ impl VM {
             crate::codegen::runtime_fns::take_native_shadow_roots();
         roots.append(&mut native_shadow_roots);
         let native_shadow_end = roots.len();
+
+        // 7b. Stack map validation: scan native stack frames for GC roots
+        // using frame pointer chain + safepoint metadata. Compare against
+        // shadow roots to validate correctness before removing shadow stores.
+        if std::env::var_os("WLIFT_VALIDATE_STACKMAP").is_some() {
+            let (stack_roots, frames_walked, jit_frames) = self.scan_native_stack_roots_debug();
+            let shadow_count = native_shadow_end - native_shadow_start;
+            let range_info: Vec<String> = self.engine.code_ranges.iter()
+                .map(|r| format!("{:#x}-{:#x}(f{})", r.start, r.end, r.func_id.0))
+                .collect();
+            eprintln!(
+                "stackmap-validate: shadow={} stack={} frames={} jit_frames={} ranges=[{}]",
+                shadow_count,
+                stack_roots.len(),
+                frames_walked,
+                jit_frames,
+                range_info.join(", "),
+            );
+        }
 
         // 8. JitContext GC-managed pointers (closure, defining_class).
         let jit_ctx_start = roots.len();
