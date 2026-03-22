@@ -506,14 +506,13 @@ fn try_dispatch_callsite_ic(
             }
             vm.engine.note_ic_hit(func_id);
             // Direct field access via UnsafeCell — no 48-byte copy.
-            let saved_func_id = JIT_CTX.with(|c| unsafe {
-                let ctx = &mut *c.get();
-                let old = ctx.current_func_id;
-                ctx.current_func_id = fn_idx as u32;
-                ctx.closure = ic.closure as *mut u8;
+            let saved_func_id = unsafe {
+                let old = JIT_CTX.current_func_id;
+                JIT_CTX.current_func_id = fn_idx as u32;
+                JIT_CTX.closure = ic.closure as *mut u8;
                 old
-            });
-            JIT_DEPTH.with(|d| d.set(depth + 1));
+            };
+            unsafe { JIT_DEPTH = depth + 1 };
             let shadow_slots = current_shadow_slot_count(vm, func_id);
             let pushed = shadow_slots > 0;
             if pushed {
@@ -523,10 +522,8 @@ fn try_dispatch_callsite_ic(
             if pushed {
                 pop_native_shadow_frame();
             }
-            JIT_DEPTH.with(|d| d.set(depth));
-            JIT_CTX.with(|c| unsafe {
-                (*c.get()).current_func_id = saved_func_id;
-            });
+            unsafe { JIT_DEPTH = depth };
+            unsafe { JIT_CTX.current_func_id = saved_func_id };
             Some(result)
         }
         _ => None,
@@ -583,39 +580,41 @@ impl Default for JitContext {
 // RefCell borrow-checking overhead on the hot path.
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// JIT context — UnsafeCell for zero-copy direct field access.
-    /// Cell<JitContext> copies 48 bytes on every get/set. UnsafeCell gives
-    /// direct pointer access with no copying — critical for the hot dispatch path.
-    static JIT_CTX: std::cell::UnsafeCell<JitContext> = const { std::cell::UnsafeCell::new(JitContext {
-        module_vars: std::ptr::null_mut(),
-        module_var_count: 0,
-        vm: std::ptr::null_mut(),
-        module_name: std::ptr::null(),
-        module_name_len: 0,
-        current_func_id: u32::MAX,
-        closure: std::ptr::null_mut(),
-        defining_class: std::ptr::null_mut(),
-    }) };
+// ---------------------------------------------------------------------------
+// #[thread_local] statics — native TLS, ~2 cycles on aarch64 (mrs tpidr_el0)
+// vs ~20 cycles for thread_local! macro (_tlv_get_addr function call).
+// ---------------------------------------------------------------------------
 
-    /// JIT root set — UnsafeCell for zero-overhead Vec mutation.
-    /// SAFETY: single-threaded access within each thread (no concurrent borrows).
+/// JIT context — native TLS for direct field access on hot dispatch path.
+#[thread_local]
+static mut JIT_CTX: JitContext = JitContext {
+    module_vars: std::ptr::null_mut(),
+    module_var_count: 0,
+    vm: std::ptr::null_mut(),
+    module_name: std::ptr::null(),
+    module_name_len: 0,
+    current_func_id: u32::MAX,
+    closure: std::ptr::null_mut(),
+    defining_class: std::ptr::null_mut(),
+};
+
+/// JIT recursion depth — native TLS.
+#[thread_local]
+static mut JIT_DEPTH: u32 = 0;
+
+// Heap-owning data stays in thread_local! (needs drop on thread exit).
+thread_local! {
+    /// JIT root set.
     static JIT_ROOTS_STORE: std::cell::UnsafeCell<Vec<Value>> = const { std::cell::UnsafeCell::new(Vec::new()) };
 
-    /// Flat shadow root stack — zero-alloc push/pop after warmup.
+    /// Flat shadow root stack.
     static FLAT_SHADOW: std::cell::UnsafeCell<FlatShadowStack> =
         const { std::cell::UnsafeCell::new(FlatShadowStack {
             roots: Vec::new(),
             boundaries: Vec::new(),
         }) };
 
-
-    /// JIT native recursion depth — guards against native stack overflow.
-    /// When depth exceeds MAX_JIT_DEPTH, calls fall back to interpreter dispatch.
-    static JIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-
-    /// When true, all JIT dispatch is disabled (fall back to interpreter).
-    /// Used by shadow check to run interpreter-only path for comparison.
+    /// JIT disabled flag.
     static JIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -656,16 +655,16 @@ fn sync_flat_shadow_ptr(stack: &mut FlatShadowStack) {
 /// 256 levels ≈ 256-512KB, well within the default 8MB stack.
 pub const MAX_JIT_DEPTH: u32 = 256;
 
-/// Read the current JIT native recursion depth.
+/// Read the current JIT native recursion depth — native TLS.
 #[inline(always)]
 pub fn jit_depth() -> u32 {
-    JIT_DEPTH.with(|d| d.get())
+    unsafe { JIT_DEPTH }
 }
 
-/// Set the JIT native recursion depth.
+/// Set the JIT native recursion depth — native TLS.
 #[inline(always)]
 pub fn set_jit_depth(depth: u32) {
-    JIT_DEPTH.with(|d| d.set(depth));
+    unsafe { JIT_DEPTH = depth };
 }
 
 /// Check if JIT dispatch is disabled (for shadow check mode).
@@ -680,22 +679,22 @@ pub fn shadow_nonleaf_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_SHADOW_NONLEAF").is_some())
 }
 
-/// Set up the JIT context before calling compiled code.
+/// Set up the JIT context — native TLS write, ~2 cycles.
 #[inline(always)]
 pub fn set_jit_context(ctx: JitContext) {
-    JIT_CTX.with(|c| unsafe { *c.get() = ctx });
+    unsafe { JIT_CTX = ctx };
 }
 
-/// Read the current JIT context (zero-copy reference via UnsafeCell).
+/// Read the current JIT context — native TLS read, ~2 cycles.
 #[inline(always)]
 pub fn read_jit_ctx() -> JitContext {
-    JIT_CTX.with(|c| unsafe { *c.get() })
+    unsafe { JIT_CTX }
 }
 
-/// Mutate the JIT context in place (no copy — direct field access).
+/// Mutate the JIT context in place — direct pointer, no copy.
 #[inline(always)]
 pub fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
-    JIT_CTX.with(|c| unsafe { f(&mut *c.get()) });
+    unsafe { f(&mut JIT_CTX) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,7 +1223,7 @@ pub fn call_closure_jit_or_sync(
             had_native_candidate = true;
             // Guard: check native recursion depth to prevent stack overflow.
             // Each JIT call level uses ~1-2KB native stack; limit to 256 levels.
-            let depth = JIT_DEPTH.with(|d| d.get());
+            let depth = unsafe { JIT_DEPTH };
             let is_leaf = vm
                 .engine
                 .jit_leaf
@@ -1253,11 +1252,11 @@ pub fn call_closure_jit_or_sync(
                 trace_native_entry(vm, func_id, if is_leaf { "leaf-nested" } else { "nonleaf-nested" });
                 vm.engine.note_native_entry(func_id);
                 vm.engine.note_native_to_native_call(func_id);
-                JIT_DEPTH.with(|d| d.set(depth + 1));
+                unsafe { JIT_DEPTH = depth + 1 };
                 let root_len_before = jit_roots_snapshot_len();
                 // Shadow frame push/pop handled by call_jit_with_shadow.
                 let result = unsafe { call_jit_with_shadow(vm, fn_ptr, func_id, args) };
-                JIT_DEPTH.with(|d| d.set(depth));
+                unsafe { JIT_DEPTH = depth };
 
                 jit_roots_restore_len(root_len_before);
                 // Restore caller's JIT context.
