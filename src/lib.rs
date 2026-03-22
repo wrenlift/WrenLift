@@ -1,5 +1,3 @@
-#![feature(thread_local)]
-
 pub mod ast;
 pub mod capi;
 pub mod codegen;
