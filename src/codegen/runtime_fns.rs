@@ -150,24 +150,15 @@ fn current_jit_callsite_ic(
     ic_table.get_mut(ic_idx).map(|ic| ic as *mut _)
 }
 
-/// Unified JIT dispatch: handles shadow frame push/pop for non-leaf functions.
+/// Unified JIT dispatch. Shadow stores replaced by stack map GC root scanning.
 #[inline(always)]
 unsafe fn call_jit_with_shadow(
-    vm: &crate::runtime::vm::VM,
+    _vm: &crate::runtime::vm::VM,
     fn_ptr: *const u8,
-    func_id: crate::runtime::engine::FuncId,
+    _func_id: crate::runtime::engine::FuncId,
     args: &[Value],
 ) -> u64 {
-    let shadow_slots = current_shadow_slot_count(vm, func_id);
-    let pushed = shadow_slots > 0;
-    if pushed {
-        push_native_shadow_frame(shadow_slots);
-    }
-    let result = call_jit_cached(fn_ptr, args);
-    if pushed {
-        pop_native_shadow_frame();
-    }
-    result
+    call_jit_cached(fn_ptr, args)
 }
 
 #[inline(always)]
@@ -546,15 +537,7 @@ fn try_dispatch_callsite_ic(
                 old
             });
             JIT_DEPTH.with(|d| d.set(depth + 1));
-            let shadow_slots = current_shadow_slot_count(vm, func_id);
-            let pushed = shadow_slots > 0;
-            if pushed {
-                push_native_shadow_frame(shadow_slots);
-            }
             let result = unsafe { call_jit_cached(live_ptr, args) };
-            if pushed {
-                pop_native_shadow_frame();
-            }
             JIT_DEPTH.with(|d| d.set(depth));
             JIT_CTX.with(|c| unsafe {
                 (*c.get()).current_func_id = saved_func_id;
@@ -1524,63 +1507,130 @@ fn dispatch_method(
 }
 
 /// Call a method with 0 extra args. Codegen: [receiver, method_sym]
+/// On aarch64, wren_call_N uses #[naked] wrappers to capture the caller's
+/// frame pointer (x29) at zero cost to JIT code. The FP is passed as the
+/// LAST argument to the inner function, which pushes it to JIT_FRAME_STACK
+/// for GC stack walking.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
+    core::arch::naked_asm!(
+        "mov x2, x29",       // pass JIT FP as 3rd arg
+        "b {inner}",
+        inner = sym wren_call_0_inner,
+    );
+}
+#[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
+    wren_call_0_inner(receiver, method, 0)
+}
+extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
     let recv = Value::from_bits(receiver);
-    dispatch_call(recv, method, &[recv])
+    let result = dispatch_call(recv, method, &[recv]);
+    pop_jit_frame();
+    result
 }
 
-/// Call with 1 extra arg. Codegen: [receiver, method_sym, arg0]
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
+    core::arch::naked_asm!(
+        "mov x3, x29",
+        "b {inner}",
+        inner = sym wren_call_1_inner,
+    );
+}
+#[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
+    wren_call_1_inner(receiver, method, a0, 0)
+}
+extern "C" fn wren_call_1_inner(receiver: u64, method: u64, a0: u64, jit_fp: u64) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
     let recv = Value::from_bits(receiver);
-    dispatch_call(recv, method, &[recv, Value::from_bits(a0)])
+    let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0)]);
+    pop_jit_frame();
+    result
 }
 
-/// Call with 2 extra args.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
+    core::arch::naked_asm!(
+        "mov x4, x29",
+        "b {inner}",
+        inner = sym wren_call_2_inner,
+    );
+}
+#[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
+    wren_call_2_inner(receiver, method, a0, a1, 0)
+}
+extern "C" fn wren_call_2_inner(receiver: u64, method: u64, a0: u64, a1: u64, jit_fp: u64) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
     let recv = Value::from_bits(receiver);
-    dispatch_call(
-        recv,
-        method,
-        &[recv, Value::from_bits(a0), Value::from_bits(a1)],
-    )
+    let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0), Value::from_bits(a1)]);
+    pop_jit_frame();
+    result
 }
 
-/// Call with 3 extra args.
-pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    let recv = Value::from_bits(receiver);
-    dispatch_call(
-        recv,
-        method,
-        &[
-            recv,
-            Value::from_bits(a0),
-            Value::from_bits(a1),
-            Value::from_bits(a2),
-        ],
-    )
-}
-
-/// Call with 4 extra args (max via registers).
-pub extern "C" fn wren_call_4(
-    receiver: u64,
-    method: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_3(
+    _receiver: u64, _method: u64, _a0: u64, _a1: u64, _a2: u64,
 ) -> u64 {
+    core::arch::naked_asm!(
+        "mov x5, x29",
+        "b {inner}",
+        inner = sym wren_call_3_inner,
+    );
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_call_3_inner(receiver, method, a0, a1, a2, 0)
+}
+extern "C" fn wren_call_3_inner(
+    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, jit_fp: u64,
+) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
     let recv = Value::from_bits(receiver);
-    dispatch_call(
-        recv,
-        method,
-        &[
-            recv,
-            Value::from_bits(a0),
-            Value::from_bits(a1),
-            Value::from_bits(a2),
-            Value::from_bits(a3),
-        ],
-    )
+    let result = dispatch_call(
+        recv, method,
+        &[recv, Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)],
+    );
+    pop_jit_frame();
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_4(
+    _receiver: u64, _method: u64, _a0: u64, _a1: u64, _a2: u64, _a3: u64,
+) -> u64 {
+    core::arch::naked_asm!(
+        "mov x6, x29",
+        "b {inner}",
+        inner = sym wren_call_4_inner,
+    );
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_call_4(
+    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64,
+) -> u64 {
+    wren_call_4_inner(receiver, method, a0, a1, a2, a3, 0)
+}
+extern "C" fn wren_call_4_inner(
+    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64, jit_fp: u64,
+) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+    let recv = Value::from_bits(receiver);
+    let result = dispatch_call(
+        recv, method,
+        &[recv, Value::from_bits(a0), Value::from_bits(a1),
+          Value::from_bits(a2), Value::from_bits(a3)],
+    );
+    pop_jit_frame();
+    result
 }
 
 fn call_static_self_inner(extra_args: &[u64]) -> u64 {
@@ -2916,16 +2966,10 @@ fn lower_linked_call(
         }
     }
 
-    if let Some(live_roots) = live_roots {
-        append_shadow_reloads(
-            &mut new_insts,
-            target_data_addr("wren_current_shadow_roots_ptr"),
-            call_scratch,
-            copy_scratch,
-            frame_ptr,
-            live_roots,
-        );
-    }
+    // Shadow reloads removed — GC writes forwarded pointers directly to
+    // spill slots via stack map write-back. JIT frame is registered by
+    // #[naked] wren_call_N wrappers.
+    let _ = live_roots;
 
     new_insts
 }

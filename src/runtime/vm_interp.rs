@@ -209,21 +209,9 @@ fn try_run_root_frame_native(
             .unwrap_or_else(|| "<unknown>".to_string());
         eprintln!("native-entry: root FuncId({}) {}", func_id.0, name);
     }
-    let shadow_slots = vm.engine.jit_metadata
-        .get(fn_idx)
-        .and_then(|m| m.as_ref())
-        .filter(|m| !m.safepoints.is_empty())
-        .map(|m| m.boxed_values.len())
-        .unwrap_or(0);
-    if shadow_slots > 0 {
-        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
-    }
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
     let result_bits = unsafe { call_jit_fn(native_fn_ptr, &[]) };
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
-    if shadow_slots > 0 {
-        crate::codegen::runtime_fns::pop_native_shadow_frame();
-    }
 
     let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
         crate::codegen::runtime_fns::jit_root_at(fiber_root_idx)
@@ -1423,15 +1411,6 @@ fn run_fiber_with_stop_depth(
                                 } else {
                                     let recv_bits = recv_val.to_bits();
                                     vm.engine.note_ic_hit(func_id);
-                                    let shadow_slots = vm.engine.jit_metadata
-                                        .get(fn_idx)
-                                        .and_then(|m| m.as_ref())
-                                        .filter(|m| !m.safepoints.is_empty())
-                                        .map(|m| m.boxed_values.len())
-                                        .unwrap_or(0);
-                                    if shadow_slots > 0 {
-                                        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
-                                    }
                                     let result_bits = unsafe {
                                         match argc {
                                             0 => {
@@ -1471,9 +1450,6 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
-                                    if shadow_slots > 0 {
-                                        crate::codegen::runtime_fns::pop_native_shadow_frame();
-                                    }
                                     vm.engine.note_native_entry(func_id);
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
@@ -1632,15 +1608,6 @@ fn run_fiber_with_stop_depth(
                                         };
                                     }
                                     let recv_bits = recv_val.to_bits();
-                                    let shadow_slots = vm.engine.jit_metadata
-                                        .get(fn_idx)
-                                        .and_then(|m| m.as_ref())
-                                        .filter(|m| !m.safepoints.is_empty())
-                                        .map(|m| m.boxed_values.len())
-                                        .unwrap_or(0);
-                                    if shadow_slots > 0 {
-                                        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
-                                    }
                                     let result_bits = unsafe {
                                         match argc {
                                             0 => {
@@ -1674,9 +1641,6 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
-                                    if shadow_slots > 0 {
-                                        crate::codegen::runtime_fns::pop_native_shadow_frame();
-                                    }
                                     vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
@@ -2550,23 +2514,11 @@ fn dispatch_closure_bc(
 
                 if is_leaf {
                     vm.engine.note_native_entry(target_func_id);
-                    let shadow_slots = vm.engine.jit_metadata
-                        .get(fn_idx)
-                        .and_then(|m| m.as_ref())
-                        .filter(|m| !m.safepoints.is_empty())
-                        .map(|m| m.boxed_values.len())
-                        .unwrap_or(0);
-                    if shadow_slots > 0 {
-                        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
-                    }
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
                     let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                     let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
                     crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
-                    if shadow_slots > 0 {
-                        crate::codegen::runtime_fns::pop_native_shadow_frame();
-                    }
 
                     // Take values back from frame (GC may have moved objects).
                     let mut values = unsafe {

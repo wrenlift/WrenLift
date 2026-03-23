@@ -1367,7 +1367,7 @@ impl VM {
             let shadow_count = native_shadow_end - native_shadow_start;
             let jit_entries = crate::codegen::runtime_fns::jit_frame_entries();
             eprintln!(
-                "stackmap-validate: shadow={} stack={} jit_frames={} ranges={}",
+                "stackmap-validate: shadow={} stack_roots={} jit_frames={} code_ranges={}",
                 shadow_count,
                 native_stack_count,
                 jit_entries.len(),

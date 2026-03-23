@@ -2001,11 +2001,24 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             resolve_parallel_copies(&mut mach);
             // Insert JIT frame registration for GC stack walking.
             // push_jit_frame(x29) after prologue, pop before each epilogue/ret.
-            let _needs_frame_reg = target == Target::Aarch64 && needs_native_shadow_stack(&mach);
+            // Frame registration for non-leaf functions WITHOUT self-recursion.
+            // Functions with CallLocal re-enter their prologue on each recursive
+            // call — prologue frame registration would be called millions of times.
+            // For those, the #[naked] wren_call_N wrappers handle frame registration.
+            let has_call_local = mach.insts.iter().any(|i| matches!(i, MachInst::CallLocal { .. }));
+            let _needs_frame_reg = target == Target::Aarch64
+                && needs_native_shadow_stack(&mach)
+                && !has_call_local;
+            // Shadow stores replaced by stack map-based GC root scanning.
+            // JIT frames are registered via #[naked] wren_call_N wrappers +
+            // prologue registration for non-CallLocal functions.
+            // force_boxed_gp_spills ensures all boxed values are in spill slots.
             let has_shadow_stores = needs_native_shadow_stack(&mach);
             if has_shadow_stores {
                 mach.set_force_boxed_gp_spills(true);
-                instrument_native_shadow_stores(&mut mach);
+                // Shadow store instrumentation removed — GC uses stack maps.
+                // But needs_shadow_frame still uses has_shadow_stores for leaf
+                // classification (non-leaf functions need full dispatch context).
             }
             let target_regs = match target {
                 Target::X86_64 => regalloc::x86_64_target_regs(),
@@ -2026,9 +2039,9 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             );
             insert_callee_saves(&mut mach, target);
 
-            // JIT frame registration for GC stack walking. Currently disabled
-            // (shadow stores handle GC roots). Enable when removing shadow stores.
-            if _needs_frame_reg && std::env::var_os("WLIFT_JIT_FRAME_REG").is_some() {
+            // JIT frame registration for GC stack walking. Non-leaf functions
+            // register their frame pointer so the GC can find spill-slot roots.
+            if _needs_frame_reg {
                 let func_id = mach.name.strip_prefix("fn_")
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(u32::MAX);
