@@ -1766,6 +1766,8 @@ fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
                 && *name != "wren_shadow_load"
                 && *name != "wren_enter_shadow_frame"
                 && *name != "wren_exit_shadow_frame"
+                && *name != "wren_jit_frame_push"
+                && *name != "wren_jit_frame_pop"
         }
         MachInst::CallInd { .. } => true,
         _ => false,
@@ -1997,6 +1999,9 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 callsite_ic_ptrs,
             );
             resolve_parallel_copies(&mut mach);
+            // Insert JIT frame registration for GC stack walking.
+            // push_jit_frame(x29) after prologue, pop before each epilogue/ret.
+            let _needs_frame_reg = target == Target::Aarch64 && needs_native_shadow_stack(&mach);
             let has_shadow_stores = needs_native_shadow_stack(&mach);
             if has_shadow_stores {
                 mach.set_force_boxed_gp_spills(true);
@@ -2020,6 +2025,15 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 native_meta.as_deref(),
             );
             insert_callee_saves(&mut mach, target);
+
+            // JIT frame registration for GC stack walking. Currently disabled
+            // (shadow stores handle GC roots). Enable when removing shadow stores.
+            if _needs_frame_reg && std::env::var_os("WLIFT_JIT_FRAME_REG").is_some() {
+                let func_id = mach.name.strip_prefix("fn_")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(u32::MAX);
+                instrument_jit_frame_registration(&mut mach, func_id);
+            }
 
             if std::env::var("WLIFT_MACH_DUMP").is_ok() {
                 let pretty = interner.resolve(mir.name);
@@ -2311,6 +2325,97 @@ fn fixup_vreg_sentinels(
         | MachInst::Nop
         | MachInst::Trap
         | MachInst::Ret => {}
+    }
+}
+
+/// Insert JIT frame registration calls for GC stack walking.
+/// Emits `wren_jit_frame_push(x29)` after each Prologue and
+/// `wren_jit_frame_pop()` before each Epilogue, so the GC can find
+/// active JIT frames without relying on the x29 chain through Rust code.
+/// Insert JIT frame registration using post-regalloc physical registers.
+/// Uses Push/Pop to preserve x0/x1 around the call (since the push happens
+/// right after prologue, before any values are computed, we only need to
+/// worry about function arguments in x0/x1).
+///
+/// After prologue + callee saves, inserts:
+///   mov  x0, x29          (pass FP as 1st arg)
+///   movz x1, func_id      (pass func_id as 2nd arg)
+///   movz x16, push_addr   (load function pointer)
+///   blr  x16              (call wren_jit_frame_push)
+///
+/// Before each epilogue, inserts:
+///   movz x16, pop_addr
+///   blr  x16              (call wren_jit_frame_pop)
+fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
+    let push_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_push")
+        .unwrap_or(0) as u64;
+    let pop_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_pop")
+        .unwrap_or(0) as u64;
+    if push_addr == 0 || pop_addr == 0 {
+        return;
+    }
+
+    let x0 = VReg::gp(0);
+    let x1 = VReg::gp(1);
+    let x16 = VReg::gp(16);
+    let x29 = VReg::gp(29);
+
+    let mut insertions: Vec<(usize, bool)> = Vec::new();
+
+    for (i, inst) in mach.insts.iter().enumerate() {
+        match inst {
+            MachInst::Prologue { .. } => {
+                insertions.push((i + 1, true));
+            }
+            MachInst::Epilogue { .. } => {
+                insertions.push((i, false));
+            }
+            _ => {}
+        }
+    }
+
+    for (idx, is_push) in insertions.into_iter().rev() {
+        if is_push {
+            // Find the insertion point AFTER all callee-save pushes.
+            let mut insert_at = idx;
+            while insert_at < mach.insts.len() {
+                if matches!(&mach.insts[insert_at], MachInst::Push { .. } | MachInst::StackAlloc { .. }) {
+                    insert_at += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // After callee saves, FuncArg instructions read x0/x1/... into
+            // virtual registers. Those haven't run yet, so x0/x1 still hold
+            // the caller's args. We save/restore them around the push call.
+            let push_seq = [
+                MachInst::Push { src: x0 },
+                MachInst::Push { src: x1 },
+                MachInst::Mov { dst: x0, src: x29 },
+                MachInst::LoadImm { dst: x1, bits: func_id as u64 },
+                MachInst::LoadImm { dst: x16, bits: push_addr },
+                MachInst::CallInd { target: x16 },
+                MachInst::Pop { dst: x1 },
+                MachInst::Pop { dst: x0 },
+            ];
+            for (j, inst) in push_seq.into_iter().enumerate() {
+                mach.insts.insert(insert_at + j, inst);
+            }
+        } else {
+            // Before epilogue: x0 holds the return value. wren_jit_frame_pop
+            // doesn't need args and doesn't return a value, but it clobbers
+            // caller-saved regs. Save/restore x0 to preserve the return value.
+            let pop_seq = [
+                MachInst::Push { src: x0 },
+                MachInst::LoadImm { dst: x16, bits: pop_addr },
+                MachInst::CallInd { target: x16 },
+                MachInst::Pop { dst: x0 },
+            ];
+            for (j, inst) in pop_seq.into_iter().enumerate() {
+                mach.insts.insert(idx + j, inst);
+            }
+        }
     }
 }
 

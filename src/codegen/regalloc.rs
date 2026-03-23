@@ -36,7 +36,8 @@ pub struct LiveInterval {
 pub enum Location {
     /// In a physical register.
     Reg(PhysReg),
-    /// Spilled to a stack slot (offset from frame pointer, negative).
+    /// Spilled to a stack slot (offset from frame pointer).
+    /// AArch64: positive (above FP/LR pair). x86_64: negative (below RBP).
     Spill(i32),
 }
 
@@ -176,6 +177,14 @@ pub struct TargetRegs {
     /// AArch64: 16 (stp x29/x30 saved at bottom of frame).
     /// x86_64: 0 (push rbp is handled outside frame_size).
     pub frame_reserved: u32,
+    /// Offset of the first spill slot from the frame pointer.
+    /// AArch64: 16 (spills above saved FP/LR pair at [x29]).
+    /// x86_64: -8 (spills below saved RBP at [rbp]).
+    pub spill_first_offset: i32,
+    /// Offset increment per additional spill slot.
+    /// AArch64: 8 (positive, growing upward from FP).
+    /// x86_64: -8 (negative, growing downward from FP).
+    pub spill_stride: i32,
 }
 
 /// Build the default aarch64 allocatable set.
@@ -200,10 +209,11 @@ pub fn aarch64_target_regs() -> TargetRegs {
         gp_allocatable: gp,
         fp_allocatable: fp,
         caller_saved: cs_gp.into_iter().chain(cs_fp).collect(),
-        // AArch64 prologue does `stp x29, x30, [sp, -total]!; add x29, sp, total`
-        // so x29 points to old_sp. Spill slots use negative offsets from x29
-        // and must fit above the 16-byte saved-pair area at the bottom of the frame.
+        // AArch64 prologue saves x29/x30 at [sp], then sets x29 = sp.
+        // Spill slots start at [x29+16] (after the 16-byte FP/LR pair).
         frame_reserved: 16,
+        spill_first_offset: 16,
+        spill_stride: 8,
     }
 }
 
@@ -228,6 +238,8 @@ pub fn x86_64_target_regs() -> TargetRegs {
         fp_allocatable: fp,
         caller_saved: cs_gp.into_iter().chain(cs_fp).collect(),
         frame_reserved: 0, // x86_64: push rbp is outside frame_size
+        spill_first_offset: -8,
+        spill_stride: -8,
     }
 }
 
@@ -254,7 +266,7 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
 
     for iv in &intervals {
         if func.force_boxed_gp_spills() && func.is_boxed_gp(iv.vreg) {
-            let slot_offset = -((next_spill_slot as i32 + 1) * 8);
+            let slot_offset = target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
             next_spill_slot += 1;
             assignments.insert(iv.vreg, Location::Spill(slot_offset));
             continue;
@@ -304,7 +316,7 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
                 let (_, spilled_vreg, hw) = active.remove(idx);
 
                 // Reassign: spilled vreg goes to stack, we get its register.
-                let slot_offset = -((next_spill_slot as i32 + 1) * 8);
+                let slot_offset = target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
                 next_spill_slot += 1;
                 assignments.insert(spilled_vreg, Location::Spill(slot_offset));
 
@@ -317,7 +329,7 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
                 active.sort_by_key(|&(end, _, _)| end);
             } else {
                 // Spill this interval directly.
-                let slot_offset = -((next_spill_slot as i32 + 1) * 8);
+                let slot_offset = target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
                 next_spill_slot += 1;
                 assignments.insert(iv.vreg, Location::Spill(slot_offset));
             }
@@ -342,7 +354,7 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
 
     // Update frame size to include spill slots and any target-reserved bytes.
     // `frame_reserved` is 16 on AArch64 (space for stp x29/x30 at frame bottom)
-    // so that negative spill offsets from x29 land within the frame.
+    // so that spill offsets from x29 land within the frame.
     let spill_bytes = result.num_spill_slots * 8;
     let aligned = (func.frame_size + frame_reserved + spill_bytes + 15) & !15;
     func.frame_size = aligned;
@@ -943,6 +955,8 @@ pub fn respill_caller_saved_across_calls(
     func: &MachFunc,
     result: &mut RegAllocResult,
     caller_saved: &[PhysReg],
+    spill_first_offset: i32,
+    spill_stride: i32,
 ) {
     // Collect call instruction positions.
     let call_positions: Vec<u32> = func
@@ -996,7 +1010,7 @@ pub fn respill_caller_saved_across_calls(
                 !func.insts[cp as usize].defs().contains(&iv.vreg)
             });
             if spans {
-                let slot = -((result.num_spill_slots as i32 + 1) * 8);
+                let slot = spill_first_offset + (result.num_spill_slots as i32) * spill_stride;
                 result.num_spill_slots += 1;
                 result.assignments.insert(iv.vreg, Location::Spill(slot));
             }
@@ -1016,7 +1030,13 @@ pub fn respill_caller_saved_across_calls(
 /// 4. Rewrite VRegs to PhysRegs with spill/reload insertion
 pub fn allocate_registers_result(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
     let mut result = linear_scan(func, target);
-    respill_caller_saved_across_calls(func, &mut result, &target.caller_saved);
+    respill_caller_saved_across_calls(
+        func,
+        &mut result,
+        &target.caller_saved,
+        target.spill_first_offset,
+        target.spill_stride,
+    );
     result
 }
 

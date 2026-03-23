@@ -209,24 +209,21 @@ fn try_run_root_frame_native(
             .unwrap_or_else(|| "<unknown>".to_string());
         eprintln!("native-entry: root FuncId({}) {}", func_id.0, name);
     }
-    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-    // Push shadow frame only when the function has shadow stores (safepoints).
-    let shadow_slot_count = vm
-        .engine
-        .jit_metadata
+    let shadow_slots = vm.engine.jit_metadata
         .get(fn_idx)
-        .and_then(|meta| meta.as_ref())
-        .filter(|meta| !meta.safepoints.is_empty())
-        .map(|meta| meta.boxed_values.len())
+        .and_then(|m| m.as_ref())
+        .filter(|m| !m.safepoints.is_empty())
+        .map(|m| m.boxed_values.len())
         .unwrap_or(0);
-    if shadow_slot_count > 0 {
-        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slot_count);
+    if shadow_slots > 0 {
+        crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
     }
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
     let result_bits = unsafe { call_jit_fn(native_fn_ptr, &[]) };
-    if shadow_slot_count > 0 {
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+    if shadow_slots > 0 {
         crate::codegen::runtime_fns::pop_native_shadow_frame();
     }
-    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
     let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
         crate::codegen::runtime_fns::jit_root_at(fiber_root_idx)
@@ -1424,10 +1421,9 @@ fn run_fiber_with_stop_depth(
                                 {
                                     *ic = crate::mir::bytecode::CallSiteIC::default();
                                 } else {
-                                    // Push shadow frame if function has shadow stores.
-                                    let shadow_slots = vm
-                                        .engine
-                                        .jit_metadata
+                                    let recv_bits = recv_val.to_bits();
+                                    vm.engine.note_ic_hit(func_id);
+                                    let shadow_slots = vm.engine.jit_metadata
                                         .get(fn_idx)
                                         .and_then(|m| m.as_ref())
                                         .filter(|m| !m.safepoints.is_empty())
@@ -1436,8 +1432,6 @@ fn run_fiber_with_stop_depth(
                                     if shadow_slots > 0 {
                                         crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
                                     }
-                                    let recv_bits = recv_val.to_bits();
-                                    vm.engine.note_ic_hit(func_id);
                                     let result_bits = unsafe {
                                         match argc {
                                             0 => {
@@ -1637,11 +1631,8 @@ fn run_fiber_with_stop_depth(
                                             kind: 1, // JIT leaf
                                         };
                                     }
-                                    // Execute inline for this call too.
-                                    // Push shadow frame if the function has shadow stores.
-                                    let shadow_slots = vm
-                                        .engine
-                                        .jit_metadata
+                                    let recv_bits = recv_val.to_bits();
+                                    let shadow_slots = vm.engine.jit_metadata
                                         .get(fn_idx)
                                         .and_then(|m| m.as_ref())
                                         .filter(|m| !m.safepoints.is_empty())
@@ -1650,7 +1641,6 @@ fn run_fiber_with_stop_depth(
                                     if shadow_slots > 0 {
                                         crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
                                     }
-                                    let recv_bits = recv_val.to_bits();
                                     let result_bits = unsafe {
                                         match argc {
                                             0 => {
@@ -2559,28 +2549,24 @@ fn dispatch_closure_bc(
                 );
 
                 if is_leaf {
-                    // Leaf: direct JIT call. Shadow frame push/pop only
-                    // when function actually has shadow stores (safepoints).
-                    let shadow_slots = vm
-                        .engine
-                        .jit_metadata
+                    vm.engine.note_native_entry(target_func_id);
+                    let shadow_slots = vm.engine.jit_metadata
                         .get(fn_idx)
                         .and_then(|m| m.as_ref())
                         .filter(|m| !m.safepoints.is_empty())
                         .map(|m| m.boxed_values.len())
                         .unwrap_or(0);
-                    vm.engine.note_native_entry(target_func_id);
-                    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-                    let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                     if shadow_slots > 0 {
                         crate::codegen::runtime_fns::push_native_shadow_frame(shadow_slots);
                     }
+                    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+                    let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                     let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
+                    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
                     if shadow_slots > 0 {
                         crate::codegen::runtime_fns::pop_native_shadow_frame();
                     }
-                    crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-                    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
                     // Take values back from frame (GC may have moved objects).
                     let mut values = unsafe {

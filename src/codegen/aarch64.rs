@@ -534,9 +534,9 @@ fn emit_inst(
         // Stack Frame
         // =================================================================
         Prologue { frame_size } => {
-            // Allocate frame: save x29/x30 at bottom, set x29 = old_sp (above frame).
-            // Spill slots use negative offsets from x29 (e.g. [x29-8]).
-            // With x29 = old_sp, these offsets land within [sp, old_sp) — the frame.
+            // Standard aarch64 frame: save x29/x30 at bottom, set x29 = sp.
+            // [x29] = parent FP, [x29+8] = return address — enables frame chain walking.
+            // Spill slots use positive offsets from x29 (e.g. [x29+16], [x29+24]).
             // Push/Pop instructions (used by link_runtime_calls to save live regs
             // across calls) decrement sp further below the frame, never overlapping
             // with the spill slots.
@@ -547,7 +547,6 @@ fn emit_inst(
                 ; stp x29, x30, [sp]
                 ; mov x29, sp
             );
-            emit_add_imm_reg(asm, 29, total);
         }
 
         Epilogue { frame_size } => {

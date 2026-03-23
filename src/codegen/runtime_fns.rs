@@ -31,25 +31,25 @@ struct FlatShadowStack {
 /// Uses volatile read/write to prevent compiler reordering across JIT calls.
 static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
 
-/// Stack of active JIT frame pointers for GC stack walking.
-/// Each JIT entry pushes its frame pointer (x29). GC walks this list
+/// Stack of active JIT frames for GC stack walking.
+/// Each JIT entry pushes (frame_pointer, func_id). GC uses this list
 /// instead of the native frame chain (which breaks across Rust→JIT boundaries).
-static mut JIT_FRAME_STACK: [usize; 64] = [0; 64];
+static mut JIT_FRAME_STACK: [(usize, u32); 64] = [(0, 0); 64];
 static mut JIT_FRAME_COUNT: u32 = 0;
 
-/// Push a JIT frame pointer for GC visibility.
+/// Push a JIT frame for GC visibility.
 #[inline(always)]
-pub fn push_jit_frame(fp: usize) {
+pub fn push_jit_frame(fp: usize, func_id: u32) {
     unsafe {
         let idx = JIT_FRAME_COUNT as usize;
-        if idx < JIT_FRAME_STACK.len() {
-            JIT_FRAME_STACK[idx] = fp;
+        if idx < 64 {
+            *JIT_FRAME_STACK.get_unchecked_mut(idx) = (fp, func_id);
             JIT_FRAME_COUNT += 1;
         }
     }
 }
 
-/// Pop a JIT frame pointer.
+/// Pop a JIT frame.
 #[inline(always)]
 pub fn pop_jit_frame() {
     unsafe {
@@ -59,8 +59,8 @@ pub fn pop_jit_frame() {
     }
 }
 
-/// Get all active JIT frame pointers for GC stack walking.
-pub fn jit_frame_pointers() -> &'static [usize] {
+/// Get all active JIT frames (fp, func_id) for GC stack walking.
+pub fn jit_frame_entries() -> &'static [(usize, u32)] {
     unsafe { &JIT_FRAME_STACK[..JIT_FRAME_COUNT as usize] }
 }
 
@@ -151,7 +151,6 @@ fn current_jit_callsite_ic(
 }
 
 /// Unified JIT dispatch: handles shadow frame push/pop for non-leaf functions.
-/// ALL code paths that call compiled JIT functions should go through this.
 #[inline(always)]
 unsafe fn call_jit_with_shadow(
     vm: &crate::runtime::vm::VM,
@@ -2526,8 +2525,23 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_fp_pow" => Some(wren_fp_pow as *const () as usize),
         "wren_fp_min" => Some(wren_fp_min as *const () as usize),
         "wren_fp_max" => Some(wren_fp_max as *const () as usize),
+        // JIT frame registration for GC stack walking
+        "wren_jit_frame_push" => Some(wren_jit_frame_push as *const () as usize),
+        "wren_jit_frame_pop" => Some(wren_jit_frame_pop as *const () as usize),
         _ => None,
     }
+}
+
+/// Register a JIT function's frame pointer for GC stack walking.
+/// Called from JIT prologue with x29 (FP) and func_id as arguments.
+pub extern "C" fn wren_jit_frame_push(fp: u64, func_id: u64) {
+    push_jit_frame(fp as usize, func_id as u32);
+}
+
+/// Unregister a JIT function's frame pointer.
+/// Called from JIT epilogue before return.
+pub extern "C" fn wren_jit_frame_pop() {
+    pop_jit_frame();
 }
 
 // ---------------------------------------------------------------------------

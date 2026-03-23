@@ -187,7 +187,12 @@ fn is_spill_safe_nonleaf(
 
 fn safepoint_kind(inst: &MachInst) -> Option<SafepointKind> {
     match inst {
-        MachInst::CallRuntime { name, .. } if *name != "wren_shadow_store" && *name != "wren_shadow_load" => {
+        MachInst::CallRuntime { name, .. }
+            if *name != "wren_shadow_store"
+                && *name != "wren_shadow_load"
+                && *name != "wren_jit_frame_push"
+                && *name != "wren_jit_frame_pop" =>
+        {
             Some(SafepointKind::CallRuntime)
         }
         MachInst::CallInd { .. } => Some(SafepointKind::CallIndirect),
