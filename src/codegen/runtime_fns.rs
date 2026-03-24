@@ -2578,6 +2578,9 @@ pub fn resolve(name: &str) -> Option<usize> {
         // JIT frame registration for GC stack walking
         "wren_jit_frame_push" => Some(wren_jit_frame_push as *const () as usize),
         "wren_jit_frame_pop" => Some(wren_jit_frame_pop as *const () as usize),
+        // Inline IC context swap for kind=6 (non-leaf JIT dispatch)
+        "wren_ic_enter" => Some(wren_ic_enter as *const () as usize),
+        "wren_ic_leave" => Some(wren_ic_leave as *const () as usize),
         _ => None,
     }
 }
@@ -2592,6 +2595,26 @@ pub extern "C" fn wren_jit_frame_push(fp: u64, func_id: u64) {
 /// Called from JIT epilogue before return.
 pub extern "C" fn wren_jit_frame_pop() {
     pop_jit_frame();
+}
+
+/// Inline IC enter: set JitContext for a non-leaf JIT call (kind=6).
+/// Saves current_func_id, sets new func_id + closure. Returns saved_func_id.
+/// Skips depth tracking — native stack overflow is the backstop for infinite recursion.
+pub extern "C" fn wren_ic_enter(func_id: u64, closure: u64) -> u64 {
+    JIT_CTX.with(|c| unsafe {
+        let ctx = &mut *c.get();
+        let saved = ctx.current_func_id;
+        ctx.current_func_id = func_id as u32;
+        ctx.closure = closure as *mut u8;
+        saved as u64
+    })
+}
+
+/// Inline IC leave: restore current_func_id after a non-leaf JIT call.
+pub extern "C" fn wren_ic_leave(saved_func_id: u64) {
+    JIT_CTX.with(|c| unsafe {
+        (*c.get()).current_func_id = saved_func_id as u32;
+    });
 }
 
 // ---------------------------------------------------------------------------

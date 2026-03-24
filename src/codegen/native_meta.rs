@@ -191,7 +191,9 @@ fn safepoint_kind(inst: &MachInst) -> Option<SafepointKind> {
             if *name != "wren_shadow_store"
                 && *name != "wren_shadow_load"
                 && *name != "wren_jit_frame_push"
-                && *name != "wren_jit_frame_pop" =>
+                && *name != "wren_jit_frame_pop"
+                && *name != "wren_ic_enter"
+                && *name != "wren_ic_leave" =>
         {
             Some(SafepointKind::CallRuntime)
         }

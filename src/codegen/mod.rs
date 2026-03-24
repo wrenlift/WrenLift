@@ -1768,6 +1768,8 @@ fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
                 && *name != "wren_exit_shadow_frame"
                 && *name != "wren_jit_frame_push"
                 && *name != "wren_jit_frame_pop"
+                && *name != "wren_ic_enter"
+                && *name != "wren_ic_leave"
         }
         MachInst::CallInd { .. } => true,
         _ => false,
@@ -3174,11 +3176,13 @@ impl<'a> LowerCtx<'a> {
                         lhs: kind,
                         rhs: leaf_kind,
                     });
+                    let nonleaf_label = self.mf.new_label();
                     self.mf.emit(MachInst::JmpIf {
                         cond: Cond::Ne,
-                        target: slow_label,
+                        target: nonleaf_label,
                     });
 
+                    // ── Kind=1: leaf JIT direct call (no context setup needed) ──
                     let target_ptr = self.mf.new_gp();
                     self.mf.emit(MachInst::Ldr {
                         dst: target_ptr,
@@ -3189,9 +3193,68 @@ impl<'a> LowerCtx<'a> {
                     direct_args.extend(user_args.iter().copied());
                     self.mf.emit(MachInst::CallIndirectAbi {
                         target: target_ptr,
-                        args: direct_args,
+                        args: direct_args.clone(),
                         ret: Some(dst),
                     });
+                    self.mf.emit(MachInst::Jmp { target: done_label });
+
+                    // ── Kind=6: non-leaf JIT direct call (inline IC) ──
+                    self.mf.emit(MachInst::DefLabel(nonleaf_label));
+                    {
+                        use crate::mir::bytecode::CALLSITE_IC_CLOSURE;
+                        let nonleaf_kind = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: nonleaf_kind,
+                            bits: 6,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: kind,
+                            rhs: nonleaf_kind,
+                        });
+                        self.mf.emit(MachInst::JmpIf {
+                            cond: Cond::Ne,
+                            target: slow_label,
+                        });
+
+                        // Load func_id and closure from IC for context setup
+                        let ic_func_id = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ic_func_id,
+                            mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
+                        });
+                        let ic_closure = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ic_closure,
+                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
+                        });
+
+                        // wren_ic_enter(func_id, closure) → saved_func_id
+                        let saved_ctx = self.mf.new_gp();
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: "wren_ic_enter",
+                            args: vec![ic_func_id, ic_closure],
+                            ret: Some(saved_ctx),
+                        });
+
+                        // Direct call to JIT function
+                        let nl_target = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: nl_target,
+                            mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
+                        });
+                        self.mf.emit(MachInst::CallIndirectAbi {
+                            target: nl_target,
+                            args: direct_args,
+                            ret: Some(dst),
+                        });
+
+                        // wren_ic_leave(saved_func_id)
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: "wren_ic_leave",
+                            args: vec![saved_ctx],
+                            ret: None,
+                        });
+                    }
                     self.mf.emit(MachInst::Jmp { target: done_label });
                     self.mf.emit(MachInst::DefLabel(getter_label));
                     let fields_ptr = self.mf.new_gp();
