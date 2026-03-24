@@ -3202,6 +3202,7 @@ impl<'a> LowerCtx<'a> {
                     self.mf.emit(MachInst::DefLabel(nonleaf_label));
                     {
                         use crate::mir::bytecode::CALLSITE_IC_CLOSURE;
+                        let native_label = self.mf.new_label();
                         let nonleaf_kind = self.mf.new_gp();
                         self.mf.emit(MachInst::LoadImm {
                             dst: nonleaf_kind,
@@ -3213,7 +3214,7 @@ impl<'a> LowerCtx<'a> {
                         });
                         self.mf.emit(MachInst::JmpIf {
                             cond: Cond::Ne,
-                            target: slow_label,
+                            target: native_label,
                         });
 
                         // Load func_id and closure from IC for context setup
@@ -3244,7 +3245,7 @@ impl<'a> LowerCtx<'a> {
                         });
                         self.mf.emit(MachInst::CallIndirectAbi {
                             target: nl_target,
-                            args: direct_args,
+                            args: direct_args.clone(),
                             ret: Some(dst),
                         });
 
@@ -3253,6 +3254,44 @@ impl<'a> LowerCtx<'a> {
                             name: "wren_ic_leave",
                             args: vec![saved_ctx],
                             ret: None,
+                        });
+                        self.mf.emit(MachInst::Jmp { target: done_label });
+
+                        // ── Kind=4: native method direct call ──
+                        self.mf.emit(MachInst::DefLabel(native_label));
+                        let native_kind = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: native_kind,
+                            bits: 4,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: kind,
+                            rhs: native_kind,
+                        });
+                        self.mf.emit(MachInst::JmpIf {
+                            cond: Cond::Ne,
+                            target: slow_label,
+                        });
+
+                        // Load native fn ptr from IC (stored in closure field)
+                        let native_fn = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: native_fn,
+                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
+                        });
+                        // Call wren_ic_native_N(native_fn, receiver, args...)
+                        let native_call_name = match args.len() {
+                            0 => "wren_ic_native_0",
+                            1 => "wren_ic_native_1",
+                            2 => "wren_ic_native_2",
+                            _ => "wren_ic_native_3",
+                        };
+                        let mut native_args = vec![native_fn, r];
+                        native_args.extend(user_args.iter().copied());
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: native_call_name,
+                            args: native_args,
+                            ret: Some(dst),
                         });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });

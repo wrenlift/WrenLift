@@ -2581,6 +2581,11 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Inline IC context swap for kind=6 (non-leaf JIT dispatch)
         "wren_ic_enter" => Some(wren_ic_enter as *const () as usize),
         "wren_ic_leave" => Some(wren_ic_leave as *const () as usize),
+        // Inline IC native dispatch for kind=4
+        "wren_ic_native_0" => Some(wren_ic_native_0 as *const () as usize),
+        "wren_ic_native_1" => Some(wren_ic_native_1 as *const () as usize),
+        "wren_ic_native_2" => Some(wren_ic_native_2 as *const () as usize),
+        "wren_ic_native_3" => Some(wren_ic_native_3 as *const () as usize),
         _ => None,
     }
 }
@@ -2595,6 +2600,78 @@ pub extern "C" fn wren_jit_frame_push(fp: u64, func_id: u64) {
 /// Called from JIT epilogue before return.
 pub extern "C" fn wren_jit_frame_pop() {
     pop_jit_frame();
+}
+
+// ---------------------------------------------------------------------------
+// Inline IC native dispatch (kind=4)
+// ---------------------------------------------------------------------------
+
+/// Thin wrapper for native method dispatch from inline IC.
+/// Takes (native_fn_ptr, receiver, args..., jit_fp) — the jit_fp is captured
+/// by #[naked] wrappers to register the JIT frame for GC.
+macro_rules! ic_native_inner {
+    ($name:ident, $($arg:ident),*) => {
+        extern "C" fn $name(native_fn: u64, recv: u64, $($arg: u64,)* jit_fp: u64) -> u64 {
+            push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+            let result = match unsafe { vm_ref() } {
+                Some(vm) => {
+                    let f: crate::runtime::object::NativeFn = unsafe { std::mem::transmute(native_fn) };
+                    f(vm, &[Value::from_bits(recv), $(Value::from_bits($arg)),*]).to_bits()
+                }
+                None => Value::null().to_bits(),
+            };
+            pop_jit_frame();
+            result
+        }
+    };
+}
+
+ic_native_inner!(wren_ic_native_0_inner,);
+ic_native_inner!(wren_ic_native_1_inner, a0);
+ic_native_inner!(wren_ic_native_2_inner, a0, a1);
+ic_native_inner!(wren_ic_native_3_inner, a0, a1, a2);
+
+// #[naked] wrappers capture x29 (JIT FP) as the last argument.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_native_0(_nfn: u64, _recv: u64) -> u64 {
+    core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_native_0_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_native_0(nfn: u64, recv: u64) -> u64 {
+    wren_ic_native_0_inner(nfn, recv, 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_native_1(_nfn: u64, _recv: u64, _a0: u64) -> u64 {
+    core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_native_1_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_native_1(nfn: u64, recv: u64, a0: u64) -> u64 {
+    wren_ic_native_1_inner(nfn, recv, a0, 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_native_2(_nfn: u64, _recv: u64, _a0: u64, _a1: u64) -> u64 {
+    core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_native_2_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_native_2(nfn: u64, recv: u64, a0: u64, a1: u64) -> u64 {
+    wren_ic_native_2_inner(nfn, recv, a0, a1, 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_native_3(
+    _nfn: u64, _recv: u64, _a0: u64, _a1: u64, _a2: u64,
+) -> u64 {
+    core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_native_3_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_native_3(nfn: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_ic_native_3_inner(nfn, recv, a0, a1, a2, 0)
 }
 
 /// Inline IC enter: set JitContext for a non-leaf JIT call (kind=6).
