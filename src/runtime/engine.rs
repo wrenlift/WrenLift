@@ -345,6 +345,8 @@ pub struct ExecutionEngine {
     pending_count: u32,
     /// Join handle for the current compilation thread (at most 1 at a time).
     compile_handle: Option<std::thread::JoinHandle<()>>,
+    /// Queue of functions awaiting compilation (when background thread is busy).
+    compile_queue: Vec<FuncId>,
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
@@ -421,6 +423,7 @@ impl ExecutionEngine {
             compiling_tier: Vec::new(),
             pending_count: 0,
             compile_handle: None,
+            compile_queue: Vec::new(),
             jit_code: Vec::new(),
             jit_leaf: Vec::new(),
             jit_metadata: Vec::new(),
@@ -1014,12 +1017,18 @@ impl ExecutionEngine {
         }
         if let Some(ref handle) = self.compile_handle {
             if !handle.is_finished() {
+                // Background thread busy — queue for later instead of dropping.
+                if !self.compile_queue.contains(&id) {
+                    self.compile_queue.push(id);
+                }
                 return;
             }
             if let Some(h) = self.compile_handle.take() {
                 let _ = h.join();
             }
         }
+        // Remove this function from the queue if it was queued.
+        self.compile_queue.retain(|&queued| queued != id);
         let Some(body) = self.functions.get(idx) else {
             return;
         };
