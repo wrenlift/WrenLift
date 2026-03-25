@@ -1782,6 +1782,24 @@ fn run_fiber_with_stop_depth(
                                 vm.engine.poll_compilations();
                             }
 
+                            // JIT dispatch for compiled constructors
+                            let fn_idx = target_func_id.0 as usize;
+                            let ctor_jit = vm
+                                .engine
+                                .jit_code
+                                .get(fn_idx)
+                                .copied()
+                                .unwrap_or(std::ptr::null());
+                            let is_ctor_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+                            if !ctor_jit.is_null() && argc <= 3 && is_ctor_leaf {
+                                let result = vm.call_constructor_sync(
+                                    recv_class, closure_ptr, &arg_vals[1..],
+                                );
+                                set_reg(&mut values, dst, result);
+                                steps += 1;
+                                continue;
+                            }
+
                             let target_bc_ptr =
                                 vm.engine.ensure_bytecode(target_func_id).ok_or_else(|| {
                                     RuntimeError::Error("invalid ctor func_id".into())
@@ -2670,7 +2688,12 @@ fn ensure_ctx_reg() {
 fn ensure_ctx_reg() {}
 
 /// Transmute and call a JIT function pointer with the given args (max 4).
-/// Sets x19 = JitContext pointer before the call (preserved by callee-saved ABI).
+/// Public wrapper for call_jit_fn (used by call_constructor_sync in vm.rs).
+pub unsafe fn call_jit_fn_pub(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    call_jit_fn(fn_ptr, args)
+}
+
+/// Sets x20 = JitContext pointer before the call (preserved by callee-saved ABI).
 #[inline(always)]
 unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
     ensure_ctx_reg();

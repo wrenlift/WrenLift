@@ -2268,7 +2268,7 @@ impl VM {
             (*fn_ptr).fn_id
         });
 
-        // Try JIT dispatch first: if the constructor body is compiled,
+        // Try JIT dispatch: if the constructor body is compiled,
         // call it directly with the new instance as `this`.
         let fn_idx = func_id.0 as usize;
         let jit_ptr = self
@@ -2277,6 +2277,36 @@ impl VM {
             .get(fn_idx)
             .copied()
             .unwrap_or(std::ptr::null());
+        let is_ctor_leaf = self.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+        if !jit_ptr.is_null() && ctor_args.len() <= 3 && is_ctor_leaf {
+            let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+            // JIT expects: [this, arg0, arg1, ...]
+            let mut jit_args = [Value::null(); 4];
+            jit_args[0] = live_instance;
+            for (i, arg) in ctor_args.iter().enumerate() {
+                jit_args[i + 1] = *arg;
+            }
+            let n = ctor_args.len() + 1;
+            let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = func_id.0 as u64;
+                ctx.closure = closure_ptr as *mut u8;
+                ctx.defining_class = class_ptr as *mut u8;
+            });
+            self.engine.note_native_entry(func_id);
+            // Use call_jit_fn which sets x20 (JitContext pointer).
+            // The constructor body's internal calls go through wren_call_N
+            // which registers the JIT frame for GC via #[naked] wrappers.
+            let _ = unsafe {
+                super::vm_interp::call_jit_fn_pub(jit_ptr, &jit_args[..n])
+            };
+            crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+            // Constructor returns the instance (possibly GC-forwarded)
+            let result = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return result;
+        }
+
         let mir = self.engine.get_mir(func_id);
         if mir.is_none() {
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);

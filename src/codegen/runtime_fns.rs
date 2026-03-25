@@ -482,8 +482,12 @@ fn try_dispatch_callsite_ic(
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return Some(Value::null().to_bits());
             }
-            vm.engine
-                .note_ic_hit(crate::runtime::engine::FuncId(ic.func_id as u32));
+            let func_id = crate::runtime::engine::FuncId(ic.func_id as u32);
+            maybe_request_next_tier(vm, func_id);
+            if vm.engine.has_pending_compilations() {
+                vm.engine.poll_compilations();
+            }
+            vm.engine.note_ic_hit(func_id);
             trace_jit_ic(|| format!("jit-ic: hit kind=3 func={}", ic.func_id));
             Some(
                 vm.call_constructor_sync(class_ptr, closure_ptr, &args[1..])
