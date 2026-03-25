@@ -2268,6 +2268,15 @@ impl VM {
             (*fn_ptr).fn_id
         });
 
+        // Try JIT dispatch first: if the constructor body is compiled,
+        // call it directly with the new instance as `this`.
+        let fn_idx = func_id.0 as usize;
+        let jit_ptr = self
+            .engine
+            .jit_code
+            .get(fn_idx)
+            .copied()
+            .unwrap_or(std::ptr::null());
         let mir = self.engine.get_mir(func_id);
         if mir.is_none() {
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);

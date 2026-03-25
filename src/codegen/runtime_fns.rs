@@ -152,7 +152,7 @@ fn current_jit_callsite_ic(
 
 /// Unified JIT dispatch. Shadow stores replaced by stack map GC root scanning.
 #[inline(always)]
-unsafe fn call_jit_with_shadow(
+pub unsafe fn call_jit_with_shadow(
     _vm: &crate::runtime::vm::VM,
     fn_ptr: *const u8,
     _func_id: crate::runtime::engine::FuncId,
