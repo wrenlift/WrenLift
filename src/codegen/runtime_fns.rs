@@ -293,13 +293,22 @@ fn populate_callsite_ic(
                 }
             }
         }
-        Method::Constructor(closure_ptr) => crate::mir::bytecode::CallSiteIC {
-            class: cache_key_class as usize,
-            jit_ptr: defining_class as *const u8,
-            closure: closure_ptr as *const u8,
-            func_id: unsafe { (*(*closure_ptr).function).fn_id as u64 },
-            kind: 3,
-        },
+        Method::Constructor(closure_ptr) => {
+            let fn_idx = unsafe { (*(*closure_ptr).function).fn_id } as usize;
+            let ctor_jit_ptr = vm
+                .engine
+                .jit_code
+                .get(fn_idx)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            crate::mir::bytecode::CallSiteIC {
+                class: cache_key_class as usize,
+                jit_ptr: ctor_jit_ptr,
+                closure: closure_ptr as *const u8,
+                func_id: fn_idx as u64,
+                kind: 3,
+            }
+        }
         Method::Native(native_fn) => crate::mir::bytecode::CallSiteIC {
             class: cache_key_class as usize,
             jit_ptr: std::ptr::null(),

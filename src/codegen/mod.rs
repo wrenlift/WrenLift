@@ -3099,6 +3099,10 @@ impl<'a> LowerCtx<'a> {
                 let user_args: Vec<VReg> = args.iter().map(|a| self.vreg_for(*a)).collect();
 
                 let done_label = self.mf.new_label();
+                if std::env::var_os("WLIFT_IC_DEBUG").is_some() {
+                    let has = self.callsite_ic_ptrs.as_ref().map(|p| p.len());
+                    eprintln!("IC lowering: func={} ic_idx={} ptrs={:?}", self.mf.name, ic_idx, has);
+                }
                 if let Some(ic_ptr) = self
                     .callsite_ic_ptrs
                     .as_ref()
@@ -3228,23 +3232,53 @@ impl<'a> LowerCtx<'a> {
                     self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind3 });
                     self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
                     {
-                        // Load closure from IC (constructor closure)
-                        let ctor_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: ctor_closure, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
-                        // Call wren_ic_ctor_N(class_val, closure_ptr, user_args...)
-                        let ctor_name = match args.len() {
-                            0 => "wren_ic_ctor_0",
-                            1 => "wren_ic_ctor_1",
-                            2 => "wren_ic_ctor_2",
-                            _ => "wren_ic_ctor_3",
-                        };
-                        let mut ctor_args = vec![r, ctor_closure];
-                        ctor_args.extend(user_args.iter().copied());
+                        // Load jit_ptr from IC — now stores the constructor's JIT code
+                        let ctor_jit = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: ctor_jit, mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR) });
+                        // If constructor isn't compiled, fall to slow path
+                        self.mf.emit(MachInst::JmpZero { src: ctor_jit, target: slow_label });
+
+                        // 1. Allocate instance: wren_alloc_instance(class) — ONE Rust call
+                        let instance = self.mf.new_gp();
                         self.mf.emit(MachInst::CallRuntime {
-                            name: ctor_name,
-                            args: ctor_args,
-                            ret: Some(dst),
+                            name: "wren_alloc_instance",
+                            args: vec![r],
+                            ret: Some(instance),
                         });
+
+                        // 2. Context swap via x20 (stores only, no Rust call)
+                        let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
+                        const CTX_OFFSET_FUNC_ID: i32 = 40;
+                        const CTX_OFFSET_CLOSURE: i32 = 48;
+
+                        let saved_func_id = self.mf.new_gp();
+                        let saved_closure = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                        self.mf.emit(MachInst::Ldr { dst: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        let ic_func_id = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: ic_func_id, mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID) });
+                        let ic_closure = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: ic_closure, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
+                        self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                        self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+
+                        // 3. Call constructor body DIRECTLY — no Rust dispatch chain
+                        // Args: [instance, user_args...]
+                        let mut ctor_call_args = Vec::with_capacity(user_args.len() + 1);
+                        ctor_call_args.push(instance);
+                        ctor_call_args.extend(user_args.iter().copied());
+                        self.mf.emit(MachInst::CallIndirectAbi {
+                            target: ctor_jit,
+                            args: ctor_call_args,
+                            ret: None, // ignore return — constructor returns this
+                        });
+
+                        // 4. Restore context
+                        self.mf.emit(MachInst::Str { src: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                        self.mf.emit(MachInst::Str { src: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+
+                        // Result = the allocated instance (constructor modifies it in place)
+                        self.mf.emit(MachInst::Mov { dst, src: instance });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
 

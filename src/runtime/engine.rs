@@ -1064,7 +1064,8 @@ impl ExecutionEngine {
         let callsite_ic_ptrs = self.callsite_ic_ptrs_for_compile(id);
 
         if tier_trace_enabled() {
-            eprintln!("tier-trace: queue {:?} FuncId({}) {}", tier, id.0, trace_name);
+            let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
+            eprintln!("tier-trace: queue {:?} FuncId({}) {} ic_ptrs={}", tier, id.0, trace_name, ic_count);
         }
 
         let compile_fn = move || {
