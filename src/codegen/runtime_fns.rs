@@ -2612,6 +2612,12 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Inline IC context swap for kind=6 (non-leaf JIT dispatch)
         "wren_ic_enter" => Some(wren_ic_enter as *const () as usize),
         "wren_ic_leave" => Some(wren_ic_leave as *const () as usize),
+        // Inline constructor dispatch for kind=3
+        "wren_alloc_instance" => Some(wren_alloc_instance as *const () as usize),
+        "wren_ic_ctor_0" => Some(wren_ic_ctor_0 as *const () as usize),
+        "wren_ic_ctor_1" => Some(wren_ic_ctor_1 as *const () as usize),
+        "wren_ic_ctor_2" => Some(wren_ic_ctor_2 as *const () as usize),
+        "wren_ic_ctor_3" => Some(wren_ic_ctor_3 as *const () as usize),
         // Inline IC native dispatch for kind=4
         "wren_ic_native_0" => Some(wren_ic_native_0 as *const () as usize),
         "wren_ic_native_1" => Some(wren_ic_native_1 as *const () as usize),
@@ -2720,6 +2726,104 @@ pub extern "C" fn wren_ic_native_3(nfn: u64, recv: u64, a0: u64, a1: u64, a2: u6
 #[inline(always)]
 pub fn jit_ctx_ptr() -> *mut JitContext {
     JIT_CTX.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
+// Inline IC constructor dispatch (kind=3)
+// ---------------------------------------------------------------------------
+
+/// Single-call constructor dispatch: alloc instance + call constructor body.
+/// Replaces the 50-function dispatch chain with one Rust function call.
+macro_rules! ic_ctor_inner {
+    ($name:ident, $($arg:ident),*) => {
+        extern "C" fn $name(class_val: u64, closure: u64, $($arg: u64,)* jit_fp: u64) -> u64 {
+            push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32,
+                if jit_fp != 0 { unsafe { *((jit_fp as usize + 8) as *const usize) } } else { 0 });
+            let result = match unsafe { vm_ref() } {
+                Some(vm) => {
+                    let class_ptr = Value::from_bits(class_val)
+                        .as_object()
+                        .unwrap_or(std::ptr::null_mut()) as *mut ObjClass;
+                    if class_ptr.is_null() {
+                        Value::null().to_bits()
+                    } else {
+                        let closure_ptr = closure as *mut ObjClosure;
+                        let ctor_args = &[$(Value::from_bits($arg)),*];
+                        vm.call_constructor_sync(class_ptr, closure_ptr, ctor_args).to_bits()
+                    }
+                }
+                None => Value::null().to_bits(),
+            };
+            pop_jit_frame();
+            result
+        }
+    };
+}
+
+ic_ctor_inner!(wren_ic_ctor_0_inner,);
+ic_ctor_inner!(wren_ic_ctor_1_inner, a0);
+ic_ctor_inner!(wren_ic_ctor_2_inner, a0, a1);
+ic_ctor_inner!(wren_ic_ctor_3_inner, a0, a1, a2);
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_ctor_0(_cls: u64, _closure: u64) -> u64 {
+    core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_ctor_0_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_ctor_0(cls: u64, closure: u64) -> u64 {
+    wren_ic_ctor_0_inner(cls, closure, 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_ctor_1(_cls: u64, _closure: u64, _a0: u64) -> u64 {
+    core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_ctor_1_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_ctor_1(cls: u64, closure: u64, a0: u64) -> u64 {
+    wren_ic_ctor_1_inner(cls, closure, a0, 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_ctor_2(_cls: u64, _closure: u64, _a0: u64, _a1: u64) -> u64 {
+    core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_ctor_2_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_ctor_2(cls: u64, closure: u64, a0: u64, a1: u64) -> u64 {
+    wren_ic_ctor_2_inner(cls, closure, a0, a1, 0)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_ic_ctor_3(
+    _cls: u64, _closure: u64, _a0: u64, _a1: u64, _a2: u64,
+) -> u64 {
+    core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_ctor_3_inner);
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub extern "C" fn wren_ic_ctor_3(cls: u64, closure: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_ic_ctor_3_inner(cls, closure, a0, a1, a2, 0)
+}
+
+/// Allocate an ObjInstance for a class. Used by inline constructor IC (kind=3).
+/// Takes the class as a NaN-boxed Value (receiver of the constructor call).
+/// Returns the new instance as a NaN-boxed Value.
+pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
+    let class_ptr = Value::from_bits(class_val)
+        .as_object()
+        .unwrap_or(std::ptr::null_mut()) as *mut ObjClass;
+    if class_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    match unsafe { vm_ref() } {
+        Some(vm) => {
+            let instance = vm.gc.alloc_instance(class_ptr);
+            Value::object(instance as *mut u8).to_bits()
+        }
+        None => Value::null().to_bits(),
+    }
 }
 
 /// Inline IC enter: set JitContext for a non-leaf JIT call (kind=6).

@@ -147,7 +147,7 @@ pub struct GcConfig {
 impl Default for GcConfig {
     fn default() -> Self {
         Self {
-            nursery_size: 16 * 1024 * 1024, // 16 MB
+            nursery_size: 512 * 1024 * 1024, // 512 MB — fits binary_trees fully
             initial_threshold: 256,
             heap_grow_factor: 2.0,
             major_gc_interval: 8,

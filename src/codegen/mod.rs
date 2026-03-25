@@ -3202,7 +3202,8 @@ impl<'a> LowerCtx<'a> {
                     let kind4 = self.mf.new_gp();
                     self.mf.emit(MachInst::LoadImm { dst: kind4, bits: 4 });
                     self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind4 });
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    let ctor_label = self.mf.new_label();
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: ctor_label });
                     {
                         let native_fn = self.mf.new_gp();
                         self.mf.emit(MachInst::Ldr { dst: native_fn, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
@@ -3215,6 +3216,35 @@ impl<'a> LowerCtx<'a> {
                         let mut native_args = vec![native_fn, r];
                         native_args.extend(user_args.iter().copied());
                         self.mf.emit(MachInst::CallRuntime { name: native_call_name, args: native_args, ret: Some(dst) });
+                    }
+                    self.mf.emit(MachInst::Jmp { target: done_label });
+
+                    // Kind=3: constructor — single-call dispatch via wren_ic_ctor_N
+                    // Allocates instance + calls constructor body, bypassing the
+                    // full dispatch chain (50 Rust function calls → 1).
+                    self.mf.emit(MachInst::DefLabel(ctor_label));
+                    let kind3 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: kind3, bits: 3 });
+                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind3 });
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    {
+                        // Load closure from IC (constructor closure)
+                        let ctor_closure = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: ctor_closure, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
+                        // Call wren_ic_ctor_N(class_val, closure_ptr, user_args...)
+                        let ctor_name = match args.len() {
+                            0 => "wren_ic_ctor_0",
+                            1 => "wren_ic_ctor_1",
+                            2 => "wren_ic_ctor_2",
+                            _ => "wren_ic_ctor_3",
+                        };
+                        let mut ctor_args = vec![r, ctor_closure];
+                        ctor_args.extend(user_args.iter().copied());
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: ctor_name,
+                            args: ctor_args,
+                            ret: Some(dst),
+                        });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
 
