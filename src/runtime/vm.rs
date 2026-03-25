@@ -1186,7 +1186,7 @@ impl VM {
         let mut found_roots = Vec::new();
         let mut slot_addrs = Vec::new();
 
-        for &(jit_fp, func_id) in crate::codegen::runtime_fns::jit_frame_entries() {
+        for &(jit_fp, func_id, ret_addr) in crate::codegen::runtime_fns::jit_frame_entries() {
             if jit_fp == 0 {
                 continue;
             }
@@ -1197,25 +1197,36 @@ impl VM {
                 .and_then(|m| m.as_ref());
             let Some(meta) = meta else { continue };
 
-            // Conservative: gather all unique spill slots from all safepoints.
-            // Since force_boxed_gp_spills ensures boxed values are always in
-            // the same spill slots, this is correct regardless of which
-            // safepoint is currently active.
-            let mut seen_offsets: Vec<i32> = Vec::new();
-            for sp in &meta.safepoints {
-                for root in &sp.live_roots {
-                    if let RootLocation::Spill(spill_offset) = root.location {
-                        if !seen_offsets.contains(&spill_offset) {
-                            seen_offsets.push(spill_offset);
-                            let addr = (jit_fp as isize + spill_offset as isize) as *mut u64;
-                            let bits = unsafe { *addr };
-                            let val = Value::from_bits(bits);
-                            // Only root values that look like object pointers.
-                            if val.is_object() {
-                                found_roots.push(val);
-                                slot_addrs.push(addr);
-                            }
-                        }
+            // Find the code range for this function to compute the safepoint offset.
+            let code_range = self.engine.code_ranges.iter().find(|r| {
+                r.func_id == crate::runtime::engine::FuncId(func_id)
+            });
+
+            // Precise safepoint scanning: use the return address to find the
+            // ACTIVE safepoint, then only scan roots that are live at that point.
+            // Falls back to conservative (all safepoints) if no match found.
+            let active_safepoint = code_range.and_then(|cr| {
+                let offset = ret_addr.wrapping_sub(cr.start) as u32;
+                meta.safepoints.iter().find(|sp| sp.code_offset == offset)
+            });
+
+            let roots_to_scan: &[crate::codegen::native_meta::LiveRootMetadata] =
+                if let Some(sp) = active_safepoint {
+                    &sp.live_roots
+                } else {
+                    // No precise match — skip (don't conservatively scan,
+                    // which would corrupt non-object spill slots).
+                    continue;
+                };
+
+            for root in roots_to_scan {
+                if let RootLocation::Spill(spill_offset) = root.location {
+                    let addr = (jit_fp as isize + spill_offset as isize) as *mut u64;
+                    let bits = unsafe { *addr };
+                    let val = Value::from_bits(bits);
+                    if val.is_object() {
+                        found_roots.push(val);
+                        slot_addrs.push(addr);
                     }
                 }
             }

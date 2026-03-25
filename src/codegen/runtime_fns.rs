@@ -32,18 +32,18 @@ struct FlatShadowStack {
 static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
 
 /// Stack of active JIT frames for GC stack walking.
-/// Each JIT entry pushes (frame_pointer, func_id). GC uses this list
-/// instead of the native frame chain (which breaks across Rust→JIT boundaries).
-static mut JIT_FRAME_STACK: [(usize, u32); 64] = [(0, 0); 64];
+/// Each entry: (frame_pointer, func_id, return_address).
+/// The return_address identifies the active safepoint for precise root scanning.
+static mut JIT_FRAME_STACK: [(usize, u32, usize); 64] = [(0, 0, 0); 64];
 static mut JIT_FRAME_COUNT: u32 = 0;
 
 /// Push a JIT frame for GC visibility.
 #[inline(always)]
-pub fn push_jit_frame(fp: usize, func_id: u32) {
+pub fn push_jit_frame(fp: usize, func_id: u32, ret_addr: usize) {
     unsafe {
         let idx = JIT_FRAME_COUNT as usize;
         if idx < 64 {
-            *JIT_FRAME_STACK.get_unchecked_mut(idx) = (fp, func_id);
+            *JIT_FRAME_STACK.get_unchecked_mut(idx) = (fp, func_id, ret_addr);
             JIT_FRAME_COUNT += 1;
         }
     }
@@ -59,8 +59,8 @@ pub fn pop_jit_frame() {
     }
 }
 
-/// Get all active JIT frames (fp, func_id) for GC stack walking.
-pub fn jit_frame_entries() -> &'static [(usize, u32)] {
+/// Get all active JIT frames (fp, func_id, ret_addr) for GC stack walking.
+pub fn jit_frame_entries() -> &'static [(usize, u32, usize)] {
     unsafe { &JIT_FRAME_STACK[..JIT_FRAME_COUNT as usize] }
 }
 
@@ -1542,16 +1542,17 @@ fn dispatch_method(
 pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
     core::arch::naked_asm!(
         "mov x2, x29",       // pass JIT FP as 3rd arg
+        "mov x3, x30",       // pass return address as 4th arg
         "b {inner}",
         inner = sym wren_call_0_inner,
     );
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
-    wren_call_0_inner(receiver, method, 0)
+    wren_call_0_inner(receiver, method, 0, 0)
 }
-extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
+extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32, ret_addr as usize);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv]);
     pop_jit_frame();
@@ -1563,16 +1564,17 @@ extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64) -> u64 
 pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!(
         "mov x3, x29",
+        "mov x4, x30",
         "b {inner}",
         inner = sym wren_call_1_inner,
     );
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
-    wren_call_1_inner(receiver, method, a0, 0)
+    wren_call_1_inner(receiver, method, a0, 0, 0)
 }
-extern "C" fn wren_call_1_inner(receiver: u64, method: u64, a0: u64, jit_fp: u64) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
+extern "C" fn wren_call_1_inner(receiver: u64, method: u64, a0: u64, jit_fp: u64, ret_addr: u64) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32, ret_addr as usize);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0)]);
     pop_jit_frame();
@@ -1584,16 +1586,17 @@ extern "C" fn wren_call_1_inner(receiver: u64, method: u64, a0: u64, jit_fp: u64
 pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!(
         "mov x4, x29",
+        "mov x5, x30",
         "b {inner}",
         inner = sym wren_call_2_inner,
     );
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
-    wren_call_2_inner(receiver, method, a0, a1, 0)
+    wren_call_2_inner(receiver, method, a0, a1, 0, 0)
 }
-extern "C" fn wren_call_2_inner(receiver: u64, method: u64, a0: u64, a1: u64, jit_fp: u64) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
+extern "C" fn wren_call_2_inner(receiver: u64, method: u64, a0: u64, a1: u64, jit_fp: u64, ret_addr: u64) -> u64 {
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32, ret_addr as usize);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0), Value::from_bits(a1)]);
     pop_jit_frame();
@@ -1607,18 +1610,19 @@ pub unsafe extern "C" fn wren_call_3(
 ) -> u64 {
     core::arch::naked_asm!(
         "mov x5, x29",
+        "mov x6, x30",
         "b {inner}",
         inner = sym wren_call_3_inner,
     );
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    wren_call_3_inner(receiver, method, a0, a1, a2, 0)
+    wren_call_3_inner(receiver, method, a0, a1, a2, 0, 0)
 }
 extern "C" fn wren_call_3_inner(
-    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, jit_fp: u64,
+    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, jit_fp: u64, ret_addr: u64,
 ) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32, ret_addr as usize);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(
         recv, method,
@@ -1635,6 +1639,7 @@ pub unsafe extern "C" fn wren_call_4(
 ) -> u64 {
     core::arch::naked_asm!(
         "mov x6, x29",
+        "mov x7, x30",
         "b {inner}",
         inner = sym wren_call_4_inner,
     );
@@ -1643,12 +1648,12 @@ pub unsafe extern "C" fn wren_call_4(
 pub extern "C" fn wren_call_4(
     receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64,
 ) -> u64 {
-    wren_call_4_inner(receiver, method, a0, a1, a2, a3, 0)
+    wren_call_4_inner(receiver, method, a0, a1, a2, a3, 0, 0)
 }
 extern "C" fn wren_call_4_inner(
-    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64, jit_fp: u64,
+    receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64, jit_fp: u64, ret_addr: u64,
 ) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32, ret_addr as usize);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(
         recv, method,
@@ -2617,9 +2622,15 @@ pub fn resolve(name: &str) -> Option<usize> {
 }
 
 /// Register a JIT function's frame pointer for GC stack walking.
-/// Called from JIT prologue with x29 (FP) and func_id as arguments.
+/// Called from JIT prologue with FP, func_id, and return address.
 pub extern "C" fn wren_jit_frame_push(fp: u64, func_id: u64) {
-    push_jit_frame(fp as usize, func_id as u32);
+    // Return address is at [fp + 8] (saved LR in the JIT frame).
+    let ret_addr = if fp != 0 {
+        unsafe { *((fp as usize + 8) as *const usize) }
+    } else {
+        0
+    };
+    push_jit_frame(fp as usize, func_id as u32, ret_addr);
 }
 
 /// Unregister a JIT function's frame pointer.
@@ -2638,7 +2649,11 @@ pub extern "C" fn wren_jit_frame_pop() {
 macro_rules! ic_native_inner {
     ($name:ident, $($arg:ident),*) => {
         extern "C" fn $name(native_fn: u64, recv: u64, $($arg: u64,)* jit_fp: u64) -> u64 {
-            push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
+            // Read return address from the JIT frame for precise safepoint scanning.
+            let ret_addr = if jit_fp != 0 {
+                unsafe { *((jit_fp as usize + 8) as *const usize) }
+            } else { 0 };
+            push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32, ret_addr);
             let result = match unsafe { vm_ref() } {
                 Some(vm) => {
                     let f: crate::runtime::object::NativeFn = unsafe { std::mem::transmute(native_fn) };
