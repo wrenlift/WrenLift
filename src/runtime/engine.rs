@@ -605,6 +605,26 @@ impl ExecutionEngine {
     ///
     /// This must run after moving GC because cached class/closure pointers
     /// may have been relocated.
+    /// Invalidate IC entries that reference a specific function.
+    /// Called after recompilation so stale jit_ptr/closure entries get refreshed.
+    fn invalidate_ic_entries_for(&mut self, target: FuncId) {
+        let target_id = target.0 as u64;
+        for body in &self.functions {
+            let bytecode = match body {
+                FuncBody::Interpreted { bytecode, .. } | FuncBody::Native { bytecode, .. } => {
+                    bytecode.as_ref()
+                }
+            };
+            let Some(bytecode) = bytecode else { continue };
+            let ic_table = unsafe { &mut *bytecode.ic_table.get() };
+            for entry in ic_table.iter_mut() {
+                if entry.func_id == target_id {
+                    *entry = CallSiteIC::default();
+                }
+            }
+        }
+    }
+
     pub fn invalidate_inline_caches(&mut self) {
         for body in &self.functions {
             let bytecode = match body {
@@ -894,7 +914,10 @@ impl ExecutionEngine {
                 }
             }
         }
-        self.invalidate_inline_caches();
+        // Selective IC invalidation: only clear IC entries that reference
+        // the recompiled function. This allows other functions' ICs (including
+        // recursive constructor call sites) to remain populated.
+        self.invalidate_ic_entries_for(FuncId(idx as u32));
         if self.collect_tier_stats {
             if let Some(stats) = self.tier_stats.get_mut(idx) {
                 stats.compile_successes += 1;
