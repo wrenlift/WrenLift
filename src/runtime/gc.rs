@@ -29,6 +29,81 @@ const FORWARDED: u8 = 3;
 // Nursery — bump-allocated arena
 // ---------------------------------------------------------------------------
 
+/// Chunk-based bump allocator for old-gen objects.
+/// Each chunk is a separately heap-allocated block. Pointers to objects
+/// in earlier chunks remain valid when new chunks are added.
+pub struct OldArena {
+    chunks: Vec<Vec<u8>>,
+    alloc_ptr: usize,
+    chunk_size: usize,
+}
+
+impl OldArena {
+    pub fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            alloc_ptr: 0,
+            chunk_size: 256 * 1024, // 256 KB initial chunk
+        }
+    }
+
+    pub fn alloc<T>(&mut self, val: T) -> *mut T {
+        let align = std::mem::align_of::<T>();
+        let size = std::mem::size_of::<T>();
+
+        if let Some(ptr) = self.try_alloc_current::<T>(align, size) {
+            unsafe { std::ptr::write(ptr, val) };
+            return ptr;
+        }
+
+        // Current chunk full — add a new one.
+        let needed = (size + align).max(self.chunk_size);
+        self.chunk_size = (self.chunk_size * 2).min(4 * 1024 * 1024); // grow up to 4 MB
+        self.chunks.push(vec![0u8; needed]);
+        self.alloc_ptr = 0;
+
+        let ptr = self.try_alloc_current::<T>(align, size).unwrap();
+        unsafe { std::ptr::write(ptr, val) };
+        ptr
+    }
+
+    fn try_alloc_current<T>(&mut self, align: usize, size: usize) -> Option<*mut T> {
+        let chunk = self.chunks.last_mut()?;
+        let aligned = (self.alloc_ptr + align - 1) & !(align - 1);
+        if aligned + size > chunk.len() {
+            return None;
+        }
+        let ptr = unsafe { chunk.as_mut_ptr().add(aligned) as *mut T };
+        self.alloc_ptr = aligned + size;
+        Some(ptr)
+    }
+
+    /// Allocate raw bytes (for instance fields).
+    pub fn alloc_bytes(&mut self, size: usize, align: usize) -> *mut u8 {
+        if let Some(chunk) = self.chunks.last_mut() {
+            let aligned = (self.alloc_ptr + align - 1) & !(align - 1);
+            if aligned + size <= chunk.len() {
+                let ptr = unsafe { chunk.as_mut_ptr().add(aligned) };
+                self.alloc_ptr = aligned + size;
+                return ptr;
+            }
+        }
+        let needed = size.max(self.chunk_size);
+        self.chunks.push(vec![0u8; needed]);
+        self.alloc_ptr = 0;
+        let chunk = self.chunks.last_mut().unwrap();
+        let ptr = chunk.as_mut_ptr();
+        self.alloc_ptr = size;
+        ptr
+    }
+
+    fn reset(&mut self) {
+        self.chunks.clear();
+        self.alloc_ptr = 0;
+        self.chunk_size = 256 * 1024;
+    }
+}
+
 struct Nursery {
     buffer: Vec<u8>,
     alloc_ptr: usize,
@@ -186,6 +261,8 @@ pub struct Gc {
     /// Head of old generation intrusive linked list.
     old_objects: *mut ObjHeader,
     old_count: usize,
+    /// Arena bump allocator for old-gen objects (replaces per-object Box::new).
+    old_arena: OldArena,
 
     /// Old objects that had a young value written into them.
     remembered_set: Vec<*mut ObjHeader>,
@@ -217,6 +294,7 @@ impl Gc {
             nursery: Nursery::new(nursery_size),
             nursery_objects: Vec::new(),
             old_objects: std::ptr::null_mut(),
+            old_arena: OldArena::new(),
             old_count: 0,
             remembered_set: Vec::new(),
             intern_table: HashMap::new(),
@@ -448,7 +526,7 @@ impl Gc {
                 .try_alloc(ObjInstance::new_with_fields(
                     class,
                     num_fields as u32,
-                    std::ptr::null_mut(), // fields set below
+                    std::ptr::null_mut(),
                 ))
                 .unwrap();
             self.nursery_objects.push(inst_ptr as *mut ObjHeader);
@@ -466,7 +544,7 @@ impl Gc {
             return inst_ptr;
         }
 
-        // Slow path: heap-allocate (old gen).
+        // Slow path: allocate in old-gen arena.
         self.alloc_old(ObjInstance::new(class))
     }
 
@@ -495,10 +573,10 @@ impl Gc {
         self.alloc_old(obj)
     }
 
-    /// Allocate directly in old gen (Box). Used for overflow and promotion.
+    /// Allocate directly in old gen (arena bump). Used for overflow and promotion.
     fn alloc_old<T>(&mut self, obj: T) -> *mut T {
         let size = std::mem::size_of::<T>();
-        let ptr = Box::into_raw(Box::new(obj));
+        let ptr = self.old_arena.alloc(obj);
         let header = ptr as *mut ObjHeader;
         unsafe {
             (*header).generation = GEN_OLD;
@@ -723,17 +801,20 @@ impl Gc {
             }
         }
 
-        // Fix ObjInstance: if fields were nursery-allocated, copy to heap.
+        // Fix ObjInstance: if fields were nursery-allocated, copy to arena.
         if (*old_header).obj_type == ObjType::Instance {
             let new_inst = new_header as *mut ObjInstance;
             let nf = (*new_inst).num_fields as usize;
             if nf > 0 && !(*new_inst).fields_owned {
                 let old_fields = (*new_inst).fields;
-                let layout = std::alloc::Layout::array::<Value>(nf).unwrap();
-                let new_fields = std::alloc::alloc(layout) as *mut Value;
+                let new_fields = self.old_arena.alloc_bytes(
+                    nf * std::mem::size_of::<Value>(),
+                    std::mem::align_of::<Value>(),
+                ) as *mut Value;
                 std::ptr::copy_nonoverlapping(old_fields, new_fields, nf);
                 (*new_inst).fields = new_fields;
-                (*new_inst).fields_owned = true;
+                // Don't set fields_owned = true — arena handles the memory.
+                // The fields ptr is valid as long as the arena lives.
             }
         }
 
@@ -743,7 +824,7 @@ impl Gc {
     /// Read an object out of the nursery arena and Box it in old gen.
     unsafe fn promote_typed<T>(&mut self, old_header: *mut ObjHeader) -> *mut ObjHeader {
         let obj: T = std::ptr::read(old_header as *const T);
-        let new_ptr = Box::into_raw(Box::new(obj));
+        let new_ptr = self.old_arena.alloc(obj);
         let header = new_ptr as *mut ObjHeader;
         (*header).generation = GEN_OLD;
         (*header).gc_mark = BLACK; // survive subsequent sweep_old
@@ -1329,39 +1410,43 @@ unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
 
 /// Reconstruct Box and drop (for old-gen objects only).
 unsafe fn drop_object(header: *mut ObjHeader) {
+    // Use drop_in_place instead of Box::from_raw — old-gen objects may be
+    // arena-allocated (not individually heap-allocated). drop_in_place
+    // calls the destructor (freeing internal Vecs, Strings, etc.) without
+    // trying to free the object's memory itself.
     match (*header).obj_type {
         ObjType::String => {
-            let _ = Box::from_raw(header as *mut ObjString);
+            std::ptr::drop_in_place(header as *mut ObjString);
         }
         ObjType::List => {
-            let _ = Box::from_raw(header as *mut ObjList);
+            std::ptr::drop_in_place(header as *mut ObjList);
         }
         ObjType::Map => {
-            let _ = Box::from_raw(header as *mut ObjMap);
+            std::ptr::drop_in_place(header as *mut ObjMap);
         }
         ObjType::Range => {
-            let _ = Box::from_raw(header as *mut ObjRange);
+            std::ptr::drop_in_place(header as *mut ObjRange);
         }
         ObjType::Fn => {
-            let _ = Box::from_raw(header as *mut ObjFn);
+            std::ptr::drop_in_place(header as *mut ObjFn);
         }
         ObjType::Closure => {
-            let _ = Box::from_raw(header as *mut ObjClosure);
+            std::ptr::drop_in_place(header as *mut ObjClosure);
         }
         ObjType::Upvalue => {
-            let _ = Box::from_raw(header as *mut ObjUpvalue);
+            std::ptr::drop_in_place(header as *mut ObjUpvalue);
         }
         ObjType::Fiber => {
-            let _ = Box::from_raw(header as *mut ObjFiber);
+            std::ptr::drop_in_place(header as *mut ObjFiber);
         }
         ObjType::Class => {
-            let _ = Box::from_raw(header as *mut ObjClass);
+            std::ptr::drop_in_place(header as *mut ObjClass);
         }
         ObjType::Instance => {
-            let _ = Box::from_raw(header as *mut ObjInstance);
+            std::ptr::drop_in_place(header as *mut ObjInstance);
         }
         ObjType::Foreign => {
-            let _ = Box::from_raw(header as *mut ObjForeign);
+            std::ptr::drop_in_place(header as *mut ObjForeign);
         }
         ObjType::Module => {
             let _ = Box::from_raw(header as *mut ObjModule);

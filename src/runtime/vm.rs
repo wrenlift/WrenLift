@@ -108,7 +108,7 @@ impl Default for VMConfig {
             fiber_stack_traces: false,
             step_limit: 1_000_000_000,
             max_call_depth: 1024,
-            gc_strategy: GcStrategy::Generational,
+            gc_strategy: GcStrategy::MarkSweep,
         }
     }
 }
