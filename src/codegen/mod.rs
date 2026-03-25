@@ -112,6 +112,8 @@ pub(crate) const ABI_ARG_SENTINELS: [u32; 6] = [
 ];
 pub(crate) const CALL_SCRATCH_SENTINEL: u32 = u32::MAX - 9;
 pub(crate) const COPY_SCRATCH_SENTINEL: u32 = u32::MAX - 10;
+/// Sentinel for x19 (JitContext pointer, aarch64 only).
+pub(crate) const CTX_PTR_SENTINEL: u32 = u32::MAX - 11;
 
 // ---------------------------------------------------------------------------
 // Labels
@@ -2172,6 +2174,8 @@ fn fixup_vreg_sentinels(
                 v.index = call_scratch;
             } else if v.index == COPY_SCRATCH_SENTINEL {
                 v.index = copy_scratch;
+            } else if v.index == CTX_PTR_SENTINEL {
+                v.index = 20; // x20 = JitContext pointer (aarch64)
             }
         }
     };
@@ -2445,9 +2449,13 @@ fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
     };
 
     // Scan all instructions for GP registers that are in the callee-saved set.
-    // Build set of callee-saved hw_enc values for fast lookup.
-    let cs_set: std::collections::BTreeSet<u32> =
-        callee_saved.iter().map(|r| r.hw_enc as u32).collect();
+    // Exclude x20 on aarch64 — it's reserved for the JitContext pointer and
+    // preserved by convention (callee-saved), not by push/pop.
+    let cs_set: std::collections::BTreeSet<u32> = callee_saved
+        .iter()
+        .filter(|r| !(target == Target::Aarch64 && r.hw_enc == 20))
+        .map(|r| r.hw_enc as u32)
+        .collect();
 
     let mut used_callee_saved = std::collections::BTreeSet::new();
     for inst in &mach.insts {
@@ -3217,7 +3225,20 @@ impl<'a> LowerCtx<'a> {
                             target: native_label,
                         });
 
-                        // Load func_id and closure from IC for context setup
+                        // x19 = JitContext pointer (set at JIT entry, callee-saved).
+                        // Inline context swap: save/restore current_func_id and closure
+                        // via direct loads/stores through x19 — no TLS access.
+                        let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
+                        const CTX_OFFSET_FUNC_ID: i32 = 40;
+                        const CTX_OFFSET_CLOSURE: i32 = 48;
+
+                        // Save current_func_id
+                        let saved_func_id = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr {
+                            dst: saved_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        // Load func_id and closure from IC
                         let ic_func_id = self.mf.new_gp();
                         self.mf.emit(MachInst::Ldr {
                             dst: ic_func_id,
@@ -3228,13 +3249,14 @@ impl<'a> LowerCtx<'a> {
                             dst: ic_closure,
                             mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
                         });
-
-                        // wren_ic_enter(func_id, closure) → saved_func_id
-                        let saved_ctx = self.mf.new_gp();
-                        self.mf.emit(MachInst::CallRuntime {
-                            name: "wren_ic_enter",
-                            args: vec![ic_func_id, ic_closure],
-                            ret: Some(saved_ctx),
+                        // Write new func_id and closure to JitContext
+                        self.mf.emit(MachInst::Str {
+                            src: ic_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: ic_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
                         });
 
                         // Direct call to JIT function
@@ -3249,11 +3271,10 @@ impl<'a> LowerCtx<'a> {
                             ret: Some(dst),
                         });
 
-                        // wren_ic_leave(saved_func_id)
-                        self.mf.emit(MachInst::CallRuntime {
-                            name: "wren_ic_leave",
-                            args: vec![saved_ctx],
-                            ret: None,
+                        // Restore current_func_id
+                        self.mf.emit(MachInst::Str {
+                            src: saved_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
                         });
                         self.mf.emit(MachInst::Jmp { target: done_label });
 

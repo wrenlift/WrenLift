@@ -195,7 +195,7 @@ fn try_run_root_frame_native(
         vm: vm_ptr,
         module_name: mod_name_bytes.as_ptr(),
         module_name_len: mod_name_bytes.len() as u32,
-        current_func_id: func_id.0,
+        current_func_id: func_id.0 as u64,
         closure: std::ptr::null_mut(),
         defining_class: std::ptr::null_mut(),
     });
@@ -1411,6 +1411,7 @@ fn run_fiber_with_stop_depth(
                                 } else {
                                     let recv_bits = recv_val.to_bits();
                                     vm.engine.note_ic_hit(func_id);
+                                    ensure_ctx_reg();
                                     let result_bits = unsafe {
                                         match argc {
                                             0 => {
@@ -1607,6 +1608,7 @@ fn run_fiber_with_stop_depth(
                                             kind: 1, // JIT leaf
                                         };
                                     }
+                                    ensure_ctx_reg();
                                     let recv_bits = recv_val.to_bits();
                                     let result_bits = unsafe {
                                         match argc {
@@ -2504,7 +2506,7 @@ fn dispatch_closure_bc(
                         vm: vm_ptr,
                         module_name: mod_name_bytes.as_ptr(),
                         module_name_len: mod_name_bytes.len() as u32,
-                        current_func_id: target_func_id.0,
+                        current_func_id: target_func_id.0 as u64,
                         closure: closure_ptr as *mut u8,
                         defining_class: defining_class
                             .map(|p| p as *mut u8)
@@ -2648,9 +2650,30 @@ fn dispatch_closure_bc(
     Ok(())
 }
 
+/// Set x19 = JitContext pointer for JIT code (aarch64 only).
+/// Must be called before any JIT function entry.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn ensure_ctx_reg() {
+    let ctx_ptr = crate::codegen::runtime_fns::jit_ctx_ptr() as u64;
+    unsafe {
+        core::arch::asm!(
+            "mov x20, {ctx}",
+            ctx = in(reg) ctx_ptr,
+            lateout("x20") _,
+            options(nostack, nomem),
+        );
+    }
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn ensure_ctx_reg() {}
+
 /// Transmute and call a JIT function pointer with the given args (max 4).
+/// Sets x19 = JitContext pointer before the call (preserved by callee-saved ABI).
 #[inline(always)]
 unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    ensure_ctx_reg();
     match args.len() {
         0 => {
             let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);

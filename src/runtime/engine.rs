@@ -1439,7 +1439,7 @@ mod tests {
                 vm: dummy_vm.as_mut_ptr(),
                 module_name: std::ptr::null(),
                 module_name_len: 0,
-                current_func_id: u32::MAX,
+                current_func_id: u32::MAX as u64,
                 closure: std::ptr::null_mut(),
                 defining_class: std::ptr::null_mut(),
             });

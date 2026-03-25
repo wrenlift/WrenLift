@@ -120,8 +120,8 @@ fn current_jit_callsite_ic(
     ic_idx: usize,
 ) -> Option<*mut crate::mir::bytecode::CallSiteIC> {
     let ctx = read_jit_ctx();
-    let func_id = if ctx.current_func_id != u32::MAX {
-        crate::runtime::engine::FuncId(ctx.current_func_id)
+    let func_id = if ctx.current_func_id != u32::MAX as u64 {
+        crate::runtime::engine::FuncId(ctx.current_func_id as u32)
     } else {
         let closure_ptr = ctx.closure as *mut ObjClosure;
         if closure_ptr.is_null() {
@@ -163,6 +163,17 @@ unsafe fn call_jit_with_shadow(
 
 #[inline(always)]
 unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    // Ensure x19 holds JitContext pointer for the JIT code.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ctx_ptr = jit_ctx_ptr() as u64;
+        core::arch::asm!(
+            "mov x20, {ctx}",
+            ctx = in(reg) ctx_ptr,
+            lateout("x20") _,
+            options(nostack, nomem),
+        );
+    }
     match args.len() {
         0 => {
             let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
@@ -532,7 +543,7 @@ fn try_dispatch_callsite_ic(
             let saved_func_id = JIT_CTX.with(|c| unsafe {
                 let ctx = &mut *c.get();
                 let old = ctx.current_func_id;
-                ctx.current_func_id = fn_idx as u32;
+                ctx.current_func_id = fn_idx as u64;
                 ctx.closure = ic.closure as *mut u8;
                 old
             });
@@ -568,7 +579,8 @@ pub struct JitContext {
     /// Module name length.
     pub module_name_len: u32,
     /// Currently executing function id, used to find per-function call-site ICs.
-    pub current_func_id: u32,
+    /// Widened to u64 for clean 8-byte aligned access from JIT code via x19.
+    pub current_func_id: u64,
     /// Current closure pointer (for upvalue access from JIT-compiled closure bodies).
     pub closure: *mut u8,
     /// The class that defines the current method (for static field access).
@@ -585,7 +597,7 @@ impl Default for JitContext {
             vm: std::ptr::null_mut(),
             module_name: std::ptr::null(),
             module_name_len: 0,
-            current_func_id: u32::MAX,
+            current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         }
@@ -608,7 +620,7 @@ thread_local! {
         vm: std::ptr::null_mut(),
         module_name: std::ptr::null(),
         module_name_len: 0,
-        current_func_id: u32::MAX,
+        current_func_id: u32::MAX as u64,
         closure: std::ptr::null_mut(),
         defining_class: std::ptr::null_mut(),
     }) };
@@ -1209,7 +1221,7 @@ pub fn call_closure_jit_or_sync(
 
     // Update context for the callee: set closure and defining_class.
     mutate_jit_ctx(|ctx| {
-        ctx.current_func_id = unsafe { (*(*closure_ptr).function).fn_id };
+        ctx.current_func_id = unsafe { (*(*closure_ptr).function).fn_id } as u64;
         ctx.closure = closure_ptr as *mut u8;
         ctx.defining_class = defining_class
             .map(|p| p as *mut u8)
@@ -1452,7 +1464,7 @@ fn dispatch_method(
                     let depth = jit_depth();
                     if depth < MAX_JIT_DEPTH {
                         mutate_jit_ctx(|ctx| {
-                            ctx.current_func_id = unsafe { (*(*cp).function).fn_id };
+                            ctx.current_func_id = unsafe { (*(*cp).function).fn_id } as u64;
                             ctx.closure = cp as *mut u8;
                             ctx.defining_class = defining_class
                                 .map(|p| p as *mut u8)
@@ -1525,7 +1537,7 @@ pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0)
 }
 extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv]);
     pop_jit_frame();
@@ -1546,7 +1558,7 @@ pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
     wren_call_1_inner(receiver, method, a0, 0)
 }
 extern "C" fn wren_call_1_inner(receiver: u64, method: u64, a0: u64, jit_fp: u64) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0)]);
     pop_jit_frame();
@@ -1567,7 +1579,7 @@ pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u
     wren_call_2_inner(receiver, method, a0, a1, 0)
 }
 extern "C" fn wren_call_2_inner(receiver: u64, method: u64, a0: u64, a1: u64, jit_fp: u64) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0), Value::from_bits(a1)]);
     pop_jit_frame();
@@ -1592,7 +1604,7 @@ pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: 
 extern "C" fn wren_call_3_inner(
     receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, jit_fp: u64,
 ) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(
         recv, method,
@@ -1622,7 +1634,7 @@ pub extern "C" fn wren_call_4(
 extern "C" fn wren_call_4_inner(
     receiver: u64, method: u64, a0: u64, a1: u64, a2: u64, a3: u64, jit_fp: u64,
 ) -> u64 {
-    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+    push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
     let recv = Value::from_bits(receiver);
     let result = dispatch_call(
         recv, method,
@@ -2612,7 +2624,7 @@ pub extern "C" fn wren_jit_frame_pop() {
 macro_rules! ic_native_inner {
     ($name:ident, $($arg:ident),*) => {
         extern "C" fn $name(native_fn: u64, recv: u64, $($arg: u64,)* jit_fp: u64) -> u64 {
-            push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id);
+            push_jit_frame(jit_fp as usize, read_jit_ctx().current_func_id as u32);
             let result = match unsafe { vm_ref() } {
                 Some(vm) => {
                     let f: crate::runtime::object::NativeFn = unsafe { std::mem::transmute(native_fn) };
@@ -2674,6 +2686,13 @@ pub extern "C" fn wren_ic_native_3(nfn: u64, recv: u64, a0: u64, a1: u64, a2: u6
     wren_ic_native_3_inner(nfn, recv, a0, a1, a2, 0)
 }
 
+/// Get the stable address of the thread-local JitContext.
+/// Used to set x19 at interpreter→JIT entry points.
+#[inline(always)]
+pub fn jit_ctx_ptr() -> *mut JitContext {
+    JIT_CTX.with(|c| c.get())
+}
+
 /// Inline IC enter: set JitContext for a non-leaf JIT call (kind=6).
 /// Saves current_func_id, sets new func_id + closure. Returns saved_func_id.
 /// Skips depth tracking — native stack overflow is the backstop for infinite recursion.
@@ -2681,7 +2700,7 @@ pub extern "C" fn wren_ic_enter(func_id: u64, closure: u64) -> u64 {
     JIT_CTX.with(|c| unsafe {
         let ctx = &mut *c.get();
         let saved = ctx.current_func_id;
-        ctx.current_func_id = func_id as u32;
+        ctx.current_func_id = func_id as u64;
         ctx.closure = closure as *mut u8;
         saved as u64
     })
@@ -2690,7 +2709,7 @@ pub extern "C" fn wren_ic_enter(func_id: u64, closure: u64) -> u64 {
 /// Inline IC leave: restore current_func_id after a non-leaf JIT call.
 pub extern "C" fn wren_ic_leave(saved_func_id: u64) {
     JIT_CTX.with(|c| unsafe {
-        (*c.get()).current_func_id = saved_func_id as u32;
+        (*c.get()).current_func_id = saved_func_id;
     });
 }
 
@@ -3222,7 +3241,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
-            current_func_id: u32::MAX,
+            current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         });
@@ -3247,7 +3266,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
-            current_func_id: u32::MAX,
+            current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         });
@@ -3279,7 +3298,7 @@ mod tests {
             vm: dummy_vm.as_mut_ptr(),
             module_name: std::ptr::null(),
             module_name_len: 0,
-            current_func_id: u32::MAX,
+            current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
         });

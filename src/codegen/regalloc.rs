@@ -9,7 +9,7 @@
 /// 5. Rewrite all VRegs to assigned PhysRegs, inserting spill/reload as needed
 use super::{
     MachFunc, MachInst, Mem, PhysReg, RegClass, VReg, ABI_RET_SENTINEL, CALL_SCRATCH_SENTINEL,
-    COPY_SCRATCH_SENTINEL, FRAME_PTR_SENTINEL, SPILL_SCRATCH_SENTINEL,
+    COPY_SCRATCH_SENTINEL, CTX_PTR_SENTINEL, FRAME_PTR_SENTINEL, SPILL_SCRATCH_SENTINEL,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -122,7 +122,7 @@ pub fn compute_live_intervals(func: &MachFunc) -> Vec<LiveInterval> {
 #[inline]
 fn is_fixed_sentinel(vreg: VReg) -> bool {
     match vreg.class {
-        RegClass::Gp => vreg.index >= COPY_SCRATCH_SENTINEL,
+        RegClass::Gp => vreg.index >= CTX_PTR_SENTINEL,
         RegClass::Fp | RegClass::Vec => vreg.index == SPILL_SCRATCH_SENTINEL,
     }
 }
@@ -195,8 +195,12 @@ pub fn aarch64_target_regs() -> TargetRegs {
     // GP callee-saved regs are now handled by insert_callee_saves(), which
     // makes the larger set worthwhile for spill-heavy non-leaf module bodies.
     // x16/x17 are scratch, x18 is platform-reserved, x29 is FP, x30 is LR, x31 is SP.
+    // x20 reserved for JitContext pointer (set at interpreter→JIT entry,
+    // preserved across all calls since it's callee-saved in AAPCS64).
+    // x19 is reserved by LLVM on this platform.
     let gp: Vec<PhysReg> = (0u8..16)
-        .chain(19u8..29)
+        .chain(19u8..20)
+        .chain(21u8..29)
         .map(PhysReg::gp)
         .collect();
     // d0-d15 allocatable (d16-d31 exist but we keep it simple; d16/d17 scratch)
