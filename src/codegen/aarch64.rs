@@ -73,7 +73,7 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
     let mut call_offsets: Vec<(usize, u32)> = Vec::new(); // (inst_index, code_offset)
 
     for (inst_idx, inst) in func.insts.iter().enumerate() {
-        emit_inst(&mut asm, inst, &labels)?;
+        emit_inst(&mut asm, inst, &labels, &mut Vec::new())?;
         // Record offset AFTER call instructions (the return address is the safepoint).
         if matches!(
             inst,
@@ -169,6 +169,7 @@ fn emit_inst(
     asm: &mut Assembler,
     inst: &MachInst,
     labels: &HashMap<Label, DynamicLabel>,
+    _literal_pool: &mut Vec<(DynamicLabel, u64)>,
 ) -> Result<(), String> {
     use MachInst::*;
     match inst {
@@ -177,7 +178,6 @@ fn emit_inst(
         // =================================================================
         LoadImm { dst, bits } => {
             let d = gp(*dst);
-            // Use movz + movk sequence for arbitrary 64-bit immediate.
             emit_load_imm64(asm, d, *bits);
         }
 

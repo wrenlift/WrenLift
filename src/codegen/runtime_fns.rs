@@ -953,9 +953,16 @@ fn nonleaf_shadow_safe(
 
 #[inline(always)]
 fn nonleaf_moving_gc_safe(
-    vm: &crate::runtime::vm::VM,
-    func_id: crate::runtime::engine::FuncId,
+    _vm: &crate::runtime::vm::VM,
+    _func_id: crate::runtime::engine::FuncId,
 ) -> bool {
+    // All non-leaf JIT functions are safe for nested execution:
+    // - JIT frame registration (#[naked] wren_call_N) makes frames visible to GC
+    // - force_boxed_gp_spills ensures all boxed values are in known spill slots
+    // - GC stack walker (scan_native_stack_roots) reads/writes spill slots directly
+    // - x20 holds JitContext pointer, eliminating TLS for context access
+    true
+    /* Old conservative check (no longer needed with stack map infrastructure):
     vm.engine
         .jit_metadata
         .get(func_id.0 as usize)
@@ -979,6 +986,7 @@ fn nonleaf_moving_gc_safe(
                 })
         })
         .unwrap_or(false)
+    */
 }
 
 fn trace_nonleaf_gate(
