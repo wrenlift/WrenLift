@@ -766,7 +766,11 @@ impl ExecutionEngine {
             FuncBody::Native {
                 optimized_executable,
                 ..
-            } if optimized_executable.is_none() => Some(CompileTier::Optimized),
+            } if optimized_executable.is_none()
+                && std::env::var_os("WLIFT_OPT_TIER").is_some() =>
+            {
+                Some(CompileTier::Optimized)
+            }
             _ => None,
         }
     }
@@ -1012,6 +1016,12 @@ impl ExecutionEngine {
         let Some(tier) = self.next_compile_tier(idx) else {
             return;
         };
+        // Don't start optimized-tier compilation while baseline functions are
+        // waiting in the queue — the optimizer can hang on complex functions,
+        // blocking all compilation progress.
+        if tier == CompileTier::Optimized && !self.compile_queue.is_empty() {
+            return;
+        }
         if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
             return;
         }
