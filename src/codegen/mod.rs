@@ -3105,202 +3105,107 @@ impl<'a> LowerCtx<'a> {
                     .and_then(|ptrs| ptrs.get(ic_idx))
                     .copied()
                 {
+                    use crate::mir::bytecode::CALLSITE_IC_CLOSURE;
+
                     let slow_label = self.mf.new_label();
-                    let getter_label = self.mf.new_label();
-                    let masked = self.mf.new_gp();
-                    let tag_obj = self.mf.new_gp();
-                    self.mf.emit(MachInst::AndImm {
-                        dst: masked,
-                        src: r,
-                        imm: TAG_OBJ,
-                    });
-                    self.mf.emit(MachInst::LoadImm {
-                        dst: tag_obj,
-                        bits: TAG_OBJ,
-                    });
-                    self.mf.emit(MachInst::ICmp {
-                        lhs: masked,
-                        rhs: tag_obj,
-                    });
-                    self.mf.emit(MachInst::JmpIf {
-                        cond: Cond::Ne,
-                        target: slow_label,
-                    });
 
+                    // ── Object tag check: top 16 bits == 0xFFFC ──
+                    // Uses right-shift + compare-immediate (3 instructions)
+                    // instead of AND + LoadImm64 + CMP (10+ instructions).
+                    let tag_shifted = self.mf.new_gp();
+                    let shift_48 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: shift_48, bits: 48 });
+                    self.mf.emit(MachInst::Shr { dst: tag_shifted, lhs: r, rhs: shift_48 });
+                    let tag_expect = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: tag_expect, bits: 0xFFFC });
+                    self.mf.emit(MachInst::ICmp { lhs: tag_shifted, rhs: tag_expect });
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+
+                    // ── Extract object pointer + load class ──
                     let obj_ptr = self.mf.new_gp();
-                    self.mf.emit(MachInst::AndImm {
-                        dst: obj_ptr,
-                        src: r,
-                        imm: PTR_MASK,
-                    });
+                    self.mf.emit(MachInst::AndImm { dst: obj_ptr, src: r, imm: PTR_MASK });
                     let recv_class = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr {
-                        dst: recv_class,
-                        mem: Mem::new(obj_ptr, HEADER_CLASS),
-                    });
+                    self.mf.emit(MachInst::Ldr { dst: recv_class, mem: Mem::new(obj_ptr, HEADER_CLASS) });
+
+                    // ── IC class check ──
                     let ic_base = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm {
-                        dst: ic_base,
-                        bits: ic_ptr as u64,
-                    });
+                    self.mf.emit(MachInst::LoadImm { dst: ic_base, bits: ic_ptr as u64 });
                     let cached_class = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr {
-                        dst: cached_class,
-                        mem: Mem::new(ic_base, CALLSITE_IC_CLASS),
-                    });
-                    self.mf.emit(MachInst::ICmp {
-                        lhs: recv_class,
-                        rhs: cached_class,
-                    });
-                    self.mf.emit(MachInst::JmpIf {
-                        cond: Cond::Ne,
-                        target: slow_label,
-                    });
+                    self.mf.emit(MachInst::Ldr { dst: cached_class, mem: Mem::new(ic_base, CALLSITE_IC_CLASS) });
+                    self.mf.emit(MachInst::ICmp { lhs: recv_class, rhs: cached_class });
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
 
+                    // ── Load kind, dispatch by value ──
                     let kind = self.mf.new_gp();
-                    let getter_kind = self.mf.new_gp();
-                    let leaf_kind = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr {
-                        dst: kind,
-                        mem: Mem::new(ic_base, CALLSITE_IC_KIND),
-                    });
-                    self.mf.emit(MachInst::LoadImm {
-                        dst: getter_kind,
-                        bits: 5,
-                    });
-                    self.mf.emit(MachInst::ICmp {
-                        lhs: kind,
-                        rhs: getter_kind,
-                    });
-                    self.mf.emit(MachInst::JmpIf {
-                        cond: Cond::Eq,
-                        target: getter_label,
-                    });
-                    self.mf.emit(MachInst::LoadImm {
-                        dst: leaf_kind,
-                        bits: 1,
-                    });
-                    self.mf.emit(MachInst::ICmp {
-                        lhs: kind,
-                        rhs: leaf_kind,
-                    });
-                    let nonleaf_label = self.mf.new_label();
-                    self.mf.emit(MachInst::JmpIf {
-                        cond: Cond::Ne,
-                        target: nonleaf_label,
-                    });
+                    self.mf.emit(MachInst::Ldr { dst: kind, mem: Mem::new(ic_base, CALLSITE_IC_KIND) });
+                    // Check kind <= 1 (kind=0 invalid, kind=1 leaf JIT) — use subtraction
+                    // to test both 0 and 1 in one comparison won't work. Just check == 1 or == 6.
+                    let non_jit_label = self.mf.new_label();
+                    let kind1 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: kind1, bits: 1 });
+                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind1 });
+                    let jit_dispatch_label = self.mf.new_label();
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: jit_dispatch_label });
+                    let kind6 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: kind6, bits: 6 });
+                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind6 });
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: non_jit_label });
+                    self.mf.emit(MachInst::DefLabel(jit_dispatch_label));
 
-                    // ── Kind=1: leaf JIT direct call (no context setup needed) ──
-                    let target_ptr = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr {
-                        dst: target_ptr,
-                        mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
-                    });
-                    let mut direct_args = Vec::with_capacity(user_args.len() + 1);
-                    direct_args.push(r);
-                    direct_args.extend(user_args.iter().copied());
-                    self.mf.emit(MachInst::CallIndirectAbi {
-                        target: target_ptr,
-                        args: direct_args.clone(),
-                        ret: Some(dst),
-                    });
-                    self.mf.emit(MachInst::Jmp { target: done_label });
-
-                    // ── Kind=6: non-leaf JIT direct call (inline IC) ──
-                    self.mf.emit(MachInst::DefLabel(nonleaf_label));
+                    // ── JIT dispatch (kind=1 or kind=6): always do context swap ──
+                    let jit_ptr = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr { dst: jit_ptr, mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR) });
+                    // For kind=1 (leaf) the context swap is harmless — the leaf
+                    // doesn't read JitContext. This avoids the kind cascade entirely.
                     {
-                        use crate::mir::bytecode::CALLSITE_IC_CLOSURE;
-                        let native_label = self.mf.new_label();
-                        let nonleaf_kind = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm {
-                            dst: nonleaf_kind,
-                            bits: 6,
-                        });
-                        self.mf.emit(MachInst::ICmp {
-                            lhs: kind,
-                            rhs: nonleaf_kind,
-                        });
-                        self.mf.emit(MachInst::JmpIf {
-                            cond: Cond::Ne,
-                            target: native_label,
-                        });
-
-                        // x19 = JitContext pointer (set at JIT entry, callee-saved).
-                        // Inline context swap: save/restore current_func_id and closure
-                        // via direct loads/stores through x19 — no TLS access.
                         let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
                         const CTX_OFFSET_FUNC_ID: i32 = 40;
                         const CTX_OFFSET_CLOSURE: i32 = 48;
 
-                        // Save current_func_id
                         let saved_func_id = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: saved_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        // Load func_id and closure from IC
+                        let saved_closure = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                        self.mf.emit(MachInst::Ldr { dst: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
                         let ic_func_id = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: ic_func_id,
-                            mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
-                        });
+                        self.mf.emit(MachInst::Ldr { dst: ic_func_id, mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID) });
                         let ic_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: ic_closure,
-                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
-                        });
-                        // Write new func_id and closure to JitContext
-                        self.mf.emit(MachInst::Str {
-                            src: ic_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Str {
-                            src: ic_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
+                        self.mf.emit(MachInst::Ldr { dst: ic_closure, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
+                        self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                        self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
 
-                        // Direct call to JIT function
-                        let nl_target = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: nl_target,
-                            mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
-                        });
+                        let mut direct_args = Vec::with_capacity(user_args.len() + 1);
+                        direct_args.push(r);
+                        direct_args.extend(user_args.iter().copied());
                         self.mf.emit(MachInst::CallIndirectAbi {
-                            target: nl_target,
-                            args: direct_args.clone(),
+                            target: jit_ptr,
+                            args: direct_args,
                             ret: Some(dst),
                         });
+                        self.mf.emit(MachInst::Str { src: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                        self.mf.emit(MachInst::Str { src: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                    }
+                    self.mf.emit(MachInst::Jmp { target: done_label });
 
-                        // Restore current_func_id
-                        self.mf.emit(MachInst::Str {
-                            src: saved_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Jmp { target: done_label });
+                    // ── Non-JIT dispatch: getter (kind=5) or native (kind=4) ──
+                    self.mf.emit(MachInst::DefLabel(non_jit_label));
+                    let kind = self.mf.new_gp();
+                    self.mf.emit(MachInst::Ldr { dst: kind, mem: Mem::new(ic_base, CALLSITE_IC_KIND) });
 
-                        // ── Kind=4: native method direct call ──
-                        self.mf.emit(MachInst::DefLabel(native_label));
-                        let native_kind = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm {
-                            dst: native_kind,
-                            bits: 4,
-                        });
-                        self.mf.emit(MachInst::ICmp {
-                            lhs: kind,
-                            rhs: native_kind,
-                        });
-                        self.mf.emit(MachInst::JmpIf {
-                            cond: Cond::Ne,
-                            target: slow_label,
-                        });
+                    // Kind=5: getter (direct field load)
+                    let getter_label = self.mf.new_label();
+                    let kind5 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: kind5, bits: 5 });
+                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind5 });
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: getter_label });
 
-                        // Load native fn ptr from IC (stored in closure field)
+                    // Kind=4: native method
+                    let kind4 = self.mf.new_gp();
+                    self.mf.emit(MachInst::LoadImm { dst: kind4, bits: 4 });
+                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind4 });
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    {
                         let native_fn = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: native_fn,
-                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
-                        });
-                        // Call wren_ic_native_N(native_fn, receiver, args...)
+                        self.mf.emit(MachInst::Ldr { dst: native_fn, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
                         let native_call_name = match args.len() {
                             0 => "wren_ic_native_0",
                             1 => "wren_ic_native_1",
@@ -3309,45 +3214,25 @@ impl<'a> LowerCtx<'a> {
                         };
                         let mut native_args = vec![native_fn, r];
                         native_args.extend(user_args.iter().copied());
-                        self.mf.emit(MachInst::CallRuntime {
-                            name: native_call_name,
-                            args: native_args,
-                            ret: Some(dst),
-                        });
+                        self.mf.emit(MachInst::CallRuntime { name: native_call_name, args: native_args, ret: Some(dst) });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
+
+                    // Kind=5: getter inline
                     self.mf.emit(MachInst::DefLabel(getter_label));
-                    let fields_ptr = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr {
-                        dst: fields_ptr,
-                        mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
-                    });
-                    let field_idx = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr {
-                        dst: field_idx,
-                        mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
-                    });
-                    let shift = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm {
-                        dst: shift,
-                        bits: 3,
-                    });
-                    let field_offset = self.mf.new_gp();
-                    self.mf.emit(MachInst::Shl {
-                        dst: field_offset,
-                        lhs: field_idx,
-                        rhs: shift,
-                    });
-                    let field_addr = self.mf.new_gp();
-                    self.mf.emit(MachInst::IAdd {
-                        dst: field_addr,
-                        lhs: fields_ptr,
-                        rhs: field_offset,
-                    });
-                    self.mf.emit(MachInst::Ldr {
-                        dst,
-                        mem: Mem::new(field_addr, 0),
-                    });
+                    {
+                        let fields_ptr = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: fields_ptr, mem: Mem::new(obj_ptr, INSTANCE_FIELDS) });
+                        let field_idx = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: field_idx, mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID) });
+                        let shift = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: shift, bits: 3 });
+                        let field_offset = self.mf.new_gp();
+                        self.mf.emit(MachInst::Shl { dst: field_offset, lhs: field_idx, rhs: shift });
+                        let field_addr = self.mf.new_gp();
+                        self.mf.emit(MachInst::IAdd { dst: field_addr, lhs: fields_ptr, rhs: field_offset });
+                        self.mf.emit(MachInst::Ldr { dst, mem: Mem::new(field_addr, 0) });
+                    }
                     self.mf.emit(MachInst::Jmp { target: done_label });
                     self.mf.emit(MachInst::DefLabel(slow_label));
                 }
