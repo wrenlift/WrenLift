@@ -3131,13 +3131,28 @@ impl<'a> LowerCtx<'a> {
                     let recv_class = self.mf.new_gp();
                     self.mf.emit(MachInst::Ldr { dst: recv_class, mem: Mem::new(obj_ptr, HEADER_CLASS) });
 
-                    // ── IC class check ──
+                    // ── IC class check (with cache_key_class logic) ──
+                    // For class objects (recv.class == ClassClass), the IC stores
+                    // the class itself as cache_key, not its metaclass. We must
+                    // compare obj_ptr (the class) instead of recv_class (the metaclass).
+                    let cache_key = self.mf.new_gp();
+                    let class_class_ptr = self.mf.new_gp();
+                    // Load ClassClass pointer from JitContext: vm.class_class
+                    // ClassClass is stored as the header.class of any class object.
+                    // If recv_class == ClassClass, use obj_ptr as cache_key.
+                    // Otherwise use recv_class.
+                    // For now: always try recv_class first. On mismatch, try obj_ptr.
                     let ic_base = self.mf.new_gp();
                     self.mf.emit(MachInst::LoadImm { dst: ic_base, bits: ic_ptr as u64 });
                     let cached_class = self.mf.new_gp();
                     self.mf.emit(MachInst::Ldr { dst: cached_class, mem: Mem::new(ic_base, CALLSITE_IC_CLASS) });
                     self.mf.emit(MachInst::ICmp { lhs: recv_class, rhs: cached_class });
+                    let class_check_ok = self.mf.new_label();
+                    self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: class_check_ok });
+                    // Mismatch: check if receiver is a class (obj_ptr == cached_class)
+                    self.mf.emit(MachInst::ICmp { lhs: obj_ptr, rhs: cached_class });
                     self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    self.mf.emit(MachInst::DefLabel(class_check_ok));
 
                     // ── Load kind, dispatch by value ──
                     let kind = self.mf.new_gp();

@@ -587,12 +587,14 @@ impl ExecutionEngine {
         let bc_ptr = self.ensure_bytecode(id)?;
         let bc = unsafe { &mut *(bc_ptr as *mut BytecodeFunction) };
         let ic_table = unsafe { &mut *bc.ic_table.get() };
-        Some(
-            ic_table
-                .iter_mut()
-                .map(|ic| ic as *mut CallSiteIC as usize)
-                .collect(),
-        )
+        let ptrs: Vec<usize> = ic_table
+            .iter_mut()
+            .map(|ic| ic as *mut CallSiteIC as usize)
+            .collect();
+        if tier_trace_enabled() && !ptrs.is_empty() {
+            eprintln!("tier-trace: ic_ptrs FuncId({}) bc={:p} ptrs={:x?}", id.0, bc_ptr, &ptrs);
+        }
+        Some(ptrs)
     }
 
     /// Whether any background compilations are waiting to be installed.
