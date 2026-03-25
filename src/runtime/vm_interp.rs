@@ -1788,11 +1788,33 @@ fn run_fiber_with_stop_depth(
                                 .get(fn_idx)
                                 .copied()
                                 .unwrap_or(std::ptr::null());
-                            // Constructor JIT dispatch disabled in interpreter path.
-                            // The call goes through the interpreter frame push below,
-                            // then recursive calls hit dispatch_method → call_constructor_sync
-                            // which handles JIT dispatch correctly.
-                            let _ = ctor_jit;
+                            if !ctor_jit.is_null() && argc <= 3 {
+                                // Save interpreter state to fiber frame before
+                                // calling into JIT (may trigger nested interpreter
+                                // calls or GC that modifies fiber state).
+                                unsafe {
+                                    let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                    frame.pc = pc;
+                                    frame.values = values;
+                                    frame.bc_ptr = bc_ptr;
+                                }
+                                let result = vm.call_constructor_sync(
+                                    recv_class, closure_ptr, &arg_vals[1..],
+                                );
+                                // Re-read interpreter state (may have been modified
+                                // by nested calls or GC during constructor execution).
+                                values = unsafe {
+                                    std::mem::take(
+                                        &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                                    )
+                                };
+                                bc_ptr = unsafe { (*fiber).mir_frames.last().unwrap().bc_ptr };
+                                bc = unsafe { &*bc_ptr };
+                                code = &bc.code;
+                                set_reg(&mut values, dst, result);
+                                steps += 1;
+                                continue;
+                            }
 
                             // Interpreter path: allocate instance here (no JIT code).
                             let instance = vm.gc.alloc_instance(recv_class);

@@ -2313,6 +2313,7 @@ impl VM {
             crate::codegen::runtime_fns::set_jit_context(saved_ctx);
             // Constructor returns the instance (possibly GC-forwarded)
             let result = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
             return result;
         }
