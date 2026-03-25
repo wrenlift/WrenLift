@@ -2288,8 +2288,7 @@ impl VM {
             .get(fn_idx)
             .copied()
             .unwrap_or(std::ptr::null());
-        let is_ctor_leaf = self.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-        if !jit_ptr.is_null() && ctor_args.len() <= 3 && is_ctor_leaf {
+        if !jit_ptr.is_null() && ctor_args.len() <= 3 {
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
             // JIT expects: [this, arg0, arg1, ...]
             let mut jit_args = [Value::null(); 4];

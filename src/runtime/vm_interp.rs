@@ -1765,15 +1765,12 @@ fn run_fiber_with_stop_depth(
                         }
                         Some(Method::Constructor(closure_ptr)) => {
                             let recv_class = recv_val.as_object().unwrap() as *mut ObjClass;
-                            let instance = vm.gc.alloc_instance(recv_class);
-                            let instance_val = Value::object(instance as *mut u8);
-                            // No write_barrier needed: instance was just allocated (always young-gen),
-                            // so source.generation != GEN_OLD and barrier would be a no-op.
-
                             let target_fn_ptr = unsafe { (*closure_ptr).function };
                             let target_func_id = FuncId(unsafe { (*target_fn_ptr).fn_id });
 
-                            // Tier-up profiling (interpreter dispatch only for constructors)
+                            // Tier-up profiling + poll BEFORE allocation.
+                            // poll_compilations() may install JIT code, changing
+                            // whether we take the JIT or interpreter path.
                             if vm.engine.mode != ExecutionMode::Interpreter {
                                 let should_tier_up = vm.engine.record_call(target_func_id);
                                 if should_tier_up {
@@ -1782,7 +1779,8 @@ fn run_fiber_with_stop_depth(
                                 vm.engine.poll_compilations();
                             }
 
-                            // JIT dispatch for compiled constructors
+                            // JIT dispatch: call_constructor_sync handles its own
+                            // instance allocation, avoiding double-allocation.
                             let fn_idx = target_func_id.0 as usize;
                             let ctor_jit = vm
                                 .engine
@@ -1790,15 +1788,15 @@ fn run_fiber_with_stop_depth(
                                 .get(fn_idx)
                                 .copied()
                                 .unwrap_or(std::ptr::null());
-                            let is_ctor_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-                            if !ctor_jit.is_null() && argc <= 3 && is_ctor_leaf {
-                                let result = vm.call_constructor_sync(
-                                    recv_class, closure_ptr, &arg_vals[1..],
-                                );
-                                set_reg(&mut values, dst, result);
-                                steps += 1;
-                                continue;
-                            }
+                            // Constructor JIT dispatch disabled in interpreter path.
+                            // The call goes through the interpreter frame push below,
+                            // then recursive calls hit dispatch_method → call_constructor_sync
+                            // which handles JIT dispatch correctly.
+                            let _ = ctor_jit;
+
+                            // Interpreter path: allocate instance here (no JIT code).
+                            let instance = vm.gc.alloc_instance(recv_class);
+                            let instance_val = Value::object(instance as *mut u8);
 
                             let target_bc_ptr =
                                 vm.engine.ensure_bytecode(target_func_id).ok_or_else(|| {
