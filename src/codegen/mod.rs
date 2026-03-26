@@ -6545,8 +6545,10 @@ mod tests {
         let v_result = f.new_value();
         {
             let b = f.block_mut(bb);
-            b.instructions.push((v_list, Instruction::BlockParam(0)));
-            b.instructions.push((v_idx, Instruction::BlockParam(1)));
+            // Use MakeList so the receiver is known to be a list
+            // (enables inline GEP instead of CallRuntime).
+            b.instructions.push((v_list, Instruction::MakeList(vec![])));
+            b.instructions.push((v_idx, Instruction::BlockParam(0)));
             b.instructions.push((
                 v_result,
                 Instruction::SubscriptGet {
@@ -6559,10 +6561,10 @@ mod tests {
         let mf = lower_mir(&f);
         let output = mf.display();
         println!("Generated code:\n{}", output);
-        // Should use inline GEP (and_imm, ldr, shl, iadd) not CallRuntime
+        // Should use inline GEP (and_imm, ldr, shl, iadd) not wren_subscript_get
         assert!(
-            !output.contains("call_runtime"),
-            "SubscriptGet should use inline GEP, got:\n{}",
+            !output.contains("wren_subscript_get"),
+            "SubscriptGet on MakeList should use inline GEP, got:\n{}",
             output
         );
         assert!(

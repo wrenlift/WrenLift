@@ -1487,7 +1487,7 @@ mod tests {
     #[test]
     fn test_aarch64_target_regs() {
         let target = aarch64_target_regs();
-        assert_eq!(target.gp_allocatable.len(), 26); // x0-x15 + x19-x28
+        assert_eq!(target.gp_allocatable.len(), 25); // x0-x15 + x19 + x21-x28 (x20 reserved for JitContext)
         assert_eq!(target.fp_allocatable.len(), 16); // d0-d15
     }
 
