@@ -515,10 +515,13 @@ fn run_fiber_with_stop_depth(
 
         let frame_count = unsafe { (*fiber).mir_frames.len() };
         if frame_count == 0 {
+            // Check if this fiber was resumed with a value from a child fiber
+            // (JIT barrier path: frames were temporarily removed).
+            let resume_val = unsafe { (*fiber).jit_resume_value.take() };
             unsafe {
                 (*fiber).state = FiberState::Done;
             }
-            return Ok(Value::null());
+            return Ok(resume_val.unwrap_or(Value::null()));
         }
 
         // Load execution state from the top frame into locals.
@@ -2779,7 +2782,14 @@ fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
         if let Some(dst) = (*caller).resume_value_dst.take() {
             if let Some(frame) = (*caller).mir_frames.last_mut() {
                 set_reg(&mut frame.values, dst.0 as u16, value);
+            } else {
+                // JIT barrier path: caller's frames were temporarily removed.
+                // Store the resume value so handle_jit_fiber_action can read it.
+                (*caller).jit_resume_value = Some(value);
             }
+        } else if (*caller).mir_frames.is_empty() {
+            // No resume_value_dst and no frames: JIT barrier path.
+            (*caller).jit_resume_value = Some(value);
         }
     }
     vm.fiber = caller;

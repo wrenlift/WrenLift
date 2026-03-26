@@ -1152,6 +1152,7 @@ impl VM {
             (*fiber).resume_value_dst = None;
             (*fiber).spawn_trace = None;
             (*fiber).is_try = false;
+            (*fiber).jit_resume_value = None;
             (*fiber).header.class = self.fiber_class;
         }
     }
@@ -3694,8 +3695,12 @@ System.print(MathUtils.double(21))
     fn test_runtime_error_has_source_location() {
         // Trigger a MethodNotFound error, verify extract_error_location returns
         // a valid SourceLoc pointing into the source code.
+        // Uses interpreter mode because JIT dispatch silently returns null on
+        // MethodNotFound instead of raising a RuntimeError.
         let source = "var x = 42\nx.bogus()";
-        let mut vm = VM::new_default();
+        let mut config = VMConfig::default();
+        config.execution_mode = crate::runtime::engine::ExecutionMode::Interpreter;
+        let mut vm = VM::new(config);
         vm.output_buffer = Some(String::new());
 
         // We need to inspect the fiber before interpret() restores prev_fiber.
@@ -3743,6 +3748,7 @@ System.print(MathUtils.double(21))
         let errors_clone = errors.clone();
 
         let mut config = VMConfig::default();
+        config.execution_mode = crate::runtime::engine::ExecutionMode::Interpreter;
         config.error_fn = Some(Box::new(move |_kind, _module, _line, msg| {
             errors_clone.lock().unwrap().push(msg.to_string());
         }));

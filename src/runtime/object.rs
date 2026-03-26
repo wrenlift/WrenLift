@@ -784,6 +784,10 @@ pub struct ObjFiber {
     /// When true, runtime errors are caught and stored on the fiber instead
     /// of propagating (set by Fiber.try).
     pub is_try: bool,
+    /// Yield/return value captured for the JIT fiber dispatch path.
+    /// Set by the interpreter when a child fiber yields/completes back to a
+    /// caller whose frames have been temporarily removed (JIT barrier).
+    pub jit_resume_value: Option<Value>,
 }
 
 impl Default for ObjFiber {
@@ -805,6 +809,7 @@ impl ObjFiber {
             resume_value_dst: None,
             spawn_trace: None,
             is_try: false,
+            jit_resume_value: None,
         }
     }
 

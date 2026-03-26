@@ -3988,9 +3988,22 @@ impl<'a> LowerCtx<'a> {
                             lhs: masked,
                             rhs: qnan_reg,
                         });
+                        let raw_bool = self.mf.new_gp();
                         self.mf.emit(MachInst::CSet {
-                            dst,
+                            dst: raw_bool,
                             cond: Cond::Ne,
+                        });
+                        // Convert 0/1 → TAG_FALSE/TAG_TRUE
+                        let shifted = self.mf.new_gp();
+                        self.mf.emit(MachInst::IAddImm {
+                            dst: shifted,
+                            src: raw_bool,
+                            imm: 1,
+                        });
+                        self.mf.emit(MachInst::OrImm {
+                            dst,
+                            src: shifted,
+                            imm: QNAN,
                         });
                     }
                     "Bool" => {
@@ -4023,10 +4036,23 @@ impl<'a> LowerCtx<'a> {
                             dst: is_false,
                             cond: Cond::Eq,
                         });
+                        let raw_bool = self.mf.new_gp();
                         self.mf.emit(MachInst::Or {
-                            dst,
+                            dst: raw_bool,
                             lhs: is_true,
                             rhs: is_false,
+                        });
+                        // Convert 0/1 → TAG_FALSE/TAG_TRUE
+                        let shifted = self.mf.new_gp();
+                        self.mf.emit(MachInst::IAddImm {
+                            dst: shifted,
+                            src: raw_bool,
+                            imm: 1,
+                        });
+                        self.mf.emit(MachInst::OrImm {
+                            dst,
+                            src: shifted,
+                            imm: QNAN,
                         });
                     }
                     "Null" => {
@@ -4040,9 +4066,22 @@ impl<'a> LowerCtx<'a> {
                             lhs: la,
                             rhs: null_reg,
                         });
+                        let raw_bool = self.mf.new_gp();
                         self.mf.emit(MachInst::CSet {
-                            dst,
+                            dst: raw_bool,
                             cond: Cond::Eq,
+                        });
+                        // Convert 0/1 → TAG_FALSE/TAG_TRUE
+                        let shifted = self.mf.new_gp();
+                        self.mf.emit(MachInst::IAddImm {
+                            dst: shifted,
+                            src: raw_bool,
+                            imm: 1,
+                        });
+                        self.mf.emit(MachInst::OrImm {
+                            dst,
+                            src: shifted,
+                            imm: QNAN,
                         });
                     }
                     _ => {
@@ -4070,8 +4109,11 @@ impl<'a> LowerCtx<'a> {
                             cond: Cond::Eq,
                             target: is_obj_label,
                         });
-                        // Not an object → false
-                        self.mf.emit(MachInst::LoadImm { dst, bits: 0 });
+                        // Not an object → false (NaN-boxed)
+                        self.mf.emit(MachInst::LoadImm {
+                            dst,
+                            bits: TAG_FALSE,
+                        });
                         self.mf.emit(MachInst::Jmp { target: done_label });
 
                         // Is an object → load class name sym and compare
@@ -4217,7 +4259,7 @@ impl<'a> LowerCtx<'a> {
                 receiver,
                 args,
                 value,
-            } if args.len() == 1 => {
+            } if args.len() == 1 && self.is_known_list_receiver(*receiver) => {
                 use crate::runtime::object_layout::*;
                 let recv_reg = self.vreg_for(*receiver);
                 let idx_reg = self.vreg_for(args[0]);

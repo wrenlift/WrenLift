@@ -1463,6 +1463,106 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
     }
 }
 
+/// Process a pending fiber action set by a native method, synchronously from
+/// within the JIT dispatch path.  Returns the value that the caller should see
+/// as the result of the `fiber.call()` / `Fiber.yield()` etc. invocation.
+///
+/// The key design: when the JIT calls `fiber.call()`, we run the target fiber
+/// synchronously via the interpreter.  We temporarily remove the caller's
+/// mir_frames so the interpreter does not re-execute the caller's module body
+/// (which is being run by JIT code) when the child fiber returns.
+fn handle_jit_fiber_action(
+    vm: &mut crate::runtime::vm::VM,
+    action: crate::runtime::vm::FiberAction,
+) -> u64 {
+    use crate::runtime::object::FiberState;
+    use crate::runtime::vm::FiberAction;
+
+    // Determine Call vs Transfer before destructuring moves the enum.
+    let is_call = matches!(&action, FiberAction::Call { .. });
+
+    match action {
+        FiberAction::Call { target, value } | FiberAction::Transfer { target, value } => {
+            let caller = vm.fiber;
+            unsafe {
+                if !caller.is_null() {
+                    (*caller).state = FiberState::Suspended;
+                }
+                if is_call {
+                    (*target).caller = caller;
+                }
+            }
+            let target_state = unsafe { (*target).state };
+            if target_state == FiberState::Suspended {
+                // Resuming a suspended fiber: deliver the value.
+                unsafe {
+                    if let Some(dst) = (*target).resume_value_dst.take() {
+                        if let Some(frame) = (*target).mir_frames.last_mut() {
+                            let i = dst.0 as usize;
+                            if i < frame.values.len() {
+                                frame.values[i] = value;
+                            } else {
+                                frame.values.resize(i + 1, Value::null());
+                                frame.values[i] = value;
+                            }
+                        }
+                    }
+                }
+            }
+            // Switch to the target fiber and run it synchronously.
+            //
+            // Problem: when the child fiber completes/yields, the interpreter's
+            // fiber_loop resumes the caller via resume_caller() which sets
+            // vm.fiber = caller and continues the fiber_loop.  That would
+            // re-run the caller's frames (which are being executed by JIT),
+            // causing double execution.
+            //
+            // Solution: temporarily take the caller's mir_frames so the
+            // interpreter sees frame_count == 0 on the caller fiber and
+            // returns instead of re-executing the module body.
+            let saved_caller_frames = if !caller.is_null() {
+                unsafe { std::mem::take(&mut (*caller).mir_frames) }
+            } else {
+                Vec::new()
+            };
+            vm.fiber = target;
+            let result = crate::runtime::vm_interp::run_fiber(vm);
+            // Restore the caller's frames and re-activate it.
+            if !caller.is_null() {
+                // Check if the child fiber yielded a value back to us.
+                // resume_caller() stores it in jit_resume_value when frames
+                // are empty (our JIT barrier).
+                let yield_val = unsafe { (*caller).jit_resume_value.take() };
+                unsafe {
+                    (*caller).mir_frames = saved_caller_frames;
+                    (*caller).state = FiberState::Running;
+                }
+                vm.fiber = caller;
+                if let Some(v) = yield_val {
+                    return v.to_bits();
+                }
+            }
+            match result {
+                Ok(v) => v.to_bits(),
+                Err(e) => {
+                    // Propagate the runtime error from the child fiber.
+                    vm.has_error = true;
+                    vm.last_error = Some(e.to_string());
+                    Value::null().to_bits()
+                }
+            }
+        }
+        FiberAction::Yield { value } => {
+            // Yield from JIT context — the fiber should return the value.
+            value.to_bits()
+        }
+        FiberAction::Suspend => {
+            // Suspend from JIT context — just return null.
+            Value::null().to_bits()
+        }
+    }
+}
+
 /// Dispatch a resolved method entry.
 #[inline(always)]
 fn dispatch_method(
@@ -1472,7 +1572,16 @@ fn dispatch_method(
     defining_class: Option<*mut crate::runtime::object::ObjClass>,
 ) -> u64 {
     match method {
-        Method::Native(native_fn) => native_fn(vm, args).to_bits(),
+        Method::Native(native_fn) => {
+            let result = native_fn(vm, args).to_bits();
+            // Check if the native method requested a fiber action (e.g. fiber.call()).
+            // If so, handle it synchronously here — the JIT caller expects a return
+            // value and has no mechanism to perform a fiber switch itself.
+            if let Some(action) = vm.pending_fiber_action.take() {
+                return handle_jit_fiber_action(vm, action);
+            }
+            result
+        }
         Method::Closure(cp) => {
             let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
             let fn_idx = func_id.0 as usize;
@@ -2488,7 +2597,27 @@ fn box_num(n: f64) -> u64 {
 }
 
 pub extern "C" fn wren_num_add(a: u64, b: u64) -> u64 {
-    box_num(unbox_num(a) + unbox_num(b))
+    let va = Value::from_bits(a);
+    if va.is_num() {
+        return box_num(unbox_num(a) + unbox_num(b));
+    }
+    // Non-numeric receiver: dispatch as method call (string concat, operator overload)
+    match unsafe { vm_ref() } {
+        Some(vm) => {
+            let sym = vm
+                .interner
+                .lookup("+(_)")
+                .or_else(|| vm.interner.lookup("+"));
+            if let Some(sym) = sym {
+                let class = vm.class_of(va);
+                if let Some((method, _dc)) = unsafe { find_method_with_class(class, sym) } {
+                    return dispatch_method(vm, method, &[va, Value::from_bits(b)], None);
+                }
+            }
+            Value::null().to_bits()
+        }
+        None => Value::null().to_bits(),
+    }
 }
 
 pub extern "C" fn wren_num_sub(a: u64, b: u64) -> u64 {
@@ -2508,7 +2637,27 @@ pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
 }
 
 pub extern "C" fn wren_num_neg(a: u64) -> u64 {
-    box_num(-unbox_num(a))
+    let va = Value::from_bits(a);
+    if va.is_num() {
+        return box_num(-unbox_num(a));
+    }
+    // Non-numeric: dispatch as prefix - method
+    match unsafe { vm_ref() } {
+        Some(vm) => {
+            let sym = vm
+                .interner
+                .lookup("-()")
+                .or_else(|| vm.interner.lookup("-"));
+            if let Some(sym) = sym {
+                let class = vm.class_of(va);
+                if let Some((method, _dc)) = unsafe { find_method_with_class(class, sym) } {
+                    return dispatch_method(vm, method, &[va], None);
+                }
+            }
+            Value::null().to_bits()
+        }
+        None => Value::null().to_bits(),
+    }
 }
 
 // ---------------------------------------------------------------------------
