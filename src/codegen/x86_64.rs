@@ -69,6 +69,11 @@ impl ExecutableCode {
     pub fn len(&self) -> usize {
         self.buf.len()
     }
+
+    /// Returns true if there is no native code.
+    pub fn is_empty(&self) -> bool {
+        self.buf.len() == 0
+    }
 }
 
 struct Fixup {
@@ -916,9 +921,7 @@ impl X64Emitter {
             }
 
             CallLocal { .. } => {
-                return Err(
-                    "CallLocal not yet linked — use CallLabel with ABI setup".to_string(),
-                );
+                return Err("CallLocal not yet linked — use CallLabel with ABI setup".to_string());
             }
 
             CallIndirectAbi { .. } => {

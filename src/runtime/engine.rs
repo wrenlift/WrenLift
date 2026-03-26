@@ -190,7 +190,16 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     let sra = Sra;
 
     let passes: Vec<&dyn MirPass> = vec![
-        &range_loop, &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+        &range_loop,
+        &constfold,
+        &dce,
+        &cse,
+        &type_spec,
+        &constfold,
+        &dce,
+        &licm,
+        &sra,
+        &dce,
     ];
     opt::run_to_fixpoint(mir, &passes, 10);
 }
@@ -265,15 +274,16 @@ fn tier_trace_enabled() -> bool {
 /// its only safepoints are self-calls (CallLocal or wren_call_static_self_*).
 /// This replaces MIR-level analysis which can't predict conditional CallRuntime
 /// emission (e.g., SetField with/without write barrier).
+#[allow(dead_code)]
 fn is_compiled_leaf(
     native_meta: &Option<std::sync::Arc<crate::codegen::native_meta::NativeFrameMetadata>>,
 ) -> bool {
     native_meta
         .as_ref()
         .map(|meta| {
-            meta.safepoints.iter().all(|sp| {
-                sp.kind == crate::codegen::native_meta::SafepointKind::CallLocal
-            })
+            meta.safepoints
+                .iter()
+                .all(|sp| sp.kind == crate::codegen::native_meta::SafepointKind::CallLocal)
         })
         .unwrap_or(true)
 }
@@ -596,7 +606,10 @@ impl ExecutionEngine {
                 if let Some(mir) = self.get_mir(callee_id) {
                     if let Some(field_idx) = Self::mir_trivial_getter_field(&mir) {
                         if tier_trace_enabled() {
-                            eprintln!("tier-trace: upgrade kind={}→5 fid={} field={}", ic.kind, ic.func_id, field_idx);
+                            eprintln!(
+                                "tier-trace: upgrade kind={}→5 fid={} field={}",
+                                ic.kind, ic.func_id, field_idx
+                            );
                         }
                         ic.kind = 5;
                         ic.func_id = field_idx as u64;
@@ -612,7 +625,12 @@ impl ExecutionEngine {
             .collect();
         if tier_trace_enabled() && !ptrs.is_empty() {
             let k5 = ic_table.iter().filter(|ic| ic.kind == 5).count();
-            eprintln!("tier-trace: ic_ptrs FuncId({}) total={} kind5={}", id.0, ptrs.len(), k5);
+            eprintln!(
+                "tier-trace: ic_ptrs FuncId({}) total={} kind5={}",
+                id.0,
+                ptrs.len(),
+                k5
+            );
         }
         Some(ptrs)
     }
@@ -620,14 +638,18 @@ impl ExecutionEngine {
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
     fn mir_trivial_getter_field(mir: &crate::mir::MirFunction) -> Option<u16> {
         use crate::mir::{Instruction, Terminator};
-        if mir.blocks.len() != 1 { return None; }
+        if mir.blocks.len() != 1 {
+            return None;
+        }
         let block = &mir.blocks[0];
         let mut self_param = None;
         let mut getter = None;
         for (vid, inst) in &block.instructions {
             match inst {
                 Instruction::BlockParam(0) if self_param.is_none() => self_param = Some(*vid),
-                Instruction::GetField(recv, idx) if getter.is_none() && Some(*recv) == self_param => {
+                Instruction::GetField(recv, idx)
+                    if getter.is_none() && Some(*recv) == self_param =>
+                {
                     getter = Some((*vid, *idx));
                 }
                 _ => return None,
@@ -733,7 +755,12 @@ impl ExecutionEngine {
         }
         let idx = id.0 as usize;
         if let Some(stats) = self.tier_stats.get_mut(idx) {
-            match self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted) {
+            match self
+                .tier_states
+                .get(idx)
+                .copied()
+                .unwrap_or(TierState::Interpreted)
+            {
                 TierState::BaselineNative => stats.baseline_entries += 1,
                 TierState::OptimizedNative => stats.optimized_entries += 1,
                 TierState::Interpreted => {}
@@ -830,9 +857,7 @@ impl ExecutionEngine {
             FuncBody::Native {
                 optimized_executable,
                 ..
-            } if optimized_executable.is_none()
-                && std::env::var_os("WLIFT_OPT_TIER").is_some() =>
-            {
+            } if optimized_executable.is_none() && std::env::var_os("WLIFT_OPT_TIER").is_some() => {
                 Some(CompileTier::Optimized)
             }
             _ => None,
@@ -890,11 +915,7 @@ impl ExecutionEngine {
                         call_count: 0,
                     },
                 ) {
-                    FuncBody::Interpreted {
-                        mir,
-                        bytecode,
-                        ..
-                    } => FuncBody::Native {
+                    FuncBody::Interpreted { mir, bytecode, .. } => FuncBody::Native {
                         baseline_executable: executable,
                         optimized_executable: None,
                         mir,
@@ -936,7 +957,9 @@ impl ExecutionEngine {
                 // Get code size from the executable stored in functions.
                 let code_size = match self.functions.get(idx) {
                     Some(FuncBody::Native {
-                        baseline_executable, optimized_executable, ..
+                        baseline_executable,
+                        optimized_executable,
+                        ..
                     }) => {
                         if let Some(opt) = optimized_executable {
                             opt.code_size()
@@ -951,7 +974,10 @@ impl ExecutionEngine {
                     if std::env::var_os("WLIFT_TRACE_CODE_RANGE").is_some() {
                         eprintln!(
                             "code-range: register f{} {:#x}-{:#x} size={}",
-                            func_id.0, start, start + code_size, code_size
+                            func_id.0,
+                            start,
+                            start + code_size,
+                            code_size
                         );
                     }
                     self.register_code_range(func_id, start, start + code_size, meta);
@@ -1045,16 +1071,17 @@ impl ExecutionEngine {
             eprintln!("{}", compile_mir.pretty_print(interner));
         }
         let target = Self::native_target();
-        let compiled = match crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
-            &compile_mir,
-            target,
-            interner,
-            tier,
-            callsite_ic_ptrs,
-        ) {
-            Ok(compiled) => compiled,
-            Err(_) => return false,
-        };
+        let compiled =
+            match crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
+                &compile_mir,
+                target,
+                interner,
+                tier,
+                callsite_ic_ptrs,
+            ) {
+                Ok(compiled) => compiled,
+                Err(_) => return false,
+            };
         let native_meta = compiled.native_meta;
         // Use MIR analysis for leaf classification. Shadow frame push/pop
         // is handled by each dispatch path via metadata checks, so even if
@@ -1132,7 +1159,10 @@ impl ExecutionEngine {
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
-            eprintln!("tier-trace: queue {:?} FuncId({}) {} ic_ptrs={}", tier, id.0, trace_name, ic_count);
+            eprintln!(
+                "tier-trace: queue {:?} FuncId({}) {} ic_ptrs={}",
+                tier, id.0, trace_name, ic_count
+            );
         }
 
         let compile_fn = move || {
@@ -1142,35 +1172,35 @@ impl ExecutionEngine {
                     tier, id.0, trace_name_clone
                 );
             }
-            let compile_mir = Self::build_compile_mir(&mir, tier, &interner_clone, profile.as_ref());
+            let compile_mir =
+                Self::build_compile_mir(&mir, tier, &interner_clone, profile.as_ref());
             if std::env::var("WLIFT_JIT_DUMP").is_ok() {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
-            let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
-                &compile_mir,
-                target,
-                &interner_clone,
-                tier,
-                callsite_ic_ptrs,
-            )
-            .ok()
-            .and_then(|artifact| {
-                let native_meta = artifact.native_meta;
-                let inline_safe = is_mir_inline_safe(&compile_mir, tier)
-                    || !artifact.needs_shadow_frame;
-                artifact
-                    .code
-                    .into_executable()
-                    .ok()
-                    .map(|executable| CompilationResult::Compiled {
-                        id,
-                        tier,
-                        executable,
-                        native_meta,
-                        inline_safe,
+            let result =
+                crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
+                    &compile_mir,
+                    target,
+                    &interner_clone,
+                    tier,
+                    callsite_ic_ptrs,
+                )
+                .ok()
+                .and_then(|artifact| {
+                    let native_meta = artifact.native_meta;
+                    let inline_safe =
+                        is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
+                    artifact.code.into_executable().ok().map(|executable| {
+                        CompilationResult::Compiled {
+                            id,
+                            tier,
+                            executable,
+                            native_meta,
+                            inline_safe,
+                        }
                     })
-            });
+                });
             if tier_trace_enabled() {
                 eprintln!(
                     "tier-trace: finish {:?} FuncId({}) {} success={}",

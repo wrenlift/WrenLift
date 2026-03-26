@@ -38,6 +38,12 @@ pub struct OldArena {
     chunk_size: usize,
 }
 
+impl Default for OldArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OldArena {
     pub fn new() -> Self {
         Self {
@@ -97,6 +103,7 @@ impl OldArena {
         ptr
     }
 
+    #[allow(dead_code)]
     fn reset(&mut self) {
         self.chunks.clear();
         self.alloc_ptr = 0;

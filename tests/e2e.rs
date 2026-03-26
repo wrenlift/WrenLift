@@ -1967,7 +1967,10 @@ for (i in 0...20) {
         t,
         output
     );
-    let expected = (0..20).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+    let expected = (0..20)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(
         output.trim(),
         expected,

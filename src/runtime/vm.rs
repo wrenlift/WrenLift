@@ -1192,15 +1192,19 @@ impl VM {
             }
 
             // Look up the function's metadata by func_id.
-            let meta = self.engine.jit_metadata
+            let meta = self
+                .engine
+                .jit_metadata
                 .get(func_id as usize)
                 .and_then(|m| m.as_ref());
             let Some(meta) = meta else { continue };
 
             // Find the code range for this function to compute the safepoint offset.
-            let code_range = self.engine.code_ranges.iter().find(|r| {
-                r.func_id == crate::runtime::engine::FuncId(func_id)
-            });
+            let code_range = self
+                .engine
+                .code_ranges
+                .iter()
+                .find(|r| r.func_id == crate::runtime::engine::FuncId(func_id));
 
             // Precise safepoint scanning: use the return address to find the
             // ACTIVE safepoint, then only scan roots that are live at that point.
@@ -1236,6 +1240,7 @@ impl VM {
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[allow(dead_code)]
     fn scan_native_stack_roots_debug(&self) -> (Vec<Value>, u32, u32) {
         use crate::codegen::native_meta::RootLocation;
         let mut found_roots = Vec::new();
@@ -1255,7 +1260,11 @@ impl VM {
             }
 
             if std::env::var_os("WLIFT_TRACE_STACKWALK").is_some() && frames_walked <= 15 {
-                let in_range = self.engine.code_ranges.iter().any(|r| return_addr >= r.start && return_addr < r.end);
+                let in_range = self
+                    .engine
+                    .code_ranges
+                    .iter()
+                    .any(|r| return_addr >= r.start && return_addr < r.end);
                 eprintln!(
                     "  frame {}: fp={:#x} ret={:#x} in_jit={}",
                     frames_walked, fp, return_addr, in_range
@@ -1649,7 +1658,7 @@ impl NativeContext for VM {
                             let recv_class = ptr as *mut ObjClass;
                             let static_sig = format!("static:{}", method);
                             let static_sym = self.interner.intern(&static_sig);
-                            (*recv_class).find_method(static_sym)?.clone()
+                            *(*recv_class).find_method(static_sym)?
                         } else {
                             return None;
                         }
@@ -1677,9 +1686,7 @@ impl NativeContext for VM {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 result
             }
-            Method::Closure(closure_ptr) => {
-                self.call_closure_sync(closure_ptr, &all_args, None)
-            }
+            Method::Closure(closure_ptr) => self.call_closure_sync(closure_ptr, &all_args, None),
             Method::Constructor(closure_ptr) => {
                 let class_ptr = receiver
                     .as_object()
@@ -2258,6 +2265,7 @@ impl VM {
     /// `this` (arg 0) instead of a newly allocated instance, causing SIGSEGV.
     /// This function allocates the instance, roots it across GC, and runs the
     /// constructor body in the interpreter.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn call_constructor_sync(
         &mut self,
         class_ptr: *mut crate::runtime::object::ObjClass,
@@ -2307,9 +2315,7 @@ impl VM {
             // Use call_jit_fn which sets x20 (JitContext pointer).
             // The constructor body's internal calls go through wren_call_N
             // which registers the JIT frame for GC via #[naked] wrappers.
-            let _ = unsafe {
-                super::vm_interp::call_jit_fn_pub(jit_ptr, &jit_args[..n])
-            };
+            let _ = unsafe { super::vm_interp::call_jit_fn_pub(jit_ptr, &jit_args[..n]) };
             crate::codegen::runtime_fns::set_jit_context(saved_ctx);
             // Constructor returns the instance (possibly GC-forwarded)
             let result = crate::codegen::runtime_fns::jit_root_at(root_len_before);

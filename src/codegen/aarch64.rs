@@ -51,7 +51,9 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
                 labels.entry(*l).or_insert_with(|| asm.new_dynamic_label());
             }
             MachInst::CallLabel { target } | MachInst::CallLocal { target, .. } => {
-                labels.entry(*target).or_insert_with(|| asm.new_dynamic_label());
+                labels
+                    .entry(*target)
+                    .or_insert_with(|| asm.new_dynamic_label());
             }
             MachInst::Jmp { target }
             | MachInst::JmpIf { target, .. }
@@ -75,10 +77,7 @@ pub fn emit(func: &MachFunc) -> Result<CompiledCode, String> {
     for (inst_idx, inst) in func.insts.iter().enumerate() {
         emit_inst(&mut asm, inst, &labels, &mut Vec::new())?;
         // Record offset AFTER call instructions (the return address is the safepoint).
-        if matches!(
-            inst,
-            MachInst::CallInd { .. } | MachInst::CallLabel { .. }
-        ) {
+        if matches!(inst, MachInst::CallInd { .. } | MachInst::CallLabel { .. }) {
             let offset = (asm.offset().0 - start.0) as u32;
             call_offsets.push((inst_idx, offset));
         }
@@ -155,6 +154,7 @@ fn emit_adjust_sp(asm: &mut Assembler, add: bool, bytes: u32) {
     }
 }
 
+#[allow(dead_code)]
 fn emit_add_imm_reg(asm: &mut Assembler, reg: u32, bytes: u32) {
     let mut remaining = bytes;
     while remaining > 0 {
@@ -512,9 +512,7 @@ fn emit_inst(
         }
 
         CallIndirectAbi { .. } => {
-            return Err(
-                "CallIndirectAbi not yet linked — use CallInd with ABI setup".to_string(),
-            );
+            return Err("CallIndirectAbi not yet linked — use CallInd with ABI setup".to_string());
         }
 
         CallRuntime { .. } => {

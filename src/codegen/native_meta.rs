@@ -55,7 +55,9 @@ impl NativeFrameMetadata {
     /// Find the safepoint metadata for a given code offset (return address).
     /// Used by GC stack walker to determine live roots at a native call site.
     pub fn find_safepoint(&self, code_offset: u32) -> Option<&SafepointMetadata> {
-        self.safepoints.iter().find(|sp| sp.code_offset == code_offset)
+        self.safepoints
+            .iter()
+            .find(|sp| sp.code_offset == code_offset)
     }
 }
 
@@ -84,10 +86,7 @@ pub fn build_native_frame_metadata(
             .filter_map(|(slot, vreg)| {
                 let interval = intervals.get(vreg)?;
                 let idx = inst_index as u32;
-                if interval.start <= idx
-                    && idx < interval.end
-                    && !inst_defs.contains(vreg)
-                {
+                if interval.start <= idx && idx < interval.end && !inst_defs.contains(vreg) {
                     let location = match alloc.assignments.get(vreg)? {
                         Location::Reg(phys) => RootLocation::Reg(phys.hw_enc),
                         Location::Spill(offset) => RootLocation::Spill(*offset),
@@ -125,7 +124,10 @@ fn is_spill_safe_nonleaf(
 ) -> bool {
     let trace = std::env::var_os("WLIFT_TRACE_SPILLSAFE").is_some();
     for inst in &mach.insts {
-        if matches!(inst, MachInst::CallRuntime { .. } | MachInst::CallIndirectAbi { .. }) {
+        if matches!(
+            inst,
+            MachInst::CallRuntime { .. } | MachInst::CallIndirectAbi { .. }
+        ) {
             continue;
         }
 

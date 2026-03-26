@@ -886,9 +886,7 @@ impl MachInst {
             | Pop { dst }
             | FuncArg { dst, .. } => Some(*dst),
 
-            CallLocal { ret, .. } | CallRuntime { ret, .. } | CallIndirectAbi { ret, .. } => {
-                *ret
-            }
+            CallLocal { ret, .. } | CallRuntime { ret, .. } | CallIndirectAbi { ret, .. } => *ret,
 
             // ParallelCopy defines multiple — return None; regalloc handles specially.
             ParallelCopy { .. } => None,
@@ -1778,6 +1776,7 @@ fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
     }) && mach.boxed_gp_vregs().next().is_some()
 }
 
+#[allow(dead_code)]
 fn instrument_native_shadow_stores(mach: &mut MachFunc) {
     let boxed_slots: HashMap<VReg, u16> = mach
         .boxed_gp_vregs()
@@ -1788,8 +1787,7 @@ fn instrument_native_shadow_stores(mach: &mut MachFunc) {
         return;
     }
     let shadow_roots_ptr_addr =
-        crate::codegen::runtime_fns::resolve("wren_current_shadow_roots_ptr")
-            .unwrap_or(0) as u64;
+        crate::codegen::runtime_fns::resolve("wren_current_shadow_roots_ptr").unwrap_or(0) as u64;
     if shadow_roots_ptr_addr == 0 {
         return;
     }
@@ -2009,10 +2007,12 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             // Functions with CallLocal re-enter their prologue on each recursive
             // call — prologue frame registration would be called millions of times.
             // For those, the #[naked] wren_call_N wrappers handle frame registration.
-            let has_call_local = mach.insts.iter().any(|i| matches!(i, MachInst::CallLocal { .. }));
-            let _needs_frame_reg = target == Target::Aarch64
-                && needs_native_shadow_stack(&mach)
-                && !has_call_local;
+            let has_call_local = mach
+                .insts
+                .iter()
+                .any(|i| matches!(i, MachInst::CallLocal { .. }));
+            let _needs_frame_reg =
+                target == Target::Aarch64 && needs_native_shadow_stack(&mach) && !has_call_local;
             // Shadow stores replaced by stack map-based GC root scanning.
             // JIT frames are registered via #[naked] wren_call_N wrappers +
             // prologue registration for non-CallLocal functions.
@@ -2046,7 +2046,9 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             // JIT frame registration for GC stack walking. Non-leaf functions
             // register their frame pointer so the GC can find spill-slot roots.
             if _needs_frame_reg {
-                let func_id = mach.name.strip_prefix("fn_")
+                let func_id = mach
+                    .name
+                    .strip_prefix("fn_")
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(u32::MAX);
                 instrument_jit_frame_registration(&mut mach, func_id);
@@ -2141,6 +2143,7 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
 }
 
 /// Rewrite sentinel indices in a single instruction.
+#[allow(clippy::too_many_arguments)]
 fn fixup_vreg_sentinels(
     inst: &mut MachInst,
     fp_enc: u32,
@@ -2366,10 +2369,8 @@ fn fixup_vreg_sentinels(
 ///   movz x16, pop_addr
 ///   blr  x16              (call wren_jit_frame_pop)
 fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
-    let push_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_push")
-        .unwrap_or(0) as u64;
-    let pop_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_pop")
-        .unwrap_or(0) as u64;
+    let push_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_push").unwrap_or(0) as u64;
+    let pop_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_pop").unwrap_or(0) as u64;
     if push_addr == 0 || pop_addr == 0 {
         return;
     }
@@ -2398,7 +2399,10 @@ fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
             // Find the insertion point AFTER all callee-save pushes.
             let mut insert_at = idx;
             while insert_at < mach.insts.len() {
-                if matches!(&mach.insts[insert_at], MachInst::Push { .. } | MachInst::StackAlloc { .. }) {
+                if matches!(
+                    &mach.insts[insert_at],
+                    MachInst::Push { .. } | MachInst::StackAlloc { .. }
+                ) {
                     insert_at += 1;
                 } else {
                     break;
@@ -2412,8 +2416,14 @@ fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
                 MachInst::Push { src: x0 },
                 MachInst::Push { src: x1 },
                 MachInst::Mov { dst: x0, src: x29 },
-                MachInst::LoadImm { dst: x1, bits: func_id as u64 },
-                MachInst::LoadImm { dst: x16, bits: push_addr },
+                MachInst::LoadImm {
+                    dst: x1,
+                    bits: func_id as u64,
+                },
+                MachInst::LoadImm {
+                    dst: x16,
+                    bits: push_addr,
+                },
                 MachInst::CallInd { target: x16 },
                 MachInst::Pop { dst: x1 },
                 MachInst::Pop { dst: x0 },
@@ -2427,7 +2437,10 @@ fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
             // caller-saved regs. Save/restore x0 to preserve the return value.
             let pop_seq = [
                 MachInst::Push { src: x0 },
-                MachInst::LoadImm { dst: x16, bits: pop_addr },
+                MachInst::LoadImm {
+                    dst: x16,
+                    bits: pop_addr,
+                },
                 MachInst::CallInd { target: x16 },
                 MachInst::Pop { dst: x0 },
             ];
@@ -2515,6 +2528,7 @@ fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
 struct LowerCtx<'a> {
     mf: &'a mut MachFunc,
     mir: &'a MirFunction,
+    #[allow(dead_code)]
     compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<usize>>,
     gc_value_reps: Vec<GcValueRep>,
@@ -2926,22 +2940,46 @@ impl<'a> LowerCtx<'a> {
                 let done_label = self.mf.new_label();
 
                 let false_imm = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm { dst: false_imm, bits: false_bits });
-                self.mf.emit(MachInst::ICmp { lhs: la, rhs: false_imm });
-                self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: is_false_label });
+                self.mf.emit(MachInst::LoadImm {
+                    dst: false_imm,
+                    bits: false_bits,
+                });
+                self.mf.emit(MachInst::ICmp {
+                    lhs: la,
+                    rhs: false_imm,
+                });
+                self.mf.emit(MachInst::JmpIf {
+                    cond: Cond::Eq,
+                    target: is_false_label,
+                });
 
                 let null_imm = self.mf.new_gp();
-                self.mf.emit(MachInst::LoadImm { dst: null_imm, bits: null_bits });
-                self.mf.emit(MachInst::ICmp { lhs: la, rhs: null_imm });
-                self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: is_false_label });
+                self.mf.emit(MachInst::LoadImm {
+                    dst: null_imm,
+                    bits: null_bits,
+                });
+                self.mf.emit(MachInst::ICmp {
+                    lhs: la,
+                    rhs: null_imm,
+                });
+                self.mf.emit(MachInst::JmpIf {
+                    cond: Cond::Eq,
+                    target: is_false_label,
+                });
 
                 // Not falsy → return false
-                self.mf.emit(MachInst::LoadImm { dst, bits: false_bits });
+                self.mf.emit(MachInst::LoadImm {
+                    dst,
+                    bits: false_bits,
+                });
                 self.mf.emit(MachInst::Jmp { target: done_label });
 
                 // Falsy → return true
                 self.mf.emit(MachInst::DefLabel(is_false_label));
-                self.mf.emit(MachInst::LoadImm { dst, bits: true_bits });
+                self.mf.emit(MachInst::LoadImm {
+                    dst,
+                    bits: true_bits,
+                });
 
                 self.mf.emit(MachInst::DefLabel(done_label));
             }
@@ -3081,13 +3119,10 @@ impl<'a> LowerCtx<'a> {
                 args,
             } => {
                 use crate::mir::bytecode::{
-                    CALLSITE_IC_CLASS, CALLSITE_IC_FUNC_ID, CALLSITE_IC_JIT_PTR,
-                    CALLSITE_IC_KIND,
+                    CALLSITE_IC_CLASS, CALLSITE_IC_FUNC_ID, CALLSITE_IC_JIT_PTR, CALLSITE_IC_KIND,
                 };
                 use crate::runtime::object_layout::{HEADER_CLASS, INSTANCE_FIELDS};
 
-                const QNAN: u64 = 0x7FFC_0000_0000_0000;
-                const TAG_OBJ: u64 = (1u64 << 63) | QNAN;
                 const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
                 let r = self.vreg_for(*receiver);
@@ -3113,7 +3148,14 @@ impl<'a> LowerCtx<'a> {
                     // At compile time, the IC may already be populated as kind=5
                     // from interpreter profiling. Inline the field load directly.
                     if std::env::var_os("WLIFT_SPEC").is_some() {
-                        eprintln!("spec: ic_ptr={:#x} kind={} class={:#x} fid={} args={}", ic_ptr, ic.kind, ic.class, ic.func_id, args.len());
+                        eprintln!(
+                            "spec: ic_ptr={:#x} kind={} class={:#x} fid={} args={}",
+                            ic_ptr,
+                            ic.kind,
+                            ic.class,
+                            ic.func_id,
+                            args.len()
+                        );
                     }
                     if ic.kind == 5 && ic.class != 0 && args.is_empty() {
                         let spec_slow = self.mf.new_label();
@@ -3121,33 +3163,77 @@ impl<'a> LowerCtx<'a> {
                         // Tag check
                         let tag_shifted = self.mf.new_gp();
                         let shift_48 = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: shift_48, bits: 48 });
-                        self.mf.emit(MachInst::Shr { dst: tag_shifted, lhs: r, rhs: shift_48 });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: shift_48,
+                            bits: 48,
+                        });
+                        self.mf.emit(MachInst::Shr {
+                            dst: tag_shifted,
+                            lhs: r,
+                            rhs: shift_48,
+                        });
                         let tag_expect = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: tag_expect, bits: 0xFFFC });
-                        self.mf.emit(MachInst::ICmp { lhs: tag_shifted, rhs: tag_expect });
-                        self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: spec_slow });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: tag_expect,
+                            bits: 0xFFFC,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: tag_shifted,
+                            rhs: tag_expect,
+                        });
+                        self.mf.emit(MachInst::JmpIf {
+                            cond: Cond::Ne,
+                            target: spec_slow,
+                        });
 
                         // Extract obj_ptr + class check with EMBEDDED expected class
                         let obj_ptr = self.mf.new_gp();
-                        self.mf.emit(MachInst::AndImm { dst: obj_ptr, src: r, imm: PTR_MASK });
+                        self.mf.emit(MachInst::AndImm {
+                            dst: obj_ptr,
+                            src: r,
+                            imm: PTR_MASK,
+                        });
                         let recv_class = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: recv_class, mem: Mem::new(obj_ptr, HEADER_CLASS) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: recv_class,
+                            mem: Mem::new(obj_ptr, HEADER_CLASS),
+                        });
                         let expected_class = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: expected_class, bits: ic.class as u64 });
-                        self.mf.emit(MachInst::ICmp { lhs: recv_class, rhs: expected_class });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: expected_class,
+                            bits: ic.class as u64,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: recv_class,
+                            rhs: expected_class,
+                        });
                         // Also check obj_ptr for class receivers (constructor cache_key_class)
                         let spec_ok = self.mf.new_label();
-                        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: spec_ok });
-                        self.mf.emit(MachInst::ICmp { lhs: obj_ptr, rhs: expected_class });
-                        self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: spec_slow });
+                        self.mf.emit(MachInst::JmpIf {
+                            cond: Cond::Eq,
+                            target: spec_ok,
+                        });
+                        self.mf.emit(MachInst::ICmp {
+                            lhs: obj_ptr,
+                            rhs: expected_class,
+                        });
+                        self.mf.emit(MachInst::JmpIf {
+                            cond: Cond::Ne,
+                            target: spec_slow,
+                        });
                         self.mf.emit(MachInst::DefLabel(spec_ok));
 
                         // Inline field load — NO blr, NO prologue, NO ret
                         let fields_ptr = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: fields_ptr, mem: Mem::new(obj_ptr, INSTANCE_FIELDS) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: fields_ptr,
+                            mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
+                        });
                         let field_offset = (ic.func_id as i32) * 8;
-                        self.mf.emit(MachInst::Ldr { dst, mem: Mem::new(fields_ptr, field_offset) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst,
+                            mem: Mem::new(fields_ptr, field_offset),
+                        });
                         self.mf.emit(MachInst::Jmp { target: done_label });
 
                         // Speculation miss → fall through to generic IC check
@@ -3170,60 +3256,125 @@ impl<'a> LowerCtx<'a> {
                     // instead of AND + LoadImm64 + CMP (10+ instructions).
                     let tag_shifted = self.mf.new_gp();
                     let shift_48 = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: shift_48, bits: 48 });
-                    self.mf.emit(MachInst::Shr { dst: tag_shifted, lhs: r, rhs: shift_48 });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: shift_48,
+                        bits: 48,
+                    });
+                    self.mf.emit(MachInst::Shr {
+                        dst: tag_shifted,
+                        lhs: r,
+                        rhs: shift_48,
+                    });
                     let tag_expect = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: tag_expect, bits: 0xFFFC });
-                    self.mf.emit(MachInst::ICmp { lhs: tag_shifted, rhs: tag_expect });
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: tag_expect,
+                        bits: 0xFFFC,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: tag_shifted,
+                        rhs: tag_expect,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: slow_label,
+                    });
 
                     // ── Extract object pointer + load class ──
                     let obj_ptr = self.mf.new_gp();
-                    self.mf.emit(MachInst::AndImm { dst: obj_ptr, src: r, imm: PTR_MASK });
+                    self.mf.emit(MachInst::AndImm {
+                        dst: obj_ptr,
+                        src: r,
+                        imm: PTR_MASK,
+                    });
                     let recv_class = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr { dst: recv_class, mem: Mem::new(obj_ptr, HEADER_CLASS) });
+                    self.mf.emit(MachInst::Ldr {
+                        dst: recv_class,
+                        mem: Mem::new(obj_ptr, HEADER_CLASS),
+                    });
 
                     // ── IC class check (with cache_key_class logic) ──
                     // For class objects (recv.class == ClassClass), the IC stores
                     // the class itself as cache_key, not its metaclass. We must
                     // compare obj_ptr (the class) instead of recv_class (the metaclass).
-                    let cache_key = self.mf.new_gp();
-                    let class_class_ptr = self.mf.new_gp();
+                    let _cache_key = self.mf.new_gp();
+                    let _class_class_ptr = self.mf.new_gp();
                     // Load ClassClass pointer from JitContext: vm.class_class
                     // ClassClass is stored as the header.class of any class object.
                     // If recv_class == ClassClass, use obj_ptr as cache_key.
                     // Otherwise use recv_class.
                     // For now: always try recv_class first. On mismatch, try obj_ptr.
                     let ic_base = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: ic_base, bits: ic_ptr as u64 });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: ic_base,
+                        bits: ic_ptr as u64,
+                    });
                     let cached_class = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr { dst: cached_class, mem: Mem::new(ic_base, CALLSITE_IC_CLASS) });
-                    self.mf.emit(MachInst::ICmp { lhs: recv_class, rhs: cached_class });
+                    self.mf.emit(MachInst::Ldr {
+                        dst: cached_class,
+                        mem: Mem::new(ic_base, CALLSITE_IC_CLASS),
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: recv_class,
+                        rhs: cached_class,
+                    });
                     let class_check_ok = self.mf.new_label();
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: class_check_ok });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Eq,
+                        target: class_check_ok,
+                    });
                     // Mismatch: check if receiver is a class (obj_ptr == cached_class)
-                    self.mf.emit(MachInst::ICmp { lhs: obj_ptr, rhs: cached_class });
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: obj_ptr,
+                        rhs: cached_class,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: slow_label,
+                    });
                     self.mf.emit(MachInst::DefLabel(class_check_ok));
 
                     // ── Load kind, dispatch by value ──
                     let kind = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr { dst: kind, mem: Mem::new(ic_base, CALLSITE_IC_KIND) });
+                    self.mf.emit(MachInst::Ldr {
+                        dst: kind,
+                        mem: Mem::new(ic_base, CALLSITE_IC_KIND),
+                    });
                     let non_jit_label = self.mf.new_label();
                     let kind1 = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: kind1, bits: 1 });
-                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind1 });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: kind1,
+                        bits: 1,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: kind1,
+                    });
                     let jit_dispatch_label = self.mf.new_label();
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: jit_dispatch_label });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Eq,
+                        target: jit_dispatch_label,
+                    });
                     let kind6 = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: kind6, bits: 6 });
-                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind6 });
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: non_jit_label });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: kind6,
+                        bits: 6,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: kind6,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: non_jit_label,
+                    });
                     self.mf.emit(MachInst::DefLabel(jit_dispatch_label));
 
                     // ── JIT dispatch (kind=1 or kind=6): always do context swap ──
                     let jit_ptr = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr { dst: jit_ptr, mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR) });
+                    self.mf.emit(MachInst::Ldr {
+                        dst: jit_ptr,
+                        mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
+                    });
                     // For kind=1 (leaf) the context swap is harmless — the leaf
                     // doesn't read JitContext. This avoids the kind cascade entirely.
                     {
@@ -3233,14 +3384,32 @@ impl<'a> LowerCtx<'a> {
 
                         let saved_func_id = self.mf.new_gp();
                         let saved_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                        self.mf.emit(MachInst::Ldr { dst: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: saved_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: saved_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                        });
                         let ic_func_id = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: ic_func_id, mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ic_func_id,
+                            mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
+                        });
                         let ic_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: ic_closure, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
-                        self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                        self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ic_closure,
+                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: ic_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: ic_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                        });
 
                         let mut direct_args = Vec::with_capacity(user_args.len() + 1);
                         direct_args.push(r);
@@ -3250,32 +3419,62 @@ impl<'a> LowerCtx<'a> {
                             args: direct_args,
                             ret: Some(dst),
                         });
-                        self.mf.emit(MachInst::Str { src: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                        self.mf.emit(MachInst::Str { src: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        self.mf.emit(MachInst::Str {
+                            src: saved_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: saved_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                        });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
 
                     // ── Non-JIT dispatch: getter (kind=5) or native (kind=4) ──
                     self.mf.emit(MachInst::DefLabel(non_jit_label));
                     let kind = self.mf.new_gp();
-                    self.mf.emit(MachInst::Ldr { dst: kind, mem: Mem::new(ic_base, CALLSITE_IC_KIND) });
+                    self.mf.emit(MachInst::Ldr {
+                        dst: kind,
+                        mem: Mem::new(ic_base, CALLSITE_IC_KIND),
+                    });
 
                     // Kind=5: getter (direct field load)
                     let getter_label = self.mf.new_label();
                     let kind5 = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: kind5, bits: 5 });
-                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind5 });
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: getter_label });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: kind5,
+                        bits: 5,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: kind5,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Eq,
+                        target: getter_label,
+                    });
 
                     // Kind=4: native method
                     let kind4 = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: kind4, bits: 4 });
-                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind4 });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: kind4,
+                        bits: 4,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: kind4,
+                    });
                     let ctor_label = self.mf.new_label();
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: ctor_label });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: ctor_label,
+                    });
                     {
                         let native_fn = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: native_fn, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: native_fn,
+                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
+                        });
                         let native_call_name = match args.len() {
                             0 => "wren_ic_native_0",
                             1 => "wren_ic_native_1",
@@ -3284,7 +3483,11 @@ impl<'a> LowerCtx<'a> {
                         };
                         let mut native_args = vec![native_fn, r];
                         native_args.extend(user_args.iter().copied());
-                        self.mf.emit(MachInst::CallRuntime { name: native_call_name, args: native_args, ret: Some(dst) });
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: native_call_name,
+                            args: native_args,
+                            ret: Some(dst),
+                        });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
 
@@ -3293,15 +3496,30 @@ impl<'a> LowerCtx<'a> {
                     // full dispatch chain (50 Rust function calls → 1).
                     self.mf.emit(MachInst::DefLabel(ctor_label));
                     let kind3 = self.mf.new_gp();
-                    self.mf.emit(MachInst::LoadImm { dst: kind3, bits: 3 });
-                    self.mf.emit(MachInst::ICmp { lhs: kind, rhs: kind3 });
-                    self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: slow_label });
+                    self.mf.emit(MachInst::LoadImm {
+                        dst: kind3,
+                        bits: 3,
+                    });
+                    self.mf.emit(MachInst::ICmp {
+                        lhs: kind,
+                        rhs: kind3,
+                    });
+                    self.mf.emit(MachInst::JmpIf {
+                        cond: Cond::Ne,
+                        target: slow_label,
+                    });
                     {
                         // Load jit_ptr from IC — now stores the constructor's JIT code
                         let ctor_jit = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: ctor_jit, mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ctor_jit,
+                            mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
+                        });
                         // If constructor isn't compiled, fall to slow path
-                        self.mf.emit(MachInst::JmpZero { src: ctor_jit, target: slow_label });
+                        self.mf.emit(MachInst::JmpZero {
+                            src: ctor_jit,
+                            target: slow_label,
+                        });
 
                         // 1. Allocate instance: wren_alloc_instance(class) — ONE Rust call
                         let instance = self.mf.new_gp();
@@ -3318,14 +3536,32 @@ impl<'a> LowerCtx<'a> {
 
                         let saved_func_id = self.mf.new_gp();
                         let saved_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                        self.mf.emit(MachInst::Ldr { dst: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: saved_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: saved_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                        });
                         let ic_func_id = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: ic_func_id, mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ic_func_id,
+                            mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
+                        });
                         let ic_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: ic_closure, mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE) });
-                        self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                        self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: ic_closure,
+                            mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: ic_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: ic_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                        });
 
                         // 3. Call constructor body DIRECTLY — no Rust dispatch chain
                         // Args: [instance, user_args...]
@@ -3339,8 +3575,14 @@ impl<'a> LowerCtx<'a> {
                         });
 
                         // 4. Restore context
-                        self.mf.emit(MachInst::Str { src: saved_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                        self.mf.emit(MachInst::Str { src: saved_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                        self.mf.emit(MachInst::Str {
+                            src: saved_func_id,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                        });
+                        self.mf.emit(MachInst::Str {
+                            src: saved_closure,
+                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                        });
 
                         // Result = the allocated instance (constructor modifies it in place)
                         self.mf.emit(MachInst::Mov { dst, src: instance });
@@ -3351,16 +3593,36 @@ impl<'a> LowerCtx<'a> {
                     self.mf.emit(MachInst::DefLabel(getter_label));
                     {
                         let fields_ptr = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: fields_ptr, mem: Mem::new(obj_ptr, INSTANCE_FIELDS) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: fields_ptr,
+                            mem: Mem::new(obj_ptr, INSTANCE_FIELDS),
+                        });
                         let field_idx = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr { dst: field_idx, mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID) });
+                        self.mf.emit(MachInst::Ldr {
+                            dst: field_idx,
+                            mem: Mem::new(ic_base, CALLSITE_IC_FUNC_ID),
+                        });
                         let shift = self.mf.new_gp();
-                        self.mf.emit(MachInst::LoadImm { dst: shift, bits: 3 });
+                        self.mf.emit(MachInst::LoadImm {
+                            dst: shift,
+                            bits: 3,
+                        });
                         let field_offset = self.mf.new_gp();
-                        self.mf.emit(MachInst::Shl { dst: field_offset, lhs: field_idx, rhs: shift });
+                        self.mf.emit(MachInst::Shl {
+                            dst: field_offset,
+                            lhs: field_idx,
+                            rhs: shift,
+                        });
                         let field_addr = self.mf.new_gp();
-                        self.mf.emit(MachInst::IAdd { dst: field_addr, lhs: fields_ptr, rhs: field_offset });
-                        self.mf.emit(MachInst::Ldr { dst, mem: Mem::new(field_addr, 0) });
+                        self.mf.emit(MachInst::IAdd {
+                            dst: field_addr,
+                            lhs: fields_ptr,
+                            rhs: field_offset,
+                        });
+                        self.mf.emit(MachInst::Ldr {
+                            dst,
+                            mem: Mem::new(field_addr, 0),
+                        });
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
                     self.mf.emit(MachInst::DefLabel(slow_label));
@@ -3392,8 +3654,7 @@ impl<'a> LowerCtx<'a> {
                 let dst = self.vreg_for(dst_val);
                 let direct_arg_count = args.len() + 1;
                 let direct_target = self.fn_entry_label;
-                if direct_arg_count <= ABI_ARG_SENTINELS.len()
-                    && !self.entry_param_vregs.is_empty()
+                if direct_arg_count <= ABI_ARG_SENTINELS.len() && !self.entry_param_vregs.is_empty()
                 {
                     let mut call_args = Vec::with_capacity(direct_arg_count);
                     call_args.push(self.entry_param_vregs[0]);

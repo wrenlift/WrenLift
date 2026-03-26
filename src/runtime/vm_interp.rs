@@ -72,7 +72,7 @@ impl MethodCache {
         let idx = Self::hash(class, method);
         if let Some(entry) = unsafe { self.entries.get_unchecked(idx) } {
             if entry.class == class && entry.method_raw == method.index() {
-                return Some((entry.result.clone(), entry.defining_class));
+                return Some((entry.result, entry.defining_class));
             }
         }
         None
@@ -163,8 +163,7 @@ fn try_run_root_frame_native(
     }
 
     let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-    let allow_nonleaf_native =
-        crate::codegen::runtime_fns::allow_root_nonleaf_native(vm, func_id);
+    let allow_nonleaf_native = crate::codegen::runtime_fns::allow_root_nonleaf_native(vm, func_id);
     if !is_leaf && !allow_nonleaf_native {
         return Ok(None);
     }
@@ -225,10 +224,7 @@ fn try_run_root_frame_native(
     trace_root_native(|| {
         format!(
             "root-native: return func={} fiber={:p} live_fiber={:p} vm_fiber_before={:p}",
-            func_id.0,
-            fiber,
-            live_fiber,
-            vm.fiber
+            func_id.0, fiber, live_fiber, vm.fiber
         )
     });
     vm.fiber = live_fiber;
@@ -541,8 +537,7 @@ fn run_fiber_with_stop_depth(
         };
 
         if pc == 0 && closure.is_none() && return_dst.is_none() {
-            if let Some(return_val) = try_run_root_frame_native(vm, fiber, func_id, &module_name)?
-            {
+            if let Some(return_val) = try_run_root_frame_native(vm, fiber, func_id, &module_name)? {
                 fiber = vm.fiber;
                 if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
                     let frame_count = if fiber.is_null() {
@@ -1533,7 +1528,7 @@ fn run_fiber_with_stop_depth(
                             };
                             if let Some((ref m, dc)) = result {
                                 vm.method_cache
-                                    .insert(cache_key_class, method, m.clone(), dc);
+                                    .insert(cache_key_class, method, *m, dc);
                             }
                             match result {
                                 Some((m, c)) => (Some(m), Some(c)),
@@ -1543,8 +1538,14 @@ fn run_fiber_with_stop_depth(
 
                     match method_entry {
                         Some(Method::Native(func)) => {
-                            let result =
-                                call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &arg_vals);
+                            let result = call_native_with_frame_sync(
+                                vm,
+                                fiber,
+                                pc,
+                                &mut values,
+                                func,
+                                &arg_vals,
+                            );
                             if vm.has_error {
                                 vm.has_error = false;
                                 let fiber_is_try = unsafe { (*fiber).is_try };
@@ -1799,7 +1800,9 @@ fn run_fiber_with_stop_depth(
                                     frame.bc_ptr = bc_ptr;
                                 }
                                 let result = vm.call_constructor_sync(
-                                    recv_class, closure_ptr, &arg_vals[1..],
+                                    recv_class,
+                                    closure_ptr,
+                                    &arg_vals[1..],
                                 );
                                 // Re-read interpreter state (may have been modified
                                 // by nested calls or GC during constructor execution).
@@ -1972,8 +1975,14 @@ fn run_fiber_with_stop_depth(
                         };
                         match method_entry {
                             Some(Method::Native(func)) => {
-                                let result =
-                                    call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &arg_vals);
+                                let result = call_native_with_frame_sync(
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &arg_vals,
+                                );
                                 set_reg(&mut values, dst, result);
                             }
                             Some(Method::Closure(closure_ptr)) => {
@@ -2041,8 +2050,14 @@ fn run_fiber_with_stop_depth(
                     let sym = subscript_get_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(Method::Native(func)) => {
-                            let result =
-                                call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &all_args);
+                            let result = call_native_with_frame_sync(
+                                vm,
+                                fiber,
+                                pc,
+                                &mut values,
+                                func,
+                                &all_args,
+                            );
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
@@ -2085,8 +2100,14 @@ fn run_fiber_with_stop_depth(
                     let sym = subscript_set_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
                         Some(Method::Native(func)) => {
-                            let result =
-                                call_native_with_frame_sync(vm, fiber, pc, &mut values, func, &all_args);
+                            let result = call_native_with_frame_sync(
+                                vm,
+                                fiber,
+                                pc,
+                                &mut values,
+                                func,
+                                &all_args,
+                            );
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
@@ -2147,9 +2168,11 @@ fn run_fiber_with_stop_depth(
                         let map_ptr =
                             map_val.as_object().unwrap() as *mut crate::runtime::object::ObjMap;
                         for i in 0..entries.len() {
-                            let key = crate::codegen::runtime_fns::jit_root_at(root_len_before + i * 2);
-                            let val =
-                                crate::codegen::runtime_fns::jit_root_at(root_len_before + i * 2 + 1);
+                            let key =
+                                crate::codegen::runtime_fns::jit_root_at(root_len_before + i * 2);
+                            let val = crate::codegen::runtime_fns::jit_root_at(
+                                root_len_before + i * 2 + 1,
+                            );
                             unsafe { (*map_ptr).set(key, val) };
                         }
                     }
@@ -2709,6 +2732,11 @@ fn ensure_ctx_reg() {}
 
 /// Transmute and call a JIT function pointer with the given args (max 4).
 /// Public wrapper for call_jit_fn (used by call_constructor_sync in vm.rs).
+///
+/// # Safety
+/// `fn_ptr` must point to a valid JIT-compiled function whose ABI matches
+/// the number of arguments provided in `args`. The JIT code must be safe to
+/// execute from the current thread context.
 pub unsafe fn call_jit_fn_pub(fn_ptr: *const u8, args: &[Value]) -> u64 {
     call_jit_fn(fn_ptr, args)
 }
@@ -2871,7 +2899,7 @@ fn try_operator_dispatch(
     } else {
         let found = unsafe { (*class).find_method(method_sym).cloned() };
         if let Some(ref m) = found {
-            vm.method_cache.insert(class, method_sym, m.clone(), class);
+            vm.method_cache.insert(class, method_sym, *m, class);
         }
         found
     };
@@ -2921,7 +2949,7 @@ unsafe fn find_method_with_class(
         let cls = &*c;
         if idx < cls.methods.len() {
             if let Some(m) = &cls.methods[idx] {
-                return Some((m.clone(), c));
+                return Some((*m, c));
             }
         }
         c = (*c).superclass;

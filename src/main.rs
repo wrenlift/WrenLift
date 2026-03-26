@@ -135,7 +135,9 @@ fn make_vm(cli: &Cli) -> VM {
         execution_mode: mode,
         step_limit,
         gc_strategy,
-        opt_threshold: cli.opt_threshold.unwrap_or(VMConfig::default().opt_threshold),
+        opt_threshold: cli
+            .opt_threshold
+            .unwrap_or(VMConfig::default().opt_threshold),
         ..VMConfig::default()
     };
     VM::new(config)

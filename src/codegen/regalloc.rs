@@ -270,7 +270,8 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
 
     for iv in &intervals {
         if func.force_boxed_gp_spills() && func.is_boxed_gp(iv.vreg) {
-            let slot_offset = target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
+            let slot_offset =
+                target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
             next_spill_slot += 1;
             assignments.insert(iv.vreg, Location::Spill(slot_offset));
             continue;
@@ -320,7 +321,8 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
                 let (_, spilled_vreg, hw) = active.remove(idx);
 
                 // Reassign: spilled vreg goes to stack, we get its register.
-                let slot_offset = target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
+                let slot_offset =
+                    target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
                 next_spill_slot += 1;
                 assignments.insert(spilled_vreg, Location::Spill(slot_offset));
 
@@ -333,7 +335,8 @@ pub fn linear_scan(func: &MachFunc, target: &TargetRegs) -> RegAllocResult {
                 active.sort_by_key(|&(end, _, _)| end);
             } else {
                 // Spill this interval directly.
-                let slot_offset = target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
+                let slot_offset =
+                    target.spill_first_offset + (next_spill_slot as i32) * target.spill_stride;
                 next_spill_slot += 1;
                 assignments.insert(iv.vreg, Location::Spill(slot_offset));
             }
@@ -420,9 +423,7 @@ pub fn apply_allocation(func: &mut MachFunc, result: &RegAllocResult, frame_rese
         // For spilled defs: insert store after the instruction.
         for d in &defs {
             if let Some(&Location::Spill(offset)) = result.assignments.get(d) {
-                let scratch = *spill_overrides
-                    .get(d)
-                    .unwrap_or(&spill_scratch(*d, 0));
+                let scratch = *spill_overrides.get(d).unwrap_or(&spill_scratch(*d, 0));
                 if d.class == RegClass::Fp || d.class == RegClass::Vec {
                     new_insts.push(MachInst::FStr {
                         src: scratch,

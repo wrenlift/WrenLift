@@ -35,7 +35,7 @@
 ///     next_i = AddF64(i, one)
 ///     br cond_bb [next_i, ...]
 /// ```
-use super::{MirPass, replace_uses_in_func};
+use super::{replace_uses_in_func, MirPass};
 use crate::intern::Interner;
 use crate::mir::{Instruction, MirFunction, Terminator, ValueId};
 use std::collections::HashMap;
@@ -73,7 +73,14 @@ impl<'a> MirPass for RangeLoop<'a> {
 
         let mut changed = false;
         for (range_vid, from_vid, to_vid) in range_infos {
-            if self.try_optimize(func, range_vid, from_vid, to_vid, iterate_sym, iter_value_sym) {
+            if self.try_optimize(
+                func,
+                range_vid,
+                from_vid,
+                to_vid,
+                iterate_sym,
+                iter_value_sym,
+            ) {
                 changed = true;
             }
         }
@@ -99,7 +106,9 @@ impl<'a> RangeLoop<'a> {
         for (bi, block) in func.blocks.iter().enumerate() {
             for (ii, &(vid, ref inst)) in block.instructions.iter().enumerate() {
                 if let Instruction::Call {
-                    receiver, method, args,
+                    receiver,
+                    method,
+                    args,
                 } = inst
                 {
                     if *receiver != range_vid {
@@ -109,9 +118,9 @@ impl<'a> RangeLoop<'a> {
                         // Check if arg is ConstNull (initial call)
                         let arg = args[0];
                         let is_null_arg = func.blocks.iter().any(|b| {
-                            b.instructions.iter().any(|&(v, ref i)| {
-                                v == arg && matches!(i, Instruction::ConstNull)
-                            })
+                            b.instructions
+                                .iter()
+                                .any(|&(v, ref i)| v == arg && matches!(i, Instruction::ConstNull))
                         });
                         if is_null_arg {
                             init_call = Some((bi, ii, vid));
@@ -129,7 +138,7 @@ impl<'a> RangeLoop<'a> {
             Some(v) => v,
             None => return false,
         };
-        let (body_bi, body_iter_ii, body_iter_vid, _iter_arg) = match body_iterate {
+        let (body_bi, body_iter_ii, _body_iter_vid, _iter_arg) = match body_iterate {
             Some(v) => v,
             None => return false,
         };
@@ -168,9 +177,11 @@ impl<'a> RangeLoop<'a> {
         let iter_param = cond_block.params[0].0;
 
         // Find Not(iter_param) in cond_bb
-        let not_pos = match cond_block.instructions.iter().position(|&(_, ref inst)| {
-            matches!(inst, Instruction::Not(v) if *v == iter_param)
-        }) {
+        let not_pos = match cond_block
+            .instructions
+            .iter()
+            .position(|(_, inst)| matches!(inst, Instruction::Not(v) if *v == iter_param))
+        {
             Some(v) => v,
             None => return false,
         };
@@ -207,8 +218,7 @@ impl<'a> RangeLoop<'a> {
         // 2. In cond_bb: replace Not(iter_param) with CmpLt(iter_param, to_vid)
         //    Use boxed CmpLt (not CmpLtF64) because iter_param is NaN-boxed.
         //    TypeSpecialize will convert to CmpLtF64 on the Optimized tier.
-        func.blocks[cond_bi].instructions[not_pos].1 =
-            Instruction::CmpLt(iter_param, to_vid);
+        func.blocks[cond_bi].instructions[not_pos].1 = Instruction::CmpLt(iter_param, to_vid);
 
         // Swap CondBranch targets (CmpLtF64 is true when we should CONTINUE, not exit)
         func.blocks[cond_bi].terminator = Terminator::CondBranch {
@@ -228,11 +238,8 @@ impl<'a> RangeLoop<'a> {
         let one_vid = func.new_value();
         let one_inst = (one_vid, Instruction::ConstNum(1.0));
         // Insert before body_iter_ii (which may have shifted if body_val_ii < body_iter_ii)
-        let adjusted_iter_ii = if body_val_ii < body_iter_ii {
-            body_iter_ii // no shift since we only replaced, not inserted above
-        } else {
-            body_iter_ii
-        };
+        // No shift needed since we only replaced (not inserted) the iteratorValue call above.
+        let adjusted_iter_ii = body_iter_ii;
         func.blocks[body_bi]
             .instructions
             .insert(adjusted_iter_ii, one_inst);
@@ -258,7 +265,9 @@ mod tests {
     #[test]
     fn test_range_loop_name() {
         let interner = Interner::new();
-        let pass = RangeLoop { interner: &interner };
+        let pass = RangeLoop {
+            interner: &interner,
+        };
         assert_eq!(pass.name(), "range_loop");
     }
 }

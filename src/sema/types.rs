@@ -135,7 +135,12 @@ impl TypeEnv {
     }
 
     /// Record a method return type (joins with existing).
-    pub fn record_method_return_type(&mut self, class: SymbolId, method: SymbolId, ty: &InferredType) {
+    pub fn record_method_return_type(
+        &mut self,
+        class: SymbolId,
+        method: SymbolId,
+        ty: &InferredType,
+    ) {
         let entry = self.method_return_types.entry((class, method));
         let current = entry.or_insert_with(|| ty.clone());
         if current != ty {
@@ -440,7 +445,10 @@ impl TypeInferrer {
                 }
                 // Look up method return type if receiver class is known.
                 if let InferredType::Class(class_sym) = &recv_ty {
-                    let ret_ty = self.env.get_method_return_type(*class_sym, method.0).clone();
+                    let ret_ty = self
+                        .env
+                        .get_method_return_type(*class_sym, method.0)
+                        .clone();
                     if ret_ty.is_known() {
                         return ret_ty;
                     }

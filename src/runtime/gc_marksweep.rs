@@ -311,6 +311,7 @@ impl GcAllocator for MarkSweepGc {
     fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
         self.alloc_boxed(ObjClass::new(name, superclass))
     }
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
         let num_fields = if class.is_null() {
             0

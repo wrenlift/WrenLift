@@ -747,18 +747,24 @@ impl<'a> MirBuilder<'a> {
                 let is_num_expr = |e: &Spanned<Expr>, env: &crate::sema::types::TypeEnv| -> bool {
                     match &e.0 {
                         Expr::Num(_) => true,
-                        Expr::UnaryOp { op: UnaryOp::Neg, operand } => matches!(operand.0, Expr::Num(_)),
+                        Expr::UnaryOp {
+                            op: UnaryOp::Neg,
+                            operand,
+                        } => matches!(operand.0, Expr::Num(_)),
                         _ => env.get_expr_type(e.1.start).is_num(),
                     }
                 };
-                let both_num = self.type_env.as_ref().map_or(false, |env| {
+                let both_num = self.type_env.as_ref().is_some_and(|env| {
                     is_num_expr(left, env) && is_num_expr(right, env)
                 });
                 if both_num {
                     // Emit unboxed f64 instructions directly — no CallRuntime.
                     match op {
-                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul
-                        | BinaryOp::Div | BinaryOp::Mod => {
+                        BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Mod => {
                             let ua = self.emit(Instruction::Unbox(lhs));
                             let ub = self.emit(Instruction::Unbox(rhs));
                             let r = self.emit(match op {
@@ -771,8 +777,7 @@ impl<'a> MirBuilder<'a> {
                             });
                             self.emit(Instruction::Box(r))
                         }
-                        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq
-                        | BinaryOp::GtEq => {
+                        BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
                             let ua = self.emit(Instruction::Unbox(lhs));
                             let ub = self.emit(Instruction::Unbox(rhs));
                             self.emit(match op {
@@ -1427,8 +1432,8 @@ pub fn lower_module(
                 }
             }
             for sym in seen {
-                if !full_map.contains_key(&sym) {
-                    full_map.insert(sym, inherited_fields + own_idx);
+                if let std::collections::hash_map::Entry::Vacant(e) = full_map.entry(sym) {
+                    e.insert(inherited_fields + own_idx);
                     own_idx += 1;
                 }
             }
@@ -1497,8 +1502,8 @@ fn compile_class(
         let mut fmap: HashMap<SymbolId, u16> = parent_field_map.clone();
         let mut own_idx: u16 = 0;
         for &sym in &field_names {
-            if !fmap.contains_key(&sym) {
-                fmap.insert(sym, inherited_field_offset + own_idx);
+            if let std::collections::hash_map::Entry::Vacant(e) = fmap.entry(sym) {
+                e.insert(inherited_field_offset + own_idx);
                 own_idx += 1;
             }
         }
@@ -1581,7 +1586,10 @@ fn compile_class(
             name: decl.name.0,
             superclass: decl.superclass.as_ref().map(|s| s.0),
             methods,
-            num_fields: field_names.iter().filter(|s| !parent_field_map.contains_key(s)).count() as u16,
+            num_fields: field_names
+                .iter()
+                .filter(|s| !parent_field_map.contains_key(s))
+                .count() as u16,
             protocols: conformance.conforms,
         },
         all_closures,
