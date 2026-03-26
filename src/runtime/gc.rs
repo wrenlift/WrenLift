@@ -65,7 +65,13 @@ impl OldArena {
         // Current chunk full — add a new one.
         let needed = (size + align).max(self.chunk_size);
         self.chunk_size = (self.chunk_size * 2).min(4 * 1024 * 1024); // grow up to 4 MB
-        self.chunks.push(vec![0u8; needed]);
+        // Allocate as Vec<u64> to guarantee 8-byte alignment, then transmute to Vec<u8>.
+        let u64_count = needed.div_ceil(8);
+        let aligned_vec: Vec<u64> = vec![0u64; u64_count];
+        let byte_len = u64_count * 8;
+        let mut bytes = std::mem::ManuallyDrop::new(aligned_vec);
+        let chunk = unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut u8, byte_len, byte_len) };
+        self.chunks.push(chunk);
         self.alloc_ptr = 0;
 
         let ptr = self.try_alloc_current::<T>(align, size).unwrap();

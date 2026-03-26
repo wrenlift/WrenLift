@@ -2031,6 +2031,17 @@ pub extern "C" fn wren_make_list_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// Allocate a new empty map.
+/// Set a key-value pair on a map object.
+pub extern "C" fn wren_map_set(map_val: u64, key: u64, value: u64) {
+    let map = Value::from_bits(map_val);
+    if let Some(ptr) = map.as_object() {
+        let map_ptr = ptr as *mut ObjMap;
+        unsafe {
+            (*map_ptr).set(Value::from_bits(key), Value::from_bits(value));
+        }
+    }
+}
+
 pub extern "C" fn wren_make_map() -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
@@ -2652,6 +2663,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_list_3" => Some(wren_make_list_3 as *const () as usize),
         "wren_make_list_4" => Some(wren_make_list_4 as *const () as usize),
         "wren_make_map" => Some(wren_make_map as *const () as usize),
+        "wren_map_set" => Some(wren_map_set as *const () as usize),
         "wren_make_range" => Some(wren_make_range as *const () as usize),
         // Arity-specific closure creation
         "wren_make_closure_0" => Some(wren_make_closure_0 as *const () as usize),

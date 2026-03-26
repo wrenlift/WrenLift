@@ -2625,6 +2625,15 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Get or create the VReg for a MIR value.
+    /// Check if a MIR value is known to be a List (from MakeList instruction).
+    fn is_known_list_receiver(&self, val: ValueId) -> bool {
+        use crate::mir::Instruction;
+        self.def_map
+            .get(val.0 as usize)
+            .and_then(|opt| opt.as_ref())
+            .is_some_and(|inst| matches!(inst, Instruction::MakeList(_)))
+    }
+
     fn vreg_for(&mut self, val: ValueId) -> VReg {
         if let Some(&r) = self.val_map.get(&val) {
             return r;
@@ -3396,23 +3405,10 @@ impl<'a> LowerCtx<'a> {
                         dst: jit_ptr,
                         mem: Mem::new(ic_base, CALLSITE_IC_JIT_PTR),
                     });
-                    // For kind=1 (leaf) the context swap is harmless — the leaf
-                    // doesn't read JitContext. This avoids the kind cascade entirely.
+                    // Context swap + direct call. On aarch64, use x20 (reserved
+                    // JitContext pointer) for zero-overhead stores. On x86_64,
+                    // use wren_ic_enter/leave CallRuntime (TLS-based).
                     {
-                        let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
-                        const CTX_OFFSET_FUNC_ID: i32 = 40;
-                        const CTX_OFFSET_CLOSURE: i32 = 48;
-
-                        let saved_func_id = self.mf.new_gp();
-                        let saved_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: saved_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Ldr {
-                            dst: saved_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
                         let ic_func_id = self.mf.new_gp();
                         self.mf.emit(MachInst::Ldr {
                             dst: ic_func_id,
@@ -3423,14 +3419,30 @@ impl<'a> LowerCtx<'a> {
                             dst: ic_closure,
                             mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
                         });
-                        self.mf.emit(MachInst::Str {
-                            src: ic_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Str {
-                            src: ic_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
+
+                        #[cfg(target_arch = "aarch64")]
+                        let saved_ctx = {
+                            let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
+                            const CTX_OFFSET_FUNC_ID: i32 = 40;
+                            const CTX_OFFSET_CLOSURE: i32 = 48;
+                            let saved_fid = self.mf.new_gp();
+                            let saved_cls = self.mf.new_gp();
+                            self.mf.emit(MachInst::Ldr { dst: saved_fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                            self.mf.emit(MachInst::Ldr { dst: saved_cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                            self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            (Some(saved_fid), Some(saved_cls))
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let saved_ctx = {
+                            let saved = self.mf.new_gp();
+                            self.mf.emit(MachInst::CallRuntime {
+                                name: "wren_ic_enter",
+                                args: vec![ic_func_id, ic_closure],
+                                ret: Some(saved),
+                            });
+                            (Some(saved), None::<VReg>)
+                        };
 
                         let mut direct_args = Vec::with_capacity(user_args.len() + 1);
                         direct_args.push(r);
@@ -3440,14 +3452,29 @@ impl<'a> LowerCtx<'a> {
                             args: direct_args,
                             ret: Some(dst),
                         });
-                        self.mf.emit(MachInst::Str {
-                            src: saved_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Str {
-                            src: saved_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
+
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
+                            const CTX_OFFSET_FUNC_ID: i32 = 40;
+                            const CTX_OFFSET_CLOSURE: i32 = 48;
+                            if let Some(fid) = saved_ctx.0 {
+                                self.mf.emit(MachInst::Str { src: fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                            }
+                            if let Some(cls) = saved_ctx.1 {
+                                self.mf.emit(MachInst::Str { src: cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            if let Some(saved) = saved_ctx.0 {
+                                self.mf.emit(MachInst::CallRuntime {
+                                    name: "wren_ic_leave",
+                                    args: vec![saved],
+                                    ret: None,
+                                });
+                            }
+                        }
                     }
                     self.mf.emit(MachInst::Jmp { target: done_label });
 
@@ -3550,21 +3577,7 @@ impl<'a> LowerCtx<'a> {
                             ret: Some(instance),
                         });
 
-                        // 2. Context swap via x20 (stores only, no Rust call)
-                        let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
-                        const CTX_OFFSET_FUNC_ID: i32 = 40;
-                        const CTX_OFFSET_CLOSURE: i32 = 48;
-
-                        let saved_func_id = self.mf.new_gp();
-                        let saved_closure = self.mf.new_gp();
-                        self.mf.emit(MachInst::Ldr {
-                            dst: saved_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Ldr {
-                            dst: saved_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
+                        // 2. Context swap + direct call (platform-specific)
                         let ic_func_id = self.mf.new_gp();
                         self.mf.emit(MachInst::Ldr {
                             dst: ic_func_id,
@@ -3575,35 +3588,64 @@ impl<'a> LowerCtx<'a> {
                             dst: ic_closure,
                             mem: Mem::new(ic_base, CALLSITE_IC_CLOSURE),
                         });
-                        self.mf.emit(MachInst::Str {
-                            src: ic_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Str {
-                            src: ic_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
 
-                        // 3. Call constructor body DIRECTLY — no Rust dispatch chain
-                        // Args: [instance, user_args...]
+                        #[cfg(target_arch = "aarch64")]
+                        let ctor_saved = {
+                            let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
+                            const CTX_OFFSET_FUNC_ID: i32 = 40;
+                            const CTX_OFFSET_CLOSURE: i32 = 48;
+                            let s_fid = self.mf.new_gp();
+                            let s_cls = self.mf.new_gp();
+                            self.mf.emit(MachInst::Ldr { dst: s_fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                            self.mf.emit(MachInst::Ldr { dst: s_cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                            self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            (Some(s_fid), Some(s_cls))
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let ctor_saved = {
+                            let saved = self.mf.new_gp();
+                            self.mf.emit(MachInst::CallRuntime {
+                                name: "wren_ic_enter",
+                                args: vec![ic_func_id, ic_closure],
+                                ret: Some(saved),
+                            });
+                            (Some(saved), None::<VReg>)
+                        };
+
+                        // 3. Call constructor body DIRECTLY
                         let mut ctor_call_args = Vec::with_capacity(user_args.len() + 1);
                         ctor_call_args.push(instance);
                         ctor_call_args.extend(user_args.iter().copied());
                         self.mf.emit(MachInst::CallIndirectAbi {
                             target: ctor_jit,
                             args: ctor_call_args,
-                            ret: None, // ignore return — constructor returns this
+                            ret: None,
                         });
 
                         // 4. Restore context
-                        self.mf.emit(MachInst::Str {
-                            src: saved_func_id,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
-                        });
-                        self.mf.emit(MachInst::Str {
-                            src: saved_closure,
-                            mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
-                        });
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            let ctx_ptr = VReg::gp(CTX_PTR_SENTINEL);
+                            const CTX_OFFSET_FUNC_ID: i32 = 40;
+                            const CTX_OFFSET_CLOSURE: i32 = 48;
+                            if let Some(fid) = ctor_saved.0 {
+                                self.mf.emit(MachInst::Str { src: fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                            }
+                            if let Some(cls) = ctor_saved.1 {
+                                self.mf.emit(MachInst::Str { src: cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            if let Some(saved) = ctor_saved.0 {
+                                self.mf.emit(MachInst::CallRuntime {
+                                    name: "wren_ic_leave",
+                                    args: vec![saved],
+                                    ret: None,
+                                });
+                            }
+                        }
 
                         // Result = the allocated instance (constructor modifies it in place)
                         self.mf.emit(MachInst::Mov { dst, src: instance });
@@ -3801,16 +3843,22 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::MakeMap(pairs) => {
                 let dst = self.vreg_for(dst_val);
-                let mut args = Vec::new();
-                for (k, v) in pairs {
-                    args.push(self.vreg_for(*k));
-                    args.push(self.vreg_for(*v));
-                }
+                // Create empty map
                 self.mf.emit(MachInst::CallRuntime {
                     name: "wren_make_map",
-                    args,
+                    args: vec![],
                     ret: Some(dst),
                 });
+                // Insert each key-value pair
+                for (k, v) in pairs {
+                    let key = self.vreg_for(*k);
+                    let val = self.vreg_for(*v);
+                    self.mf.emit(MachInst::CallRuntime {
+                        name: "wren_map_set",
+                        args: vec![dst, key, val],
+                        ret: None,
+                    });
+                }
             }
             Instruction::MakeRange(from, to, inclusive) => {
                 let f = self.vreg_for(*from);
@@ -4053,7 +4101,12 @@ impl<'a> LowerCtx<'a> {
                 });
             }
             // -- Subscript: inline GEP for single-index list access --
-            Instruction::SubscriptGet { receiver, args } if args.len() == 1 => {
+            Instruction::SubscriptGet { receiver, args }
+                if args.len() == 1
+                    && self.is_known_list_receiver(*receiver) =>
+            {
+                // Direct list subscript — only safe when receiver is known to be a List.
+                // For maps and other objects, fall to the CallRuntime path below.
                 use crate::runtime::object_layout::*;
                 let recv_reg = self.vreg_for(*receiver);
                 let idx_reg = self.vreg_for(args[0]);

@@ -44,7 +44,8 @@ pub struct MarkSweepGc {
     bytes_since_gc: usize,
     /// Collection threshold in bytes.
     gc_threshold: usize,
-    /// Arena bump allocator for object memory.
+    /// Arena bump allocator for object memory (unused — using Box::new).
+    #[allow(dead_code)]
     arena: super::gc::OldArena,
 }
 
@@ -68,7 +69,7 @@ impl MarkSweepGc {
 
     fn alloc_boxed<T>(&mut self, obj: T) -> *mut T {
         let size = std::mem::size_of::<T>();
-        let ptr = self.arena.alloc(obj);
+        let ptr = Box::into_raw(Box::new(obj));
         self.objects.push(ptr as *mut ObjHeader);
         self.stats.total_allocated += size;
         self.stats.objects_allocated += 1;
@@ -237,22 +238,19 @@ unsafe fn object_size(header: *mut ObjHeader) -> usize {
 }
 
 unsafe fn drop_object(header: *mut ObjHeader) {
-    // Use drop_in_place: objects are arena-allocated, not Box-allocated.
-    // drop_in_place calls the destructor (freeing internal Vecs, Strings, etc.)
-    // without trying to free the object's memory itself.
     match (*header).obj_type {
-        ObjType::String => std::ptr::drop_in_place(header as *mut ObjString),
-        ObjType::List => std::ptr::drop_in_place(header as *mut ObjList),
-        ObjType::Map => std::ptr::drop_in_place(header as *mut ObjMap),
-        ObjType::Range => std::ptr::drop_in_place(header as *mut ObjRange),
-        ObjType::Fn => std::ptr::drop_in_place(header as *mut ObjFn),
-        ObjType::Closure => std::ptr::drop_in_place(header as *mut ObjClosure),
-        ObjType::Upvalue => std::ptr::drop_in_place(header as *mut ObjUpvalue),
-        ObjType::Fiber => std::ptr::drop_in_place(header as *mut ObjFiber),
-        ObjType::Class => std::ptr::drop_in_place(header as *mut ObjClass),
-        ObjType::Instance => std::ptr::drop_in_place(header as *mut ObjInstance),
-        ObjType::Foreign => std::ptr::drop_in_place(header as *mut ObjForeign),
-        ObjType::Module => std::ptr::drop_in_place(header as *mut ObjModule),
+        ObjType::String => { let _ = Box::from_raw(header as *mut ObjString); }
+        ObjType::List => { let _ = Box::from_raw(header as *mut ObjList); }
+        ObjType::Map => { let _ = Box::from_raw(header as *mut ObjMap); }
+        ObjType::Range => { let _ = Box::from_raw(header as *mut ObjRange); }
+        ObjType::Fn => { let _ = Box::from_raw(header as *mut ObjFn); }
+        ObjType::Closure => { let _ = Box::from_raw(header as *mut ObjClosure); }
+        ObjType::Upvalue => { let _ = Box::from_raw(header as *mut ObjUpvalue); }
+        ObjType::Fiber => { let _ = Box::from_raw(header as *mut ObjFiber); }
+        ObjType::Class => { let _ = Box::from_raw(header as *mut ObjClass); }
+        ObjType::Instance => { let _ = Box::from_raw(header as *mut ObjInstance); }
+        ObjType::Foreign => { let _ = Box::from_raw(header as *mut ObjForeign); }
+        ObjType::Module => { let _ = Box::from_raw(header as *mut ObjModule); }
     }
 }
 
@@ -313,32 +311,13 @@ impl GcAllocator for MarkSweepGc {
     }
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn alloc_instance(&mut self, class: *mut ObjClass) -> *mut ObjInstance {
-        let num_fields = if class.is_null() {
+        let _num_fields = if class.is_null() {
             0
         } else {
             unsafe { (*class).num_fields as usize }
         };
 
-        // Allocate instance and fields from the arena (no malloc).
-        let inst = ObjInstance::new_with_fields(class, num_fields as u32, std::ptr::null_mut());
-        let ptr = self.alloc_boxed(inst);
-
-        if num_fields > 0 {
-            let fields_ptr = self.arena.alloc_bytes(
-                num_fields * std::mem::size_of::<Value>(),
-                std::mem::align_of::<Value>(),
-            ) as *mut Value;
-            unsafe {
-                // Initialize fields to null
-                for i in 0..num_fields {
-                    fields_ptr.add(i).write(Value::null());
-                }
-                (*ptr).fields = fields_ptr;
-                (*ptr).fields_owned = false; // arena manages the memory
-            }
-        }
-
-        ptr
+        self.alloc_boxed(ObjInstance::new(class))
     }
     fn alloc_foreign(&mut self, data: Vec<u8>) -> *mut ObjForeign {
         self.alloc_boxed(ObjForeign::new(data))
