@@ -3099,10 +3099,62 @@ impl<'a> LowerCtx<'a> {
                 let user_args: Vec<VReg> = args.iter().map(|a| self.vreg_for(*a)).collect();
 
                 let done_label = self.mf.new_label();
-                if std::env::var_os("WLIFT_IC_DEBUG").is_some() {
-                    let has = self.callsite_ic_ptrs.as_ref().map(|p| p.len());
-                    eprintln!("IC lowering: func={} ic_idx={} ptrs={:?}", self.mf.name, ic_idx, has);
+
+                // ── Speculative inlining: if the IC is already populated as a
+                // trivial getter (kind=5), emit a direct field load with an
+                // embedded class guard. No IC load, no kind check, no blr.
+                if let Some(&ic_ptr) = self
+                    .callsite_ic_ptrs
+                    .as_ref()
+                    .and_then(|ptrs| ptrs.get(ic_idx))
+                {
+                    let ic = unsafe { &*(ic_ptr as *const crate::mir::bytecode::CallSiteIC) };
+                    // Speculative inline for kind=5 (getter) IC entries.
+                    // At compile time, the IC may already be populated as kind=5
+                    // from interpreter profiling. Inline the field load directly.
+                    if std::env::var_os("WLIFT_SPEC").is_some() {
+                        eprintln!("spec: ic_ptr={:#x} kind={} class={:#x} fid={} args={}", ic_ptr, ic.kind, ic.class, ic.func_id, args.len());
+                    }
+                    if ic.kind == 5 && ic.class != 0 && args.is_empty() {
+                        let spec_slow = self.mf.new_label();
+
+                        // Tag check
+                        let tag_shifted = self.mf.new_gp();
+                        let shift_48 = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: shift_48, bits: 48 });
+                        self.mf.emit(MachInst::Shr { dst: tag_shifted, lhs: r, rhs: shift_48 });
+                        let tag_expect = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: tag_expect, bits: 0xFFFC });
+                        self.mf.emit(MachInst::ICmp { lhs: tag_shifted, rhs: tag_expect });
+                        self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: spec_slow });
+
+                        // Extract obj_ptr + class check with EMBEDDED expected class
+                        let obj_ptr = self.mf.new_gp();
+                        self.mf.emit(MachInst::AndImm { dst: obj_ptr, src: r, imm: PTR_MASK });
+                        let recv_class = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: recv_class, mem: Mem::new(obj_ptr, HEADER_CLASS) });
+                        let expected_class = self.mf.new_gp();
+                        self.mf.emit(MachInst::LoadImm { dst: expected_class, bits: ic.class as u64 });
+                        self.mf.emit(MachInst::ICmp { lhs: recv_class, rhs: expected_class });
+                        // Also check obj_ptr for class receivers (constructor cache_key_class)
+                        let spec_ok = self.mf.new_label();
+                        self.mf.emit(MachInst::JmpIf { cond: Cond::Eq, target: spec_ok });
+                        self.mf.emit(MachInst::ICmp { lhs: obj_ptr, rhs: expected_class });
+                        self.mf.emit(MachInst::JmpIf { cond: Cond::Ne, target: spec_slow });
+                        self.mf.emit(MachInst::DefLabel(spec_ok));
+
+                        // Inline field load — NO blr, NO prologue, NO ret
+                        let fields_ptr = self.mf.new_gp();
+                        self.mf.emit(MachInst::Ldr { dst: fields_ptr, mem: Mem::new(obj_ptr, INSTANCE_FIELDS) });
+                        let field_offset = (ic.func_id as i32) * 8;
+                        self.mf.emit(MachInst::Ldr { dst, mem: Mem::new(fields_ptr, field_offset) });
+                        self.mf.emit(MachInst::Jmp { target: done_label });
+
+                        // Speculation miss → fall through to generic IC check
+                        self.mf.emit(MachInst::DefLabel(spec_slow));
+                    }
                 }
+
                 if let Some(ic_ptr) = self
                     .callsite_ic_ptrs
                     .as_ref()

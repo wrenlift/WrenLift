@@ -208,6 +208,8 @@ fn trivial_getter_field_index(
     vm: &crate::runtime::vm::VM,
     closure_ptr: *mut ObjClosure,
 ) -> Option<u16> {
+    // Performance note: this function is called on every IC population.
+    // It checks the callee's MIR to see if it's a trivial getter.
     use crate::mir::{Instruction, Terminator};
 
     let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
@@ -2832,6 +2834,36 @@ pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
             Value::object(instance as *mut u8).to_bits()
         }
         None => Value::null().to_bits(),
+    }
+}
+
+/// Check if a function is a trivial getter (get_field + return).
+/// Used by speculative inlining to inline getter bodies at call sites.
+pub fn trivial_getter_check(func_id: crate::runtime::engine::FuncId) -> Option<u16> {
+    use crate::mir::{Instruction, Terminator};
+    // Access the MIR through thread-local JIT context
+    let ctx = read_jit_ctx();
+    let vm = unsafe {
+        if ctx.vm.is_null() { return None; }
+        &*(ctx.vm as *const crate::runtime::vm::VM)
+    };
+    let mir = vm.engine.get_mir(func_id)?;
+    if mir.blocks.len() != 1 { return None; }
+    let block = &mir.blocks[0];
+    let mut self_param = None;
+    let mut getter = None;
+    for (_vid, inst) in &block.instructions {
+        match inst {
+            Instruction::BlockParam(0) if self_param.is_none() => self_param = Some(*_vid),
+            Instruction::GetField(recv, idx) if getter.is_none() && Some(*recv) == self_param => {
+                getter = Some((*_vid, *idx));
+            }
+            _ => return None,
+        }
+    }
+    match (getter, &block.terminator) {
+        (Some((ret_vid, field_idx)), Terminator::Return(v)) if *v == ret_vid => Some(field_idx),
+        _ => None,
     }
 }
 

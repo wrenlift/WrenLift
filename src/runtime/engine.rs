@@ -587,14 +587,56 @@ impl ExecutionEngine {
         let bc_ptr = self.ensure_bytecode(id)?;
         let bc = unsafe { &mut *(bc_ptr as *mut BytecodeFunction) };
         let ic_table = unsafe { &mut *bc.ic_table.get() };
+
+        // Upgrade kind=1/6 IC entries to kind=5 if the callee is a trivial getter.
+        // This ensures speculative inlining can use the IC data at compile time.
+        for ic in ic_table.iter_mut() {
+            if (ic.kind == 1 || ic.kind == 6) && ic.func_id != 0 {
+                let callee_id = FuncId(ic.func_id as u32);
+                if let Some(mir) = self.get_mir(callee_id) {
+                    if let Some(field_idx) = Self::mir_trivial_getter_field(&mir) {
+                        if tier_trace_enabled() {
+                            eprintln!("tier-trace: upgrade kind={}→5 fid={} field={}", ic.kind, ic.func_id, field_idx);
+                        }
+                        ic.kind = 5;
+                        ic.func_id = field_idx as u64;
+                        ic.jit_ptr = std::ptr::null();
+                    }
+                }
+            }
+        }
+
         let ptrs: Vec<usize> = ic_table
             .iter_mut()
             .map(|ic| ic as *mut CallSiteIC as usize)
             .collect();
         if tier_trace_enabled() && !ptrs.is_empty() {
-            eprintln!("tier-trace: ic_ptrs FuncId({}) bc={:p} ptrs={:x?}", id.0, bc_ptr, &ptrs);
+            let k5 = ic_table.iter().filter(|ic| ic.kind == 5).count();
+            eprintln!("tier-trace: ic_ptrs FuncId({}) total={} kind5={}", id.0, ptrs.len(), k5);
         }
         Some(ptrs)
+    }
+
+    /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
+    fn mir_trivial_getter_field(mir: &crate::mir::MirFunction) -> Option<u16> {
+        use crate::mir::{Instruction, Terminator};
+        if mir.blocks.len() != 1 { return None; }
+        let block = &mir.blocks[0];
+        let mut self_param = None;
+        let mut getter = None;
+        for (vid, inst) in &block.instructions {
+            match inst {
+                Instruction::BlockParam(0) if self_param.is_none() => self_param = Some(*vid),
+                Instruction::GetField(recv, idx) if getter.is_none() && Some(*recv) == self_param => {
+                    getter = Some((*vid, *idx));
+                }
+                _ => return None,
+            }
+        }
+        match (getter, &block.terminator) {
+            (Some((ret_vid, field_idx)), Terminator::Return(v)) if *v == ret_vid => Some(field_idx),
+            _ => None,
+        }
     }
 
     /// Whether any background compilations are waiting to be installed.
