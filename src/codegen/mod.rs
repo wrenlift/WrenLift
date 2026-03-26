@@ -3157,8 +3157,6 @@ impl<'a> LowerCtx<'a> {
                     // ── Load kind, dispatch by value ──
                     let kind = self.mf.new_gp();
                     self.mf.emit(MachInst::Ldr { dst: kind, mem: Mem::new(ic_base, CALLSITE_IC_KIND) });
-                    // Check kind <= 1 (kind=0 invalid, kind=1 leaf JIT) — use subtraction
-                    // to test both 0 and 1 in one comparison won't work. Just check == 1 or == 6.
                     let non_jit_label = self.mf.new_label();
                     let kind1 = self.mf.new_gp();
                     self.mf.emit(MachInst::LoadImm { dst: kind1, bits: 1 });
