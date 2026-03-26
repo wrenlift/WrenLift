@@ -2534,6 +2534,10 @@ struct LowerCtx<'a> {
     gc_value_reps: Vec<GcValueRep>,
     /// MIR ValueId → VReg mapping.
     val_map: HashMap<ValueId, VReg>,
+    /// Cache: MIR ValueId → extracted obj_ptr VReg (after AND PTR_MASK).
+    /// Avoids repeating the mask operation for multiple field accesses
+    /// on the same receiver within a basic block.
+    obj_ptr_cache: HashMap<ValueId, VReg>,
     /// MIR BlockId → Label mapping.
     block_labels: HashMap<BlockId, Label>,
     /// Interner for resolving symbol names (e.g. IsType class names).
@@ -2607,6 +2611,7 @@ impl<'a> LowerCtx<'a> {
             callsite_ic_ptrs,
             gc_value_reps,
             val_map: HashMap::new(),
+            obj_ptr_cache: HashMap::new(),
             block_labels,
             interner,
             in_entry_block: false,
@@ -2663,6 +2668,9 @@ impl<'a> LowerCtx<'a> {
             let block = &self.mir.blocks[block_idx];
             let label = self.block_labels[&block.id];
             self.mf.emit(MachInst::DefLabel(label));
+            // Clear obj_ptr cache at block boundaries — cached pointers
+            // from a different block may not dominate this block.
+            self.obj_ptr_cache.clear();
 
             // Block parameters (SSA phi-joins) — just register their vregs.
             for (val, _ty) in &block.params {
@@ -3017,13 +3025,20 @@ impl<'a> LowerCtx<'a> {
                 let recv_reg = self.vreg_for(*recv);
                 let dst = self.vreg_for(dst_val);
 
-                // 1. Extract object pointer: AND with PTR_MASK (48-bit)
-                let obj_ptr = self.mf.new_gp();
-                self.mf.emit(MachInst::AndImm {
-                    dst: obj_ptr,
-                    src: recv_reg,
-                    imm: 0x0000_FFFF_FFFF_FFFF, // PTR_MASK
-                });
+                // 1. Extract object pointer, caching across multiple field accesses
+                //    on the same receiver (avoids repeating AND PTR_MASK).
+                let obj_ptr = if let Some(&cached) = self.obj_ptr_cache.get(recv) {
+                    cached
+                } else {
+                    let ptr = self.mf.new_gp();
+                    self.mf.emit(MachInst::AndImm {
+                        dst: ptr,
+                        src: recv_reg,
+                        imm: 0x0000_FFFF_FFFF_FFFF,
+                    });
+                    self.obj_ptr_cache.insert(*recv, ptr);
+                    ptr
+                };
 
                 // 2. Load fields pointer: obj_ptr + INSTANCE_FIELDS
                 let fields_ptr = self.mf.new_gp();
@@ -3045,13 +3060,19 @@ impl<'a> LowerCtx<'a> {
                 let v = self.vreg_for(*val);
                 let dst = self.vreg_for(dst_val);
 
-                // 1. Extract object pointer
-                let obj_ptr = self.mf.new_gp();
-                self.mf.emit(MachInst::AndImm {
-                    dst: obj_ptr,
-                    src: recv_reg,
-                    imm: 0x0000_FFFF_FFFF_FFFF,
-                });
+                // 1. Extract object pointer (cached)
+                let obj_ptr = if let Some(&cached) = self.obj_ptr_cache.get(recv) {
+                    cached
+                } else {
+                    let ptr = self.mf.new_gp();
+                    self.mf.emit(MachInst::AndImm {
+                        dst: ptr,
+                        src: recv_reg,
+                        imm: 0x0000_FFFF_FFFF_FFFF,
+                    });
+                    self.obj_ptr_cache.insert(*recv, ptr);
+                    ptr
+                };
 
                 // 2. Load fields pointer
                 let fields_ptr = self.mf.new_gp();
