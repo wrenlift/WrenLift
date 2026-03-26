@@ -239,18 +239,42 @@ unsafe fn object_size(header: *mut ObjHeader) -> usize {
 
 unsafe fn drop_object(header: *mut ObjHeader) {
     match (*header).obj_type {
-        ObjType::String => { let _ = Box::from_raw(header as *mut ObjString); }
-        ObjType::List => { let _ = Box::from_raw(header as *mut ObjList); }
-        ObjType::Map => { let _ = Box::from_raw(header as *mut ObjMap); }
-        ObjType::Range => { let _ = Box::from_raw(header as *mut ObjRange); }
-        ObjType::Fn => { let _ = Box::from_raw(header as *mut ObjFn); }
-        ObjType::Closure => { let _ = Box::from_raw(header as *mut ObjClosure); }
-        ObjType::Upvalue => { let _ = Box::from_raw(header as *mut ObjUpvalue); }
-        ObjType::Fiber => { let _ = Box::from_raw(header as *mut ObjFiber); }
-        ObjType::Class => { let _ = Box::from_raw(header as *mut ObjClass); }
-        ObjType::Instance => { let _ = Box::from_raw(header as *mut ObjInstance); }
-        ObjType::Foreign => { let _ = Box::from_raw(header as *mut ObjForeign); }
-        ObjType::Module => { let _ = Box::from_raw(header as *mut ObjModule); }
+        ObjType::String => {
+            let _ = Box::from_raw(header as *mut ObjString);
+        }
+        ObjType::List => {
+            let _ = Box::from_raw(header as *mut ObjList);
+        }
+        ObjType::Map => {
+            let _ = Box::from_raw(header as *mut ObjMap);
+        }
+        ObjType::Range => {
+            let _ = Box::from_raw(header as *mut ObjRange);
+        }
+        ObjType::Fn => {
+            let _ = Box::from_raw(header as *mut ObjFn);
+        }
+        ObjType::Closure => {
+            let _ = Box::from_raw(header as *mut ObjClosure);
+        }
+        ObjType::Upvalue => {
+            let _ = Box::from_raw(header as *mut ObjUpvalue);
+        }
+        ObjType::Fiber => {
+            let _ = Box::from_raw(header as *mut ObjFiber);
+        }
+        ObjType::Class => {
+            let _ = Box::from_raw(header as *mut ObjClass);
+        }
+        ObjType::Instance => {
+            let _ = Box::from_raw(header as *mut ObjInstance);
+        }
+        ObjType::Foreign => {
+            let _ = Box::from_raw(header as *mut ObjForeign);
+        }
+        ObjType::Module => {
+            let _ = Box::from_raw(header as *mut ObjModule);
+        }
     }
 }
 

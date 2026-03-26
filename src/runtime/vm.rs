@@ -213,7 +213,9 @@ impl VM {
     pub fn new(config: VMConfig) -> Self {
         // Reset thread-local JIT state to avoid stale data from previous VM instances
         // (critical for test isolation when multiple VMs are created in the same process).
-        crate::codegen::runtime_fns::set_jit_context(crate::codegen::runtime_fns::JitContext::default());
+        crate::codegen::runtime_fns::set_jit_context(
+            crate::codegen::runtime_fns::JitContext::default(),
+        );
         crate::codegen::runtime_fns::clear_jit_roots();
 
         let mut vm = Self {

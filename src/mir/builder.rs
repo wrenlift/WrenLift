@@ -754,9 +754,10 @@ impl<'a> MirBuilder<'a> {
                         _ => env.get_expr_type(e.1.start).is_num(),
                     }
                 };
-                let both_num = self.type_env.as_ref().is_some_and(|env| {
-                    is_num_expr(left, env) && is_num_expr(right, env)
-                });
+                let both_num = self
+                    .type_env
+                    .as_ref()
+                    .is_some_and(|env| is_num_expr(left, env) && is_num_expr(right, env));
                 if both_num {
                     // Emit unboxed f64 instructions directly — no CallRuntime.
                     match op {

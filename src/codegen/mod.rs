@@ -3427,10 +3427,22 @@ impl<'a> LowerCtx<'a> {
                             const CTX_OFFSET_CLOSURE: i32 = 48;
                             let saved_fid = self.mf.new_gp();
                             let saved_cls = self.mf.new_gp();
-                            self.mf.emit(MachInst::Ldr { dst: saved_fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                            self.mf.emit(MachInst::Ldr { dst: saved_cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
-                            self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                            self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            self.mf.emit(MachInst::Ldr {
+                                dst: saved_fid,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                            });
+                            self.mf.emit(MachInst::Ldr {
+                                dst: saved_cls,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                            });
+                            self.mf.emit(MachInst::Str {
+                                src: ic_func_id,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                            });
+                            self.mf.emit(MachInst::Str {
+                                src: ic_closure,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                            });
                             (Some(saved_fid), Some(saved_cls))
                         };
                         #[cfg(not(target_arch = "aarch64"))]
@@ -3459,10 +3471,16 @@ impl<'a> LowerCtx<'a> {
                             const CTX_OFFSET_FUNC_ID: i32 = 40;
                             const CTX_OFFSET_CLOSURE: i32 = 48;
                             if let Some(fid) = saved_ctx.0 {
-                                self.mf.emit(MachInst::Str { src: fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                                self.mf.emit(MachInst::Str {
+                                    src: fid,
+                                    mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                                });
                             }
                             if let Some(cls) = saved_ctx.1 {
-                                self.mf.emit(MachInst::Str { src: cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                                self.mf.emit(MachInst::Str {
+                                    src: cls,
+                                    mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                                });
                             }
                         }
                         #[cfg(not(target_arch = "aarch64"))]
@@ -3596,10 +3614,22 @@ impl<'a> LowerCtx<'a> {
                             const CTX_OFFSET_CLOSURE: i32 = 48;
                             let s_fid = self.mf.new_gp();
                             let s_cls = self.mf.new_gp();
-                            self.mf.emit(MachInst::Ldr { dst: s_fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                            self.mf.emit(MachInst::Ldr { dst: s_cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
-                            self.mf.emit(MachInst::Str { src: ic_func_id, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
-                            self.mf.emit(MachInst::Str { src: ic_closure, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                            self.mf.emit(MachInst::Ldr {
+                                dst: s_fid,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                            });
+                            self.mf.emit(MachInst::Ldr {
+                                dst: s_cls,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                            });
+                            self.mf.emit(MachInst::Str {
+                                src: ic_func_id,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                            });
+                            self.mf.emit(MachInst::Str {
+                                src: ic_closure,
+                                mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                            });
                             (Some(s_fid), Some(s_cls))
                         };
                         #[cfg(not(target_arch = "aarch64"))]
@@ -3630,10 +3660,16 @@ impl<'a> LowerCtx<'a> {
                             const CTX_OFFSET_FUNC_ID: i32 = 40;
                             const CTX_OFFSET_CLOSURE: i32 = 48;
                             if let Some(fid) = ctor_saved.0 {
-                                self.mf.emit(MachInst::Str { src: fid, mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID) });
+                                self.mf.emit(MachInst::Str {
+                                    src: fid,
+                                    mem: Mem::new(ctx_ptr, CTX_OFFSET_FUNC_ID),
+                                });
                             }
                             if let Some(cls) = ctor_saved.1 {
-                                self.mf.emit(MachInst::Str { src: cls, mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE) });
+                                self.mf.emit(MachInst::Str {
+                                    src: cls,
+                                    mem: Mem::new(ctx_ptr, CTX_OFFSET_CLOSURE),
+                                });
                             }
                         }
                         #[cfg(not(target_arch = "aarch64"))]
@@ -4102,8 +4138,7 @@ impl<'a> LowerCtx<'a> {
             }
             // -- Subscript: inline GEP for single-index list access --
             Instruction::SubscriptGet { receiver, args }
-                if args.len() == 1
-                    && self.is_known_list_receiver(*receiver) =>
+                if args.len() == 1 && self.is_known_list_receiver(*receiver) =>
             {
                 // Direct list subscript — only safe when receiver is known to be a List.
                 // For maps and other objects, fall to the CallRuntime path below.

@@ -1527,8 +1527,7 @@ fn run_fiber_with_stop_depth(
                                 unsafe { find_method_with_class(class, method) }
                             };
                             if let Some((ref m, dc)) = result {
-                                vm.method_cache
-                                    .insert(cache_key_class, method, *m, dc);
+                                vm.method_cache.insert(cache_key_class, method, *m, dc);
                             }
                             match result {
                                 Some((m, c)) => (Some(m), Some(c)),
