@@ -2136,12 +2136,12 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
         u32,
         u32,
     ) = match target {
-        // gp_scratch(SPILL) must NOT be R11 — R11 is SCRATCH_GP used inside
-        // AndImm/OrImm/ICmpImm emitters.  Using R10 for SPILL_SCRATCH avoids
-        // clobbering the reloaded value.  COPY_SCRATCH (second spill, rare)
-        // stays at R11 since two-input instructions (IAdd, ICmp) don't use
-        // SCRATCH_GP internally.
-        Target::X86_64 => (5, 10, 15, 0, [7, 6, 2, 1, 8, 9], 11, 11),
+        // SPILL_SCRATCH=R10, COPY_SCRATCH=R12. Neither can be R11 because
+        // R11 is SCRATCH_GP, used internally by AndImm/OrImm/ICmpImm to hold
+        // 64-bit immediates. If either spill scratch were R11, the inline
+        // number checks (emit_boxed_arith_inline) would clobber the reloaded
+        // operand when loading the QNAN constant.
+        Target::X86_64 => (5, 10, 15, 0, [7, 6, 2, 1, 8, 9], 11, 12),
         Target::Aarch64 => (29, 16, 16, 0, [0, 1, 2, 3, 4, 5], 16, 17),
         Target::Wasm => return,
     };
