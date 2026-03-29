@@ -1633,26 +1633,6 @@ fn dispatch_method(
             call_closure_jit_or_sync(vm, cp, args, defining_class)
         }
         Method::Constructor(cp) => {
-            if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter {
-                let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
-                let fn_idx = func_id.0 as usize;
-                let needs_tier_up = vm
-                    .engine
-                    .jit_code
-                    .get(fn_idx)
-                    .copied()
-                    .unwrap_or(std::ptr::null())
-                    .is_null();
-                if needs_tier_up {
-                    let should_tier_up = vm.engine.record_call(func_id);
-                    if should_tier_up {
-                        vm.engine.request_tier_up(func_id, &vm.interner);
-                    }
-                }
-            }
-            // Constructor: never use JIT dispatch — the compiled code would receive
-            // the CLASS as `this` instead of a newly-allocated instance, causing SIGSEGV.
-            // Always allocate the instance and run the constructor body in interpreter.
             let class_ptr = args
                 .first()
                 .and_then(|v| v.as_object())
@@ -1662,8 +1642,8 @@ fn dispatch_method(
                 return Value::null().to_bits();
             }
             // args[1..] are the user-visible constructor arguments (args[0] is the class)
-            let instance = vm.call_constructor_sync(class_ptr, cp, &args[1..]);
-            instance.to_bits()
+            vm.call_constructor_sync(class_ptr, cp, &args[1..])
+                .to_bits()
         }
     }
 }
@@ -1687,7 +1667,18 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
         inner = sym wren_call_0_inner,
     );
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
+    // SysV: rdi=receiver, rsi=method → inner gets rdx=jit_fp, rcx=ret_addr
+    core::arch::naked_asm!(
+        "mov rdx, rbp",       // pass JIT FP (caller's RBP) as 3rd arg
+        "mov rcx, [rsp]",     // pass return address as 4th arg
+        "jmp {inner}",
+        inner = sym wren_call_0_inner,
+    );
+}
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0, 0)
 }
@@ -1715,7 +1706,18 @@ pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> 
         inner = sym wren_call_1_inner,
     );
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
+    // SysV: rdi=receiver, rsi=method, rdx=a0 → inner gets rcx=jit_fp, r8=ret_addr
+    core::arch::naked_asm!(
+        "mov rcx, rbp",
+        "mov r8, [rsp]",
+        "jmp {inner}",
+        inner = sym wren_call_1_inner,
+    );
+}
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
     wren_call_1_inner(receiver, method, a0, 0, 0)
 }
@@ -1749,7 +1751,18 @@ pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1
         inner = sym wren_call_2_inner,
     );
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
+    // SysV: rdi=receiver, rsi=method, rdx=a0, rcx=a1 → inner gets r8=jit_fp, r9=ret_addr
+    core::arch::naked_asm!(
+        "mov r8, rbp",
+        "mov r9, [rsp]",
+        "jmp {inner}",
+        inner = sym wren_call_2_inner,
+    );
+}
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
     wren_call_2_inner(receiver, method, a0, a1, 0, 0)
 }
@@ -1794,7 +1807,31 @@ pub unsafe extern "C" fn wren_call_3(
         inner = sym wren_call_3_inner,
     );
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+pub extern "C" fn wren_call_3(
+    receiver: u64,
+    method: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    // Can't use #[naked] for 7 args (exceeds 6 SysV register args).
+    // Read the caller's frame pointer from the stack frame chain instead.
+    // After this function's prologue: [rbp] = saved caller RBP, [rbp+8] = ret addr.
+    // The JIT function's FP is the saved caller RBP: [rbp] points to the JIT frame.
+    let jit_fp: u64;
+    let ret_addr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {fp}, [rbp]",      // caller's RBP = JIT frame pointer
+            "mov {ra}, [rbp+8]",    // this function's return address
+            fp = out(reg) jit_fp,
+            ra = out(reg) ret_addr,
+        );
+    }
+    wren_call_3_inner(receiver, method, a0, a1, a2, jit_fp, ret_addr)
+}
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_call_3_inner(receiver, method, a0, a1, a2, 0, 0)
 }
@@ -2117,6 +2154,17 @@ fn make_list_impl(elements: &[u64]) -> u64 {
     jit_roots_restore_len(root_len_before);
     push_jit_root(val);
     val.to_bits()
+}
+
+/// Add a single element to an existing list.
+pub extern "C" fn wren_list_add(list_val: u64, elem: u64) {
+    let list = Value::from_bits(list_val);
+    if let Some(ptr) = list.as_object() {
+        let list_ptr = ptr as *mut crate::runtime::object::ObjList;
+        unsafe {
+            (*list_ptr).add(Value::from_bits(elem));
+        }
+    }
 }
 
 pub extern "C" fn wren_make_list() -> u64 {
@@ -2811,6 +2859,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_list_2" => Some(wren_make_list_2 as *const () as usize),
         "wren_make_list_3" => Some(wren_make_list_3 as *const () as usize),
         "wren_make_list_4" => Some(wren_make_list_4 as *const () as usize),
+        "wren_list_add" => Some(wren_list_add as *const () as usize),
         "wren_make_map" => Some(wren_make_map as *const () as usize),
         "wren_map_set" => Some(wren_map_set as *const () as usize),
         "wren_make_range" => Some(wren_make_range as *const () as usize),

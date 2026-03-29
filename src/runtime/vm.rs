@@ -1188,7 +1188,6 @@ impl VM {
     /// all spill slots that could contain boxed values.
     ///
     /// Returns (values, slot_addresses) for GC write-back.
-    #[cfg(target_arch = "aarch64")]
     fn scan_native_stack_roots(&self) -> (Vec<Value>, Vec<*mut u64>) {
         use crate::codegen::native_meta::RootLocation;
         let mut found_roots = Vec::new();
@@ -1306,10 +1305,7 @@ impl VM {
         (Vec::new(), 0, 0)
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
-    fn scan_native_stack_roots(&self) -> (Vec<Value>, Vec<*mut u64>) {
-        (Vec::new(), Vec::new())
-    }
+    // scan_native_stack_roots is now enabled for all platforms (not just aarch64)
 
     pub fn collect_garbage(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
@@ -2280,8 +2276,6 @@ impl VM {
         closure_ptr: *mut ObjClosure,
         ctor_args: &[Value], // args WITHOUT the class receiver (just the user args)
     ) -> Value {
-        use crate::mir::{BlockId, Instruction};
-
         // Allocate the new instance. This may trigger a minor GC.
         let instance_raw = self.gc.alloc_instance(class_ptr);
         let instance_val = Value::object(instance_raw as *mut u8);
@@ -2295,15 +2289,39 @@ impl VM {
             (*fn_ptr).fn_id
         });
 
+        self.call_constructor_sync_impl(class_ptr, closure_ptr, ctor_args, func_id, root_len_before)
+    }
+
+    fn call_constructor_sync_impl(
+        &mut self,
+        class_ptr: *mut crate::runtime::object::ObjClass,
+        closure_ptr: *mut ObjClosure,
+        ctor_args: &[Value],
+        func_id: crate::runtime::engine::FuncId,
+        root_len_before: usize,
+    ) -> Value {
+        use crate::mir::{BlockId, Instruction};
         // Try JIT dispatch: if the constructor body is compiled,
         // call it directly with the new instance as `this`.
+        // Don't use JIT if this constructor has active interpreter frames
+        // on the fiber stack — dispatching to JIT mid-recursion while
+        // interpreter frames are still executing causes incorrect results.
         let fn_idx = func_id.0 as usize;
-        let jit_ptr = self
-            .engine
-            .jit_code
-            .get(fn_idx)
-            .copied()
-            .unwrap_or(std::ptr::null());
+        let has_active_interp_frames = if !self.fiber.is_null() {
+            let fiber = unsafe { &*self.fiber };
+            fiber.mir_frames.iter().any(|f| f.func_id == func_id)
+        } else {
+            false
+        };
+        let jit_ptr = if !has_active_interp_frames {
+            self.engine
+                .jit_code
+                .get(fn_idx)
+                .copied()
+                .unwrap_or(std::ptr::null())
+        } else {
+            std::ptr::null()
+        };
         if !jit_ptr.is_null() && ctor_args.len() <= 3 {
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
             // JIT expects: [this, arg0, arg1, ...]
@@ -2335,7 +2353,7 @@ impl VM {
         let mir = self.engine.get_mir(func_id);
         if mir.is_none() {
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-            return instance_val;
+            return crate::codegen::runtime_fns::jit_root_at(root_len_before);
         }
         let mir = mir.unwrap();
 

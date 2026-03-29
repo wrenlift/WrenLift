@@ -22,6 +22,8 @@ const SCRATCH_XMM: u32 = 15; // XMM15
 /// On x86_64 hosts, call `make_executable()` to get a callable function pointer.
 pub struct EmittedCode {
     code: Vec<u8>,
+    /// (instruction_index, code_offset_after_call) pairs for safepoint patching.
+    pub call_offsets: Vec<(usize, u32)>,
 }
 
 impl EmittedCode {
@@ -709,9 +711,18 @@ impl X64Emitter {
 
             Shl { dst, lhs, rhs } => {
                 let d = gp(*dst);
-                self.emit_mov_rr(1, gp(*rhs)); // mov rcx, shift_amount
-                self.emit_mov_rr(d, gp(*lhs));
-                self.emit_shift_cl(4, d);
+                let r = gp(*rhs);
+                let l = gp(*lhs);
+                if d == 1 {
+                    self.emit_mov_rr(1, r);
+                    self.emit_mov_rr(11, l);
+                    self.emit_shift_cl(4, 11);
+                    self.emit_mov_rr(1, 11);
+                } else {
+                    self.emit_mov_rr(1, r);
+                    self.emit_mov_rr(d, l);
+                    self.emit_shift_cl(4, d);
+                }
             }
 
             Sar { dst, lhs, rhs } => {
@@ -723,9 +734,20 @@ impl X64Emitter {
 
             Shr { dst, lhs, rhs } => {
                 let d = gp(*dst);
-                self.emit_mov_rr(1, gp(*rhs));
-                self.emit_mov_rr(d, gp(*lhs));
-                self.emit_shift_cl(5, d);
+                let r = gp(*rhs);
+                let l = gp(*lhs);
+                if d == 1 {
+                    // dst is RCX: CL is both shift amount and destination.
+                    // Use R11 (scratch) as temp to avoid clobbering.
+                    self.emit_mov_rr(1, r);  // RCX = shift amount (CL ready)
+                    self.emit_mov_rr(11, l); // R11 = lhs
+                    self.emit_shift_cl(5, 11); // shr R11, CL
+                    self.emit_mov_rr(1, 11); // RCX = result
+                } else {
+                    self.emit_mov_rr(1, r);
+                    self.emit_mov_rr(d, l);
+                    self.emit_shift_cl(5, d);
+                }
             }
 
             // ── FP Arithmetic (SSE2 scalar double) ──
@@ -1233,11 +1255,20 @@ impl X64Emitter {
 /// Emit x86_64 machine code from a MachFunc.
 pub fn emit(func: &MachFunc) -> Result<EmittedCode, String> {
     let mut e = X64Emitter::new();
-    for inst in &func.insts {
+    let mut call_offsets: Vec<(usize, u32)> = Vec::new();
+    for (inst_idx, inst) in func.insts.iter().enumerate() {
         e.emit_inst(inst)?;
+        // Record offset AFTER call instructions (the return address is the safepoint).
+        if matches!(inst, MachInst::CallInd { .. } | MachInst::CallLabel { .. }) {
+            let offset = e.code.len() as u32;
+            call_offsets.push((inst_idx, offset));
+        }
     }
     e.resolve_fixups()?;
-    Ok(EmittedCode { code: e.code })
+    Ok(EmittedCode {
+        code: e.code,
+        call_offsets,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

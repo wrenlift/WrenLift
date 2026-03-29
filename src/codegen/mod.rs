@@ -1994,6 +1994,9 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             })
         }
         _ => {
+            // Disable inline IC on x86_64 until register conflicts are resolved.
+            #[cfg(not(target_arch = "aarch64"))]
+            let callsite_ic_ptrs: Option<Vec<usize>> = None;
             let mut mach = lower_mir_with_interner_and_callsite_ics(
                 mir,
                 interner,
@@ -2066,6 +2069,17 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             let code = match target {
                 Target::X86_64 => {
                     let emitted = x86_64::emit(&mach)?;
+                    // Patch safepoint code offsets from emitted call positions.
+                    if let Some(ref mut meta) = native_meta {
+                        let meta = Arc::make_mut(meta);
+                        for &(inst_idx, offset) in &emitted.call_offsets {
+                            for sp in &mut meta.safepoints {
+                                if sp.inst_index == inst_idx as u32 {
+                                    sp.code_offset = offset;
+                                }
+                            }
+                        }
+                    }
                     CompiledFunction::X86_64(emitted)
                 }
                 #[cfg(target_arch = "aarch64")]
@@ -2122,7 +2136,12 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
         u32,
         u32,
     ) = match target {
-        Target::X86_64 => (5, 11, 15, 0, [7, 6, 2, 1, 8, 9], 11, 10),
+        // gp_scratch(SPILL) must NOT be R11 — R11 is SCRATCH_GP used inside
+        // AndImm/OrImm/ICmpImm emitters.  Using R10 for SPILL_SCRATCH avoids
+        // clobbering the reloaded value.  COPY_SCRATCH (second spill, rare)
+        // stays at R11 since two-input instructions (IAdd, ICmp) don't use
+        // SCRATCH_GP internally.
+        Target::X86_64 => (5, 10, 15, 0, [7, 6, 2, 1, 8, 9], 11, 11),
         Target::Aarch64 => (29, 16, 16, 0, [0, 1, 2, 3, 4, 5], 16, 17),
         Target::Wasm => return,
     };
@@ -3863,19 +3882,36 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::MakeList(elems) => {
                 let dst = self.vreg_for(dst_val);
-                let args: Vec<VReg> = elems.iter().map(|e| self.vreg_for(*e)).collect();
-                let name = match elems.len() {
-                    0 => "wren_make_list",
-                    1 => "wren_make_list_1",
-                    2 => "wren_make_list_2",
-                    3 => "wren_make_list_3",
-                    _ => "wren_make_list_4",
-                };
-                self.mf.emit(MachInst::CallRuntime {
-                    name,
-                    args,
-                    ret: Some(dst),
-                });
+                if elems.len() <= 4 {
+                    let args: Vec<VReg> = elems.iter().map(|e| self.vreg_for(*e)).collect();
+                    let name = match elems.len() {
+                        0 => "wren_make_list",
+                        1 => "wren_make_list_1",
+                        2 => "wren_make_list_2",
+                        3 => "wren_make_list_3",
+                        _ => "wren_make_list_4",
+                    };
+                    self.mf.emit(MachInst::CallRuntime {
+                        name,
+                        args,
+                        ret: Some(dst),
+                    });
+                } else {
+                    // >4 elements: create empty list, then add each element
+                    self.mf.emit(MachInst::CallRuntime {
+                        name: "wren_make_list",
+                        args: vec![],
+                        ret: Some(dst),
+                    });
+                    for e in elems {
+                        let v = self.vreg_for(*e);
+                        self.mf.emit(MachInst::CallRuntime {
+                            name: "wren_list_add",
+                            args: vec![dst, v],
+                            ret: None,
+                        });
+                    }
+                }
             }
             Instruction::MakeMap(pairs) => {
                 let dst = self.vreg_for(dst_val);
@@ -6499,7 +6535,7 @@ mod tests {
         fixup_sentinels(&mut mf, Target::X86_64);
 
         if let MachInst::Ldr { dst, mem } = &mf.insts[0] {
-            assert_eq!(dst.index, 11, "GP scratch should be R11 on x86_64");
+            assert_eq!(dst.index, 10, "GP spill scratch should be R10 on x86_64");
             assert_eq!(mem.base.index, 5, "frame ptr should be RBP on x86_64");
         } else {
             panic!("expected Ldr");
