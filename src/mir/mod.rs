@@ -389,6 +389,17 @@ impl Instruction {
                 | Instruction::SuperCall { .. }
                 | Instruction::SetUpvalue(..)
                 | Instruction::SubscriptSet { .. }
+                // Allocation instructions create new mutable objects — they must
+                // NOT be hoisted out of loops by LICM even when their arguments
+                // are loop-invariant, because each execution must produce a
+                // distinct object.
+                | Instruction::MakeList(..)
+                | Instruction::MakeMap(..)
+                | Instruction::MakeRange { .. }
+                | Instruction::MakeClosure { .. }
+                | Instruction::StringConcat(..)
+                | Instruction::ToString(..)
+                | Instruction::SetStaticField(..)
         )
     }
 
