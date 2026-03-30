@@ -1372,11 +1372,6 @@ unsafe fn find_method_with_class(
 
 /// Internal: dispatch a method call with a pre-built args slice.
 fn dispatch_call(recv: Value, method_packed: u64, args: &[Value]) -> u64 {
-    // with_rooted_args removed: the caller's JIT frame is on JIT_FRAME_STACK
-    // (via #[naked] wren_call_N wrapper), so GC finds roots in spill slots
-    // directly. The args here are only used to pass to the callee; they're
-    // not reused after the callee returns. The callee's copies are rooted
-    // in its own JIT spill slots or interpreter frame.
     dispatch_call_rooted(recv, method_packed, args)
 }
 
