@@ -223,10 +223,12 @@ pub fn aarch64_target_regs() -> TargetRegs {
 
 /// Build the default x86_64 allocatable set.
 pub fn x86_64_target_regs() -> TargetRegs {
-    // All GP except RSP(4), RBP(5), R10(10=spill scratch), R11(11=call scratch/SCRATCH_GP),
-    // R12(12=copy scratch — second spill reload register, avoids R11/SCRATCH_GP conflict)
+    // All GP except RSP(4), RBP(5), R10(10=spill scratch), R11(11=call+copy scratch).
+    // R11 is also SCRATCH_GP in the x86_64 emitter (used by AndImm/ICmpImm for
+    // 64-bit immediates). The boxed arith/cmp fast paths now use explicit LoadImm +
+    // register-register And/ICmp instead of AndImm/ICmpImm, avoiding the conflict.
     let gp: Vec<PhysReg> = (0..16)
-        .filter(|&r| r != 4 && r != 5 && r != 10 && r != 11 && r != 12)
+        .filter(|&r| r != 4 && r != 5 && r != 10 && r != 11)
         .map(PhysReg::gp)
         .collect();
     // XMM0-XMM14 (XMM15 is scratch)
@@ -1495,13 +1497,12 @@ mod tests {
     #[test]
     fn test_x86_64_target_regs() {
         let target = x86_64_target_regs();
-        assert_eq!(target.gp_allocatable.len(), 11); // 16 - RSP(4) - RBP(5) - R10(10) - R11(11) - R12(12)
+        assert_eq!(target.gp_allocatable.len(), 12); // 16 - RSP(4) - RBP(5) - R10(10) - R11(11)
         assert_eq!(target.fp_allocatable.len(), 15); // XMM0-XMM14
                                                      // Verify excluded registers.
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 4)); // no RSP
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 5)); // no RBP
         assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 11)); // no R11
-        assert!(!target.gp_allocatable.iter().any(|r| r.hw_enc == 12)); // no R12 (copy scratch)
     }
 
     // -- Integration with MIR lowering --

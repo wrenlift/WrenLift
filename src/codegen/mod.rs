@@ -2136,12 +2136,12 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
         u32,
         u32,
     ) = match target {
-        // SPILL_SCRATCH=R10, COPY_SCRATCH=R12. Neither can be R11 because
-        // R11 is SCRATCH_GP, used internally by AndImm/OrImm/ICmpImm to hold
-        // 64-bit immediates. If either spill scratch were R11, the inline
-        // number checks (emit_boxed_arith_inline) would clobber the reloaded
-        // operand when loading the QNAN constant.
-        Target::X86_64 => (5, 10, 15, 0, [7, 6, 2, 1, 8, 9], 11, 12),
+        // SPILL_SCRATCH=R10, COPY_SCRATCH=R11. The boxed arith/cmp fast paths
+        // use explicit LoadImm + register-register And/ICmp (not AndImm/ICmpImm),
+        // so SCRATCH_GP (R11) is no longer clobbered during QNAN checks.
+        // COPY_SCRATCH=R11 is safe because two-input instructions (And, ICmp,
+        // IAdd) don't use SCRATCH_GP internally.
+        Target::X86_64 => (5, 10, 15, 0, [7, 6, 2, 1, 8, 9], 11, 11),
         Target::Aarch64 => (29, 16, 16, 0, [0, 1, 2, 3, 4, 5], 16, 17),
         Target::Wasm => return,
     };
@@ -3055,16 +3055,16 @@ impl<'a> LowerCtx<'a> {
 
                 // 1. Extract object pointer, caching across multiple field accesses
                 //    on the same receiver (avoids repeating AND PTR_MASK).
-                let obj_ptr = if let Some(&cached) = self.obj_ptr_cache.get(recv) {
-                    cached
-                } else {
+                // Extract object pointer fresh each time — caching across
+                // multiple field accesses creates artificially long live ranges
+                // that cause register pressure and incorrect spilling on x86_64.
+                let obj_ptr = {
                     let ptr = self.mf.new_gp();
                     self.mf.emit(MachInst::AndImm {
                         dst: ptr,
                         src: recv_reg,
                         imm: 0x0000_FFFF_FFFF_FFFF,
                     });
-                    self.obj_ptr_cache.insert(*recv, ptr);
                     ptr
                 };
 
@@ -3088,17 +3088,14 @@ impl<'a> LowerCtx<'a> {
                 let v = self.vreg_for(*val);
                 let dst = self.vreg_for(dst_val);
 
-                // 1. Extract object pointer (cached)
-                let obj_ptr = if let Some(&cached) = self.obj_ptr_cache.get(recv) {
-                    cached
-                } else {
+                // 1. Extract object pointer (fresh each time)
+                let obj_ptr = {
                     let ptr = self.mf.new_gp();
                     self.mf.emit(MachInst::AndImm {
                         dst: ptr,
                         src: recv_reg,
                         imm: 0x0000_FFFF_FFFF_FFFF,
                     });
-                    self.obj_ptr_cache.insert(*recv, ptr);
                     ptr
                 };
 
@@ -3759,6 +3756,11 @@ impl<'a> LowerCtx<'a> {
                     1 => "wren_call_1",
                     2 => "wren_call_2",
                     3 => "wren_call_3",
+                    4 => "wren_call_4",
+                    // wren_call_4 handles up to 4 user args. For 5+ user args,
+                    // only the first 4 are passed to dispatch; the runtime
+                    // resolves the method and uses the interpreter for the actual
+                    // call which reads all args from the fiber frame.
                     _ => "wren_call_4",
                 };
                 self.mf.emit(MachInst::CallRuntime {
@@ -4889,16 +4891,26 @@ impl<'a> LowerCtx<'a> {
         let slow_label = self.mf.new_label();
         let done_label = self.mf.new_label();
 
+        // Materialize QNAN as an explicit virtual register so the register
+        // allocator can place it without conflicting with spill scratch regs.
+        // This avoids the x86_64 SCRATCH_GP (R11) conflict where AndImm/ICmpImm
+        // internally load the immediate into R11, clobbering spill reloads.
+        let qnan = self.mf.new_gp();
+        self.mf.emit(MachInst::LoadImm {
+            dst: qnan,
+            bits: QNAN,
+        });
+
         // Check a: (a & QNAN) == QNAN → not a number → slow path
         let tmp_a = self.mf.new_gp();
-        self.mf.emit(MachInst::AndImm {
+        self.mf.emit(MachInst::And {
             dst: tmp_a,
-            src: la,
-            imm: QNAN,
+            lhs: la,
+            rhs: qnan,
         });
-        self.mf.emit(MachInst::ICmpImm {
+        self.mf.emit(MachInst::ICmp {
             lhs: tmp_a,
-            imm: QNAN,
+            rhs: qnan,
         });
         self.mf.emit(MachInst::JmpIf {
             cond: Cond::Eq,
@@ -4907,14 +4919,14 @@ impl<'a> LowerCtx<'a> {
 
         // Check b: (b & QNAN) == QNAN → not a number → slow path
         let tmp_b = self.mf.new_gp();
-        self.mf.emit(MachInst::AndImm {
+        self.mf.emit(MachInst::And {
             dst: tmp_b,
-            src: lb,
-            imm: QNAN,
+            lhs: lb,
+            rhs: qnan,
         });
-        self.mf.emit(MachInst::ICmpImm {
+        self.mf.emit(MachInst::ICmp {
             lhs: tmp_b,
-            imm: QNAN,
+            rhs: qnan,
         });
         self.mf.emit(MachInst::JmpIf {
             cond: Cond::Eq,
@@ -4985,16 +4997,23 @@ impl<'a> LowerCtx<'a> {
         let slow_label = self.mf.new_label();
         let done_label = self.mf.new_label();
 
+        // Materialize QNAN as explicit virtual register (see emit_boxed_arith_inline).
+        let qnan = self.mf.new_gp();
+        self.mf.emit(MachInst::LoadImm {
+            dst: qnan,
+            bits: QNAN,
+        });
+
         // Check a is a number
         let tmp_a = self.mf.new_gp();
-        self.mf.emit(MachInst::AndImm {
+        self.mf.emit(MachInst::And {
             dst: tmp_a,
-            src: la,
-            imm: QNAN,
+            lhs: la,
+            rhs: qnan,
         });
-        self.mf.emit(MachInst::ICmpImm {
+        self.mf.emit(MachInst::ICmp {
             lhs: tmp_a,
-            imm: QNAN,
+            rhs: qnan,
         });
         self.mf.emit(MachInst::JmpIf {
             cond: Cond::Eq,
@@ -5003,14 +5022,14 @@ impl<'a> LowerCtx<'a> {
 
         // Check b is a number
         let tmp_b = self.mf.new_gp();
-        self.mf.emit(MachInst::AndImm {
+        self.mf.emit(MachInst::And {
             dst: tmp_b,
-            src: lb,
-            imm: QNAN,
+            lhs: lb,
+            rhs: qnan,
         });
-        self.mf.emit(MachInst::ICmpImm {
+        self.mf.emit(MachInst::ICmp {
             lhs: tmp_b,
-            imm: QNAN,
+            rhs: qnan,
         });
         self.mf.emit(MachInst::JmpIf {
             cond: Cond::Eq,
