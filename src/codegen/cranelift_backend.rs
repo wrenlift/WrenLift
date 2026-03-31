@@ -46,7 +46,7 @@ pub mod cl {
     pub fn compile_mir(
         mir: &MirFunction,
         interner: &Interner,
-        callsite_ic_ptrs: Option<&[usize]>,
+        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -397,7 +397,7 @@ pub mod cl {
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut JITModule,
-        callsite_ic_ptrs: Option<&[usize]>,
+        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
     ) -> Result<(), String> {
         lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, None)
     }
@@ -412,7 +412,7 @@ pub mod cl {
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut JITModule,
-        callsite_ic_ptrs: Option<&[usize]>,
+        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         f64_self_id: Option<cranelift_module::FuncId>,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
@@ -664,7 +664,7 @@ pub mod cl {
             &str,
             usize,
         ) -> Result<cranelift_codegen::ir::FuncRef, String>,
-        callsite_ic_ptrs: Option<&[usize]>,
+        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         call_site_idx: &mut usize,
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
@@ -907,8 +907,7 @@ pub mod cl {
                 // Try inline IC: if we have IC data for this call site,
                 // emit a class-check + direct call fast path.
                 let ic = callsite_ic_ptrs
-                    .and_then(|ptrs| ptrs.get(ic_idx))
-                    .map(|&ptr| unsafe { &*(ptr as *const crate::mir::bytecode::CallSiteIC) });
+                    .and_then(|ics| ics.get(ic_idx));
 
                 // Kind=1 (JIT leaf) or kind=5 (getter): emit inline fast path
                 if let Some(ic) = ic {

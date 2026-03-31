@@ -593,30 +593,34 @@ impl ExecutionEngine {
         ptr
     }
 
-    fn callsite_ic_ptrs_for_compile(&mut self, id: FuncId) -> Option<Vec<usize>> {
+    fn callsite_ic_snapshot_for_compile(&mut self, id: FuncId) -> Option<Vec<CallSiteIC>> {
         let bc_ptr = self.ensure_bytecode(id)?;
-        let bc = unsafe { &mut *(bc_ptr as *mut BytecodeFunction) };
-        let ic_table = unsafe { &mut *bc.ic_table.get() };
+        let bc = unsafe { &*(bc_ptr as *const BytecodeFunction) };
+        let ic_table = unsafe { &*bc.ic_table.get() };
 
-        // NOTE: Previously we upgraded kind=1/6→5 for trivial getters here,
-        // but that mutates the live IC table while the interpreter may be
-        // reading it (race condition). Removed to fix delta_blue flakiness.
-        // The Cranelift backend handles kind=1 IC entries correctly.
-
-        let ptrs: Vec<usize> = ic_table
-            .iter_mut()
-            .map(|ic| ic as *mut CallSiteIC as usize)
+        // Snapshot the IC entries to avoid data races: the interpreter
+        // may update IC entries on the main thread while the compiler
+        // reads them on a background thread.
+        let snapshot: Vec<CallSiteIC> = ic_table
+            .iter()
+            .map(|ic| CallSiteIC {
+                class: ic.class,
+                jit_ptr: ic.jit_ptr,
+                closure: ic.closure,
+                func_id: ic.func_id,
+                kind: ic.kind,
+            })
             .collect();
-        if tier_trace_enabled() && !ptrs.is_empty() {
-            let k5 = ic_table.iter().filter(|ic| ic.kind == 5).count();
+        if tier_trace_enabled() && !snapshot.is_empty() {
+            let k5 = snapshot.iter().filter(|ic| ic.kind == 5).count();
             eprintln!(
                 "tier-trace: ic_ptrs FuncId({}) total={} kind5={}",
                 id.0,
-                ptrs.len(),
+                snapshot.len(),
                 k5
             );
         }
-        Some(ptrs)
+        Some(snapshot)
     }
 
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
@@ -1072,7 +1076,7 @@ impl ExecutionEngine {
             }
         }
         let compile_mir = Self::build_compile_mir(&mir, tier, interner, profile.as_ref());
-        let callsite_ic_ptrs = self.callsite_ic_ptrs_for_compile(id);
+        let callsite_ic_ptrs = self.callsite_ic_snapshot_for_compile(id);
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
@@ -1171,7 +1175,7 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let interner_clone = interner.clone();
         let trace_name_clone = trace_name.clone();
-        let callsite_ic_ptrs = self.callsite_ic_ptrs_for_compile(id);
+        let callsite_ic_ptrs = self.callsite_ic_snapshot_for_compile(id);
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);

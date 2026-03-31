@@ -2001,7 +2001,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     target: Target,
     interner: &crate::intern::Interner,
     compile_tier: CompileTier,
-    callsite_ic_ptrs: Option<Vec<usize>>,
+    callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
@@ -2030,6 +2030,14 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             // Disable inline IC on x86_64 until register conflicts are resolved.
             #[cfg(not(target_arch = "aarch64"))]
             let callsite_ic_ptrs: Option<Vec<usize>> = None;
+            // Non-Cranelift path uses raw pointers to IC entries.
+            // Convert snapshot back to pointers (entries live as long as the Vec).
+            #[cfg(target_arch = "aarch64")]
+            let callsite_ic_ptrs: Option<Vec<usize>> = callsite_ic_ptrs.map(|ics| {
+                ics.iter()
+                    .map(|ic| ic as *const crate::mir::bytecode::CallSiteIC as usize)
+                    .collect()
+            });
             let mut mach = lower_mir_with_interner_and_callsite_ics(
                 mir,
                 interner,

@@ -1387,14 +1387,17 @@ fn run_fiber_with_stop_depth(
                     if ic_idx < ic_table.len() {
                         let ic = &mut ic_table[ic_idx];
                         if ic.kind == 1 {
-                            let func_id = FuncId(ic.func_id as u32);
+                            // IC fast path: record call for tier-up.
+                            // Poll + drain only when tier-up fires (rare).
                             if vm.engine.mode == ExecutionMode::Tiered {
+                                let func_id = FuncId(ic.func_id as u32);
                                 let should_tier_up = vm.engine.record_call(func_id);
                                 if should_tier_up {
                                     vm.engine.request_tier_up(func_id, &vm.interner);
                                 }
-                                if vm.engine.has_pending_compilations() {
+                                if should_tier_up && vm.engine.has_pending_compilations() {
                                     vm.engine.poll_compilations();
+                                    vm.engine.drain_compile_queue(&vm.interner);
                                 }
                             }
                             let recv_class = if recv_val.is_object() {
@@ -2358,6 +2361,22 @@ fn run_fiber_with_stop_depth(
                         let src_reg = read_u16(code, &mut pc);
                         let val = get_reg(&values, src_reg);
                         set_reg(&mut values, dst_reg, val);
+                    }
+                    // Back-edge detection: if jumping backward, this is a
+                    // loop iteration. Trigger JIT compilation after enough
+                    // iterations so hot loops in infrequently-called functions
+                    // (like the script's main function) still get compiled.
+                    // Also drain the compile queue here — this is a safe point
+                    // between iterations (not mid-call-dispatch).
+                    if target < pc && vm.engine.mode == ExecutionMode::Tiered {
+                        let should_tier_up = vm.engine.record_call(func_id);
+                        if should_tier_up {
+                            vm.engine.request_tier_up(func_id, &vm.interner);
+                        }
+                        if should_tier_up && vm.engine.has_pending_compilations() {
+                            vm.engine.poll_compilations();
+                            vm.engine.drain_compile_queue(&vm.interner);
+                        }
                     }
                     pc = target;
                 }
