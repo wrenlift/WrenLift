@@ -598,26 +598,10 @@ impl ExecutionEngine {
         let bc = unsafe { &mut *(bc_ptr as *mut BytecodeFunction) };
         let ic_table = unsafe { &mut *bc.ic_table.get() };
 
-        // Upgrade kind=1/6 IC entries to kind=5 if the callee is a trivial getter.
-        // This ensures speculative inlining can use the IC data at compile time.
-        for ic in ic_table.iter_mut() {
-            if (ic.kind == 1 || ic.kind == 6) && ic.func_id != 0 {
-                let callee_id = FuncId(ic.func_id as u32);
-                if let Some(mir) = self.get_mir(callee_id) {
-                    if let Some(field_idx) = Self::mir_trivial_getter_field(&mir) {
-                        if tier_trace_enabled() {
-                            eprintln!(
-                                "tier-trace: upgrade kind={}→5 fid={} field={}",
-                                ic.kind, ic.func_id, field_idx
-                            );
-                        }
-                        ic.kind = 5;
-                        ic.func_id = field_idx as u64;
-                        ic.jit_ptr = std::ptr::null();
-                    }
-                }
-            }
-        }
+        // NOTE: Previously we upgraded kind=1/6→5 for trivial getters here,
+        // but that mutates the live IC table while the interpreter may be
+        // reading it (race condition). Removed to fix delta_blue flakiness.
+        // The Cranelift backend handles kind=1 IC entries correctly.
 
         let ptrs: Vec<usize> = ic_table
             .iter_mut()
@@ -664,7 +648,7 @@ impl ExecutionEngine {
     /// Whether any background compilations are waiting to be installed.
     #[inline(always)]
     pub fn has_pending_compilations(&self) -> bool {
-        self.pending_count != 0
+        self.pending_count != 0 || !self.compile_queue.is_empty()
     }
 
     /// Invalidate all monomorphic call-site inline caches.
@@ -903,6 +887,12 @@ impl ExecutionEngine {
         } else {
             std::ptr::null()
         };
+        if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
+            eprintln!(
+                "INSTALL: idx={} tier={:?} native={} ptr={:p}",
+                idx, tier, executable.is_native(), native_ptr
+            );
+        }
 
         match tier {
             CompileTier::Baseline => {
@@ -1212,12 +1202,19 @@ impl ExecutionEngine {
                     tier,
                     callsite_ic_ptrs,
                 )
+                .map_err(|e| {
+                    eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
+                    e
+                })
                 .ok()
                 .and_then(|artifact| {
                     let native_meta = artifact.native_meta;
                     let inline_safe =
                         is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
-                    artifact.code.into_executable().ok().map(|executable| {
+                    artifact.code.into_executable().map_err(|e| {
+                        eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
+                        e
+                    }).ok().map(|executable| {
                         CompilationResult::Compiled {
                             id,
                             tier,
@@ -1245,7 +1242,7 @@ impl ExecutionEngine {
     /// Install any completed background compilations.
     #[inline]
     pub fn poll_compilations(&mut self) {
-        if self.pending_count == 0 {
+        if self.pending_count == 0 && self.compile_queue.is_empty() {
             return;
         }
         while let Ok(result) = self.compilation_rx.try_recv() {
@@ -1280,6 +1277,50 @@ impl ExecutionEngine {
                 self.compiling_tier[idx] = None;
             }
             self.pending_count = self.pending_count.saturating_sub(1);
+        }
+
+    }
+
+    /// Drain the compile queue: if the background thread is idle and there
+    /// are queued functions, start compiling the next one. Must be called
+    /// with interner access (from the VM context).
+    pub fn drain_compile_queue(&mut self, interner: &crate::intern::Interner) {
+        while !self.compile_queue.is_empty() {
+            let thread_idle = self
+                .compile_handle
+                .as_ref()
+                .map_or(true, |h| h.is_finished());
+            if !thread_idle {
+                break;
+            }
+            if let Some(h) = self.compile_handle.take() {
+                let _ = h.join();
+            }
+            // Poll any newly completed results before starting next.
+            while let Ok(result) = self.compilation_rx.try_recv() {
+                let idx = match &result {
+                    CompilationResult::Compiled { id, .. }
+                    | CompilationResult::Failed { id, .. } => id.0 as usize,
+                };
+                if idx < self.functions.len() {
+                    if let CompilationResult::Compiled {
+                        tier,
+                        executable,
+                        native_meta,
+                        inline_safe,
+                        ..
+                    } = result
+                    {
+                        self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
+                    }
+                }
+                if idx < self.compiling_tier.len() {
+                    self.compiling_tier[idx] = None;
+                }
+                self.pending_count = self.pending_count.saturating_sub(1);
+            }
+            let queued_id = self.compile_queue.remove(0);
+            self.request_tier_up(queued_id, interner);
         }
     }
 

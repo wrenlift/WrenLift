@@ -62,9 +62,10 @@ pub mod cl {
             .set("preserve_frame_pointers", "false")
             .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
 
-        // Enable probestack for large stack allocations (prevents stack overflow)
+        // Disable probestack — macOS aarch64 inline probestack can cause
+        // false SIGSEGV (interpreted as stack overflow by the Rust runtime).
         flag_builder
-            .set("enable_probestack", "true")
+            .set("enable_probestack", "false")
             .map_err(|e| format!("Failed to set enable_probestack: {}", e))?;
 
         flag_builder
@@ -86,11 +87,10 @@ pub mod cl {
         let mut module = JITModule::new(jit_builder);
 
         // 3. Build the function signature: all args are i64 (NaN-boxed values)
-        let param_count = mir.blocks[0]
-            .instructions
-            .iter()
-            .filter(|(_, inst)| matches!(inst, Instruction::BlockParam(_)))
-            .count();
+        // Use mir.arity (total params INCLUDING receiver) to match the caller's ABI.
+        // BlockParam instructions may be fewer (dead receiver eliminated by DCE),
+        // but the function must still accept all args the caller passes.
+        let param_count = mir.arity as usize;
 
         // Check if this function is num-specialized (all params guarded as Num).
         // If so, create an inner f64→f64 version for direct recursive calls
@@ -123,14 +123,21 @@ pub mod cl {
             .declare_function(&safe_name, Linkage::Local, &sig)
             .map_err(|e| e.to_string())?;
 
+        // Count actually-used params (BlockParam instructions in bb0) —
+        // this may be fewer than arity (e.g., unused receiver after DCE).
+        let used_param_count = mir.blocks[0]
+            .instructions
+            .iter()
+            .filter(|(_, inst)| matches!(inst, Instruction::BlockParam(_)))
+            .count();
+
         // If num-specialized, declare an inner f64→f64 function for recursion.
         // The outer i64→i64 wrapper does guard+unbox, calls inner, then boxes result.
+        // The inner function only takes the USED params (typically just n, not receiver).
         let inner_func_id = if use_f64_inner {
             let inner_name = format!("{}_f64", safe_name);
             let mut inner_sig = module.make_signature();
-            // All params that have GuardNum use f64; the rest stay i64
-            // For simplicity, make ALL params f64 (assumes all are guarded)
-            for _ in 0..param_count {
+            for _ in 0..used_param_count {
                 inner_sig.params.push(AbiParam::new(types::F64));
             }
             inner_sig.returns.push(AbiParam::new(types::F64));
@@ -174,6 +181,12 @@ pub mod cl {
                 eprintln!("{}", inner_func.display());
                 eprintln!("=== end ===");
             }
+            // Verify inner function before defining
+            if let Err(errors) =
+                cranelift_codegen::verify_function(&inner_func, module.isa())
+            {
+                return Err(format!("Verifier errors in inner {}: {}", safe_name, errors));
+            }
             let mut inner_ctx = Context::for_function(inner_func);
             module
                 .define_function(inner_id, &mut inner_ctx)
@@ -195,10 +208,26 @@ pub mod cl {
                     builder.append_block_param(entry, types::I64);
                 }
                 let entry_params = builder.block_params(entry).to_vec();
-                // Unbox each param to f64
-                let f64_args: Vec<Value> = entry_params
+                // Collect the BlockParam indices used by the MIR, then
+                // unbox only those params to pass to the inner f64 function.
+                let used_indices: Vec<usize> = mir.blocks[0]
+                    .instructions
                     .iter()
-                    .map(|&p| builder.ins().bitcast(types::F64, MemFlags::new(), p))
+                    .filter_map(|(_, inst)| {
+                        if let Instruction::BlockParam(idx) = inst {
+                            Some(*idx as usize)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let f64_args: Vec<Value> = used_indices
+                    .iter()
+                    .map(|&idx| {
+                        builder
+                            .ins()
+                            .bitcast(types::F64, MemFlags::new(), entry_params[idx])
+                    })
                     .collect();
                 // Call inner
                 let inner_ref = module.declare_func_in_func(inner_id, builder.func);
@@ -396,6 +425,9 @@ pub mod cl {
         // Map MIR values to Cranelift values
         let mut val_map: HashMap<ValueId, Value> = HashMap::new();
 
+        // Receiver (entry_params[0]) saved for CallStaticSelf
+        let mut receiver_val: Option<Value> = None;
+
         // Track which MIR values are raw Cranelift booleans (i8) rather than
         // NaN-boxed TAG_TRUE/TAG_FALSE. Used to skip the expensive truthiness
         // check in CondBranch when the condition is a direct fcmp/icmp result.
@@ -448,29 +480,46 @@ pub mod cl {
             // For the entry block, add function params as block params
             // THEN map BlockParam instructions to those params.
             if block_idx == 0 {
-                // Count BlockParam instructions to know how many func args
-                let bp_count = block
-                    .instructions
-                    .iter()
-                    .filter(|(_, inst)| matches!(inst, Instruction::BlockParam(_)))
-                    .count();
-                // Append function argument params to the entry block.
-                // In f64 mode, params are f64 (not i64).
-                let param_type = if f64_self_id.is_some() {
-                    types::F64
+                if f64_self_id.is_some() {
+                    // f64 inner function: params are only the USED ones
+                    // (sequential f64 params, no receiver).
+                    let bp_count = block
+                        .instructions
+                        .iter()
+                        .filter(|(_, inst)| matches!(inst, Instruction::BlockParam(_)))
+                        .count();
+                    for _ in 0..bp_count {
+                        builder.append_block_param(cl_block, types::F64);
+                    }
+                    let entry_params = builder.block_params(cl_block).to_vec();
+                    let mut param_idx = 0usize;
+                    for &(vid, ref inst) in &block.instructions {
+                        if matches!(inst, Instruction::BlockParam(_)) {
+                            if param_idx < entry_params.len() {
+                                val_map.insert(vid, entry_params[param_idx]);
+                            }
+                            param_idx += 1;
+                        }
+                    }
                 } else {
-                    types::I64
-                };
-                for _ in 0..bp_count {
-                    builder.append_block_param(cl_block, param_type);
-                }
-                // Map them
-                let entry_params = builder.block_params(cl_block);
-                let mut param_idx = 0usize;
-                for &(vid, ref inst) in &block.instructions {
-                    if matches!(inst, Instruction::BlockParam(_)) {
-                        val_map.insert(vid, entry_params[param_idx]);
-                        param_idx += 1;
+                    // i64 path: add mir.arity params to match the caller ABI
+                    // (includes receiver even if dead).
+                    let arity = mir.arity as usize;
+                    for _ in 0..arity {
+                        builder.append_block_param(cl_block, types::I64);
+                    }
+                    let entry_params = builder.block_params(cl_block).to_vec();
+                    if !entry_params.is_empty() {
+                        receiver_val = Some(entry_params[0]);
+                    }
+                    // Map BlockParam(idx) → entry_params[idx]
+                    for &(vid, ref inst) in &block.instructions {
+                        if let Instruction::BlockParam(idx) = inst {
+                            let idx = *idx as usize;
+                            if idx < entry_params.len() {
+                                val_map.insert(vid, entry_params[idx]);
+                            }
+                        }
                     }
                 }
             }
@@ -496,6 +545,7 @@ pub mod cl {
                     callsite_ic_ptrs,
                     &mut call_site_idx,
                     f64_self_id,
+                    receiver_val,
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -617,6 +667,7 @@ pub mod cl {
         callsite_ic_ptrs: Option<&[usize]>,
         call_site_idx: &mut usize,
         f64_self_id: Option<cranelift_module::FuncId>,
+        receiver_val: Option<Value>,
     ) -> Result<Option<Value>, String> {
         let get = |vid: &ValueId| -> Value {
             *val_map
@@ -1345,7 +1396,7 @@ pub mod cl {
             Instruction::CallStaticSelf { args } => {
                 // In f64 mode: call inner function directly with f64 args
                 // (no box/unbox roundtrip — args are already f64).
-                // In i64 mode: call self with i64 args.
+                // In i64 mode: call self with i64 args, prepending receiver.
                 let target_id = if let Some(inner_id) = f64_self_id {
                     inner_id
                 } else {
@@ -1355,7 +1406,18 @@ pub mod cl {
                     })
                 };
                 let self_func_ref = module.declare_func_in_func(target_id, builder.func);
-                let call_args: Vec<Value> = args.iter().map(|a| get(a)).collect();
+                let mut call_args: Vec<Value> = Vec::with_capacity(1 + args.len());
+                // Prepend receiver (param #0) for self-calls to match arity.
+                // f64 inner functions don't need the receiver (they use
+                // a reduced signature).
+                if f64_self_id.is_none() {
+                    if let Some(recv) = receiver_val {
+                        call_args.push(recv);
+                    }
+                }
+                for a in args {
+                    call_args.push(get(a));
+                }
                 let result = builder.ins().call(self_func_ref, &call_args);
                 Ok(Some(builder.inst_results(result)[0]))
             }
@@ -1451,14 +1513,15 @@ pub mod cl {
 
         dfs(0, mir, &mut visited, &mut post_order);
 
-        // Add any unreachable blocks at the end
+        post_order.reverse(); // reverse post-order — bb0 is now first
+
+        // Add any unreachable blocks AFTER reversing so they come last
         for i in 0..n {
             if !visited[i] {
                 post_order.push(i);
             }
         }
 
-        post_order.reverse(); // reverse post-order
         post_order
     }
 }

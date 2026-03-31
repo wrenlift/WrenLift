@@ -508,6 +508,7 @@ fn run_fiber_with_stop_depth(
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
+
         let mut fiber = vm.fiber;
         unsafe {
             (*fiber).state = FiberState::Running;
@@ -627,6 +628,7 @@ fn run_fiber_with_stop_depth(
                     vm.method_cache.invalidate();
                     vm.engine.invalidate_inline_caches();
                     vm.engine.poll_compilations();
+                    // Queue processed by request_tier_up
                     fiber = vm.fiber;
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -1610,6 +1612,12 @@ fn run_fiber_with_stop_depth(
                                 #[cfg(not(feature = "cranelift"))]
                                 let jit_dispatch_ok = !jit_ptr.is_null()
                                     && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+                                if std::env::var_os("WLIFT_TRACE_JIT_CALL").is_some() {
+                                    eprintln!(
+                                        "JIT-CHECK: fn_idx={} argc={} jit_null={} ok={}",
+                                        fn_idx, argc, jit_ptr.is_null(), jit_dispatch_ok
+                                    );
+                                }
                                 if jit_dispatch_ok {
                                     // Populate IC for this call site
                                     let ic_table = unsafe { &mut *bc.ic_table.get() };
