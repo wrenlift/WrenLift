@@ -92,6 +92,21 @@ pub mod cl {
             .filter(|(_, inst)| matches!(inst, Instruction::BlockParam(_)))
             .count();
 
+        // Check if this function is num-specialized (all params guarded as Num).
+        // If so, create an inner f64→f64 version for direct recursive calls
+        // to avoid the box/unbox roundtrip per recursion (~370ns → ~5ns).
+        let has_num_guards = mir.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|(_, inst)| matches!(inst, Instruction::GuardNum(_)))
+        });
+        let has_self_calls = mir.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|(_, inst)| matches!(inst, Instruction::CallStaticSelf { .. }))
+        });
+        let use_f64_inner = has_num_guards && has_self_calls && param_count > 0;
+
         let mut sig = module.make_signature();
         for _ in 0..param_count {
             sig.params.push(AbiParam::new(types::I64));
@@ -108,10 +123,24 @@ pub mod cl {
             .declare_function(&safe_name, Linkage::Local, &sig)
             .map_err(|e| e.to_string())?;
 
-        let mut func = Function::with_name_signature(
-            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
-            sig,
-        );
+        // If num-specialized, declare an inner f64→f64 function for recursion.
+        // The outer i64→i64 wrapper does guard+unbox, calls inner, then boxes result.
+        let inner_func_id = if use_f64_inner {
+            let inner_name = format!("{}_f64", safe_name);
+            let mut inner_sig = module.make_signature();
+            // All params that have GuardNum use f64; the rest stay i64
+            // For simplicity, make ALL params f64 (assumes all are guarded)
+            for _ in 0..param_count {
+                inner_sig.params.push(AbiParam::new(types::F64));
+            }
+            inner_sig.returns.push(AbiParam::new(types::F64));
+            let inner_id = module
+                .declare_function(&inner_name, Linkage::Local, &inner_sig)
+                .map_err(|e| e.to_string())?;
+            Some((inner_id, inner_sig))
+        } else {
+            None
+        };
 
         // 5. Lower MIR to Cranelift IR
         if std::env::var_os("WLIFT_CL_MIR").is_some() {
@@ -119,6 +148,87 @@ pub mod cl {
             eprintln!("{}", mir.pretty_print(interner));
             eprintln!("=== end ===");
         }
+
+        if let Some((inner_id, ref inner_sig)) = inner_func_id {
+            // ── Build the INNER f64→f64 function (the hot recursive path) ──
+            let mut inner_func = Function::with_name_signature(
+                cranelift_codegen::ir::UserFuncName::user(0, inner_id.as_u32()),
+                inner_sig.clone(),
+            );
+            {
+                let mut fb_ctx = FunctionBuilderContext::new();
+                let mut builder = FunctionBuilder::new(&mut inner_func, &mut fb_ctx);
+                lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs)?;
+                builder.seal_all_blocks();
+                builder.finalize();
+            }
+            if std::env::var_os("WLIFT_CL_IR").is_some() {
+                eprintln!("=== Cranelift IR (inner f64) for {} ===", safe_name);
+                eprintln!("{}", inner_func.display());
+                eprintln!("=== end ===");
+            }
+            let mut inner_ctx = Context::for_function(inner_func);
+            module
+                .define_function(inner_id, &mut inner_ctx)
+                .map_err(|e| e.to_string())?;
+
+            // ── Build the OUTER i64→i64 wrapper ──
+            // unbox params → call inner → box result
+            let mut func = Function::with_name_signature(
+                cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+                sig,
+            );
+            {
+                let mut fb_ctx = FunctionBuilderContext::new();
+                let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+                let entry = builder.create_block();
+                builder.switch_to_block(entry);
+                // Add i64 params
+                for _ in 0..param_count {
+                    builder.append_block_param(entry, types::I64);
+                }
+                let entry_params = builder.block_params(entry).to_vec();
+                // Unbox each param to f64
+                let f64_args: Vec<Value> = entry_params
+                    .iter()
+                    .map(|&p| builder.ins().bitcast(types::F64, MemFlags::new(), p))
+                    .collect();
+                // Call inner
+                let inner_ref = module.declare_func_in_func(inner_id, builder.func);
+                let call = builder.ins().call(inner_ref, &f64_args);
+                let f64_result = builder.inst_results(call)[0];
+                // Box result back to i64
+                let i64_result = builder
+                    .ins()
+                    .bitcast(types::I64, MemFlags::new(), f64_result);
+                builder.ins().return_(&[i64_result]);
+                builder.seal_all_blocks();
+                builder.finalize();
+            }
+            if std::env::var_os("WLIFT_CL_IR").is_some() {
+                eprintln!("=== Cranelift IR (wrapper) for {} ===", safe_name);
+                eprintln!("{}", func.display());
+                eprintln!("=== end ===");
+            }
+            let mut ctx = Context::for_function(func);
+            module
+                .define_function(func_id, &mut ctx)
+                .map_err(|e| e.to_string())?;
+            module.finalize_definitions().map_err(|e| e.to_string())?;
+            let fn_ptr = module.get_finalized_function(func_id);
+            let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
+            return Ok(CraneliftCompiledCode {
+                _module: module,
+                fn_ptr,
+                code_size,
+            });
+        }
+
+        // Standard path (no f64 specialization)
+        let mut func = Function::with_name_signature(
+            cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+            sig,
+        );
         {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
