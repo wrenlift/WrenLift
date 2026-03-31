@@ -1014,17 +1014,18 @@ impl ExecutionEngine {
         match self.functions.get_mut(idx) {
             Some(FuncBody::Interpreted { call_count, .. }) => {
                 *call_count += 1;
-                *call_count >= self.jit_threshold
+                *call_count == self.jit_threshold
             }
             Some(FuncBody::Native {
                 opt_call_count,
                 optimized_executable,
                 ..
             }) if optimized_executable.is_none()
-                && self.tier_states.get(idx).copied() == Some(TierState::BaselineNative) =>
+                && self.tier_states.get(idx).copied() == Some(TierState::BaselineNative)
+                && self.compiling_tier.get(idx).copied().flatten().is_none() =>
             {
                 *opt_call_count += 1;
-                *opt_call_count >= self.opt_threshold
+                *opt_call_count == self.opt_threshold
             }
             _ => false,
         }

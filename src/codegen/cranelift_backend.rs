@@ -56,6 +56,12 @@ pub mod cl {
         flag_builder
             .set("is_pic", "false")
             .map_err(|e| e.to_string())?;
+
+        // Disable frame pointers for smaller/faster code
+        flag_builder
+            .set("preserve_frame_pointers", "false")
+            .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
+
         // Keep verifier ON to catch IR construction bugs
         flag_builder
             .set("enable_verifier", "true")
