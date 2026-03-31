@@ -46,6 +46,7 @@ pub mod cl {
     pub fn compile_mir(
         mir: &MirFunction,
         interner: &Interner,
+        callsite_ic_ptrs: Option<&[usize]>,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -112,7 +113,7 @@ pub mod cl {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
 
-            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module)?;
+            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs)?;
 
             builder.seal_all_blocks();
             builder.finalize();
@@ -240,6 +241,7 @@ pub mod cl {
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut JITModule,
+        callsite_ic_ptrs: Option<&[usize]>,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
@@ -253,6 +255,9 @@ pub mod cl {
 
         // Cache for declared runtime functions
         let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> = HashMap::new();
+
+        // Call site counter for IC lookup
+        let mut call_site_idx: usize = 0;
 
         // Helper to get or declare a runtime function
         let mut get_runtime_fn = |module: &mut JITModule,
@@ -326,6 +331,8 @@ pub mod cl {
                     module,
                     &val_map,
                     &mut get_runtime_fn,
+                    callsite_ic_ptrs,
+                    &mut call_site_idx,
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -441,6 +448,8 @@ pub mod cl {
             &str,
             usize,
         ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        callsite_ic_ptrs: Option<&[usize]>,
+        call_site_idx: &mut usize,
     ) -> Result<Option<Value>, String> {
         let get = |vid: &ValueId| -> Value {
             *val_map
@@ -667,16 +676,117 @@ pub mod cl {
                 Ok(Some(builder.inst_results(result)[0]))
             }
 
-            // === Method calls → wren_call_N ===
+            // === Method calls — inline IC fast path + wren_call_N slow path ===
             Instruction::Call {
                 receiver,
                 method,
                 args,
             } => {
                 let r = get(receiver);
+                let ic_idx = *call_site_idx;
+                *call_site_idx += 1;
+
+                // Try inline IC: if we have IC data for this call site,
+                // emit a class-check + direct call fast path.
+                let ic = callsite_ic_ptrs
+                    .and_then(|ptrs| ptrs.get(ic_idx))
+                    .map(|&ptr| unsafe { &*(ptr as *const crate::mir::bytecode::CallSiteIC) });
+
+                // Kind=1 (JIT leaf) or kind=5 (getter): emit inline fast path
+                if let Some(ic) = ic {
+                    if (ic.kind == 1 || ic.kind == 5) && ic.class != 0 && !ic.jit_ptr.is_null() {
+                        let fast_block = builder.create_block();
+                        let slow_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, types::I64);
+
+                        // Extract receiver class: recv & PTR_MASK → load class at offset 16
+                        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                        let obj_ptr = builder.ins().band(r, ptr_mask);
+                        let recv_class = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            obj_ptr,
+                            HEADER_CLASS,
+                        );
+
+                        // Compare against cached class
+                        let cached_class = builder.ins().iconst(types::I64, ic.class as i64);
+                        let class_match =
+                            builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                        builder
+                            .ins()
+                            .brif(class_match, fast_block, &[], slow_block, &[]);
+
+                        // Fast path: direct call or inline field load
+                        builder.switch_to_block(fast_block);
+                        let fast_result = if ic.kind == 5 {
+                            // Getter: inline field load
+                            let field_idx = ic.func_id as i32;
+                            let fields_ptr = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                obj_ptr,
+                                INSTANCE_FIELDS,
+                            );
+                            let offset = field_idx * VALUE_SIZE;
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), fields_ptr, offset)
+                        } else {
+                            // Kind=1: direct call to JIT function pointer
+                            let jit_addr = builder.ins().iconst(types::I64, ic.jit_ptr as i64);
+                            // Build call signature: (recv, args...) -> i64
+                            let mut sig = module.make_signature();
+                            sig.params.push(AbiParam::new(types::I64)); // recv
+                            for _ in args {
+                                sig.params.push(AbiParam::new(types::I64));
+                            }
+                            sig.returns.push(AbiParam::new(types::I64));
+                            let sig_ref = builder.import_signature(sig);
+                            let mut call_args = vec![r];
+                            for a in args {
+                                call_args.push(get(a));
+                            }
+                            let call = builder.ins().call_indirect(sig_ref, jit_addr, &call_args);
+                            builder.inst_results(call)[0]
+                        };
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(fast_result)]);
+
+                        // Slow path: full dispatch via wren_call_N
+                        builder.switch_to_block(slow_block);
+                        let method_bits = method.index() as u64;
+                        let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                        let call_name = match args.len() {
+                            0 => "wren_call_0",
+                            1 => "wren_call_1",
+                            2 => "wren_call_2",
+                            3 => "wren_call_3",
+                            _ => "wren_call_4",
+                        };
+                        let arg_count = 2 + args.len().min(4);
+                        let f = get_runtime_fn(module, builder, call_name, arg_count)?;
+                        let mut slow_args = vec![r, method_val];
+                        for a in args.iter().take(4) {
+                            slow_args.push(get(a));
+                        }
+                        let slow_call = builder.ins().call(f, &slow_args);
+                        let slow_result = builder.inst_results(slow_call)[0];
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                        // Merge
+                        builder.switch_to_block(merge_block);
+                        return Ok(Some(builder.block_params(merge_block)[0]));
+                    }
+                }
+
+                // No IC or unsupported IC kind: full dispatch
                 let method_bits = method.index() as u64;
                 let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-
                 let call_name = match args.len() {
                     0 => "wren_call_0",
                     1 => "wren_call_1",
@@ -684,9 +794,8 @@ pub mod cl {
                     3 => "wren_call_3",
                     _ => "wren_call_4",
                 };
-                let arg_count = 2 + args.len().min(4); // recv + method + user_args
+                let arg_count = 2 + args.len().min(4);
                 let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-
                 let mut call_args = vec![r, method_val];
                 for a in args.iter().take(4) {
                     call_args.push(get(a));

@@ -2017,7 +2017,8 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
         // encoding correctly for both x86_64 and aarch64.
         #[cfg(feature = "cranelift")]
         Target::X86_64 | Target::Aarch64 => {
-            let compiled = cranelift_backend::cl::compile_mir(mir, interner)?;
+            let compiled =
+                cranelift_backend::cl::compile_mir(mir, interner, callsite_ic_ptrs.as_deref())?;
             let code = CompiledFunction::CraneliftOwned(compiled);
             return Ok(CompiledArtifact {
                 code,
