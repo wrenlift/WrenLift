@@ -253,6 +253,11 @@ pub mod cl {
         // Map MIR values to Cranelift values
         let mut val_map: HashMap<ValueId, Value> = HashMap::new();
 
+        // Track which MIR values are raw Cranelift booleans (i8) rather than
+        // NaN-boxed TAG_TRUE/TAG_FALSE. Used to skip the expensive truthiness
+        // check in CondBranch when the condition is a direct fcmp/icmp result.
+        let mut raw_bools: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+
         // Cache for declared runtime functions
         let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> = HashMap::new();
 
@@ -323,6 +328,14 @@ pub mod cl {
 
             // Lower each instruction
             for &(vid, ref inst) in &block.instructions {
+                // Track raw booleans from f64 comparisons
+                let is_raw_bool = matches!(
+                    inst,
+                    Instruction::CmpLtF64(..)
+                        | Instruction::CmpGtF64(..)
+                        | Instruction::CmpLeF64(..)
+                        | Instruction::CmpGeF64(..)
+                );
                 let result = lower_instruction(
                     inst,
                     mir,
@@ -336,11 +349,14 @@ pub mod cl {
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
+                    if is_raw_bool {
+                        raw_bools.insert(vid);
+                    }
                 }
             }
 
             // Lower terminator
-            lower_terminator(&block.terminator, builder, &val_map, &block_map);
+            lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools);
         }
 
         Ok(())
@@ -1020,34 +1036,28 @@ pub mod cl {
             }
             Instruction::NegF64(a) => Ok(Some(builder.ins().fneg(get(a)))),
 
-            // === Unboxed f64 comparisons ===
+            // === Unboxed f64 comparisons → raw Cranelift booleans ===
+            // These produce raw i8 booleans (not NaN-boxed). The CondBranch
+            // handler detects raw_bools and uses brif directly without the
+            // expensive NaN-box truthiness check.
             Instruction::CmpLtF64(a, b) => {
-                let cmp = builder.ins().fcmp(FloatCC::LessThan, get(a), get(b));
-                // Convert bool to NaN-boxed TAG_TRUE/TAG_FALSE
-                let true_val = builder.ins().iconst(types::I64, TAG_TRUE as i64);
-                let false_val = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                Ok(Some(builder.ins().select(cmp, true_val, false_val)))
+                Ok(Some(builder.ins().fcmp(FloatCC::LessThan, get(a), get(b))))
             }
-            Instruction::CmpGtF64(a, b) => {
-                let cmp = builder.ins().fcmp(FloatCC::GreaterThan, get(a), get(b));
-                let true_val = builder.ins().iconst(types::I64, TAG_TRUE as i64);
-                let false_val = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                Ok(Some(builder.ins().select(cmp, true_val, false_val)))
-            }
-            Instruction::CmpLeF64(a, b) => {
-                let cmp = builder.ins().fcmp(FloatCC::LessThanOrEqual, get(a), get(b));
-                let true_val = builder.ins().iconst(types::I64, TAG_TRUE as i64);
-                let false_val = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                Ok(Some(builder.ins().select(cmp, true_val, false_val)))
-            }
-            Instruction::CmpGeF64(a, b) => {
-                let cmp = builder
-                    .ins()
-                    .fcmp(FloatCC::GreaterThanOrEqual, get(a), get(b));
-                let true_val = builder.ins().iconst(types::I64, TAG_TRUE as i64);
-                let false_val = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                Ok(Some(builder.ins().select(cmp, true_val, false_val)))
-            }
+            Instruction::CmpGtF64(a, b) => Ok(Some(builder.ins().fcmp(
+                FloatCC::GreaterThan,
+                get(a),
+                get(b),
+            ))),
+            Instruction::CmpLeF64(a, b) => Ok(Some(builder.ins().fcmp(
+                FloatCC::LessThanOrEqual,
+                get(a),
+                get(b),
+            ))),
+            Instruction::CmpGeF64(a, b) => Ok(Some(builder.ins().fcmp(
+                FloatCC::GreaterThanOrEqual,
+                get(a),
+                get(b),
+            ))),
 
             // === Box/Unbox ===
             Instruction::Unbox(a) => {
@@ -1197,6 +1207,7 @@ pub mod cl {
         builder: &mut FunctionBuilder,
         val_map: &HashMap<ValueId, Value>,
         block_map: &HashMap<BlockId, cranelift_codegen::ir::Block>,
+        raw_bools: &std::collections::HashSet<ValueId>,
     ) {
         let get = |vid: &ValueId| -> Value {
             *val_map
@@ -1225,21 +1236,27 @@ pub mod cl {
                 false_target,
                 false_args,
             } => {
-                // Convert NaN-boxed boolean to Cranelift i8 condition
-                // is_truthy: val != TAG_FALSE && val != TAG_NULL
                 let cond = get(condition);
-                let tag_false = builder.ins().iconst(types::I64, TAG_FALSE as i64);
-                let tag_null = builder.ins().iconst(types::I64, TAG_NULL as i64);
-                let not_false = builder.ins().icmp(IntCC::NotEqual, cond, tag_false);
-                let not_null = builder.ins().icmp(IntCC::NotEqual, cond, tag_null);
-                let is_truthy = builder.ins().band(not_false, not_null);
-
                 let t_block = block_map[true_target];
                 let f_block = block_map[false_target];
                 let t_args: Vec<BlockArg> =
                     true_args.iter().map(|a| BlockArg::Value(get(a))).collect();
                 let f_args: Vec<BlockArg> =
                     false_args.iter().map(|a| BlockArg::Value(get(a))).collect();
+
+                // If the condition is a raw boolean (from CmpLtF64 etc.),
+                // use it directly — no NaN-box truthiness check needed.
+                // This turns 8 instructions into 1 for typed comparisons.
+                let is_truthy = if raw_bools.contains(condition) {
+                    cond // Already a Cranelift i8 boolean
+                } else {
+                    // NaN-boxed truthiness: val != TAG_FALSE && val != TAG_NULL
+                    let tag_false = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                    let tag_null = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                    let not_false = builder.ins().icmp(IntCC::NotEqual, cond, tag_false);
+                    let not_null = builder.ins().icmp(IntCC::NotEqual, cond, tag_null);
+                    builder.ins().band(not_false, not_null)
+                };
 
                 builder
                     .ins()

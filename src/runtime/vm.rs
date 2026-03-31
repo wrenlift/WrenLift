@@ -593,12 +593,12 @@ impl VM {
             }
         }
 
-        // The module entry runs exactly once, so entry-count tiering can never
-        // make it hot enough on its own. Baseline-compile it up front for
-        // method-heavy scripts, but avoid constructor-heavy entry functions for
-        // now since they still route through the slow temp-fiber bridge.
-        // Don't eagerly compile when step_limit is small — the JIT code has
-        // no step counter, so infinite loops in the entry function would hang.
+        // Eager compilation: compile the module entry before running it.
+        // Disabled when Cranelift is the backend — we need 100 interpreter
+        // calls first to collect IC + profile data for TypeSpecialize and
+        // inline caching. Without this warmup, the JIT code uses full
+        // dispatch for every method call (30-40x slower).
+        #[cfg(not(feature = "cranelift"))]
         if self.config.execution_mode != super::engine::ExecutionMode::Interpreter
             && self.config.step_limit > 100_000
             && self
