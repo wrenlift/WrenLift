@@ -98,6 +98,11 @@ pub mod cl {
         );
 
         // 5. Lower MIR to Cranelift IR
+        if std::env::var_os("WLIFT_CL_MIR").is_some() {
+            eprintln!("=== CL MIR input for {} ===", safe_name);
+            eprintln!("{}", mir.pretty_print(interner));
+            eprintln!("=== end ===");
+        }
         {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
@@ -106,6 +111,13 @@ pub mod cl {
 
             builder.seal_all_blocks();
             builder.finalize();
+        }
+
+        // Dump Cranelift IR if requested
+        if std::env::var_os("WLIFT_CL_IR").is_some() {
+            eprintln!("=== Cranelift IR for {} ===", safe_name);
+            eprintln!("{}", func.display());
+            eprintln!("=== end ===");
         }
 
         // 6. Compile
