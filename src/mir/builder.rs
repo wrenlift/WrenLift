@@ -427,8 +427,13 @@ impl<'a> MirBuilder<'a> {
         // Pre-create phi block params in cond_bb for ALL variables.
         // This ensures both condition and body use phi values, so mutations
         // in the body propagate correctly back to the condition via the back-edge.
-        let vars_snapshot: Vec<(SymbolId, ValueId)> =
+        let mut vars_snapshot: Vec<(SymbolId, ValueId)> =
             self.variables.iter().map(|(&k, &v)| (k, v)).collect();
+        // Sort by SymbolId to ensure deterministic block parameter ordering
+        // across platforms. HashMap iteration order is non-deterministic,
+        // which produces different (but semantically valid) parameter orderings
+        // that can expose register allocation bugs on specific platforms.
+        vars_snapshot.sort_by_key(|&(k, _)| k.index());
 
         let mut entry_args = Vec::new();
         let mut phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
@@ -539,8 +544,10 @@ impl<'a> MirBuilder<'a> {
         // Create phi block params in cond_bb for the iterator state AND all
         // live variables, so mutations in the body propagate through the
         // back-edge (same approach as lower_while).
-        let vars_snapshot: Vec<(SymbolId, ValueId)> =
+        let mut vars_snapshot: Vec<(SymbolId, ValueId)> =
             self.variables.iter().map(|(&k, &v)| (k, v)).collect();
+        // Deterministic ordering (see lower_while comment).
+        vars_snapshot.sort_by_key(|&(k, _)| k.index());
         let tracked_names: Vec<SymbolId> = vars_snapshot.iter().map(|&(k, _)| k).collect();
 
         // First param: iterator state

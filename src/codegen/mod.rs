@@ -2038,6 +2038,13 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             )));
             regalloc::apply_allocation(&mut mach, &alloc, target_regs.frame_reserved);
             fixup_sentinels(&mut mach, target);
+            // Resolve any remaining parallel copies after register allocation.
+            // Pre-alloc resolution uses virtual registers (no conflicts), but
+            // after allocation two different vregs may map to the same physical
+            // register, creating write-before-read hazards in the sequential
+            // Mov sequence. The postalloc resolver detects these and inserts
+            // scratch-register temporaries to break cycles.
+            resolve_parallel_copies_postalloc(&mut mach, target);
             runtime_fns::link_runtime_calls(
                 &mut mach,
                 target,
