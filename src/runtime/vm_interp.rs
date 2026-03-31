@@ -2537,7 +2537,12 @@ fn dispatch_closure_bc(
         // use-after-free when poll_compilations replaces a previously-compiled
         // function with a recompiled version (dropping the old ExecutableBuffer).
         vm.engine.poll_compilations();
-        // Worker thread processes compile queue automatically.
+        // Drain compile queue: dispatch_closure_bc is a safe point because
+        // caller state has been saved and we're about to push a new frame.
+        // Note: drain_compile_queue is NOT safe to call here — it modifies
+        // engine state (IC invalidation, jit_code changes) that can corrupt
+        // the interpreter's assumptions during execution. Queue processing
+        // is handled by request_tier_up when new functions hit the threshold.
         let fn_ptr_raw = vm
             .engine
             .jit_code
