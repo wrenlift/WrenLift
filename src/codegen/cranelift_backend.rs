@@ -12,7 +12,7 @@ pub mod cl {
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
-    use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, MemFlags, Value};
+    use cranelift_codegen::ir::{AbiParam, BlockArg, Function, InstBuilder, MemFlags, Value};
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_codegen::Context;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -374,7 +374,7 @@ pub mod cl {
         let a_is_nan = builder.ins().icmp(IntCC::Equal, a_masked, qnan);
         builder
             .ins()
-            .brif(a_is_nan, slow_block, &[], check_b_block, &[]);
+            .brif(a_is_nan, slow_block, &[], check_b_block, &[] as &[BlockArg]);
 
         // Check b: (b & QNAN) == QNAN means NOT a number → slow path
         builder.switch_to_block(check_b_block);
@@ -382,7 +382,7 @@ pub mod cl {
         let b_is_nan = builder.ins().icmp(IntCC::Equal, b_masked, qnan);
         builder
             .ins()
-            .brif(b_is_nan, slow_block, &[], fast_block, &[]);
+            .brif(b_is_nan, slow_block, &[], fast_block, &[] as &[BlockArg]);
 
         // Fast path: bitcast to f64, do the operation, bitcast result back
         builder.switch_to_block(fast_block);
@@ -406,14 +406,16 @@ pub mod cl {
                 builder.ins().select(cmp, true_val, false_val)
             }
         };
-        builder.ins().jump(merge_block, &[iresult]);
+        builder.ins().jump(merge_block, &[BlockArg::Value(iresult)]);
 
         // Slow path: call runtime function
         builder.switch_to_block(slow_block);
         let f = get_runtime_fn(module, builder, slow_fn, 2)?;
         let call = builder.ins().call(f, &[la, lb]);
         let slow_result = builder.inst_results(call)[0];
-        builder.ins().jump(merge_block, &[slow_result]);
+        builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(slow_result)]);
 
         // Merge block: result from whichever path was taken
         builder.switch_to_block(merge_block);
@@ -1099,7 +1101,7 @@ pub mod cl {
             }
             Terminator::Branch { target, args } => {
                 let cl_block = block_map[target];
-                let cl_args: Vec<Value> = args.iter().map(|a| get(a)).collect();
+                let cl_args: Vec<BlockArg> = args.iter().map(|a| BlockArg::Value(get(a))).collect();
                 builder.ins().jump(cl_block, &cl_args);
             }
             Terminator::CondBranch {
@@ -1120,8 +1122,10 @@ pub mod cl {
 
                 let t_block = block_map[true_target];
                 let f_block = block_map[false_target];
-                let t_args: Vec<Value> = true_args.iter().map(|a| get(a)).collect();
-                let f_args: Vec<Value> = false_args.iter().map(|a| get(a)).collect();
+                let t_args: Vec<BlockArg> =
+                    true_args.iter().map(|a| BlockArg::Value(get(a))).collect();
+                let f_args: Vec<BlockArg> =
+                    false_args.iter().map(|a| BlockArg::Value(get(a))).collect();
 
                 builder
                     .ins()
