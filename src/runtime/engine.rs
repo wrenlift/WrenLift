@@ -980,6 +980,25 @@ impl ExecutionEngine {
                             code_size
                         );
                     }
+                    // Dump raw machine code hex for offline disassembly.
+                    if std::env::var_os("WLIFT_DUMP_HEX").is_some() {
+                        let func_name = self
+                            .functions
+                            .get(idx)
+                            .map(|b| b.mir().name)
+                            .and_then(|sym| {
+                                // Can't access interner here, use func_id
+                                None::<&str>
+                            })
+                            .unwrap_or("?");
+                        eprint!("HEX:f{}:{}:", func_id.0, code_size);
+                        let code_bytes =
+                            unsafe { std::slice::from_raw_parts(start as *const u8, code_size) };
+                        for b in code_bytes {
+                            eprint!("{:02x}", b);
+                        }
+                        eprintln!();
+                    }
                     self.register_code_range(func_id, start, start + code_size, meta);
                 }
             }
@@ -1057,6 +1076,13 @@ impl ExecutionEngine {
         let Some(body) = self.functions.get(idx) else {
             return false;
         };
+        // Skip JIT compilation for functions named in WLIFT_SKIP_JIT env var
+        if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
+            let name = interner.resolve(body.mir().name);
+            if skip.split(',').any(|s| name.contains(s)) {
+                return false;
+            }
+        }
         let mir = Arc::clone(body.mir());
         let profile = self.get_type_profile(id).cloned();
         if self.collect_tier_stats {
@@ -1110,6 +1136,15 @@ impl ExecutionEngine {
         let Some(tier) = self.next_compile_tier(idx) else {
             return;
         };
+        // Skip JIT for functions named in WLIFT_SKIP_JIT env var
+        if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
+            if let Some(body) = self.functions.get(idx) {
+                let name = interner.resolve(body.mir().name);
+                if skip.split(',').any(|s| name.contains(s)) {
+                    return;
+                }
+            }
+        }
         // Don't start optimized-tier compilation while baseline functions are
         // waiting in the queue — the optimizer can hang on complex functions,
         // blocking all compilation progress.
