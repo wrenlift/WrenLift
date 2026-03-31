@@ -1380,95 +1380,62 @@ fn run_fiber_with_stop_depth(
                     pc += (argc as u32) * 2;
 
                     // ── IC fast path: monomorphic inline cache ──────────────
-                    // Only kind 1 (JIT leaf) is inlined here. Adding more IC
-                    // kinds inline causes LLVM to bloat the dispatch loop and
-                    // regress performance on tight method-call benchmarks.
-                    let ic_table = unsafe { &mut *bc.ic_table.get() };
+                    // Stripped to bare minimum: class check → call → store.
+                    // No tier-up profiling, no IC re-validation, no stats.
+                    // Tier-up happens via slow path + back-edge counting.
+                    let ic_table = unsafe { &*bc.ic_table.get() };
                     if ic_idx < ic_table.len() {
-                        let ic = &mut ic_table[ic_idx];
-                        if ic.kind == 1 {
-                            // IC fast path: record call for tier-up.
-                            // Poll + drain only when tier-up fires (rare).
-                            if vm.engine.mode == ExecutionMode::Tiered {
-                                let func_id = FuncId(ic.func_id as u32);
-                                let should_tier_up = vm.engine.record_call(func_id);
-                                if should_tier_up {
-                                    vm.engine.request_tier_up(func_id, &vm.interner);
-                                }
-                                if should_tier_up && vm.engine.has_pending_compilations() {
-                                    vm.engine.poll_compilations();
-                                    vm.engine.drain_compile_queue(&vm.interner);
-                                }
-                            }
-                            let recv_class = if recv_val.is_object() {
-                                let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
-                                unsafe { (*(obj_ptr as *const ObjHeader)).class as usize }
-                            } else {
-                                0
-                            };
-                            if recv_class == ic.class && recv_class != 0 {
-                                let fn_idx = ic.func_id as usize;
-                                let live_ptr = vm
-                                    .engine
-                                    .jit_code
-                                    .get(fn_idx)
-                                    .copied()
-                                    .unwrap_or(std::ptr::null());
-                                if live_ptr.is_null()
-                                    || live_ptr != ic.jit_ptr
-                                    || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
-                                {
-                                    *ic = crate::mir::bytecode::CallSiteIC::default();
-                                } else {
-                                    let recv_bits = recv_val.to_bits();
-                                    vm.engine.note_ic_hit(func_id);
-                                    ensure_ctx_reg();
-                                    let result_bits = unsafe {
-                                        match argc {
-                                            0 => {
-                                                let f: extern "C" fn(u64) -> u64 =
-                                                    std::mem::transmute(live_ptr);
-                                                f(recv_bits)
-                                            }
-                                            1 => {
-                                                let a1 = read_u16_at(code, arg_regs_pc);
-                                                let f: extern "C" fn(u64, u64) -> u64 =
-                                                    std::mem::transmute(live_ptr);
-                                                f(recv_bits, get_reg(&values, a1).to_bits())
-                                            }
-                                            2 => {
-                                                let a1 = read_u16_at(code, arg_regs_pc);
-                                                let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                                let f: extern "C" fn(u64, u64, u64) -> u64 =
-                                                    std::mem::transmute(live_ptr);
-                                                f(
-                                                    recv_bits,
-                                                    get_reg(&values, a1).to_bits(),
-                                                    get_reg(&values, a2).to_bits(),
-                                                )
-                                            }
-                                            _ => {
-                                                let a1 = read_u16_at(code, arg_regs_pc);
-                                                let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                                let a3 = read_u16_at(code, arg_regs_pc + 4);
-                                                let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
-                                                    std::mem::transmute(live_ptr);
-                                                f(
-                                                    recv_bits,
-                                                    get_reg(&values, a1).to_bits(),
-                                                    get_reg(&values, a2).to_bits(),
-                                                    get_reg(&values, a3).to_bits(),
-                                                )
-                                            }
+                        let ic = &ic_table[ic_idx];
+                        if ic.kind == 1 && recv_val.is_object() {
+                            let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
+                            let recv_class =
+                                unsafe { (*(obj_ptr as *const ObjHeader)).class as usize };
+                            if recv_class == ic.class {
+                                let jit_ptr = ic.jit_ptr;
+                                let recv_bits = recv_val.to_bits();
+                                ensure_ctx_reg();
+                                let result_bits = unsafe {
+                                    match argc {
+                                        0 => {
+                                            let f: extern "C" fn(u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(recv_bits)
                                         }
-                                    };
-                                    vm.engine.note_native_entry(func_id);
-                                    set_reg(&mut values, dst, Value::from_bits(result_bits));
-                                    steps += 1;
-                                    continue;
-                                }
-                            } else {
-                                vm.engine.note_ic_miss(func_id);
+                                        1 => {
+                                            let a1 = read_u16_at(code, arg_regs_pc);
+                                            let f: extern "C" fn(u64, u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(recv_bits, get_reg(&values, a1).to_bits())
+                                        }
+                                        2 => {
+                                            let a1 = read_u16_at(code, arg_regs_pc);
+                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                            let f: extern "C" fn(u64, u64, u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(
+                                                recv_bits,
+                                                get_reg(&values, a1).to_bits(),
+                                                get_reg(&values, a2).to_bits(),
+                                            )
+                                        }
+                                        _ => {
+                                            let a1 = read_u16_at(code, arg_regs_pc);
+                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                            let a3 = read_u16_at(code, arg_regs_pc + 4);
+                                            let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
+                                                std::mem::transmute(jit_ptr);
+                                            f(
+                                                recv_bits,
+                                                get_reg(&values, a1).to_bits(),
+                                                get_reg(&values, a2).to_bits(),
+                                                get_reg(&values, a3).to_bits(),
+                                            )
+                                        }
+                                    }
+                                };
+                                set_reg(&mut values, dst, Value::from_bits(result_bits));
+                                steps += 1;
+                                continue;
                             }
                         }
                     }
@@ -2373,9 +2340,8 @@ fn run_fiber_with_stop_depth(
                         if should_tier_up {
                             vm.engine.request_tier_up(func_id, &vm.interner);
                         }
-                        if should_tier_up && vm.engine.has_pending_compilations() {
+                        if vm.engine.has_pending_compilations() {
                             vm.engine.poll_compilations();
-                            vm.engine.drain_compile_queue(&vm.interner);
                         }
                     }
                     pc = target;
@@ -2571,6 +2537,12 @@ fn dispatch_closure_bc(
         // use-after-free when poll_compilations replaces a previously-compiled
         // function with a recompiled version (dropping the old ExecutableBuffer).
         vm.engine.poll_compilations();
+        // Drain compile queue: dispatch_closure_bc is a safe point because
+        // caller state has been saved and we're about to push a new frame.
+        // Note: drain_compile_queue is NOT safe to call here — it modifies
+        // engine state (IC invalidation, jit_code changes) that can corrupt
+        // the interpreter's assumptions during execution. Queue processing
+        // is handled by request_tier_up when new functions hit the threshold.
         let fn_ptr_raw = vm
             .engine
             .jit_code

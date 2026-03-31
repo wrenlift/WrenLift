@@ -1285,6 +1285,12 @@ impl ExecutionEngine {
 
     }
 
+    /// Check if the background compilation thread is idle (finished or absent).
+    #[inline]
+    pub fn compile_thread_idle(&self) -> bool {
+        self.compile_handle.as_ref().map_or(true, |h| h.is_finished())
+    }
+
     /// Drain the compile queue: if the background thread is idle and there
     /// are queued functions, start compiling the next one. Must be called
     /// with interner access (from the VM context).
