@@ -111,6 +111,11 @@ impl MirPass for TypeSpecialize {
                         known_nums.insert(*src);
                         new_instructions.push((*val_id, inst.clone()));
                     }
+                    Instruction::Move(src) if known_nums.contains(src) => {
+                        // Propagate known-Num through moves.
+                        known_nums.insert(*val_id);
+                        new_instructions.push((*val_id, inst.clone()));
+                    }
 
                     Instruction::Add(a, b) if known_nums.contains(a) && known_nums.contains(b) => {
                         expand_binop(func, &mut new_instructions, *val_id, *a, *b, BinOp::Add);

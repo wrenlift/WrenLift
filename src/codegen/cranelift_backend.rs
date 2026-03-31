@@ -1064,19 +1064,19 @@ pub mod cl {
 
             // === Static self-calls ===
             Instruction::CallStaticSelf { args } => {
-                // Call self recursively — for now, use wren_call_N pattern
-                // A proper implementation would use a direct call to the function itself
-                let call_name = match args.len() {
-                    0 => "wren_call_0",
-                    1 => "wren_call_1",
-                    2 => "wren_call_2",
-                    3 => "wren_call_3",
-                    _ => "wren_call_4",
-                };
-                let arg_count = args.len().min(4);
-                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                let call_args: Vec<Value> = args.iter().take(4).map(|a| get(a)).collect();
-                let result = builder.ins().call(f, &call_args);
+                // Direct recursive call to self — use module's func_id to get
+                // a proper FuncRef, avoiding full dispatch overhead.
+                // The func_id was declared in compile_mir; re-declare it in
+                // this function so Cranelift can emit a direct call.
+                let self_func_ref = module.declare_func_in_func(
+                    cranelift_module::FuncId::from_u32(match builder.func.name {
+                        cranelift_codegen::ir::UserFuncName::User(ref u) => u.index,
+                        _ => 0,
+                    }),
+                    builder.func,
+                );
+                let call_args: Vec<Value> = args.iter().map(|a| get(a)).collect();
+                let result = builder.ins().call(self_func_ref, &call_args);
                 Ok(Some(builder.inst_results(result)[0]))
             }
         }
