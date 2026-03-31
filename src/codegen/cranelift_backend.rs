@@ -21,9 +21,10 @@ pub mod cl {
     use std::collections::HashMap;
 
     const QNAN: u64 = 0x7FFC_0000_0000_0000;
-    const TAG_TRUE: u64 = QNAN | 2;
+    const TAG_NULL: u64 = QNAN; // 0x7FFC_0000_0000_0000 — no extra bits
     const TAG_FALSE: u64 = QNAN | 1;
-    const TAG_NULL: u64 = QNAN | 3;
+    const TAG_TRUE: u64 = QNAN | 2;
+    // Note: QNAN | 3 = TAG_UNDEFINED (not null!)
     const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
     /// Compiled output from the Cranelift backend.
