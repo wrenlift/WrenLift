@@ -21,6 +21,7 @@ jobs:
   benchmark:
     name: Run benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -55,14 +56,14 @@ jobs:
       - name: Run benchmarks
         run: |
           WLIFT="./target/release/wlift"
-          RUNS=1000
+          RUNS=10
 
           # Helper: run a command N times, extract best "elapsed: X" time
           best_of() {
             local best=""
             for i in $(seq 1 $RUNS); do
               local output exit_code
-              output=$("$@" 2>&1) && exit_code=$? || exit_code=$?
+              output=$(timeout 60 "$@" 2>&1) && exit_code=$? || exit_code=$?
               if [ $exit_code -ne 0 ] && [ $i -eq 1 ]; then
                 echo "  [debug] exit=$exit_code for: $*" >&2
                 echo "  [debug] output: $(echo "$output" | tail -3)" >&2
@@ -131,7 +132,8 @@ jobs:
             --arg sha "${{ github.sha }}" \
             --arg ref "${{ github.ref_name }}" \
             --arg runner "$(uname -m)" \
-            '. + {meta: {date: $date, commit: $sha, branch: $ref, arch: $runner, runs: 10}}')
+            --argjson runs "$RUNS" \
+            '. + {meta: {date: $date, commit: $sha, branch: $ref, arch: $runner, runs: $runs}}')
 
           echo "$RESULTS" | jq .
           echo "$RESULTS" > bench/site/results.json
