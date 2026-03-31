@@ -158,7 +158,14 @@ pub mod cl {
             {
                 let mut fb_ctx = FunctionBuilderContext::new();
                 let mut builder = FunctionBuilder::new(&mut inner_func, &mut fb_ctx);
-                lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs)?;
+                lower_mir_impl(
+                    mir,
+                    interner,
+                    &mut builder,
+                    &mut module,
+                    callsite_ic_ptrs,
+                    Some(inner_id),
+                )?;
                 builder.seal_all_blocks();
                 builder.finalize();
             }
@@ -363,6 +370,22 @@ pub mod cl {
         module: &mut JITModule,
         callsite_ic_ptrs: Option<&[usize]>,
     ) -> Result<(), String> {
+        lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, None)
+    }
+
+    /// Inner lowering with optional f64 specialization.
+    /// When `f64_self_id` is Some, this function is the f64→f64 inner version:
+    /// - BlockParam types are f64 (not i64)
+    /// - Unbox/Box of params/returns are no-ops
+    /// - CallStaticSelf calls the inner function directly with f64 args
+    fn lower_mir_impl(
+        mir: &MirFunction,
+        interner: &Interner,
+        builder: &mut FunctionBuilder,
+        module: &mut JITModule,
+        callsite_ic_ptrs: Option<&[usize]>,
+        f64_self_id: Option<cranelift_module::FuncId>,
+    ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
         for (i, _) in mir.blocks.iter().enumerate() {
@@ -431,9 +454,15 @@ pub mod cl {
                     .iter()
                     .filter(|(_, inst)| matches!(inst, Instruction::BlockParam(_)))
                     .count();
-                // Append function argument params to the entry block
+                // Append function argument params to the entry block.
+                // In f64 mode, params are f64 (not i64).
+                let param_type = if f64_self_id.is_some() {
+                    types::F64
+                } else {
+                    types::I64
+                };
                 for _ in 0..bp_count {
-                    builder.append_block_param(cl_block, types::I64);
+                    builder.append_block_param(cl_block, param_type);
                 }
                 // Map them
                 let entry_params = builder.block_params(cl_block);
@@ -466,6 +495,7 @@ pub mod cl {
                     &mut get_runtime_fn,
                     callsite_ic_ptrs,
                     &mut call_site_idx,
+                    f64_self_id,
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -586,6 +616,7 @@ pub mod cl {
         ) -> Result<cranelift_codegen::ir::FuncRef, String>,
         callsite_ic_ptrs: Option<&[usize]>,
         call_site_idx: &mut usize,
+        f64_self_id: Option<cranelift_module::FuncId>,
     ) -> Result<Option<Value>, String> {
         let get = |vid: &ValueId| -> Value {
             *val_map
@@ -1181,27 +1212,36 @@ pub mod cl {
 
             // === Box/Unbox ===
             Instruction::Unbox(a) => {
-                // i64 (NaN-boxed) → f64 bitcast
-                Ok(Some(builder.ins().bitcast(
-                    types::F64,
-                    MemFlags::new(),
-                    get(a),
-                )))
+                if f64_self_id.is_some() {
+                    // In f64 inner function: values are already f64, no-op
+                    Ok(Some(get(a)))
+                } else {
+                    // i64 (NaN-boxed) → f64 bitcast
+                    Ok(Some(builder.ins().bitcast(
+                        types::F64,
+                        MemFlags::new(),
+                        get(a),
+                    )))
+                }
             }
             Instruction::Box(a) => {
-                // f64 → i64 (NaN-boxed) bitcast
-                Ok(Some(builder.ins().bitcast(
-                    types::I64,
-                    MemFlags::new(),
-                    get(a),
-                )))
+                if f64_self_id.is_some() {
+                    // In f64 inner function: keep as f64, no boxing
+                    Ok(Some(get(a)))
+                } else {
+                    // f64 → i64 (NaN-boxed) bitcast
+                    Ok(Some(builder.ins().bitcast(
+                        types::I64,
+                        MemFlags::new(),
+                        get(a),
+                    )))
+                }
             }
 
             // === Guards ===
             Instruction::GuardNum(src) => {
-                // (val >> 48) != 0x7FFC → pass (is a number)
-                // On failure, return null (deopt)
-                // For now, just pass through — guards are mainly for optimized tier
+                // In f64 mode: no guard needed, values are already f64
+                // In i64 mode: pass through (guards are for optimization hints)
                 Ok(Some(get(src)))
             }
             Instruction::GuardBool(src) => Ok(Some(get(src))),
@@ -1303,17 +1343,18 @@ pub mod cl {
 
             // === Static self-calls ===
             Instruction::CallStaticSelf { args } => {
-                // Direct recursive call to self — use module's func_id to get
-                // a proper FuncRef, avoiding full dispatch overhead.
-                // The func_id was declared in compile_mir; re-declare it in
-                // this function so Cranelift can emit a direct call.
-                let self_func_ref = module.declare_func_in_func(
+                // In f64 mode: call inner function directly with f64 args
+                // (no box/unbox roundtrip — args are already f64).
+                // In i64 mode: call self with i64 args.
+                let target_id = if let Some(inner_id) = f64_self_id {
+                    inner_id
+                } else {
                     cranelift_module::FuncId::from_u32(match builder.func.name {
                         cranelift_codegen::ir::UserFuncName::User(ref u) => u.index,
                         _ => 0,
-                    }),
-                    builder.func,
-                );
+                    })
+                };
+                let self_func_ref = module.declare_func_in_func(target_id, builder.func);
                 let call_args: Vec<Value> = args.iter().map(|a| get(a)).collect();
                 let result = builder.ins().call(self_func_ref, &call_args);
                 Ok(Some(builder.inst_results(result)[0]))
