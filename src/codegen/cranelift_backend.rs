@@ -909,9 +909,11 @@ pub mod cl {
                 let ic = callsite_ic_ptrs
                     .and_then(|ics| ics.get(ic_idx));
 
-                // Kind=1 (JIT leaf) or kind=5 (getter): emit inline fast path
+                // Kind=5 (getter): inline field load only (safe — no code pointer).
+                // Kind=1 (JIT call): DISABLED — baked jit_ptr goes stale when
+                // callee is recompiled, causing use-after-free.
                 if let Some(ic) = ic {
-                    if (ic.kind == 1 || ic.kind == 5) && ic.class != 0 && !ic.jit_ptr.is_null() {
+                    if ic.kind == 5 && ic.class != 0 {
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
                         let merge_block = builder.create_block();
