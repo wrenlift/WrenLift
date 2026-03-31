@@ -174,6 +174,18 @@ enum CompilationResult {
     },
 }
 
+/// Work item sent to the compile worker thread.
+struct CompileWork {
+    id: FuncId,
+    tier: CompileTier,
+    mir: Arc<MirFunction>,
+    interner: crate::intern::Interner,
+    profile: Option<TypeProfile>,
+    callsite_ics: Option<Vec<CallSiteIC>>,
+    target: crate::codegen::Target,
+    result_tx: mpsc::Sender<CompilationResult>,
+}
+
 /// Run the optimization pipeline on MIR for JIT compilation.
 /// Same passes as the AOT pipeline: ConstFold, DCE, CSE, TypeSpecialize, LICM, SRA.
 fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interner) {
@@ -345,18 +357,18 @@ pub struct ExecutionEngine {
     pub opt_threshold: u32,
     /// Module registry: module name → (top_level FuncId, module var storage).
     pub modules: HashMap<String, ModuleEntry>,
-    /// Sender cloned into each background compilation thread.
-    compilation_tx: mpsc::Sender<CompilationResult>,
     /// Receiver polled at safepoints to install completed compilations.
     compilation_rx: mpsc::Receiver<CompilationResult>,
+    /// Sender for completed results (cloned into worker thread).
+    compilation_tx: mpsc::Sender<CompilationResult>,
     /// Per-function compile tier currently in flight, if any.
     compiling_tier: Vec<Option<CompileTier>>,
     /// Number of compilations currently in flight (fast check for poll_compilations).
     pending_count: u32,
-    /// Join handle for the current compilation thread (at most 1 at a time).
-    compile_handle: Option<std::thread::JoinHandle<()>>,
-    /// Queue of functions awaiting compilation (when background thread is busy).
-    compile_queue: Vec<FuncId>,
+    /// Sender for compile work items → worker thread picks up automatically.
+    compile_work_tx: Option<mpsc::Sender<CompileWork>>,
+    /// Worker thread handle (long-lived, processes compile queue).
+    compile_worker: Option<std::thread::JoinHandle<()>>,
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
@@ -428,12 +440,12 @@ impl ExecutionEngine {
             jit_threshold: 100,
             opt_threshold: 1000,
             modules: HashMap::new(),
-            compilation_tx: tx,
             compilation_rx: rx,
+            compilation_tx: tx,
             compiling_tier: Vec::new(),
             pending_count: 0,
-            compile_handle: None,
-            compile_queue: Vec::new(),
+            compile_work_tx: None,
+            compile_worker: None,
             jit_code: Vec::new(),
             jit_leaf: Vec::new(),
             jit_metadata: Vec::new(),
@@ -652,7 +664,7 @@ impl ExecutionEngine {
     /// Whether any background compilations are waiting to be installed.
     #[inline(always)]
     pub fn has_pending_compilations(&self) -> bool {
-        self.pending_count != 0 || !self.compile_queue.is_empty()
+        self.pending_count != 0
     }
 
     /// Invalidate all monomorphic call-site inline caches.
@@ -1130,126 +1142,93 @@ impl ExecutionEngine {
                 }
             }
         }
-        // Don't start optimized-tier compilation while baseline functions are
-        // waiting in the queue — the optimizer can hang on complex functions,
-        // blocking all compilation progress.
-        if tier == CompileTier::Optimized && !self.compile_queue.is_empty() {
-            return;
-        }
         if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
             return;
         }
-        if let Some(ref handle) = self.compile_handle {
-            if !handle.is_finished() {
-                // Background thread busy — queue for later instead of dropping.
-                if !self.compile_queue.contains(&id) {
-                    self.compile_queue.push(id);
-                }
-                return;
-            }
-            if let Some(h) = self.compile_handle.take() {
-                let _ = h.join();
-            }
-        }
-        // Remove this function from the queue if it was queued.
-        self.compile_queue.retain(|&queued| queued != id);
-        let Some(body) = self.functions.get(idx) else {
-            return;
+        let mir = match self.functions.get(idx) {
+            Some(b) => Arc::clone(b.mir()),
+            None => return,
         };
-        let mir = Arc::clone(body.mir());
         let profile = self.get_type_profile(id).cloned();
-        let trace_name = self
-            .functions
-            .get(idx)
-            .map(|body| interner.resolve(body.mir().name).to_string())
-            .unwrap_or_else(|| format!("FuncId({})", id.0));
+        let callsite_ics = self.callsite_ic_snapshot_for_compile(id);
         if self.collect_tier_stats {
             if let Some(stats) = self.tier_stats.get_mut(idx) {
                 stats.compile_attempts += 1;
             }
         }
-
-        self.compiling_tier[idx] = Some(tier);
-        self.pending_count += 1;
-        let tx = self.compilation_tx.clone();
-        let target = Self::native_target();
-        let interner_clone = interner.clone();
-        let trace_name_clone = trace_name.clone();
-        let callsite_ic_ptrs = self.callsite_ic_snapshot_for_compile(id);
-
         if tier_trace_enabled() {
-            let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
+            let ic_count = callsite_ics.as_ref().map(|v| v.len()).unwrap_or(0);
             eprintln!(
                 "tier-trace: queue {:?} FuncId({}) {} ic_ptrs={}",
-                tier, id.0, trace_name, ic_count
+                tier, id.0, interner.resolve(mir.name), ic_count
             );
         }
 
-        let compile_fn = move || {
-            if tier_trace_enabled() {
-                eprintln!(
-                    "tier-trace: start {:?} FuncId({}) {}",
-                    tier, id.0, trace_name_clone
-                );
-            }
-            let compile_mir =
-                Self::build_compile_mir(&mir, tier, &interner_clone, profile.as_ref());
-            if std::env::var("WLIFT_JIT_DUMP").is_ok() {
-                eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
-                eprintln!("{}", compile_mir.pretty_print(&interner_clone));
-            }
-            let result =
-                crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
-                    &compile_mir,
-                    target,
-                    &interner_clone,
-                    tier,
-                    callsite_ic_ptrs,
-                )
-                .map_err(|e| {
-                    eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
-                    e
-                })
-                .ok()
-                .and_then(|artifact| {
-                    let native_meta = artifact.native_meta;
-                    let inline_safe =
-                        is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
-                    artifact.code.into_executable().map_err(|e| {
-                        eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
-                        e
-                    }).ok().map(|executable| {
-                        CompilationResult::Compiled {
-                            id,
-                            tier,
-                            executable,
-                            native_meta,
-                            inline_safe,
-                        }
-                    })
-                });
-            if tier_trace_enabled() {
-                eprintln!(
-                    "tier-trace: finish {:?} FuncId({}) {} success={}",
-                    tier,
-                    id.0,
-                    trace_name_clone,
-                    result.is_some()
-                );
-            }
-            let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
-        };
+        self.compiling_tier[idx] = Some(tier);
+        self.pending_count += 1;
 
-        self.compile_handle = Some(std::thread::spawn(compile_fn));
+        // Ensure compile worker thread is running
+        if self.compile_work_tx.is_none() {
+            let (work_tx, work_rx) = mpsc::channel::<CompileWork>();
+            self.compile_work_tx = Some(work_tx);
+            self.compile_worker = Some(std::thread::spawn(move || {
+                Self::compile_worker_loop(work_rx);
+            }));
+        }
+
+        // Send work to the worker — channel is unbounded, never blocks.
+        if let Some(ref tx) = self.compile_work_tx {
+            let _ = tx.send(CompileWork {
+                id,
+                tier,
+                mir,
+                interner: interner.clone(),
+                profile,
+                callsite_ics,
+                target: Self::native_target(),
+                result_tx: self.compilation_tx.clone(),
+            });
+        }
+    }
+
+    /// Background compile worker: processes work items sequentially.
+    fn compile_worker_loop(rx: mpsc::Receiver<CompileWork>) {
+        while let Ok(work) = rx.recv() {
+            let CompileWork { id, tier, mir, interner, profile, callsite_ics, target, result_tx } = work;
+            if tier_trace_enabled() {
+                eprintln!("tier-trace: start {:?} FuncId({}) {}", tier, id.0, interner.resolve(mir.name));
+            }
+            let compile_mir = Self::build_compile_mir(&mir, tier, &interner, profile.as_ref());
+            let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
+                &compile_mir, target, &interner, tier, callsite_ics,
+            )
+            .map_err(|e| { eprintln!("COMPILE ERR FuncId({}): {}", id.0, e); e })
+            .ok()
+            .and_then(|artifact| {
+                let native_meta = artifact.native_meta;
+                let inline_safe = is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
+                artifact.code.into_executable()
+                    .map_err(|e| { eprintln!("EXEC ERR FuncId({}): {}", id.0, e); e })
+                    .ok()
+                    .map(|executable| CompilationResult::Compiled { id, tier, executable, native_meta, inline_safe })
+            });
+            if tier_trace_enabled() {
+                eprintln!("tier-trace: finish {:?} FuncId({}) {} success={}", tier, id.0, interner.resolve(mir.name), result.is_some());
+            }
+            let _ = result_tx.send(result.unwrap_or(CompilationResult::Failed { id }));
+        }
     }
 
     /// Install any completed background compilations.
     #[inline]
     pub fn poll_compilations(&mut self) {
-        if self.pending_count == 0 && self.compile_queue.is_empty() {
+        if self.pending_count == 0 {
             return;
         }
-        while let Ok(result) = self.compilation_rx.try_recv() {
+        // Install ONE compiled function per poll call. Installing all at
+        // once causes rapid IC invalidation that can corrupt interpreter
+        // state when many functions compile simultaneously.
+        if let Ok(result) = self.compilation_rx.try_recv() {
             let idx = match result {
                 CompilationResult::Compiled { id, .. } | CompilationResult::Failed { id, .. } => {
                     id.0 as usize
@@ -1285,54 +1264,7 @@ impl ExecutionEngine {
 
     }
 
-    /// Check if the background compilation thread is idle (finished or absent).
-    #[inline]
-    pub fn compile_thread_idle(&self) -> bool {
-        self.compile_handle.as_ref().map_or(true, |h| h.is_finished())
-    }
-
-    /// Drain the compile queue: if the background thread is idle and there
-    /// are queued functions, start compiling the next one. Must be called
-    /// with interner access (from the VM context).
-    pub fn drain_compile_queue(&mut self, interner: &crate::intern::Interner) {
-        while !self.compile_queue.is_empty() {
-            let thread_idle = self
-                .compile_handle
-                .as_ref()
-                .map_or(true, |h| h.is_finished());
-            if !thread_idle {
-                break;
-            }
-            if let Some(h) = self.compile_handle.take() {
-                let _ = h.join();
-            }
-            // Poll any newly completed results before starting next.
-            while let Ok(result) = self.compilation_rx.try_recv() {
-                let idx = match &result {
-                    CompilationResult::Compiled { id, .. }
-                    | CompilationResult::Failed { id, .. } => id.0 as usize,
-                };
-                if idx < self.functions.len() {
-                    if let CompilationResult::Compiled {
-                        tier,
-                        executable,
-                        native_meta,
-                        inline_safe,
-                        ..
-                    } = result
-                    {
-                        self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
-                    }
-                }
-                if idx < self.compiling_tier.len() {
-                    self.compiling_tier[idx] = None;
-                }
-                self.pending_count = self.pending_count.saturating_sub(1);
-            }
-            let queued_id = self.compile_queue.remove(0);
-            self.request_tier_up(queued_id, interner);
-        }
-    }
+    // Worker thread processes compile queue automatically.
 
     /// Determine the native compilation target for the current platform.
     pub fn native_target() -> crate::codegen::Target {
@@ -1357,7 +1289,8 @@ impl Drop for ExecutionEngine {
         // worker here can stall process exit long after the program has already
         // printed its result, especially if an optimize-tier compile started
         // right before shutdown. Dropping the JoinHandle detaches the worker.
-        if let Some(handle) = self.compile_handle.take() {
+        self.compile_work_tx = None; // signal worker to exit
+        if let Some(handle) = self.compile_worker.take() {
             if handle.is_finished() {
                 if tier_trace_enabled() {
                     eprintln!("tier-trace: drop joining finished compile thread");
