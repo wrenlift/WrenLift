@@ -1787,7 +1787,9 @@ fn run_fiber_with_stop_depth(
                             // call_constructor_sync_impl checks has_active_interp_frames
                             // to avoid mid-recursion tier-up bugs.
                             let fn_idx = target_func_id.0 as usize;
-                            let ctor_jit = vm.engine.jit_code
+                            let ctor_jit = vm
+                                .engine
+                                .jit_code
                                 .get(fn_idx)
                                 .copied()
                                 .unwrap_or(std::ptr::null());

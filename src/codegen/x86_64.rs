@@ -739,7 +739,7 @@ impl X64Emitter {
                 if d == 1 {
                     // dst is RCX: CL is both shift amount and destination.
                     // Use R11 (scratch) as temp to avoid clobbering.
-                    self.emit_mov_rr(1, r);  // RCX = shift amount (CL ready)
+                    self.emit_mov_rr(1, r); // RCX = shift amount (CL ready)
                     self.emit_mov_rr(11, l); // R11 = lhs
                     self.emit_shift_cl(5, 11); // shr R11, CL
                     self.emit_mov_rr(1, 11); // RCX = result

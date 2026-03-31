@@ -1803,13 +1803,7 @@ pub unsafe extern "C" fn wren_call_3(
     );
 }
 #[cfg(target_arch = "x86_64")]
-pub extern "C" fn wren_call_3(
-    receiver: u64,
-    method: u64,
-    a0: u64,
-    a1: u64,
-    a2: u64,
-) -> u64 {
+pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     // Can't use #[naked] for 7 args (exceeds 6 SysV register args).
     // Read the caller's frame pointer from the stack frame chain instead.
     // After this function's prologue: [rbp] = saved caller RBP, [rbp+8] = ret addr.

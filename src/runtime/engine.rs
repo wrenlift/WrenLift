@@ -982,15 +982,6 @@ impl ExecutionEngine {
                     }
                     // Dump raw machine code hex for offline disassembly.
                     if std::env::var_os("WLIFT_DUMP_HEX").is_some() {
-                        let func_name = self
-                            .functions
-                            .get(idx)
-                            .map(|b| b.mir().name)
-                            .and_then(|sym| {
-                                // Can't access interner here, use func_id
-                                None::<&str>
-                            })
-                            .unwrap_or("?");
                         eprint!("HEX:f{}:{}:", func_id.0, code_size);
                         let code_bytes =
                             unsafe { std::slice::from_raw_parts(start as *const u8, code_size) };
