@@ -55,6 +55,10 @@ pub mod cl {
         flag_builder
             .set("is_pic", "false")
             .map_err(|e| e.to_string())?;
+        // Keep verifier ON to catch IR construction bugs
+        flag_builder
+            .set("enable_verifier", "true")
+            .map_err(|e| e.to_string())?;
         let isa = cranelift_native::builder()
             .map_err(|e| e.to_string())?
             .finish(settings::Flags::new(flag_builder))
@@ -375,7 +379,7 @@ pub mod cl {
         let a_is_nan = builder.ins().icmp(IntCC::Equal, a_masked, qnan);
         builder
             .ins()
-            .brif(a_is_nan, slow_block, &[], check_b_block, &[] as &[BlockArg]);
+            .brif(a_is_nan, slow_block, &[], check_b_block, &[]);
 
         // Check b: (b & QNAN) == QNAN means NOT a number → slow path
         builder.switch_to_block(check_b_block);
@@ -383,7 +387,7 @@ pub mod cl {
         let b_is_nan = builder.ins().icmp(IntCC::Equal, b_masked, qnan);
         builder
             .ins()
-            .brif(b_is_nan, slow_block, &[], fast_block, &[] as &[BlockArg]);
+            .brif(b_is_nan, slow_block, &[], fast_block, &[]);
 
         // Fast path: bitcast to f64, do the operation, bitcast result back
         builder.switch_to_block(fast_block);

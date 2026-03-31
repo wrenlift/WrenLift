@@ -872,8 +872,6 @@ impl ExecutionEngine {
     ) -> Arc<MirFunction> {
         match tier {
             CompileTier::Baseline => {
-                // Baseline: range loop only. Profile-guided guards are
-                // applied at optimized tier to avoid disrupting leaf classification.
                 let mut baseline_mir = (**mir).clone();
                 {
                     use crate::mir::opt::{range_loop::RangeLoop, MirPass};
