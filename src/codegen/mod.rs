@@ -12,6 +12,8 @@
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 pub mod cfg;
+#[cfg(feature = "cranelift")]
+pub mod cranelift_backend;
 pub mod native_meta;
 pub mod regalloc;
 pub mod runtime_fns;
@@ -1862,6 +1864,9 @@ pub enum CompiledFunction {
     /// aarch64 executable buffer.
     #[cfg(target_arch = "aarch64")]
     Aarch64(aarch64::CompiledCode),
+    /// Cranelift-compiled code (owns the JIT module memory).
+    #[cfg(feature = "cranelift")]
+    CraneliftOwned(cranelift_backend::cl::CraneliftCompiledCode),
     /// WebAssembly module bytes.
     Wasm(wasm::WasmModule),
 }
@@ -1892,6 +1897,8 @@ impl CompiledFunction {
             }
             #[cfg(target_arch = "aarch64")]
             CompiledFunction::Aarch64(code) => Ok(ExecutableFunction::Aarch64(code)),
+            #[cfg(feature = "cranelift")]
+            CompiledFunction::CraneliftOwned(cl) => Ok(ExecutableFunction::Cranelift(cl)),
             CompiledFunction::Wasm(_) => {
                 Err("WASM modules cannot be made directly executable; use a WASM runtime".into())
             }
@@ -1912,6 +1919,8 @@ pub enum ExecutableFunction {
     X86_64(x86_64::ExecutableCode),
     #[cfg(target_arch = "aarch64")]
     Aarch64(aarch64::CompiledCode),
+    #[cfg(feature = "cranelift")]
+    Cranelift(cranelift_backend::cl::CraneliftCompiledCode),
 }
 
 impl ExecutableFunction {
@@ -1925,12 +1934,18 @@ impl ExecutableFunction {
             ExecutableFunction::X86_64(code) => code.as_fn(),
             #[cfg(target_arch = "aarch64")]
             ExecutableFunction::Aarch64(code) => code.as_fn(),
+            #[cfg(feature = "cranelift")]
+            ExecutableFunction::Cranelift(cl) => std::mem::transmute_copy(&cl.fn_ptr),
         }
     }
 
     /// Get the raw function pointer for use with `std::mem::transmute`.
     pub fn native_ptr(&self) -> *const u8 {
-        unsafe { self.as_fn::<*const u8>() }
+        match self {
+            #[cfg(feature = "cranelift")]
+            ExecutableFunction::Cranelift(cl) => cl.fn_ptr,
+            _ => unsafe { self.as_fn::<*const u8>() },
+        }
     }
 
     /// Whether this function can be called on the current host.
@@ -1939,6 +1954,8 @@ impl ExecutableFunction {
             ExecutableFunction::X86_64(_) => cfg!(target_arch = "x86_64"),
             #[cfg(target_arch = "aarch64")]
             ExecutableFunction::Aarch64(_) => true,
+            #[cfg(feature = "cranelift")]
+            ExecutableFunction::Cranelift(_) => true,
         }
     }
 
@@ -1948,6 +1965,8 @@ impl ExecutableFunction {
             ExecutableFunction::X86_64(code) => code.len(),
             #[cfg(target_arch = "aarch64")]
             ExecutableFunction::Aarch64(code) => code.code_size(),
+            #[cfg(feature = "cranelift")]
+            ExecutableFunction::Cranelift(cl) => cl.code_size,
         }
     }
 }
@@ -1992,6 +2011,19 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 native_meta: None,
                 needs_shadow_frame: false,
             })
+        }
+        // Use Cranelift for all native targets when the feature is enabled.
+        // Cranelift handles register allocation, instruction selection, and
+        // encoding correctly for both x86_64 and aarch64.
+        #[cfg(feature = "cranelift")]
+        Target::X86_64 | Target::Aarch64 => {
+            let compiled = cranelift_backend::cl::compile_mir(mir, interner)?;
+            let code = CompiledFunction::CraneliftOwned(compiled);
+            return Ok(CompiledArtifact {
+                code,
+                native_meta: None,
+                needs_shadow_frame: false,
+            });
         }
         _ => {
             // Disable inline IC on x86_64 until register conflicts are resolved.
