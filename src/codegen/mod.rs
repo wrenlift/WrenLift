@@ -2930,16 +2930,32 @@ impl<'a> LowerCtx<'a> {
 
             // -- Boxed arithmetic with inline number fast-path --
             Instruction::Add(a, b) => {
-                self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Add, "wren_num_add")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Add, "wren_num_add")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_num_add")
+                }
             }
             Instruction::Sub(a, b) => {
-                self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Sub, "wren_num_sub")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Sub, "wren_num_sub")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_num_sub")
+                }
             }
             Instruction::Mul(a, b) => {
-                self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Mul, "wren_num_mul")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Mul, "wren_num_mul")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_num_mul")
+                }
             }
             Instruction::Div(a, b) => {
-                self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Div, "wren_num_div")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_arith_inline(dst_val, *a, *b, FpBinOp::Div, "wren_num_div")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_num_div")
+                }
             }
             Instruction::Mod(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_num_mod"),
             Instruction::Neg(a) => {
@@ -2954,16 +2970,32 @@ impl<'a> LowerCtx<'a> {
 
             // -- Boxed comparisons with inline number fast-path --
             Instruction::CmpLt(a, b) => {
-                self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Lt, "wren_cmp_lt")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Lt, "wren_cmp_lt")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_lt")
+                }
             }
             Instruction::CmpGt(a, b) => {
-                self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Gt, "wren_cmp_gt")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Gt, "wren_cmp_gt")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_gt")
+                }
             }
             Instruction::CmpLe(a, b) => {
-                self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Le, "wren_cmp_le")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Le, "wren_cmp_le")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_le")
+                }
             }
             Instruction::CmpGe(a, b) => {
-                self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Ge, "wren_cmp_ge")
+                if cfg!(target_arch = "aarch64") {
+                    self.emit_boxed_cmp_inline(dst_val, *a, *b, Cond::Ge, "wren_cmp_ge")
+                } else {
+                    self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_ge")
+                }
             }
             Instruction::CmpEq(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_eq"),
             Instruction::CmpNe(a, b) => self.emit_boxed_binop(dst_val, *a, *b, "wren_cmp_ne"),
