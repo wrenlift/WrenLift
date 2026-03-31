@@ -597,7 +597,10 @@ impl VM {
         // make it hot enough on its own. Baseline-compile it up front for
         // method-heavy scripts, but avoid constructor-heavy entry functions for
         // now since they still route through the slow temp-fiber bridge.
+        // Don't eagerly compile when step_limit is small — the JIT code has
+        // no step counter, so infinite loops in the entry function would hang.
         if self.config.execution_mode != super::engine::ExecutionMode::Interpreter
+            && self.config.step_limit > 100_000
             && self
                 .engine
                 .get_mir(func_id)

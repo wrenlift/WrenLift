@@ -602,8 +602,16 @@ fn run_fiber_with_stop_depth(
 
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
-            // GC safepoint: check every 4096 instructions
-            if steps & 0xFFF == 0 {
+            // GC safepoint: check every 4096 instructions (or more often for
+            // small step limits to avoid missing the limit entirely).
+            let check_interval = if vm.config.step_limit <= 0xFF {
+                0xF // every 16 steps for very small limits
+            } else if vm.config.step_limit <= 0xFFF {
+                0xFF // every 256 steps for small limits
+            } else {
+                0xFFF // every 4096 steps normally
+            };
+            if steps & check_interval == 0 {
                 if steps > vm.config.step_limit {
                     return Err(RuntimeError::StepLimitExceeded);
                 }
