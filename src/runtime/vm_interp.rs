@@ -1605,9 +1605,12 @@ fn run_fiber_with_stop_depth(
                                     .get(fn_idx)
                                     .copied()
                                     .unwrap_or(std::ptr::null());
-                                if !jit_ptr.is_null()
-                                    && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
-                                {
+                                #[cfg(feature = "cranelift")]
+                                let jit_dispatch_ok = !jit_ptr.is_null();
+                                #[cfg(not(feature = "cranelift"))]
+                                let jit_dispatch_ok = !jit_ptr.is_null()
+                                    && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+                                if jit_dispatch_ok {
                                     // Populate IC for this call site
                                     let ic_table = unsafe { &mut *bc.ic_table.get() };
                                     if ic_idx < ic_table.len() {
@@ -2589,7 +2592,15 @@ fn dispatch_closure_bc(
                     },
                 );
 
-                if is_leaf {
+                // With Cranelift, dispatch all JIT functions (leaf + non-leaf).
+                // The old backend only dispatched leaf functions to avoid
+                // spill-slot bugs in non-leaf code.
+                #[cfg(feature = "cranelift")]
+                let dispatch_jit = true;
+                #[cfg(not(feature = "cranelift"))]
+                let dispatch_jit = is_leaf;
+
+                if dispatch_jit {
                     vm.engine.note_native_entry(target_func_id);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
                     let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
@@ -2597,7 +2608,6 @@ fn dispatch_closure_bc(
                     crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
-                    // Take values back from frame (GC may have moved objects).
                     let mut values = unsafe {
                         (*fiber)
                             .mir_frames

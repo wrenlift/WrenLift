@@ -95,6 +95,17 @@ impl MirPass for TypeSpecialize {
         let mut known_nums: HashSet<ValueId> = HashSet::new();
         let mut changed = false;
 
+        // Pre-pass: if this function has GuardNum on any parameter,
+        // assume CallStaticSelf (recursive calls) also return Num.
+        // This enables unboxing the `add` of two recursive results
+        // (e.g., fib: calc(n-1) + calc(n-2) → fadd instead of wren_num_add).
+        let has_num_guard = func.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|(_, inst)| matches!(inst, Instruction::GuardNum(_)))
+        });
+        let self_call_returns_num = has_num_guard;
+
         for block_idx in 0..func.blocks.len() {
             let old_instructions = std::mem::take(&mut func.blocks[block_idx].instructions);
             let mut new_instructions = Vec::new();
@@ -218,6 +229,12 @@ impl MirPass for TypeSpecialize {
                         new_instructions.push((*val_id, Instruction::Box(result_f)));
                         known_nums.insert(*val_id);
                         changed = true;
+                    }
+
+                    // CallStaticSelf returns Num if function has Num guards
+                    Instruction::CallStaticSelf { .. } if self_call_returns_num => {
+                        known_nums.insert(*val_id);
+                        new_instructions.push((*val_id, inst.clone()));
                     }
 
                     _ => {

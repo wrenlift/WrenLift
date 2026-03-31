@@ -62,7 +62,11 @@ pub mod cl {
             .set("preserve_frame_pointers", "false")
             .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
 
-        // Keep verifier ON to catch IR construction bugs
+        // Enable probestack for large stack allocations (prevents stack overflow)
+        flag_builder
+            .set("enable_probestack", "true")
+            .map_err(|e| format!("Failed to set enable_probestack: {}", e))?;
+
         flag_builder
             .set("enable_verifier", "true")
             .map_err(|e| e.to_string())?;

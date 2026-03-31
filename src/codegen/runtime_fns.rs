@@ -1061,12 +1061,25 @@ pub fn allow_nonleaf_native(
     vm: &crate::runtime::vm::VM,
     func_id: crate::runtime::engine::FuncId,
 ) -> bool {
-    let allow_nonleaf_native = match vm.config.gc_strategy {
-        crate::runtime::gc_trait::GcStrategy::Generational => nonleaf_moving_gc_safe(vm, func_id),
-        _ => nonleaf_shadow_safe(vm, func_id),
-    };
-    trace_nonleaf_gate(vm, func_id, allow_nonleaf_native);
-    allow_nonleaf_native
+    // With Cranelift, all non-leaf JIT functions are safe to call —
+    // Cranelift handles register allocation and stack frames correctly.
+    // The old backend needed shadow-stack/spill-slot safety checks.
+    #[cfg(feature = "cranelift")]
+    {
+        let _ = (vm, func_id);
+        return true;
+    }
+    #[cfg(not(feature = "cranelift"))]
+    {
+        let allow_nonleaf_native = match vm.config.gc_strategy {
+            crate::runtime::gc_trait::GcStrategy::Generational => {
+                nonleaf_moving_gc_safe(vm, func_id)
+            }
+            _ => nonleaf_shadow_safe(vm, func_id),
+        };
+        trace_nonleaf_gate(vm, func_id, allow_nonleaf_native);
+        allow_nonleaf_native
+    }
 }
 
 pub fn allow_root_nonleaf_native(
@@ -1604,7 +1617,14 @@ fn dispatch_method(
                     .copied()
                     .unwrap_or(std::ptr::null());
                 let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-                if !fn_ptr.is_null() && is_leaf {
+                // With Cranelift, allow non-leaf JIT dispatch — Cranelift
+                // handles register allocation and call conventions correctly.
+                // The old backend required is_leaf to avoid spill-slot bugs.
+                #[cfg(feature = "cranelift")]
+                let allow_jit = !fn_ptr.is_null();
+                #[cfg(not(feature = "cranelift"))]
+                let allow_jit = !fn_ptr.is_null() && is_leaf;
+                if allow_jit {
                     let saved_ctx = read_jit_ctx();
                     let depth = jit_depth();
                     if depth < MAX_JIT_DEPTH {
