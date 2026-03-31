@@ -6,7 +6,9 @@
 #[cfg(feature = "cranelift")]
 pub mod cl {
     use crate::intern::Interner;
-    use crate::mir::{BlockId, Instruction, MathUnaryOp, MirFunction, MirType, Terminator, ValueId};
+    use crate::mir::{
+        BlockId, Instruction, MathUnaryOp, MirFunction, MirType, Terminator, ValueId,
+    };
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
@@ -211,9 +213,7 @@ pub mod cl {
         let func_id = module
             .declare_function(name, Linkage::Import, &sig)
             .map_err(|e| e.to_string())?;
-        let func_ref = module
-            .declare_func_in_func(func_id, builder.func)
-            ;
+        let func_ref = module.declare_func_in_func(func_id, builder.func);
         Ok(func_ref)
     }
 
@@ -238,19 +238,18 @@ pub mod cl {
         let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> = HashMap::new();
 
         // Helper to get or declare a runtime function
-        let mut get_runtime_fn =
-            |module: &mut JITModule,
-             builder: &mut FunctionBuilder,
-             name: &str,
-             param_count: usize|
-             -> Result<cranelift_codegen::ir::FuncRef, String> {
-                if let Some(&func_ref) = runtime_cache.get(name) {
-                    return Ok(func_ref);
-                }
-                let func_ref = declare_runtime_fn(module, builder, name, param_count)?;
-                runtime_cache.insert(name.to_string(), func_ref);
-                Ok(func_ref)
-            };
+        let mut get_runtime_fn = |module: &mut JITModule,
+                                  builder: &mut FunctionBuilder,
+                                  name: &str,
+                                  param_count: usize|
+         -> Result<cranelift_codegen::ir::FuncRef, String> {
+            if let Some(&func_ref) = runtime_cache.get(name) {
+                return Ok(func_ref);
+            }
+            let func_ref = declare_runtime_fn(module, builder, name, param_count)?;
+            runtime_cache.insert(name.to_string(), func_ref);
+            Ok(func_ref)
+        };
 
         // Process blocks in reverse post-order (dominance order).
         // The MIR block array may have preheader blocks (bb4) listed after
@@ -317,12 +316,7 @@ pub mod cl {
             }
 
             // Lower terminator
-            lower_terminator(
-                &block.terminator,
-                builder,
-                &val_map,
-                &block_map,
-            );
+            lower_terminator(&block.terminator, builder, &val_map, &block_map);
         }
 
         Ok(())
@@ -366,13 +360,17 @@ pub mod cl {
         // Check a: (a & QNAN) == QNAN means NOT a number → slow path
         let a_masked = builder.ins().band(la, qnan);
         let a_is_nan = builder.ins().icmp(IntCC::Equal, a_masked, qnan);
-        builder.ins().brif(a_is_nan, slow_block, &[], check_b_block, &[]);
+        builder
+            .ins()
+            .brif(a_is_nan, slow_block, &[], check_b_block, &[]);
 
         // Check b: (b & QNAN) == QNAN means NOT a number → slow path
         builder.switch_to_block(check_b_block);
         let b_masked = builder.ins().band(lb, qnan);
         let b_is_nan = builder.ins().icmp(IntCC::Equal, b_masked, qnan);
-        builder.ins().brif(b_is_nan, slow_block, &[], fast_block, &[]);
+        builder
+            .ins()
+            .brif(b_is_nan, slow_block, &[], fast_block, &[]);
 
         // Fast path: bitcast to f64, do the operation, bitcast result back
         builder.switch_to_block(fast_block);
@@ -456,26 +454,54 @@ pub mod cl {
             Instruction::Add(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Arith("fadd"), "wren_num_add")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Arith("fadd"),
+                    "wren_num_add",
+                )
             }
             Instruction::Sub(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Arith("fsub"), "wren_num_sub")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Arith("fsub"),
+                    "wren_num_sub",
+                )
             }
             Instruction::Mul(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Arith("fmul"), "wren_num_mul")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Arith("fmul"),
+                    "wren_num_mul",
+                )
             }
             Instruction::Div(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Arith("fdiv"), "wren_num_div")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Arith("fdiv"),
+                    "wren_num_div",
+                )
             }
             Instruction::Mod(a, b) => {
                 let f = get_runtime_fn(module, builder, "wren_num_mod", 2)?;
@@ -492,26 +518,54 @@ pub mod cl {
             Instruction::CmpLt(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Cmp(FloatCC::LessThan), "wren_cmp_lt")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Cmp(FloatCC::LessThan),
+                    "wren_cmp_lt",
+                )
             }
             Instruction::CmpGt(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Cmp(FloatCC::GreaterThan), "wren_cmp_gt")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Cmp(FloatCC::GreaterThan),
+                    "wren_cmp_gt",
+                )
             }
             Instruction::CmpLe(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Cmp(FloatCC::LessThanOrEqual), "wren_cmp_le")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Cmp(FloatCC::LessThanOrEqual),
+                    "wren_cmp_le",
+                )
             }
             Instruction::CmpGe(a, b) => {
                 let la = get(a);
                 let lb = get(b);
-                emit_inline_boxed_binop(builder, module, get_runtime_fn, la, lb,
-                    InlineBinOp::Cmp(FloatCC::GreaterThanOrEqual), "wren_cmp_ge")
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Cmp(FloatCC::GreaterThanOrEqual),
+                    "wren_cmp_ge",
+                )
             }
             Instruction::CmpEq(a, b) => {
                 let f = get_runtime_fn(module, builder, "wren_cmp_eq", 2)?;
@@ -749,8 +803,7 @@ pub mod cl {
                     3 => "wren_make_closure_3",
                     _ => "wren_make_closure_4",
                 };
-                let f =
-                    get_runtime_fn(module, builder, name, 1 + upvalues.len().min(4))?;
+                let f = get_runtime_fn(module, builder, name, 1 + upvalues.len().min(4))?;
                 let fn_id_val = builder.ins().iconst(types::I64, *fn_id as i64);
                 let mut args = vec![fn_id_val];
                 for uv in upvalues.iter().take(4) {
@@ -762,12 +815,7 @@ pub mod cl {
 
             // === Subscript operations ===
             Instruction::SubscriptGet { receiver, args } => {
-                let f = get_runtime_fn(
-                    module,
-                    builder,
-                    "wren_subscript_get",
-                    1 + args.len(),
-                )?;
+                let f = get_runtime_fn(module, builder, "wren_subscript_get", 1 + args.len())?;
                 let mut call_args = vec![get(receiver)];
                 for a in args {
                     call_args.push(get(a));
@@ -780,12 +828,7 @@ pub mod cl {
                 args,
                 value,
             } => {
-                let f = get_runtime_fn(
-                    module,
-                    builder,
-                    "wren_subscript_set",
-                    2 + args.len(),
-                )?;
+                let f = get_runtime_fn(module, builder, "wren_subscript_set", 2 + args.len())?;
                 let mut call_args = vec![get(receiver)];
                 for a in args {
                     call_args.push(get(a));
@@ -864,9 +907,7 @@ pub mod cl {
                 Ok(Some(builder.ins().select(cmp, true_val, false_val)))
             }
             Instruction::CmpLeF64(a, b) => {
-                let cmp = builder
-                    .ins()
-                    .fcmp(FloatCC::LessThanOrEqual, get(a), get(b));
+                let cmp = builder.ins().fcmp(FloatCC::LessThanOrEqual, get(a), get(b));
                 let true_val = builder.ins().iconst(types::I64, TAG_TRUE as i64);
                 let false_val = builder.ins().iconst(types::I64, TAG_FALSE as i64);
                 Ok(Some(builder.ins().select(cmp, true_val, false_val)))
@@ -883,19 +924,19 @@ pub mod cl {
             // === Box/Unbox ===
             Instruction::Unbox(a) => {
                 // i64 (NaN-boxed) → f64 bitcast
-                Ok(Some(
-                    builder
-                        .ins()
-                        .bitcast(types::F64, MemFlags::new(), get(a)),
-                ))
+                Ok(Some(builder.ins().bitcast(
+                    types::F64,
+                    MemFlags::new(),
+                    get(a),
+                )))
             }
             Instruction::Box(a) => {
                 // f64 → i64 (NaN-boxed) bitcast
-                Ok(Some(
-                    builder
-                        .ins()
-                        .bitcast(types::I64, MemFlags::new(), get(a)),
-                ))
+                Ok(Some(builder.ins().bitcast(
+                    types::I64,
+                    MemFlags::new(),
+                    get(a),
+                )))
             }
 
             // === Guards ===
@@ -938,9 +979,15 @@ pub mod cl {
                     // libm functions — call via C ABI
                     Sin | Cos | Tan | Asin | Acos | Atan | Log | Log2 | Exp | Cbrt => {
                         let libm_name = match op {
-                            Sin => "sin", Cos => "cos", Tan => "tan",
-                            Asin => "asin", Acos => "acos", Atan => "atan",
-                            Log => "log", Log2 => "log2", Exp => "exp",
+                            Sin => "sin",
+                            Cos => "cos",
+                            Tan => "tan",
+                            Asin => "asin",
+                            Acos => "acos",
+                            Atan => "atan",
+                            Log => "log",
+                            Log2 => "log2",
+                            Exp => "exp",
                             Cbrt => "cbrt",
                             _ => unreachable!(),
                         };
@@ -948,7 +995,8 @@ pub mod cl {
                         let mut sig = module.make_signature();
                         sig.params.push(AbiParam::new(types::F64));
                         sig.returns.push(AbiParam::new(types::F64));
-                        let fid = module.declare_function(libm_name, Linkage::Import, &sig)
+                        let fid = module
+                            .declare_function(libm_name, Linkage::Import, &sig)
                             .map_err(|e| e.to_string())?;
                         let fref = module.declare_func_in_func(fid, builder.func);
                         let call = builder.ins().call(fref, &[val]);
@@ -968,13 +1016,16 @@ pub mod cl {
                     // libm functions
                     Pow | Atan2 => {
                         let libm_name = match op {
-                            Pow => "pow", Atan2 => "atan2", _ => unreachable!(),
+                            Pow => "pow",
+                            Atan2 => "atan2",
+                            _ => unreachable!(),
                         };
                         let mut sig = module.make_signature();
                         sig.params.push(AbiParam::new(types::F64));
                         sig.params.push(AbiParam::new(types::F64));
                         sig.returns.push(AbiParam::new(types::F64));
-                        let fid = module.declare_function(libm_name, Linkage::Import, &sig)
+                        let fid = module
+                            .declare_function(libm_name, Linkage::Import, &sig)
                             .map_err(|e| e.to_string())?;
                         let fref = module.declare_func_in_func(fid, builder.func);
                         let call = builder.ins().call(fref, &[va, vb]);
@@ -1060,10 +1111,14 @@ pub mod cl {
                 let t_args: Vec<Value> = true_args.iter().map(|a| get(a)).collect();
                 let f_args: Vec<Value> = false_args.iter().map(|a| get(a)).collect();
 
-                builder.ins().brif(is_truthy, t_block, &t_args, f_block, &f_args);
+                builder
+                    .ins()
+                    .brif(is_truthy, t_block, &t_args, f_block, &f_args);
             }
             Terminator::Unreachable => {
-                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                builder
+                    .ins()
+                    .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             }
         }
     }
@@ -1075,12 +1130,7 @@ pub mod cl {
         let mut visited = vec![false; n];
         let mut post_order = Vec::with_capacity(n);
 
-        fn dfs(
-            idx: usize,
-            mir: &MirFunction,
-            visited: &mut [bool],
-            post_order: &mut Vec<usize>,
-        ) {
+        fn dfs(idx: usize, mir: &MirFunction, visited: &mut [bool], post_order: &mut Vec<usize>) {
             if visited[idx] {
                 return;
             }
