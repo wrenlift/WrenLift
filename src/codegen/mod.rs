@@ -1993,6 +1993,7 @@ pub fn compile_function_artifact_with_interner(
         interner,
         compile_tier,
         None,
+        None,
     )
 }
 
@@ -2002,6 +2003,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     interner: &crate::intern::Interner,
     compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
+    callsite_ic_live_ptrs: Option<Vec<usize>>,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
@@ -2017,8 +2019,12 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
         // encoding correctly for both x86_64 and aarch64.
         #[cfg(feature = "cranelift")]
         Target::X86_64 | Target::Aarch64 => {
-            let compiled =
-                cranelift_backend::cl::compile_mir(mir, interner, callsite_ic_ptrs.as_deref())?;
+            let compiled = cranelift_backend::cl::compile_mir(
+                mir,
+                interner,
+                callsite_ic_ptrs.as_deref(),
+                callsite_ic_live_ptrs.as_deref(),
+            )?;
             let code = CompiledFunction::CraneliftOwned(compiled);
             return Ok(CompiledArtifact {
                 code,

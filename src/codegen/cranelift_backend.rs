@@ -9,6 +9,7 @@ pub mod cl {
     use crate::mir::{
         BlockId, Instruction, MathUnaryOp, MirFunction, MirType, Terminator, ValueId,
     };
+    use crate::mir::bytecode::{CALLSITE_IC_CLASS, CALLSITE_IC_JIT_PTR};
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
@@ -47,6 +48,7 @@ pub mod cl {
         mir: &MirFunction,
         interner: &Interner,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&[usize]>,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -171,6 +173,7 @@ pub mod cl {
                     &mut builder,
                     &mut module,
                     callsite_ic_ptrs,
+                    None, // f64 inner functions don't use IC
                     Some(inner_id),
                 )?;
                 builder.seal_all_blocks();
@@ -269,7 +272,7 @@ pub mod cl {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
 
-            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs)?;
+            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs, callsite_ic_live_ptrs)?;
 
             builder.seal_all_blocks();
             builder.finalize();
@@ -309,6 +312,10 @@ pub mod cl {
             "wren_call_2",
             "wren_call_3",
             "wren_call_4",
+            "wren_ic_call_0",
+            "wren_ic_call_1",
+            "wren_ic_call_2",
+            "wren_ic_call_3",
             "wren_super_call_0",
             "wren_super_call_1",
             "wren_super_call_2",
@@ -398,8 +405,9 @@ pub mod cl {
         builder: &mut FunctionBuilder,
         module: &mut JITModule,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&[usize]>,
     ) -> Result<(), String> {
-        lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, None)
+        lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, callsite_ic_live_ptrs, None)
     }
 
     /// Inner lowering with optional f64 specialization.
@@ -413,6 +421,7 @@ pub mod cl {
         builder: &mut FunctionBuilder,
         module: &mut JITModule,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&[usize]>,
         f64_self_id: Option<cranelift_module::FuncId>,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
@@ -566,6 +575,7 @@ pub mod cl {
                     &val_map,
                     &mut get_runtime_fn,
                     callsite_ic_ptrs,
+                    callsite_ic_live_ptrs,
                     &mut call_site_idx,
                     f64_self_id,
                     receiver_val,
@@ -688,6 +698,7 @@ pub mod cl {
             usize,
         ) -> Result<cranelift_codegen::ir::FuncRef, String>,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&[usize]>,
         call_site_idx: &mut usize,
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
@@ -927,15 +938,16 @@ pub mod cl {
                 let ic_idx = *call_site_idx;
                 *call_site_idx += 1;
 
-                // Try inline IC: if we have IC data for this call site,
-                // emit a class-check + direct call fast path.
-                let ic = callsite_ic_ptrs
-                    .and_then(|ics| ics.get(ic_idx));
+                // Try inline IC: emit class-check + fast path.
+                // Kind=5 (getter): inline field load (class baked as constant).
+                // Kind=1: currently only used for IC index encoding in slow path.
+                let ic = callsite_ic_ptrs.and_then(|ics| ics.get(ic_idx));
+                let _live_ptr = callsite_ic_live_ptrs.and_then(|ptrs| ptrs.get(ic_idx).copied());
 
-                // Kind=5 (getter): inline field load only (safe — no code pointer).
-                // Kind=1 (JIT call): DISABLED — baked jit_ptr goes stale when
-                // callee is recompiled, causing use-after-free.
                 if let Some(ic) = ic {
+                    // Only emit IC fast path for kind=5 (getter inline).
+                    // Kind=1 uses the slow path with IC index encoding so
+                    // dispatch_call_rooted can use cached method lookups.
                     if ic.kind == 5 && ic.class != 0 {
                         let fast_block = builder.create_block();
                         let slow_block = builder.create_block();
@@ -952,7 +964,7 @@ pub mod cl {
                             HEADER_CLASS,
                         );
 
-                        // Compare against cached class
+                        // Kind=5 getter: class is baked as constant.
                         let cached_class = builder.ins().iconst(types::I64, ic.class as i64);
                         let class_match =
                             builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
@@ -960,39 +972,19 @@ pub mod cl {
                             .ins()
                             .brif(class_match, fast_block, &[], slow_block, &[]);
 
-                        // Fast path: direct call or inline field load
+                        // Fast path: inline field load (kind=5 only)
                         builder.switch_to_block(fast_block);
-                        let fast_result = if ic.kind == 5 {
-                            // Getter: inline field load
-                            let field_idx = ic.func_id as i32;
-                            let fields_ptr = builder.ins().load(
-                                types::I64,
-                                MemFlags::trusted(),
-                                obj_ptr,
-                                INSTANCE_FIELDS,
-                            );
-                            let offset = field_idx * VALUE_SIZE;
-                            builder
-                                .ins()
-                                .load(types::I64, MemFlags::trusted(), fields_ptr, offset)
-                        } else {
-                            // Kind=1: direct call to JIT function pointer
-                            let jit_addr = builder.ins().iconst(types::I64, ic.jit_ptr as i64);
-                            // Build call signature: (recv, args...) -> i64
-                            let mut sig = module.make_signature();
-                            sig.params.push(AbiParam::new(types::I64)); // recv
-                            for _ in args {
-                                sig.params.push(AbiParam::new(types::I64));
-                            }
-                            sig.returns.push(AbiParam::new(types::I64));
-                            let sig_ref = builder.import_signature(sig);
-                            let mut call_args = vec![r];
-                            for a in args {
-                                call_args.push(get(a));
-                            }
-                            let call = builder.ins().call_indirect(sig_ref, jit_addr, &call_args);
-                            builder.inst_results(call)[0]
-                        };
+                        let field_idx = ic.func_id as i32;
+                        let fields_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            obj_ptr,
+                            INSTANCE_FIELDS,
+                        );
+                        let offset = field_idx * VALUE_SIZE;
+                        let fast_result = builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), fields_ptr, offset);
                         builder
                             .ins()
                             .jump(merge_block, &[BlockArg::Value(fast_result)]);

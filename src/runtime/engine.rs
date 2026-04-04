@@ -593,14 +593,20 @@ impl ExecutionEngine {
         ptr
     }
 
-    fn callsite_ic_snapshot_for_compile(&mut self, id: FuncId) -> Option<Vec<CallSiteIC>> {
+    /// Snapshot IC entries for compilation AND collect live IC entry pointers.
+    /// The snapshot is used by the compiler to decide WHAT to inline (kind=5 getter).
+    /// The live pointers are embedded in JIT code as constants for indirect IC:
+    /// the generated code loads class/jit_ptr from the live entry at runtime,
+    /// so it always uses the most recent IC data without going stale.
+    fn callsite_ic_data_for_compile(
+        &mut self,
+        id: FuncId,
+    ) -> Option<(Vec<CallSiteIC>, Vec<usize>)> {
         let bc_ptr = self.ensure_bytecode(id)?;
         let bc = unsafe { &*(bc_ptr as *const BytecodeFunction) };
-        let ic_table = unsafe { &*bc.ic_table.get() };
+        let ic_table = unsafe { &mut *bc.ic_table.get() };
 
-        // Snapshot the IC entries to avoid data races: the interpreter
-        // may update IC entries on the main thread while the compiler
-        // reads them on a background thread.
+        // Snapshot for the compiler (used on background thread).
         let snapshot: Vec<CallSiteIC> = ic_table
             .iter()
             .map(|ic| CallSiteIC {
@@ -611,6 +617,12 @@ impl ExecutionEngine {
                 kind: ic.kind,
             })
             .collect();
+        // Live pointers: address of each IC entry in the live table.
+        // These are stable because the Vec doesn't reallocate after creation.
+        let live_ptrs: Vec<usize> = ic_table
+            .iter_mut()
+            .map(|ic| ic as *mut CallSiteIC as usize)
+            .collect();
         if tier_trace_enabled() && !snapshot.is_empty() {
             let k5 = snapshot.iter().filter(|ic| ic.kind == 5).count();
             eprintln!(
@@ -620,7 +632,7 @@ impl ExecutionEngine {
                 k5
             );
         }
-        Some(snapshot)
+        Some((snapshot, live_ptrs))
     }
 
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
@@ -1106,7 +1118,10 @@ impl ExecutionEngine {
             }
         }
         let compile_mir = Self::build_compile_mir(&mir, tier, interner, profile.as_ref());
-        let callsite_ic_ptrs = self.callsite_ic_snapshot_for_compile(id);
+        let (callsite_ic_ptrs, callsite_ic_live_ptrs) = self
+            .callsite_ic_data_for_compile(id)
+            .map(|(s, l)| (Some(s), Some(l)))
+            .unwrap_or((None, None));
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
@@ -1119,6 +1134,7 @@ impl ExecutionEngine {
                 interner,
                 tier,
                 callsite_ic_ptrs,
+                callsite_ic_live_ptrs,
             ) {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
@@ -1214,7 +1230,10 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let interner_clone = interner.clone();
         let trace_name_clone = trace_name.clone();
-        let callsite_ic_ptrs = self.callsite_ic_snapshot_for_compile(id);
+        let (callsite_ic_ptrs, callsite_ic_live_ptrs) = self
+            .callsite_ic_data_for_compile(id)
+            .map(|(s, l)| (Some(s), Some(l)))
+            .unwrap_or((None, None));
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -1244,6 +1263,7 @@ impl ExecutionEngine {
                     &interner_clone,
                     tier,
                     callsite_ic_ptrs,
+                    callsite_ic_live_ptrs,
                 )
                 .map_err(|e| {
                     eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
