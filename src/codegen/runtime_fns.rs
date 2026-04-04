@@ -1264,8 +1264,13 @@ pub fn call_closure_jit_or_sync(
     let saved_ctx = read_jit_ctx();
     let saved_ctx_root_len = root_saved_jit_context(saved_ctx);
 
-    // Update context for the callee: set closure and defining_class.
+    // Update context for the callee: set closure, defining_class, and
+    // ensure vm is set (may be null if we're called from a fresh thread
+    // or after a context restore).
     mutate_jit_ctx(|ctx| {
+        if ctx.vm.is_null() {
+            ctx.vm = vm as *mut _ as *mut u8;
+        }
         ctx.current_func_id = unsafe { (*(*closure_ptr).function).fn_id } as u64;
         ctx.closure = closure_ptr as *mut u8;
         ctx.defining_class = defining_class
@@ -1629,6 +1634,11 @@ fn dispatch_method(
                     let depth = jit_depth();
                     if depth < MAX_JIT_DEPTH {
                         mutate_jit_ctx(|ctx| {
+                            // Ensure vm is set — may have been cleared by
+                            // a prior context restore if this is a nested call.
+                            if ctx.vm.is_null() {
+                                ctx.vm = vm as *mut _ as *mut u8;
+                            }
                             ctx.current_func_id = unsafe { (*(*cp).function).fn_id } as u64;
                             ctx.closure = cp as *mut u8;
                             ctx.defining_class = defining_class

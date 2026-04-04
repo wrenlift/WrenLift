@@ -628,6 +628,7 @@ fn run_fiber_with_stop_depth(
                     vm.method_cache.invalidate();
                     vm.engine.invalidate_inline_caches();
                     vm.engine.poll_compilations();
+                    vm.engine.drain_compile_queue(&vm.interner);
                     fiber = vm.fiber;
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {

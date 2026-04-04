@@ -1321,7 +1321,32 @@ impl ExecutionEngine {
             }
             self.pending_count = self.pending_count.saturating_sub(1);
         }
+    }
 
+    /// Install completed compilations AND start the next queued compile
+    /// if the background thread is idle. This is the safe version that
+    /// avoids the re-entrancy issues of drain_compile_queue by only
+    /// starting ONE compile per call.
+    pub fn poll_and_advance_queue(&mut self, interner: &crate::intern::Interner) {
+        self.poll_compilations();
+        // If thread is idle and queue has work, start the next compile.
+        if !self.compile_queue.is_empty() {
+            let thread_idle = self
+                .compile_handle
+                .as_ref()
+                .map_or(true, |h| h.is_finished());
+            if thread_idle {
+                if let Some(h) = self.compile_handle.take() {
+                    let _ = h.join();
+                }
+                // Poll again in case the join produced a result.
+                self.poll_compilations();
+                if let Some(queued_id) = self.compile_queue.first().copied() {
+                    self.compile_queue.remove(0);
+                    self.request_tier_up(queued_id, interner);
+                }
+            }
+        }
     }
 
     /// Check if the background compilation thread is idle (finished or absent).
