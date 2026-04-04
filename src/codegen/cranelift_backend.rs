@@ -436,7 +436,25 @@ pub mod cl {
         // Cache for declared runtime functions
         let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> = HashMap::new();
 
-        // Call site counter for IC lookup
+        // Pre-compute per-block call site base index.
+        // The IC table is indexed by sequential block order (bb0, bb1, ...),
+        // but we process blocks in RPO order. Without this map, call_site_idx
+        // would assign wrong IC entries to call sites in reordered blocks.
+        let mut block_call_site_base: Vec<usize> = Vec::with_capacity(mir.blocks.len());
+        {
+            let mut running = 0usize;
+            for blk in &mir.blocks {
+                block_call_site_base.push(running);
+                for (_, inst) in &blk.instructions {
+                    if matches!(
+                        inst,
+                        Instruction::Call { .. } | Instruction::SuperCall { .. }
+                    ) {
+                        running += 1;
+                    }
+                }
+            }
+        }
         let mut call_site_idx: usize = 0;
 
         // Helper to get or declare a runtime function
@@ -463,6 +481,11 @@ pub mod cl {
             let bid = BlockId(block_idx as u32);
             let cl_block = block_map[&bid];
             builder.switch_to_block(cl_block);
+
+            // Reset call_site_idx to the pre-computed base for this block.
+            // This ensures IC entries are read from the correct sequential
+            // position even though blocks are processed in RPO order.
+            call_site_idx = block_call_site_base[block_idx];
 
             // Add block parameters (from loop back-edges / CondBranch args)
             for (vid, ty) in &block.params {

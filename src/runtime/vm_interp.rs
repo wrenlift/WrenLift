@@ -628,7 +628,6 @@ fn run_fiber_with_stop_depth(
                     vm.method_cache.invalidate();
                     vm.engine.invalidate_inline_caches();
                     vm.engine.poll_compilations();
-                    // Queue processed by request_tier_up
                     fiber = vm.fiber;
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -1390,7 +1389,9 @@ fn run_fiber_with_stop_depth(
                             let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
                             let recv_class =
                                 unsafe { (*(obj_ptr as *const ObjHeader)).class as usize };
-                            if recv_class == ic.class {
+                            let fn_idx_ic = ic.func_id as usize;
+                            let is_leaf = vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
+                            if recv_class == ic.class && is_leaf {
                                 let jit_ptr = ic.jit_ptr;
                                 let recv_bits = recv_val.to_bits();
                                 ensure_ctx_reg();
@@ -1577,8 +1578,12 @@ fn run_fiber_with_stop_depth(
                                     .get(fn_idx)
                                     .copied()
                                     .unwrap_or(std::ptr::null());
+                                // For Cranelift: only inline-dispatch leaf functions.
+                                // Non-leaf functions use dispatch_closure_bc which
+                                // properly saves/restores JIT context for re-entrant calls.
                                 #[cfg(feature = "cranelift")]
-                                let jit_dispatch_ok = !jit_ptr.is_null();
+                                let jit_dispatch_ok = !jit_ptr.is_null()
+                                    && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
                                 #[cfg(not(feature = "cranelift"))]
                                 let jit_dispatch_ok = !jit_ptr.is_null()
                                     && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
@@ -1600,6 +1605,17 @@ fn run_fiber_with_stop_depth(
                                             kind: 1, // JIT leaf
                                         };
                                     }
+                                    // Save/restore JIT context — callee may
+                                    // re-enter the interpreter and overwrite it.
+                                    let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+                                    crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                                        ctx.vm = vm as *mut _ as *mut u8;
+                                        ctx.current_func_id = fn_idx as u64;
+                                        ctx.closure = closure_ptr as *mut u8;
+                                        ctx.defining_class = defining_class
+                                            .map(|p| p as *mut u8)
+                                            .unwrap_or(std::ptr::null_mut());
+                                    });
                                     ensure_ctx_reg();
                                     let recv_bits = recv_val.to_bits();
                                     let result_bits = unsafe {
@@ -1635,6 +1651,7 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
+                                    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
                                     vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;

@@ -891,6 +891,7 @@ impl ExecutionEngine {
         } else {
             std::ptr::null()
         };
+        let installed_code_size = executable.code_size();
         if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
             eprintln!(
                 "INSTALL: idx={} tier={:?} native={} ptr={:p}",
@@ -942,6 +943,28 @@ impl ExecutionEngine {
             self.bc_cache[idx] = Arc::as_ptr(&bytecode);
         }
         self.sync_active_tier_cache(idx);
+        if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
+            let jit_ptr = self.jit_code.get(idx).copied().unwrap_or(std::ptr::null());
+            let leaf = self.jit_leaf.get(idx).copied().unwrap_or(false);
+            let state = self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted);
+            eprintln!(
+                "SYNC: idx={} jit_code={:p} leaf={} state={:?}",
+                idx, jit_ptr, leaf, state
+            );
+        }
+        // Dump machine code hex for any installed native function.
+        if std::env::var_os("WLIFT_DUMP_HEX").is_some() && !native_ptr.is_null() {
+            let code_size = installed_code_size;
+            if code_size > 0 {
+                eprint!("HEX:f{}:{}:", idx, code_size);
+                let code_bytes =
+                    unsafe { std::slice::from_raw_parts(native_ptr as *const u8, code_size) };
+                for b in code_bytes {
+                    eprint!("{:02x}", b);
+                }
+                eprintln!();
+            }
+        }
         // Register code range for GC stack walking.
         if !native_ptr.is_null() {
             if let Some(meta) = self.jit_metadata.get(idx).and_then(|m| m.clone()) {
@@ -1064,7 +1087,14 @@ impl ExecutionEngine {
         // Skip JIT compilation for functions named in WLIFT_SKIP_JIT env var
         if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
             let name = interner.resolve(body.mir().name);
-            if skip.split(',').any(|s| name.contains(s)) {
+            if skip.split(',').any(|s| name == s || name.contains(s)) {
+                return false;
+            }
+        }
+        // Only JIT functions named in WLIFT_ONLY_JIT env var
+        if let Ok(only) = std::env::var("WLIFT_ONLY_JIT") {
+            let name = interner.resolve(body.mir().name);
+            if !only.split(',').any(|s| name == s || name.contains(s)) {
                 return false;
             }
         }
@@ -1125,7 +1155,16 @@ impl ExecutionEngine {
         if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
             if let Some(body) = self.functions.get(idx) {
                 let name = interner.resolve(body.mir().name);
-                if skip.split(',').any(|s| name.contains(s)) {
+                if skip.split(',').any(|s| name == s || name.contains(s)) {
+                    return;
+                }
+            }
+        }
+        // Only JIT functions named in WLIFT_ONLY_JIT env var
+        if let Ok(only) = std::env::var("WLIFT_ONLY_JIT") {
+            if let Some(body) = self.functions.get(idx) {
+                let name = interner.resolve(body.mir().name);
+                if !only.split(',').any(|s| name == s || name.contains(s)) {
                     return;
                 }
             }
