@@ -1547,6 +1547,7 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::GetStaticField(_)
                 | Instruction::GetModuleVar(_)
                 | Instruction::Call { .. }
+                | Instruction::CallKnownFunc { .. }
                 | Instruction::CallStaticSelf { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::MakeClosure { .. }
@@ -1645,6 +1646,7 @@ fn infer_mir_gc_value_reps(
                     | Instruction::GetStaticField(_)
                     | Instruction::GetModuleVar(_)
                     | Instruction::Call { .. }
+                    | Instruction::CallKnownFunc { .. }
                     | Instruction::SuperCall { .. }
                     | Instruction::MakeClosure { .. }
                     | Instruction::GetUpvalue(_)
@@ -1997,6 +1999,57 @@ pub fn compile_function_artifact_with_interner(
     )
 }
 
+/// Transform monomorphic Call sites into CallKnownFunc using IC snapshot data.
+/// Only transforms kind=1 (JIT leaf) entries where the callee's func_id is known.
+/// The CallKnownFunc instruction loads the callee's JIT pointer at runtime and
+/// does a direct call_indirect — skipping method lookup entirely.
+fn devirt_calls_with_ic(
+    mir: &MirFunction,
+    ic_snapshot: &[crate::mir::bytecode::CallSiteIC],
+) -> MirFunction {
+    use crate::mir::Instruction;
+
+    let mut new_mir = mir.clone();
+    let mut ic_idx = 0usize;
+
+    // Pre-compute per-block IC base (same logic as cranelift_backend)
+    let mut block_ic_base: Vec<usize> = Vec::with_capacity(mir.blocks.len());
+    let mut running = 0usize;
+    for blk in &mir.blocks {
+        block_ic_base.push(running);
+        for (_, inst) in &blk.instructions {
+            if matches!(inst, Instruction::Call { .. } | Instruction::SuperCall { .. }) {
+                running += 1;
+            }
+        }
+    }
+
+    for (block_idx, block) in new_mir.blocks.iter_mut().enumerate() {
+        ic_idx = block_ic_base[block_idx];
+        for (_, inst) in block.instructions.iter_mut() {
+            if let Instruction::Call { receiver, method, args } = inst {
+                if ic_idx < ic_snapshot.len() {
+                    let ic = &ic_snapshot[ic_idx];
+                    // Only devirtualize kind=1 (JIT call) with known func_id
+                    if ic.kind == 1 && ic.class != 0 && ic.func_id != 0 {
+                        let fid = ic.func_id as u32;
+                        *inst = Instruction::CallKnownFunc {
+                            func_id: fid,
+                            method: *method,
+                            receiver: *receiver,
+                            args: std::mem::take(args),
+                        };
+                    }
+                }
+                ic_idx += 1;
+            } else if matches!(inst, Instruction::SuperCall { .. }) {
+                ic_idx += 1;
+            }
+        }
+    }
+    new_mir
+}
+
 pub fn compile_function_artifact_with_interner_and_callsite_ics(
     mir: &MirFunction,
     target: Target,
@@ -2019,11 +2072,21 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
         // encoding correctly for both x86_64 and aarch64.
         #[cfg(feature = "cranelift")]
         Target::X86_64 | Target::Aarch64 => {
+            // Speculative devirtualization: transform Call → CallKnownFunc
+            // for monomorphic call sites using IC snapshot data.
+            let devirt_mir;
+            let mir_ref = if let Some(ref ic_snapshot) = callsite_ic_ptrs {
+                devirt_mir = devirt_calls_with_ic(mir, ic_snapshot);
+                &devirt_mir
+            } else {
+                mir
+            };
             let compiled = cranelift_backend::cl::compile_mir(
-                mir,
+                mir_ref,
                 interner,
                 callsite_ic_ptrs.as_deref(),
                 callsite_ic_live_ptrs.as_deref(),
+                None, // jit_code_base passed via wren_load_jit_ptr
             )?;
             let code = CompiledFunction::CraneliftOwned(compiled);
             return Ok(CompiledArtifact {
@@ -3855,6 +3918,15 @@ impl<'a> LowerCtx<'a> {
                     ret: Some(dst),
                 });
                 self.mf.emit(MachInst::DefLabel(done_label));
+            }
+            Instruction::CallKnownFunc { func_id: _, method: _, receiver: _, args: _ } => {
+                // TODO: implement direct JIT call via jit_code_base[func_id]
+                // For now, return null.
+                let dst = self.vreg_for(dst_val);
+                self.mf.emit(MachInst::LoadImm {
+                    dst,
+                    bits: 0x7FFC_0000_0000_0000,
+                });
             }
             Instruction::CallStaticSelf { args } => {
                 let dst = self.vreg_for(dst_val);

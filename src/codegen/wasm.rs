@@ -864,6 +864,11 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::Call(self.runtime_imports["wren_super_call"]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
+            Instruction::CallKnownFunc { .. } => {
+                // CallKnownFunc is not supported in WASM — return null.
+                func.instruction(&WasmInst::I64Const(0x7FFC_0000_0000_0000u64 as i64));
+                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+            }
 
             // -- Closures --
             Instruction::MakeClosure { fn_id, upvalues } => {

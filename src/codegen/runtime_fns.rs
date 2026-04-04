@@ -611,6 +611,11 @@ pub struct JitContext {
     pub closure: *mut u8,
     /// The class that defines the current method (for static field access).
     pub defining_class: *mut u8,
+    /// Base pointer to engine.jit_code array (Vec<*const u8> data pointer).
+    /// Used by CallKnownFunc to load callee JIT pointers at runtime.
+    pub jit_code_base: *const *const u8,
+    /// Number of entries in jit_code array.
+    pub jit_code_len: u32,
 }
 
 unsafe impl Send for JitContext {}
@@ -626,6 +631,8 @@ impl Default for JitContext {
             current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
+            jit_code_base: std::ptr::null(),
+            jit_code_len: 0,
         }
     }
 }
@@ -649,6 +656,8 @@ thread_local! {
         current_func_id: u32::MAX as u64,
         closure: std::ptr::null_mut(),
         defining_class: std::ptr::null_mut(),
+        jit_code_base: std::ptr::null(),
+        jit_code_len: 0,
     }) };
 
     /// JIT root set — UnsafeCell for zero-overhead Vec mutation.
@@ -1220,6 +1229,19 @@ pub extern "C" fn wren_get_module_var(slot: u64) -> u64 {
         }
     })
     .unwrap_or(Value::null().to_bits())
+}
+
+/// Load the JIT code pointer for a given function ID.
+/// Returns the function pointer as u64 (0 if not compiled).
+/// Used by CallKnownFunc to do direct JIT-to-JIT calls.
+pub extern "C" fn wren_load_jit_ptr(func_id: u64) -> u64 {
+    let ctx = read_jit_ctx();
+    let idx = func_id as usize;
+    if idx < ctx.jit_code_len as usize && !ctx.jit_code_base.is_null() {
+        unsafe { *ctx.jit_code_base.add(idx) as u64 }
+    } else {
+        0
+    }
 }
 
 /// Set a module variable by slot index.
@@ -2955,6 +2977,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_super_call_3" => Some(wren_super_call_3 as *const () as usize),
         "wren_super_call_4" => Some(wren_super_call_4 as *const () as usize),
         // Collections
+        // JIT pointer loading for CallKnownFunc
+        "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
         // Indirect IC dispatch (lightweight JIT-to-JIT calls)
         "wren_ic_call_0" => Some(wren_ic_call_0 as *const () as usize),
         "wren_ic_call_1" => Some(wren_ic_call_1 as *const () as usize),
@@ -3870,6 +3894,8 @@ mod tests {
             current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
+            jit_code_base: std::ptr::null(),
+            jit_code_len: 0,
         });
         assert!(with_context(|_| ()).is_some());
 
@@ -3895,6 +3921,8 @@ mod tests {
             current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
+            jit_code_base: std::ptr::null(),
+            jit_code_len: 0,
         });
 
         // Read first module var (num 42)
@@ -3927,6 +3955,8 @@ mod tests {
             current_func_id: u32::MAX as u64,
             closure: std::ptr::null_mut(),
             defining_class: std::ptr::null_mut(),
+            jit_code_base: std::ptr::null(),
+            jit_code_len: 0,
         });
 
         let new_val = Value::num(99.0).to_bits();
@@ -3980,6 +4010,8 @@ mod tests {
             current_func_id: 7,
             closure: old_closure.as_mut_ptr(),
             defining_class: old_class.as_mut_ptr(),
+            jit_code_base: std::ptr::null(),
+            jit_code_len: 0,
         };
 
         let root_len_before = root_saved_jit_context(saved_ctx);

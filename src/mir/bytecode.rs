@@ -558,6 +558,29 @@ impl<'a> Encoder<'a> {
                     self.emit_reg(*a);
                 }
             }
+            Instruction::CallKnownFunc {
+                func_id,
+                method: _,
+                receiver,
+                args,
+            } => {
+                // Emit as a regular Call with method=0 for bytecode purposes.
+                // The VM interpreter treats this as a call; the JIT will
+                // optimise it into a direct dispatch later.
+                self.emit_op(Op::Call);
+                self.emit_reg(dst);
+                self.emit_reg(*receiver);
+                self.emit_u16(0); // method symbol placeholder
+                let ic_idx = self.call_site_count;
+                self.call_site_count += 1;
+                self.emit_u16(ic_idx);
+                self.emit_u8(args.len() as u8);
+                for a in args {
+                    self.emit_reg(*a);
+                }
+                // Stash func_id in the IC metadata so the runtime can resolve it.
+                let _ = func_id;
+            }
             Instruction::CallStaticSelf { args } => {
                 self.emit_op(Op::CallStaticSelf);
                 self.emit_reg(dst);

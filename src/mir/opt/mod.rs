@@ -154,7 +154,8 @@ fn replace_in_inst(inst: &mut Instruction, map: &HashMap<ValueId, ValueId>) {
         SetModuleVar(_, val) | SetUpvalue(_, val) => {
             *val = resolve(*val, map);
         }
-        Call { receiver, args, .. } => {
+        Call { receiver, args, .. }
+        | CallKnownFunc { receiver, args, .. } => {
             *receiver = resolve(*receiver, map);
             for arg in args.iter_mut() {
                 *arg = resolve(*arg, map);

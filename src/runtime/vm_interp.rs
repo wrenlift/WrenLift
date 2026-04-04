@@ -197,6 +197,8 @@ fn try_run_root_frame_native(
         current_func_id: func_id.0 as u64,
         closure: std::ptr::null_mut(),
         defining_class: std::ptr::null_mut(),
+        jit_code_base: vm.engine.jit_code.as_ptr(),
+        jit_code_len: vm.engine.jit_code.len() as u32,
     });
 
     vm.engine.note_native_entry(func_id);
@@ -2606,6 +2608,8 @@ fn dispatch_closure_bc(
                         defining_class: defining_class
                             .map(|p| p as *mut u8)
                             .unwrap_or(std::ptr::null_mut()),
+                        jit_code_base: vm.engine.jit_code.as_ptr(),
+                        jit_code_len: vm.engine.jit_code.len() as u32,
                     },
                 );
 

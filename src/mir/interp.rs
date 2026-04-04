@@ -314,6 +314,7 @@ pub fn eval_pure_instruction(
         Instruction::GetModuleVar(_) => Err(InterpError::Unsupported("GetModuleVar".into())),
         Instruction::SetModuleVar(_, _) => Err(InterpError::Unsupported("SetModuleVar".into())),
         Instruction::Call { .. } => Err(InterpError::Unsupported("Call".into())),
+        Instruction::CallKnownFunc { .. } => Err(InterpError::Unsupported("CallKnownFunc".into())),
         Instruction::SuperCall { .. } => Err(InterpError::Unsupported("SuperCall".into())),
         Instruction::GetField(_, _) => Err(InterpError::Unsupported("GetField".into())),
         Instruction::SetField(_, _, _) => Err(InterpError::Unsupported("SetField".into())),

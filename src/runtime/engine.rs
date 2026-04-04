@@ -1711,6 +1711,8 @@ mod tests {
                 current_func_id: u32::MAX as u64,
                 closure: std::ptr::null_mut(),
                 defining_class: std::ptr::null_mut(),
+                jit_code_base: std::ptr::null(),
+                jit_code_len: 0,
             });
 
             let result = compile_and_exec(f, &interner);

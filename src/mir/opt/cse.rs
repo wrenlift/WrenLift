@@ -176,6 +176,7 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         GuardProtocol(..) => 62,
         GetStaticField(..) => 63,
         SetStaticField(..) => 64,
+        CallKnownFunc { .. } => 65,
     }
 }
 

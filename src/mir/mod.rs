@@ -313,6 +313,15 @@ pub enum Instruction {
         method: SymbolId,
         args: Vec<ValueId>,
     },
+    /// Direct call to a known function by FuncId. Emitted by speculative
+    /// devirtualization when the receiver class is known from IC data.
+    /// Falls through to wren_call_N slow path if the callee is not yet compiled.
+    CallKnownFunc {
+        func_id: u32,
+        method: SymbolId,
+        receiver: ValueId,
+        args: Vec<ValueId>,
+    },
     /// Recursive call to the current static method on its defining class.
     CallStaticSelf {
         args: Vec<ValueId>,
@@ -385,6 +394,7 @@ impl Instruction {
                 | Instruction::GuardClass(..)
                 | Instruction::GuardProtocol(..)
                 | Instruction::Call { .. }
+                | Instruction::CallKnownFunc { .. }
                 | Instruction::CallStaticSelf { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::SetUpvalue(..)
@@ -466,7 +476,8 @@ impl Instruction {
             Instruction::SetModuleVar(_, val) => vec![*val],
             Instruction::SetUpvalue(_, val) => vec![*val],
 
-            Instruction::Call { receiver, args, .. } => {
+            Instruction::Call { receiver, args, .. }
+            | Instruction::CallKnownFunc { receiver, args, .. } => {
                 let mut ops = vec![*receiver];
                 ops.extend(args);
                 ops
@@ -969,6 +980,17 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CallStaticSelf { args } => {
             format!("call_static_self({})", fmt_val_list(args))
         }
+        Instruction::CallKnownFunc {
+            func_id,
+            method: _,
+            receiver,
+            args,
+        } => format!(
+            "call_known FuncId({}) {}({})",
+            func_id,
+            receiver,
+            fmt_val_list(args)
+        ),
         Instruction::SuperCall { method, args } => {
             format!(
                 "super_call %{}({})",

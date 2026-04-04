@@ -49,6 +49,7 @@ pub mod cl {
         interner: &Interner,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
+        jit_code_base: Option<*const *const u8>,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -174,6 +175,7 @@ pub mod cl {
                     &mut module,
                     callsite_ic_ptrs,
                     None, // f64 inner functions don't use IC
+                    None, // no jit_code_base for inner
                     Some(inner_id),
                 )?;
                 builder.seal_all_blocks();
@@ -272,7 +274,7 @@ pub mod cl {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
 
-            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs, callsite_ic_live_ptrs)?;
+            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs, callsite_ic_live_ptrs, jit_code_base)?;
 
             builder.seal_all_blocks();
             builder.finalize();
@@ -312,6 +314,7 @@ pub mod cl {
             "wren_call_2",
             "wren_call_3",
             "wren_call_4",
+            "wren_load_jit_ptr",
             "wren_ic_call_0",
             "wren_ic_call_1",
             "wren_ic_call_2",
@@ -406,8 +409,9 @@ pub mod cl {
         module: &mut JITModule,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
+        jit_code_base: Option<*const *const u8>,
     ) -> Result<(), String> {
-        lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, callsite_ic_live_ptrs, None)
+        lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, callsite_ic_live_ptrs, jit_code_base, None)
     }
 
     /// Inner lowering with optional f64 specialization.
@@ -422,6 +426,7 @@ pub mod cl {
         module: &mut JITModule,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
+        jit_code_base: Option<*const *const u8>,
         f64_self_id: Option<cranelift_module::FuncId>,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
@@ -1019,6 +1024,32 @@ pub mod cl {
                 }
 
                 // No IC or unsupported IC kind: full dispatch
+                let method_bits = method.index() as u64;
+                let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                let call_name = match args.len() {
+                    0 => "wren_call_0",
+                    1 => "wren_call_1",
+                    2 => "wren_call_2",
+                    3 => "wren_call_3",
+                    _ => "wren_call_4",
+                };
+                let arg_count = 2 + args.len().min(4);
+                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
+                let mut call_args = vec![r, method_val];
+                for a in args.iter().take(4) {
+                    call_args.push(get(a));
+                }
+                let result = builder.ins().call(f, &call_args);
+                Ok(Some(builder.inst_results(result)[0]))
+            }
+
+            // === Direct known-function call (devirtualized) ===
+            Instruction::CallKnownFunc { func_id: _, method, receiver, args } => {
+                let r = get(receiver);
+                // Use wren_call_N with encoded IC index so the slow path
+                // populates IC entries. This is the same as a regular Call
+                // but the devirt pass has already verified this is monomorphic.
+                // Future: load jit_ptr from live IC entry for zero-overhead dispatch.
                 let method_bits = method.index() as u64;
                 let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                 let call_name = match args.len() {
