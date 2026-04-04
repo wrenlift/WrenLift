@@ -315,6 +315,10 @@ pub mod cl {
             "wren_call_3",
             "wren_call_4",
             "wren_load_jit_ptr",
+            "wren_known_call_0",
+            "wren_known_call_1",
+            "wren_known_call_2",
+            "wren_known_call_3",
             "wren_ic_call_0",
             "wren_ic_call_1",
             "wren_ic_call_2",
@@ -1044,25 +1048,22 @@ pub mod cl {
             }
 
             // === Direct known-function call (devirtualized) ===
-            Instruction::CallKnownFunc { func_id: _, method, receiver, args } => {
+            Instruction::CallKnownFunc { func_id, method, receiver, args } => {
                 let r = get(receiver);
-                // Use wren_call_N with encoded IC index so the slow path
-                // populates IC entries. This is the same as a regular Call
-                // but the devirt pass has already verified this is monomorphic.
-                // Future: load jit_ptr from live IC entry for zero-overhead dispatch.
-                let method_bits = method.index() as u64;
-                let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                // Call wren_known_call_N: skips method lookup, calls by FuncId.
+                // Pack func_id (lower 32) | method_sym (upper 32) into one u64.
+                let packed = (*func_id as u64) | ((method.index() as u64) << 32);
+                let fid_val = builder.ins().iconst(types::I64, packed as i64);
                 let call_name = match args.len() {
-                    0 => "wren_call_0",
-                    1 => "wren_call_1",
-                    2 => "wren_call_2",
-                    3 => "wren_call_3",
-                    _ => "wren_call_4",
+                    0 => "wren_known_call_0",
+                    1 => "wren_known_call_1",
+                    2 => "wren_known_call_2",
+                    _ => "wren_known_call_3",
                 };
-                let arg_count = 2 + args.len().min(4);
+                let arg_count = 2 + args.len().min(3);
                 let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                let mut call_args = vec![r, method_val];
-                for a in args.iter().take(4) {
+                let mut call_args = vec![fid_val, r];
+                for a in args.iter().take(3) {
                     call_args.push(get(a));
                 }
                 let result = builder.ins().call(f, &call_args);

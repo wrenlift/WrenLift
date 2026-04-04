@@ -1967,6 +1967,68 @@ extern "C" fn wren_call_4_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Known-function dispatch: skip method lookup, call by FuncId directly.
+// Used by CallKnownFunc for devirtualized call sites. ~5x faster than
+// wren_call_N because we skip: method_and_ic decode, IC check, method
+// cache lookup, class hierarchy walk. Just: jit_code[func_id] → call.
+// ---------------------------------------------------------------------------
+
+/// `packed` = func_id (lower 32) | method_sym (upper 32)
+fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
+    let func_id = (packed & 0xFFFF_FFFF) as u32;
+    let method_raw = (packed >> 32) as u32;
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+    let fid = func_id as usize;
+    let fid_obj = crate::runtime::engine::FuncId(func_id);
+    let jit_ptr = vm.engine.jit_code.get(fid).copied().unwrap_or(std::ptr::null());
+
+    if !jit_ptr.is_null() && args.len() <= 4 {
+        let saved_ctx = read_jit_ctx();
+        mutate_jit_ctx(|ctx| {
+            ctx.current_func_id = func_id as u64;
+        });
+        let depth = jit_depth();
+        if depth < MAX_JIT_DEPTH {
+            set_jit_depth(depth + 1);
+            let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, args) };
+            set_jit_depth(depth);
+            set_jit_context(saved_ctx);
+            return result;
+        }
+        set_jit_context(saved_ctx);
+    }
+
+    // Fallback: full dispatch via method symbol
+    let recv = args.first().copied().unwrap_or(Value::null());
+    let method_sym = crate::intern::SymbolId::from_raw(method_raw);
+    dispatch_call(recv, method_sym.index() as u64, args)
+}
+
+/// Known call with 0 extra args: (func_id, recv) -> result
+pub extern "C" fn wren_known_call_0(func_id: u64, recv: u64) -> u64 {
+    wren_known_call_inner(func_id, &[Value::from_bits(recv)])
+}
+
+/// Known call with 1 extra arg: (func_id, recv, a0) -> result
+pub extern "C" fn wren_known_call_1(func_id: u64, recv: u64, a0: u64) -> u64 {
+    wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0)])
+}
+
+/// Known call with 2 extra args: (func_id, recv, a0, a1) -> result
+pub extern "C" fn wren_known_call_2(func_id: u64, recv: u64, a0: u64, a1: u64) -> u64 {
+    wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1)])
+}
+
+/// Known call with 3 extra args
+pub extern "C" fn wren_known_call_3(func_id: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+}
+
+// ---------------------------------------------------------------------------
 // Indirect IC dispatch: lightweight JIT-to-JIT calls via IC entry.
 // These are ~10x faster than wren_call_N because they skip method lookup.
 // Called from Cranelift JIT code when the indirect IC class check passes.
@@ -2977,8 +3039,12 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_super_call_3" => Some(wren_super_call_3 as *const () as usize),
         "wren_super_call_4" => Some(wren_super_call_4 as *const () as usize),
         // Collections
-        // JIT pointer loading for CallKnownFunc
+        // Known-function dispatch (devirtualized)
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
+        "wren_known_call_0" => Some(wren_known_call_0 as *const () as usize),
+        "wren_known_call_1" => Some(wren_known_call_1 as *const () as usize),
+        "wren_known_call_2" => Some(wren_known_call_2 as *const () as usize),
+        "wren_known_call_3" => Some(wren_known_call_3 as *const () as usize),
         // Indirect IC dispatch (lightweight JIT-to-JIT calls)
         "wren_ic_call_0" => Some(wren_ic_call_0 as *const () as usize),
         "wren_ic_call_1" => Some(wren_ic_call_1 as *const () as usize),
