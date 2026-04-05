@@ -1334,12 +1334,45 @@ impl ExecutionEngine {
                 } = result
                 {
                     self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
+                    // Eagerly queue callees discovered from IC data.
+                    self.queue_callees_from_ic(FuncId(idx as u32));
                 }
             }
             if idx < self.compiling_tier.len() {
                 self.compiling_tier[idx] = None;
             }
             self.pending_count = self.pending_count.saturating_sub(1);
+        }
+    }
+
+    /// Scan a function's IC table for callee FuncIds and queue uncompiled
+    /// callees for background compilation. This ensures that by the time a
+    /// JIT function runs and calls its callees, those callees are likely
+    /// already compiled (or being compiled).
+    fn queue_callees_from_ic(&mut self, caller_id: FuncId) {
+        let bc_ptr = self.bc_cache.get(caller_id.0 as usize).copied().unwrap_or(std::ptr::null());
+        if bc_ptr.is_null() {
+            return;
+        }
+        let bc = unsafe { &*(bc_ptr as *const BytecodeFunction) };
+        let ic_table = unsafe { &*bc.ic_table.get() };
+        for ic in ic_table.iter() {
+            // kind=1: JIT call with known func_id
+            if ic.kind == 1 && ic.func_id != 0 {
+                let callee_id = FuncId(ic.func_id as u32);
+                let callee_idx = callee_id.0 as usize;
+                // Only queue if not yet compiled and not already queued/compiling
+                let already_compiled = self
+                    .jit_code
+                    .get(callee_idx)
+                    .map(|p| !p.is_null())
+                    .unwrap_or(false);
+                let already_queued = self.compiling_tier.get(callee_idx).map(|t| t.is_some()).unwrap_or(false)
+                    || self.compile_queue.contains(&callee_id);
+                if !already_compiled && !already_queued && callee_idx < self.functions.len() {
+                    self.compile_queue.push(callee_id);
+                }
+            }
         }
     }
 
