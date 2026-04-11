@@ -751,6 +751,12 @@ pub fn read_jit_ctx() -> JitContext {
     JIT_CTX.with(|c| unsafe { *c.get() })
 }
 
+/// Fast null check for ctx.vm without copying the full context.
+#[inline(always)]
+pub fn jit_ctx_vm_is_null() -> bool {
+    JIT_CTX.with(|c| unsafe { (*c.get()).vm.is_null() })
+}
+
 /// Mutate the JIT context in place (no copy — direct field access).
 #[inline(always)]
 pub fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {

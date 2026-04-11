@@ -603,6 +603,29 @@ fn run_fiber_with_stop_depth(
             .map(|m| &mut m.vars as *mut Vec<Value>)
             .unwrap_or(std::ptr::null_mut());
 
+        // Set JIT context for the current frame so JIT-compiled functions
+        // dispatched from the IC fast path have access to vm + module_vars.
+        // Only set when ctx.vm is null (check raw field without copying).
+        if crate::codegen::runtime_fns::jit_ctx_vm_is_null() {
+            let (mv_ptr, mv_count) = if !module_vars_ptr.is_null() {
+                let v = unsafe { &*module_vars_ptr };
+                (v.as_ptr() as *mut u64, v.len() as u32)
+            } else {
+                (std::ptr::null_mut(), 0)
+            };
+            let mod_name_bytes = module_name.as_bytes();
+            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                ctx.vm = vm as *mut _ as *mut u8;
+                ctx.module_vars = mv_ptr;
+                ctx.module_var_count = mv_count;
+                ctx.module_name = mod_name_bytes.as_ptr();
+                ctx.module_name_len = mod_name_bytes.len() as u32;
+                ctx.current_func_id = func_id.0 as u64;
+                ctx.jit_code_base = vm.engine.jit_code.as_ptr();
+                ctx.jit_code_len = vm.engine.jit_code.len() as u32;
+            });
+        }
+
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
             // GC safepoint: check every 4096 instructions (or more often for
@@ -1608,11 +1631,11 @@ fn run_fiber_with_stop_depth(
                                             kind: 1, // JIT leaf
                                         };
                                     }
-                                    // Save/restore JIT context — callee may
-                                    // re-enter the interpreter and overwrite it.
-                                    let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+                                    // Update only callee-specific fields.
+                                    // The vm/module_vars/jit_code_base were
+                                    // set at the top of the fiber loop and
+                                    // remain valid throughout this frame.
                                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
-                                        ctx.vm = vm as *mut _ as *mut u8;
                                         ctx.current_func_id = fn_idx as u64;
                                         ctx.closure = closure_ptr as *mut u8;
                                         ctx.defining_class = defining_class
@@ -1654,7 +1677,6 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
-                                    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
                                     vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
