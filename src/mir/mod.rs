@@ -322,6 +322,10 @@ pub enum Instruction {
         func_id: u32,
         method: SymbolId,
         expected_class: usize,
+        /// If Some(field_idx), Cranelift emits an inlined field load
+        /// (class check + get_field) instead of a function call.
+        /// Valid only for trivial getters of the form `{ _field }`.
+        inline_getter_field: Option<u16>,
         receiver: ValueId,
         args: Vec<ValueId>,
     },
@@ -987,6 +991,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
             func_id,
             method: _,
             expected_class: _,
+            inline_getter_field: _,
             receiver,
             args,
         } => format!(

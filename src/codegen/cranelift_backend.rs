@@ -1056,10 +1056,84 @@ pub mod cl {
                 func_id,
                 method,
                 expected_class,
+                inline_getter_field,
                 receiver,
                 args,
             } => {
                 let r = get(receiver);
+
+                // === Trivial-getter inline path ===
+                // If the callee is a trivial getter (one-instruction
+                // GetField), inline the field load directly. Class check
+                // guards against polymorphic misuse. Zero FFI — pure load.
+                if let Some(field_idx) = inline_getter_field {
+                    let fast_block = builder.create_block();
+                    let slow_block = builder.create_block();
+                    let merge_block = builder.create_block();
+                    builder.append_block_param(merge_block, types::I64);
+
+                    let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                    let obj_ptr = builder.ins().band(r, ptr_mask);
+                    let recv_class = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        obj_ptr,
+                        HEADER_CLASS,
+                    );
+                    let cached_class =
+                        builder.ins().iconst(types::I64, *expected_class as i64);
+                    let class_match =
+                        builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                    builder
+                        .ins()
+                        .brif(class_match, fast_block, &[], slow_block, &[]);
+
+                    // Fast path: load fields_ptr then indexed field.
+                    builder.switch_to_block(fast_block);
+                    let fields_ptr = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        obj_ptr,
+                        INSTANCE_FIELDS,
+                    );
+                    let offset = (*field_idx as i32) * VALUE_SIZE;
+                    let field_val = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        fields_ptr,
+                        offset,
+                    );
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(field_val)]);
+
+                    // Slow path: class mismatch → wren_call_N.
+                    builder.switch_to_block(slow_block);
+                    let method_bits = method.index() as u64;
+                    let method_val =
+                        builder.ins().iconst(types::I64, method_bits as i64);
+                    let slow_name = match args.len() {
+                        0 => "wren_call_0",
+                        1 => "wren_call_1",
+                        2 => "wren_call_2",
+                        3 => "wren_call_3",
+                        _ => "wren_call_4",
+                    };
+                    let slow_arg_count = 2 + args.len().min(4);
+                    let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
+                    let mut slow_args = vec![r, method_val];
+                    for a in args.iter().take(4) {
+                        slow_args.push(get(a));
+                    }
+                    let slow_call = builder.ins().call(slow_f, &slow_args);
+                    let slow_result = builder.inst_results(slow_call)[0];
+                    builder
+                        .ins()
+                        .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                    builder.switch_to_block(merge_block);
+                    return Ok(Some(builder.block_params(merge_block)[0]));
+                }
 
                 // Only inline-dispatch when we have a cached class pointer.
                 // Otherwise fall back to the slow helper.

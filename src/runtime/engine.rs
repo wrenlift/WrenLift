@@ -635,6 +635,32 @@ impl ExecutionEngine {
         Some((snapshot, live_ptrs))
     }
 
+    /// Compute per-IC-entry trivial-getter hints for devirt inlining.
+    /// For each monomorphic IC entry (kind=1 with a known func_id), if
+    /// the callee MIR matches the trivial-getter pattern, record the
+    /// expected class + field index so Cranelift can inline a direct
+    /// field load at that call site.
+    fn compute_getter_hints(
+        &self,
+        ic_snapshot: &[CallSiteIC],
+    ) -> Vec<Option<crate::codegen::GetterInlineHint>> {
+        ic_snapshot
+            .iter()
+            .map(|ic| {
+                if ic.kind != 1 || ic.class == 0 || ic.func_id == 0 {
+                    return None;
+                }
+                let callee_id = FuncId(ic.func_id as u32);
+                let mir = self.get_mir(callee_id)?;
+                let field_idx = Self::mir_trivial_getter_field(&mir)?;
+                Some(crate::codegen::GetterInlineHint {
+                    expected_class: ic.class,
+                    field_idx,
+                })
+            })
+            .collect()
+    }
+
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
     fn mir_trivial_getter_field(mir: &crate::mir::MirFunction) -> Option<u16> {
         use crate::mir::{Instruction, Terminator};
@@ -1122,6 +1148,9 @@ impl ExecutionEngine {
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
+        let getter_hints = callsite_ic_ptrs
+            .as_ref()
+            .map(|ics| self.compute_getter_hints(ics));
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
@@ -1135,6 +1164,7 @@ impl ExecutionEngine {
                 tier,
                 callsite_ic_ptrs,
                 callsite_ic_live_ptrs,
+                getter_hints,
             ) {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
@@ -1234,6 +1264,9 @@ impl ExecutionEngine {
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
+        let getter_hints = callsite_ic_ptrs
+            .as_ref()
+            .map(|ics| self.compute_getter_hints(ics));
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -1264,6 +1297,7 @@ impl ExecutionEngine {
                     tier,
                     callsite_ic_ptrs,
                     callsite_ic_live_ptrs,
+                    getter_hints,
                 )
                 .map_err(|e| {
                     eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);

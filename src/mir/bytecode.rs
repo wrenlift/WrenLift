@@ -562,6 +562,7 @@ impl<'a> Encoder<'a> {
                 func_id,
                 method: _,
                 expected_class: _,
+                inline_getter_field: _,
                 receiver,
                 args,
             } => {

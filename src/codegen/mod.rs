@@ -1996,21 +1996,33 @@ pub fn compile_function_artifact_with_interner(
         compile_tier,
         None,
         None,
+        None,
     )
 }
 
-/// Transform monomorphic Call sites into CallKnownFunc using IC snapshot data.
-/// Only transforms kind=1 (JIT leaf) entries where the callee's func_id is known.
-/// The CallKnownFunc instruction loads the callee's JIT pointer at runtime and
-/// does a direct call_indirect — skipping method lookup entirely.
+/// Per-IC-entry devirtualization hint: if Some(class_ptr, field_idx), the
+/// call site can be inlined as `GetField(receiver, field_idx)` guarded by
+/// a class check. Otherwise falls through to CallKnownFunc / Call.
+#[derive(Clone, Copy)]
+pub struct GetterInlineHint {
+    pub expected_class: usize,
+    pub field_idx: u16,
+}
+
+/// Transform monomorphic Call sites using IC snapshot data:
+/// - Trivial getters → inline field load (GuardClass + GetField)
+/// - Other monomorphic calls → CallKnownFunc
+///
+/// `getter_hints` is indexed by IC entry position (same order as ic_snapshot).
+/// A None entry means that site is not a trivial getter.
 fn devirt_calls_with_ic(
     mir: &MirFunction,
     ic_snapshot: &[crate::mir::bytecode::CallSiteIC],
+    getter_hints: Option<&[Option<GetterInlineHint>]>,
 ) -> MirFunction {
-    use crate::mir::Instruction;
+    use crate::mir::{Instruction, Terminator};
 
     let mut new_mir = mir.clone();
-    let mut ic_idx = 0usize;
 
     // Pre-compute per-block IC base (same logic as cranelift_backend)
     let mut block_ic_base: Vec<usize> = Vec::with_capacity(mir.blocks.len());
@@ -2024,8 +2036,41 @@ fn devirt_calls_with_ic(
         }
     }
 
+    // Trivial-getter inlining needs to SPLIT a block at the call site
+    // (to insert a guarded fast path). For simplicity we do this as a
+    // two-pass transform: first pass collects sites to inline, second
+    // pass rewrites the blocks. The rewrite inserts a new ConstNum guard
+    // followed by GetField — no new blocks, using direct replacement.
+    //
+    // Since Wren's class check needs an explicit branch, we emit a
+    // runtime guard call (wren_load_class_eq) followed by a branch.
+    // For now, without a GuardClass instruction, we do a simpler
+    // transformation: emit IsType + GuardType. IsType/GuardType may not
+    // exist; fall back to GetField with an implicit class check via
+    // a new Instruction variant. The simplest correct transform is to
+    // replace Call with a new instruction that loads the field iff the
+    // receiver class matches, and returns TAG_NULL otherwise — but then
+    // we'd need to handle the null result correctly.
+    //
+    // Practical approach: don't inline trivial getters at the MIR level.
+    // Instead, transform them into CallKnownFunc with a "is_trivial_getter"
+    // flag so Cranelift can emit the inlined field load directly.
+    // We encode this by reusing expected_class + a special func_id encoding:
+    // when the hint is present, we store field_idx in the upper 16 bits
+    // of func_id and use a special marker. Actually simpler: add a new
+    // MIR instruction InlineGetField { recv, expected_class, field_idx }.
+    //
+    // For this iteration we'll piggyback on CallKnownFunc: if the callee
+    // is a trivial getter, we still emit CallKnownFunc but Cranelift
+    // recognizes the pattern and emits the inlined load. That requires
+    // threading the getter hint through to Cranelift.
+    //
+    // SIMPLEST: Add a new field `inline_as_getter: Option<u16>` to
+    // CallKnownFunc. When Some, Cranelift skips the call entirely and
+    // emits only the class check + field load.
+
     for (block_idx, block) in new_mir.blocks.iter_mut().enumerate() {
-        ic_idx = block_ic_base[block_idx];
+        let mut ic_idx = block_ic_base[block_idx];
         for (_, inst) in block.instructions.iter_mut() {
             if let Instruction::Call { receiver, method, args } = inst {
                 if ic_idx < ic_snapshot.len() {
@@ -2033,10 +2078,15 @@ fn devirt_calls_with_ic(
                     // Only devirtualize kind=1 (JIT call) with known func_id
                     if ic.kind == 1 && ic.class != 0 && ic.func_id != 0 {
                         let fid = ic.func_id as u32;
+                        let getter_field = getter_hints
+                            .and_then(|h| h.get(ic_idx).copied().flatten())
+                            .filter(|h| h.expected_class == ic.class)
+                            .map(|h| h.field_idx);
                         *inst = Instruction::CallKnownFunc {
                             func_id: fid,
                             method: *method,
                             expected_class: ic.class,
+                            inline_getter_field: getter_field,
                             receiver: *receiver,
                             args: std::mem::take(args),
                         };
@@ -2048,6 +2098,7 @@ fn devirt_calls_with_ic(
             }
         }
     }
+    let _ = Terminator::Unreachable; // silence unused import on some configs
     new_mir
 }
 
@@ -2058,6 +2109,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
     callsite_ic_live_ptrs: Option<Vec<usize>>,
+    getter_hints: Option<Vec<Option<GetterInlineHint>>>,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
@@ -2077,7 +2129,11 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             // for monomorphic call sites using IC snapshot data.
             let devirt_mir;
             let mir_ref = if let Some(ref ic_snapshot) = callsite_ic_ptrs {
-                devirt_mir = devirt_calls_with_ic(mir, ic_snapshot);
+                devirt_mir = devirt_calls_with_ic(
+                    mir,
+                    ic_snapshot,
+                    getter_hints.as_deref(),
+                );
                 &devirt_mir
             } else {
                 mir
@@ -3920,7 +3976,7 @@ impl<'a> LowerCtx<'a> {
                 });
                 self.mf.emit(MachInst::DefLabel(done_label));
             }
-            Instruction::CallKnownFunc { func_id: _, method: _, expected_class: _, receiver: _, args: _ } => {
+            Instruction::CallKnownFunc { func_id: _, method: _, expected_class: _, inline_getter_field: _, receiver: _, args: _ } => {
                 // TODO: implement direct JIT call via jit_code_base[func_id]
                 // For now, return null.
                 let dst = self.vreg_for(dst_val);
