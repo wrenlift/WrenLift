@@ -2383,7 +2383,20 @@ fn run_fiber_with_stop_depth(
                             vm.engine.request_tier_up(func_id, &vm.interner);
                         }
                         if vm.engine.has_pending_compilations() {
+                            // Save frame state before draining.
+                            unsafe {
+                                if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                                    frame.values = std::mem::take(&mut values);
+                                    frame.pc = pc;
+                                }
+                            }
                             vm.engine.poll_compilations();
+                            vm.engine.drain_compile_queue(&vm.interner);
+                            unsafe {
+                                if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                                    values = std::mem::take(&mut frame.values);
+                                }
+                            }
                         }
                     }
                     pc = target;

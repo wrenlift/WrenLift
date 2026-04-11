@@ -1989,6 +1989,31 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
         None => return Value::null().to_bits(),
     };
     let fid = func_id as usize;
+    let method_sym = crate::intern::SymbolId::from_raw(method_raw);
+    let recv = args.first().copied().unwrap_or(Value::null());
+
+    // Verify the receiver's actual method is FuncId(func_id).
+    // Devirtualization is speculative — for polymorphic call sites,
+    // the receiver class may differ from the one observed at compile
+    // time, so we must check before calling the pre-selected FuncId.
+    let class = vm.class_of(recv);
+    let actual_method = vm
+        .method_cache
+        .lookup(class, method_sym)
+        .or_else(|| unsafe { find_method_with_class(class, method_sym) });
+
+    let is_match = match actual_method {
+        Some((crate::runtime::object::Method::Closure(cp), _)) => {
+            unsafe { (*(*cp).function).fn_id == func_id }
+        }
+        _ => false,
+    };
+
+    if !is_match {
+        // Polymorphic miss — fall back to full dispatch.
+        return dispatch_call(recv, method_sym.index() as u64, args);
+    }
+
     let fid_obj = crate::runtime::engine::FuncId(func_id);
     let jit_ptr = vm.engine.jit_code.get(fid).copied().unwrap_or(std::ptr::null());
 
@@ -2008,9 +2033,7 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
         set_jit_context(saved_ctx);
     }
 
-    // Fallback: full dispatch via method symbol
-    let recv = args.first().copied().unwrap_or(Value::null());
-    let method_sym = crate::intern::SymbolId::from_raw(method_raw);
+    // Callee not JIT'd yet — full dispatch via method symbol.
     dispatch_call(recv, method_sym.index() as u64, args)
 }
 
