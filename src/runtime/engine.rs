@@ -635,30 +635,67 @@ impl ExecutionEngine {
         Some((snapshot, live_ptrs))
     }
 
-    /// Compute per-IC-entry trivial-getter hints for devirt inlining.
-    /// For each monomorphic IC entry (kind=1 with a known func_id), if
-    /// the callee MIR matches the trivial-getter pattern, record the
-    /// expected class + field index so Cranelift can inline a direct
-    /// field load at that call site.
-    fn compute_getter_hints(
+    /// Compute per-IC-entry devirtualization hints.
+    /// For each monomorphic IC entry (kind=1 with a known func_id):
+    /// - If the callee is a trivial getter, record the field index
+    ///   so Cranelift inlines a direct field load.
+    /// - If the callee has no internal calls (pure leaf), mark it so
+    ///   Cranelift can emit a pure direct call_indirect with zero FFI.
+    fn compute_devirt_hints(
         &self,
         ic_snapshot: &[CallSiteIC],
-    ) -> Vec<Option<crate::codegen::GetterInlineHint>> {
+    ) -> Vec<crate::codegen::DevirtHint> {
         ic_snapshot
             .iter()
             .map(|ic| {
+                let mut hint = crate::codegen::DevirtHint::default();
                 if ic.kind != 1 || ic.class == 0 || ic.func_id == 0 {
-                    return None;
+                    return hint;
                 }
                 let callee_id = FuncId(ic.func_id as u32);
-                let mir = self.get_mir(callee_id)?;
-                let field_idx = Self::mir_trivial_getter_field(&mir)?;
-                Some(crate::codegen::GetterInlineHint {
-                    expected_class: ic.class,
-                    field_idx,
-                })
+                let Some(mir) = self.get_mir(callee_id) else {
+                    return hint;
+                };
+                hint.getter_field = Self::mir_trivial_getter_field(&mir);
+                hint.pure_leaf = Self::mir_is_pure_leaf(&mir);
+                hint
             })
             .collect()
+    }
+
+    /// A "pure leaf" function has no internal method calls — Cranelift
+    /// can emit a zero-FFI direct `call_indirect` because the callee
+    /// doesn't need its own JIT context (current_func_id, etc.).
+    fn mir_is_pure_leaf(mir: &crate::mir::MirFunction) -> bool {
+        use crate::mir::Instruction;
+        for block in &mir.blocks {
+            for (_, inst) in &block.instructions {
+                match inst {
+                    Instruction::Call { .. }
+                    | Instruction::CallKnownFunc { .. }
+                    | Instruction::CallStaticSelf { .. }
+                    | Instruction::SuperCall { .. } => return false,
+                    // Runtime calls that require context (module_vars, etc.)
+                    // — any of these prevent pure_leaf status.
+                    Instruction::GetModuleVar(_)
+                    | Instruction::SetModuleVar(_, _)
+                    | Instruction::GetStaticField(_)
+                    | Instruction::SetStaticField(_, _)
+                    | Instruction::GetUpvalue(_)
+                    | Instruction::SetUpvalue(_, _)
+                    | Instruction::MakeList(_)
+                    | Instruction::MakeMap(_)
+                    | Instruction::MakeRange { .. }
+                    | Instruction::MakeClosure { .. }
+                    | Instruction::StringConcat(_)
+                    | Instruction::ToString(_)
+                    | Instruction::SubscriptGet { .. }
+                    | Instruction::SubscriptSet { .. } => return false,
+                    _ => {}
+                }
+            }
+        }
+        true
     }
 
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
@@ -1148,9 +1185,10 @@ impl ExecutionEngine {
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
-        let getter_hints = callsite_ic_ptrs
+        let devirt_hints = callsite_ic_ptrs
             .as_ref()
-            .map(|ics| self.compute_getter_hints(ics));
+            .map(|ics| self.compute_devirt_hints(ics));
+        let jit_code_base = Some(self.jit_code.as_ptr());
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
@@ -1164,7 +1202,8 @@ impl ExecutionEngine {
                 tier,
                 callsite_ic_ptrs,
                 callsite_ic_live_ptrs,
-                getter_hints,
+                devirt_hints,
+                jit_code_base,
             ) {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
@@ -1264,9 +1303,10 @@ impl ExecutionEngine {
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
-        let getter_hints = callsite_ic_ptrs
+        let devirt_hints = callsite_ic_ptrs
             .as_ref()
-            .map(|ics| self.compute_getter_hints(ics));
+            .map(|ics| self.compute_devirt_hints(ics));
+        let jit_code_base_raw = self.jit_code.as_ptr() as usize;
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -1297,7 +1337,8 @@ impl ExecutionEngine {
                     tier,
                     callsite_ic_ptrs,
                     callsite_ic_live_ptrs,
-                    getter_hints,
+                    devirt_hints,
+                    Some(jit_code_base_raw as *const *const u8),
                 )
                 .map_err(|e| {
                     eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);

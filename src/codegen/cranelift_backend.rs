@@ -589,6 +589,7 @@ pub mod cl {
                     &mut get_runtime_fn,
                     callsite_ic_ptrs,
                     callsite_ic_live_ptrs,
+                    jit_code_base,
                     &mut call_site_idx,
                     f64_self_id,
                     receiver_val,
@@ -712,6 +713,7 @@ pub mod cl {
         ) -> Result<cranelift_codegen::ir::FuncRef, String>,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
+        jit_code_base: Option<*const *const u8>,
         call_site_idx: &mut usize,
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
@@ -1057,10 +1059,119 @@ pub mod cl {
                 method,
                 expected_class,
                 inline_getter_field,
+                pure_leaf,
                 receiver,
                 args,
             } => {
                 let r = get(receiver);
+
+                // === Pure-leaf direct call (ZERO FFI) ===
+                // Callee has no internal method calls, so no context
+                // setup is needed. Emit: class check + load callee ptr
+                // + call_indirect. The JIT code slot address is stable
+                // because engine.jit_code doesn't reallocate post-load.
+                // Skip if we have a getter-inline hint — that path is cheaper.
+                if inline_getter_field.is_none()
+                    && *pure_leaf
+                    && *expected_class != 0
+                    && args.len() <= 4
+                {
+                    if let Some(jit_base_ptr) = jit_code_base {
+                        let fast_block = builder.create_block();
+                        let slow_block = builder.create_block();
+                        let merge_block = builder.create_block();
+                        builder.append_block_param(merge_block, types::I64);
+
+                        // Class check
+                        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                        let obj_ptr = builder.ins().band(r, ptr_mask);
+                        let recv_class = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            obj_ptr,
+                            HEADER_CLASS,
+                        );
+                        let cached_class =
+                            builder.ins().iconst(types::I64, *expected_class as i64);
+                        let class_match =
+                            builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                        builder
+                            .ins()
+                            .brif(class_match, fast_block, &[], slow_block, &[]);
+
+                        // Fast path: load the callee's JIT slot and call_indirect.
+                        // slot_addr = jit_code_base + func_id * 8
+                        builder.switch_to_block(fast_block);
+                        let slot_addr = unsafe {
+                            jit_base_ptr.add(*func_id as usize) as i64
+                        };
+                        let slot_addr_val =
+                            builder.ins().iconst(types::I64, slot_addr);
+                        let jit_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::new(),
+                            slot_addr_val,
+                            0,
+                        );
+                        // Guard: if slot is null (callee not yet compiled),
+                        // fall to slow path.
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        let has_jit =
+                            builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
+                        let pure_call_block = builder.create_block();
+                        builder
+                            .ins()
+                            .brif(has_jit, pure_call_block, &[], slow_block, &[]);
+
+                        builder.switch_to_block(pure_call_block);
+                        // Direct call signature: (recv, args...) -> i64
+                        let mut sig = module.make_signature();
+                        sig.params.push(AbiParam::new(types::I64)); // recv
+                        for _ in args.iter() {
+                            sig.params.push(AbiParam::new(types::I64));
+                        }
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let sig_ref = builder.import_signature(sig);
+                        let mut call_args = vec![r];
+                        for a in args {
+                            call_args.push(get(a));
+                        }
+                        let call = builder
+                            .ins()
+                            .call_indirect(sig_ref, jit_ptr, &call_args);
+                        let fast_result = builder.inst_results(call)[0];
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(fast_result)]);
+
+                        // Slow path: wren_call_N full dispatch.
+                        builder.switch_to_block(slow_block);
+                        let method_bits = method.index() as u64;
+                        let method_val =
+                            builder.ins().iconst(types::I64, method_bits as i64);
+                        let slow_name = match args.len() {
+                            0 => "wren_call_0",
+                            1 => "wren_call_1",
+                            2 => "wren_call_2",
+                            3 => "wren_call_3",
+                            _ => "wren_call_4",
+                        };
+                        let slow_arg_count = 2 + args.len().min(4);
+                        let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
+                        let mut slow_args = vec![r, method_val];
+                        for a in args.iter().take(4) {
+                            slow_args.push(get(a));
+                        }
+                        let slow_call = builder.ins().call(slow_f, &slow_args);
+                        let slow_result = builder.inst_results(slow_call)[0];
+                        builder
+                            .ins()
+                            .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                        builder.switch_to_block(merge_block);
+                        return Ok(Some(builder.block_params(merge_block)[0]));
+                    }
+                }
 
                 // === Trivial-getter inline path ===
                 // If the callee is a trivial getter (one-instruction

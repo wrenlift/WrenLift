@@ -563,6 +563,7 @@ impl<'a> Encoder<'a> {
                 method: _,
                 expected_class: _,
                 inline_getter_field: _,
+                pure_leaf: _,
                 receiver,
                 args,
             } => {
