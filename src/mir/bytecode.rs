@@ -561,6 +561,7 @@ impl<'a> Encoder<'a> {
             Instruction::CallKnownFunc {
                 func_id,
                 method: _,
+                expected_class: _,
                 receiver,
                 args,
             } => {

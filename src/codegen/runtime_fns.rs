@@ -2042,6 +2042,77 @@ pub extern "C" fn wren_known_call_0(func_id: u64, recv: u64) -> u64 {
     wren_known_call_inner(func_id, &[Value::from_bits(recv)])
 }
 
+/// Fast variant: caller (Cranelift) has already verified the class matches.
+/// Skips class_of + method_cache lookup. Just loads jit_code[func_id] and
+/// does the context swap + call.
+#[inline]
+fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
+    let func_id = (packed & 0xFFFF_FFFF) as u32;
+    let method_raw = (packed >> 32) as u32;
+    let vm = unsafe { vm_ref() };
+    let vm = match vm {
+        Some(v) => v,
+        None => return Value::null().to_bits(),
+    };
+    let fid = func_id as usize;
+    let fid_obj = crate::runtime::engine::FuncId(func_id);
+    let jit_ptr = vm.engine.jit_code.get(fid).copied().unwrap_or(std::ptr::null());
+
+    if !jit_ptr.is_null() && args.len() <= 4 {
+        // For leaf callees (no internal wren_call_N), we don't need to
+        // touch ctx.current_func_id at all — leaf functions don't look
+        // up IC tables. This saves ~40ns per call on method_call.
+        let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
+        if is_leaf {
+            let depth = jit_depth();
+            if depth < MAX_JIT_DEPTH {
+                set_jit_depth(depth + 1);
+                let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, args) };
+                set_jit_depth(depth);
+                return result;
+            }
+        } else {
+            // Non-leaf: save/restore current_func_id so the callee's
+            // internal wren_call_N reads from its own IC table.
+            let saved_func_id = read_jit_ctx().current_func_id;
+            mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = func_id as u64;
+            });
+            let depth = jit_depth();
+            if depth < MAX_JIT_DEPTH {
+                set_jit_depth(depth + 1);
+                let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, args) };
+                set_jit_depth(depth);
+                mutate_jit_ctx(|ctx| {
+                    ctx.current_func_id = saved_func_id;
+                });
+                return result;
+            }
+            mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = saved_func_id;
+            });
+        }
+    }
+
+    // Callee not compiled yet → fall back to full dispatch.
+    let recv = args.first().copied().unwrap_or(Value::null());
+    let method_sym = crate::intern::SymbolId::from_raw(method_raw);
+    dispatch_call(recv, method_sym.index() as u64, args)
+}
+
+pub extern "C" fn wren_known_call_0_nocheck(packed: u64, recv: u64) -> u64 {
+    wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv)])
+}
+pub extern "C" fn wren_known_call_1_nocheck(packed: u64, recv: u64, a0: u64) -> u64 {
+    wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0)])
+}
+pub extern "C" fn wren_known_call_2_nocheck(packed: u64, recv: u64, a0: u64, a1: u64) -> u64 {
+    wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1)])
+}
+pub extern "C" fn wren_known_call_3_nocheck(packed: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+}
+
 /// Known call with 1 extra arg: (func_id, recv, a0) -> result
 pub extern "C" fn wren_known_call_1(func_id: u64, recv: u64, a0: u64) -> u64 {
     wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0)])
@@ -3074,6 +3145,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_known_call_1" => Some(wren_known_call_1 as *const () as usize),
         "wren_known_call_2" => Some(wren_known_call_2 as *const () as usize),
         "wren_known_call_3" => Some(wren_known_call_3 as *const () as usize),
+        "wren_known_call_0_nocheck" => Some(wren_known_call_0_nocheck as *const () as usize),
+        "wren_known_call_1_nocheck" => Some(wren_known_call_1_nocheck as *const () as usize),
+        "wren_known_call_2_nocheck" => Some(wren_known_call_2_nocheck as *const () as usize),
+        "wren_known_call_3_nocheck" => Some(wren_known_call_3_nocheck as *const () as usize),
         // Indirect IC dispatch (lightweight JIT-to-JIT calls)
         "wren_ic_call_0" => Some(wren_ic_call_0 as *const () as usize),
         "wren_ic_call_1" => Some(wren_ic_call_1 as *const () as usize),

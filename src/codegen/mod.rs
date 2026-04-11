@@ -2036,6 +2036,7 @@ fn devirt_calls_with_ic(
                         *inst = Instruction::CallKnownFunc {
                             func_id: fid,
                             method: *method,
+                            expected_class: ic.class,
                             receiver: *receiver,
                             args: std::mem::take(args),
                         };
@@ -3919,7 +3920,7 @@ impl<'a> LowerCtx<'a> {
                 });
                 self.mf.emit(MachInst::DefLabel(done_label));
             }
-            Instruction::CallKnownFunc { func_id: _, method: _, receiver: _, args: _ } => {
+            Instruction::CallKnownFunc { func_id: _, method: _, expected_class: _, receiver: _, args: _ } => {
                 // TODO: implement direct JIT call via jit_code_base[func_id]
                 // For now, return null.
                 let dst = self.vreg_for(dst_val);

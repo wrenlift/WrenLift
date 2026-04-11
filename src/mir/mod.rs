@@ -315,10 +315,13 @@ pub enum Instruction {
     },
     /// Direct call to a known function by FuncId. Emitted by speculative
     /// devirtualization when the receiver class is known from IC data.
-    /// Falls through to wren_call_N slow path if the callee is not yet compiled.
+    /// `expected_class` is the class pointer (as usize) observed at
+    /// compile time; the JIT emits an inline class check and falls
+    /// back to wren_call_N on polymorphic miss.
     CallKnownFunc {
         func_id: u32,
         method: SymbolId,
+        expected_class: usize,
         receiver: ValueId,
         args: Vec<ValueId>,
     },
@@ -983,6 +986,7 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::CallKnownFunc {
             func_id,
             method: _,
+            expected_class: _,
             receiver,
             args,
         } => format!(
