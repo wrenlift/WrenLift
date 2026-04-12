@@ -507,6 +507,8 @@ fn run_fiber_with_stop_depth(
     }
 
     let mut steps: usize = 0;
+    // Back-edge counter: sampled for tier-up polling on hot loops.
+    let mut backedge_counter: u32 = 0;
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
@@ -2378,23 +2380,30 @@ fn run_fiber_with_stop_depth(
                     // Also drain the compile queue here — this is a safe point
                     // between iterations (not mid-call-dispatch).
                     if target < pc && vm.engine.mode == ExecutionMode::Tiered {
+                        // Sample tier-up polling every 64 back-edges to keep
+                        // the hot loop fast. We still bump call_count on every
+                        // back-edge (cheap inline increment), but the expensive
+                        // pending-compile polling only runs every 64 iterations.
+                        backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
                         if should_tier_up {
                             vm.engine.request_tier_up(func_id, &vm.interner);
                         }
-                        if vm.engine.has_pending_compilations() {
-                            // Save frame state before draining.
-                            unsafe {
-                                if let Some(frame) = (*fiber).mir_frames.last_mut() {
-                                    frame.values = std::mem::take(&mut values);
-                                    frame.pc = pc;
+                        if should_tier_up || (backedge_counter & 63) == 0 {
+                            if vm.engine.has_pending_compilations() {
+                                // Save frame state before draining.
+                                unsafe {
+                                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                                        frame.values = std::mem::take(&mut values);
+                                        frame.pc = pc;
+                                    }
                                 }
-                            }
-                            vm.engine.poll_compilations();
-                            vm.engine.drain_compile_queue(&vm.interner);
-                            unsafe {
-                                if let Some(frame) = (*fiber).mir_frames.last_mut() {
-                                    values = std::mem::take(&mut frame.values);
+                                vm.engine.poll_compilations();
+                                vm.engine.drain_compile_queue(&vm.interner);
+                                unsafe {
+                                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                                        values = std::mem::take(&mut frame.values);
+                                    }
                                 }
                             }
                         }

@@ -297,6 +297,7 @@ fn is_mir_inline_safe(mir: &MirFunction, compile_tier: CompileTier) -> bool {
             match inst {
                 // These generate runtime calls (allocation, dispatch, context access):
                 Instruction::Call { .. }
+                | Instruction::CallKnownFunc { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::MakeList(_)
                 | Instruction::MakeMap(_)
