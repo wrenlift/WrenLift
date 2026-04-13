@@ -996,9 +996,24 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
     }
 }
 
-/// Execute threaded code and return the result.
+/// Maximum threaded interpreter nesting depth. Each level uses ~200 bytes
+/// of stack (ThreadedState + locals). 64 levels ≈ 12KB — safe.
+const MAX_THREADED_DEPTH: u32 = 64;
+
+thread_local! {
+    static THREADED_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Check if threaded dispatch would exceed the recursion depth limit.
+#[inline]
+pub fn threaded_depth_ok() -> bool {
+    THREADED_DEPTH.with(|d| d.get() < MAX_THREADED_DEPTH)
+}
+
+/// Execute threaded code and return the result + the register file for reuse.
 /// `ic_table_override`: if provided, use this IC table instead of the
 /// threaded code's own (shares the bytecode function's live IC data).
+/// `recycled_regs`: pre-allocated register file from a pool (avoids alloc).
 pub fn execute_threaded(
     code: &ThreadedCode,
     args: &[Value],
@@ -1006,10 +1021,23 @@ pub fn execute_threaded(
     module_var_count: u32,
     vm: *mut u8,
     ic_table_override: Option<*mut Vec<CallSiteIC>>,
-) -> Value {
+    recycled_regs: Option<Vec<Value>>,
+) -> (Value, Vec<Value>) {
     let ic_ptr = ic_table_override.unwrap_or(code.ic_table.get());
+    let needed = code.reg_count.max(args.len());
+    let mut regs = if let Some(mut r) = recycled_regs {
+        r.resize(needed, Value::null());
+        // Clear to null (recycled may have stale values).
+        for v in r.iter_mut() {
+            *v = Value::null();
+        }
+        r
+    } else {
+        vec![Value::null(); needed]
+    };
+
     let mut state = ThreadedState {
-        regs: vec![Value::null(); code.reg_count.max(args.len())],
+        regs,
         pc: 0,
         ic_table: ic_ptr,
         module_vars,
@@ -1025,6 +1053,9 @@ pub fn execute_threaded(
         }
     }
 
+    // Track recursion depth
+    THREADED_DEPTH.with(|d| d.set(d.get() + 1));
+
     // Main loop: zero decode, one indirect call per instruction
     loop {
         if state.pc >= code.ops.len() {
@@ -1038,7 +1069,9 @@ pub fn execute_threaded(
         state.pc = next_pc;
     }
 
-    state.return_value.unwrap_or(Value::null())
+    THREADED_DEPTH.with(|d| d.set(d.get() - 1));
+    let result = state.return_value.unwrap_or(Value::null());
+    (result, state.regs) // return regs for pooling
 }
 
 #[cfg(test)]
@@ -1064,7 +1097,7 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let code = lower_mir_to_threaded(&f, None);
-        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None);
+        let (result, _regs) = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None, None);
         assert_eq!(result.as_num(), Some(42.0));
     }
 
@@ -1080,7 +1113,7 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
         let code = lower_mir_to_threaded(&f, None);
-        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None);
+        let (result, _regs) = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None, None);
         assert_eq!(result.as_num(), Some(42.0));
     }
 
@@ -1095,7 +1128,7 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
         let code = lower_mir_to_threaded(&f, None);
-        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None);
+        let (result, _regs) = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None, None);
         // not(true) = false
         assert!(result.is_falsy());
     }

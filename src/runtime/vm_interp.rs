@@ -628,10 +628,71 @@ fn run_fiber_with_stop_depth(
             });
         }
 
-        // Root-frame threaded dispatch disabled: works for simple
-        // functions but causes stack overflow on deep recursive chains
-        // (each execute_threaded allocates a Vec<Value> register file).
-        // Needs register file pooling to be viable.
+        // Root-frame threaded dispatch disabled: delta_blue hangs when
+        // some functions run via threaded. The CondBranch arg guard
+        // rejects most complex functions, but simpler ones that qualify
+        // may still produce wrong results due to missing threaded handlers.
+        if false {
+            let fn_idx_tc = func_id.0 as usize;
+            let has_jit = !vm.engine.jit_code.get(fn_idx_tc).copied().unwrap_or(std::ptr::null()).is_null();
+            if pc == 0 && !has_jit && vm.engine.mode != ExecutionMode::Interpreter
+                && crate::mir::threaded::threaded_depth_ok()
+            {
+                let _ = vm.engine.ensure_threaded_code(func_id, &vm.interner);
+                let has_tc = vm.engine.threaded_code
+                    .get(fn_idx_tc)
+                    .and_then(|t| t.as_ref())
+                    .and_then(|t| t.as_ref())
+                    .is_some();
+                if has_tc {
+                    let (mv_ptr, mv_count) = if !module_vars_ptr.is_null() {
+                        let v = unsafe { &*module_vars_ptr };
+                        (v.as_ptr() as *mut u64, v.len() as u32)
+                    } else {
+                        (std::ptr::null_mut(), 0)
+                    };
+                    let vm_ptr = vm as *mut VM as *mut u8;
+                    let mod_name_bytes = module_name.as_bytes();
+                    crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                        ctx.vm = vm_ptr;
+                        ctx.module_vars = mv_ptr;
+                        ctx.module_var_count = mv_count;
+                        ctx.module_name = mod_name_bytes.as_ptr();
+                        ctx.module_name_len = mod_name_bytes.len() as u32;
+                        ctx.current_func_id = func_id.0 as u64;
+                        ctx.jit_code_base = vm.engine.jit_code.as_ptr();
+                        ctx.jit_code_len = vm.engine.jit_code.len() as u32;
+                    });
+                    let tc = vm.engine.threaded_code[fn_idx_tc].as_ref().unwrap().as_ref().unwrap();
+                    let recycled = vm.register_pool.pop();
+                    let (result, regs_back) = crate::mir::threaded::execute_threaded(
+                        tc,
+                        &values,
+                        mv_ptr,
+                        mv_count,
+                        vm_ptr,
+                        None,
+                        recycled,
+                    );
+                    if vm.register_pool.len() < 128 {
+                        vm.register_pool.push(regs_back);
+                    }
+                    unsafe { (*fiber).mir_frames.pop(); }
+                    if let Some(rdst) = return_dst {
+                        unsafe {
+                            if let Some(caller_frame) = (*fiber).mir_frames.last_mut() {
+                                caller_frame.values[rdst.0 as usize] = result;
+                            }
+                        }
+                    }
+                    values.clear();
+                    if vm.register_pool.len() < 128 {
+                        vm.register_pool.push(values);
+                    }
+                    continue 'fiber_loop;
+                }
+            }
+        }
 
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
@@ -2782,7 +2843,10 @@ fn dispatch_closure_bc_inner(
     // but slower than native JIT. Skipped when called from
     // try_operator_dispatch (allow_threaded=false).
     let fn_has_jit = !vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null()).is_null();
-    if allow_threaded && !fn_has_jit && vm.engine.mode != ExecutionMode::Interpreter {
+    if allow_threaded && !fn_has_jit
+        && vm.engine.mode != ExecutionMode::Interpreter
+        && crate::mir::threaded::threaded_depth_ok()
+    {
         // Ensure threaded code exists (lazy init).
         let _ = vm.engine.ensure_threaded_code(target_func_id, &vm.interner);
         // Now borrow the threaded code immutably + modules separately.
@@ -2824,14 +2888,19 @@ fn dispatch_closure_bc_inner(
                 ctx.jit_code_len = vm.engine.jit_code.len() as u32;
             });
             let tc = vm.engine.threaded_code[fn_idx].as_ref().unwrap().as_ref().unwrap();
-            let result = crate::mir::threaded::execute_threaded(
+            let recycled = vm.register_pool.pop();
+            let (result, regs_back) = crate::mir::threaded::execute_threaded(
                 tc,
                 arg_vals,
                 mv_ptr,
                 mv_count,
                 vm_ptr,
                 bc_ic_table,
+                recycled,
             );
+            if vm.register_pool.len() < 128 {
+                vm.register_pool.push(regs_back);
+            }
             // Store result in caller's frame and return.
             set_reg(&mut values, return_dst.0 as u16, result);
             unsafe {
