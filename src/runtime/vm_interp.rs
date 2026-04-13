@@ -628,6 +628,11 @@ fn run_fiber_with_stop_depth(
             });
         }
 
+        // NOTE: Root-frame threaded dispatch disabled — MakeRange +
+        // iterate pattern has a bug in the threaded op_call handler
+        // (wrong IC table for the range's iterate method). Threaded
+        // dispatch for callees (in dispatch_closure_bc) works correctly.
+
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
             // GC safepoint: check every 4096 instructions (or more often for
