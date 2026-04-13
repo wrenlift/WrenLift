@@ -2406,6 +2406,13 @@ fn run_fiber_with_stop_depth(
                                     }
                                 }
                             }
+                            // OSR is disabled: re-executing from the top
+                            // causes flaky e2e tests (side effects re-run).
+                            // True OSR needs mid-function entry points.
+                            // The JIT code is correct but ~same speed as the
+                            // interpreter because devirt coverage is too low
+                            // at first compilation. Needs recompilation with
+                            // fresh IC data after more interpreted iterations.
                         }
                     }
                     pc = target;
