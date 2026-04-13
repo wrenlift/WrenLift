@@ -391,7 +391,9 @@ pub struct ExecutionEngine {
     pub code_ranges: Vec<CodeRange>,
     /// Threaded-code cache indexed by FuncId. Lazily populated on first
     /// interpreter dispatch — faster than bytecode for hot functions.
-    pub threaded_code: Vec<Option<crate::mir::threaded::ThreadedCode>>,
+    /// `None` = not yet checked. `Some(None)` = checked, not eligible.
+    /// `Some(Some(tc))` = eligible, threaded code ready.
+    pub threaded_code: Vec<Option<Option<crate::mir::threaded::ThreadedCode>>>,
 }
 
 /// Address range of a compiled function's native code.
@@ -477,7 +479,7 @@ impl ExecutionEngine {
         self.optimized_leaf.push(false);
         self.optimized_metadata.push(None);
         self.bc_cache.push(std::ptr::null());
-        self.threaded_code.push(None);
+        self.threaded_code.push(None); // None = not yet checked
         self.type_profiles.push(None);
         id
     }
@@ -540,12 +542,14 @@ impl ExecutionEngine {
         if self.threaded_code[idx].is_none() {
             let mir = self.get_mir(id)?;
             if !crate::mir::threaded::can_use_threaded(&mir) {
+                // Cache negative result so we don't re-check.
+                self.threaded_code[idx] = Some(None);
                 return None;
             }
             let tc = crate::mir::threaded::lower_mir_to_threaded(&mir, Some(interner));
-            self.threaded_code[idx] = Some(tc);
+            self.threaded_code[idx] = Some(Some(tc));
         }
-        self.threaded_code[idx].as_ref()
+        self.threaded_code[idx].as_ref().and_then(|opt| opt.as_ref())
     }
 
     /// Get a function body by ID.

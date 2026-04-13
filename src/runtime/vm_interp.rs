@@ -2576,6 +2576,28 @@ fn dispatch_closure_bc(
     defining_class: Option<*mut ObjClass>,
     caller_bc_ptr: *const BytecodeFunction,
 ) -> Result<(), RuntimeError> {
+    dispatch_closure_bc_inner(
+        vm, fiber, closure_ptr, arg_vals, pc, values,
+        module_name, return_dst, defining_class, caller_bc_ptr, true,
+    )
+}
+
+/// Inner dispatch with `allow_threaded` flag. When false (called from
+/// try_operator_dispatch), skip the threaded path because the bytecode
+/// loop's `continue 'fiber_loop` expects a frame push/pop cycle.
+fn dispatch_closure_bc_inner(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    closure_ptr: *mut ObjClosure,
+    arg_vals: &[Value],
+    pc: u32,
+    mut values: Vec<Value>,
+    module_name: &Rc<String>,
+    return_dst: ValueId,
+    defining_class: Option<*mut ObjClass>,
+    caller_bc_ptr: *const BytecodeFunction,
+    allow_threaded: bool,
+) -> Result<(), RuntimeError> {
     let fn_ptr = unsafe { (*closure_ptr).function };
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
     let fn_idx = target_func_id.0 as usize;
@@ -2749,20 +2771,21 @@ fn dispatch_closure_bc(
     }
 
     // Threaded dispatch: use pre-decoded threaded code instead of
-    // bytecode interpretation. Faster because operands are pre-decoded
-    // and dispatch is via function pointer (no match statement).
-    // Gated: operator dispatch (try_operator_dispatch) uses
-    // dispatch_closure_bc in a way that's incompatible with the
-    // threaded inline path. The threaded executor returns the result
-    // directly and writes it to the caller's frame, but the bytecode
-    // loop's `continue 'fiber_loop` doesn't pick it up correctly.
-    if vm.engine.mode != ExecutionMode::Interpreter
-        && std::env::var_os("WLIFT_THREADED").is_some()
-    {
+    // bytecode interpretation. Only for functions that DON'T have JIT
+    // code (those already use the faster JIT path above). Threaded is
+    // a middle tier between bytecode and JIT: faster decode than bytecode,
+    // but slower than native JIT. Skipped when called from
+    // try_operator_dispatch (allow_threaded=false).
+    let fn_has_jit = !vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null()).is_null();
+    if allow_threaded && !fn_has_jit && vm.engine.mode != ExecutionMode::Interpreter {
         // Ensure threaded code exists (lazy init).
         let _ = vm.engine.ensure_threaded_code(target_func_id, &vm.interner);
         // Now borrow the threaded code immutably + modules separately.
-        let has_tc = vm.engine.threaded_code.get(fn_idx).and_then(|t| t.as_ref()).is_some();
+        let has_tc = vm.engine.threaded_code
+            .get(fn_idx)
+            .and_then(|t| t.as_ref())
+            .and_then(|t| t.as_ref())
+            .is_some();
         if has_tc {
             let (mv_ptr, mv_count) = vm
                 .engine
@@ -2795,7 +2818,7 @@ fn dispatch_closure_bc(
                 ctx.jit_code_base = vm.engine.jit_code.as_ptr();
                 ctx.jit_code_len = vm.engine.jit_code.len() as u32;
             });
-            let tc = vm.engine.threaded_code[fn_idx].as_ref().unwrap();
+            let tc = vm.engine.threaded_code[fn_idx].as_ref().unwrap().as_ref().unwrap();
             let result = crate::mir::threaded::execute_threaded(
                 tc,
                 arg_vals,
@@ -3088,7 +3111,9 @@ fn try_operator_dispatch(
             let mut arg_vals: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + args.len());
             arg_vals.push(recv);
             arg_vals.extend_from_slice(args);
-            dispatch_closure_bc(
+            // Use allow_threaded=false: the bytecode loop expects a
+            // frame push/pop cycle for operator dispatch.
+            dispatch_closure_bc_inner(
                 vm,
                 fiber,
                 closure_ptr,
@@ -3099,6 +3124,7 @@ fn try_operator_dispatch(
                 ValueId(dst as u32),
                 None,
                 caller_bc_ptr,
+                false, // no threaded — bytecode loop handles return
             )?;
             Ok(true)
         }
