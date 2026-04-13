@@ -209,20 +209,54 @@ fn op_cmp_ge_f64(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
 }
 
 fn op_cmp_eq(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
-    let r = crate::codegen::runtime_fns::wren_cmp_eq(
-        get(state, op.a).to_bits(),
-        get(state, op.b).to_bits(),
-    );
-    set(state, op.dst, Value::from_bits(r));
+    let lhs = get(state, op.a);
+    let rhs = get(state, op.b);
+    // For objects that aren't strings/nums/bools, dispatch ==(_) as a
+    // method call to support operator overloading. Mirrors the bytecode
+    // interpreter's try_operator_dispatch path.
+    if lhs.is_object() && !lhs.is_string_object()
+        && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num()
+    {
+        let eq_sym = crate::intern::SymbolId::from_raw(op.c);
+        if eq_sym.index() != 0 {
+            let r = unsafe {
+                crate::codegen::runtime_fns::wren_call_1(
+                    lhs.to_bits(),
+                    eq_sym.index() as u64,
+                    rhs.to_bits(),
+                )
+            };
+            if std::env::var_os("WLIFT_TRACE_THREADED_EQ").is_some() {
+                eprintln!("THREADED-EQ: sym={} result=0x{:016x}", eq_sym.index(), r);
+            }
+            set(state, op.dst, Value::from_bits(r));
+            return state.pc + 1;
+        }
+    }
+    set(state, op.dst, Value::bool(lhs == rhs));
     state.pc + 1
 }
 
 fn op_cmp_ne(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
-    let r = crate::codegen::runtime_fns::wren_cmp_ne(
-        get(state, op.a).to_bits(),
-        get(state, op.b).to_bits(),
-    );
-    set(state, op.dst, Value::from_bits(r));
+    let lhs = get(state, op.a);
+    let rhs = get(state, op.b);
+    if lhs.is_object() && !lhs.is_string_object()
+        && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num()
+    {
+        let ne_sym = crate::intern::SymbolId::from_raw(op.c);
+        if ne_sym.index() != 0 {
+            let r = unsafe {
+                crate::codegen::runtime_fns::wren_call_1(
+                    lhs.to_bits(),
+                    ne_sym.index() as u64,
+                    rhs.to_bits(),
+                )
+            };
+            set(state, op.dst, Value::from_bits(r));
+            return state.pc + 1;
+        }
+    }
+    set(state, op.dst, Value::bool(lhs != rhs));
     state.pc + 1
 }
 
@@ -568,7 +602,16 @@ pub fn can_use_threaded(mir: &MirFunction) -> bool {
 }
 
 /// Lower a MIR function into threaded code for fast interpretation.
-pub fn lower_mir_to_threaded(mir: &MirFunction) -> ThreadedCode {
+pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern::Interner>) -> ThreadedCode {
+    // Look up operator method symbols for CmpEq/CmpNe dispatch.
+    let eq_sym = interner
+        .and_then(|i| i.lookup("==(_)"))
+        .map(|s| s.index())
+        .unwrap_or(0);
+    let ne_sym = interner
+        .and_then(|i| i.lookup("!=(_)"))
+        .map(|s| s.index())
+        .unwrap_or(0);
     let mut ops: Vec<ThreadedOp> = Vec::new();
     let mut block_offsets: HashMap<BlockId, usize> = HashMap::new();
     // Deferred branch fixups: (op_index, field=c or extra, target_block)
@@ -675,12 +718,12 @@ pub fn lower_mir_to_threaded(mir: &MirFunction) -> ThreadedCode {
                 Instruction::CmpEq(a, b) => ThreadedOp {
                     handler: op_cmp_eq,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16, b: b.0 as u16, c: eq_sym, extra: 0,
                 },
                 Instruction::CmpNe(a, b) => ThreadedOp {
                     handler: op_cmp_ne,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16, b: b.0 as u16, c: ne_sym, extra: 0,
                 },
                 Instruction::CmpLtF64(a, b) => ThreadedOp {
                     handler: op_cmp_lt_f64,
@@ -907,18 +950,20 @@ pub fn lower_mir_to_threaded(mir: &MirFunction) -> ThreadedCode {
 
 /// Execute threaded code and return the result.
 /// `ic_table_override`: if provided, use this IC table instead of the
-/// threaded code's own (allows sharing the bytecode function's IC data).
+/// threaded code's own (shares the bytecode function's live IC data).
 pub fn execute_threaded(
     code: &ThreadedCode,
     args: &[Value],
     module_vars: *mut u64,
     module_var_count: u32,
     vm: *mut u8,
+    ic_table_override: Option<*mut Vec<CallSiteIC>>,
 ) -> Value {
+    let ic_ptr = ic_table_override.unwrap_or(code.ic_table.get());
     let mut state = ThreadedState {
         regs: vec![Value::null(); code.reg_count.max(args.len())],
         pc: 0,
-        ic_table: code.ic_table.get(),
+        ic_table: ic_ptr,
         module_vars,
         module_var_count,
         vm,
@@ -970,8 +1015,8 @@ mod tests {
         let v0 = emit(&mut f, bb, Instruction::ConstNum(42.0));
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
-        let code = lower_mir_to_threaded(&f);
-        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut());
+        let code = lower_mir_to_threaded(&f, None);
+        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None);
         assert_eq!(result.as_num(), Some(42.0));
     }
 
@@ -986,8 +1031,8 @@ mod tests {
         let v2 = emit(&mut f, bb, Instruction::Add(v0, v1));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
-        let code = lower_mir_to_threaded(&f);
-        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut());
+        let code = lower_mir_to_threaded(&f, None);
+        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None);
         assert_eq!(result.as_num(), Some(42.0));
     }
 
@@ -1001,8 +1046,8 @@ mod tests {
         let v1 = emit(&mut f, bb, Instruction::Not(v0));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
-        let code = lower_mir_to_threaded(&f);
-        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut());
+        let code = lower_mir_to_threaded(&f, None);
+        let result = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None);
         // not(true) = false
         assert!(result.is_falsy());
     }
@@ -1015,7 +1060,7 @@ mod tests {
         let bb = f.new_block();
         f.block_mut(bb).terminator = Terminator::ReturnNull;
 
-        let code = lower_mir_to_threaded(&f);
+        let code = lower_mir_to_threaded(&f, None);
         assert_eq!(code.ops.len(), 1); // just the ReturnNull terminator
     }
 }

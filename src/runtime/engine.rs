@@ -531,6 +531,7 @@ impl ExecutionEngine {
     pub fn ensure_threaded_code(
         &mut self,
         id: FuncId,
+        interner: &crate::intern::Interner,
     ) -> Option<&crate::mir::threaded::ThreadedCode> {
         let idx = id.0 as usize;
         if idx >= self.threaded_code.len() {
@@ -541,7 +542,7 @@ impl ExecutionEngine {
             if !crate::mir::threaded::can_use_threaded(&mir) {
                 return None;
             }
-            let tc = crate::mir::threaded::lower_mir_to_threaded(&mir);
+            let tc = crate::mir::threaded::lower_mir_to_threaded(&mir, Some(interner));
             self.threaded_code[idx] = Some(tc);
         }
         self.threaded_code[idx].as_ref()

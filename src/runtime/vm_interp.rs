@@ -2751,12 +2751,16 @@ fn dispatch_closure_bc(
     // Threaded dispatch: use pre-decoded threaded code instead of
     // bytecode interpretation. Faster because operands are pre-decoded
     // and dispatch is via function pointer (no match statement).
-    // Gated behind WLIFT_THREADED env for now — needs more testing.
+    // Gated: operator dispatch (try_operator_dispatch) uses
+    // dispatch_closure_bc in a way that's incompatible with the
+    // threaded inline path. The threaded executor returns the result
+    // directly and writes it to the caller's frame, but the bytecode
+    // loop's `continue 'fiber_loop` doesn't pick it up correctly.
     if vm.engine.mode != ExecutionMode::Interpreter
         && std::env::var_os("WLIFT_THREADED").is_some()
     {
         // Ensure threaded code exists (lazy init).
-        let _ = vm.engine.ensure_threaded_code(target_func_id);
+        let _ = vm.engine.ensure_threaded_code(target_func_id, &vm.interner);
         // Now borrow the threaded code immutably + modules separately.
         let has_tc = vm.engine.threaded_code.get(fn_idx).and_then(|t| t.as_ref()).is_some();
         if has_tc {
@@ -2767,6 +2771,30 @@ fn dispatch_closure_bc(
                 .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
                 .unwrap_or((std::ptr::null_mut(), 0));
             let vm_ptr = vm as *mut VM as *mut u8;
+            // Share the bytecode function's IC table with the threaded
+            // interpreter so IC entries populated by the bytecode slow
+            // path are immediately available to the threaded fast path.
+            let bc_ic_table = vm.engine.ensure_bytecode(target_func_id)
+                .map(|bc_ptr| unsafe {
+                    let bc = &*(bc_ptr as *const BytecodeFunction);
+                    bc.ic_table.get()
+                });
+            // Set JIT context so wren_call_N slow path works.
+            let mod_name_bytes = module_name.as_bytes();
+            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                ctx.vm = vm_ptr;
+                ctx.module_vars = mv_ptr;
+                ctx.module_var_count = mv_count;
+                ctx.module_name = mod_name_bytes.as_ptr();
+                ctx.module_name_len = mod_name_bytes.len() as u32;
+                ctx.current_func_id = target_func_id.0 as u64;
+                ctx.closure = closure_ptr as *mut u8;
+                ctx.defining_class = defining_class
+                    .map(|p| p as *mut u8)
+                    .unwrap_or(std::ptr::null_mut());
+                ctx.jit_code_base = vm.engine.jit_code.as_ptr();
+                ctx.jit_code_len = vm.engine.jit_code.len() as u32;
+            });
             let tc = vm.engine.threaded_code[fn_idx].as_ref().unwrap();
             let result = crate::mir::threaded::execute_threaded(
                 tc,
@@ -2774,6 +2802,7 @@ fn dispatch_closure_bc(
                 mv_ptr,
                 mv_count,
                 vm_ptr,
+                bc_ic_table,
             );
             // Store result in caller's frame and return.
             set_reg(&mut values, return_dst.0 as u16, result);
