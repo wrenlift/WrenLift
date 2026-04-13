@@ -408,6 +408,97 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     state.pc + 1
 }
 
+// -- Runtime-backed ops --
+
+fn op_make_range(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let from = get(state, op.a).to_bits();
+    let to = get(state, op.b).to_bits();
+    let inclusive = op.c as u64;
+    let r = crate::codegen::runtime_fns::wren_make_range(from, to, inclusive);
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_to_string(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let v = get(state, op.a).to_bits();
+    let r = crate::codegen::runtime_fns::wren_to_string(v);
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_string_concat(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let a = get(state, op.a).to_bits();
+    let b = get(state, op.b).to_bits();
+    let r = crate::codegen::runtime_fns::wren_string_concat(a, b);
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_const_string(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let r = crate::codegen::runtime_fns::wren_const_string(op.extra);
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_neg(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let v = get(state, op.a).to_bits();
+    let r = crate::codegen::runtime_fns::wren_num_neg(v);
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_div(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let r = crate::codegen::runtime_fns::wren_num_div(
+        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_mod(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let r = crate::codegen::runtime_fns::wren_num_mod(
+        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_cmp_gt(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let r = crate::codegen::runtime_fns::wren_cmp_gt(
+        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_cmp_le(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let r = crate::codegen::runtime_fns::wren_cmp_le(
+        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_guard_num(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    // Guards are no-ops in threaded mode (checked at JIT tier).
+    set(state, op.dst, get(state, op.a));
+    state.pc + 1
+}
+
+fn op_is_type(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    let r = crate::codegen::runtime_fns::wren_is_type(
+        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+    set(state, op.dst, Value::from_bits(r));
+    state.pc + 1
+}
+
+fn op_write_barrier(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    crate::codegen::runtime_fns::wren_write_barrier(
+        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+    state.pc + 1
+}
+
+fn op_construct(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+    // Construct is handled at a higher level; no-op here
+    state.pc + 1
+}
+
 // -- Noop/placeholder --
 
 fn op_noop(state: &mut ThreadedState, _op: &ThreadedOp) -> usize {
@@ -421,6 +512,60 @@ fn op_unreachable(_state: &mut ThreadedState, _op: &ThreadedOp) -> usize {
 // ---------------------------------------------------------------------------
 // MIR → ThreadedCode lowering
 // ---------------------------------------------------------------------------
+
+/// Check if a MIR function can be executed via the threaded interpreter.
+/// Returns false if any instruction isn't supported (mapped to op_noop).
+pub fn can_use_threaded(mir: &MirFunction) -> bool {
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            match inst {
+                Instruction::ConstNull
+                | Instruction::ConstBool(_)
+                | Instruction::ConstNum(_)
+                | Instruction::ConstI64(_)
+                | Instruction::Move(_)
+                | Instruction::BlockParam(_)
+                | Instruction::Add(_, _)
+                | Instruction::Sub(_, _)
+                | Instruction::Mul(_, _)
+                | Instruction::AddF64(_, _)
+                | Instruction::SubF64(_, _)
+                | Instruction::MulF64(_, _)
+                | Instruction::CmpLt(_, _)
+                | Instruction::CmpGe(_, _)
+                | Instruction::CmpEq(_, _)
+                | Instruction::CmpNe(_, _)
+                | Instruction::Div(_, _)
+                | Instruction::Mod(_, _)
+                | Instruction::DivF64(_, _)
+                | Instruction::ModF64(_, _)
+                | Instruction::CmpGt(_, _)
+                | Instruction::CmpLe(_, _)
+                | Instruction::CmpLtF64(_, _)
+                | Instruction::CmpGtF64(_, _)
+                | Instruction::CmpLeF64(_, _)
+                | Instruction::CmpGeF64(_, _)
+                | Instruction::Not(_)
+                | Instruction::Neg(_)
+                | Instruction::GetField(_, _)
+                | Instruction::SetField(_, _, _)
+                | Instruction::GetModuleVar(_)
+                | Instruction::SetModuleVar(_, _)
+                | Instruction::Call { .. }
+                | Instruction::CallKnownFunc { .. }
+                | Instruction::MakeRange { .. }
+                | Instruction::StringConcat(_)
+                | Instruction::ToString(_)
+                | Instruction::ConstString(_)
+                | Instruction::GuardNum(_)
+                | Instruction::GuardBool(_)
+                => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
 
 /// Lower a MIR function into threaded code for fast interpretation.
 pub fn lower_mir_to_threaded(mir: &MirFunction) -> ThreadedCode {
@@ -595,7 +740,93 @@ pub fn lower_mir_to_threaded(mir: &MirFunction) -> ThreadedCode {
                         extra: packed,
                     }
                 }
-                // Everything else: noop placeholder (will be expanded)
+                // More arithmetic
+                Instruction::Div(a, b) => ThreadedOp {
+                    handler: op_div,
+                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                },
+                Instruction::Mod(a, b) => ThreadedOp {
+                    handler: op_mod,
+                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                },
+                Instruction::Neg(a) => ThreadedOp {
+                    handler: op_neg,
+                    dst, a: a.0 as u16, b: 0, c: 0, extra: 0,
+                },
+                // More comparisons
+                Instruction::CmpGt(a, b) => ThreadedOp {
+                    handler: op_cmp_gt,
+                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                },
+                Instruction::CmpLe(a, b) => ThreadedOp {
+                    handler: op_cmp_le,
+                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                },
+                // Runtime-backed ops
+                Instruction::MakeRange(from, to, inclusive) => ThreadedOp {
+                    handler: op_make_range,
+                    dst, a: from.0 as u16, b: to.0 as u16,
+                    c: if *inclusive { 1 } else { 0 }, extra: 0,
+                },
+                Instruction::ToString(a) => ThreadedOp {
+                    handler: op_to_string,
+                    dst, a: a.0 as u16, b: 0, c: 0, extra: 0,
+                },
+                Instruction::StringConcat(parts) if parts.len() == 2 => ThreadedOp {
+                    handler: op_string_concat,
+                    dst, a: parts[0].0 as u16, b: parts[1].0 as u16, c: 0, extra: 0,
+                },
+                Instruction::ConstString(idx) => ThreadedOp {
+                    handler: op_const_string,
+                    dst, a: 0, b: 0, c: 0, extra: *idx as u64,
+                },
+                // Guards (no-op in threaded mode)
+                Instruction::GuardNum(a) | Instruction::GuardBool(a) => ThreadedOp {
+                    handler: op_guard_num,
+                    dst, a: a.0 as u16, b: 0, c: 0, extra: 0,
+                },
+                Instruction::IsType(a, cls) => ThreadedOp {
+                    handler: op_is_type,
+                    dst, a: a.0 as u16, b: 0 /* cls used at runtime */, c: 0, extra: 0,
+                },
+
+                // Calls that go through runtime (same slow path as op_call)
+                Instruction::CallKnownFunc { receiver, method, args, .. } => {
+                    let recv_id = receiver.0 as u16;
+                    let cur_ic = ic_idx;
+                    ic_idx += 1;
+                    ic_entries.push(CallSiteIC::default());
+                    let argc = args.len();
+                    let mut packed: u64 = argc as u64;
+                    for (i, arg) in args.iter().take(3).enumerate() {
+                        packed |= (arg.0 as u64) << (8 + i * 16);
+                    }
+                    ThreadedOp {
+                        handler: op_call,
+                        dst, a: recv_id, b: method.index() as u16,
+                        c: cur_ic as u32, extra: packed,
+                    }
+                }
+                Instruction::CallStaticSelf { args } => {
+                    // CallStaticSelf doesn't go through dispatch — runtime handles it
+                    let argc = args.len();
+                    let mut packed: u64 = argc as u64;
+                    for (i, arg) in args.iter().take(3).enumerate() {
+                        packed |= (arg.0 as u64) << (8 + i * 16);
+                    }
+                    ThreadedOp {
+                        handler: op_call, // fallback to generic call
+                        dst, a: 0, b: 0, c: 0, extra: packed,
+                    }
+                }
+                Instruction::MakeList(elems) => {
+                    // For now, delegate to runtime
+                    ThreadedOp {
+                        handler: op_noop,
+                        dst, a: 0, b: 0, c: 0, extra: 0,
+                    }
+                }
+                // Everything else: noop placeholder
                 _ => ThreadedOp {
                     handler: op_noop,
                     dst,
@@ -675,7 +906,15 @@ pub fn lower_mir_to_threaded(mir: &MirFunction) -> ThreadedCode {
 }
 
 /// Execute threaded code and return the result.
-pub fn execute_threaded(code: &ThreadedCode, args: &[Value], module_vars: *mut u64, module_var_count: u32, vm: *mut u8) -> Value {
+/// `ic_table_override`: if provided, use this IC table instead of the
+/// threaded code's own (allows sharing the bytecode function's IC data).
+pub fn execute_threaded(
+    code: &ThreadedCode,
+    args: &[Value],
+    module_vars: *mut u64,
+    module_var_count: u32,
+    vm: *mut u8,
+) -> Value {
     let mut state = ThreadedState {
         regs: vec![Value::null(); code.reg_count.max(args.len())],
         pc: 0,

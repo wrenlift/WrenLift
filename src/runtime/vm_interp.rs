@@ -2747,6 +2747,46 @@ fn dispatch_closure_bc(
         }
         vm.engine.poll_compilations();
     }
+
+    // Threaded dispatch: use pre-decoded threaded code instead of
+    // bytecode interpretation. Faster because operands are pre-decoded
+    // and dispatch is via function pointer (no match statement).
+    // Gated behind WLIFT_THREADED env for now — needs more testing.
+    if vm.engine.mode != ExecutionMode::Interpreter
+        && std::env::var_os("WLIFT_THREADED").is_some()
+    {
+        // Ensure threaded code exists (lazy init).
+        let _ = vm.engine.ensure_threaded_code(target_func_id);
+        // Now borrow the threaded code immutably + modules separately.
+        let has_tc = vm.engine.threaded_code.get(fn_idx).and_then(|t| t.as_ref()).is_some();
+        if has_tc {
+            let (mv_ptr, mv_count) = vm
+                .engine
+                .modules
+                .get(module_name.as_str())
+                .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+                .unwrap_or((std::ptr::null_mut(), 0));
+            let vm_ptr = vm as *mut VM as *mut u8;
+            let tc = vm.engine.threaded_code[fn_idx].as_ref().unwrap();
+            let result = crate::mir::threaded::execute_threaded(
+                tc,
+                arg_vals,
+                mv_ptr,
+                mv_count,
+                vm_ptr,
+            );
+            // Store result in caller's frame and return.
+            set_reg(&mut values, return_dst.0 as u16, result);
+            unsafe {
+                if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                    frame.pc = pc;
+                    frame.values = values;
+                }
+            }
+            return Ok(());
+        }
+    }
+
     vm.engine.note_interpreted_entry(target_func_id);
 
     // Get bytecode for target function (lazily compiled, survives tier-up).

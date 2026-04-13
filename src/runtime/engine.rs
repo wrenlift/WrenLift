@@ -389,6 +389,9 @@ pub struct ExecutionEngine {
     /// Code ranges for compiled functions, sorted by start address.
     /// Used by GC stack walker to map return addresses → safepoint metadata.
     pub code_ranges: Vec<CodeRange>,
+    /// Threaded-code cache indexed by FuncId. Lazily populated on first
+    /// interpreter dispatch — faster than bytecode for hot functions.
+    pub threaded_code: Vec<Option<crate::mir::threaded::ThreadedCode>>,
 }
 
 /// Address range of a compiled function's native code.
@@ -449,6 +452,7 @@ impl ExecutionEngine {
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
+            threaded_code: Vec::new(),
         }
     }
 
@@ -473,6 +477,7 @@ impl ExecutionEngine {
         self.optimized_leaf.push(false);
         self.optimized_metadata.push(None);
         self.bc_cache.push(std::ptr::null());
+        self.threaded_code.push(None);
         self.type_profiles.push(None);
         id
     }
@@ -517,6 +522,29 @@ impl ExecutionEngine {
         self.functions
             .get(id.0 as usize)
             .map(|body| Arc::clone(body.mir()))
+    }
+
+    /// Get or lazily create threaded code for a function.
+    /// Returns a reference to the ThreadedCode if available.
+    /// Only creates threaded code for functions where ALL instructions
+    /// are supported — otherwise falls through to bytecode interpreter.
+    pub fn ensure_threaded_code(
+        &mut self,
+        id: FuncId,
+    ) -> Option<&crate::mir::threaded::ThreadedCode> {
+        let idx = id.0 as usize;
+        if idx >= self.threaded_code.len() {
+            return None;
+        }
+        if self.threaded_code[idx].is_none() {
+            let mir = self.get_mir(id)?;
+            if !crate::mir::threaded::can_use_threaded(&mir) {
+                return None;
+            }
+            let tc = crate::mir::threaded::lower_mir_to_threaded(&mir);
+            self.threaded_code[idx] = Some(tc);
+        }
+        self.threaded_code[idx].as_ref()
     }
 
     /// Get a function body by ID.
