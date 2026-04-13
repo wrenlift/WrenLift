@@ -628,10 +628,10 @@ fn run_fiber_with_stop_depth(
             });
         }
 
-        // NOTE: Root-frame threaded dispatch disabled — MakeRange +
-        // iterate pattern has a bug in the threaded op_call handler
-        // (wrong IC table for the range's iterate method). Threaded
-        // dispatch for callees (in dispatch_closure_bc) works correctly.
+        // Root-frame threaded dispatch disabled: works for simple
+        // functions but causes stack overflow on deep recursive chains
+        // (each execute_threaded allocates a Vec<Value> register file).
+        // Needs register file pooling to be viable.
 
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {

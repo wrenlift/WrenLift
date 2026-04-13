@@ -597,6 +597,16 @@ pub fn can_use_threaded(mir: &MirFunction) -> bool {
                 _ => return false,
             }
         }
+        // Check terminator: CondBranch with args needs phi resolution
+        // which the threaded interpreter doesn't support yet.
+        match &block.terminator {
+            Terminator::CondBranch { true_args, false_args, .. }
+                if !true_args.is_empty() || !false_args.is_empty() =>
+            {
+                return false;
+            }
+            _ => {}
+        }
     }
     true
 }
@@ -620,11 +630,19 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
     let mut ic_idx: usize = 0;
     let mut max_reg: u16 = 0;
 
-    // First pass: compute block offsets
+    // First pass: compute block offsets.
+    // Account for extra move ops emitted for branch args.
     let mut offset = 0usize;
     for (block_idx, block) in mir.blocks.iter().enumerate() {
         block_offsets.insert(BlockId(block_idx as u32), offset);
         offset += block.instructions.len();
+        // Count extra moves for branch args
+        match &block.terminator {
+            Terminator::Branch { args, .. } => {
+                offset += args.len(); // one move per arg
+            }
+            _ => {}
+        }
         offset += 1; // terminator
     }
 
@@ -877,6 +895,36 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                 },
             };
             ops.push(threaded_op);
+        }
+
+        // Emit moves for branch args before the terminator.
+        // MIR block params are SSA phi-like values — the branch that
+        // targets a block must copy its args into the block's params.
+        match &block.terminator {
+            Terminator::Branch { target, args } if !args.is_empty() => {
+                let target_block = &mir.blocks[target.0 as usize];
+                for (i, arg) in args.iter().enumerate() {
+                    if i < target_block.params.len() {
+                        let dst_vid = target_block.params[i].0;
+                        if dst_vid.0 as u16 > max_reg { max_reg = dst_vid.0 as u16; }
+                        ops.push(ThreadedOp {
+                            handler: op_move,
+                            dst: dst_vid.0 as u16,
+                            a: arg.0 as u16, b: 0, c: 0, extra: 0,
+                        });
+                    }
+                }
+            }
+            Terminator::CondBranch { true_target, true_args, false_target, false_args, .. } => {
+                // CondBranch args are trickier: we need to copy args for
+                // BOTH branches. But we can only execute one set. For now,
+                // emit moves AFTER the branch in each target's block start.
+                // Actually, we handle this by NOT emitting moves here and
+                // instead relying on the block params being initialized.
+                // This works if both branches have the same params.
+                // TODO: proper phi resolution with parallel moves.
+            }
+            _ => {}
         }
 
         // Terminator
