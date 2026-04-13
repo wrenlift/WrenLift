@@ -628,10 +628,9 @@ fn run_fiber_with_stop_depth(
             });
         }
 
-        // Root-frame threaded dispatch disabled: delta_blue hangs when
-        // some functions run via threaded. The CondBranch arg guard
-        // rejects most complex functions, but simpler ones that qualify
-        // may still produce wrong results due to missing threaded handlers.
+        // Root-frame threaded dispatch — disabled pending proper
+        // frame lifecycle handling (popping root frame + fiber_loop
+        // re-entry causes infinite null output).
         if false {
             let fn_idx_tc = func_id.0 as usize;
             let has_jit = !vm.engine.jit_code.get(fn_idx_tc).copied().unwrap_or(std::ptr::null()).is_null();
@@ -2842,8 +2841,17 @@ fn dispatch_closure_bc_inner(
     // a middle tier between bytecode and JIT: faster decode than bytecode,
     // but slower than native JIT. Skipped when called from
     // try_operator_dispatch (allow_threaded=false).
+    // Skip threaded for constructors — they need special instance
+    // allocation that the threaded path doesn't handle. Also check if
+    // the function name starts with "new(" as a heuristic.
+    let is_constructor = vm.engine.get_mir(target_func_id)
+        .map(|m| {
+            let name = vm.interner.resolve(m.name);
+            name.starts_with("new(") || name.starts_with("new ")
+        })
+        .unwrap_or(false);
     let fn_has_jit = !vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null()).is_null();
-    if allow_threaded && !fn_has_jit
+    if allow_threaded && !fn_has_jit && !is_constructor
         && vm.engine.mode != ExecutionMode::Interpreter
         && crate::mir::threaded::threaded_depth_ok()
     {
