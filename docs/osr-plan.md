@@ -99,7 +99,9 @@ Implemented so far:
 
 ## Phase 4: Eligibility Expansion
 
-Status: in progress.
+Status: complete for the current design. Remaining items listed below are
+deferred to Phase 6+ because they require either tier-down / deopt
+infrastructure or give no measurable benefit in today's dispatch topology.
 
 - Enable method/closure OSR once context preservation is proven.
 - Add a continuation-safe method/closure OSR path for loops reached from native
@@ -153,15 +155,25 @@ Implemented so far:
   backward conditional arm as an OSR safepoint, and Cranelift emits matching
   OSR entries for conditional-back-edge target blocks.
 
-Known gaps:
+Deferred items (no action planned inside Phase 4):
 
-- The threaded interpreter path does not yet poll back-edges for tier-up or
-  OSR transfer. In tiered mode, threaded dispatch now falls back to bytecode
-  for functions whose bytecode contains OSR points, preserving safepoints for
-  hot method loops. The broader fix is still to fold back-edge polling directly
-  into the threaded interpreter.
-- Proper resume semantics for fiber yield/transfer/suspend from inside an
-  OSR'd loop. Today we raise `Unsupported` instead of corrupting state.
+- In-threaded back-edge polling. With the Phase 4 dispatch rule
+  ("functions with bytecode OSR points never enter the threaded
+  interpreter") threaded only covers functions whose bytecode has no
+  backward branch — there are literally no back-edges to poll. Call-site
+  `record_call` already drives tier-up for threaded-hosted code. Revisit
+  only if a future optimizer pass makes OSR-less functions gain hot
+  loops (e.g. tail-recursion turned into a threaded loop).
+- Proper resume semantics for `Fiber.yield` / `transfer` / `suspend` from
+  inside an OSR'd loop. A correct fix requires tier-down / deopt
+  infrastructure: the native OSR code must (a) poll `pending_fiber_action`
+  after every call that can yield, (b) exit the native loop cleanly while
+  preserving register state, and (c) hand the interpreter an MIR resume
+  point that matches the live native state. None of that exists yet.
+  Today we fail fast with an `Unsupported` runtime error rather than
+  silently corrupting fiber state — safe but restrictive. Users who need
+  fiber ops inside a hot loop can set `WLIFT_DISABLE_METHOD_OSR` to keep
+  the loop on the bytecode interpreter.
 
 ## Phase 5: Performance Validation
 
