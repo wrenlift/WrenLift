@@ -427,6 +427,18 @@ fn try_enter_loop_osr(
         return Err(RuntimeError::Error(err));
     }
 
+    // Deopt: fiber actions (yield / transfer / suspend) triggered inside the
+    // OSR'd native loop can't resume at an arbitrary iteration once the
+    // frame has been popped. Until we have a proper interpreter-resume
+    // continuation for these cases, surface a clear runtime error instead
+    // of silently continuing past the action.
+    if vm.pending_fiber_action.is_some() {
+        vm.pending_fiber_action = None;
+        return Err(RuntimeError::Unsupported(
+            "fiber yield/transfer from inside a JIT-OSR loop is not yet supported".into(),
+        ));
+    }
+
     let result = Value::from_bits(result_bits);
     let frame_values = unsafe {
         (*live_fiber)
