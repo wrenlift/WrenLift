@@ -1885,6 +1885,17 @@ pub struct CompiledArtifact {
     pub needs_shadow_frame: bool,
 }
 
+/// Native entry point for a compiled loop/header OSR target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeOsrEntry {
+    pub target_block: BlockId,
+    pub param_count: u16,
+    pub ptr: *const u8,
+}
+
+unsafe impl Send for NativeOsrEntry {}
+unsafe impl Sync for NativeOsrEntry {}
+
 impl CompiledFunction {
     /// Make the compiled code executable, returning an owned handle.
     ///
@@ -1947,6 +1958,15 @@ impl ExecutableFunction {
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(cl) => cl.fn_ptr,
             _ => unsafe { self.as_fn::<*const u8>() },
+        }
+    }
+
+    /// Get compiled OSR entry points, if this backend produced any.
+    pub fn osr_entries(&self) -> &[NativeOsrEntry] {
+        match self {
+            #[cfg(feature = "cranelift")]
+            ExecutableFunction::Cranelift(cl) => &cl.osr_entries,
+            _ => &[],
         }
     }
 
@@ -2043,7 +2063,10 @@ fn devirt_calls_with_ic(
     for blk in &mir.blocks {
         block_ic_base.push(running);
         for (_, inst) in &blk.instructions {
-            if matches!(inst, Instruction::Call { .. } | Instruction::SuperCall { .. }) {
+            if matches!(
+                inst,
+                Instruction::Call { .. } | Instruction::SuperCall { .. }
+            ) {
                 running += 1;
             }
         }
@@ -2052,7 +2075,12 @@ fn devirt_calls_with_ic(
     for (block_idx, block) in new_mir.blocks.iter_mut().enumerate() {
         let mut ic_idx = block_ic_base[block_idx];
         for (_, inst) in block.instructions.iter_mut() {
-            if let Instruction::Call { receiver, method, args } = inst {
+            if let Instruction::Call {
+                receiver,
+                method,
+                args,
+            } = inst
+            {
                 if ic_idx < ic_snapshot.len() {
                     let ic = &ic_snapshot[ic_idx];
                     if ic.kind == 1 && ic.class != 0 && ic.func_id != 0 {
@@ -2108,11 +2136,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             // for monomorphic call sites using IC snapshot data.
             let devirt_mir;
             let mir_ref = if let Some(ref ic_snapshot) = callsite_ic_ptrs {
-                devirt_mir = devirt_calls_with_ic(
-                    mir,
-                    ic_snapshot,
-                    devirt_hints.as_deref(),
-                );
+                devirt_mir = devirt_calls_with_ic(mir, ic_snapshot, devirt_hints.as_deref());
                 &devirt_mir
             } else {
                 mir
@@ -3955,7 +3979,15 @@ impl<'a> LowerCtx<'a> {
                 });
                 self.mf.emit(MachInst::DefLabel(done_label));
             }
-            Instruction::CallKnownFunc { func_id: _, method: _, expected_class: _, inline_getter_field: _, pure_leaf: _, receiver: _, args: _ } => {
+            Instruction::CallKnownFunc {
+                func_id: _,
+                method: _,
+                expected_class: _,
+                inline_getter_field: _,
+                pure_leaf: _,
+                receiver: _,
+                args: _,
+            } => {
                 // TODO: implement direct JIT call via jit_code_base[func_id]
                 // For now, return null.
                 let dst = self.vreg_for(dst_val);
@@ -6490,6 +6522,80 @@ mod tests {
 
         let result = compile_function(&f, Target::X86_64);
         assert!(result.is_ok(), "branch pipeline failed: {:?}", result.err());
+    }
+
+    #[cfg(feature = "cranelift")]
+    #[test]
+    fn test_cranelift_artifact_exposes_osr_entry_for_simple_loop() {
+        use crate::mir::MirType;
+
+        let mut interner = Interner::new();
+        let mut f = make_mir(&mut interner);
+        f.name = interner.intern("<module>");
+        let bb0 = f.new_block();
+        let bb1 = f.new_block();
+        let bb2 = f.new_block();
+        let bb3 = f.new_block();
+
+        let v_zero = f.new_value();
+        let v_i = f.new_value();
+        let v_limit = f.new_value();
+        let v_cond = f.new_value();
+        let v_one = f.new_value();
+        let v_next = f.new_value();
+
+        f.block_mut(bb0)
+            .instructions
+            .push((v_zero, Instruction::ConstNum(0.0)));
+        f.block_mut(bb0).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v_zero],
+        };
+
+        f.block_mut(bb1).params.push((v_i, MirType::Value));
+        f.block_mut(bb1)
+            .instructions
+            .push((v_limit, Instruction::ConstNum(3.0)));
+        f.block_mut(bb1)
+            .instructions
+            .push((v_cond, Instruction::CmpLt(v_i, v_limit)));
+        f.block_mut(bb1).terminator = Terminator::CondBranch {
+            condition: v_cond,
+            true_target: bb2,
+            true_args: vec![],
+            false_target: bb3,
+            false_args: vec![],
+        };
+
+        f.block_mut(bb2)
+            .instructions
+            .push((v_one, Instruction::ConstNum(1.0)));
+        f.block_mut(bb2)
+            .instructions
+            .push((v_next, Instruction::Add(v_i, v_one)));
+        f.block_mut(bb2).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v_next],
+        };
+
+        f.block_mut(bb3).terminator = Terminator::Return(v_i);
+
+        let artifact = compile_function_artifact_with_interner(
+            &f,
+            Target::Aarch64,
+            &interner,
+            CompileTier::Baseline,
+        )
+        .expect("cranelift artifact should compile");
+        let executable = artifact
+            .code
+            .into_executable()
+            .expect("artifact should become executable");
+        let entries = executable.osr_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target_block, bb1);
+        assert_eq!(entries[0].param_count, 1);
+        assert!(!entries[0].ptr.is_null());
     }
 
     #[cfg(target_arch = "aarch64")]

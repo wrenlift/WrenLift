@@ -1713,6 +1713,206 @@ System.print(total)
 }
 
 #[test]
+fn e2e_tiered_backedge_does_not_restart_module_entry() {
+    let source = r#"
+System.print("setup")
+var i = 0
+while (i < 1000000) {
+  i = i + 1
+}
+System.print("done")
+"#;
+
+    let (result, output, elapsed) = run_with_config(
+        source,
+        VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 5,
+            ..VMConfig::default()
+        },
+    );
+    let t = fmt_elapsed(elapsed);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered back-edge run failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "setup\ndone",
+        "tiered back-edge OSR must not re-run module setup ({})",
+        t
+    );
+}
+
+#[test]
+fn e2e_tiered_backedge_enters_osr_entry() {
+    let source = r#"
+var i = 0
+while (i < 1000000) {
+  i = i + 1
+}
+System.print(i)
+"#;
+
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 5,
+        ..VMConfig::default()
+    });
+    vm.engine.collect_tier_stats = true;
+    vm.output_buffer = Some(String::new());
+
+    let start = Instant::now();
+    let result = vm.interpret("main", source);
+    let elapsed = start.elapsed();
+    let output = vm.take_output();
+    let t = fmt_elapsed(elapsed);
+
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered OSR run failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "1000000",
+        "tiered OSR output mismatch ({})",
+        t
+    );
+    assert!(
+        vm.engine
+            .tier_stats
+            .iter()
+            .any(|stats| stats.osr_entries > 0),
+        "expected at least one OSR entry ({})",
+        t
+    );
+}
+
+#[test]
+fn e2e_tiered_backedge_enters_osr_entry_in_method() {
+    // A hot loop inside a user-defined method should also take an OSR entry
+    // now that method frames are eligible. The threaded interpreter fast path
+    // is disabled here because it doesn't yet integrate with OSR safepoints.
+    std::env::set_var("WLIFT_DISABLE_THREADED", "1");
+    let source = r#"
+class Counter {
+  construct new() {}
+  run() {
+    var i = 0
+    while (i < 1000000) {
+      i = i + 1
+    }
+    return i
+  }
+}
+
+var c = Counter.new()
+System.print(c.run())
+"#;
+
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 5,
+        ..VMConfig::default()
+    });
+    vm.engine.collect_tier_stats = true;
+    vm.output_buffer = Some(String::new());
+
+    let start = Instant::now();
+    let result = vm.interpret("main", source);
+    let elapsed = start.elapsed();
+    let output = vm.take_output();
+    let t = fmt_elapsed(elapsed);
+
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered method OSR run failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "1000000",
+        "tiered method OSR output mismatch ({})",
+        t
+    );
+    assert!(
+        vm.engine
+            .tier_stats
+            .iter()
+            .any(|stats| stats.osr_entries > 0),
+        "expected at least one OSR entry from a method loop ({})",
+        t
+    );
+    std::env::remove_var("WLIFT_DISABLE_THREADED");
+}
+
+#[test]
+fn e2e_tiered_backedge_osr_survives_gc_pressure() {
+    // Allocating inside a hot method loop forces multiple GC cycles while the
+    // OSR entry is active. The receiver and loop-carried list must stay live
+    // across each transfer.
+    std::env::set_var("WLIFT_DISABLE_THREADED", "1");
+    let source = r#"
+class Accumulator {
+  construct new() {
+    _list = []
+  }
+  run() {
+    var i = 0
+    while (i < 500) {
+      _list.add([i, i + 1, i + 2, i + 3])
+      i = i + 1
+    }
+    return _list.count
+  }
+}
+
+var total = 0
+for (j in 0...8) {
+  total = total + Accumulator.new().run()
+}
+System.print(total)
+"#;
+
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 5,
+        ..VMConfig::default()
+    });
+    vm.engine.collect_tier_stats = true;
+    vm.output_buffer = Some(String::new());
+
+    let start = Instant::now();
+    let result = vm.interpret("main", source);
+    let elapsed = start.elapsed();
+    let output = vm.take_output();
+    let t = fmt_elapsed(elapsed);
+
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "tiered method OSR GC stress run failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "4000",
+        "method OSR under GC pressure output mismatch ({})",
+        t
+    );
+    std::env::remove_var("WLIFT_DISABLE_THREADED");
+}
+
+#[test]
 fn e2e_tiered_nested_nonleaf_closure_call_survives_gc_pressure() {
     let source = r#"
 var outer = Fn.new { |f, list|

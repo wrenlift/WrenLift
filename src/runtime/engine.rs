@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use crate::codegen::native_meta::NativeFrameMetadata;
-use crate::codegen::{CompileTier, ExecutableFunction};
+use crate::codegen::{CompileTier, ExecutableFunction, NativeOsrEntry};
 use crate::intern::SymbolId;
 use crate::mir::bytecode::{BytecodeFunction, CallSiteIC};
 use crate::mir::MirFunction;
@@ -140,6 +140,7 @@ pub struct FuncTierStats {
     pub ic_hits: u64,
     pub ic_misses: u64,
     pub native_to_native_calls: u64,
+    pub osr_entries: u64,
     pub deopts_to_baseline: u64,
     pub fallbacks_to_interpreter: u64,
 }
@@ -361,6 +362,8 @@ pub struct ExecutionEngine {
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
+    /// Active native OSR entry points indexed by FuncId.
+    pub jit_osr_entries: Vec<Vec<NativeOsrEntry>>,
     /// Whether the currently active native tier can use the direct fast path.
     pub jit_leaf: Vec<bool>,
     /// Preserved native-frame metadata for compiled functions.
@@ -371,12 +374,16 @@ pub struct ExecutionEngine {
     pub tier_stats: Vec<FuncTierStats>,
     /// Baseline native code pointers indexed by FuncId.
     pub baseline_code: Vec<*const u8>,
+    /// Baseline native OSR entry points indexed by FuncId.
+    pub baseline_osr_entries: Vec<Vec<NativeOsrEntry>>,
     /// Whether baseline-native code can use the direct fast path.
     pub baseline_leaf: Vec<bool>,
     /// Baseline native metadata indexed by FuncId.
     pub baseline_metadata: Vec<Option<Arc<NativeFrameMetadata>>>,
     /// Optimized native code pointers indexed by FuncId.
     pub optimized_code: Vec<*const u8>,
+    /// Optimized native OSR entry points indexed by FuncId.
+    pub optimized_osr_entries: Vec<Vec<NativeOsrEntry>>,
     /// Whether optimized-native code can use the direct fast path.
     pub optimized_leaf: Vec<bool>,
     /// Optimized native metadata indexed by FuncId.
@@ -441,14 +448,17 @@ impl ExecutionEngine {
             compile_handle: None,
             compile_queue: Vec::new(),
             jit_code: Vec::new(),
+            jit_osr_entries: Vec::new(),
             jit_leaf: Vec::new(),
             jit_metadata: Vec::new(),
             tier_states: Vec::new(),
             tier_stats: Vec::new(),
             baseline_code: Vec::new(),
+            baseline_osr_entries: Vec::new(),
             baseline_leaf: Vec::new(),
             baseline_metadata: Vec::new(),
             optimized_code: Vec::new(),
+            optimized_osr_entries: Vec::new(),
             optimized_leaf: Vec::new(),
             optimized_metadata: Vec::new(),
             bc_cache: Vec::new(),
@@ -468,14 +478,17 @@ impl ExecutionEngine {
         });
         self.compiling_tier.push(None);
         self.jit_code.push(std::ptr::null());
+        self.jit_osr_entries.push(Vec::new());
         self.jit_leaf.push(false);
         self.jit_metadata.push(None);
         self.tier_states.push(TierState::Interpreted);
         self.tier_stats.push(FuncTierStats::default());
         self.baseline_code.push(std::ptr::null());
+        self.baseline_osr_entries.push(Vec::new());
         self.baseline_leaf.push(false);
         self.baseline_metadata.push(None);
         self.optimized_code.push(std::ptr::null());
+        self.optimized_osr_entries.push(Vec::new());
         self.optimized_leaf.push(false);
         self.optimized_metadata.push(None);
         self.bc_cache.push(std::ptr::null());
@@ -549,7 +562,9 @@ impl ExecutionEngine {
             let tc = crate::mir::threaded::lower_mir_to_threaded(&mir, Some(interner));
             self.threaded_code[idx] = Some(Some(tc));
         }
-        self.threaded_code[idx].as_ref().and_then(|opt| opt.as_ref())
+        self.threaded_code[idx]
+            .as_ref()
+            .and_then(|opt| opt.as_ref())
     }
 
     /// Get a function body by ID.
@@ -675,10 +690,7 @@ impl ExecutionEngine {
     ///   so Cranelift inlines a direct field load.
     /// - If the callee has no internal calls (pure leaf), mark it so
     ///   Cranelift can emit a pure direct call_indirect with zero FFI.
-    fn compute_devirt_hints(
-        &self,
-        ic_snapshot: &[CallSiteIC],
-    ) -> Vec<crate::codegen::DevirtHint> {
+    fn compute_devirt_hints(&self, ic_snapshot: &[CallSiteIC]) -> Vec<crate::codegen::DevirtHint> {
         ic_snapshot
             .iter()
             .map(|ic| {
@@ -814,20 +826,40 @@ impl ExecutionEngine {
         match state {
             TierState::Interpreted => {
                 self.jit_code[idx] = std::ptr::null();
+                self.jit_osr_entries[idx].clear();
                 self.jit_leaf[idx] = false;
                 self.jit_metadata[idx] = None;
             }
             TierState::BaselineNative => {
                 self.jit_code[idx] = self.baseline_code[idx];
+                self.jit_osr_entries[idx] = self.baseline_osr_entries[idx].clone();
                 self.jit_leaf[idx] = self.baseline_leaf[idx];
                 self.jit_metadata[idx] = self.baseline_metadata[idx].clone();
             }
             TierState::OptimizedNative => {
                 self.jit_code[idx] = self.optimized_code[idx];
+                self.jit_osr_entries[idx] = self.optimized_osr_entries[idx].clone();
                 self.jit_leaf[idx] = self.optimized_leaf[idx];
                 self.jit_metadata[idx] = self.optimized_metadata[idx].clone();
             }
         }
+    }
+
+    pub fn active_osr_entry(
+        &self,
+        id: FuncId,
+        target_block: crate::mir::BlockId,
+        param_count: usize,
+    ) -> Option<NativeOsrEntry> {
+        self.jit_osr_entries
+            .get(id.0 as usize)?
+            .iter()
+            .copied()
+            .find(|entry| {
+                entry.target_block == target_block
+                    && entry.param_count as usize == param_count
+                    && !entry.ptr.is_null()
+            })
     }
 
     pub fn tier_state(&self, id: FuncId) -> TierState {
@@ -871,6 +903,15 @@ impl ExecutionEngine {
         }
         if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
             stats.native_to_native_calls += 1;
+        }
+    }
+
+    pub fn note_osr_entry(&mut self, id: FuncId) {
+        if !self.collect_tier_stats {
+            return;
+        }
+        if let Some(stats) = self.tier_stats.get_mut(id.0 as usize) {
+            stats.osr_entries += 1;
         }
     }
 
@@ -929,7 +970,7 @@ impl ExecutionEngine {
             }
             let name = interner.resolve(body.mir().name);
             eprintln!(
-                "FuncId({idx}) {name} tier={:?} interp={} baseline={} opt={} compiles={}/{} ic={}/{} native2native={} deopts={} fallbacks={}",
+                "FuncId({idx}) {name} tier={:?} interp={} baseline={} opt={} compiles={}/{} ic={}/{} native2native={} osr={} deopts={} fallbacks={}",
                 self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted),
                 stats.interpreted_entries,
                 stats.baseline_entries,
@@ -939,6 +980,7 @@ impl ExecutionEngine {
                 stats.ic_hits,
                 stats.ic_misses,
                 stats.native_to_native_calls,
+                stats.osr_entries,
                 stats.deopts_to_baseline,
                 stats.fallbacks_to_interpreter,
             );
@@ -1000,11 +1042,15 @@ impl ExecutionEngine {
         } else {
             std::ptr::null()
         };
+        let osr_entries = executable.osr_entries().to_vec();
         let installed_code_size = executable.code_size();
         if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
             eprintln!(
                 "INSTALL: idx={} tier={:?} native={} ptr={:p}",
-                idx, tier, executable.is_native(), native_ptr
+                idx,
+                tier,
+                executable.is_native(),
+                native_ptr
             );
         }
 
@@ -1029,6 +1075,7 @@ impl ExecutionEngine {
                 };
                 self.functions[idx] = body;
                 self.baseline_code[idx] = native_ptr;
+                self.baseline_osr_entries[idx] = osr_entries;
                 self.baseline_leaf[idx] = inline_safe;
                 self.baseline_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::BaselineNative;
@@ -1042,6 +1089,7 @@ impl ExecutionEngine {
                     *optimized_executable = Some(executable);
                 }
                 self.optimized_code[idx] = native_ptr;
+                self.optimized_osr_entries[idx] = osr_entries;
                 self.optimized_leaf[idx] = inline_safe;
                 self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
@@ -1055,7 +1103,11 @@ impl ExecutionEngine {
         if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
             let jit_ptr = self.jit_code.get(idx).copied().unwrap_or(std::ptr::null());
             let leaf = self.jit_leaf.get(idx).copied().unwrap_or(false);
-            let state = self.tier_states.get(idx).copied().unwrap_or(TierState::Interpreted);
+            let state = self
+                .tier_states
+                .get(idx)
+                .copied()
+                .unwrap_or(TierState::Interpreted);
             eprintln!(
                 "SYNC: idx={} jit_code={:p} leaf={} state={:?}",
                 idx, jit_ptr, leaf, state
@@ -1363,39 +1415,41 @@ impl ExecutionEngine {
                 eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
-            let result =
-                crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
-                    &compile_mir,
-                    target,
-                    &interner_clone,
-                    tier,
-                    callsite_ic_ptrs,
-                    callsite_ic_live_ptrs,
-                    devirt_hints,
-                    Some(jit_code_base_raw as *const *const u8),
-                )
-                .map_err(|e| {
-                    eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
-                    e
-                })
-                .ok()
-                .and_then(|artifact| {
-                    let native_meta = artifact.native_meta;
-                    let inline_safe =
-                        is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
-                    artifact.code.into_executable().map_err(|e| {
+            let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
+                &compile_mir,
+                target,
+                &interner_clone,
+                tier,
+                callsite_ic_ptrs,
+                callsite_ic_live_ptrs,
+                devirt_hints,
+                Some(jit_code_base_raw as *const *const u8),
+            )
+            .map_err(|e| {
+                eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
+                e
+            })
+            .ok()
+            .and_then(|artifact| {
+                let native_meta = artifact.native_meta;
+                let inline_safe =
+                    is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
+                artifact
+                    .code
+                    .into_executable()
+                    .map_err(|e| {
                         eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
                         e
-                    }).ok().map(|executable| {
-                        CompilationResult::Compiled {
-                            id,
-                            tier,
-                            executable,
-                            native_meta,
-                            inline_safe,
-                        }
                     })
-                });
+                    .ok()
+                    .map(|executable| CompilationResult::Compiled {
+                        id,
+                        tier,
+                        executable,
+                        native_meta,
+                        inline_safe,
+                    })
+            });
             if tier_trace_enabled() {
                 eprintln!(
                     "tier-trace: finish {:?} FuncId({}) {} success={}",
@@ -1459,7 +1513,11 @@ impl ExecutionEngine {
     /// JIT function runs and calls its callees, those callees are likely
     /// already compiled (or being compiled).
     fn queue_callees_from_ic(&mut self, caller_id: FuncId) {
-        let bc_ptr = self.bc_cache.get(caller_id.0 as usize).copied().unwrap_or(std::ptr::null());
+        let bc_ptr = self
+            .bc_cache
+            .get(caller_id.0 as usize)
+            .copied()
+            .unwrap_or(std::ptr::null());
         if bc_ptr.is_null() {
             return;
         }
@@ -1476,7 +1534,11 @@ impl ExecutionEngine {
                     .get(callee_idx)
                     .map(|p| !p.is_null())
                     .unwrap_or(false);
-                let already_queued = self.compiling_tier.get(callee_idx).map(|t| t.is_some()).unwrap_or(false)
+                let already_queued = self
+                    .compiling_tier
+                    .get(callee_idx)
+                    .map(|t| t.is_some())
+                    .unwrap_or(false)
                     || self.compile_queue.contains(&callee_id);
                 if !already_compiled && !already_queued && callee_idx < self.functions.len() {
                     self.compile_queue.push(callee_id);
@@ -1514,7 +1576,9 @@ impl ExecutionEngine {
     /// Check if the background compilation thread is idle (finished or absent).
     #[inline]
     pub fn compile_thread_idle(&self) -> bool {
-        self.compile_handle.as_ref().map_or(true, |h| h.is_finished())
+        self.compile_handle
+            .as_ref()
+            .map_or(true, |h| h.is_finished())
     }
 
     /// Drain the compile queue: if the background thread is idle and there
@@ -1633,6 +1697,12 @@ mod tests {
         let id = engine.register_function(mir);
         assert_eq!(id, FuncId(0));
         assert!(engine.get_function(id).is_some());
+        assert!(engine.jit_osr_entries[id.0 as usize].is_empty());
+        assert!(engine.baseline_osr_entries[id.0 as usize].is_empty());
+        assert!(engine.optimized_osr_entries[id.0 as usize].is_empty());
+        assert!(engine
+            .active_osr_entry(id, crate::mir::BlockId(0), 0)
+            .is_none());
     }
 
     #[test]

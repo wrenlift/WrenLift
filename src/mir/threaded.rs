@@ -14,7 +14,6 @@
 /// This eliminates: bytecode decode (~15ns), match dispatch (~10ns), and
 /// gives better branch prediction (each handler is a unique call target).
 /// Expected: ~40ns/method-call vs ~75ns for bytecode interpreter.
-
 use crate::intern::SymbolId;
 use crate::mir::bytecode::CallSiteIC;
 use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
@@ -214,8 +213,11 @@ fn op_cmp_eq(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     // For objects that aren't strings/nums/bools, dispatch ==(_) as a
     // method call to support operator overloading. Mirrors the bytecode
     // interpreter's try_operator_dispatch path.
-    if lhs.is_object() && !lhs.is_string_object()
-        && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num()
+    if lhs.is_object()
+        && !lhs.is_string_object()
+        && !rhs.is_null()
+        && !rhs.is_bool()
+        && !rhs.is_num()
     {
         let eq_sym = crate::intern::SymbolId::from_raw(op.c);
         if eq_sym.index() != 0 {
@@ -240,8 +242,11 @@ fn op_cmp_eq(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
 fn op_cmp_ne(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let lhs = get(state, op.a);
     let rhs = get(state, op.b);
-    if lhs.is_object() && !lhs.is_string_object()
-        && !rhs.is_null() && !rhs.is_bool() && !rhs.is_num()
+    if lhs.is_object()
+        && !lhs.is_string_object()
+        && !rhs.is_null()
+        && !rhs.is_bool()
+        && !rhs.is_num()
     {
         let ne_sym = crate::intern::SymbolId::from_raw(op.c);
         if ne_sym.index() != 0 {
@@ -363,9 +368,8 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
         let ic = &ic_table[ic_idx];
         if ic.kind == 1 && recv.is_object() {
             let obj_ptr = unsafe { recv.as_object().unwrap_unchecked() };
-            let recv_class = unsafe {
-                (*(obj_ptr as *const crate::runtime::object::ObjHeader)).class as usize
-            };
+            let recv_class =
+                unsafe { (*(obj_ptr as *const crate::runtime::object::ObjHeader)).class as usize };
             if recv_class == ic.class {
                 let jit_ptr = ic.jit_ptr;
                 if !jit_ptr.is_null() {
@@ -374,8 +378,7 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
                     let result = unsafe {
                         match argc {
                             0 => {
-                                let f: extern "C" fn(u64) -> u64 =
-                                    std::mem::transmute(jit_ptr);
+                                let f: extern "C" fn(u64) -> u64 = std::mem::transmute(jit_ptr);
                                 f(recv_bits)
                             }
                             1 => {
@@ -420,24 +423,26 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     // Slow path: full wren_call_N dispatch
     let recv_bits = recv.to_bits();
     let method_bits = method.index() as u64;
-    let result = unsafe { match argc {
-        0 => crate::codegen::runtime_fns::wren_call_0(recv_bits, method_bits),
-        1 => {
-            let a0 = get(state, ((op.extra >> 8) & 0xFFFF) as u16).to_bits();
-            crate::codegen::runtime_fns::wren_call_1(recv_bits, method_bits, a0)
+    let result = unsafe {
+        match argc {
+            0 => crate::codegen::runtime_fns::wren_call_0(recv_bits, method_bits),
+            1 => {
+                let a0 = get(state, ((op.extra >> 8) & 0xFFFF) as u16).to_bits();
+                crate::codegen::runtime_fns::wren_call_1(recv_bits, method_bits, a0)
+            }
+            2 => {
+                let a0 = get(state, ((op.extra >> 8) & 0xFFFF) as u16).to_bits();
+                let a1 = get(state, ((op.extra >> 24) & 0xFFFF) as u16).to_bits();
+                crate::codegen::runtime_fns::wren_call_2(recv_bits, method_bits, a0, a1)
+            }
+            _ => {
+                let a0 = get(state, ((op.extra >> 8) & 0xFFFF) as u16).to_bits();
+                let a1 = get(state, ((op.extra >> 24) & 0xFFFF) as u16).to_bits();
+                let a2 = get(state, ((op.extra >> 40) & 0xFFFF) as u16).to_bits();
+                crate::codegen::runtime_fns::wren_call_3(recv_bits, method_bits, a0, a1, a2)
+            }
         }
-        2 => {
-            let a0 = get(state, ((op.extra >> 8) & 0xFFFF) as u16).to_bits();
-            let a1 = get(state, ((op.extra >> 24) & 0xFFFF) as u16).to_bits();
-            crate::codegen::runtime_fns::wren_call_2(recv_bits, method_bits, a0, a1)
-        }
-        _ => {
-            let a0 = get(state, ((op.extra >> 8) & 0xFFFF) as u16).to_bits();
-            let a1 = get(state, ((op.extra >> 24) & 0xFFFF) as u16).to_bits();
-            let a2 = get(state, ((op.extra >> 40) & 0xFFFF) as u16).to_bits();
-            crate::codegen::runtime_fns::wren_call_3(recv_bits, method_bits, a0, a1, a2)
-        }
-    } };
+    };
     set(state, op.dst, Value::from_bits(result));
     state.pc + 1
 }
@@ -483,28 +488,36 @@ fn op_neg(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
 
 fn op_div(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let r = crate::codegen::runtime_fns::wren_num_div(
-        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+        get(state, op.a).to_bits(),
+        get(state, op.b).to_bits(),
+    );
     set(state, op.dst, Value::from_bits(r));
     state.pc + 1
 }
 
 fn op_mod(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let r = crate::codegen::runtime_fns::wren_num_mod(
-        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+        get(state, op.a).to_bits(),
+        get(state, op.b).to_bits(),
+    );
     set(state, op.dst, Value::from_bits(r));
     state.pc + 1
 }
 
 fn op_cmp_gt(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let r = crate::codegen::runtime_fns::wren_cmp_gt(
-        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+        get(state, op.a).to_bits(),
+        get(state, op.b).to_bits(),
+    );
     set(state, op.dst, Value::from_bits(r));
     state.pc + 1
 }
 
 fn op_cmp_le(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let r = crate::codegen::runtime_fns::wren_cmp_le(
-        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+        get(state, op.a).to_bits(),
+        get(state, op.b).to_bits(),
+    );
     set(state, op.dst, Value::from_bits(r));
     state.pc + 1
 }
@@ -517,14 +530,18 @@ fn op_guard_num(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
 
 fn op_is_type(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let r = crate::codegen::runtime_fns::wren_is_type(
-        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+        get(state, op.a).to_bits(),
+        get(state, op.b).to_bits(),
+    );
     set(state, op.dst, Value::from_bits(r));
     state.pc + 1
 }
 
 fn op_write_barrier(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     crate::codegen::runtime_fns::wren_write_barrier(
-        get(state, op.a).to_bits(), get(state, op.b).to_bits());
+        get(state, op.a).to_bits(),
+        get(state, op.b).to_bits(),
+    );
     state.pc + 1
 }
 
@@ -592,17 +609,18 @@ pub fn can_use_threaded(mir: &MirFunction) -> bool {
                 | Instruction::ToString(_)
                 | Instruction::ConstString(_)
                 | Instruction::GuardNum(_)
-                | Instruction::GuardBool(_)
-                => {}
+                | Instruction::GuardBool(_) => {}
                 _ => return false,
             }
         }
         // Check terminator: CondBranch with args needs phi resolution
         // which the threaded interpreter doesn't support yet.
         match &block.terminator {
-            Terminator::CondBranch { true_args, false_args, .. }
-                if !true_args.is_empty() || !false_args.is_empty() =>
-            {
+            Terminator::CondBranch {
+                true_args,
+                false_args,
+                ..
+            } if !true_args.is_empty() || !false_args.is_empty() => {
                 return false;
             }
             _ => {}
@@ -612,7 +630,10 @@ pub fn can_use_threaded(mir: &MirFunction) -> bool {
 }
 
 /// Lower a MIR function into threaded code for fast interpretation.
-pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern::Interner>) -> ThreadedCode {
+pub fn lower_mir_to_threaded(
+    mir: &MirFunction,
+    interner: Option<&crate::intern::Interner>,
+) -> ThreadedCode {
     // Look up operator method symbols for CmpEq/CmpNe dispatch.
     let eq_sym = interner
         .and_then(|i| i.lookup("==(_)"))
@@ -657,132 +678,206 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                 Instruction::ConstNull => ThreadedOp {
                     handler: op_const_null,
                     dst,
-                    a: 0, b: 0, c: 0, extra: 0,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::ConstBool(true) => ThreadedOp {
                     handler: op_const_true,
                     dst,
-                    a: 0, b: 0, c: 0, extra: 0,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::ConstBool(false) => ThreadedOp {
                     handler: op_const_false,
                     dst,
-                    a: 0, b: 0, c: 0, extra: 0,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::ConstNum(f) => ThreadedOp {
                     handler: op_const_num,
                     dst,
-                    a: 0, b: 0, c: 0,
+                    a: 0,
+                    b: 0,
+                    c: 0,
                     extra: Value::num(*f).to_bits(),
                 },
                 Instruction::ConstI64(i) => ThreadedOp {
                     handler: op_const_num,
                     dst,
-                    a: 0, b: 0, c: 0,
+                    a: 0,
+                    b: 0,
+                    c: 0,
                     extra: *i as u64,
                 },
                 Instruction::Move(src) => ThreadedOp {
                     handler: op_move,
                     dst,
-                    a: src.0 as u16, b: 0, c: 0, extra: 0,
+                    a: src.0 as u16,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::BlockParam(idx) => ThreadedOp {
                     handler: op_move,
                     dst,
-                    a: *idx, b: 0, c: 0, extra: 0,
+                    a: *idx,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 // Arithmetic
                 Instruction::Add(a, b) => ThreadedOp {
                     handler: op_add,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::Sub(a, b) => ThreadedOp {
                     handler: op_sub,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::Mul(a, b) => ThreadedOp {
                     handler: op_mul,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::AddF64(a, b) => ThreadedOp {
                     handler: op_add_f64,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::SubF64(a, b) => ThreadedOp {
                     handler: op_sub_f64,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::MulF64(a, b) => ThreadedOp {
                     handler: op_mul_f64,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 // Comparisons
                 Instruction::CmpLt(a, b) => ThreadedOp {
                     handler: op_cmp_lt,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::CmpGe(a, b) => ThreadedOp {
                     handler: op_cmp_ge,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::CmpEq(a, b) => ThreadedOp {
                     handler: op_cmp_eq,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: eq_sym, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: eq_sym,
+                    extra: 0,
                 },
                 Instruction::CmpNe(a, b) => ThreadedOp {
                     handler: op_cmp_ne,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: ne_sym, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: ne_sym,
+                    extra: 0,
                 },
                 Instruction::CmpLtF64(a, b) => ThreadedOp {
                     handler: op_cmp_lt_f64,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::CmpGeF64(a, b) => ThreadedOp {
                     handler: op_cmp_ge_f64,
                     dst,
-                    a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 // Logical
                 Instruction::Not(a) => ThreadedOp {
                     handler: op_not,
                     dst,
-                    a: a.0 as u16, b: 0, c: 0, extra: 0,
+                    a: a.0 as u16,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 // Field access
                 Instruction::GetField(recv, idx) => ThreadedOp {
                     handler: op_get_field,
                     dst,
-                    a: recv.0 as u16, b: *idx, c: 0, extra: 0,
+                    a: recv.0 as u16,
+                    b: *idx,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::SetField(recv, idx, val) => ThreadedOp {
                     handler: op_set_field,
                     dst,
-                    a: recv.0 as u16, b: *idx, c: val.0 as u32, extra: 0,
+                    a: recv.0 as u16,
+                    b: *idx,
+                    c: val.0 as u32,
+                    extra: 0,
                 },
                 // Module vars
                 Instruction::GetModuleVar(slot) => ThreadedOp {
                     handler: op_get_module_var,
                     dst,
-                    a: *slot, b: 0, c: 0, extra: 0,
+                    a: *slot,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::SetModuleVar(slot, val) => ThreadedOp {
                     handler: op_set_module_var,
                     dst,
-                    a: *slot, b: val.0 as u16, c: 0, extra: 0,
+                    a: *slot,
+                    b: val.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 // Method calls
-                Instruction::Call { receiver, method, args } => {
+                Instruction::Call {
+                    receiver,
+                    method,
+                    args,
+                } => {
                     let cur_ic = ic_idx;
                     ic_idx += 1;
                     ic_entries.push(CallSiteIC::default());
@@ -804,55 +899,103 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                 // More arithmetic
                 Instruction::Div(a, b) => ThreadedOp {
                     handler: op_div,
-                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::Mod(a, b) => ThreadedOp {
                     handler: op_mod,
-                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::Neg(a) => ThreadedOp {
                     handler: op_neg,
-                    dst, a: a.0 as u16, b: 0, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 // More comparisons
                 Instruction::CmpGt(a, b) => ThreadedOp {
                     handler: op_cmp_gt,
-                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::CmpLe(a, b) => ThreadedOp {
                     handler: op_cmp_le,
-                    dst, a: a.0 as u16, b: b.0 as u16, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: b.0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 // Runtime-backed ops
                 Instruction::MakeRange(from, to, inclusive) => ThreadedOp {
                     handler: op_make_range,
-                    dst, a: from.0 as u16, b: to.0 as u16,
-                    c: if *inclusive { 1 } else { 0 }, extra: 0,
+                    dst,
+                    a: from.0 as u16,
+                    b: to.0 as u16,
+                    c: if *inclusive { 1 } else { 0 },
+                    extra: 0,
                 },
                 Instruction::ToString(a) => ThreadedOp {
                     handler: op_to_string,
-                    dst, a: a.0 as u16, b: 0, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::StringConcat(parts) if parts.len() == 2 => ThreadedOp {
                     handler: op_string_concat,
-                    dst, a: parts[0].0 as u16, b: parts[1].0 as u16, c: 0, extra: 0,
+                    dst,
+                    a: parts[0].0 as u16,
+                    b: parts[1].0 as u16,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::ConstString(idx) => ThreadedOp {
                     handler: op_const_string,
-                    dst, a: 0, b: 0, c: 0, extra: *idx as u64,
+                    dst,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    extra: *idx as u64,
                 },
                 // Guards (no-op in threaded mode)
                 Instruction::GuardNum(a) | Instruction::GuardBool(a) => ThreadedOp {
                     handler: op_guard_num,
-                    dst, a: a.0 as u16, b: 0, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
                 Instruction::IsType(a, cls) => ThreadedOp {
                     handler: op_is_type,
-                    dst, a: a.0 as u16, b: 0 /* cls used at runtime */, c: 0, extra: 0,
+                    dst,
+                    a: a.0 as u16,
+                    b: 0, /* cls used at runtime */
+                    c: 0,
+                    extra: 0,
                 },
 
                 // Calls that go through runtime (same slow path as op_call)
-                Instruction::CallKnownFunc { receiver, method, args, .. } => {
+                Instruction::CallKnownFunc {
+                    receiver,
+                    method,
+                    args,
+                    ..
+                } => {
                     let recv_id = receiver.0 as u16;
                     let cur_ic = ic_idx;
                     ic_idx += 1;
@@ -864,8 +1007,11 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                     }
                     ThreadedOp {
                         handler: op_call,
-                        dst, a: recv_id, b: method.index() as u16,
-                        c: cur_ic as u32, extra: packed,
+                        dst,
+                        a: recv_id,
+                        b: method.index() as u16,
+                        c: cur_ic as u32,
+                        extra: packed,
                     }
                 }
                 Instruction::CallStaticSelf { args } => {
@@ -877,21 +1023,32 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                     }
                     ThreadedOp {
                         handler: op_call, // fallback to generic call
-                        dst, a: 0, b: 0, c: 0, extra: packed,
+                        dst,
+                        a: 0,
+                        b: 0,
+                        c: 0,
+                        extra: packed,
                     }
                 }
                 Instruction::MakeList(elems) => {
                     // For now, delegate to runtime
                     ThreadedOp {
                         handler: op_noop,
-                        dst, a: 0, b: 0, c: 0, extra: 0,
+                        dst,
+                        a: 0,
+                        b: 0,
+                        c: 0,
+                        extra: 0,
                     }
                 }
                 // Everything else: noop placeholder
                 _ => ThreadedOp {
                     handler: op_noop,
                     dst,
-                    a: 0, b: 0, c: 0, extra: 0,
+                    a: 0,
+                    b: 0,
+                    c: 0,
+                    extra: 0,
                 },
             };
             ops.push(threaded_op);
@@ -906,16 +1063,27 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                 for (i, arg) in args.iter().enumerate() {
                     if i < target_block.params.len() {
                         let dst_vid = target_block.params[i].0;
-                        if dst_vid.0 as u16 > max_reg { max_reg = dst_vid.0 as u16; }
+                        if dst_vid.0 as u16 > max_reg {
+                            max_reg = dst_vid.0 as u16;
+                        }
                         ops.push(ThreadedOp {
                             handler: op_move,
                             dst: dst_vid.0 as u16,
-                            a: arg.0 as u16, b: 0, c: 0, extra: 0,
+                            a: arg.0 as u16,
+                            b: 0,
+                            c: 0,
+                            extra: 0,
                         });
                     }
                 }
             }
-            Terminator::CondBranch { true_target, true_args, false_target, false_args, .. } => {
+            Terminator::CondBranch {
+                true_target,
+                true_args,
+                false_target,
+                false_args,
+                ..
+            } => {
                 // CondBranch args are trickier: we need to copy args for
                 // BOTH branches. But we can only execute one set. For now,
                 // emit moves AFTER the branch in each target's block start.
@@ -932,12 +1100,18 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
             Terminator::Return(val) => ThreadedOp {
                 handler: op_return,
                 dst: 0,
-                a: val.0 as u16, b: 0, c: 0, extra: 0,
+                a: val.0 as u16,
+                b: 0,
+                c: 0,
+                extra: 0,
             },
             Terminator::ReturnNull => ThreadedOp {
                 handler: op_return_null,
                 dst: 0,
-                a: 0, b: 0, c: 0, extra: 0,
+                a: 0,
+                b: 0,
+                c: 0,
+                extra: 0,
             },
             Terminator::Branch { target, args: _ } => {
                 let idx = ops.len();
@@ -945,7 +1119,8 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
                 ThreadedOp {
                     handler: op_branch,
                     dst: 0,
-                    a: 0, b: 0,
+                    a: 0,
+                    b: 0,
                     c: 0, // fixup later
                     extra: 0,
                 }
@@ -972,7 +1147,10 @@ pub fn lower_mir_to_threaded(mir: &MirFunction, interner: Option<&crate::intern:
             Terminator::Unreachable => ThreadedOp {
                 handler: op_unreachable,
                 dst: 0,
-                a: 0, b: 0, c: 0, extra: 0,
+                a: 0,
+                b: 0,
+                c: 0,
+                extra: 0,
             },
         };
         ops.push(term_op);
@@ -1008,6 +1186,14 @@ thread_local! {
 #[inline]
 pub fn threaded_depth_ok() -> bool {
     THREADED_DEPTH.with(|d| d.get() < MAX_THREADED_DEPTH)
+}
+
+/// Env-gated kill switch for threaded dispatch. Set WLIFT_DISABLE_THREADED=1
+/// to force the bytecode interpreter, which preserves OSR safepoints. Used
+/// while Phase 4 OSR is integrated with method-level hot loops.
+#[inline]
+pub fn threaded_enabled() -> bool {
+    std::env::var_os("WLIFT_DISABLE_THREADED").is_none()
 }
 
 /// Execute threaded code and return the result + the register file for reuse.
@@ -1077,8 +1263,8 @@ pub fn execute_threaded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mir::{MirFunction, Instruction, Terminator};
     use crate::intern::Interner;
+    use crate::mir::{Instruction, MirFunction, Terminator};
 
     /// Helper: emit instruction into block, return ValueId
     fn emit(f: &mut MirFunction, bb: BlockId, inst: Instruction) -> ValueId {
@@ -1097,7 +1283,15 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v0);
 
         let code = lower_mir_to_threaded(&f, None);
-        let (result, _regs) = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None, None);
+        let (result, _regs) = execute_threaded(
+            &code,
+            &[],
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            None,
+            None,
+        );
         assert_eq!(result.as_num(), Some(42.0));
     }
 
@@ -1113,7 +1307,15 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
         let code = lower_mir_to_threaded(&f, None);
-        let (result, _regs) = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None, None);
+        let (result, _regs) = execute_threaded(
+            &code,
+            &[],
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            None,
+            None,
+        );
         assert_eq!(result.as_num(), Some(42.0));
     }
 
@@ -1128,7 +1330,15 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
         let code = lower_mir_to_threaded(&f, None);
-        let (result, _regs) = execute_threaded(&code, &[], std::ptr::null_mut(), 0, std::ptr::null_mut(), None, None);
+        let (result, _regs) = execute_threaded(
+            &code,
+            &[],
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            None,
+            None,
+        );
         // not(true) = false
         assert!(result.is_falsy());
     }

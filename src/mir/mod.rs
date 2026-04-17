@@ -8,12 +8,15 @@
 /// one value. Block parameters receive values from predecessor branches.
 pub mod builder;
 pub mod bytecode;
-pub mod threaded;
 pub mod interp;
 pub mod opt;
 pub mod ssa;
+pub mod threaded;
 
-use std::fmt;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use crate::intern::SymbolId;
 
@@ -883,6 +886,113 @@ impl MirFunction {
         out.push_str("}\n");
         out
     }
+}
+
+/// Return true for MIR values the OSR entry can recreate exactly.
+pub fn is_osr_rematerializable(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::ConstNum(_)
+            | Instruction::ConstBool(_)
+            | Instruction::ConstNull
+            | Instruction::ConstF64(_)
+            | Instruction::ConstI64(_)
+    )
+}
+
+/// Constants defined outside `target`'s reachable region that can be rebuilt
+/// in a native OSR entry instead of being passed from the interpreter.
+pub fn osr_rematerializable_defs(
+    func: &MirFunction,
+    target: BlockId,
+) -> HashMap<ValueId, Instruction> {
+    let reachable = osr_reachable_blocks(func, target);
+    let mut defs = HashMap::new();
+    for (idx, block) in func.blocks.iter().enumerate() {
+        if reachable.contains(&idx) {
+            continue;
+        }
+        for &(vid, ref inst) in &block.instructions {
+            if is_osr_rematerializable(inst) {
+                defs.insert(vid, inst.clone());
+            }
+        }
+    }
+    defs
+}
+
+/// Values used by a loop/header region but defined outside it, excluding
+/// constants that can be rematerialized. The order is deterministic and is
+/// part of the bytecode-to-native OSR ABI.
+pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<ValueId> {
+    let reachable = osr_reachable_blocks(func, target);
+    let rematerializable = osr_rematerializable_defs(func, target);
+    let mut internal_defs = HashSet::new();
+    for &idx in &reachable {
+        let block = &func.blocks[idx];
+        for &(param, _) in &block.params {
+            internal_defs.insert(param);
+        }
+        for &(dst, _) in &block.instructions {
+            internal_defs.insert(dst);
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut live = Vec::new();
+    for idx in osr_rpo_from(func, target) {
+        let block = &func.blocks[idx];
+        for (_, inst) in &block.instructions {
+            for op in inst.operands() {
+                if !internal_defs.contains(&op)
+                    && !rematerializable.contains_key(&op)
+                    && seen.insert(op)
+                {
+                    live.push(op);
+                }
+            }
+        }
+        for op in block.terminator.operands() {
+            if !internal_defs.contains(&op)
+                && !rematerializable.contains_key(&op)
+                && seen.insert(op)
+            {
+                live.push(op);
+            }
+        }
+    }
+    live
+}
+
+fn osr_reachable_blocks(func: &MirFunction, start: BlockId) -> HashSet<usize> {
+    let mut reachable = HashSet::new();
+    fn dfs(idx: usize, func: &MirFunction, reachable: &mut HashSet<usize>) {
+        if idx >= func.blocks.len() || !reachable.insert(idx) {
+            return;
+        }
+        for succ in func.blocks[idx].terminator.successors() {
+            dfs(succ.0 as usize, func, reachable);
+        }
+    }
+    dfs(start.0 as usize, func, &mut reachable);
+    reachable
+}
+
+fn osr_rpo_from(func: &MirFunction, start: BlockId) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    fn dfs(idx: usize, func: &MirFunction, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
+        if idx >= func.blocks.len() || !seen.insert(idx) {
+            return;
+        }
+        for succ in func.blocks[idx].terminator.successors() {
+            dfs(succ.0 as usize, func, seen, order);
+        }
+        order.push(idx);
+    }
+    dfs(start.0 as usize, func, &mut seen, &mut order);
+    order.reverse();
+    order
 }
 
 // ---------------------------------------------------------------------------

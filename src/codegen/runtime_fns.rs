@@ -2003,9 +2003,9 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
         .or_else(|| unsafe { find_method_with_class(class, method_sym) });
 
     let is_match = match actual_method {
-        Some((crate::runtime::object::Method::Closure(cp), _)) => {
-            unsafe { (*(*cp).function).fn_id == func_id }
-        }
+        Some((crate::runtime::object::Method::Closure(cp), _)) => unsafe {
+            (*(*cp).function).fn_id == func_id
+        },
         _ => false,
     };
 
@@ -2015,7 +2015,12 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
     }
 
     let fid_obj = crate::runtime::engine::FuncId(func_id);
-    let jit_ptr = vm.engine.jit_code.get(fid).copied().unwrap_or(std::ptr::null());
+    let jit_ptr = vm
+        .engine
+        .jit_code
+        .get(fid)
+        .copied()
+        .unwrap_or(std::ptr::null());
 
     if !jit_ptr.is_null() && args.len() <= 4 {
         let saved_ctx = read_jit_ctx();
@@ -2056,7 +2061,12 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
     };
     let fid = func_id as usize;
     let fid_obj = crate::runtime::engine::FuncId(func_id);
-    let jit_ptr = vm.engine.jit_code.get(fid).copied().unwrap_or(std::ptr::null());
+    let jit_ptr = vm
+        .engine
+        .jit_code
+        .get(fid)
+        .copied()
+        .unwrap_or(std::ptr::null());
 
     if !jit_ptr.is_null() && args.len() <= 4 {
         // For leaf callees (no internal wren_call_N), we don't need to
@@ -2107,10 +2117,31 @@ pub extern "C" fn wren_known_call_1_nocheck(packed: u64, recv: u64, a0: u64) -> 
     wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0)])
 }
 pub extern "C" fn wren_known_call_2_nocheck(packed: u64, recv: u64, a0: u64, a1: u64) -> u64 {
-    wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1)])
+    wren_known_call_nocheck_inner(
+        packed,
+        &[
+            Value::from_bits(recv),
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+        ],
+    )
 }
-pub extern "C" fn wren_known_call_3_nocheck(packed: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    wren_known_call_nocheck_inner(packed, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+pub extern "C" fn wren_known_call_3_nocheck(
+    packed: u64,
+    recv: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+) -> u64 {
+    wren_known_call_nocheck_inner(
+        packed,
+        &[
+            Value::from_bits(recv),
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+            Value::from_bits(a2),
+        ],
+    )
 }
 
 /// Known call with 1 extra arg: (func_id, recv, a0) -> result
@@ -2120,12 +2151,27 @@ pub extern "C" fn wren_known_call_1(func_id: u64, recv: u64, a0: u64) -> u64 {
 
 /// Known call with 2 extra args: (func_id, recv, a0, a1) -> result
 pub extern "C" fn wren_known_call_2(func_id: u64, recv: u64, a0: u64, a1: u64) -> u64 {
-    wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1)])
+    wren_known_call_inner(
+        func_id,
+        &[
+            Value::from_bits(recv),
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+        ],
+    )
 }
 
 /// Known call with 3 extra args
 pub extern "C" fn wren_known_call_3(func_id: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    wren_known_call_inner(func_id, &[Value::from_bits(recv), Value::from_bits(a0), Value::from_bits(a1), Value::from_bits(a2)])
+    wren_known_call_inner(
+        func_id,
+        &[
+            Value::from_bits(recv),
+            Value::from_bits(a0),
+            Value::from_bits(a1),
+            Value::from_bits(a2),
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------

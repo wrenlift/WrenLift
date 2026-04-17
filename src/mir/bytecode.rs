@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use crate::ast::Span;
 use crate::mir::{
-    BasicBlock, BlockId, Instruction, MathBinaryOp, MathUnaryOp, MirFunction, Terminator, ValueId,
+    osr_external_live_values, BasicBlock, BlockId, Instruction, MathBinaryOp, MathUnaryOp,
+    MirFunction, Terminator, ValueId,
 };
 
 // ---------------------------------------------------------------------------
@@ -200,6 +201,7 @@ impl Clone for BytecodeFunction {
             block_offsets: self.block_offsets.clone(),
             register_count: self.register_count,
             param_offsets: self.param_offsets.clone(),
+            osr_points: self.osr_points.clone(),
             ic_table: std::cell::UnsafeCell::new(unsafe { &*self.ic_table.get() }.clone()),
         }
     }
@@ -236,8 +238,24 @@ pub struct BytecodeFunction {
     /// Cached entry block param layout: [(dst_register, param_index), ...].
     /// Pre-computed during lowering so callers don't need to re-scan bytecode.
     pub param_offsets: Vec<(u16, u16)>,
+    /// Candidate loop-header OSR points discovered while lowering branches.
+    pub osr_points: Vec<OsrPoint>,
     /// Inline cache table for call sites (mutable through Arc via UnsafeCell).
     pub ic_table: std::cell::UnsafeCell<Vec<CallSiteIC>>,
+}
+
+/// Metadata for a bytecode back-edge that may later transfer into native OSR.
+#[derive(Debug, Clone)]
+pub struct OsrPoint {
+    /// Bytecode offset of the Branch opcode that forms the back-edge.
+    pub branch_offset: u32,
+    /// Bytecode offset of the target loop-header block.
+    pub target_offset: u32,
+    /// MIR block id for the target loop header.
+    pub target_block: BlockId,
+    /// Registers passed to native OSR: external live-ins first, then target
+    /// block params after branch binding.
+    pub param_regs: Vec<u16>,
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +268,12 @@ struct PatchSite {
     code_offset: usize,
     /// The MIR BlockId this branch targets.
     target_block: BlockId,
+}
+
+struct PendingOsrPoint {
+    branch_offset: u32,
+    target_block: BlockId,
+    param_regs: Vec<u16>,
 }
 
 /// Lower a MirFunction to compact bytecode.
@@ -268,6 +292,7 @@ struct Encoder<'a> {
     source_map: Vec<(u32, Span)>,
     block_offsets: Vec<u32>,
     patches: Vec<PatchSite>,
+    osr_points: Vec<PendingOsrPoint>,
     call_site_count: u16,
 }
 
@@ -281,6 +306,7 @@ impl<'a> Encoder<'a> {
             source_map: Vec::new(),
             block_offsets: vec![0u32; mir.blocks.len()],
             patches: Vec::new(),
+            osr_points: Vec::new(),
             call_site_count: 0,
         }
     }
@@ -679,41 +705,40 @@ impl<'a> Encoder<'a> {
         params
     }
 
-    /// Emit [dst, src] pairs for block param binding in a branch.
-    fn emit_branch_params(&mut self, target: BlockId, args: &[ValueId]) {
+    fn branch_param_bindings(&self, target: BlockId, args: &[ValueId]) -> Vec<(u16, u16)> {
         let target_block = &self.mir.blocks[target.0 as usize];
-        // Prefer block.params if populated, otherwise scan for BlockParam instructions
+        // Prefer block.params if populated, otherwise scan for BlockParam instructions.
         if !target_block.params.is_empty() {
             let param_count = target_block.params.len().min(args.len());
-            self.emit_u8(param_count as u8);
-            for (arg, &(param_vid, _)) in args
-                .iter()
+            args.iter()
                 .zip(target_block.params.iter())
                 .take(param_count)
-            {
-                self.emit_reg(param_vid); // dst
-                self.emit_reg(*arg); // src
-            }
+                .map(|(arg, &(param_vid, _))| (param_vid.0 as u16, arg.0 as u16))
+                .collect()
         } else {
             let block_params = Self::collect_block_params(target_block);
-            let mut count = 0u8;
-            // Count how many params can be bound
-            for (_, idx) in &block_params {
-                if (*idx as usize) < args.len() {
-                    count += 1;
-                }
-            }
-            self.emit_u8(count);
-            for (vid, idx) in &block_params {
-                if (*idx as usize) < args.len() {
-                    self.emit_reg(*vid); // dst
-                    self.emit_reg(args[*idx as usize]); // src
-                }
-            }
+            block_params
+                .iter()
+                .filter_map(|(vid, idx)| {
+                    args.get(*idx as usize)
+                        .map(|arg| (vid.0 as u16, arg.0 as u16))
+                })
+                .collect()
         }
     }
 
-    fn emit_terminator(&mut self, term: &Terminator, _block: &BasicBlock) {
+    /// Emit [dst, src] pairs for block param binding in a branch.
+    fn emit_branch_params(&mut self, target: BlockId, args: &[ValueId]) -> Vec<(u16, u16)> {
+        let bindings = self.branch_param_bindings(target, args);
+        self.emit_u8(bindings.len() as u8);
+        for &(dst, src) in &bindings {
+            self.emit_u16(dst);
+            self.emit_u16(src);
+        }
+        bindings
+    }
+
+    fn emit_terminator(&mut self, term: &Terminator, block: &BasicBlock) {
         match term {
             Terminator::Return(v) => {
                 self.emit_op(Op::Return);
@@ -726,9 +751,22 @@ impl<'a> Encoder<'a> {
                 self.emit_op(Op::Unreachable);
             }
             Terminator::Branch { target, args } => {
+                let branch_offset = self.code.len() as u32;
                 self.emit_op(Op::Branch);
                 self.emit_branch_target(*target);
-                self.emit_branch_params(*target, args);
+                let bindings = self.emit_branch_params(*target, args);
+                if target.0 <= block.id.0 {
+                    let mut param_regs: Vec<u16> = osr_external_live_values(self.mir, *target)
+                        .into_iter()
+                        .map(|vid| vid.0 as u16)
+                        .collect();
+                    param_regs.extend(bindings.iter().map(|(dst, _)| *dst));
+                    self.osr_points.push(PendingOsrPoint {
+                        branch_offset,
+                        target_block: *target,
+                        param_regs,
+                    });
+                }
             }
             Terminator::CondBranch {
                 condition,
@@ -791,6 +829,23 @@ impl<'a> Encoder<'a> {
             param_offsets.push((dst, param_idx));
         }
 
+        let osr_points = self
+            .osr_points
+            .into_iter()
+            .filter_map(|point| {
+                let target_offset = self
+                    .block_offsets
+                    .get(point.target_block.0 as usize)
+                    .copied()?;
+                (target_offset < point.branch_offset).then_some(OsrPoint {
+                    branch_offset: point.branch_offset,
+                    target_offset,
+                    target_block: point.target_block,
+                    param_regs: point.param_regs,
+                })
+            })
+            .collect();
+
         BytecodeFunction {
             code: self.code,
             constants: self.constants,
@@ -798,6 +853,7 @@ impl<'a> Encoder<'a> {
             block_offsets: self.block_offsets,
             register_count: self.mir.next_value,
             param_offsets,
+            osr_points,
             ic_table: std::cell::UnsafeCell::new(vec![
                 CallSiteIC::default();
                 self.call_site_count as usize
@@ -1040,6 +1096,83 @@ mod tests {
         // Branch starts at offset 3, target is at offset 4 (after opcode)
         let target = u32::from_le_bytes([bc.code[4], bc.code[5], bc.code[6], bc.code[7]]);
         assert_eq!(target, bb1_offset);
+        assert!(bc.osr_points.is_empty());
+    }
+
+    #[test]
+    fn test_lower_records_backedge_osr_point() {
+        let mut f = make_func();
+        let bb0 = f.new_block();
+        let bb1 = f.new_block();
+
+        let v0 = f.new_value();
+        let v_loop = f.new_value();
+
+        f.block_mut(bb0)
+            .instructions
+            .push((v0, Instruction::ConstNum(1.0)));
+        f.block_mut(bb0).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v0],
+        };
+
+        f.block_mut(bb1).params.push((v_loop, MirType::Value));
+        let v_body = f.new_value();
+        f.block_mut(bb1)
+            .instructions
+            .push((v_body, Instruction::ConstNull));
+        f.block_mut(bb1).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v_loop],
+        };
+
+        let bc = lower(&f);
+        assert_eq!(bc.osr_points.len(), 1);
+
+        let point = &bc.osr_points[0];
+        assert_eq!(point.target_block, bb1);
+        assert_eq!(point.target_offset, bc.block_offsets[bb1.0 as usize]);
+        assert!(point.target_offset < point.branch_offset);
+        assert_eq!(point.param_regs, vec![v_loop.0 as u16]);
+    }
+
+    #[test]
+    fn test_lower_records_external_osr_live_in_before_block_params() {
+        let mut f = make_func();
+        let bb0 = f.new_block();
+        let bb1 = f.new_block();
+
+        let v_initial = f.new_value();
+        let v_limit = f.new_value();
+        let v_loop = f.new_value();
+
+        f.block_mut(bb0)
+            .instructions
+            .push((v_initial, Instruction::ConstNum(0.0)));
+        f.block_mut(bb0)
+            .instructions
+            .push((v_limit, Instruction::GetModuleVar(0)));
+        f.block_mut(bb0).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v_initial],
+        };
+
+        f.block_mut(bb1).params.push((v_loop, MirType::Value));
+        let v_cond = f.new_value();
+        f.block_mut(bb1)
+            .instructions
+            .push((v_cond, Instruction::CmpLt(v_loop, v_limit)));
+        f.block_mut(bb1).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v_loop],
+        };
+
+        let bc = lower(&f);
+        assert_eq!(bc.osr_points.len(), 1);
+        assert_eq!(
+            bc.osr_points[0].param_regs,
+            vec![v_limit.0 as u16, v_loop.0 as u16]
+        );
     }
 
     #[test]

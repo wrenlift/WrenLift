@@ -7,9 +7,9 @@
 pub mod cl {
     use crate::intern::Interner;
     use crate::mir::{
-        BlockId, Instruction, MathUnaryOp, MirFunction, MirType, Terminator, ValueId,
+        osr_external_live_values, osr_rematerializable_defs, BlockId, Instruction, MirFunction,
+        MirType, Terminator, ValueId,
     };
-    use crate::mir::bytecode::{CALLSITE_IC_CLASS, CALLSITE_IC_JIT_PTR};
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
@@ -19,7 +19,7 @@ pub mod cl {
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{Linkage, Module};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     const QNAN: u64 = 0x7FFC_0000_0000_0000;
     const TAG_NULL: u64 = QNAN; // 0x7FFC_0000_0000_0000 — no extra bits
@@ -34,6 +34,8 @@ pub mod cl {
         _module: JITModule,
         /// Callable function pointer.
         pub fn_ptr: *const u8,
+        /// Optional compiled loop/header OSR entry points.
+        pub osr_entries: Vec<crate::codegen::NativeOsrEntry>,
         /// Size of the generated code.
         pub code_size: usize,
     }
@@ -177,6 +179,7 @@ pub mod cl {
                     None, // f64 inner functions don't use IC
                     None, // no jit_code_base for inner
                     Some(inner_id),
+                    None,
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -187,10 +190,11 @@ pub mod cl {
                 eprintln!("=== end ===");
             }
             // Verify inner function before defining
-            if let Err(errors) =
-                cranelift_codegen::verify_function(&inner_func, module.isa())
-            {
-                return Err(format!("Verifier errors in inner {}: {}", safe_name, errors));
+            if let Err(errors) = cranelift_codegen::verify_function(&inner_func, module.isa()) {
+                return Err(format!(
+                    "Verifier errors in inner {}: {}",
+                    safe_name, errors
+                ));
             }
             let mut inner_ctx = Context::for_function(inner_func);
             module
@@ -261,6 +265,7 @@ pub mod cl {
             return Ok(CraneliftCompiledCode {
                 _module: module,
                 fn_ptr,
+                osr_entries: Vec::new(),
                 code_size,
             });
         }
@@ -274,7 +279,15 @@ pub mod cl {
             let mut fb_ctx = FunctionBuilderContext::new();
             let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
 
-            lower_mir_to_cranelift(mir, interner, &mut builder, &mut module, callsite_ic_ptrs, callsite_ic_live_ptrs, jit_code_base)?;
+            lower_mir_to_cranelift(
+                mir,
+                interner,
+                &mut builder,
+                &mut module,
+                callsite_ic_ptrs,
+                callsite_ic_live_ptrs,
+                jit_code_base,
+            )?;
 
             builder.seal_all_blocks();
             builder.finalize();
@@ -292,16 +305,374 @@ pub mod cl {
         module
             .define_function(func_id, &mut ctx)
             .map_err(|e| e.to_string())?;
+        let osr_defs = if should_compile_osr_entries(mir, interner) {
+            compile_osr_entries(
+                mir,
+                interner,
+                &mut module,
+                &safe_name,
+                callsite_ic_ptrs,
+                callsite_ic_live_ptrs,
+                jit_code_base,
+            )
+        } else {
+            Vec::new()
+        };
         module.finalize_definitions().map_err(|e| e.to_string())?;
 
         let fn_ptr = module.get_finalized_function(func_id);
         let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
+        let osr_entries = osr_defs
+            .into_iter()
+            .map(|def| crate::codegen::NativeOsrEntry {
+                target_block: def.target_block,
+                param_count: def.param_count,
+                ptr: module.get_finalized_function(def.func_id),
+            })
+            .collect();
 
         Ok(CraneliftCompiledCode {
             _module: module,
             fn_ptr,
+            osr_entries,
             code_size,
         })
+    }
+
+    struct PendingOsrDefinition {
+        target_block: BlockId,
+        param_count: u16,
+        func_id: cranelift_module::FuncId,
+    }
+
+    #[derive(Clone)]
+    struct OsrEntryLayout {
+        target_block: BlockId,
+        external_args: Vec<ValueId>,
+        param_count: u16,
+    }
+
+    fn should_compile_osr_entries(mir: &MirFunction, interner: &Interner) -> bool {
+        // Runtime OSR transfer covers top-level/module frames and now
+        // method/closure frames reached from the interpreter. The per-block
+        // `osr_entry_layout` analysis still rejects loops whose live-in layout
+        // or reachable region is unsupported.
+        if interner.resolve(mir.name) == "<module>" {
+            return mir.arity == 0;
+        }
+        // Only compile OSR entries if this function has at least one backward
+        // branch. Saves code bloat on straight-line methods.
+        mir.blocks.iter().any(|block| {
+            matches!(
+                &block.terminator,
+                Terminator::Branch { target, .. } if target.0 <= block.id.0
+            )
+        })
+    }
+
+    fn compile_osr_entries(
+        mir: &MirFunction,
+        interner: &Interner,
+        module: &mut JITModule,
+        safe_name: &str,
+        callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
+        callsite_ic_live_ptrs: Option<&[usize]>,
+        jit_code_base: Option<*const *const u8>,
+    ) -> Vec<PendingOsrDefinition> {
+        let mut defs = Vec::new();
+        for target_block in collect_osr_targets(mir) {
+            let Some(layout) = osr_entry_layout(mir, target_block) else {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "osr-trace: skip {} bb{} unsupported live-in layout",
+                        safe_name, target_block.0
+                    );
+                }
+                continue;
+            };
+
+            let mut sig = module.make_signature();
+            for _ in 0..layout.param_count {
+                sig.params.push(AbiParam::new(types::I64));
+            }
+            sig.returns.push(AbiParam::new(types::I64));
+
+            let osr_name = format!("{}_osr_bb{}", safe_name, target_block.0);
+            let Ok(func_id) = module.declare_function(&osr_name, Linkage::Local, &sig) else {
+                continue;
+            };
+            let mut func = Function::with_name_signature(
+                cranelift_codegen::ir::UserFuncName::user(0, func_id.as_u32()),
+                sig,
+            );
+            let mut fb_ctx = FunctionBuilderContext::new();
+            let lower_result = {
+                let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+                let result = lower_mir_impl(
+                    mir,
+                    interner,
+                    &mut builder,
+                    module,
+                    callsite_ic_ptrs,
+                    callsite_ic_live_ptrs,
+                    jit_code_base,
+                    None,
+                    Some(layout.clone()),
+                );
+                if result.is_ok() {
+                    builder.seal_all_blocks();
+                    builder.finalize();
+                }
+                result
+            };
+            if lower_result.is_err() {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "osr-trace: skip {} bb{} lowering failed: {:?}",
+                        safe_name,
+                        target_block.0,
+                        lower_result.err()
+                    );
+                }
+                continue;
+            }
+            if let Err(errors) = cranelift_codegen::verify_function(&func, module.isa()) {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "osr-trace: skip {} bb{} verifier failed: {}",
+                        safe_name, target_block.0, errors
+                    );
+                }
+                continue;
+            }
+            let mut ctx = Context::for_function(func);
+            if let Err(error) = module.define_function(func_id, &mut ctx) {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "osr-trace: skip {} bb{} define failed: {}",
+                        safe_name, target_block.0, error
+                    );
+                }
+                continue;
+            }
+            defs.push(PendingOsrDefinition {
+                target_block,
+                param_count: layout.param_count,
+                func_id,
+            });
+        }
+        defs
+    }
+
+    fn collect_osr_targets(mir: &MirFunction) -> Vec<BlockId> {
+        let mut seen = HashSet::new();
+        let mut targets = Vec::new();
+        for block in &mir.blocks {
+            if let Terminator::Branch { target, .. } = &block.terminator {
+                if target.0 <= block.id.0 && seen.insert(*target) {
+                    targets.push(*target);
+                }
+            }
+        }
+        targets
+    }
+
+    fn osr_entry_layout(mir: &MirFunction, target: BlockId) -> Option<OsrEntryLayout> {
+        let target_idx = target.0 as usize;
+        let target_block = mir.blocks.get(target_idx)?;
+        if target_block
+            .params
+            .iter()
+            .any(|(_, ty)| !matches!(ty, MirType::Value))
+        {
+            return None;
+        }
+
+        let value_types = infer_osr_value_types(mir);
+        let external_args = osr_external_live_values(mir, target);
+        if external_args.iter().any(|vid| {
+            !matches!(
+                value_types.get(vid.0 as usize).copied(),
+                Some(MirType::Value)
+            )
+        }) {
+            return None;
+        }
+
+        let param_count = external_args.len() + target_block.params.len();
+        if param_count > 4 {
+            return None;
+        }
+
+        let reachable = reachable_from(mir, target);
+        let mut defs = HashSet::new();
+        for &idx in &reachable {
+            let block = &mir.blocks[idx];
+            for &(param, _) in &block.params {
+                defs.insert(param);
+            }
+            for &(dst, _) in &block.instructions {
+                defs.insert(dst);
+            }
+        }
+        let rematerializable = osr_rematerializable_defs(mir, target);
+        let external_arg_set: HashSet<ValueId> = external_args.iter().copied().collect();
+
+        for &idx in &reachable {
+            let block = &mir.blocks[idx];
+            for (_, inst) in &block.instructions {
+                if matches!(inst, Instruction::CallStaticSelf { .. }) {
+                    return None;
+                }
+                for op in inst.operands() {
+                    if !defs.contains(&op)
+                        && !rematerializable.contains_key(&op)
+                        && !external_arg_set.contains(&op)
+                    {
+                        return None;
+                    }
+                }
+            }
+            for op in block.terminator.operands() {
+                if !defs.contains(&op)
+                    && !rematerializable.contains_key(&op)
+                    && !external_arg_set.contains(&op)
+                {
+                    return None;
+                }
+            }
+        }
+
+        Some(OsrEntryLayout {
+            target_block: target,
+            external_args,
+            param_count: param_count as u16,
+        })
+    }
+
+    fn infer_osr_value_types(mir: &MirFunction) -> Vec<MirType> {
+        let mut value_types = vec![MirType::Void; mir.next_value as usize];
+        for block in &mir.blocks {
+            for &(value, ty) in &block.params {
+                value_types[value.0 as usize] = ty;
+            }
+        }
+        for block in &mir.blocks {
+            for &(dst, ref inst) in &block.instructions {
+                let ty = match inst {
+                    Instruction::ConstNum(_)
+                    | Instruction::ConstBool(_)
+                    | Instruction::ConstNull
+                    | Instruction::ConstString(_)
+                    | Instruction::Add(..)
+                    | Instruction::Sub(..)
+                    | Instruction::Mul(..)
+                    | Instruction::Div(..)
+                    | Instruction::Mod(..)
+                    | Instruction::Neg(..)
+                    | Instruction::Box(_)
+                    | Instruction::GetField(..)
+                    | Instruction::GetStaticField(_)
+                    | Instruction::GetModuleVar(_)
+                    | Instruction::Call { .. }
+                    | Instruction::CallKnownFunc { .. }
+                    | Instruction::CallStaticSelf { .. }
+                    | Instruction::SuperCall { .. }
+                    | Instruction::MakeClosure { .. }
+                    | Instruction::GetUpvalue(_)
+                    | Instruction::MakeList(_)
+                    | Instruction::MakeMap(_)
+                    | Instruction::MakeRange(..)
+                    | Instruction::StringConcat(_)
+                    | Instruction::ToString(_)
+                    | Instruction::SubscriptGet { .. }
+                    | Instruction::BitAnd(..)
+                    | Instruction::BitOr(..)
+                    | Instruction::BitXor(..)
+                    | Instruction::BitNot(_)
+                    | Instruction::Shl(..)
+                    | Instruction::Shr(..) => MirType::Value,
+                    Instruction::ConstF64(_)
+                    | Instruction::MathUnaryF64(..)
+                    | Instruction::MathBinaryF64(..)
+                    | Instruction::AddF64(..)
+                    | Instruction::SubF64(..)
+                    | Instruction::MulF64(..)
+                    | Instruction::DivF64(..)
+                    | Instruction::ModF64(..)
+                    | Instruction::NegF64(_)
+                    | Instruction::Unbox(_) => MirType::F64,
+                    Instruction::ConstI64(_) => MirType::I64,
+                    Instruction::CmpLt(..)
+                    | Instruction::CmpGt(..)
+                    | Instruction::CmpLe(..)
+                    | Instruction::CmpGe(..)
+                    | Instruction::CmpEq(..)
+                    | Instruction::CmpNe(..)
+                    | Instruction::CmpLtF64(..)
+                    | Instruction::CmpGtF64(..)
+                    | Instruction::CmpLeF64(..)
+                    | Instruction::CmpGeF64(..)
+                    | Instruction::Not(_)
+                    | Instruction::IsType(..) => MirType::Bool,
+                    Instruction::GuardNum(src)
+                    | Instruction::GuardBool(src)
+                    | Instruction::Move(src)
+                    | Instruction::SetField(_, _, src)
+                    | Instruction::SetStaticField(_, src)
+                    | Instruction::SetModuleVar(_, src)
+                    | Instruction::SetUpvalue(_, src) => value_types[src.0 as usize],
+                    Instruction::GuardClass(src, _) | Instruction::GuardProtocol(src, _) => {
+                        value_types[src.0 as usize]
+                    }
+                    Instruction::SubscriptSet { value, .. } => value_types[value.0 as usize],
+                    Instruction::BlockParam(idx) => block
+                        .params
+                        .get(*idx as usize)
+                        .map(|(_, ty)| *ty)
+                        .unwrap_or(MirType::Value),
+                };
+                value_types[dst.0 as usize] = ty;
+            }
+        }
+        value_types
+    }
+
+    fn reachable_from(mir: &MirFunction, start: BlockId) -> HashSet<usize> {
+        let mut reachable = HashSet::new();
+        fn dfs(idx: usize, mir: &MirFunction, reachable: &mut HashSet<usize>) {
+            if !reachable.insert(idx) {
+                return;
+            }
+            for succ in mir.blocks[idx].terminator.successors() {
+                dfs(succ.0 as usize, mir, reachable);
+            }
+        }
+        dfs(start.0 as usize, mir, &mut reachable);
+        reachable
+    }
+
+    fn emit_osr_external_constants(
+        mir: &MirFunction,
+        target: BlockId,
+        builder: &mut FunctionBuilder,
+        val_map: &mut HashMap<ValueId, Value>,
+    ) -> Result<(), String> {
+        for (vid, inst) in osr_rematerializable_defs(mir, target) {
+            let value = match inst {
+                Instruction::ConstNum(n) => builder.ins().iconst(types::I64, n.to_bits() as i64),
+                Instruction::ConstBool(b) => {
+                    let bits = if b { TAG_TRUE } else { TAG_FALSE } as i64;
+                    builder.ins().iconst(types::I64, bits)
+                }
+                Instruction::ConstNull => builder.ins().iconst(types::I64, TAG_NULL as i64),
+                Instruction::ConstF64(n) => builder.ins().f64const(n),
+                Instruction::ConstI64(n) => builder.ins().iconst(types::I64, n),
+                _ => return Err("non-rematerializable OSR external value".to_string()),
+            };
+            val_map.insert(vid, value);
+        }
+        Ok(())
     }
 
     /// Collect all runtime function name→address pairs for Cranelift symbol resolution.
@@ -419,7 +790,17 @@ pub mod cl {
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
     ) -> Result<(), String> {
-        lower_mir_impl(mir, interner, builder, module, callsite_ic_ptrs, callsite_ic_live_ptrs, jit_code_base, None)
+        lower_mir_impl(
+            mir,
+            interner,
+            builder,
+            module,
+            callsite_ic_ptrs,
+            callsite_ic_live_ptrs,
+            jit_code_base,
+            None,
+            None,
+        )
     }
 
     /// Inner lowering with optional f64 specialization.
@@ -436,6 +817,7 @@ pub mod cl {
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
         f64_self_id: Option<cranelift_module::FuncId>,
+        osr_entry: Option<OsrEntryLayout>,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
@@ -444,8 +826,34 @@ pub mod cl {
             block_map.insert(BlockId(i as u32), cl_block);
         }
 
-        // Map MIR values to Cranelift values
+        // Map MIR values to Cranelift values.
         let mut val_map: HashMap<ValueId, Value> = HashMap::new();
+
+        if let Some(ref layout) = osr_entry {
+            let osr_entry = builder.create_block();
+            builder.switch_to_block(osr_entry);
+            for vid in &layout.external_args {
+                let param = builder.append_block_param(osr_entry, types::I64);
+                val_map.insert(*vid, param);
+            }
+            let target_block = &mir.blocks[layout.target_block.0 as usize];
+            for (_, ty) in &target_block.params {
+                let cl_type = match ty {
+                    MirType::F64 => types::F64,
+                    _ => types::I64,
+                };
+                builder.append_block_param(osr_entry, cl_type);
+            }
+            emit_osr_external_constants(mir, layout.target_block, builder, &mut val_map)?;
+            let args: Vec<BlockArg> = builder
+                .block_params(osr_entry)
+                .iter()
+                .skip(layout.external_args.len())
+                .copied()
+                .map(BlockArg::Value)
+                .collect();
+            builder.ins().jump(block_map[&layout.target_block], &args);
+        }
 
         // Receiver (entry_params[0]) saved for CallStaticSelf
         let mut receiver_val: Option<Value> = None;
@@ -477,8 +885,6 @@ pub mod cl {
                 }
             }
         }
-        let mut call_site_idx: usize = 0;
-
         // Helper to get or declare a runtime function
         let mut get_runtime_fn = |module: &mut JITModule,
                                   builder: &mut FunctionBuilder,
@@ -497,7 +903,10 @@ pub mod cl {
         // The MIR block array may have preheader blocks (bb4) listed after
         // loop bodies (bb2), but Cranelift requires values to be defined
         // before use. RPO guarantees dominators come first.
-        let rpo = compute_rpo(mir);
+        let rpo = match osr_entry.as_ref() {
+            Some(layout) => compute_rpo_from(mir, layout.target_block),
+            None => compute_rpo(mir),
+        };
         for &block_idx in &rpo {
             let block = &mir.blocks[block_idx];
             let bid = BlockId(block_idx as u32);
@@ -507,7 +916,7 @@ pub mod cl {
             // Reset call_site_idx to the pre-computed base for this block.
             // This ensures IC entries are read from the correct sequential
             // position even though blocks are processed in RPO order.
-            call_site_idx = block_call_site_base[block_idx];
+            let mut call_site_idx = block_call_site_base[block_idx];
 
             // Add block parameters (from loop back-edges / CondBranch args)
             for (vid, ty) in &block.params {
@@ -524,7 +933,7 @@ pub mod cl {
             // Cranelift adds signature params to the first switched-to block.
             // For the entry block, add function params as block params
             // THEN map BlockParam instructions to those params.
-            if block_idx == 0 {
+            if osr_entry.is_none() && block_idx == 0 {
                 if f64_self_id.is_some() {
                     // f64 inner function: params are only the USED ones
                     // (sequential f64 params, no receiver).
@@ -997,9 +1406,10 @@ pub mod cl {
                             INSTANCE_FIELDS,
                         );
                         let offset = field_idx * VALUE_SIZE;
-                        let fast_result = builder
-                            .ins()
-                            .load(types::I64, MemFlags::trusted(), fields_ptr, offset);
+                        let fast_result =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), fields_ptr, offset);
                         builder
                             .ins()
                             .jump(merge_block, &[BlockArg::Value(fast_result)]);
@@ -1091,8 +1501,7 @@ pub mod cl {
                             obj_ptr,
                             HEADER_CLASS,
                         );
-                        let cached_class =
-                            builder.ins().iconst(types::I64, *expected_class as i64);
+                        let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
                         let class_match =
                             builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
                         builder
@@ -1102,22 +1511,16 @@ pub mod cl {
                         // Fast path: load the callee's JIT slot and call_indirect.
                         // slot_addr = jit_code_base + func_id * 8
                         builder.switch_to_block(fast_block);
-                        let slot_addr = unsafe {
-                            jit_base_ptr.add(*func_id as usize) as i64
-                        };
-                        let slot_addr_val =
-                            builder.ins().iconst(types::I64, slot_addr);
-                        let jit_ptr = builder.ins().load(
-                            types::I64,
-                            MemFlags::new(),
-                            slot_addr_val,
-                            0,
-                        );
+                        let slot_addr = unsafe { jit_base_ptr.add(*func_id as usize) as i64 };
+                        let slot_addr_val = builder.ins().iconst(types::I64, slot_addr);
+                        let jit_ptr =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::new(), slot_addr_val, 0);
                         // Guard: if slot is null (callee not yet compiled),
                         // fall to slow path.
                         let zero = builder.ins().iconst(types::I64, 0);
-                        let has_jit =
-                            builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
+                        let has_jit = builder.ins().icmp(IntCC::NotEqual, jit_ptr, zero);
                         let pure_call_block = builder.create_block();
                         builder
                             .ins()
@@ -1136,9 +1539,7 @@ pub mod cl {
                         for a in args {
                             call_args.push(get(a));
                         }
-                        let call = builder
-                            .ins()
-                            .call_indirect(sig_ref, jit_ptr, &call_args);
+                        let call = builder.ins().call_indirect(sig_ref, jit_ptr, &call_args);
                         let fast_result = builder.inst_results(call)[0];
                         builder
                             .ins()
@@ -1147,8 +1548,7 @@ pub mod cl {
                         // Slow path: wren_call_N full dispatch.
                         builder.switch_to_block(slow_block);
                         let method_bits = method.index() as u64;
-                        let method_val =
-                            builder.ins().iconst(types::I64, method_bits as i64);
+                        let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                         let slow_name = match args.len() {
                             0 => "wren_call_0",
                             1 => "wren_call_1",
@@ -1185,16 +1585,12 @@ pub mod cl {
 
                     let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                     let obj_ptr = builder.ins().band(r, ptr_mask);
-                    let recv_class = builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        obj_ptr,
-                        HEADER_CLASS,
-                    );
-                    let cached_class =
-                        builder.ins().iconst(types::I64, *expected_class as i64);
-                    let class_match =
-                        builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                    let recv_class =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+                    let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
+                    let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
                     builder
                         .ins()
                         .brif(class_match, fast_block, &[], slow_block, &[]);
@@ -1208,12 +1604,10 @@ pub mod cl {
                         INSTANCE_FIELDS,
                     );
                     let offset = (*field_idx as i32) * VALUE_SIZE;
-                    let field_val = builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        fields_ptr,
-                        offset,
-                    );
+                    let field_val =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), fields_ptr, offset);
                     builder
                         .ins()
                         .jump(merge_block, &[BlockArg::Value(field_val)]);
@@ -1221,8 +1615,7 @@ pub mod cl {
                     // Slow path: class mismatch → wren_call_N.
                     builder.switch_to_block(slow_block);
                     let method_bits = method.index() as u64;
-                    let method_val =
-                        builder.ins().iconst(types::I64, method_bits as i64);
+                    let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                     let slow_name = match args.len() {
                         0 => "wren_call_0",
                         1 => "wren_call_1",
@@ -1260,22 +1653,20 @@ pub mod cl {
                     // comparison below will fail safely.
                     let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                     let obj_ptr = builder.ins().band(r, ptr_mask);
-                    let recv_class = builder.ins().load(
-                        types::I64,
-                        MemFlags::trusted(),
-                        obj_ptr,
-                        HEADER_CLASS,
-                    );
-                    let cached_class =
-                        builder.ins().iconst(types::I64, *expected_class as i64);
-                    let class_match =
-                        builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                    let recv_class =
+                        builder
+                            .ins()
+                            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+                    let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
+                    let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
 
                     // Fast path: class matches — load jit_ptr and call direct.
                     // We still have to go through wren_known_call_N because it
                     // handles context setup and depth tracking. But at least we
                     // skipped the class check in Rust (saves ~15ns).
-                    builder.ins().brif(class_match, fast_block, &[], slow_block, &[]);
+                    builder
+                        .ins()
+                        .brif(class_match, fast_block, &[], slow_block, &[]);
 
                     // Fast path: class matched — use _nocheck variant which
                     // skips the Rust-side class verification (we already did
@@ -1283,8 +1674,7 @@ pub mod cl {
                     // + depth tracking, but ~15ns faster than the checked
                     // version.
                     builder.switch_to_block(fast_block);
-                    let packed =
-                        (*func_id as u64) | ((method.index() as u64) << 32);
+                    let packed = (*func_id as u64) | ((method.index() as u64) << 32);
                     let fid_val = builder.ins().iconst(types::I64, packed as i64);
                     let fast_name = match args.len() {
                         0 => "wren_known_call_0_nocheck",
@@ -1307,8 +1697,7 @@ pub mod cl {
                     // Slow path: class mismatch → wren_call_N full dispatch.
                     builder.switch_to_block(slow_block);
                     let method_bits = method.index() as u64;
-                    let method_val =
-                        builder.ins().iconst(types::I64, method_bits as i64);
+                    let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                     let slow_name = match args.len() {
                         0 => "wren_call_0",
                         1 => "wren_call_1",
@@ -1851,6 +2240,27 @@ pub mod cl {
             }
         }
 
+        post_order
+    }
+
+    fn compute_rpo_from(mir: &MirFunction, start: BlockId) -> Vec<usize> {
+        let n = mir.blocks.len();
+        let mut visited = vec![false; n];
+        let mut post_order = Vec::with_capacity(n);
+
+        fn dfs(idx: usize, mir: &MirFunction, visited: &mut [bool], post_order: &mut Vec<usize>) {
+            if visited[idx] {
+                return;
+            }
+            visited[idx] = true;
+            for succ in mir.blocks[idx].terminator.successors() {
+                dfs(succ.0 as usize, mir, visited, post_order);
+            }
+            post_order.push(idx);
+        }
+
+        dfs(start.0 as usize, mir, &mut visited, &mut post_order);
+        post_order.reverse();
         post_order
     }
 }

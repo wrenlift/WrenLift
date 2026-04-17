@@ -244,6 +244,222 @@ fn try_run_root_frame_native(
     Ok(Some(Value::from_bits(result_bits)))
 }
 
+enum OsrTransfer {
+    NotEntered,
+    ContinueFiberLoop,
+    Return(Value),
+}
+
+fn try_enter_loop_osr(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    func_id: FuncId,
+    module_name: &Rc<String>,
+    closure: Option<*mut ObjClosure>,
+    defining_class: Option<*mut ObjClass>,
+    return_dst: Option<ValueId>,
+    bc: &BytecodeFunction,
+    branch_offset: u32,
+    target_offset: u32,
+    values: &mut Vec<Value>,
+    stop_depth: Option<usize>,
+) -> Result<OsrTransfer, RuntimeError> {
+    if vm.engine.mode != ExecutionMode::Tiered || crate::codegen::runtime_fns::jit_disabled() {
+        return Ok(OsrTransfer::NotEntered);
+    }
+    // Phase 4: allow method/closure OSR when an env-gated kill switch is not
+    // set. Keep a fast opt-out so production deployments can disable this path
+    // if a regression surfaces before we build GC/deopt coverage.
+    if (closure.is_some() || defining_class.is_some())
+        && std::env::var_os("WLIFT_DISABLE_METHOD_OSR").is_some()
+    {
+        return Ok(OsrTransfer::NotEntered);
+    }
+
+    let Some(point) = bc
+        .osr_points
+        .iter()
+        .find(|point| point.branch_offset == branch_offset && point.target_offset == target_offset)
+    else {
+        return Ok(OsrTransfer::NotEntered);
+    };
+    if point.param_regs.len() > 4 {
+        return Ok(OsrTransfer::NotEntered);
+    }
+
+    let mut osr_args = SmallVec::<[Value; 4]>::new();
+    for &reg in &point.param_regs {
+        let Some(value) = values.get(reg as usize).copied() else {
+            return Ok(OsrTransfer::NotEntered);
+        };
+        if value.is_undefined() {
+            return Ok(OsrTransfer::NotEntered);
+        }
+        osr_args.push(value);
+    }
+
+    let Some(entry) = vm
+        .engine
+        .active_osr_entry(func_id, point.target_block, osr_args.len())
+    else {
+        return Ok(OsrTransfer::NotEntered);
+    };
+
+    let jit_depth = crate::codegen::runtime_fns::jit_depth();
+    if jit_depth > 0 || jit_depth >= crate::codegen::runtime_fns::MAX_JIT_DEPTH {
+        return Ok(OsrTransfer::NotEntered);
+    }
+
+    unsafe {
+        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+            frame.pc = target_offset;
+            frame.values = std::mem::take(values);
+            frame.bc_ptr = bc as *const BytecodeFunction;
+        }
+    }
+
+    let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+    let saved_ctx_root_idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    crate::codegen::runtime_fns::push_jit_root(if saved_ctx.closure.is_null() {
+        Value::null()
+    } else {
+        Value::object(saved_ctx.closure)
+    });
+    crate::codegen::runtime_fns::push_jit_root(if saved_ctx.defining_class.is_null() {
+        Value::null()
+    } else {
+        Value::object(saved_ctx.defining_class)
+    });
+    let current_ctx_root_idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    crate::codegen::runtime_fns::push_jit_root(
+        closure
+            .map(|ptr| Value::object(ptr as *mut u8))
+            .unwrap_or_else(Value::null),
+    );
+    crate::codegen::runtime_fns::push_jit_root(
+        defining_class
+            .map(|ptr| Value::object(ptr as *mut u8))
+            .unwrap_or_else(Value::null),
+    );
+    let fiber_root_idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    crate::codegen::runtime_fns::push_jit_root(Value::object(fiber as *mut u8));
+
+    let vm_ptr = vm as *mut VM as *mut u8;
+    let mod_name_bytes = module_name.as_bytes();
+    let (mv_ptr, mv_count) = vm
+        .engine
+        .modules
+        .get(module_name.as_str())
+        .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+        .unwrap_or((std::ptr::null_mut(), 0));
+    crate::codegen::runtime_fns::set_jit_context(crate::codegen::runtime_fns::JitContext {
+        module_vars: mv_ptr,
+        module_var_count: mv_count,
+        vm: vm_ptr,
+        module_name: mod_name_bytes.as_ptr(),
+        module_name_len: mod_name_bytes.len() as u32,
+        current_func_id: func_id.0 as u64,
+        closure: crate::codegen::runtime_fns::jit_root_at(current_ctx_root_idx)
+            .as_object()
+            .unwrap_or(std::ptr::null_mut()),
+        defining_class: crate::codegen::runtime_fns::jit_root_at(current_ctx_root_idx + 1)
+            .as_object()
+            .unwrap_or(std::ptr::null_mut()),
+        jit_code_base: vm.engine.jit_code.as_ptr(),
+        jit_code_len: vm.engine.jit_code.len() as u32,
+    });
+
+    if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+        let name = vm
+            .engine
+            .get_mir(func_id)
+            .map(|mir| vm.interner.resolve(mir.name).to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!(
+            "osr-trace: enter FuncId({}) {} bb{} argc={}",
+            func_id.0,
+            name,
+            point.target_block.0,
+            osr_args.len()
+        );
+    }
+
+    vm.engine.note_native_entry(func_id);
+    vm.engine.note_osr_entry(func_id);
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
+    let result_bits = unsafe { call_jit_fn(entry.ptr, &osr_args) };
+    crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+
+    let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
+        crate::codegen::runtime_fns::jit_root_at(fiber_root_idx)
+            .as_object()
+            .map(|p| p as *mut ObjFiber)
+            .unwrap_or(fiber)
+    } else {
+        fiber
+    };
+    vm.fiber = live_fiber;
+
+    let mut restored_ctx = saved_ctx;
+    restored_ctx.closure = crate::codegen::runtime_fns::jit_root_at(saved_ctx_root_idx)
+        .as_object()
+        .unwrap_or(std::ptr::null_mut());
+    restored_ctx.defining_class = crate::codegen::runtime_fns::jit_root_at(saved_ctx_root_idx + 1)
+        .as_object()
+        .unwrap_or(std::ptr::null_mut());
+    crate::codegen::runtime_fns::jit_roots_restore_len(saved_ctx_root_idx);
+    crate::codegen::runtime_fns::set_jit_context(restored_ctx);
+
+    if vm.has_error {
+        vm.has_error = false;
+        let err = vm
+            .last_error
+            .take()
+            .unwrap_or_else(|| "runtime error in OSR entry".to_string());
+        return Err(RuntimeError::Error(err));
+    }
+
+    let result = Value::from_bits(result_bits);
+    let frame_values = unsafe {
+        (*live_fiber)
+            .mir_frames
+            .pop()
+            .map(|frame| frame.values)
+            .unwrap_or_default()
+    };
+    if vm.register_pool.len() < 128 {
+        vm.register_pool.push(frame_values);
+    }
+
+    let remaining_depth = unsafe { (*live_fiber).mir_frames.len() };
+    if stop_depth == Some(remaining_depth) {
+        return Ok(OsrTransfer::Return(result));
+    }
+    if remaining_depth == 0 {
+        unsafe {
+            (*live_fiber).state = FiberState::Done;
+        }
+        let caller = unsafe { (*live_fiber).caller };
+        if !caller.is_null() {
+            unsafe {
+                (*live_fiber).caller = std::ptr::null_mut();
+            }
+            resume_caller(vm, caller, result);
+            return Ok(OsrTransfer::ContinueFiberLoop);
+        }
+        return Ok(OsrTransfer::Return(result));
+    }
+
+    if let Some(dst) = return_dst {
+        unsafe {
+            if let Some(caller_frame) = (*live_fiber).mir_frames.last_mut() {
+                set_reg(&mut caller_frame.values, dst.0 as u16, result);
+            }
+        }
+    }
+    Ok(OsrTransfer::ContinueFiberLoop)
+}
+
 // ---------------------------------------------------------------------------
 // Runtime errors
 // ---------------------------------------------------------------------------
@@ -512,7 +728,6 @@ fn run_fiber_with_stop_depth(
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
-
         let mut fiber = vm.fiber;
         unsafe {
             (*fiber).state = FiberState::Running;
@@ -532,7 +747,7 @@ fn run_fiber_with_stop_depth(
         // Load execution state from the top frame into locals.
         // These are mutable so that inline call/return can update them
         // without restarting the fiber loop.
-        let (mut func_id, mut pc, mut values, module_name, closure, return_dst) = unsafe {
+        let (mut func_id, mut pc, mut values, module_name, closure, defining_class, return_dst) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
             (
                 frame.func_id,
@@ -540,6 +755,7 @@ fn run_fiber_with_stop_depth(
                 std::mem::take(&mut frame.values),
                 frame.module_name.clone(),
                 frame.closure,
+                frame.defining_class,
                 frame.return_dst,
             )
         };
@@ -633,12 +849,23 @@ fn run_fiber_with_stop_depth(
         // re-entry causes infinite null output).
         if false {
             let fn_idx_tc = func_id.0 as usize;
-            let has_jit = !vm.engine.jit_code.get(fn_idx_tc).copied().unwrap_or(std::ptr::null()).is_null();
-            if pc == 0 && !has_jit && vm.engine.mode != ExecutionMode::Interpreter
+            let has_jit = !vm
+                .engine
+                .jit_code
+                .get(fn_idx_tc)
+                .copied()
+                .unwrap_or(std::ptr::null())
+                .is_null();
+            if pc == 0
+                && !has_jit
+                && vm.engine.mode != ExecutionMode::Interpreter
                 && crate::mir::threaded::threaded_depth_ok()
+                && crate::mir::threaded::threaded_enabled()
             {
                 let _ = vm.engine.ensure_threaded_code(func_id, &vm.interner);
-                let has_tc = vm.engine.threaded_code
+                let has_tc = vm
+                    .engine
+                    .threaded_code
                     .get(fn_idx_tc)
                     .and_then(|t| t.as_ref())
                     .and_then(|t| t.as_ref())
@@ -662,21 +889,21 @@ fn run_fiber_with_stop_depth(
                         ctx.jit_code_base = vm.engine.jit_code.as_ptr();
                         ctx.jit_code_len = vm.engine.jit_code.len() as u32;
                     });
-                    let tc = vm.engine.threaded_code[fn_idx_tc].as_ref().unwrap().as_ref().unwrap();
+                    let tc = vm.engine.threaded_code[fn_idx_tc]
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap();
                     let recycled = vm.register_pool.pop();
                     let (result, regs_back) = crate::mir::threaded::execute_threaded(
-                        tc,
-                        &values,
-                        mv_ptr,
-                        mv_count,
-                        vm_ptr,
-                        None,
-                        recycled,
+                        tc, &values, mv_ptr, mv_count, vm_ptr, None, recycled,
                     );
                     if vm.register_pool.len() < 128 {
                         vm.register_pool.push(regs_back);
                     }
-                    unsafe { (*fiber).mir_frames.pop(); }
+                    unsafe {
+                        (*fiber).mir_frames.pop();
+                    }
                     if let Some(rdst) = return_dst {
                         unsafe {
                             if let Some(caller_frame) = (*fiber).mir_frames.last_mut() {
@@ -693,17 +920,17 @@ fn run_fiber_with_stop_depth(
             }
         }
 
+        // Pre-compute safepoint interval (config doesn't change mid-loop).
+        let check_interval: usize = if vm.config.step_limit <= 0xFF {
+            0xF
+        } else if vm.config.step_limit <= 0xFFF {
+            0xFF
+        } else {
+            0xFFF
+        };
+
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
-            // GC safepoint: check every 4096 instructions (or more often for
-            // small step limits to avoid missing the limit entirely).
-            let check_interval = if vm.config.step_limit <= 0xFF {
-                0xF // every 16 steps for very small limits
-            } else if vm.config.step_limit <= 0xFFF {
-                0xFF // every 256 steps for small limits
-            } else {
-                0xFFF // every 4096 steps normally
-            };
             if steps & check_interval == 0 {
                 if steps > vm.config.step_limit {
                     return Err(RuntimeError::StepLimitExceeded);
@@ -1483,7 +1710,8 @@ fn run_fiber_with_stop_depth(
                             let recv_class =
                                 unsafe { (*(obj_ptr as *const ObjHeader)).class as usize };
                             let fn_idx_ic = ic.func_id as usize;
-                            let is_leaf = vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
+                            let is_leaf =
+                                vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
                             if recv_class == ic.class && is_leaf {
                                 let jit_ptr = ic.jit_ptr;
                                 let recv_bits = recv_val.to_bits();
@@ -1683,7 +1911,10 @@ fn run_fiber_with_stop_depth(
                                 if std::env::var_os("WLIFT_TRACE_JIT_CALL").is_some() {
                                     eprintln!(
                                         "JIT-CHECK: fn_idx={} argc={} jit_null={} ok={}",
-                                        fn_idx, argc, jit_ptr.is_null(), jit_dispatch_ok
+                                        fn_idx,
+                                        argc,
+                                        jit_ptr.is_null(),
+                                        jit_dispatch_ok
                                     );
                                 }
                                 if jit_dispatch_ok {
@@ -1854,7 +2085,10 @@ fn run_fiber_with_stop_depth(
                                 });
                             }
 
-                            // Update locals to execute callee inline (skip fiber_loop restart)
+                            // Update locals to execute callee inline (skip fiber_loop restart).
+                            // Keep `func_id` in sync with the active frame so back-edge
+                            // tier-up and OSR lookups target the callee, not the caller.
+                            func_id = target_func_id;
                             pc = 0;
                             values = unsafe {
                                 std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
@@ -1982,6 +2216,7 @@ fn run_fiber_with_stop_depth(
                                 });
                             }
 
+                            func_id = target_func_id;
                             pc = 0;
                             values = unsafe {
                                 std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
@@ -2429,6 +2664,7 @@ fn run_fiber_with_stop_depth(
                     return Err(RuntimeError::Unreachable);
                 }
                 Op::Branch => {
+                    let branch_offset = pc - 1;
                     let target = read_u32(code, &mut pc);
                     let argc = read_u8(code, &mut pc) as usize;
                     // Bind block params: read [dst, src] pairs
@@ -2451,6 +2687,19 @@ fn run_fiber_with_stop_depth(
                         // pending-compile polling only runs every 64 iterations.
                         backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
+                        if std::env::var_os("WLIFT_OSR_TRACE").is_some()
+                            && (backedge_counter == 1 || should_tier_up)
+                        {
+                            let name = vm
+                                .engine
+                                .get_mir(func_id)
+                                .map(|mir| vm.interner.resolve(mir.name).to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            eprintln!(
+                                "osr-trace: backedge FuncId({}) {} count={} tier_up={}",
+                                func_id.0, name, backedge_counter, should_tier_up
+                            );
+                        }
                         if should_tier_up {
                             vm.engine.request_tier_up(func_id, &vm.interner);
                         }
@@ -2471,13 +2720,36 @@ fn run_fiber_with_stop_depth(
                                     }
                                 }
                             }
-                            // OSR is disabled: re-executing from the top
-                            // causes flaky e2e tests (side effects re-run).
-                            // True OSR needs mid-function entry points.
-                            // The JIT code is correct but ~same speed as the
-                            // interpreter because devirt coverage is too low
-                            // at first compilation. Needs recompilation with
-                            // fresh IC data after more interpreted iterations.
+                            // Read current-frame context so inline-push call
+                            // sites don't leave stale closure/class/module for
+                            // the OSR transfer.
+                            let (cur_module_name, cur_closure, cur_defining_class, cur_return_dst) = unsafe {
+                                let frame = (*fiber).mir_frames.last().unwrap();
+                                (
+                                    Rc::clone(&frame.module_name),
+                                    frame.closure,
+                                    frame.defining_class,
+                                    frame.return_dst,
+                                )
+                            };
+                            match try_enter_loop_osr(
+                                vm,
+                                fiber,
+                                func_id,
+                                &cur_module_name,
+                                cur_closure,
+                                cur_defining_class,
+                                cur_return_dst,
+                                bc,
+                                branch_offset,
+                                target,
+                                &mut values,
+                                stop_depth,
+                            )? {
+                                OsrTransfer::NotEntered => {}
+                                OsrTransfer::ContinueFiberLoop => continue 'fiber_loop,
+                                OsrTransfer::Return(value) => return Ok(value),
+                            }
                         }
                     }
                     pc = target;
@@ -2642,8 +2914,17 @@ fn dispatch_closure_bc(
     caller_bc_ptr: *const BytecodeFunction,
 ) -> Result<(), RuntimeError> {
     dispatch_closure_bc_inner(
-        vm, fiber, closure_ptr, arg_vals, pc, values,
-        module_name, return_dst, defining_class, caller_bc_ptr, true,
+        vm,
+        fiber,
+        closure_ptr,
+        arg_vals,
+        pc,
+        values,
+        module_name,
+        return_dst,
+        defining_class,
+        caller_bc_ptr,
+        true,
     )
 }
 
@@ -2844,21 +3125,34 @@ fn dispatch_closure_bc_inner(
     // Skip threaded for constructors — they need special instance
     // allocation that the threaded path doesn't handle. Also check if
     // the function name starts with "new(" as a heuristic.
-    let is_constructor = vm.engine.get_mir(target_func_id)
+    let is_constructor = vm
+        .engine
+        .get_mir(target_func_id)
         .map(|m| {
             let name = vm.interner.resolve(m.name);
             name.starts_with("new(") || name.starts_with("new ")
         })
         .unwrap_or(false);
-    let fn_has_jit = !vm.engine.jit_code.get(fn_idx).copied().unwrap_or(std::ptr::null()).is_null();
-    if allow_threaded && !fn_has_jit && !is_constructor
+    let fn_has_jit = !vm
+        .engine
+        .jit_code
+        .get(fn_idx)
+        .copied()
+        .unwrap_or(std::ptr::null())
+        .is_null();
+    if allow_threaded
+        && !fn_has_jit
+        && !is_constructor
         && vm.engine.mode != ExecutionMode::Interpreter
         && crate::mir::threaded::threaded_depth_ok()
+        && crate::mir::threaded::threaded_enabled()
     {
         // Ensure threaded code exists (lazy init).
         let _ = vm.engine.ensure_threaded_code(target_func_id, &vm.interner);
         // Now borrow the threaded code immutably + modules separately.
-        let has_tc = vm.engine.threaded_code
+        let has_tc = vm
+            .engine
+            .threaded_code
             .get(fn_idx)
             .and_then(|t| t.as_ref())
             .and_then(|t| t.as_ref())
@@ -2874,7 +3168,9 @@ fn dispatch_closure_bc_inner(
             // Share the bytecode function's IC table with the threaded
             // interpreter so IC entries populated by the bytecode slow
             // path are immediately available to the threaded fast path.
-            let bc_ic_table = vm.engine.ensure_bytecode(target_func_id)
+            let bc_ic_table = vm
+                .engine
+                .ensure_bytecode(target_func_id)
                 .map(|bc_ptr| unsafe {
                     let bc = &*(bc_ptr as *const BytecodeFunction);
                     bc.ic_table.get()
@@ -2895,7 +3191,11 @@ fn dispatch_closure_bc_inner(
                 ctx.jit_code_base = vm.engine.jit_code.as_ptr();
                 ctx.jit_code_len = vm.engine.jit_code.len() as u32;
             });
-            let tc = vm.engine.threaded_code[fn_idx].as_ref().unwrap().as_ref().unwrap();
+            let tc = vm.engine.threaded_code[fn_idx]
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap();
             let recycled = vm.register_pool.pop();
             let (result, regs_back) = crate::mir::threaded::execute_threaded(
                 tc,
