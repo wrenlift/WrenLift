@@ -306,7 +306,15 @@ fn try_enter_loop_osr(
     };
 
     let jit_depth = crate::codegen::runtime_fns::jit_depth();
-    if jit_depth > 0 || jit_depth >= crate::codegen::runtime_fns::MAX_JIT_DEPTH {
+    if jit_depth >= crate::codegen::runtime_fns::MAX_JIT_DEPTH {
+        return Ok(OsrTransfer::NotEntered);
+    }
+    // Continuation-safe OSR: nested transfers are allowed (jit_depth > 0)
+    // because the save/restore discipline below mirrors regular native-from-
+    // native dispatch — JIT context, roots, and depth are all snapshotted
+    // before the call and restored after. A kill switch keeps a quick opt-
+    // out while we finish deopt/fiber-action coverage.
+    if jit_depth > 0 && std::env::var_os("WLIFT_DISABLE_NESTED_OSR").is_some() {
         return Ok(OsrTransfer::NotEntered);
     }
 

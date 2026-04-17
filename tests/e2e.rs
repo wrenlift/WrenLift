@@ -1909,6 +1909,76 @@ System.print(total)
 }
 
 #[test]
+fn e2e_tiered_backedge_osr_nested_inside_native_caller() {
+    // The module's own loop tiers up to native, then calls a method whose
+    // inner loop also tiers up. The inner method's OSR transfer must work
+    // even though we're already nested in a native frame (jit_depth > 0).
+    let source = r#"
+class Worker {
+  construct new() {}
+  inner() {
+    var j = 0
+    while (j < 2000) {
+      j = j + 1
+    }
+    return j
+  }
+}
+
+var w = Worker.new()
+var total = 0
+var i = 0
+while (i < 500) {
+  total = total + w.inner()
+  i = i + 1
+}
+System.print(total)
+"#;
+
+    let mut vm = VM::new(VMConfig {
+        execution_mode: ExecutionMode::Tiered,
+        jit_threshold: 5,
+        ..VMConfig::default()
+    });
+    vm.engine.collect_tier_stats = true;
+    vm.output_buffer = Some(String::new());
+
+    let start = Instant::now();
+    let result = vm.interpret("main", source);
+    let elapsed = start.elapsed();
+    let output = vm.take_output();
+    let t = fmt_elapsed(elapsed);
+
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "nested OSR run failed: {:?} ({})\nOutput:\n{}",
+        result,
+        t,
+        output
+    );
+    assert_eq!(
+        output.trim(),
+        "1000000",
+        "nested OSR output mismatch ({})",
+        t
+    );
+    // At least two OSR entries: the module's outer loop and the inner
+    // method's loop reached from inside the native module frame.
+    let total_osr: u64 = vm
+        .engine
+        .tier_stats
+        .iter()
+        .map(|stats| stats.osr_entries)
+        .sum();
+    assert!(
+        total_osr >= 2,
+        "expected at least 2 OSR entries (outer + nested), got {} ({})",
+        total_osr,
+        t
+    );
+}
+
+#[test]
 fn e2e_tiered_nested_nonleaf_closure_call_survives_gc_pressure() {
     let source = r#"
 var outer = Fn.new { |f, list|

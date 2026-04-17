@@ -133,6 +133,15 @@ Implemented so far:
   bytecode path instead of entering the threaded interpreter.
 - The native JIT frame stack used by GC stack walking is thread-local, avoiding
   cross-test contamination when e2e tests run in parallel.
+- Continuation-safe OSR: the `jit_depth > 0` hard reject is gone. OSR now
+  transfers into native even when the interpreter is already nested inside a
+  native caller (e.g. a hot inner method called from a natively-running
+  module loop). The existing save/restore discipline — JIT context snapshot,
+  closure/class rooting, fiber root, depth bump/restore — already covered
+  nested re-entry; the gate was over-conservative. `WLIFT_DISABLE_NESTED_OSR`
+  keeps a kill switch.
+- `e2e_tiered_backedge_osr_nested_inside_native_caller` covers the nested
+  case: a native module loop calling a hot method whose inner loop OSRs.
 
 Known gaps:
 
@@ -141,8 +150,6 @@ Known gaps:
   for functions whose bytecode contains OSR points, preserving safepoints for
   hot method loops. The broader fix is still to fold back-edge polling directly
   into the threaded interpreter.
-- The `jit_depth > 0` gate still blocks continuation-safe OSR for loops
-  reached from native callers.
 - Conditional-back-edge OSR, deopt paths, and explicit fallback rules for
   unsupported fiber actions remain pending.
 
@@ -164,11 +171,14 @@ Implemented so far:
 - Cranelift method-call slow paths use plain method symbols again instead of
   packed call-site IC indexes. The packed path regressed `binary_trees` and made
   `delta_blue` crash or hang under broader tiered compilation.
-- Current spot checks (2026-04-17, after Phase 4 step 1):
-  - `bench/fib.wren --mode tiered`: about 0.009s
-  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.26s
-  - `bench/binary_trees.wren --mode tiered`: about 0.86s
-  - `bench/method_call.wren --mode tiered`: about 0.31s (down from 0.42s before
-    method OSR — the `func_id` sync fix in the inline call path corrects
-    tier-up attribution, and method-level OSR now skips interpreter overhead
-    in the loop body)
+- Current spot checks (2026-04-17, after Phase 4 nested-OSR):
+  - `bench/fib.wren --mode tiered`: about 0.008s
+  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.25s
+  - `bench/binary_trees.wren --mode tiered`: about 0.83s
+  - `bench/method_call.wren --mode tiered`: about 0.30s
+- Nested OSR does not move these benchmarks on its own: the inner methods in
+  `delta_blue` back-edge too few times per call to reach the tier-up
+  threshold, so opening the `jit_depth > 0` gate unlocks a capability without
+  showing up in current bench output. It lets future work (in-threaded
+  back-edge polling, lower per-method thresholds for OSR-eligible bodies)
+  actually cash in on nested loops.
