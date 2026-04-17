@@ -1196,7 +1196,8 @@ impl VM {
         let mut found_roots = Vec::new();
         let mut slot_addrs = Vec::new();
 
-        for &(jit_fp, func_id, ret_addr) in crate::codegen::runtime_fns::jit_frame_entries() {
+        let jit_entries = crate::codegen::runtime_fns::jit_frame_entries();
+        for &(jit_fp, func_id, ret_addr) in &jit_entries {
             if jit_fp == 0 {
                 continue;
             }

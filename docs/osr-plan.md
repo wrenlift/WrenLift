@@ -128,15 +128,19 @@ Implemented so far:
   taking an OSR entry.
 - `e2e_tiered_backedge_osr_survives_gc_pressure` covers a method loop that
   allocates per iteration, exercising GC pressure while OSR is active.
+- Threaded dispatch now preserves OSR safepoints conservatively: when tiered
+  method OSR is enabled, functions with bytecode OSR points stay on the
+  bytecode path instead of entering the threaded interpreter.
+- The native JIT frame stack used by GC stack walking is thread-local, avoiding
+  cross-test contamination when e2e tests run in parallel.
 
 Known gaps:
 
 - The threaded interpreter path does not yet poll back-edges for tier-up or
-  OSR transfer. Hot methods that stay in threaded dispatch currently skip
-  OSR. Tests that target method OSR set `WLIFT_DISABLE_THREADED=1` to force
-  the bytecode loop; the broader fix is to fold back-edge polling into the
-  threaded interpreter or to fall back to bytecode once a function is hot
-  enough to warrant OSR.
+  OSR transfer. In tiered mode, threaded dispatch now falls back to bytecode
+  for functions whose bytecode contains OSR points, preserving safepoints for
+  hot method loops. The broader fix is still to fold back-edge polling directly
+  into the threaded interpreter.
 - The `jit_depth > 0` gate still blocks continuation-safe OSR for loops
   reached from native callers.
 - Conditional-back-edge OSR, deopt paths, and explicit fallback rules for
@@ -155,17 +159,16 @@ Status: in progress.
 
 Implemented so far:
 
-- Cranelift OSR artifacts are compiled only for module/top-level functions,
-  matching the runtime transfer gate while method/closure continuation handling
-  remains pending.
+- Cranelift OSR artifacts are emitted for functions with backward branches,
+  with `osr_entry_layout` filtering unsupported live-in shapes.
 - Cranelift method-call slow paths use plain method symbols again instead of
   packed call-site IC indexes. The packed path regressed `binary_trees` and made
   `delta_blue` crash or hang under broader tiered compilation.
 - Current spot checks (2026-04-17, after Phase 4 step 1):
-  - `bench/fib.wren --mode tiered`: about 0.008s
-  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.24s
+  - `bench/fib.wren --mode tiered`: about 0.009s
+  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.26s
   - `bench/binary_trees.wren --mode tiered`: about 0.86s
-  - `bench/method_call.wren --mode tiered`: about 0.29s (down from 0.42s before
+  - `bench/method_call.wren --mode tiered`: about 0.31s (down from 0.42s before
     method OSR — the `func_id` sync fix in the inline call path corrects
     tier-up attribution, and method-level OSR now skips interpreter overhead
     in the loop body)

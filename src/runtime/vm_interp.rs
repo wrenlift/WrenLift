@@ -747,7 +747,7 @@ fn run_fiber_with_stop_depth(
         // Load execution state from the top frame into locals.
         // These are mutable so that inline call/return can update them
         // without restarting the fiber loop.
-        let (mut func_id, mut pc, mut values, module_name, closure, defining_class, return_dst) = unsafe {
+        let (mut func_id, mut pc, mut values, module_name, closure, _defining_class, return_dst) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
             (
                 frame.func_id,
@@ -3140,9 +3140,23 @@ fn dispatch_closure_bc_inner(
         .copied()
         .unwrap_or(std::ptr::null())
         .is_null();
+    let threaded_bypasses_osr = if vm.engine.mode == ExecutionMode::Tiered
+        && std::env::var_os("WLIFT_DISABLE_METHOD_OSR").is_none()
+    {
+        vm.engine
+            .ensure_bytecode(target_func_id)
+            .map(|bc_ptr| unsafe {
+                let bc = &*(bc_ptr as *const BytecodeFunction);
+                !bc.osr_points.is_empty()
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
     if allow_threaded
         && !fn_has_jit
         && !is_constructor
+        && !threaded_bypasses_osr
         && vm.engine.mode != ExecutionMode::Interpreter
         && crate::mir::threaded::threaded_depth_ok()
         && crate::mir::threaded::threaded_enabled()

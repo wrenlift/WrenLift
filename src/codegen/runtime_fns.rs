@@ -14,6 +14,7 @@ use crate::runtime::object::{
 /// - x86_64: System V ABI (RDI, RSI, RDX, RCX, R8, R9 → RAX)
 /// - aarch64: AAPCS64 (X0-X7 → X0)
 use crate::runtime::value::Value;
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 /// Flat shadow root storage. All shadow frames share a single contiguous
@@ -31,38 +32,35 @@ struct FlatShadowStack {
 /// Uses volatile read/write to prevent compiler reordering across JIT calls.
 static mut CURRENT_NATIVE_SHADOW_ROOTS: *mut Value = std::ptr::null_mut();
 
-/// Stack of active JIT frames for GC stack walking.
-/// Each entry: (frame_pointer, func_id, return_address).
-/// The return_address identifies the active safepoint for precise root scanning.
-static mut JIT_FRAME_STACK: [(usize, u32, usize); 64] = [(0, 0, 0); 64];
-static mut JIT_FRAME_COUNT: u32 = 0;
+// Stack of active JIT frames for GC stack walking.
+// Each entry: (frame_pointer, func_id, return_address).
+// The return_address identifies the active safepoint for precise root scanning.
+thread_local! {
+    static JIT_FRAME_STACK: RefCell<Vec<(usize, u32, usize)>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Push a JIT frame for GC visibility.
 #[inline(always)]
 pub fn push_jit_frame(fp: usize, func_id: u32, ret_addr: usize) {
-    unsafe {
-        let idx = JIT_FRAME_COUNT as usize;
-        if idx < 64 {
-            std::ptr::addr_of_mut!(JIT_FRAME_STACK)
-                .cast::<(usize, u32, usize)>()
-                .add(idx)
-                .write((fp, func_id, ret_addr));
-            JIT_FRAME_COUNT += 1;
+    JIT_FRAME_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.len() < 64 {
+            stack.push((fp, func_id, ret_addr));
         }
-    }
+    });
 }
 
 /// Pop a JIT frame.
 #[inline(always)]
 pub fn pop_jit_frame() {
-    unsafe {
-        JIT_FRAME_COUNT = JIT_FRAME_COUNT.saturating_sub(1);
-    }
+    JIT_FRAME_STACK.with(|stack| {
+        stack.borrow_mut().pop();
+    });
 }
 
 /// Get all active JIT frames (fp, func_id, ret_addr) for GC stack walking.
-pub fn jit_frame_entries() -> &'static [(usize, u32, usize)] {
-    unsafe { &JIT_FRAME_STACK[..JIT_FRAME_COUNT as usize] }
+pub fn jit_frame_entries() -> Vec<(usize, u32, usize)> {
+    JIT_FRAME_STACK.with(|stack| stack.borrow().clone())
 }
 
 #[inline(always)]

@@ -1797,9 +1797,8 @@ System.print(i)
 #[test]
 fn e2e_tiered_backedge_enters_osr_entry_in_method() {
     // A hot loop inside a user-defined method should also take an OSR entry
-    // now that method frames are eligible. The threaded interpreter fast path
-    // is disabled here because it doesn't yet integrate with OSR safepoints.
-    std::env::set_var("WLIFT_DISABLE_THREADED", "1");
+    // now that method frames are eligible. Threaded dispatch should fall back
+    // to bytecode for functions with OSR safepoints.
     let source = r#"
 class Counter {
   construct new() {}
@@ -1851,15 +1850,13 @@ System.print(c.run())
         "expected at least one OSR entry from a method loop ({})",
         t
     );
-    std::env::remove_var("WLIFT_DISABLE_THREADED");
 }
 
 #[test]
 fn e2e_tiered_backedge_osr_survives_gc_pressure() {
     // Allocating inside a hot method loop forces multiple GC cycles while the
     // OSR entry is active. The receiver and loop-carried list must stay live
-    // across each transfer.
-    std::env::set_var("WLIFT_DISABLE_THREADED", "1");
+    // across each transfer, without globally disabling threaded dispatch.
     let source = r#"
 class Accumulator {
   construct new() {
@@ -1909,7 +1906,6 @@ System.print(total)
         "method OSR under GC pressure output mismatch ({})",
         t
     );
-    std::env::remove_var("WLIFT_DISABLE_THREADED");
 }
 
 #[test]
