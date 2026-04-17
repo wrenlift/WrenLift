@@ -362,12 +362,7 @@ pub mod cl {
         }
         // Only compile OSR entries if this function has at least one backward
         // branch. Saves code bloat on straight-line methods.
-        mir.blocks.iter().any(|block| {
-            matches!(
-                &block.terminator,
-                Terminator::Branch { target, .. } if target.0 <= block.id.0
-            )
-        })
+        mir.blocks.iter().any(has_backward_successor)
     }
 
     fn compile_osr_entries(
@@ -468,13 +463,21 @@ pub mod cl {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for block in &mir.blocks {
-            if let Terminator::Branch { target, .. } = &block.terminator {
-                if target.0 <= block.id.0 && seen.insert(*target) {
-                    targets.push(*target);
+            for target in block.terminator.successors() {
+                if target.0 <= block.id.0 && seen.insert(target) {
+                    targets.push(target);
                 }
             }
         }
         targets
+    }
+
+    fn has_backward_successor(block: &crate::mir::BasicBlock) -> bool {
+        block
+            .terminator
+            .successors()
+            .into_iter()
+            .any(|target| target.0 <= block.id.0)
     }
 
     fn osr_entry_layout(mir: &MirFunction, target: BlockId) -> Option<OsrEntryLayout> {

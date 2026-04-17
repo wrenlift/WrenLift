@@ -148,6 +148,10 @@ Implemented so far:
   / transferring / suspending a fiber from inside an OSR'd loop is not
   supported; the previous behavior would have silently continued past the
   action.
+- Conditional-back-edge OSR metadata is now recorded for taken `CondBranch`
+  arms that jump backward. The bytecode interpreter treats the selected
+  backward conditional arm as an OSR safepoint, and Cranelift emits matching
+  OSR entries for conditional-back-edge target blocks.
 
 Known gaps:
 
@@ -156,10 +160,6 @@ Known gaps:
   for functions whose bytecode contains OSR points, preserving safepoints for
   hot method loops. The broader fix is still to fold back-edge polling directly
   into the threaded interpreter.
-- Conditional-back-edge OSR remains pending. Current MIR lowering emits
-  unconditional Branch as the loop latch, so `while` / `for` loops already
-  OSR without it; this item only matters for loops whose back-edge lands
-  directly on a CondBranch terminator.
 - Proper resume semantics for fiber yield/transfer/suspend from inside an
   OSR'd loop. Today we raise `Unsupported` instead of corrupting state.
 
@@ -181,10 +181,10 @@ Implemented so far:
 - Cranelift method-call slow paths use plain method symbols again instead of
   packed call-site IC indexes. The packed path regressed `binary_trees` and made
   `delta_blue` crash or hang under broader tiered compilation.
-- Current spot checks (2026-04-17, after Phase 4 nested-OSR):
-  - `bench/fib.wren --mode tiered`: about 0.008s
-  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.25s
-  - `bench/binary_trees.wren --mode tiered`: about 0.83s
+- Current spot checks (2026-04-18, after conditional-back-edge OSR):
+  - `bench/fib.wren --mode tiered`: about 0.010s
+  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.26s
+  - `bench/binary_trees.wren --mode tiered`: about 0.86s
   - `bench/method_call.wren --mode tiered`: about 0.30s
 - Nested OSR does not move these benchmarks on its own: the inner methods in
   `delta_blue` back-edge too few times per call to reach the tier-up

@@ -775,14 +775,40 @@ impl<'a> Encoder<'a> {
                 false_target,
                 false_args,
             } => {
+                let branch_offset = self.code.len() as u32;
                 self.emit_op(Op::CondBranch);
                 self.emit_reg(*condition);
                 // True branch
                 self.emit_branch_target(*true_target);
-                self.emit_branch_params(*true_target, true_args);
+                let true_bindings = self.emit_branch_params(*true_target, true_args);
+                if true_target.0 <= block.id.0 {
+                    let mut param_regs: Vec<u16> = osr_external_live_values(self.mir, *true_target)
+                        .into_iter()
+                        .map(|vid| vid.0 as u16)
+                        .collect();
+                    param_regs.extend(true_bindings.iter().map(|(dst, _)| *dst));
+                    self.osr_points.push(PendingOsrPoint {
+                        branch_offset,
+                        target_block: *true_target,
+                        param_regs,
+                    });
+                }
                 // False branch
                 self.emit_branch_target(*false_target);
-                self.emit_branch_params(*false_target, false_args);
+                let false_bindings = self.emit_branch_params(*false_target, false_args);
+                if false_target.0 <= block.id.0 {
+                    let mut param_regs: Vec<u16> =
+                        osr_external_live_values(self.mir, *false_target)
+                            .into_iter()
+                            .map(|vid| vid.0 as u16)
+                            .collect();
+                    param_regs.extend(false_bindings.iter().map(|(dst, _)| *dst));
+                    self.osr_points.push(PendingOsrPoint {
+                        branch_offset,
+                        target_block: *false_target,
+                        param_regs,
+                    });
+                }
             }
         }
     }
@@ -1173,6 +1199,52 @@ mod tests {
             bc.osr_points[0].param_regs,
             vec![v_limit.0 as u16, v_loop.0 as u16]
         );
+    }
+
+    #[test]
+    fn test_lower_records_cond_branch_backedge_osr_point() {
+        let mut f = make_func();
+        let bb0 = f.new_block();
+        let bb1 = f.new_block();
+        let bb2 = f.new_block();
+
+        let v_initial = f.new_value();
+        let v_loop = f.new_value();
+        let v_limit = f.new_value();
+        let v_cond = f.new_value();
+
+        f.block_mut(bb0)
+            .instructions
+            .push((v_initial, Instruction::ConstNum(0.0)));
+        f.block_mut(bb0).terminator = Terminator::Branch {
+            target: bb1,
+            args: vec![v_initial],
+        };
+
+        f.block_mut(bb1).params.push((v_loop, MirType::Value));
+        f.block_mut(bb1)
+            .instructions
+            .push((v_limit, Instruction::ConstNum(3.0)));
+        f.block_mut(bb1)
+            .instructions
+            .push((v_cond, Instruction::CmpLt(v_loop, v_limit)));
+        f.block_mut(bb1).terminator = Terminator::CondBranch {
+            condition: v_cond,
+            true_target: bb1,
+            true_args: vec![v_loop],
+            false_target: bb2,
+            false_args: vec![],
+        };
+
+        f.block_mut(bb2).terminator = Terminator::Return(v_loop);
+
+        let bc = lower(&f);
+        assert_eq!(bc.osr_points.len(), 1);
+        let point = &bc.osr_points[0];
+        assert_eq!(point.target_block, bb1);
+        assert_eq!(point.target_offset, bc.block_offsets[bb1.0 as usize]);
+        assert!(point.target_offset < point.branch_offset);
+        assert_eq!(point.param_regs, vec![v_loop.0 as u16]);
     }
 
     #[test]

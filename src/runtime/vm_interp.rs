@@ -2775,6 +2775,7 @@ fn run_fiber_with_stop_depth(
                     pc = target;
                 }
                 Op::CondBranch => {
+                    let branch_offset = pc - 1;
                     let cond_reg = read_u16(code, &mut pc);
                     let cond = get_reg(&values, cond_reg);
 
@@ -2789,8 +2790,10 @@ fn run_fiber_with_stop_depth(
                     let false_off = read_u32(code, &mut pc);
                     let f_argc = read_u8(code, &mut pc) as usize;
                     let false_params_start = pc;
+                    let branch_end = false_params_start + (f_argc * 4) as u32;
                     // Don't need to advance pc — both branches jump to target offset
 
+                    let target;
                     if cond.is_truthy_wren() {
                         // Bind true params
                         let mut p = true_params_start;
@@ -2800,7 +2803,7 @@ fn run_fiber_with_stop_depth(
                             let val = get_reg(&values, src_reg);
                             set_reg(&mut values, dst_reg, val);
                         }
-                        pc = true_off;
+                        target = true_off;
                     } else {
                         // Bind false params
                         let mut p = false_params_start;
@@ -2810,8 +2813,74 @@ fn run_fiber_with_stop_depth(
                             let val = get_reg(&values, src_reg);
                             set_reg(&mut values, dst_reg, val);
                         }
-                        pc = false_off;
+                        target = false_off;
                     }
+
+                    if target < branch_end && vm.engine.mode == ExecutionMode::Tiered {
+                        backedge_counter = backedge_counter.wrapping_add(1);
+                        let should_tier_up = vm.engine.record_call(func_id);
+                        if std::env::var_os("WLIFT_OSR_TRACE").is_some()
+                            && (backedge_counter == 1 || should_tier_up)
+                        {
+                            let name = vm
+                                .engine
+                                .get_mir(func_id)
+                                .map(|mir| vm.interner.resolve(mir.name).to_string())
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            eprintln!(
+                                "osr-trace: cond-backedge FuncId({}) {} count={} tier_up={}",
+                                func_id.0, name, backedge_counter, should_tier_up
+                            );
+                        }
+                        if should_tier_up {
+                            vm.engine.request_tier_up(func_id, &vm.interner);
+                        }
+                        if should_tier_up || (backedge_counter & 63) == 0 {
+                            if vm.engine.has_pending_compilations() {
+                                unsafe {
+                                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                                        frame.values = std::mem::take(&mut values);
+                                        frame.pc = branch_end;
+                                    }
+                                }
+                                vm.engine.poll_compilations();
+                                vm.engine.drain_compile_queue(&vm.interner);
+                                unsafe {
+                                    if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                                        values = std::mem::take(&mut frame.values);
+                                    }
+                                }
+                            }
+                            let (cur_module_name, cur_closure, cur_defining_class, cur_return_dst) = unsafe {
+                                let frame = (*fiber).mir_frames.last().unwrap();
+                                (
+                                    Rc::clone(&frame.module_name),
+                                    frame.closure,
+                                    frame.defining_class,
+                                    frame.return_dst,
+                                )
+                            };
+                            match try_enter_loop_osr(
+                                vm,
+                                fiber,
+                                func_id,
+                                &cur_module_name,
+                                cur_closure,
+                                cur_defining_class,
+                                cur_return_dst,
+                                bc,
+                                branch_offset,
+                                target,
+                                &mut values,
+                                stop_depth,
+                            )? {
+                                OsrTransfer::NotEntered => {}
+                                OsrTransfer::ContinueFiberLoop => continue 'fiber_loop,
+                                OsrTransfer::Return(value) => return Ok(value),
+                            }
+                        }
+                    }
+                    pc = target;
                 }
             } // match op
         } // inner dispatch loop
