@@ -2206,6 +2206,17 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     if jit_ptr.is_null() {
         return Value::null().to_bits();
     }
+    // Leaf (kind=1) fast path: `is_mir_inline_safe` guarantees the callee
+    // makes no outbound calls, touches no upvalues and never reads
+    // current_func_id / closure / defining_class. The caller's ctx.vm /
+    // module_vars / jit_code_base are already correct, so we can skip the
+    // full save/restore and jit_depth bump — for tight dispatch loops this
+    // removes ~6 TLS roundtrips and a 48-byte copy per call.
+    if ic.kind == 1 {
+        let args_val: smallvec::SmallVec<[Value; 5]> =
+            args.iter().map(|&a| Value::from_bits(a)).collect();
+        return unsafe { call_jit_with_shadow_raw(jit_ptr, &args_val) };
+    }
     // Save and set context for the callee.
     let saved_ctx = read_jit_ctx();
     mutate_jit_ctx(|ctx| {
