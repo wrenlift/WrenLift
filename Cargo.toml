@@ -25,6 +25,8 @@ wasm-encoder = "0.245"
 smallvec = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
+toml = "0.8"
+zstd = "0.13"
 cranelift-codegen = { version = "0.130", optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }

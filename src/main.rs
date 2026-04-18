@@ -76,11 +76,23 @@ struct Cli {
     /// bytecode cache at the given path and exit without running.
     /// Subsequent launches can pass the `.wlbc` path instead of the
     /// source file to skip parse / sema / MIR-build / optimize.
-    ///
-    /// (The `--bundle` flag is reserved for multi-module `.hatch`
-    /// packaging, landing in a later commit.)
     #[arg(long, value_name = "OUT_PATH")]
     build: Option<String>,
+
+    /// Compile a source tree (the positional `file` argument is used
+    /// as the root directory) into a `.hatch` distribution package at
+    /// the given path and exit. Every `.wren` file under the tree
+    /// becomes a module; the name comes from its path relative to the
+    /// root (slashes → dots). If the tree contains a `hatch.toml` it
+    /// is used as-is; otherwise a minimal manifest is synthesised.
+    #[arg(long, value_name = "OUT_PATH")]
+    bundle: Option<String>,
+
+    /// Print the manifest + section listing of a `.hatch` package and
+    /// exit without running. Accepts the positional `file` argument
+    /// as the hatch path.
+    #[arg(long)]
+    inspect: bool,
 
     /// Maximum interpreter steps before aborting.
     /// Defaults to 1B (interpreter) or 10B (tiered/jit).
@@ -456,6 +468,82 @@ fn build_bytecode_cache(source: &str, filename: &str, out_path: &str, cli: &Cli)
     );
 }
 
+/// Walk a source tree, compile every `.wren` file, write the result
+/// as a `.hatch` package. `root` is the positional `file` argument.
+fn build_hatch_package(root: &str, out_path: &str) {
+    let root_path = std::path::PathBuf::from(root);
+    if !root_path.is_dir() {
+        eprintln!(
+            "error: --bundle expects the positional argument to be a directory (got '{}')",
+            root
+        );
+        process::exit(1);
+    }
+    let bytes = match wren_lift::hatch::build_from_source_tree(&root_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(65);
+        }
+    };
+    if let Err(e) = fs::write(out_path, &bytes) {
+        eprintln!("error: cannot write '{}': {}", out_path, e);
+        process::exit(1);
+    }
+    eprintln!(
+        "bundled {} bytes from {} → {}",
+        bytes.len(),
+        root,
+        out_path
+    );
+}
+
+/// Parse a `.hatch` byte stream and print its manifest + section
+/// listing to stdout. Non-zero exit on format errors.
+fn inspect_hatch(bytes: &[u8]) {
+    let hatch = match wren_lift::hatch::load(bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(65);
+        }
+    };
+    println!("hatch: {} {}", hatch.manifest.name, hatch.manifest.version);
+    println!("  entry:   {}", hatch.manifest.entry);
+    println!("  modules: {}", hatch.manifest.modules.join(", "));
+    if !hatch.manifest.dependencies.is_empty() {
+        println!("  dependencies:");
+        for (name, version) in &hatch.manifest.dependencies {
+            println!("    {} = {}", name, version);
+        }
+    }
+    println!("  sections:");
+    for section in &hatch.sections {
+        println!(
+            "    {:>8?}  {:>10} bytes  {}",
+            section.kind,
+            section.data.len(),
+            section.name
+        );
+    }
+}
+
+/// Load + run a `.hatch` package.
+fn run_hatch(bytes: &[u8], cli: &Cli) {
+    let mut vm = make_vm(cli);
+    match vm.interpret_hatch(bytes) {
+        InterpretResult::Success => {}
+        InterpretResult::CompileError => process::exit(65),
+        InterpretResult::RuntimeError => process::exit(70),
+    }
+    if cli.gc_stats {
+        let stats = vm.gc.stats();
+        eprintln!("--- GC Stats ---");
+        eprintln!("  minor collections: {}", stats.minor_collections);
+        eprintln!("  major collections: {}", stats.major_collections);
+    }
+}
+
 /// Load + run a `.wlbc` bytecode cache.
 fn run_bytecode(bytes: &[u8], filename: &str, cli: &Cli) {
     let mut vm = make_vm(cli);
@@ -493,9 +581,17 @@ fn main() {
 
     match &cli.file {
         Some(filename) => {
+            // `--bundle` treats the positional argument as a source
+            // tree root rather than a file — resolve it before the
+            // file-read path below.
+            if let Some(out_path) = &cli.bundle {
+                build_hatch_package(filename, out_path);
+                return;
+            }
+
             // Read the file as raw bytes first so we can sniff the
-            // `.wlbc` magic and route the bytecode path without trying
-            // to UTF-8-decode a binary blob.
+            // `.wlbc` / `.hatch` magic and route the right path
+            // without trying to UTF-8-decode a binary blob.
             let bytes = match fs::read(filename) {
                 Ok(b) => b,
                 Err(e) => {
@@ -504,6 +600,14 @@ fn main() {
                 }
             };
 
+            if wren_lift::hatch::looks_like_hatch(&bytes) {
+                if cli.inspect {
+                    inspect_hatch(&bytes);
+                    return;
+                }
+                run_hatch(&bytes, &cli);
+                return;
+            }
             if wren_lift::serialize::looks_like_wlbc(&bytes) {
                 run_bytecode(&bytes, filename, &cli);
                 return;
@@ -520,6 +624,11 @@ fn main() {
             if let Some(out_path) = &cli.build {
                 build_bytecode_cache(&source, filename, out_path, &cli);
                 return;
+            }
+
+            if cli.inspect {
+                eprintln!("error: --inspect requires a .hatch file");
+                process::exit(1);
             }
 
             run_file(&source, filename, &cli);

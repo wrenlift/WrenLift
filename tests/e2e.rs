@@ -3329,3 +3329,282 @@ fn e2e_bytecode_cache_rejects_garbage() {
         "loader should reject non-wlbc bytes with CompileError"
     );
 }
+
+#[test]
+fn e2e_hatch_package_round_trip_matches_source() {
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+
+    // Build a hatch containing one compiled module.
+    let source = r#"
+class Counter {
+  construct new() { _n = 0 }
+  tick() { _n = _n + 1 }
+  count { _n }
+}
+
+var c = Counter.new()
+for (i in 0..2) c.tick()
+System.print("main says %(c.count)")
+"#;
+
+    let mut vm_build = VM::new_default();
+    let wlbc = vm_build
+        .compile_source_to_blob(source)
+        .expect("compile_source_to_blob");
+
+    let hatch = Hatch {
+        manifest: Manifest {
+            name: "e2e".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "main".to_string(),
+            modules: vec!["main".to_string()],
+            dependencies: BTreeMap::new(),
+        },
+        sections: vec![Section {
+            kind: SectionKind::Wlbc,
+            name: "main".to_string(),
+            data: wlbc,
+        }],
+    };
+    let bytes = emit(&hatch).expect("emit hatch");
+    assert!(
+        wren_lift::hatch::looks_like_hatch(&bytes),
+        "emitted bytes must start with HATCH magic"
+    );
+
+    // Source baseline for output comparison.
+    let mut vm_src = VM::new_default();
+    vm_src.output_buffer = Some(String::new());
+    let result_src = vm_src.interpret("main", source);
+    let output_src = vm_src.take_output();
+    assert!(matches!(result_src, InterpretResult::Success));
+
+    // Load + run the hatch in a fresh VM.
+    let mut vm_load = VM::new_default();
+    vm_load.output_buffer = Some(String::new());
+    let result_load = vm_load.interpret_hatch(&bytes);
+    let output_load = vm_load.take_output();
+    assert!(
+        matches!(result_load, InterpretResult::Success),
+        "hatch run should succeed, got {:?}",
+        result_load
+    );
+
+    assert_eq!(output_load, output_src, "hatch output must match source");
+}
+
+#[test]
+fn e2e_hatch_rejects_missing_entry_module() {
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest};
+
+    // Manifest claims `entry = "ghost"` but no such section exists.
+    let hatch = Hatch {
+        manifest: Manifest {
+            name: "bad".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "ghost".to_string(),
+            modules: vec!["ghost".to_string()],
+            dependencies: BTreeMap::new(),
+        },
+        sections: vec![],
+    };
+    let bytes = emit(&hatch).expect("emit");
+
+    let mut vm = VM::new_default();
+    let result = vm.interpret_hatch(&bytes);
+    assert!(
+        matches!(result, InterpretResult::CompileError),
+        "hatch with unresolved manifest module should fail cleanly"
+    );
+}
+
+#[test]
+fn e2e_hatch_cross_module_import_within_one_hatch() {
+    // Two modules in the same hatch: `util` exports a class that
+    // `main` imports and uses. The manifest lists them in dependency
+    // order (util before main) so util's top-level runs first and its
+    // class is visible via `find_imported_var` when main installs.
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+
+    let util_src = r#"
+class Greeter {
+  construct new(who) { _who = who }
+  hello { "hello, %(_who)!" }
+}
+"#;
+    let main_src = r#"
+import "util" for Greeter
+var g = Greeter.new("hatch")
+System.print(g.hello)
+"#;
+
+    let mut util_vm = VM::new_default();
+    let util_wlbc = util_vm
+        .compile_source_to_blob(util_src)
+        .expect("util compile");
+    let mut main_vm = VM::new_default();
+    let main_wlbc = main_vm
+        .compile_source_to_blob(main_src)
+        .expect("main compile");
+
+    let hatch = Hatch {
+        manifest: Manifest {
+            name: "cross-module-one-hatch".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "main".to_string(),
+            modules: vec!["util".to_string(), "main".to_string()],
+            dependencies: BTreeMap::new(),
+        },
+        sections: vec![
+            Section {
+                kind: SectionKind::Wlbc,
+                name: "util".to_string(),
+                data: util_wlbc,
+            },
+            Section {
+                kind: SectionKind::Wlbc,
+                name: "main".to_string(),
+                data: main_wlbc,
+            },
+        ],
+    };
+    let bytes = emit(&hatch).expect("emit hatch");
+
+    let mut vm = VM::new_default();
+    vm.output_buffer = Some(String::new());
+    let result = vm.interpret_hatch(&bytes);
+    let output = vm.take_output();
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "cross-module hatch should succeed, got {:?}\n{}",
+        result,
+        output
+    );
+    assert_eq!(output.trim(), "hello, hatch!");
+}
+
+#[test]
+fn e2e_hatch_cross_hatch_import_via_install_then_run() {
+    // Simulate what hatch-cli will do for a dependency graph:
+    // install the library hatch first via `install_hatch_modules`
+    // (no entry required), then run the application hatch that
+    // imports from it. Classes registered by the library hatch must
+    // be visible to the application hatch at install time.
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+
+    let lib_src = r#"
+class Counter {
+  construct new() { _n = 0 }
+  bump { _n = _n + 1 }
+  value { _n }
+}
+"#;
+    let app_src = r#"
+import "counter" for Counter
+var c = Counter.new()
+for (_ in 0..4) c.bump
+System.print(c.value)
+"#;
+
+    let mut vm_build = VM::new_default();
+    let lib_wlbc = vm_build
+        .compile_source_to_blob(lib_src)
+        .expect("lib compile");
+    let mut vm_build = VM::new_default();
+    let app_wlbc = vm_build
+        .compile_source_to_blob(app_src)
+        .expect("app compile");
+
+    let lib_hatch = emit(&Hatch {
+        manifest: Manifest {
+            name: "libcounter".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "counter".to_string(),
+            modules: vec!["counter".to_string()],
+            dependencies: BTreeMap::new(),
+        },
+        sections: vec![Section {
+            kind: SectionKind::Wlbc,
+            name: "counter".to_string(),
+            data: lib_wlbc,
+        }],
+    })
+    .expect("emit lib hatch");
+
+    let app_hatch = emit(&Hatch {
+        manifest: Manifest {
+            name: "app".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "main".to_string(),
+            modules: vec!["main".to_string()],
+            dependencies: {
+                let mut d = BTreeMap::new();
+                d.insert("libcounter".to_string(), "0.1.0".to_string());
+                d
+            },
+        },
+        sections: vec![Section {
+            kind: SectionKind::Wlbc,
+            name: "main".to_string(),
+            data: app_wlbc,
+        }],
+    })
+    .expect("emit app hatch");
+
+    // Install order: lib first (so `Counter` is registered), then app.
+    // This is the exact sequence `hatch-cli` will orchestrate once
+    // it's built.
+    let mut vm = VM::new_default();
+    vm.output_buffer = Some(String::new());
+    let install = vm.install_hatch_modules(&lib_hatch);
+    assert!(
+        matches!(install, InterpretResult::Success),
+        "lib install should succeed, got {:?}",
+        install
+    );
+    let run = vm.interpret_hatch(&app_hatch);
+    let output = vm.take_output();
+    assert!(
+        matches!(run, InterpretResult::Success),
+        "cross-hatch run should succeed, got {:?}\n{}",
+        run,
+        output
+    );
+    assert_eq!(output.trim(), "5");
+}
+
+#[test]
+fn e2e_hatch_rejects_native_lib_section() {
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+
+    // Native-lib sections are reserved for commit 3b. Hatches that
+    // declare one should be refused today rather than silently
+    // ignoring the dependency.
+    let hatch = Hatch {
+        manifest: Manifest {
+            name: "native".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "main".to_string(),
+            modules: vec!["main".to_string()],
+            dependencies: BTreeMap::new(),
+        },
+        sections: vec![Section {
+            kind: SectionKind::NativeLib,
+            name: "libdb".to_string(),
+            data: b"stub".to_vec(),
+        }],
+    };
+    let bytes = emit(&hatch).expect("emit");
+
+    let mut vm = VM::new_default();
+    let result = vm.interpret_hatch(&bytes);
+    assert!(
+        matches!(result, InterpretResult::CompileError),
+        "hatch with native lib section should be refused in commit 3a"
+    );
+}

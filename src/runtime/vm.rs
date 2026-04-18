@@ -357,24 +357,16 @@ impl VM {
             return Err(InterpretResult::CompileError);
         }
 
-        // `.wlbc` snapshots are single-module today. Imports are AST-
-        // level; by the time we serialize MIR they've been resolved
-        // into `GetModuleVar` references against the module's own var
-        // slot. For an import to be useful post-load, the importing
-        // process must separately load the imported module first —
-        // either via another `.wlbc` or via `interpret`. The `.hatch`
-        // distribution format (commit 3) will bundle all imports
-        // together so `wlift run pkg.hatch` just works.
-        let has_imports = parse_result
-            .module
-            .iter()
-            .any(|stmt| matches!(&stmt.0, crate::ast::Stmt::Import { .. }));
-        if has_imports {
-            eprintln!(
-                "warning: module has `import` statements; .wlbc does not bundle imports. \
-Load imported modules separately before running the cache, or use a .hatch package."
-            );
-        }
+        // .wlbc is a single-module artifact by design: imports are
+        // AST-level and get resolved into `GetModuleVar` refs during
+        // MIR build. The loader satisfies those refs against whatever
+        // modules are already installed in the VM — either from a
+        // prior `interpret`, a previous `interpret_bytecode`, or (the
+        // canonical case) earlier modules in the same `.hatch` that
+        // this wlbc is a section of. No diagnostic here: `.hatch` and
+        // `hatch-cli` own cross-module concerns; the wlbc emit path
+        // just produces a per-module blob.
+        let _ = &parse_result.module;
 
         // 3. Lower to MIR
         let mut module_mir =
@@ -445,6 +437,118 @@ Load imported modules separately before running the cache, or use a .hatch packa
             }
         };
         self.install_module_mir_and_run(module_name, &blob.interner, blob.module, blob.var_names)
+    }
+
+    /// Install every module carried by a `.hatch` — same as
+    /// [`Self::interpret_hatch`] but does not require or enforce an
+    /// entry module, and still succeeds if the manifest's entry is
+    /// missing. Used to preload "library" hatches whose only purpose
+    /// is to register classes that a subsequent application hatch
+    /// imports.
+    ///
+    /// Each installed module's top-level runs, the same way a source-
+    /// path `import` does. Returns `RuntimeError` if any module's
+    /// top-level raises.
+    pub fn install_hatch_modules(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
+        let hatch = match crate::hatch::load(hatch_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("failed to load hatch: {}", e);
+                return InterpretResult::CompileError;
+            }
+        };
+        self.install_hatch_sections(&hatch)
+    }
+
+    /// Shared body: install every `Wlbc` section named in
+    /// `manifest.modules`. Rejects `NativeLib` sections (commit 3b).
+    fn install_hatch_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
+        for section in &hatch.sections {
+            if matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
+                eprintln!(
+                    "hatch '{}' requires native library support (section '{}') — not yet implemented in this build",
+                    hatch.manifest.name, section.name
+                );
+                return InterpretResult::CompileError;
+            }
+        }
+
+        for module_name in &hatch.manifest.modules {
+            // Skip modules already loaded (e.g. by a previously
+            // installed hatch) so `--link A --link B` where both carry
+            // an overlapping transitive dep doesn't re-run it.
+            if self.engine.modules.contains_key(module_name) {
+                continue;
+            }
+
+            let section = match hatch
+                .sections
+                .iter()
+                .find(|s| matches!(s.kind, crate::hatch::SectionKind::Wlbc) && &s.name == module_name)
+            {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "hatch manifest lists module '{}' but no wlbc section carries it",
+                        module_name
+                    );
+                    return InterpretResult::CompileError;
+                }
+            };
+
+            let result = match crate::serialize::load(&section.data) {
+                Ok(blob) => self.install_module_mir_and_run(
+                    module_name,
+                    &blob.interner,
+                    blob.module,
+                    blob.var_names,
+                ),
+                Err(e) => {
+                    eprintln!(
+                        "hatch module '{}' failed to load its wlbc payload: {}",
+                        module_name, e
+                    );
+                    return InterpretResult::CompileError;
+                }
+            };
+            if !matches!(result, InterpretResult::Success) {
+                return result;
+            }
+        }
+        InterpretResult::Success
+    }
+
+    /// Install every module carried by a `.hatch` package, then run
+    /// the manifest's entry module. Modules are installed in
+    /// `manifest.modules` order, so callers should write that list in
+    /// dependency order (imports must be available by the time a
+    /// module's `install_module_mir_and_run` fires).
+    ///
+    /// Rejects any hatch that advertises native-library sections
+    /// today — those land in commit 3b. Resource sections are ignored
+    /// by this loader; a future `wlift.resource(...)` API will surface
+    /// them.
+    pub fn interpret_hatch(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
+        let hatch = match crate::hatch::load(hatch_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("failed to load hatch: {}", e);
+                return InterpretResult::CompileError;
+            }
+        };
+
+        // Entry module gets no second run; its top-level executes as
+        // part of the install loop. `manifest.entry` is effectively an
+        // assertion that the named module exists in the hatch.
+        if !hatch.manifest.modules.contains(&hatch.manifest.entry) {
+            eprintln!(
+                "hatch entry '{}' is not listed in manifest.modules",
+                hatch.manifest.entry
+            );
+            return InterpretResult::CompileError;
+        }
+
+        self.install_hatch_sections(&hatch)
     }
 
     /// Compile and execute Wren source code.
