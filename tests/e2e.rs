@@ -3698,18 +3698,14 @@ System.print(m["foo()"][null]["pinned"][0])
 }
 
 // ===========================================================================
-// Foreign methods backed by dlopen/dlsym (Phase 3b)
+// Foreign methods backed by dlopen/dlsym (Phase 3b / 3c-iii)
 // ===========================================================================
 //
-// The dispatch bridge is unit-tested in src/runtime/foreign.rs against
-// plain `extern "C" fn` pointers (which don't require symbol export).
-// The full end-to-end round-trip (Wren → #!native → dlsym → extern fn)
-// needs a fixture whose symbols are actually resolvable via `dlsym`. On
-// macOS/Linux the test binary's `#[no_mangle]` symbols are NOT exported
-// to dyld's global scope by default — that requires `-rdynamic` /
-// `-Wl,-export_dynamic` in the linker invocation, which we don't want
-// to enable globally. Phase 3c will either build a tiny fixture cdylib
-// or wire up per-test linker flags and enable the ignored tests below.
+// The dispatch bridge is unit-tested directly in src/runtime/foreign.rs.
+// These tests drive the full Wren → #!native → dlsym → extern fn path.
+// `.cargo/config.toml` enables `-Wl,-export_dynamic` on unix so the
+// test binary's own `#[no_mangle]` symbols are reachable via
+// `Library::this()` — a sentinel `#!native = "self"` targets that case.
 
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -3721,9 +3717,19 @@ pub extern "C" fn wrenlift_e2e_double(vm: *mut wren_lift::runtime::vm::VM) {
     }
 }
 
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn wrenlift_e2e_add(vm: *mut wren_lift::runtime::vm::VM) {
+    unsafe {
+        let slots = &mut (*vm).api_stack;
+        let a = slots[1].as_num().unwrap_or(0.0);
+        let b = slots[2].as_num().unwrap_or(0.0);
+        slots[0] = wren_lift::runtime::value::Value::num(a + b);
+    }
+}
+
 #[cfg(unix)]
 #[test]
-#[ignore = "needs -rdynamic to export test-binary symbols; see Phase 3c"]
 fn e2e_foreign_class_binds_symbol_from_self() {
     let source = r#"
 #!native = "self"
@@ -3734,6 +3740,23 @@ foreign class Doubler {
 System.print(Doubler.double(21))
 "#;
     assert_output(source, "42");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_foreign_symbol_defaults_to_method_name() {
+    // With no `#!symbol` override, the loader falls back to the
+    // method's base name — so a Wren method called `wrenlift_e2e_add`
+    // maps directly to the `#[no_mangle] extern "C" fn` of the same
+    // name in this test binary.
+    let source = r#"
+#!native = "self"
+foreign class MathX {
+  foreign static wrenlift_e2e_add(a, b)
+}
+System.print(MathX.wrenlift_e2e_add(3, 4))
+"#;
+    assert_output(source, "7");
 }
 
 #[cfg(unix)]

@@ -1,0 +1,13 @@
+# Test binaries load their own `#[no_mangle]` symbols via
+# `libloading::Library::this()` (i.e. `dlopen(NULL)`) so integration
+# tests can exercise the foreign-method round-trip without a fixture
+# cdylib. By default neither macOS nor Linux exports an executable's
+# symbols to dyld's global scope — `-Wl,-export_dynamic` flips that.
+# The flag is a no-op for non-dlsym'd code; main binaries pick up a
+# slightly larger exported-symbol table but no runtime perf hit.
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-export_dynamic"]
+
+[target.'cfg(all(unix, not(target_os = "macos")))']
+rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
