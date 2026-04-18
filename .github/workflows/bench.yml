@@ -54,6 +54,13 @@ jobs:
         run: cargo build --release
 
       - name: Run benchmarks
+        # WLIFT defaults that matter for these numbers:
+        # - --mode Tiered (interpret → JIT with OSR)
+        # - Threaded interpreter dispatch ON (no WLIFT_DISABLE_THREADED)
+        # - Method / nested-caller OSR ON (no WLIFT_DISABLE_METHOD_OSR /
+        #   WLIFT_DISABLE_NESTED_OSR)
+        # Keep these kill switches unset so the bench reflects the release
+        # configuration.
         run: |
           WLIFT="./target/release/wlift"
           RUNS=10
@@ -79,7 +86,7 @@ jobs:
             echo "$best"
           }
 
-          BENCHMARKS="fib method_call binary_trees"
+          BENCHMARKS="fib method_call binary_trees delta_blue"
           RESULTS="{}"
 
           for bench in $BENCHMARKS; do
