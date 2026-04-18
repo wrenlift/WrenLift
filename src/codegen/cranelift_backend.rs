@@ -1419,7 +1419,10 @@ pub mod cl {
 
                         // Slow path: full dispatch via wren_call_N
                         builder.switch_to_block(slow_block);
-                        let method_bits = method.index() as u64;
+                        let mut method_bits = method.index() as u64;
+                        if std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some() {
+                            method_bits |= ((ic_idx as u64) + 1) << 32;
+                        }
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                         let call_name = match args.len() {
                             0 => "wren_call_0",
@@ -1447,7 +1450,10 @@ pub mod cl {
                 }
 
                 // No IC or unsupported IC kind: full dispatch
-                let method_bits = method.index() as u64;
+                let mut method_bits = method.index() as u64;
+                if std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some() {
+                    method_bits |= ((ic_idx as u64) + 1) << 32;
+                }
                 let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                 let call_name = match args.len() {
                     0 => "wren_call_0",

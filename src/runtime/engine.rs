@@ -145,6 +145,34 @@ pub struct FuncTierStats {
     pub fallbacks_to_interpreter: u64,
 }
 
+/// Coarse runtime-call counters used to find dispatch overhead in benchmarks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeCallStats {
+    pub wren_call_entries: u64,
+    pub dispatch_call_entries: u64,
+    pub dispatch_call_fn_fastpath: u64,
+    pub dispatch_call_ic_attempts: u64,
+    pub dispatch_call_ic_class_misses: u64,
+    pub dispatch_call_method_cache_hits: u64,
+    pub dispatch_call_method_cache_misses: u64,
+    pub dispatch_method_native: u64,
+    pub dispatch_method_closure: u64,
+    pub dispatch_method_constructor: u64,
+    pub dispatch_method_trivial_getter: u64,
+    pub call_closure_entries: u64,
+    pub call_closure_native_candidates: u64,
+    pub call_closure_native_entries: u64,
+    pub call_closure_interpreter_fallbacks: u64,
+    pub jit_context_save_restore_pairs: u64,
+    pub ic_kind1_hits: u64,
+    pub ic_kind2_hits: u64,
+    pub ic_kind3_hits: u64,
+    pub ic_kind4_hits: u64,
+    pub ic_kind5_hits: u64,
+    pub ic_kind6_hits: u64,
+    pub ic_invalidations: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Compiled module
 // ---------------------------------------------------------------------------
@@ -372,6 +400,9 @@ pub struct ExecutionEngine {
     pub tier_states: Vec<TierState>,
     /// Per-function tier and dispatch statistics.
     pub tier_stats: Vec<FuncTierStats>,
+    pub runtime_call_stats: RuntimeCallStats,
+    /// Cached field index for trivial getters of the form `{ _field }`.
+    pub trivial_getter_fields: Vec<Option<u16>>,
     /// Baseline native code pointers indexed by FuncId.
     pub baseline_code: Vec<*const u8>,
     /// Baseline native OSR entry points indexed by FuncId.
@@ -453,6 +484,8 @@ impl ExecutionEngine {
             jit_metadata: Vec::new(),
             tier_states: Vec::new(),
             tier_stats: Vec::new(),
+            runtime_call_stats: RuntimeCallStats::default(),
+            trivial_getter_fields: Vec::new(),
             baseline_code: Vec::new(),
             baseline_osr_entries: Vec::new(),
             baseline_leaf: Vec::new(),
@@ -471,6 +504,7 @@ impl ExecutionEngine {
     /// Register a MIR function and return its FuncId.
     pub fn register_function(&mut self, mir: MirFunction) -> FuncId {
         let id = FuncId(self.functions.len() as u32);
+        let trivial_getter = Self::mir_trivial_getter_field(&mir);
         self.functions.push(FuncBody::Interpreted {
             mir: Arc::new(mir),
             bytecode: None,
@@ -483,6 +517,7 @@ impl ExecutionEngine {
         self.jit_metadata.push(None);
         self.tier_states.push(TierState::Interpreted);
         self.tier_stats.push(FuncTierStats::default());
+        self.trivial_getter_fields.push(trivial_getter);
         self.baseline_code.push(std::ptr::null());
         self.baseline_osr_entries.push(Vec::new());
         self.baseline_leaf.push(false);
@@ -961,7 +996,51 @@ impl ExecutionEngine {
         }
     }
 
+    #[inline(always)]
+    pub fn note_runtime_call_stats(&mut self, f: impl FnOnce(&mut RuntimeCallStats)) {
+        if !self.collect_tier_stats {
+            return;
+        }
+        f(&mut self.runtime_call_stats);
+    }
+
     pub fn dump_tier_stats(&self, interner: &crate::intern::Interner) {
+        let runtime = self.runtime_call_stats;
+        if runtime != RuntimeCallStats::default() {
+            eprintln!("=== WLIFT runtime call stats ===");
+            eprintln!(
+                "wren_call={} dispatch_call={} fn_fastpath={} ic_attempts={} ic_class_misses={} method_cache={}/{}",
+                runtime.wren_call_entries,
+                runtime.dispatch_call_entries,
+                runtime.dispatch_call_fn_fastpath,
+                runtime.dispatch_call_ic_attempts,
+                runtime.dispatch_call_ic_class_misses,
+                runtime.dispatch_call_method_cache_hits,
+                runtime.dispatch_call_method_cache_misses,
+            );
+            eprintln!(
+                "dispatch_method native={} closure={} ctor={} trivial_getter={} call_closure={} native_candidates={} native_entries={} interp_fallbacks={} ctx_save_restore={}",
+                runtime.dispatch_method_native,
+                runtime.dispatch_method_closure,
+                runtime.dispatch_method_constructor,
+                runtime.dispatch_method_trivial_getter,
+                runtime.call_closure_entries,
+                runtime.call_closure_native_candidates,
+                runtime.call_closure_native_entries,
+                runtime.call_closure_interpreter_fallbacks,
+                runtime.jit_context_save_restore_pairs,
+            );
+            eprintln!(
+                "ic_hits kind1={} kind2={} kind3={} kind4={} kind5={} kind6={} invalidations={}",
+                runtime.ic_kind1_hits,
+                runtime.ic_kind2_hits,
+                runtime.ic_kind3_hits,
+                runtime.ic_kind4_hits,
+                runtime.ic_kind5_hits,
+                runtime.ic_kind6_hits,
+                runtime.ic_invalidations,
+            );
+        }
         eprintln!("=== WLIFT tier stats ===");
         for (idx, body) in self.functions.iter().enumerate() {
             let stats = self.tier_stats.get(idx).copied().unwrap_or_default();

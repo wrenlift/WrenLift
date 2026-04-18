@@ -569,6 +569,8 @@ pub struct ObjFn {
     pub upvalue_count: u16,
     /// Index into the code/module's function table.
     pub fn_id: u32,
+    /// Cached field index for trivial getters, or u16::MAX when not a getter.
+    pub trivial_getter_field: u16,
 }
 
 impl ObjFn {
@@ -579,6 +581,7 @@ impl ObjFn {
             arity,
             upvalue_count,
             fn_id,
+            trivial_getter_field: u16::MAX,
         }
     }
 }

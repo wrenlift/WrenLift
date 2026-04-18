@@ -1910,15 +1910,15 @@ System.print(total)
 
 #[test]
 fn e2e_tiered_backedge_osr_nested_inside_native_caller() {
-    // The module's own loop tiers up to native, then calls a method whose
-    // inner loop also tiers up. The inner method's OSR transfer must work
-    // even though we're already nested in a native frame (jit_depth > 0).
+    // The module loop first OSRs into native code, then the native module frame
+    // calls a method whose loop also tiers up via OSR. The inner transfer must
+    // work even though we're already nested in a native frame (jit_depth > 0).
     let source = r#"
 class Worker {
   construct new() {}
   inner() {
     var j = 0
-    while (j < 2000) {
+    while (j < 200000) {
       j = j + 1
     }
     return j
@@ -1926,13 +1926,11 @@ class Worker {
 }
 
 var w = Worker.new()
-var total = 0
 var i = 0
-while (i < 500) {
-  total = total + w.inner()
+while (i < 100000) {
   i = i + 1
 }
-System.print(total)
+System.print(w.inner())
 "#;
 
     let mut vm = VM::new(VMConfig {
@@ -1958,22 +1956,34 @@ System.print(total)
     );
     assert_eq!(
         output.trim(),
-        "1000000",
+        "200000",
         "nested OSR output mismatch ({})",
         t
     );
-    // At least two OSR entries: the module's outer loop and the inner
-    // method's loop reached from inside the native module frame.
-    let total_osr: u64 = vm
-        .engine
-        .tier_stats
-        .iter()
-        .map(|stats| stats.osr_entries)
-        .sum();
+    let mut module_osr_entries = 0;
+    let mut inner_osr_entries = 0;
+    for (idx, stats) in vm.engine.tier_stats.iter().enumerate() {
+        let Some(mir) = vm
+            .engine
+            .get_mir(wren_lift::runtime::engine::FuncId(idx as u32))
+        else {
+            continue;
+        };
+        let name = vm.interner.resolve(mir.name);
+        if name == "<module>" {
+            module_osr_entries += stats.osr_entries;
+        } else if name == "inner()" {
+            inner_osr_entries += stats.osr_entries;
+        }
+    }
     assert!(
-        total_osr >= 2,
-        "expected at least 2 OSR entries (outer + nested), got {} ({})",
-        total_osr,
+        module_osr_entries > 0,
+        "expected <module> to enter OSR before calling inner() ({})",
+        t
+    );
+    assert!(
+        inner_osr_entries > 0,
+        "expected inner() to enter OSR under the native caller ({})",
         t
     );
 }

@@ -91,9 +91,9 @@ Implemented so far:
 - OSR transfer now accepts object-valued live params for eligible top-level
   frames; the suspended MIR frame and rooted fiber keep those values visible to
   GC.
-- OSR transfer is still gated to frames without closure/defining-class context,
-  and when already inside native JIT depth; method/closure continuation handling
-  needs a separate return/resume path.
+- Initial OSR transfer landed for top-level/module frames first. Phase 4 extends
+  that path to eligible method/closure frames and nested native callers, with
+  kill switches kept for quick rollback.
 - `e2e_tiered_backedge_enters_osr_entry` covers that an actual OSR entry is
   taken for a hot module loop.
 
@@ -192,12 +192,21 @@ Implemented so far:
   with `osr_entry_layout` filtering unsupported live-in shapes.
 - Cranelift method-call slow paths use plain method symbols again instead of
   packed call-site IC indexes. The packed path regressed `binary_trees` and made
-  `delta_blue` crash or hang under broader tiered compilation.
-- Current spot checks (2026-04-18, after conditional-back-edge OSR):
-  - `bench/fib.wren --mode tiered`: about 0.010s
-  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.26s
-  - `bench/binary_trees.wren --mode tiered`: about 0.86s
-  - `bench/method_call.wren --mode tiered`: about 0.30s
+  `delta_blue` crash or hang under broader tiered compilation. It remains
+  available as an opt-in diagnostic with `WLIFT_ENABLE_JIT_CALLSITE_IC`.
+- `WLIFT_TIER_STATS` now prints coarse runtime-call counters for `wren_call_N`,
+  `dispatch_call`, IC attempts/hits, resolved-method dispatch, closure fallback,
+  and JIT context save/restore pairs. This confirmed that `method_call` was
+  spending its time in full resolved-method dispatch, not in successful IC hits.
+- Trivial getters are classified once at function registration, copied onto
+  `ObjFn`, and served directly from resolved `Method::Closure` dispatch. This
+  avoids the temp-fiber / context-save path for getter calls while leaving the
+  crashy packed-IC path disabled by default.
+- Current spot checks (2026-04-18, after resolved trivial-getter fast path):
+  - `bench/fib.wren --mode tiered`: about 0.008s
+  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.23s
+  - `bench/binary_trees.wren --mode tiered`: about 0.84s
+  - `bench/method_call.wren --mode tiered`: about 0.12s
 - Nested OSR does not move these benchmarks on its own: the inner methods in
   `delta_blue` back-edge too few times per call to reach the tier-up
   threshold, so opening the `jit_depth > 0` gate unlocks a capability without

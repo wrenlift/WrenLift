@@ -71,6 +71,14 @@ fn trace_jit_ic(msg: impl FnOnce() -> String) {
 }
 
 #[inline(always)]
+fn note_wren_call_entry() {
+    if let Some(vm) = unsafe { vm_ref() } {
+        vm.engine
+            .note_runtime_call_stats(|s| s.wren_call_entries += 1);
+    }
+}
+
+#[inline(always)]
 fn decode_method_and_ic(packed: u64) -> (crate::intern::SymbolId, Option<usize>) {
     let method = crate::intern::SymbolId::from_raw(packed as u32);
     let ic_tag = (packed >> 32) as u32;
@@ -212,11 +220,19 @@ fn trivial_getter_field_index(
     vm: &crate::runtime::vm::VM,
     closure_ptr: *mut ObjClosure,
 ) -> Option<u16> {
-    // Performance note: this function is called on every IC population.
-    // It checks the callee's MIR to see if it's a trivial getter.
+    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+    if let Some(cached) = vm
+        .engine
+        .trivial_getter_fields
+        .get(func_id.0 as usize)
+        .copied()
+    {
+        return cached;
+    }
+
+    // Fallback for functions registered before the cache was populated.
     use crate::mir::{Instruction, Terminator};
 
-    let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
     let mir = vm.engine.get_mir(func_id)?;
     if mir.blocks.len() != 1 {
         return None;
@@ -419,6 +435,8 @@ fn try_dispatch_callsite_ic(
 ) -> Option<u64> {
     let ic = unsafe { &mut *ic_ptr };
     if ic.class != cache_key_class as usize || ic.class == 0 {
+        vm.engine
+            .note_runtime_call_stats(|s| s.dispatch_call_ic_class_misses += 1);
         if ic.func_id != 0 {
             vm.engine
                 .note_ic_miss(crate::runtime::engine::FuncId(ic.func_id as u32));
@@ -429,6 +447,8 @@ fn try_dispatch_callsite_ic(
     match ic.kind {
         1 => {
             if args.len() > 4 {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
@@ -446,16 +466,21 @@ fn try_dispatch_callsite_ic(
                 || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
                 || jit_disabled()
             {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
             vm.engine.note_ic_hit(func_id);
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind1_hits += 1);
             trace_jit_ic(|| format!("jit-ic: hit kind=1 func={}", ic.func_id));
             Some(unsafe { call_jit_with_shadow(vm, live_ptr, func_id, args) })
         }
         2 => {
             let closure_ptr = ic.closure as *mut ObjClosure;
             if closure_ptr.is_null() {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
@@ -473,6 +498,7 @@ fn try_dispatch_callsite_ic(
                     .note_ic_hit(crate::runtime::engine::FuncId(unsafe {
                         (*ic_ptr).func_id as u32
                     }));
+                vm.engine.note_runtime_call_stats(|s| s.ic_kind1_hits += 1);
                 trace_jit_ic(|| {
                     format!("jit-ic: hit upgraded kind=1 func={}", unsafe {
                         (*ic_ptr).func_id
@@ -482,6 +508,7 @@ fn try_dispatch_callsite_ic(
                 return Some(unsafe { call_jit_with_shadow(vm, live_ptr, fid, args) });
             }
             vm.engine.note_ic_hit(func_id);
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind2_hits += 1);
             trace_jit_ic(|| format!("jit-ic: hit kind=2 func={}", ic.func_id));
             let defining_class = ic.jit_ptr as *mut ObjClass;
             Some(call_closure_jit_or_sync(
@@ -499,6 +526,8 @@ fn try_dispatch_callsite_ic(
             let closure_ptr = ic.closure as *mut ObjClosure;
             let class_ptr = recv.as_object().unwrap_or(std::ptr::null_mut()) as *mut ObjClass;
             if closure_ptr.is_null() || class_ptr.is_null() || args.is_empty() {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return Some(Value::null().to_bits());
             }
@@ -508,6 +537,7 @@ fn try_dispatch_callsite_ic(
                 vm.engine.poll_compilations();
             }
             vm.engine.note_ic_hit(func_id);
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind3_hits += 1);
             trace_jit_ic(|| format!("jit-ic: hit kind=3 func={}", ic.func_id));
             Some(
                 vm.call_constructor_sync(class_ptr, closure_ptr, &args[1..])
@@ -515,6 +545,7 @@ fn try_dispatch_callsite_ic(
             )
         }
         4 => {
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind4_hits += 1);
             trace_jit_ic(|| "jit-ic: hit kind=4".to_string());
             let native_fn: crate::runtime::object::NativeFn =
                 unsafe { std::mem::transmute(ic.closure) };
@@ -526,6 +557,8 @@ fn try_dispatch_callsite_ic(
                 .map(|p| p as *mut ObjInstance)
                 .unwrap_or(std::ptr::null_mut());
             if instance.is_null() {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
@@ -535,9 +568,12 @@ fn try_dispatch_callsite_ic(
                 });
                 vm.engine.note_ic_hit(func_id);
             }
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind5_hits += 1);
             trace_jit_ic(|| format!("jit-ic: hit kind=5 field={}", ic.func_id));
             let fields_ptr = unsafe { (*instance).fields };
             if fields_ptr.is_null() {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
@@ -559,10 +595,13 @@ fn try_dispatch_callsite_ic(
                 .copied()
                 .unwrap_or(std::ptr::null());
             if live_ptr.is_null() || live_ptr != ic.jit_ptr || jit_disabled() {
+                vm.engine
+                    .note_runtime_call_stats(|s| s.ic_invalidations += 1);
                 *ic = crate::mir::bytecode::CallSiteIC::default();
                 return None;
             }
             vm.engine.note_ic_hit(func_id);
+            vm.engine.note_runtime_call_stats(|s| s.ic_kind6_hits += 1);
             // Direct field access via UnsafeCell — no 48-byte copy.
             let saved_func_id = JIT_CTX.with(|c| unsafe {
                 let ctx = &mut *c.get();
@@ -1283,12 +1322,16 @@ pub fn call_closure_jit_or_sync(
     args: &[Value],
     defining_class: Option<*mut crate::runtime::object::ObjClass>,
 ) -> u64 {
+    vm.engine
+        .note_runtime_call_stats(|s| s.call_closure_entries += 1);
     // Save the caller's JIT context so we can restore it after the nested call.
     // Without this, interpreter fallback paths (call_closure_sync → run_fiber)
     // can overwrite the context via dispatch_closure_bc, corrupting the caller's
     // module_vars / closure / defining_class when control returns.
     let saved_ctx = read_jit_ctx();
     let saved_ctx_root_len = root_saved_jit_context(saved_ctx);
+    vm.engine
+        .note_runtime_call_stats(|s| s.jit_context_save_restore_pairs += 1);
 
     // Update context for the callee: set closure, defining_class, and
     // ensure vm is set (may be null if we're called from a fresh thread
@@ -1324,6 +1367,8 @@ pub fn call_closure_jit_or_sync(
 
         if let Some(fn_ptr) = native_fn_ptr {
             had_native_candidate = true;
+            vm.engine
+                .note_runtime_call_stats(|s| s.call_closure_native_candidates += 1);
             // Guard: check native recursion depth to prevent stack overflow.
             // Each JIT call level uses ~1-2KB native stack; limit to 256 levels.
             let depth = JIT_DEPTH.with(|d| d.get());
@@ -1343,6 +1388,8 @@ pub fn call_closure_jit_or_sync(
             // interpreter until native frame rooting exists.
             if !is_leaf && !allow_nonleaf_native {
                 vm.engine.note_fallback_to_interpreter(func_id);
+                vm.engine
+                    .note_runtime_call_stats(|s| s.call_closure_interpreter_fallbacks += 1);
                 let result = vm
                     .call_closure_sync(closure_ptr, args, defining_class)
                     .map(|v| v.to_bits())
@@ -1363,6 +1410,8 @@ pub fn call_closure_jit_or_sync(
                 );
                 vm.engine.note_native_entry(func_id);
                 vm.engine.note_native_to_native_call(func_id);
+                vm.engine
+                    .note_runtime_call_stats(|s| s.call_closure_native_entries += 1);
                 JIT_DEPTH.with(|d| d.set(depth + 1));
                 let root_len_before = jit_roots_snapshot_len();
                 // Shadow frame push/pop handled by call_jit_with_shadow.
@@ -1382,6 +1431,8 @@ pub fn call_closure_jit_or_sync(
     if had_native_candidate {
         let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
         vm.engine.note_fallback_to_interpreter(func_id);
+        vm.engine
+            .note_runtime_call_stats(|s| s.call_closure_interpreter_fallbacks += 1);
     }
     let result = vm
         .call_closure_sync(closure_ptr, args, defining_class)
@@ -1425,6 +1476,8 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
         Some(v) => v,
         None => return Value::null().to_bits(),
     };
+    vm.engine
+        .note_runtime_call_stats(|s| s.dispatch_call_entries += 1);
     let (method_sym, ic_idx) = decode_method_and_ic(method_packed);
 
     // Match the interpreter's closure call fast path. Fn.call(...) is a stub
@@ -1434,6 +1487,8 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
             let header = ptr as *const ObjHeader;
             if unsafe { (*header).obj_type } == ObjType::Closure {
                 let closure_ptr = ptr as *mut ObjClosure;
+                vm.engine
+                    .note_runtime_call_stats(|s| s.dispatch_call_fn_fastpath += 1);
                 return call_closure_jit_or_sync(vm, closure_ptr, &args[1..], None);
             }
         }
@@ -1444,6 +1499,8 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
     let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, idx));
 
     if let Some(ic_ptr) = ic_ptr {
+        vm.engine
+            .note_runtime_call_stats(|s| s.dispatch_call_ic_attempts += 1);
         if let Some(result) = try_dispatch_callsite_ic(vm, ic_ptr, recv, args, cache_key_class) {
             return result;
         }
@@ -1451,6 +1508,8 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
 
     // Check method cache first (avoids find_method + static symbol resolution).
     if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method_sym) {
+        vm.engine
+            .note_runtime_call_stats(|s| s.dispatch_call_method_cache_hits += 1);
         if let Some(ic_ptr) = ic_ptr {
             populate_callsite_ic(vm, ic_ptr, cache_key_class, m, dc);
         }
@@ -1458,6 +1517,8 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
     }
 
     // Cache miss: full hierarchy lookup to get the correct defining class.
+    vm.engine
+        .note_runtime_call_stats(|s| s.dispatch_call_method_cache_misses += 1);
     let lookup = unsafe { find_method_with_class(class, method_sym) };
 
     match lookup {
@@ -1612,6 +1673,8 @@ fn dispatch_method(
 ) -> u64 {
     match method {
         Method::Native(native_fn) => {
+            vm.engine
+                .note_runtime_call_stats(|s| s.dispatch_method_native += 1);
             let result = native_fn(vm, args).to_bits();
             // Check if the native method requested a fiber action (e.g. fiber.call()).
             // If so, handle it synchronously here — the JIT caller expects a return
@@ -1622,7 +1685,29 @@ fn dispatch_method(
             result
         }
         Method::Closure(cp) => {
+            vm.engine
+                .note_runtime_call_stats(|s| s.dispatch_method_closure += 1);
             let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
+            let trivial_getter_field = unsafe { (*(*cp).function).trivial_getter_field };
+            if trivial_getter_field != u16::MAX && args.len() == 1 {
+                {
+                    let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
+                    if !receiver_obj.is_null()
+                        && unsafe { (*(receiver_obj as *const ObjHeader)).obj_type }
+                            == ObjType::Instance
+                    {
+                        let instance = receiver_obj as *mut ObjInstance;
+                        let fields = unsafe { (*instance).fields };
+                        if !fields.is_null() {
+                            vm.engine
+                                .note_runtime_call_stats(|s| s.dispatch_method_trivial_getter += 1);
+                            return unsafe {
+                                (*fields.add(trivial_getter_field as usize)).to_bits()
+                            };
+                        }
+                    }
+                }
+            }
             let fn_idx = func_id.0 as usize;
             if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter {
                 let needs_tier_up = vm
@@ -1657,6 +1742,8 @@ fn dispatch_method(
                 let allow_jit = !fn_ptr.is_null() && is_leaf;
                 if allow_jit {
                     let saved_ctx = read_jit_ctx();
+                    vm.engine
+                        .note_runtime_call_stats(|s| s.jit_context_save_restore_pairs += 1);
                     let depth = jit_depth();
                     if depth < MAX_JIT_DEPTH {
                         mutate_jit_ctx(|ctx| {
@@ -1684,6 +1771,8 @@ fn dispatch_method(
             call_closure_jit_or_sync(vm, cp, args, defining_class)
         }
         Method::Constructor(cp) => {
+            vm.engine
+                .note_runtime_call_stats(|s| s.dispatch_method_constructor += 1);
             let class_ptr = args
                 .first()
                 .and_then(|v| v.as_object())
@@ -1734,6 +1823,7 @@ pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0, 0)
 }
 extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
+    note_wren_call_entry();
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
@@ -1779,6 +1869,7 @@ extern "C" fn wren_call_1_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
+    note_wren_call_entry();
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
@@ -1825,6 +1916,7 @@ extern "C" fn wren_call_2_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
+    note_wren_call_entry();
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
@@ -1889,6 +1981,7 @@ extern "C" fn wren_call_3_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
+    note_wren_call_entry();
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
@@ -1949,6 +2042,7 @@ extern "C" fn wren_call_4_inner(
     jit_fp: u64,
     ret_addr: u64,
 ) -> u64 {
+    note_wren_call_entry();
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
@@ -2595,6 +2689,13 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     let fn_ptr = vm.gc.alloc_fn(name_sym, arity, uv_count, func_id);
     unsafe {
         (*fn_ptr).header.class = vm.fn_class;
+        (*fn_ptr).trivial_getter_field = vm
+            .engine
+            .trivial_getter_fields
+            .get(func_id as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(u16::MAX);
     }
     // Root the fn object before further allocations.
     push_jit_root(Value::object(fn_ptr as *mut u8));

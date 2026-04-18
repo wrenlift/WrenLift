@@ -2567,6 +2567,13 @@ fn run_fiber_with_stop_depth(
                     let fn_ptr = vm.gc.alloc_fn(closure_name, arity, uv_count as u16, fn_id);
                     unsafe {
                         (*fn_ptr).header.class = vm.fn_class;
+                        (*fn_ptr).trivial_getter_field = vm
+                            .engine
+                            .trivial_getter_fields
+                            .get(fn_id as usize)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(u16::MAX);
                     }
                     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
                     unsafe {
@@ -2700,7 +2707,7 @@ fn run_fiber_with_stop_depth(
                     // (like the script's main function) still get compiled.
                     // Also drain the compile queue here — this is a safe point
                     // between iterations (not mid-call-dispatch).
-                    if target < pc && vm.engine.mode == ExecutionMode::Tiered {
+                    if target < branch_offset && vm.engine.mode == ExecutionMode::Tiered {
                         // Sample tier-up polling every 64 back-edges to keep
                         // the hot loop fast. We still bump call_count on every
                         // back-edge (cheap inline increment), but the expensive
@@ -2723,7 +2730,10 @@ fn run_fiber_with_stop_depth(
                         if should_tier_up {
                             vm.engine.request_tier_up(func_id, &vm.interner);
                         }
-                        if should_tier_up || (backedge_counter & 63) == 0 {
+                        if should_tier_up
+                            || vm.engine.has_pending_compilations()
+                            || (backedge_counter & 63) == 0
+                        {
                             if vm.engine.has_pending_compilations() {
                                 // Save frame state before draining.
                                 unsafe {
@@ -2816,7 +2826,7 @@ fn run_fiber_with_stop_depth(
                         target = false_off;
                     }
 
-                    if target < branch_end && vm.engine.mode == ExecutionMode::Tiered {
+                    if target < branch_offset && vm.engine.mode == ExecutionMode::Tiered {
                         backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
                         if std::env::var_os("WLIFT_OSR_TRACE").is_some()
@@ -2835,7 +2845,10 @@ fn run_fiber_with_stop_depth(
                         if should_tier_up {
                             vm.engine.request_tier_up(func_id, &vm.interner);
                         }
-                        if should_tier_up || (backedge_counter & 63) == 0 {
+                        if should_tier_up
+                            || vm.engine.has_pending_compilations()
+                            || (backedge_counter & 63) == 0
+                        {
                             if vm.engine.has_pending_compilations() {
                                 unsafe {
                                     if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -3712,7 +3725,7 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mir::{Instruction, MirFunction, Terminator};
+    use crate::mir::{Instruction, MirFunction, MirType, Terminator};
     use crate::runtime::vm::{VMConfig, VM};
 
     fn make_vm() -> VM {
@@ -3964,6 +3977,81 @@ mod tests {
         let mut vars = vec![];
         let result = eval_in_vm(&mut vm, &f, &mut vars).unwrap();
         assert_eq!(result.as_num().unwrap(), 15.0);
+    }
+
+    #[cfg(feature = "cranelift")]
+    #[test]
+    fn test_tiered_cond_branch_backedge_enters_osr() {
+        let mut config = VMConfig::default();
+        config.execution_mode = ExecutionMode::Tiered;
+        config.jit_threshold = 1;
+        config.opt_threshold = u32::MAX;
+        let mut vm = VM::new(config);
+        vm.engine.collect_tier_stats = true;
+
+        let name = vm.interner.intern("cond_backedge_osr_test");
+        let mut f = MirFunction::new(name, 0);
+
+        let entry = f.new_block();
+        let loop_bb = f.new_block();
+        let exit = f.new_block();
+
+        let v_zero = f.new_value();
+        {
+            let b = f.block_mut(entry);
+            b.instructions.push((v_zero, Instruction::ConstNum(0.0)));
+            b.terminator = Terminator::Branch {
+                target: loop_bb,
+                args: vec![v_zero],
+            };
+        }
+
+        let v_i = f.new_value();
+        let v_limit = f.new_value();
+        let v_cond = f.new_value();
+        let v_one = f.new_value();
+        let v_next = f.new_value();
+        {
+            let b = f.block_mut(loop_bb);
+            b.params.push((v_i, MirType::Value));
+            b.instructions.push((v_i, Instruction::BlockParam(0)));
+            b.instructions
+                .push((v_limit, Instruction::ConstNum(100_000.0)));
+            b.instructions
+                .push((v_cond, Instruction::CmpLt(v_i, v_limit)));
+            b.instructions.push((v_one, Instruction::ConstNum(1.0)));
+            b.instructions.push((v_next, Instruction::Add(v_i, v_one)));
+            b.terminator = Terminator::CondBranch {
+                condition: v_cond,
+                true_target: loop_bb,
+                true_args: vec![v_next],
+                false_target: exit,
+                false_args: vec![v_i],
+            };
+        }
+
+        let v_result = f.new_value();
+        {
+            let b = f.block_mut(exit);
+            b.params.push((v_result, MirType::Value));
+            b.instructions.push((v_result, Instruction::BlockParam(0)));
+            b.terminator = Terminator::Return(v_result);
+        }
+
+        let mut vars = vec![];
+        let result = eval_in_vm(&mut vm, &f, &mut vars).unwrap();
+        assert_eq!(result.as_num().unwrap(), 100_000.0);
+
+        let osr_entries: u64 = vm
+            .engine
+            .tier_stats
+            .iter()
+            .map(|stats| stats.osr_entries)
+            .sum();
+        assert!(
+            osr_entries > 0,
+            "expected the conditional back-edge loop to enter OSR"
+        );
     }
 
     #[test]

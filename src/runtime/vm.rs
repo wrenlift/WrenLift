@@ -551,6 +551,13 @@ impl VM {
                 let fn_ptr = self.gc.alloc_fn(sig_sym, 0, 0, method_func_id.0);
                 unsafe {
                     (*fn_ptr).header.class = self.fn_class;
+                    (*fn_ptr).trivial_getter_field = self
+                        .engine
+                        .trivial_getter_fields
+                        .get(method_func_id.0 as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(u16::MAX);
                 }
 
                 let closure_ptr = self.gc.alloc_closure(fn_ptr);
@@ -2065,6 +2072,13 @@ impl VM {
         let fn_ptr = self.gc.alloc_fn(fn_name, 0, 0, func_id.0);
         unsafe {
             (*fn_ptr).header.class = self.fn_class;
+            (*fn_ptr).trivial_getter_field = self
+                .engine
+                .trivial_getter_fields
+                .get(func_id.0 as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(u16::MAX);
         }
         let closure_ptr = self.gc.alloc_closure(fn_ptr);
         unsafe {
