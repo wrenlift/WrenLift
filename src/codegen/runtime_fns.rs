@@ -1308,7 +1308,7 @@ pub fn allow_nonleaf_native(
     #[cfg(feature = "cranelift")]
     {
         let _ = (vm, func_id);
-        return true;
+        true
     }
     #[cfg(not(feature = "cranelift"))]
     {
@@ -1911,7 +1911,7 @@ fn dispatch_method(
                     .get(fn_idx)
                     .copied()
                     .unwrap_or(std::ptr::null());
-                let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+                let _is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
                 // With Cranelift, allow non-leaf JIT dispatch — Cranelift
                 // handles register allocation and call conventions correctly.
                 // The old backend required is_leaf to avoid spill-slot bugs.

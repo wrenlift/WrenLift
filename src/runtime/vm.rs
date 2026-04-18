@@ -2594,6 +2594,7 @@ fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32
     }
 }
 
+#[allow(dead_code)] // Kept for future eager-compile heuristics on module entries.
 fn should_eager_compile_entry(
     mir: &crate::mir::MirFunction,
     interner: &crate::intern::Interner,

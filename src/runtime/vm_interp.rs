@@ -250,6 +250,7 @@ enum OsrTransfer {
     Return(Value),
 }
 
+#[allow(clippy::too_many_arguments)] // OSR transfer needs every piece of the live frame context.
 fn try_enter_loop_osr(
     vm: &mut VM,
     fiber: *mut ObjFiber,
@@ -2810,8 +2811,7 @@ fn run_fiber_with_stop_depth(
                     let branch_end = false_params_start + (f_argc * 4) as u32;
                     // Don't need to advance pc — both branches jump to target offset
 
-                    let target;
-                    if cond.is_truthy_wren() {
+                    let target = if cond.is_truthy_wren() {
                         // Bind true params
                         let mut p = true_params_start;
                         for _ in 0..t_argc {
@@ -2820,7 +2820,7 @@ fn run_fiber_with_stop_depth(
                             let val = get_reg(&values, src_reg);
                             set_reg(&mut values, dst_reg, val);
                         }
-                        target = true_off;
+                        true_off
                     } else {
                         // Bind false params
                         let mut p = false_params_start;
@@ -2830,8 +2830,8 @@ fn run_fiber_with_stop_depth(
                             let val = get_reg(&values, src_reg);
                             set_reg(&mut values, dst_reg, val);
                         }
-                        target = false_off;
-                    }
+                        false_off
+                    };
 
                     if target < branch_offset && vm.engine.mode == ExecutionMode::Tiered {
                         backedge_counter = backedge_counter.wrapping_add(1);
@@ -3016,7 +3016,7 @@ fn dispatch_closure_bc(
     closure_ptr: *mut ObjClosure,
     arg_vals: &[Value],
     pc: u32,
-    mut values: Vec<Value>,
+    values: Vec<Value>,
     module_name: &Rc<String>,
     return_dst: ValueId,
     defining_class: Option<*mut ObjClass>,
@@ -3040,6 +3040,7 @@ fn dispatch_closure_bc(
 /// Inner dispatch with `allow_threaded` flag. When false (called from
 /// try_operator_dispatch), skip the threaded path because the bytecode
 /// loop's `continue 'fiber_loop` expects a frame push/pop cycle.
+#[allow(clippy::too_many_arguments)] // Closure dispatch fans out caller state; wrapping in a struct would churn every callsite.
 fn dispatch_closure_bc_inner(
     vm: &mut VM,
     fiber: *mut ObjFiber,
@@ -3099,7 +3100,7 @@ fn dispatch_closure_bc_inner(
             .unwrap_or(std::ptr::null());
 
         if !fn_ptr_raw.is_null() {
-            let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+            let _is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
             let allow_shadow_nonleaf =
                 crate::codegen::runtime_fns::allow_nonleaf_native(vm, target_func_id);
             // Only dispatch leaf functions via JIT. Non-leaf JIT dispatch is
@@ -3255,7 +3256,7 @@ fn dispatch_closure_bc_inner(
         vm.engine
             .ensure_bytecode(target_func_id)
             .map(|bc_ptr| unsafe {
-                let bc = &*(bc_ptr as *const BytecodeFunction);
+                let bc = &*bc_ptr;
                 !bc.osr_points.is_empty()
             })
             .unwrap_or(false)
@@ -3295,7 +3296,7 @@ fn dispatch_closure_bc_inner(
                 .engine
                 .ensure_bytecode(target_func_id)
                 .map(|bc_ptr| unsafe {
-                    let bc = &*(bc_ptr as *const BytecodeFunction);
+                    let bc = &*bc_ptr;
                     bc.ic_table.get()
                 });
             // Set JIT context so wren_call_N slow path works.
@@ -3989,10 +3990,12 @@ mod tests {
     #[cfg(feature = "cranelift")]
     #[test]
     fn test_tiered_cond_branch_backedge_enters_osr() {
-        let mut config = VMConfig::default();
-        config.execution_mode = ExecutionMode::Tiered;
-        config.jit_threshold = 1;
-        config.opt_threshold = u32::MAX;
+        let config = VMConfig {
+            execution_mode: ExecutionMode::Tiered,
+            jit_threshold: 1,
+            opt_threshold: u32::MAX,
+            ..VMConfig::default()
+        };
         let mut vm = VM::new(config);
         vm.engine.collect_tier_stats = true;
 

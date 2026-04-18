@@ -16,7 +16,7 @@
 /// Expected: ~40ns/method-call vs ~75ns for bytecode interpreter.
 use crate::intern::SymbolId;
 use crate::mir::bytecode::CallSiteIC;
-use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
+use crate::mir::{BlockId, Instruction, MirFunction, Terminator};
 use crate::runtime::value::Value;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -280,7 +280,7 @@ fn op_get_field(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let idx = op.b as usize;
     let val = unsafe {
         let obj_ptr = recv.as_object().unwrap_unchecked();
-        let header = obj_ptr as *const crate::runtime::object::ObjHeader;
+        let _header = obj_ptr as *const crate::runtime::object::ObjHeader;
         let inst = obj_ptr as *const crate::runtime::object::ObjInstance;
         let fields = (*inst).fields;
         *fields.add(idx)
@@ -328,7 +328,7 @@ fn op_set_module_var(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
 
 // -- Control flow --
 
-fn op_branch(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+fn op_branch(_state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     op.c as usize // target pc
 }
 
@@ -537,6 +537,7 @@ fn op_is_type(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     state.pc + 1
 }
 
+#[allow(dead_code)] // Reserved for a future threaded SetField emission path.
 fn op_write_barrier(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     crate::codegen::runtime_fns::wren_write_barrier(
         get(state, op.a).to_bits(),
@@ -545,7 +546,8 @@ fn op_write_barrier(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     state.pc + 1
 }
 
-fn op_construct(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
+#[allow(dead_code)] // Reserved slot for constructor lowering; handled at a higher level today.
+fn op_construct(state: &mut ThreadedState, _op: &ThreadedOp) -> usize {
     // Construct is handled at a higher level; no-op here
     state.pc + 1
 }
@@ -658,17 +660,14 @@ pub fn lower_mir_to_threaded(
         block_offsets.insert(BlockId(block_idx as u32), offset);
         offset += block.instructions.len();
         // Count extra moves for branch args
-        match &block.terminator {
-            Terminator::Branch { args, .. } => {
-                offset += args.len(); // one move per arg
-            }
-            _ => {}
+        if let Terminator::Branch { args, .. } = &block.terminator {
+            offset += args.len(); // one move per arg
         }
         offset += 1; // terminator
     }
 
     // Second pass: emit ops
-    for (block_idx, block) in mir.blocks.iter().enumerate() {
+    for block in mir.blocks.iter() {
         for &(vid, ref inst) in &block.instructions {
             let dst = vid.0 as u16;
             if dst > max_reg {
@@ -852,7 +851,7 @@ pub fn lower_mir_to_threaded(
                     dst,
                     a: recv.0 as u16,
                     b: *idx,
-                    c: val.0 as u32,
+                    c: val.0,
                     extra: 0,
                 },
                 // Module vars
@@ -980,7 +979,7 @@ pub fn lower_mir_to_threaded(
                     c: 0,
                     extra: 0,
                 },
-                Instruction::IsType(a, cls) => ThreadedOp {
+                Instruction::IsType(a, _cls) => ThreadedOp {
                     handler: op_is_type,
                     dst,
                     a: a.0 as u16,
@@ -1030,7 +1029,7 @@ pub fn lower_mir_to_threaded(
                         extra: packed,
                     }
                 }
-                Instruction::MakeList(elems) => {
+                Instruction::MakeList(_elems) => {
                     // For now, delegate to runtime
                     ThreadedOp {
                         handler: op_noop,
@@ -1078,10 +1077,10 @@ pub fn lower_mir_to_threaded(
                 }
             }
             Terminator::CondBranch {
-                true_target,
-                true_args,
-                false_target,
-                false_args,
+                true_target: _,
+                true_args: _,
+                false_target: _,
+                false_args: _,
                 ..
             } => {
                 // CondBranch args are trickier: we need to copy args for
@@ -1211,7 +1210,7 @@ pub fn execute_threaded(
 ) -> (Value, Vec<Value>) {
     let ic_ptr = ic_table_override.unwrap_or(code.ic_table.get());
     let needed = code.reg_count.max(args.len());
-    let mut regs = if let Some(mut r) = recycled_regs {
+    let regs = if let Some(mut r) = recycled_regs {
         r.resize(needed, Value::null());
         // Clear to null (recycled may have stale values).
         for v in r.iter_mut() {
@@ -1264,7 +1263,7 @@ pub fn execute_threaded(
 mod tests {
     use super::*;
     use crate::intern::Interner;
-    use crate::mir::{Instruction, MirFunction, Terminator};
+    use crate::mir::{Instruction, MirFunction, Terminator, ValueId};
 
     /// Helper: emit instruction into block, return ValueId
     fn emit(f: &mut MirFunction, bb: BlockId, inst: Instruction) -> ValueId {

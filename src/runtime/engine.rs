@@ -85,6 +85,13 @@ pub fn classify_value(v: crate::runtime::value::Value) -> u8 {
     }
 }
 
+/// Backing storage for a registered function.
+///
+/// The `Native` variant dominates size because `ExecutableFunction` inlines
+/// the backend buffer. Boxing would double heap allocations per installed
+/// function without reducing peak memory — each `FuncBody` already lives
+/// inside a `Vec<FuncBody>` that grows linearly with the program.
+#[allow(clippy::large_enum_variant)]
 pub enum FuncBody {
     /// MIR available for interpretation. Not yet compiled to native.
     Interpreted {
@@ -193,6 +200,12 @@ pub struct CompiledModule {
 // ---------------------------------------------------------------------------
 
 /// A completed background compilation ready to be installed.
+///
+/// `Compiled` is the dominant variant; the two sit next to each other on a
+/// one-shot mpsc channel, so a single allocation per compile is the cheapest
+/// shape. Boxing just to quiet the lint would add a heap hop on every
+/// tier-up install.
+#[allow(clippy::large_enum_variant)]
 enum CompilationResult {
     Compiled {
         id: FuncId,
@@ -695,7 +708,7 @@ impl ExecutionEngine {
         id: FuncId,
     ) -> Option<(Vec<CallSiteIC>, Vec<usize>)> {
         let bc_ptr = self.ensure_bytecode(id)?;
-        let bc = unsafe { &*(bc_ptr as *const BytecodeFunction) };
+        let bc = unsafe { &*bc_ptr };
         let ic_table = unsafe { &mut *bc.ic_table.get() };
 
         // Snapshot for the compiler (used on background thread).
@@ -1243,7 +1256,7 @@ impl ExecutionEngine {
             if code_size > 0 {
                 eprint!("HEX:f{}:{}:", idx, code_size);
                 let code_bytes =
-                    unsafe { std::slice::from_raw_parts(native_ptr as *const u8, code_size) };
+                    unsafe { std::slice::from_raw_parts(native_ptr, code_size) };
                 for b in code_bytes {
                     eprint!("{:02x}", b);
                 }
@@ -1645,7 +1658,7 @@ impl ExecutionEngine {
         if bc_ptr.is_null() {
             return;
         }
-        let bc = unsafe { &*(bc_ptr as *const BytecodeFunction) };
+        let bc = unsafe { &*bc_ptr };
         let ic_table = unsafe { &*bc.ic_table.get() };
         for ic in ic_table.iter() {
             // kind=1: JIT call with known func_id
@@ -1682,7 +1695,7 @@ impl ExecutionEngine {
             let thread_idle = self
                 .compile_handle
                 .as_ref()
-                .map_or(true, |h| h.is_finished());
+                .is_none_or(|h| h.is_finished());
             if thread_idle {
                 if let Some(h) = self.compile_handle.take() {
                     let _ = h.join();
@@ -1702,7 +1715,7 @@ impl ExecutionEngine {
     pub fn compile_thread_idle(&self) -> bool {
         self.compile_handle
             .as_ref()
-            .map_or(true, |h| h.is_finished())
+            .is_none_or(|h| h.is_finished())
     }
 
     /// Drain the compile queue: if the background thread is idle and there
@@ -1713,7 +1726,7 @@ impl ExecutionEngine {
             let thread_idle = self
                 .compile_handle
                 .as_ref()
-                .map_or(true, |h| h.is_finished());
+                .is_none_or(|h| h.is_finished());
             if !thread_idle {
                 break;
             }

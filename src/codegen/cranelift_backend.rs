@@ -811,6 +811,7 @@ pub mod cl {
     /// - BlockParam types are f64 (not i64)
     /// - Unbox/Box of params/returns are no-ops
     /// - CallStaticSelf calls the inner function directly with f64 args
+    #[allow(clippy::too_many_arguments)] // Lowering context is inherently wide (IC, OSR, f64 inner, ...).
     fn lower_mir_impl(
         mir: &MirFunction,
         interner: &Interner,
@@ -1034,6 +1035,7 @@ pub mod cl {
     /// Fast path: both operands are numbers → bitcast to f64, do the operation,
     ///            bitcast back (arith) or produce TAG_TRUE/TAG_FALSE (cmp).
     /// Slow path: call the runtime function.
+    #[allow(clippy::type_complexity)] // Runtime-fn resolver closure: one-shot type used only here.
     fn emit_inline_boxed_binop(
         builder: &mut FunctionBuilder,
         module: &mut JITModule,
@@ -1110,6 +1112,7 @@ pub mod cl {
     }
 
     /// Lower a single MIR instruction to Cranelift IR.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)] // Instruction lowering threads builder/module/val-map/IC/JIT-code-base — wide by design.
     fn lower_instruction(
         inst: &Instruction,
         _mir: &MirFunction,
@@ -1781,7 +1784,7 @@ pub mod cl {
                         _ => "wren_make_list_4",
                     };
                     let f = get_runtime_fn(module, builder, name, elems.len())?;
-                    let args: Vec<Value> = elems.iter().map(|e| get(e)).collect();
+                    let args: Vec<Value> = elems.iter().map(&get).collect();
                     let result = builder.ins().call(f, &args);
                     Ok(Some(builder.inst_results(result)[0]))
                 } else {
@@ -2243,8 +2246,8 @@ pub mod cl {
         post_order.reverse(); // reverse post-order — bb0 is now first
 
         // Add any unreachable blocks AFTER reversing so they come last
-        for i in 0..n {
-            if !visited[i] {
+        for (i, &seen) in visited.iter().enumerate().take(n) {
+            if !seen {
                 post_order.push(i);
             }
         }

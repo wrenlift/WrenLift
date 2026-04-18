@@ -1757,6 +1757,7 @@ fn infer_mir_gc_value_reps(
     reps
 }
 
+#[allow(dead_code)] // Used by the legacy hand-rolled backend + its lib tests; dead when cranelift is the only backend.
 fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
     mach.insts.iter().any(|inst| match inst {
         // Exclude deopt calls (wren_deopt_*) and shadow management calls —
@@ -1860,6 +1861,12 @@ pub fn lower_mir_with_interner_and_callsite_ics(
 // ---------------------------------------------------------------------------
 
 /// Compiled output from the full pipeline.
+///
+/// Variants carry backend-specific state that is already heap-owned internally
+/// (JIT modules, mmap handles). Boxing the whole enum would trade a single
+/// heap hop for two on every produced artifact without reducing the
+/// constant-size overhead the lint is flagging, so we keep it flat.
+#[allow(clippy::large_enum_variant)]
 pub enum CompiledFunction {
     /// x86_64 machine code bytes.
     X86_64(x86_64::EmittedCode),
@@ -1928,6 +1935,11 @@ impl CompiledFunction {
 }
 
 /// Executable function backed by mmap'd memory. Drop to release.
+///
+/// Same rationale as `CompiledFunction`: variants hold their own heap
+/// allocations, so boxing the enum itself adds indirection without saving
+/// space on the variants that matter.
+#[allow(clippy::large_enum_variant)]
 pub enum ExecutableFunction {
     X86_64(x86_64::ExecutableCode),
     #[cfg(target_arch = "aarch64")]
@@ -2108,11 +2120,12 @@ fn devirt_calls_with_ic(
     new_mir
 }
 
+#[allow(clippy::too_many_arguments)] // Single call site; plumbs IC snapshot, devirt hints and jit_code_base into the backend.
 pub fn compile_function_artifact_with_interner_and_callsite_ics(
     mir: &MirFunction,
     target: Target,
     interner: &crate::intern::Interner,
-    compile_tier: CompileTier,
+    #[cfg_attr(feature = "cranelift", allow(unused_variables))] compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
     callsite_ic_live_ptrs: Option<Vec<usize>>,
     devirt_hints: Option<Vec<DevirtHint>>,
@@ -2149,12 +2162,13 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 jit_code_base,
             )?;
             let code = CompiledFunction::CraneliftOwned(compiled);
-            return Ok(CompiledArtifact {
+            Ok(CompiledArtifact {
                 code,
                 native_meta: None,
                 needs_shadow_frame: false,
-            });
+            })
         }
+        #[cfg(not(feature = "cranelift"))]
         _ => {
             // Disable inline IC on x86_64 until register conflicts are resolved.
             #[cfg(not(target_arch = "aarch64"))]
@@ -2303,6 +2317,7 @@ pub fn compile_function_with_interner(
 
 /// Replace sentinel VReg indices (frame pointer, spill scratch, ABI regs) with
 /// actual hardware register encodings for the target.
+#[allow(dead_code)] // Legacy backend helper; kept for tests and non-cranelift builds.
 fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
     let (fp_enc, gp_scratch, fp_scratch, gp_ret, gp_args, call_scratch, copy_scratch): (
         u32,
@@ -2339,7 +2354,7 @@ fn fixup_sentinels(mach: &mut MachFunc, target: Target) {
 }
 
 /// Rewrite sentinel indices in a single instruction.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)] // Legacy backend helper.
 fn fixup_vreg_sentinels(
     inst: &mut MachInst,
     fp_enc: u32,
@@ -2564,6 +2579,7 @@ fn fixup_vreg_sentinels(
 /// Before each epilogue, inserts:
 ///   movz x16, pop_addr
 ///   blr  x16              (call wren_jit_frame_pop)
+#[allow(dead_code)] // Legacy backend helper; cranelift handles this via its own runtime entries.
 fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
     let push_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_push").unwrap_or(0) as u64;
     let pop_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_pop").unwrap_or(0) as u64;
@@ -2650,6 +2666,7 @@ fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
 /// After register allocation, insert push/pop for callee-saved registers that
 /// were assigned by the allocator. Without this, JIT code clobbers the caller's
 /// preserved registers (RBX, R12-R15 on x86_64) causing SIGSEGV on return.
+#[allow(dead_code)] // Legacy backend helper.
 fn insert_callee_saves(mach: &mut MachFunc, target: Target) {
     let callee_saved: &[PhysReg] = match target {
         Target::X86_64 => phys_x86_64::ABI.gp_callee_saved,
