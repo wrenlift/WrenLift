@@ -24,20 +24,16 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Supabase project URL for the hatch catalog. Override via
-/// `HATCH_SERVICE_URL` — essential for tests and for power users who
-/// want to point at a fork / private mirror.
-pub const DEFAULT_SERVICE_URL: &str = "https://hatch.supabase.co";
+/// `HATCH_SERVICE_URL` for tests, private mirrors, or forks.
+pub const DEFAULT_SERVICE_URL: &str = "https://bncbgsfttafynyalrrbb.supabase.co";
 
-/// Public anon key used for catalog reads. Supabase exposes this
-/// publicly by design — write paths are protected by the auth'd
-/// JWT `hatch login` stores in credentials, not by this key. Override
-/// via `HATCH_SERVICE_ANON_KEY`.
-///
-/// The default value is an empty string so a fresh clone with no
-/// environment set produces a clear "service not configured" error
-/// instead of a silent dial against a random URL. Populate once the
-/// Supabase project exists.
-pub const DEFAULT_SERVICE_ANON_KEY: &str = "";
+/// Public anon key — safe to ship in source because Supabase gates
+/// every request through row-level security policies. Write paths
+/// additionally require the user's JWT from `hatch login`, so
+/// leaking this key only exposes what's already public: reads of
+/// the `packages` table. Override via `HATCH_SERVICE_ANON_KEY`.
+pub const DEFAULT_SERVICE_ANON_KEY: &str =
+    "sb_publishable_uTNCHuGnN5mzsWbuJI8CQg_0qFEBQRz";
 
 /// Runtime configuration resolved from env vars (with defaults).
 #[derive(Debug, Clone)]
