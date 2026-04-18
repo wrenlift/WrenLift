@@ -3656,3 +3656,61 @@ System.print(m["foo()"][null]["pinned"][0])
 "#;
     assert_output(source, "null");
 }
+
+// ===========================================================================
+// Foreign methods backed by dlopen/dlsym (Phase 3b)
+// ===========================================================================
+//
+// The dispatch bridge is unit-tested in src/runtime/foreign.rs against
+// plain `extern "C" fn` pointers (which don't require symbol export).
+// The full end-to-end round-trip (Wren → #!native → dlsym → extern fn)
+// needs a fixture whose symbols are actually resolvable via `dlsym`. On
+// macOS/Linux the test binary's `#[no_mangle]` symbols are NOT exported
+// to dyld's global scope by default — that requires `-rdynamic` /
+// `-Wl,-export_dynamic` in the linker invocation, which we don't want
+// to enable globally. Phase 3c will either build a tiny fixture cdylib
+// or wire up per-test linker flags and enable the ignored tests below.
+
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn wrenlift_e2e_double(vm: *mut wren_lift::runtime::vm::VM) {
+    unsafe {
+        let slots = &mut (*vm).api_stack;
+        let n = slots[1].as_num().unwrap_or(0.0);
+        slots[0] = wren_lift::runtime::value::Value::num(n * 2.0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "needs -rdynamic to export test-binary symbols; see Phase 3c"]
+fn e2e_foreign_class_binds_symbol_from_self() {
+    let source = r#"
+#!native = "self"
+foreign class Doubler {
+  #!symbol = "wrenlift_e2e_double"
+  foreign static double(x)
+}
+System.print(Doubler.double(21))
+"#;
+    assert_output(source, "42");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_foreign_missing_library_surfaces_error() {
+    // A bogus library name must fail cleanly: the load error prints to
+    // stderr and the foreign method simply isn't bound. Calling it then
+    // surfaces as a normal "method not found" runtime error rather than
+    // SEGV-ing the process.
+    let source = r#"
+#!native = "__wrenlift_missing_lib__"
+foreign class Bogus {
+  #!symbol = "nope"
+  foreign static go()
+}
+Bogus.go()
+"#;
+    let (result, _output, _) = run(source);
+    assert!(matches!(result, InterpretResult::RuntimeError));
+}

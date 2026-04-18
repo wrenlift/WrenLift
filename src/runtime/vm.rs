@@ -220,6 +220,17 @@ pub struct VM {
 
     /// Stable core-library symbols used by hot native dispatch fast paths.
     pub hot_method_symbols: HotMethodSymbols,
+
+    /// Dynamic libraries opened on behalf of `foreign` classes via
+    /// `#!native`. Kept alive for the VM's lifetime so the function
+    /// pointers bound into method tables remain valid.
+    pub native_libs: Vec<libloading::Library>,
+
+    /// Extra filesystem directories to search when resolving a
+    /// `#!native = "..."` library reference, tried ahead of the OS
+    /// loader's ambient search. Populated from the workspace's
+    /// `hatchfile` at VM setup time.
+    pub native_search_paths: Vec<std::path::PathBuf>,
 }
 
 impl VM {
@@ -286,6 +297,8 @@ impl VM {
             method_cache: super::vm_interp::MethodCache::new(),
             call_sym_flags: Vec::new(),
             hot_method_symbols: HotMethodSymbols::default(),
+            native_libs: Vec::new(),
+            native_search_paths: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -889,6 +902,72 @@ impl VM {
                             .insert(bind_sym, method_mir.attributes);
                     }
                 }
+            }
+
+            // Resolve #!native / #!symbol foreign methods via dlopen/dlsym.
+            // Unresolved methods remain absent from the method table — calls
+            // surface as a normal method-not-found runtime error.
+            if let Some(lib_name) = class_mir.native_library.as_ref() {
+                let trace = std::env::var_os("WLIFT_TRACE_FOREIGN").is_some();
+                match crate::runtime::foreign::load_library(
+                    lib_name,
+                    &self.native_search_paths,
+                ) {
+                    Ok(lib) => {
+                        if trace {
+                            eprintln!("wrenlift: loaded native library '{}'", lib_name);
+                        }
+                        unsafe {
+                            (*class_ptr).is_foreign = true;
+                        }
+                        for fm in &class_mir.foreign_methods {
+                            let symbol_name: String = fm.symbol.clone().unwrap_or_else(|| {
+                                crate::runtime::foreign::base_name_of_signature(&fm.signature)
+                                    .to_string()
+                            });
+                            match crate::runtime::foreign::resolve_symbol(
+                                &lib,
+                                lib_name,
+                                &symbol_name,
+                            ) {
+                                Ok(func) => {
+                                    let sig_sym = self.interner.intern(&fm.signature);
+                                    let bind_sym = if fm.is_static {
+                                        let static_sig = format!("static:{}", fm.signature);
+                                        self.interner.intern(&static_sig)
+                                    } else {
+                                        sig_sym
+                                    };
+                                    if trace {
+                                        eprintln!(
+                                            "wrenlift: bound '{}' → {} (sym={})",
+                                            fm.signature, symbol_name, bind_sym.index(),
+                                        );
+                                    }
+                                    unsafe {
+                                        (*class_ptr).bind_foreign_c(bind_sym, func);
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("wrenlift: {}", err);
+                                }
+                            }
+                        }
+                        self.native_libs.push(lib);
+                    }
+                    Err(err) => {
+                        eprintln!("wrenlift: {}", err);
+                    }
+                }
+            } else if !class_mir.foreign_methods.is_empty() {
+                // Phase 3b does not yet route through bind_foreign_method_fn
+                // when #!native is absent. Surface a diagnostic so silent
+                // "method not found" errors aren't mysterious.
+                let class_name = self.interner.resolve(class_mir.name).to_string();
+                eprintln!(
+                    "wrenlift: class '{}' has foreign methods but no #!native directive",
+                    class_name
+                );
             }
 
             // Store class in module vars
@@ -2008,7 +2087,7 @@ impl NativeContext for VM {
         all_args.extend_from_slice(args);
 
         match method_entry {
-            Method::Native(func) => {
+            m @ (Method::Native(_) | Method::ForeignC(_)) => {
                 let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                 for &arg in &all_args {
                     crate::codegen::runtime_fns::push_jit_root(arg);
@@ -2016,7 +2095,13 @@ impl NativeContext for VM {
                 let rooted_args: Vec<Value> = (0..all_args.len())
                     .map(|idx| crate::codegen::runtime_fns::jit_root_at(root_len_before + idx))
                     .collect();
-                let result = Some(func(self, &rooted_args));
+                let result = Some(match m {
+                    Method::Native(func) => func(self, &rooted_args),
+                    Method::ForeignC(func) => {
+                        crate::runtime::foreign::dispatch_foreign_c(self, func, &rooted_args)
+                    }
+                    _ => unreachable!(),
+                });
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                 result
             }
@@ -2933,6 +3018,9 @@ mod tests {
         let method = unsafe { (*class).find_method(sym).cloned() };
         match method {
             Some(Method::Native(func)) => func(vm, args),
+            Some(Method::ForeignC(func)) => {
+                crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
+            }
             _ => panic!("Method '{}' not found", sig),
         }
     }
@@ -2943,6 +3031,9 @@ mod tests {
         let method = unsafe { (*class).find_method(sym).cloned() };
         match method {
             Some(Method::Native(func)) => func(vm, args),
+            Some(Method::ForeignC(func)) => {
+                crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
+            }
             _ => panic!("Static method '{}' not found", sig),
         }
     }

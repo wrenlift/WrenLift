@@ -1,6 +1,7 @@
 pub mod core;
 pub mod engine;
 pub mod fiber;
+pub mod foreign;
 pub mod gc;
 pub mod gc_arena;
 pub mod gc_marksweep;

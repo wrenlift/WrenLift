@@ -537,6 +537,10 @@ fn populate_callsite_ic(
             func_id: 0,
             kind: 4,
         },
+        // ForeignC methods aren't cached in the IC — each call falls
+        // back to full method-table lookup. The call overhead is
+        // already dominated by dlsym'd code, so re-resolution is fine.
+        Method::ForeignC(_) => crate::mir::bytecode::CallSiteIC::default(),
     };
 
     unsafe {
@@ -1882,9 +1886,16 @@ fn dispatch_method(
             vm.engine
                 .note_runtime_call_stats(|s| s.dispatch_method_native += 1);
             let result = native_fn(vm, args).to_bits();
-            // Check if the native method requested a fiber action (e.g. fiber.call()).
-            // If so, handle it synchronously here — the JIT caller expects a return
-            // value and has no mechanism to perform a fiber switch itself.
+            if let Some(action) = vm.pending_fiber_action.take() {
+                return handle_jit_fiber_action(vm, action);
+            }
+            result
+        }
+        Method::ForeignC(foreign_fn) => {
+            vm.engine
+                .note_runtime_call_stats(|s| s.dispatch_method_native += 1);
+            let result = crate::runtime::foreign::dispatch_foreign_c(vm, foreign_fn, args)
+                .to_bits();
             if let Some(action) = vm.pending_fiber_action.take() {
                 return handle_jit_fiber_action(vm, action);
             }
@@ -2696,6 +2707,9 @@ fn dispatch_super_call_rooted(
     };
     match lookup {
         Some((Method::Native(native_fn), _dc)) => native_fn(vm, args).to_bits(),
+        Some((Method::ForeignC(foreign_fn), _dc)) => {
+            crate::runtime::foreign::dispatch_foreign_c(vm, foreign_fn, args).to_bits()
+        }
         Some((Method::Closure(closure_ptr), dc)) => {
             call_closure_jit_or_sync(vm, closure_ptr, args, Some(dc))
         }

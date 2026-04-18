@@ -441,7 +441,7 @@ impl Gc {
                             Method::Closure(ptr) | Method::Constructor(ptr) => {
                                 check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
                             }
-                            Method::Native(_) => {}
+                            Method::Native(_) | Method::ForeignC(_) => {}
                         }
                     }
                 }
@@ -990,7 +990,7 @@ impl Gc {
                             Method::Closure(ptr) | Method::Constructor(ptr) => {
                                 check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
                             }
-                            Method::Native(_) => {}
+                            Method::Native(_) | Method::ForeignC(_) => {}
                         }
                     }
                 }
@@ -1214,7 +1214,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                             mark_gray(*ptr as *mut ObjHeader, gray_stack);
                         }
                     }
-                    Method::Native(_) => {}
+                    Method::Native(_) | Method::ForeignC(_) => {}
                 }
             }
             for &val in class.static_fields.values() {
@@ -1354,7 +1354,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
                     Method::Closure(ref mut ptr) | Method::Constructor(ref mut ptr) => {
                         update_raw_ptr_inline(ptr, nursery);
                     }
-                    Method::Native(_) => {}
+                    Method::Native(_) | Method::ForeignC(_) => {}
                 }
             }
             for val in class.static_fields.values_mut() {

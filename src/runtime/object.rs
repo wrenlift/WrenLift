@@ -887,6 +887,11 @@ pub struct ObjClass {
     pub method_attributes: HashMap<SymbolId, Vec<crate::mir::AttrEntry>>,
 }
 
+/// A C-ABI foreign method (`extern "C" fn(*mut VM)`) — the Wren
+/// embedding API shape. Resolved from `#!native` / `#!symbol` at class
+/// install time and dispatched through the slot-based bridge.
+pub type ForeignCFn = extern "C" fn(vm: *mut crate::runtime::vm::VM);
+
 /// A method entry in the class method table.
 #[derive(Clone, Copy)]
 pub enum Method {
@@ -896,6 +901,10 @@ pub enum Method {
     Constructor(*mut ObjClosure),
     /// A native/foreign function.
     Native(NativeFn),
+    /// A C-ABI foreign method bound from a dynamic library via
+    /// `#!native` + `#!symbol`. Dispatched through the slot-based
+    /// bridge that matches the standard Wren embedding API.
+    ForeignC(ForeignCFn),
 }
 
 impl fmt::Debug for Method {
@@ -904,6 +913,7 @@ impl fmt::Debug for Method {
             Method::Closure(_) => write!(f, "Method::Closure(...)"),
             Method::Constructor(_) => write!(f, "Method::Constructor(...)"),
             Method::Native(_) => write!(f, "Method::Native(...)"),
+            Method::ForeignC(_) => write!(f, "Method::ForeignC(...)"),
         }
     }
 }
@@ -1040,6 +1050,12 @@ impl ObjClass {
     pub fn bind_native(&mut self, name: SymbolId, func: NativeFn) {
         self.ensure_capacity(name);
         self.methods[name.index() as usize] = Some(Method::Native(func));
+    }
+
+    /// Bind a C-ABI foreign method resolved from a dynamic library.
+    pub fn bind_foreign_c(&mut self, name: SymbolId, func: ForeignCFn) {
+        self.ensure_capacity(name);
+        self.methods[name.index() as usize] = Some(Method::ForeignC(func));
     }
 
     /// Look up a method by symbol. O(1) flat array access.

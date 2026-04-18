@@ -134,6 +134,37 @@ fn call_native_with_frame_sync(
     result
 }
 
+/// Mirror of `call_native_with_frame_sync` for C-ABI foreign methods
+/// bound from a dynamic library. Saves the current interpreter frame
+/// state around the call so the foreign function can re-enter the VM
+/// without clobbering live register files.
+#[inline]
+fn call_foreign_c_with_frame_sync(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    pc: u32,
+    values: &mut Vec<Value>,
+    func: crate::runtime::object::ForeignCFn,
+    args: &[Value],
+) -> Value {
+    unsafe {
+        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+            frame.values = std::mem::take(values);
+            frame.pc = pc;
+        }
+    }
+
+    let result = crate::runtime::foreign::dispatch_foreign_c(vm, func, args);
+
+    unsafe {
+        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+            *values = std::mem::take(&mut frame.values);
+        }
+    }
+
+    result
+}
+
 fn try_run_root_frame_native(
     vm: &mut VM,
     fiber: *mut ObjFiber,
@@ -1862,15 +1893,16 @@ fn run_fiber_with_stop_depth(
                         };
 
                     match method_entry {
-                        Some(Method::Native(func)) => {
-                            let result = call_native_with_frame_sync(
-                                vm,
-                                fiber,
-                                pc,
-                                &mut values,
-                                func,
-                                &arg_vals,
-                            );
+                        Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
+                            let result = match m {
+                                Method::Native(func) => call_native_with_frame_sync(
+                                    vm, fiber, pc, &mut values, func, &arg_vals,
+                                ),
+                                Method::ForeignC(func) => call_foreign_c_with_frame_sync(
+                                    vm, fiber, pc, &mut values, func, &arg_vals,
+                                ),
+                                _ => unreachable!(),
+                            };
                             if vm.has_error {
                                 vm.has_error = false;
                                 let fiber_is_try = unsafe { (*fiber).is_try };
@@ -2332,15 +2364,16 @@ fn run_fiber_with_stop_depth(
                             }
                         };
                         match method_entry {
-                            Some(Method::Native(func)) => {
-                                let result = call_native_with_frame_sync(
-                                    vm,
-                                    fiber,
-                                    pc,
-                                    &mut values,
-                                    func,
-                                    &arg_vals,
-                                );
+                            Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
+                                let result = match m {
+                                    Method::Native(func) => call_native_with_frame_sync(
+                                        vm, fiber, pc, &mut values, func, &arg_vals,
+                                    ),
+                                    Method::ForeignC(func) => call_foreign_c_with_frame_sync(
+                                        vm, fiber, pc, &mut values, func, &arg_vals,
+                                    ),
+                                    _ => unreachable!(),
+                                };
                                 set_reg(&mut values, dst, result);
                             }
                             Some(Method::Closure(closure_ptr)) => {
@@ -2407,15 +2440,16 @@ fn run_fiber_with_stop_depth(
                     let class = vm.class_of(recv);
                     let sym = subscript_get_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
-                        Some(Method::Native(func)) => {
-                            let result = call_native_with_frame_sync(
-                                vm,
-                                fiber,
-                                pc,
-                                &mut values,
-                                func,
-                                &all_args,
-                            );
+                        Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
+                            let result = match m {
+                                Method::Native(func) => call_native_with_frame_sync(
+                                    vm, fiber, pc, &mut values, func, &all_args,
+                                ),
+                                Method::ForeignC(func) => call_foreign_c_with_frame_sync(
+                                    vm, fiber, pc, &mut values, func, &all_args,
+                                ),
+                                _ => unreachable!(),
+                            };
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
@@ -2457,15 +2491,16 @@ fn run_fiber_with_stop_depth(
                     let class = vm.class_of(recv);
                     let sym = subscript_set_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
-                        Some(Method::Native(func)) => {
-                            let result = call_native_with_frame_sync(
-                                vm,
-                                fiber,
-                                pc,
-                                &mut values,
-                                func,
-                                &all_args,
-                            );
+                        Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
+                            let result = match m {
+                                Method::Native(func) => call_native_with_frame_sync(
+                                    vm, fiber, pc, &mut values, func, &all_args,
+                                ),
+                                Method::ForeignC(func) => call_foreign_c_with_frame_sync(
+                                    vm, fiber, pc, &mut values, func, &all_args,
+                                ),
+                                _ => unreachable!(),
+                            };
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
@@ -3605,11 +3640,19 @@ fn try_operator_dispatch(
         found
     };
     match method_entry {
-        Some(Method::Native(func)) => {
+        Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
             let mut arg_vals: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + args.len());
             arg_vals.push(recv);
             arg_vals.extend_from_slice(args);
-            let result = call_native_with_frame_sync(vm, fiber, *pc, values, func, &arg_vals);
+            let result = match m {
+                Method::Native(func) => {
+                    call_native_with_frame_sync(vm, fiber, *pc, values, func, &arg_vals)
+                }
+                Method::ForeignC(func) => {
+                    call_foreign_c_with_frame_sync(vm, fiber, *pc, values, func, &arg_vals)
+                }
+                _ => unreachable!(),
+            };
             set_reg(values, dst, result);
             Ok(false)
         }
