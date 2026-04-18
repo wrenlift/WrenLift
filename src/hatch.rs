@@ -511,7 +511,7 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
     }
 
     // Manifest: `hatchfile` at project root, or synthesized.
-    let manifest = match std::fs::read_to_string(root.join(HATCHFILE)) {
+    let mut manifest = match std::fs::read_to_string(root.join(HATCHFILE)) {
         Ok(text) => {
             let mut m: Manifest =
                 toml::from_str(&text).map_err(|e| HatchError::ManifestParse(e.to_string()))?;
@@ -535,8 +535,57 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
         },
     };
 
+    pack_bundled_native_libs(root, &mut manifest, &mut sections)?;
+
     let hatch = Hatch { manifest, sections };
     emit(&hatch)
+}
+
+/// Walk the workspace's `[native_libs]` entries and bundle each one
+/// that references a workspace-relative path. The file's bytes are
+/// packed as a `NativeLib` section keyed by the library name; the
+/// manifest entry is then removed so downstream loaders rely on the
+/// section (not the filesystem path that only existed on the build
+/// host). Absolute paths are left untouched — those are system refs
+/// and shouldn't be bundled.
+///
+/// This is host-platform-only for now: the resolver picks the current
+/// platform's entry and bundles that one. Cross-platform packaging
+/// (multi-platform sections side-by-side) is a follow-up.
+fn pack_bundled_native_libs(
+    root: &Path,
+    manifest: &mut Manifest,
+    sections: &mut Vec<Section>,
+) -> Result<(), HatchError> {
+    let mut bundled: Vec<String> = Vec::new();
+    for (name, entry) in &manifest.native_libs {
+        let Some(path_str) = entry.resolve() else {
+            continue; // nothing declared for this host platform — skip
+        };
+        let path = Path::new(path_str);
+        if path.is_absolute() {
+            continue; // system ref — don't bundle
+        }
+        let full = root.join(path);
+        let bytes = std::fs::read(&full).map_err(|e| {
+            HatchError::Encode(format!(
+                "native lib '{}' declared at '{}' could not be read: {}",
+                name,
+                full.display(),
+                e
+            ))
+        })?;
+        sections.push(Section {
+            kind: SectionKind::NativeLib,
+            name: name.clone(),
+            data: bytes,
+        });
+        bundled.push(name.clone());
+    }
+    for name in bundled {
+        manifest.native_libs.remove(&name);
+    }
+    Ok(())
 }
 
 fn collect_wren_files(
@@ -774,6 +823,69 @@ macos = "libs/mac/libz.dylib"
         );
         // No OS match — fall back to `any`.
         assert_eq!(entry.resolve_for("linux", "x86_64"), Some("libs/libz"));
+    }
+
+    #[test]
+    fn build_packs_relative_native_libs_and_strips_manifest_entry() {
+        // Stand up a fake workspace, declare a relative-path native
+        // lib, and confirm `build_from_source_tree` reads the file,
+        // emits a NativeLib section with the bytes, and drops the
+        // now-bundled entry from the manifest. Absolute-path entries
+        // pass through untouched — those are system refs.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::write(root.join("main.wren"), "System.print(\"hi\")").unwrap();
+        std::fs::create_dir_all(root.join("libs")).unwrap();
+        std::fs::write(root.join("libs/libfoo.bin"), b"native-bytes").unwrap();
+
+        let hatchfile = r#"
+name = "pkg"
+version = "0.1.0"
+entry = "main"
+
+[native_libs]
+libfoo = "libs/libfoo.bin"
+libssl = "/usr/lib/libssl.dylib"
+"#;
+        std::fs::write(root.join("hatchfile"), hatchfile).unwrap();
+
+        let bytes = build_from_source_tree(root).expect("build");
+        let hatch = load(&bytes).expect("reload");
+
+        // Relative entry was bundled: one NativeLib section named
+        // "libfoo" whose bytes match what was on disk.
+        let lib_section = hatch
+            .sections
+            .iter()
+            .find(|s| matches!(s.kind, SectionKind::NativeLib) && s.name == "libfoo")
+            .expect("libfoo NativeLib section");
+        assert_eq!(lib_section.data, b"native-bytes");
+
+        // Manifest no longer carries the bundled entry …
+        assert!(!hatch.manifest.native_libs.contains_key("libfoo"));
+        // … but the absolute-path (system) entry stays so the loader
+        // keeps the override.
+        assert!(hatch.manifest.native_libs.contains_key("libssl"));
+    }
+
+    #[test]
+    fn build_errors_when_declared_native_lib_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("main.wren"), "1").unwrap();
+        let hatchfile = r#"
+name = "pkg"
+version = "0.1.0"
+entry = "main"
+
+[native_libs]
+ghost = "libs/missing.bin"
+"#;
+        std::fs::write(root.join("hatchfile"), hatchfile).unwrap();
+
+        let result = build_from_source_tree(root);
+        assert!(matches!(result, Err(HatchError::Encode(_))));
     }
 
     #[test]
