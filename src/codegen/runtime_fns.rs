@@ -1,18 +1,30 @@
+//! Runtime functions callable from JIT-compiled code.
+//!
+//! These are `extern "C"` functions that the JIT emits `CallRuntime` for.
+//! The `resolve` function maps a runtime function name to its address so
+//! the codegen can patch `CallRuntime` → `CallInd` with the actual pointer.
+//!
+//! # Convention
+//! - All values are passed/returned as NaN-boxed `u64`
+//! - VM context is accessed via thread-local `JIT_CONTEXT`
+//! - x86_64: System V ABI (RDI, RSI, RDX, RCX, R8, R9 → RAX)
+//! - aarch64: AAPCS64 (X0-X7 → X0)
+//!
+//! # Safety
+//!
+//! Every `pub unsafe extern "C"` entry below is a JIT-ABI runtime entry
+//! point called only from compiled code; the safety contract is the
+//! module-wide convention above — callers are the JIT emitter, which
+//! respects the ABI it was emitted against. The per-item
+//! `missing_safety_doc` lint is silenced so each arch-gated `#[cfg]`
+//! twin doesn't need its own duplicated `# Safety` block.
+
+#![allow(clippy::missing_safety_doc)]
+
 use crate::runtime::object::{
     MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap, ObjString,
     ObjType,
 };
-/// Runtime functions callable from JIT-compiled code.
-///
-/// These are `extern "C"` functions that the JIT emits `CallRuntime` for.
-/// The `resolve` function maps a runtime function name to its address so
-/// the codegen can patch `CallRuntime` → `CallInd` with the actual pointer.
-///
-/// Convention:
-/// - All values are passed/returned as NaN-boxed `u64`
-/// - VM context is accessed via thread-local `JIT_CONTEXT`
-/// - x86_64: System V ABI (RDI, RSI, RDX, RCX, R8, R9 → RAX)
-/// - aarch64: AAPCS64 (X0-X7 → X0)
 use crate::runtime::value::Value;
 use std::cell::RefCell;
 use std::sync::OnceLock;

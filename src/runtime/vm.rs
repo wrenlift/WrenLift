@@ -1346,7 +1346,11 @@ impl VM {
         (found_roots, frames_walked, jit_frames)
     }
 
+    // Fallback stub kept so the debug signature is callable on any arch.
+    // aarch64 has its own implementation further up; other hosts don't
+    // unwind native frames today, so the helper just returns empties.
     #[cfg(not(target_arch = "aarch64"))]
+    #[allow(dead_code)]
     fn scan_native_stack_roots_debug(&self) -> (Vec<Value>, u32, u32) {
         (Vec::new(), 0, 0)
     }
