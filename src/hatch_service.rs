@@ -78,7 +78,8 @@ pub struct PackageRecord {
 
 /// Persisted auth state. Lives at `~/.hatch/credentials` with 0600
 /// perms. The refresh token lets the CLI quietly renew the access
-/// token when Supabase's short-lived JWT expires.
+/// token when Supabase's short-lived JWT expires; `expires_at`
+/// (Unix seconds) tells `ensure_fresh_credentials` when to bother.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Credentials {
     pub access_token: String,
@@ -86,6 +87,10 @@ pub struct Credentials {
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub service_url: Option<String>,
+    /// Unix seconds at which the access_token stops being valid.
+    /// Missing for `--token` logins where we can't infer the expiry.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -320,11 +325,7 @@ pub fn interactive_login(config: &ServiceConfig) -> Result<Credentials, ServiceE
 
     let tokens: TokenResponse = serde_json::from_str(&resp)
         .map_err(|e| ServiceError::Decode(format!("token response: {}", e)))?;
-    Ok(Credentials {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        service_url: Some(config.url.clone()),
-    })
+    Ok(tokens_to_credentials(config, tokens))
 }
 
 #[derive(serde::Deserialize)]
@@ -332,6 +333,105 @@ struct TokenResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
+    /// Seconds until the access token expires. Supabase sets this
+    /// on every issuance; missing only on non-standard servers.
+    #[serde(default)]
+    expires_in: Option<i64>,
+    /// Unix seconds of expiry. Some Supabase versions include this
+    /// directly; when absent we derive it from `expires_in`.
+    #[serde(default)]
+    expires_at: Option<i64>,
+}
+
+/// Pull `access_token`, `refresh_token`, and a computed expiry out
+/// of a Supabase token response. Centralized so the same logic
+/// runs for login and refresh; if Supabase ever sends `expires_at`
+/// directly we respect it verbatim instead of re-deriving.
+fn tokens_to_credentials(config: &ServiceConfig, tokens: TokenResponse) -> Credentials {
+    let expires_at = tokens
+        .expires_at
+        .or_else(|| tokens.expires_in.map(|dur| now_unix() + dur));
+    Credentials {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        service_url: Some(config.url.clone()),
+        expires_at,
+    }
+}
+
+/// Trade the stored refresh token for a fresh access/refresh pair.
+/// Returns an error if the credentials have no refresh token — the
+/// caller should push the user toward `hatch login` in that case.
+pub fn refresh_access_token(
+    config: &ServiceConfig,
+    creds: &Credentials,
+) -> Result<Credentials, ServiceError> {
+    if !config.is_configured() {
+        return Err(ServiceError::NotConfigured);
+    }
+    let Some(refresh) = creds.refresh_token.as_deref() else {
+        return Err(ServiceError::NotLoggedIn);
+    };
+    let body = format!("{{\"refresh_token\":\"{}\"}}", refresh);
+    let url = format!(
+        "{}/auth/v1/token?grant_type=refresh_token",
+        config.url.trim_end_matches('/')
+    );
+    let resp = curl_post(
+        &url,
+        &[
+            &format!("apikey: {}", config.anon_key),
+            "Content-Type: application/json",
+        ],
+        &body,
+    )?;
+    let tokens: TokenResponse = serde_json::from_str(&resp)
+        .map_err(|e| ServiceError::Decode(format!("refresh response: {}", e)))?;
+    Ok(tokens_to_credentials(config, tokens))
+}
+
+/// Seconds of slack we keep before the nominal expiry. A request
+/// that takes 30s to fly to Supabase + come back shouldn't expire
+/// mid-flight; 60s cushion covers that plus clock skew.
+const EXPIRY_SKEW_SECS: i64 = 60;
+
+/// Refresh the access token if it's close to (or past) expiry, and
+/// persist the new credentials to disk. Returns the current-good
+/// credentials — possibly the original, possibly freshly minted.
+///
+/// Used before every authenticated request so long-running sessions
+/// don't break when Supabase's hour-ish JWT times out.
+pub fn ensure_fresh_credentials(
+    config: &ServiceConfig,
+    creds: Credentials,
+) -> Result<Credentials, ServiceError> {
+    let needs_refresh = match creds.expires_at {
+        Some(t) => now_unix() + EXPIRY_SKEW_SECS >= t,
+        // Unknown expiry — can't tell whether to refresh. If we
+        // have a refresh token we could optimistically refresh
+        // every call, but that hammers the auth endpoint for
+        // legacy --token logins where refresh isn't possible
+        // anyway. Leave it alone and let the request itself 401.
+        None => false,
+    };
+    if !needs_refresh {
+        return Ok(creds);
+    }
+    if creds.refresh_token.is_none() {
+        // Expired but no refresh token — the user has to log in
+        // again manually.
+        return Err(ServiceError::NotLoggedIn);
+    }
+    let refreshed = refresh_access_token(config, &creds)?;
+    let _ = save_credentials(&refreshed)?;
+    Ok(refreshed)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Generate a PKCE code verifier — 96 random bytes encoded
@@ -606,6 +706,7 @@ mod tests {
             access_token: "jwt-abc".to_string(),
             refresh_token: Some("refresh-xyz".to_string()),
             service_url: Some("https://hatch.supabase.co".to_string()),
+            expires_at: Some(1_700_000_000),
         };
         save_credentials(&before).expect("save");
         assert!(path.exists());
@@ -613,6 +714,7 @@ mod tests {
         let after = load_credentials().expect("load").expect("some");
         assert_eq!(after.access_token, "jwt-abc");
         assert_eq!(after.refresh_token.as_deref(), Some("refresh-xyz"));
+        assert_eq!(after.expires_at, Some(1_700_000_000));
 
         // 0600 perms on unix.
         #[cfg(unix)]
@@ -706,6 +808,103 @@ mod tests {
         // Not a callback path at all.
         let req = "GET /favicon.ico HTTP/1.1\r\n\r\n";
         assert_eq!(extract_code_from_request(req), None);
+    }
+
+    #[test]
+    fn tokens_to_credentials_derives_expiry_from_expires_in() {
+        // Supabase always sends `expires_in`; we turn it into an
+        // absolute `expires_at` so later refresh decisions don't
+        // have to remember when the token was issued.
+        let cfg = ServiceConfig {
+            url: "https://x".into(),
+            anon_key: "k".into(),
+        };
+        let tokens = TokenResponse {
+            access_token: "jwt".to_string(),
+            refresh_token: Some("rt".to_string()),
+            expires_in: Some(3600),
+            expires_at: None,
+        };
+        let before = now_unix();
+        let creds = tokens_to_credentials(&cfg, tokens);
+        let after = now_unix();
+        let got = creds.expires_at.expect("expiry derived");
+        assert!(got >= before + 3600 && got <= after + 3600);
+    }
+
+    #[test]
+    fn tokens_to_credentials_honours_explicit_expires_at() {
+        // If Supabase sends `expires_at` directly we trust it
+        // verbatim instead of re-deriving.
+        let cfg = ServiceConfig {
+            url: "https://x".into(),
+            anon_key: "k".into(),
+        };
+        let tokens = TokenResponse {
+            access_token: "jwt".to_string(),
+            refresh_token: None,
+            expires_in: Some(3600),
+            expires_at: Some(2_000_000_000),
+        };
+        let creds = tokens_to_credentials(&cfg, tokens);
+        assert_eq!(creds.expires_at, Some(2_000_000_000));
+    }
+
+    #[test]
+    fn ensure_fresh_credentials_is_noop_when_token_is_valid() {
+        // Valid for another hour → pass through untouched. Reaches
+        // the network only when the token is near expiry, and we
+        // aren't near expiry here.
+        let cfg = ServiceConfig {
+            url: "https://x".into(),
+            anon_key: "k".into(),
+        };
+        let creds = Credentials {
+            access_token: "still-good".to_string(),
+            refresh_token: Some("rt".to_string()),
+            service_url: Some(cfg.url.clone()),
+            expires_at: Some(now_unix() + 3600),
+        };
+        let out = ensure_fresh_credentials(&cfg, creds.clone()).expect("no refresh needed");
+        assert_eq!(out.access_token, "still-good");
+    }
+
+    #[test]
+    fn ensure_fresh_credentials_errors_when_expired_without_refresh_token() {
+        // --token logins don't carry a refresh token; once the
+        // token expires the user has to re-auth manually.
+        let cfg = ServiceConfig {
+            url: "https://x".into(),
+            anon_key: "k".into(),
+        };
+        let creds = Credentials {
+            access_token: "expired".to_string(),
+            refresh_token: None,
+            service_url: Some(cfg.url.clone()),
+            expires_at: Some(now_unix() - 60), // already past expiry
+        };
+        let err = ensure_fresh_credentials(&cfg, creds).expect_err("should require re-login");
+        assert!(matches!(err, ServiceError::NotLoggedIn));
+    }
+
+    #[test]
+    fn ensure_fresh_credentials_passes_through_when_expiry_unknown() {
+        // Legacy credentials without expires_at (older CLI, or
+        // manual --token) must not constantly hammer refresh —
+        // we pass them through and let the actual request decide
+        // whether they're still good.
+        let cfg = ServiceConfig {
+            url: "https://x".into(),
+            anon_key: "k".into(),
+        };
+        let creds = Credentials {
+            access_token: "unknown".to_string(),
+            refresh_token: Some("rt".to_string()),
+            service_url: Some(cfg.url.clone()),
+            expires_at: None,
+        };
+        let out = ensure_fresh_credentials(&cfg, creds).expect("pass through");
+        assert_eq!(out.access_token, "unknown");
     }
 
     #[test]

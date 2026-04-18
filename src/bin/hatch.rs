@@ -592,11 +592,15 @@ fn cmd_login(token: Option<&str>) {
     let creds = match token {
         Some(jwt) => {
             // Escape hatch for CI / scripted flows: skip the browser
-            // dance entirely and trust a pre-minted token.
+            // dance entirely and trust a pre-minted token. No
+            // refresh token + no known expiry — the request itself
+            // will 401 when the JWT expires and the user will need
+            // to re-run this command.
             wren_lift::hatch_service::Credentials {
                 access_token: jwt.to_string(),
                 refresh_token: None,
                 service_url: Some(cfg.url.clone()),
+                expires_at: None,
             }
         }
         None => match wren_lift::hatch_service::interactive_login(&cfg) {
@@ -713,6 +717,21 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
     };
 
     let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
+    // Quietly refresh the JWT if it's near expiry so long-idle
+    // sessions don't 401 mid-publish. No-op when the token's still
+    // good (or when we don't have a refresh token to redeem).
+    let creds = match wren_lift::hatch_service::ensure_fresh_credentials(&cfg, creds) {
+        Ok(c) => c,
+        Err(wren_lift::hatch_service::ServiceError::NotLoggedIn) => {
+            eprintln!("error: session expired — run `hatch login` to renew");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
+
     let record = wren_lift::hatch_service::PackageRecord {
         name: manifest.name.clone(),
         git: git.clone(),
