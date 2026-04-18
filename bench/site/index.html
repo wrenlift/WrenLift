@@ -144,9 +144,10 @@ const CHART_TITLES = {
   method_call: "Method Call",
   fib: "Recursive Fibonacci",
   binary_trees: "Binary Trees",
+  delta_blue: "DeltaBlue",
 };
 
-const BENCH_ORDER = ["method_call", "binary_trees", "fib"];
+const BENCH_ORDER = ["method_call", "binary_trees", "fib", "delta_blue"];
 
 function buildChart(name, data) {
   const title = CHART_TITLES[name] || name;
@@ -225,7 +226,7 @@ async function main() {
         Last updated: ${m.date || "\u2014"} &middot;
         Commit: <code>${sha}</code> &middot;
         Arch: ${m.arch || "\u2014"} &middot;
-        Best of ${m.runs || 5} runs
+        Best of ${m.runs || 10} runs
       </div>`;
   }
 }
