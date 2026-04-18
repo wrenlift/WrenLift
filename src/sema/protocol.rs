@@ -145,7 +145,9 @@ pub const BUILTIN_PROTOCOLS: &[ProtocolDef] =
 
 /// A compact bitset tracking which protocols a class conforms to.
 /// Supports up to 32 protocols (more than enough for the foreseeable future).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct ProtocolSet(pub u32);
 
 impl ProtocolSet {

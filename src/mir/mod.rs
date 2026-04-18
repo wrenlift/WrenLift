@@ -25,7 +25,9 @@ use crate::intern::SymbolId;
 // ---------------------------------------------------------------------------
 
 /// A reference to an SSA value.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ValueId(pub u32);
 
 impl fmt::Debug for ValueId {
@@ -41,7 +43,9 @@ impl fmt::Display for ValueId {
 }
 
 /// A reference to a basic block.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct BlockId(pub u32);
 
 impl fmt::Debug for BlockId {

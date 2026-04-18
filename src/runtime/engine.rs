@@ -1261,8 +1261,7 @@ impl ExecutionEngine {
             let code_size = installed_code_size;
             if code_size > 0 {
                 eprint!("HEX:f{}:{}:", idx, code_size);
-                let code_bytes =
-                    unsafe { std::slice::from_raw_parts(native_ptr, code_size) };
+                let code_bytes = unsafe { std::slice::from_raw_parts(native_ptr, code_size) };
                 for b in code_bytes {
                     eprint!("{:02x}", b);
                 }
@@ -1698,10 +1697,7 @@ impl ExecutionEngine {
         self.poll_compilations();
         // If thread is idle and queue has work, start the next compile.
         if !self.compile_queue.is_empty() {
-            let thread_idle = self
-                .compile_handle
-                .as_ref()
-                .is_none_or(|h| h.is_finished());
+            let thread_idle = self.compile_handle.as_ref().is_none_or(|h| h.is_finished());
             if thread_idle {
                 if let Some(h) = self.compile_handle.take() {
                     let _ = h.join();
@@ -1719,9 +1715,7 @@ impl ExecutionEngine {
     /// Check if the background compilation thread is idle (finished or absent).
     #[inline]
     pub fn compile_thread_idle(&self) -> bool {
-        self.compile_handle
-            .as_ref()
-            .is_none_or(|h| h.is_finished())
+        self.compile_handle.as_ref().is_none_or(|h| h.is_finished())
     }
 
     /// Drain the compile queue: if the background thread is idle and there
@@ -1729,10 +1723,7 @@ impl ExecutionEngine {
     /// with interner access (from the VM context).
     pub fn drain_compile_queue(&mut self, interner: &crate::intern::Interner) {
         while !self.compile_queue.is_empty() {
-            let thread_idle = self
-                .compile_handle
-                .as_ref()
-                .is_none_or(|h| h.is_finished());
+            let thread_idle = self.compile_handle.as_ref().is_none_or(|h| h.is_finished());
             if !thread_idle {
                 break;
             }

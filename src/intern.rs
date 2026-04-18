@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 
 /// An interned string identifier. Cheap to copy and compare.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct SymbolId(u32);
 
 impl SymbolId {

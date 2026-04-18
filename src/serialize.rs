@@ -165,7 +165,10 @@ mod tests {
             interner_back.resolve(module_back.top_level.name)
         );
         assert_eq!(module.top_level.arity, module_back.top_level.arity);
-        assert_eq!(module.top_level.blocks.len(), module_back.top_level.blocks.len());
+        assert_eq!(
+            module.top_level.blocks.len(),
+            module_back.top_level.blocks.len()
+        );
     }
 
     #[test]
