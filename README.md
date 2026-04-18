@@ -16,6 +16,7 @@ Fast JIT runtime for the <a href="https://wren.io">Wren</a> programming language
 <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="Version 0.1.0"/>
 <img src="https://img.shields.io/badge/tests-836_passing-brightgreen" alt="836 tests passing"/>
 <img src="https://img.shields.io/badge/targets-x86__64_%7C_aarch64_%7C_WASM-purple" alt="x86_64 | aarch64 | WASM"/>
+<a href="https://github.com/wrenlift/hatch"><img src="https://img.shields.io/badge/ecosystem-Hatch-f97316" alt="hatch ecosystem"/></a>
 </p>
 
 ---
