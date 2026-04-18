@@ -202,12 +202,17 @@ Implemented so far:
   copied onto `ObjFn`, and served directly from resolved `Method::Closure`
   dispatch. This avoids the temp-fiber / context-save path for simple field
   accessors while leaving the crashy packed-IC path disabled by default.
-- Current spot checks (2026-04-18, after resolved trivial getter/setter fast
-  paths):
+- Stable `List` primitives (`add(_)`, `count`, `removeAt(_)`, iteration, and
+  subscript get/set) are handled before the method cache for `List` receivers.
+  `wren_call_N` also has a no-frame pre-dispatch for those list primitives and
+  cached trivial field accessors, avoiding JIT-frame registration on calls that
+  cannot enter Wren code or trigger Wren-heap GC.
+- Current spot checks (2026-04-18, after list primitive + no-frame accessor
+  fast paths):
   - `bench/fib.wren --mode tiered`: about 0.008s
-  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.22s
-  - `bench/binary_trees.wren --mode tiered`: about 0.84s
-  - `bench/method_call.wren --mode tiered`: about 0.10s
+  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.19s
+  - `bench/binary_trees.wren --mode tiered`: about 0.82s
+  - `bench/method_call.wren --mode tiered`: about 0.088s
 - Nested OSR does not move these benchmarks on its own: the inner methods in
   `delta_blue` back-edge too few times per call to reach the tier-up
   threshold, so opening the `jit_depth > 0` gate unlocks a capability without

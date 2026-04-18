@@ -122,6 +122,17 @@ pub struct WrenHandle {
     pub value: Value,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HotMethodSymbols {
+    pub list_subscript: Option<SymbolId>,
+    pub list_subscript_set: Option<SymbolId>,
+    pub list_add: Option<SymbolId>,
+    pub list_count: Option<SymbolId>,
+    pub list_iterate: Option<SymbolId>,
+    pub list_iterator_value: Option<SymbolId>,
+    pub list_remove_at: Option<SymbolId>,
+}
+
 // ---------------------------------------------------------------------------
 // VM
 // ---------------------------------------------------------------------------
@@ -206,6 +217,9 @@ pub struct VM {
     /// Bitset: `call_sym_flags[sym.index()]` is true for call()/call(_)/... symbols.
     /// Used for O(1) "is this a closure call?" check in the dispatch hot path.
     pub call_sym_flags: Vec<bool>,
+
+    /// Stable core-library symbols used by hot native dispatch fast paths.
+    pub hot_method_symbols: HotMethodSymbols,
 }
 
 impl VM {
@@ -271,10 +285,12 @@ impl VM {
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
             call_sym_flags: Vec::new(),
+            hot_method_symbols: HotMethodSymbols::default(),
         };
 
         // Bootstrap core classes.
         super::core::initialize(&mut vm);
+        vm.refresh_hot_method_symbols();
 
         vm
     }
@@ -1002,6 +1018,18 @@ impl VM {
     pub fn is_call_sym(&self, sym: SymbolId) -> bool {
         let idx = sym.index() as usize;
         idx < self.call_sym_flags.len() && unsafe { *self.call_sym_flags.get_unchecked(idx) }
+    }
+
+    fn refresh_hot_method_symbols(&mut self) {
+        self.hot_method_symbols = HotMethodSymbols {
+            list_subscript: self.interner.lookup("[_]"),
+            list_subscript_set: self.interner.lookup("[_]=(_)"),
+            list_add: self.interner.lookup("add(_)"),
+            list_count: self.interner.lookup("count"),
+            list_iterate: self.interner.lookup("iterate(_)"),
+            list_iterator_value: self.interner.lookup("iteratorValue(_)"),
+            list_remove_at: self.interner.lookup("removeAt(_)"),
+        };
     }
 
     /// Look up a static method on a class.

@@ -122,6 +122,195 @@ fn cache_key_class(
 }
 
 #[inline(always)]
+fn fast_list_index(value: Value, count: usize) -> Option<usize> {
+    let raw_num = value.as_num()?;
+    if raw_num != raw_num.trunc() || raw_num.is_infinite() {
+        return None;
+    }
+    let raw = raw_num as i64;
+    let index = if raw < 0 { raw + count as i64 } else { raw };
+    if index < 0 || index as usize >= count {
+        return None;
+    }
+    Some(index as usize)
+}
+
+#[inline(always)]
+fn note_list_native_fastpath(vm: &mut crate::runtime::vm::VM) {
+    vm.engine
+        .note_runtime_call_stats(|s| s.dispatch_call_list_native_fastpath += 1);
+}
+
+#[inline(always)]
+fn try_dispatch_list_native_fastpath(
+    vm: &mut crate::runtime::vm::VM,
+    recv: Value,
+    method_sym: crate::intern::SymbolId,
+    args: &[Value],
+) -> Option<u64> {
+    let syms = vm.hot_method_symbols;
+    let list_ptr = recv.as_object()? as *mut ObjList;
+    debug_assert_eq!(
+        unsafe { (*(list_ptr as *const ObjHeader)).obj_type },
+        ObjType::List
+    );
+
+    if Some(method_sym) == syms.list_count && args.len() == 1 {
+        note_list_native_fastpath(vm);
+        return Some(Value::num(unsafe { (*list_ptr).count } as f64).to_bits());
+    }
+
+    if Some(method_sym) == syms.list_add && args.len() == 2 {
+        let value = args[1];
+        unsafe {
+            (*list_ptr).add(value);
+        }
+        vm.gc.write_barrier(list_ptr as *mut ObjHeader, value);
+        note_list_native_fastpath(vm);
+        return Some(args[0].to_bits());
+    }
+
+    if Some(method_sym) == syms.list_subscript && args.len() == 2 {
+        let count = unsafe { (*list_ptr).count as usize };
+        let index = fast_list_index(args[1], count)?;
+        note_list_native_fastpath(vm);
+        return Some(unsafe { (*list_ptr).get(index).unwrap_or(Value::null()).to_bits() });
+    }
+
+    if Some(method_sym) == syms.list_subscript_set && args.len() == 3 {
+        let count = unsafe { (*list_ptr).count as usize };
+        let index = fast_list_index(args[1], count)?;
+        let value = args[2];
+        unsafe {
+            (*list_ptr).set(index, value);
+        }
+        vm.gc.write_barrier(list_ptr as *mut ObjHeader, value);
+        note_list_native_fastpath(vm);
+        return Some(value.to_bits());
+    }
+
+    if Some(method_sym) == syms.list_remove_at && args.len() == 2 {
+        let count = unsafe { (*list_ptr).count as usize };
+        let index = fast_list_index(args[1], count)?;
+        let removed = unsafe { (*list_ptr).remove(index).unwrap_or(Value::null()) };
+        note_list_native_fastpath(vm);
+        return Some(removed.to_bits());
+    }
+
+    if Some(method_sym) == syms.list_iterate && args.len() == 2 {
+        let count = unsafe { (*list_ptr).count as usize };
+        let iterator = args[1];
+        note_list_native_fastpath(vm);
+        if iterator.is_null() {
+            if count == 0 {
+                return Some(Value::bool(false).to_bits());
+            }
+            return Some(Value::num(0.0).to_bits());
+        }
+        if !iterator.is_num() {
+            return Some(Value::bool(false).to_bits());
+        }
+        let next = iterator.as_num().unwrap() + 1.0;
+        if next >= count as f64 {
+            return Some(Value::bool(false).to_bits());
+        }
+        return Some(Value::num(next).to_bits());
+    }
+
+    if Some(method_sym) == syms.list_iterator_value && args.len() == 2 {
+        let index = args[1].as_num()? as usize;
+        note_list_native_fastpath(vm);
+        return Some(unsafe { (*list_ptr).get(index).unwrap_or(Value::null()).to_bits() });
+    }
+
+    None
+}
+
+#[inline(always)]
+fn try_dispatch_trivial_accessor_fastpath(
+    vm: &mut crate::runtime::vm::VM,
+    method: Method,
+    args: &[Value],
+) -> Option<u64> {
+    let Method::Closure(cp) = method else {
+        return None;
+    };
+    let fn_ref = unsafe { &*(*cp).function };
+    if fn_ref.trivial_getter_field != u16::MAX && args.len() == 1 {
+        let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
+        if !receiver_obj.is_null()
+            && unsafe { (*(receiver_obj as *const ObjHeader)).obj_type } == ObjType::Instance
+        {
+            let instance = receiver_obj as *mut ObjInstance;
+            let fields = unsafe { (*instance).fields };
+            if !fields.is_null() {
+                vm.engine.note_runtime_call_stats(|s| {
+                    s.dispatch_method_closure += 1;
+                    s.dispatch_method_trivial_getter += 1;
+                });
+                return Some(unsafe {
+                    (*fields.add(fn_ref.trivial_getter_field as usize)).to_bits()
+                });
+            }
+        }
+    }
+    if fn_ref.trivial_setter_field != u16::MAX && args.len() == 2 {
+        let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
+        if !receiver_obj.is_null()
+            && unsafe { (*(receiver_obj as *const ObjHeader)).obj_type } == ObjType::Instance
+        {
+            let instance = receiver_obj as *mut ObjInstance;
+            let fields = unsafe { (*instance).fields };
+            if !fields.is_null() {
+                let value = args[1];
+                unsafe {
+                    *fields.add(fn_ref.trivial_setter_field as usize) = value;
+                }
+                vm.gc.write_barrier(receiver_obj as *mut ObjHeader, value);
+                vm.engine.note_runtime_call_stats(|s| {
+                    s.dispatch_method_closure += 1;
+                    s.dispatch_method_trivial_setter += 1;
+                });
+                return Some(value.to_bits());
+            }
+        }
+    }
+
+    None
+}
+
+#[inline(always)]
+fn try_dispatch_call_noframe_fast(recv: Value, method_packed: u64, args: &[Value]) -> Option<u64> {
+    let vm = unsafe { vm_ref() }?;
+    let (method_sym, _) = decode_method_and_ic(method_packed);
+    let class = vm.class_of(recv);
+
+    if class == vm.list_class {
+        if let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args) {
+            vm.engine.note_runtime_call_stats(|s| {
+                s.wren_call_noframe_fastpath += 1;
+                s.dispatch_call_entries += 1;
+            });
+            return Some(result);
+        }
+    }
+
+    let cache_key_class = cache_key_class(vm, recv, class);
+    if let Some((method, _defining_class)) = vm.method_cache.lookup(cache_key_class, method_sym) {
+        if let Some(result) = try_dispatch_trivial_accessor_fastpath(vm, method, args) {
+            vm.engine.note_runtime_call_stats(|s| {
+                s.wren_call_noframe_fastpath += 1;
+                s.dispatch_call_entries += 1;
+                s.dispatch_call_method_cache_hits += 1;
+            });
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+#[inline(always)]
 fn current_jit_callsite_ic(
     vm: &mut crate::runtime::vm::VM,
     ic_idx: usize,
@@ -1496,6 +1685,11 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
 
     let class = vm.class_of(recv);
     let cache_key_class = cache_key_class(vm, recv, class);
+    if class == vm.list_class {
+        if let Some(result) = try_dispatch_list_native_fastpath(vm, recv, method_sym, args) {
+            return result;
+        }
+    }
     let ic_ptr = ic_idx.and_then(|idx| current_jit_callsite_ic(vm, idx));
 
     if let Some(ic_ptr) = ic_ptr {
@@ -1685,49 +1879,14 @@ fn dispatch_method(
             result
         }
         Method::Closure(cp) => {
+            if let Some(result) =
+                try_dispatch_trivial_accessor_fastpath(vm, Method::Closure(cp), args)
+            {
+                return result;
+            }
             vm.engine
                 .note_runtime_call_stats(|s| s.dispatch_method_closure += 1);
             let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
-            let fn_ref = unsafe { &*(*cp).function };
-            if fn_ref.trivial_getter_field != u16::MAX && args.len() == 1 {
-                {
-                    let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
-                    if !receiver_obj.is_null()
-                        && unsafe { (*(receiver_obj as *const ObjHeader)).obj_type }
-                            == ObjType::Instance
-                    {
-                        let instance = receiver_obj as *mut ObjInstance;
-                        let fields = unsafe { (*instance).fields };
-                        if !fields.is_null() {
-                            vm.engine
-                                .note_runtime_call_stats(|s| s.dispatch_method_trivial_getter += 1);
-                            return unsafe {
-                                (*fields.add(fn_ref.trivial_getter_field as usize)).to_bits()
-                            };
-                        }
-                    }
-                }
-            }
-            if fn_ref.trivial_setter_field != u16::MAX && args.len() == 2 {
-                let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
-                if !receiver_obj.is_null()
-                    && unsafe { (*(receiver_obj as *const ObjHeader)).obj_type }
-                        == ObjType::Instance
-                {
-                    let instance = receiver_obj as *mut ObjInstance;
-                    let fields = unsafe { (*instance).fields };
-                    if !fields.is_null() {
-                        let value = args[1];
-                        unsafe {
-                            *fields.add(fn_ref.trivial_setter_field as usize) = value;
-                        }
-                        vm.gc.write_barrier(receiver_obj as *mut ObjHeader, value);
-                        vm.engine
-                            .note_runtime_call_stats(|s| s.dispatch_method_trivial_setter += 1);
-                        return value.to_bits();
-                    }
-                }
-            }
             let fn_idx = func_id.0 as usize;
             if vm.engine.mode != crate::runtime::engine::ExecutionMode::Interpreter {
                 let needs_tier_up = vm
@@ -1844,12 +2003,15 @@ pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
 }
 extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
     note_wren_call_entry();
+    let recv = Value::from_bits(receiver);
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &[recv]) {
+        return result;
+    }
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
         ret_addr as usize,
     );
-    let recv = Value::from_bits(receiver);
     let result = dispatch_call(recv, method, &[recv]);
     pop_jit_frame();
     result
@@ -1890,13 +2052,17 @@ extern "C" fn wren_call_1_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
+    let recv = Value::from_bits(receiver);
+    let args = [recv, Value::from_bits(a0)];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
         ret_addr as usize,
     );
-    let recv = Value::from_bits(receiver);
-    let result = dispatch_call(recv, method, &[recv, Value::from_bits(a0)]);
+    let result = dispatch_call(recv, method, &args);
     pop_jit_frame();
     result
 }
@@ -1937,17 +2103,17 @@ extern "C" fn wren_call_2_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
+    let recv = Value::from_bits(receiver);
+    let args = [recv, Value::from_bits(a0), Value::from_bits(a1)];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
         ret_addr as usize,
     );
-    let recv = Value::from_bits(receiver);
-    let result = dispatch_call(
-        recv,
-        method,
-        &[recv, Value::from_bits(a0), Value::from_bits(a1)],
-    );
+    let result = dispatch_call(recv, method, &args);
     pop_jit_frame();
     result
 }
@@ -2002,22 +2168,22 @@ extern "C" fn wren_call_3_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
+    let recv = Value::from_bits(receiver);
+    let args = [
+        recv,
+        Value::from_bits(a0),
+        Value::from_bits(a1),
+        Value::from_bits(a2),
+    ];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
         ret_addr as usize,
     );
-    let recv = Value::from_bits(receiver);
-    let result = dispatch_call(
-        recv,
-        method,
-        &[
-            recv,
-            Value::from_bits(a0),
-            Value::from_bits(a1),
-            Value::from_bits(a2),
-        ],
-    );
+    let result = dispatch_call(recv, method, &args);
     pop_jit_frame();
     result
 }
@@ -2063,23 +2229,23 @@ extern "C" fn wren_call_4_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
+    let recv = Value::from_bits(receiver);
+    let args = [
+        recv,
+        Value::from_bits(a0),
+        Value::from_bits(a1),
+        Value::from_bits(a2),
+        Value::from_bits(a3),
+    ];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
     push_jit_frame(
         jit_fp as usize,
         read_jit_ctx().current_func_id as u32,
         ret_addr as usize,
     );
-    let recv = Value::from_bits(receiver);
-    let result = dispatch_call(
-        recv,
-        method,
-        &[
-            recv,
-            Value::from_bits(a0),
-            Value::from_bits(a1),
-            Value::from_bits(a2),
-            Value::from_bits(a3),
-        ],
-    );
+    let result = dispatch_call(recv, method, &args);
     pop_jit_frame();
     result
 }
