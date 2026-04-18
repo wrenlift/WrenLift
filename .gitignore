@@ -1,3 +1,4 @@
 /target
 bench/site/results.json
 profile.json.gz
+/hatch/

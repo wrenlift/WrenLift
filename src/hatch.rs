@@ -381,16 +381,21 @@ pub fn looks_like_hatch(bytes: &[u8]) -> bool {
 // Builder: walk a source directory, compile each .wren to .wlbc
 // ---------------------------------------------------------------------------
 
+/// On-disk manifest filename at a project root. `hatch-cli` treats a
+/// directory containing one of these as a wrenlift workspace.
+pub const HATCHFILE: &str = "hatchfile";
+
 /// Compile an on-disk source tree into a `.hatch` byte stream.
 ///
 /// Walks `root` recursively for `*.wren` files, compiles each one to a
 /// `.wlbc` blob, and writes a single hatch containing all of them plus
-/// a synthesized manifest. If `root/hatch.toml` exists it is used as
-/// the manifest starting point; otherwise a minimal one is generated.
+/// a manifest section. If `root/hatchfile` (the workspace manifest)
+/// exists it is parsed as TOML and used as-is; otherwise a minimal one
+/// is synthesized.
 ///
-/// The module ordering in the emitted manifest is "discovery order"
-/// (file-system enumeration). Callers that need a specific dependency
-/// order should supply a hatch.toml with `modules` explicitly set.
+/// The module ordering in the emitted manifest is alphabetical by
+/// module name. Callers that need a specific dependency order should
+/// supply a `hatchfile` with `modules` set explicitly.
 pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
     let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     collect_wren_files(root, root, &mut wren_files)?;
@@ -420,8 +425,8 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
         module_names.push(module_name.clone());
     }
 
-    // Manifest: user-supplied or synthesized.
-    let manifest = match std::fs::read_to_string(root.join("hatch.toml")) {
+    // Manifest: `hatchfile` at project root, or synthesized.
+    let manifest = match std::fs::read_to_string(root.join(HATCHFILE)) {
         Ok(text) => {
             let mut m: Manifest =
                 toml::from_str(&text).map_err(|e| HatchError::ManifestParse(e.to_string()))?;
