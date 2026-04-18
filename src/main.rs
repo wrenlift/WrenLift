@@ -513,8 +513,17 @@ fn inspect_hatch(bytes: &[u8]) {
     println!("  modules: {}", hatch.manifest.modules.join(", "));
     if !hatch.manifest.dependencies.is_empty() {
         println!("  dependencies:");
-        for (name, version) in &hatch.manifest.dependencies {
-            println!("    {} = {}", name, version);
+        for (name, dep) in &hatch.manifest.dependencies {
+            match dep {
+                wren_lift::hatch::Dependency::Version(v) => println!("    {} = {}", name, v),
+                wren_lift::hatch::Dependency::Path { path, version } => match version {
+                    Some(v) => println!(
+                        "    {} = {{ path = \"{}\", version = \"{}\" }}",
+                        name, path, v
+                    ),
+                    None => println!("    {} = {{ path = \"{}\" }}", name, path),
+                },
+            }
         }
     }
     println!("  sections:");

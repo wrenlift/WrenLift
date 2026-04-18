@@ -3551,7 +3551,10 @@ System.print(c.value)
             modules: vec!["main".to_string()],
             dependencies: {
                 let mut d = BTreeMap::new();
-                d.insert("libcounter".to_string(), "0.1.0".to_string());
+                d.insert(
+                    "libcounter".to_string(),
+                    wren_lift::hatch::Dependency::Version("0.1.0".to_string()),
+                );
                 d
             },
             native_libs: BTreeMap::new(),

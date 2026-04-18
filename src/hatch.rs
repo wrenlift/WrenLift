@@ -113,11 +113,13 @@ pub struct Manifest {
     /// dependency order; the loader does not topologically sort.
     #[serde(default)]
     pub modules: Vec<String>,
-    /// `name → version` dependency list for future resolver work.
-    /// Today the loader doesn't enforce anything here; kept so hatches
-    /// can declare their deps for tooling.
+    /// `name → dependency` declaration list. Each entry is either a
+    /// version string (advisory for now — no registry yet) or an
+    /// inline table with a `path` key pointing at another workspace
+    /// directory. Path deps are recursively built and their sections
+    /// merged into the enclosing hatch at build time.
     #[serde(default)]
-    pub dependencies: BTreeMap<String, String>,
+    pub dependencies: BTreeMap<String, Dependency>,
     /// Native library declarations. Keys match the string a Wren
     /// `#!native = "..."` attribute resolves; values describe how the
     /// loader should find the underlying `.dylib` / `.so` / `.dll` —
@@ -133,6 +135,39 @@ pub struct Manifest {
     /// relative paths both work.
     #[serde(default)]
     pub native_search_paths: Vec<String>,
+}
+
+/// Shape of a `[dependencies.<name>]` entry. Accepts a bare version
+/// string (advisory — no registry resolution today) or an inline
+/// table pointing at another workspace directory via `path`:
+///
+/// ```toml
+/// [dependencies]
+/// json       = "1.0"                          # advisory version
+/// libcounter = { path = "../libcounter" }     # bundled at build
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum Dependency {
+    /// `name = "1.2.3"` — advisory-only until a registry lands.
+    Version(String),
+    /// `name = { path = "../sibling" }` — workspace-relative path
+    /// resolved at `hatch build`, recursively built, and its sections
+    /// merged into the enclosing hatch.
+    Path {
+        path: String,
+        #[serde(default)]
+        version: Option<String>,
+    },
+}
+
+impl Dependency {
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Dependency::Path { path, .. } => Some(path.as_str()),
+            Dependency::Version(_) => None,
+        }
+    }
 }
 
 /// Shape of a `[native_libs.<name>]` entry in a hatchfile. Either a
@@ -482,6 +517,26 @@ pub const HATCHFILE: &str = "hatchfile";
 /// module name. Callers that need a specific dependency order should
 /// supply a `hatchfile` with `modules` set explicitly.
 pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    build_recursive(root, &mut visited)
+}
+
+/// Internal recursive variant. `visited` holds canonicalized directory
+/// paths to short-circuit dependency cycles — otherwise a loop like
+/// `a → b → a` would recurse forever.
+fn build_recursive(
+    root: &Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Result<Vec<u8>, HatchError> {
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !visited.insert(canonical) {
+        return Err(HatchError::Encode(format!(
+            "dependency cycle detected at {}",
+            root.display()
+        )));
+    }
+
     let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     collect_wren_files(root, root, &mut wren_files)?;
     wren_files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -536,9 +591,80 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
     };
 
     pack_bundled_native_libs(root, &mut manifest, &mut sections)?;
+    merge_path_dependencies(root, &mut manifest, &mut sections, visited)?;
 
     let hatch = Hatch { manifest, sections };
     emit(&hatch)
+}
+
+/// Recursively build every `path = "..."` dependency and fold its
+/// sections into `sections` / `manifest.modules`. Dep modules install
+/// *before* this hatch's own modules — `manifest.modules` is rewritten
+/// with dep modules prepended so the install loop hits them first.
+/// Name collisions between modules are a hard error; two different
+/// deps carrying a `main` module is undefined behavior we'd rather
+/// catch at build.
+fn merge_path_dependencies(
+    root: &Path,
+    manifest: &mut Manifest,
+    sections: &mut Vec<Section>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> Result<(), HatchError> {
+    let path_deps: Vec<(String, std::path::PathBuf)> = manifest
+        .dependencies
+        .iter()
+        .filter_map(|(name, dep)| dep.path().map(|p| (name.clone(), root.join(p))))
+        .collect();
+
+    for (dep_name, dep_root) in path_deps {
+        let dep_bytes = build_recursive(&dep_root, visited).map_err(|e| {
+            HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
+        })?;
+        let dep_hatch = load(&dep_bytes)?;
+
+        // Prepend dep modules so they install before ours. Collisions
+        // would create ambiguous imports — reject loudly.
+        for mod_name in &dep_hatch.manifest.modules {
+            if manifest.modules.contains(mod_name) {
+                return Err(HatchError::Encode(format!(
+                    "dependency '{}' carries module '{}' that collides with the enclosing hatch",
+                    dep_name, mod_name
+                )));
+            }
+        }
+        let mut merged_modules = dep_hatch.manifest.modules.clone();
+        merged_modules.extend(std::mem::take(&mut manifest.modules));
+        manifest.modules = merged_modules;
+
+        // Carry over any NativeLib sections the dep bundled for itself
+        // and any absolute-path system refs it declared.
+        for section in dep_hatch.sections {
+            if matches!(section.kind, SectionKind::Wlbc | SectionKind::NativeLib) {
+                if sections.iter().any(|s| s.name == section.name && s.kind == section.kind) {
+                    return Err(HatchError::Encode(format!(
+                        "dependency '{}' carries section '{:?}/{}' that collides with the enclosing hatch",
+                        dep_name, section.kind, section.name
+                    )));
+                }
+                sections.push(section);
+            }
+        }
+        // Fold dep system refs + extra search paths into ours. Local
+        // workspace path entries from the dep were already bundled
+        // during its own `build_recursive` and won't appear here.
+        for (name, entry) in dep_hatch.manifest.native_libs {
+            manifest.native_libs.entry(name).or_insert(entry);
+        }
+        for path in dep_hatch.manifest.native_search_paths {
+            if !manifest.native_search_paths.contains(&path) {
+                manifest.native_search_paths.push(path);
+            }
+        }
+        // Drop the dep from our manifest — it's bundled now, the
+        // loader doesn't need to chase any external reference.
+        manifest.dependencies.remove(&dep_name);
+    }
+    Ok(())
 }
 
 /// Walk the workspace's `[native_libs]` entries and bundle each one
@@ -867,6 +993,109 @@ libssl = "/usr/lib/libssl.dylib"
         // … but the absolute-path (system) entry stays so the loader
         // keeps the override.
         assert!(hatch.manifest.native_libs.contains_key("libssl"));
+    }
+
+    #[test]
+    fn build_bundles_path_dependencies_transitively() {
+        // Lay out a tiny two-hatch workspace:
+        //   deps/libcounter/  → a dep hatch with a `counter.wren` module
+        //   app/              → an app hatch whose hatchfile names the
+        //                       dep via `{ path = "../deps/libcounter" }`
+        // After building app/, the resulting hatch must carry both
+        // modules (dep first in install order), no dangling dependency
+        // reference, and remain runnable end-to-end.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let lib_root = tmp.path().join("libcounter");
+        let app_root = tmp.path().join("app");
+        std::fs::create_dir_all(&lib_root).unwrap();
+        std::fs::create_dir_all(&app_root).unwrap();
+
+        std::fs::write(
+            lib_root.join("counter.wren"),
+            "class Counter {\n  static bump(n) { n + 1 }\n}",
+        )
+        .unwrap();
+        std::fs::write(
+            lib_root.join("hatchfile"),
+            r#"name = "libcounter"
+version = "0.1.0"
+entry = "counter"
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            app_root.join("main.wren"),
+            "import \"counter\" for Counter\nSystem.print(Counter.bump(41))",
+        )
+        .unwrap();
+        std::fs::write(
+            app_root.join("hatchfile"),
+            r#"name = "app"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+libcounter = { path = "../libcounter" }
+"#,
+        )
+        .unwrap();
+
+        let bytes = build_from_source_tree(&app_root).expect("build");
+        let hatch = load(&bytes).expect("reload");
+
+        // Both modules present, dep first so the install loop hits
+        // the class declaration before `main` imports it.
+        assert_eq!(hatch.manifest.modules, vec!["counter", "main"]);
+
+        // Dep reference stripped from the manifest — it's bundled now.
+        assert!(!hatch.manifest.dependencies.contains_key("libcounter"));
+
+        // Both .wlbc sections present.
+        let module_names: Vec<&str> = hatch
+            .sections
+            .iter()
+            .filter(|s| matches!(s.kind, SectionKind::Wlbc))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(module_names.contains(&"counter"));
+        assert!(module_names.contains(&"main"));
+
+        // And the whole thing actually runs: 41 → 42.
+        let mut vm = crate::runtime::vm::VM::new_default();
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret_hatch(&bytes);
+        assert!(matches!(
+            result,
+            crate::runtime::engine::InterpretResult::Success
+        ));
+        assert_eq!(vm.take_output().trim(), "42");
+    }
+
+    #[test]
+    fn build_rejects_dep_cycle() {
+        // a/hatchfile depends on b, b/hatchfile depends on a — build
+        // must bail out rather than spin.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("a.wren"), "1").unwrap();
+        std::fs::write(b.join("b.wren"), "1").unwrap();
+        std::fs::write(
+            a.join("hatchfile"),
+            "name = \"a\"\nversion = \"0\"\nentry = \"a\"\n[dependencies]\nb = { path = \"../b\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("hatchfile"),
+            "name = \"b\"\nversion = \"0\"\nentry = \"b\"\n[dependencies]\na = { path = \"../a\" }\n",
+        )
+        .unwrap();
+
+        let result = build_from_source_tree(&a);
+        assert!(matches!(result, Err(HatchError::Encode(msg)) if msg.contains("cycle")));
     }
 
     #[test]
