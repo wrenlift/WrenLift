@@ -665,6 +665,18 @@ pub struct ClassMir {
     /// Runtime-visible attributes (`#key`, `#!` ones are stripped).
     #[serde(default)]
     pub attributes: Vec<AttrEntry>,
+    /// Value of `#!native = "..."` on a foreign class — the native
+    /// library name (or path) whose symbols back this class's methods.
+    /// Only populated when the class is `foreign`.
+    #[serde(default)]
+    pub native_library: Option<String>,
+    /// One entry per `foreign` method declared inside this class. These
+    /// have no Wren body; at class install time Phase 3b will look up
+    /// each `symbol` inside `native_library` (falling back to
+    /// `bind_foreign_method_fn`) and bind a `WrenForeignMethodFn`
+    /// trampoline.
+    #[serde(default)]
+    pub foreign_methods: Vec<ForeignMethodMir>,
 }
 
 /// MIR for a single method within a class.
@@ -678,6 +690,23 @@ pub struct MethodMir {
     /// Runtime-visible attributes attached to the method declaration.
     #[serde(default)]
     pub attributes: Vec<AttrEntry>,
+}
+
+/// Stub record for a `foreign` method. Carries only what Phase 3b needs
+/// to resolve it at install time — no MIR body exists because the
+/// implementation lives in an external shared library (or the host's
+/// `bind_foreign_method_fn` callback).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForeignMethodMir {
+    /// Wren method signature (e.g. "open(_)"). Used both for method-
+    /// table binding and as the default symbol lookup key when `symbol`
+    /// is `None`.
+    pub signature: String,
+    pub is_static: bool,
+    /// Value of `#!symbol = "..."` if present. When absent the runtime
+    /// loader falls back to the method's base name.
+    #[serde(default)]
+    pub symbol: Option<String>,
 }
 
 /// Flattened attribute record stored on MIR classes and methods. Each

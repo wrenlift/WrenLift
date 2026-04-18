@@ -38,7 +38,7 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 /// are additive from bincode's perspective as long as we never reorder
 /// existing variants, so most upgrades won't need a version bump — but
 /// reshuffling a struct field or swapping enum variant order will).
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Combined payload: everything a fresh `VM` needs to materialise the
 /// module without touching the parser, resolver, MIR builder, or the

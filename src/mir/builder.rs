@@ -1472,6 +1472,7 @@ fn compile_class(
     parent_field_map: &HashMap<SymbolId, u16>,
 ) -> (ClassMir, Vec<MirFunction>) {
     let mut methods = Vec::new();
+    let mut foreign_methods: Vec<ForeignMethodMir> = Vec::new();
     let mut field_names: Vec<SymbolId> = Vec::new();
     let mut all_closures: Vec<MirFunction> = Vec::new();
 
@@ -1487,6 +1488,13 @@ fn compile_class(
     for method_spanned in &decl.methods {
         let method = &method_spanned.0;
         if method.is_foreign || method.body.is_none() {
+            if method.is_foreign {
+                foreign_methods.push(ForeignMethodMir {
+                    signature: wren_signature(&method.signature, interner),
+                    is_static: method.is_static,
+                    symbol: extract_compile_time_string(&method.attributes, interner, "symbol"),
+                });
+            }
             continue;
         }
 
@@ -1605,9 +1613,39 @@ fn compile_class(
                 .count() as u16,
             protocols: conformance.conforms,
             attributes: lower_runtime_attributes(&decl.attributes, interner),
+            native_library: if decl.is_foreign {
+                extract_compile_time_string(&decl.attributes, interner, "native")
+            } else {
+                None
+            },
+            foreign_methods,
         },
         all_closures,
     )
+}
+
+/// Extract a `#!key = "value"` string from an attribute list. Returns
+/// `None` if no matching compile-time attribute exists or if the value
+/// isn't a string literal. Used to pull build-time directives like
+/// `#!native` and `#!symbol` that the runtime loader consumes directly
+/// instead of exposing via reflection.
+fn extract_compile_time_string(
+    attrs: &[Attribute],
+    interner: &Interner,
+    key: &str,
+) -> Option<String> {
+    for attr in attrs {
+        if attr.is_runtime {
+            continue;
+        }
+        if interner.resolve(attr.name.0) != key {
+            continue;
+        }
+        if let AttributeBody::Value((AttributeLiteral::Str(s), _)) = &attr.body {
+            return Some(s.clone());
+        }
+    }
+    None
 }
 
 /// Flatten AST attributes into MIR-side records, dropping compile-time
@@ -1868,6 +1906,52 @@ mod tests {
             .expect("foo() method");
         assert_eq!(method.attributes.len(), 1);
         assert_eq!(method.attributes[0].key, "pinned");
+    }
+
+    #[test]
+    fn test_lower_native_library_on_foreign_class() {
+        let source = "#!native = \"sqlite3\"\nforeign class Db {}";
+        let module = lower_full(source);
+        let class = &module.classes[0];
+        assert_eq!(class.native_library.as_deref(), Some("sqlite3"));
+    }
+
+    #[test]
+    fn test_lower_native_library_ignored_on_regular_class() {
+        // `#!native` on a non-foreign class is meaningless — the loader
+        // only consults it for foreign classes, so the MIR drops it.
+        let source = "#!native = \"sqlite3\"\nclass Db {}";
+        let module = lower_full(source);
+        let class = &module.classes[0];
+        assert!(class.native_library.is_none());
+    }
+
+    #[test]
+    fn test_lower_foreign_methods_emitted() {
+        let source = r#"
+#!native = "sqlite3"
+foreign class Db {
+  #!symbol = "sqlite3_open_v2"
+  foreign open(path)
+  foreign close()
+}
+"#;
+        let module = lower_full(source);
+        let class = &module.classes[0];
+        assert_eq!(class.methods.len(), 0, "no bodied methods");
+        assert_eq!(class.foreign_methods.len(), 2);
+        let open = class
+            .foreign_methods
+            .iter()
+            .find(|m| m.signature == "open(_)")
+            .expect("open(_)");
+        assert_eq!(open.symbol.as_deref(), Some("sqlite3_open_v2"));
+        let close = class
+            .foreign_methods
+            .iter()
+            .find(|m| m.signature == "close()")
+            .expect("close()");
+        assert!(close.symbol.is_none(), "falls back to method name at load");
     }
 
     fn assert_has_instruction(func: &MirFunction, pred: impl Fn(&Instruction) -> bool) {
