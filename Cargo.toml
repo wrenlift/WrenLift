@@ -26,6 +26,7 @@ smallvec = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
 toml = "0.8"
+toml_edit = "0.22"
 zstd = "0.13"
 libloading = "0.8"
 tempfile = "3"

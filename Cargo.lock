@@ -2263,6 +2263,7 @@ dependencies = [
  "smallvec",
  "tempfile",
  "toml",
+ "toml_edit",
  "wasm-encoder 0.245.1",
  "wasmparser 0.226.0",
  "wasmprinter",

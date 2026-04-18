@@ -3,6 +3,7 @@ pub mod capi;
 pub mod codegen;
 pub mod diagnostics;
 pub mod hatch;
+pub mod hatch_registry;
 pub mod intern;
 pub mod mir;
 pub mod parse;

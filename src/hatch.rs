@@ -517,9 +517,21 @@ pub const HATCHFILE: &str = "hatchfile";
 /// module name. Callers that need a specific dependency order should
 /// supply a `hatchfile` with `modules` set explicitly.
 pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
+    build_from_source_tree_with_cache(root, None)
+}
+
+/// Variant that lets callers override the registry cache directory
+/// `hatch build` consults when resolving version-pinned dependencies.
+/// `None` falls back to the ambient `cache_root()` — `HATCH_CACHE_DIR`
+/// or `$HOME/.hatch/cache`. Tests pass an explicit path to avoid
+/// process-wide env var coupling.
+pub fn build_from_source_tree_with_cache(
+    root: &Path,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>, HatchError> {
     let mut visited: std::collections::HashSet<std::path::PathBuf> =
         std::collections::HashSet::new();
-    build_recursive(root, &mut visited)
+    build_recursive(root, &mut visited, cache_dir)
 }
 
 /// Internal recursive variant. `visited` holds canonicalized directory
@@ -528,6 +540,7 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
 fn build_recursive(
     root: &Path,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if !visited.insert(canonical) {
@@ -591,35 +604,71 @@ fn build_recursive(
     };
 
     pack_bundled_native_libs(root, &mut manifest, &mut sections)?;
-    merge_path_dependencies(root, &mut manifest, &mut sections, visited)?;
+    merge_path_dependencies(root, &mut manifest, &mut sections, visited, cache_dir)?;
 
     let hatch = Hatch { manifest, sections };
     emit(&hatch)
 }
 
-/// Recursively build every `path = "..."` dependency and fold its
-/// sections into `sections` / `manifest.modules`. Dep modules install
-/// *before* this hatch's own modules — `manifest.modules` is rewritten
-/// with dep modules prepended so the install loop hits them first.
-/// Name collisions between modules are a hard error; two different
-/// deps carrying a `main` module is undefined behavior we'd rather
-/// catch at build.
+/// Recursively resolve every dependency and fold its sections into
+/// `sections` / `manifest.modules`. Two resolution modes:
+///
+/// * `path = "..."` — recursively build the sibling workspace.
+/// * `"<version>"` — look up `~/.hatch/cache/<name>-<version>.hatch`
+///   (populated by `hatch install`). A cache miss is a hard error —
+///   we never silently reach out to the network during `hatch build`.
+///
+/// Dep modules install *before* this hatch's own modules, so an
+/// `import "counter"` in `main.wren` resolves against the dep's
+/// already-installed class. Name collisions between modules /
+/// sections are rejected loudly so ambiguous imports never slip
+/// through to runtime.
 fn merge_path_dependencies(
     root: &Path,
     manifest: &mut Manifest,
     sections: &mut Vec<Section>,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    cache_dir: Option<&Path>,
 ) -> Result<(), HatchError> {
-    let path_deps: Vec<(String, std::path::PathBuf)> = manifest
+    // Collect into an owned list so we can mutate `manifest.dependencies`
+    // while iterating.
+    let deps: Vec<(String, Dependency)> = manifest
         .dependencies
         .iter()
-        .filter_map(|(name, dep)| dep.path().map(|p| (name.clone(), root.join(p))))
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    for (dep_name, dep_root) in path_deps {
-        let dep_bytes = build_recursive(&dep_root, visited).map_err(|e| {
-            HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
-        })?;
+    for (dep_name, dep) in deps {
+        let dep_bytes = match &dep {
+            Dependency::Path { path, .. } => {
+                let dep_root = root.join(path);
+                build_recursive(&dep_root, visited, cache_dir).map_err(|e| {
+                    HatchError::Encode(format!(
+                        "failed to build dependency '{}': {}",
+                        dep_name, e
+                    ))
+                })?
+            }
+            Dependency::Version(version) => {
+                // Resolve via registry cache. `hatch install` populates
+                // this; during `hatch build` we refuse to fetch so
+                // offline builds remain deterministic.
+                let cached = match cache_dir {
+                    Some(dir) => crate::hatch_registry::cached_artifact_path_in(
+                        dir, &dep_name, version,
+                    ),
+                    None => crate::hatch_registry::cached_artifact_path(&dep_name, version)
+                        .map_err(|e| HatchError::Encode(e.to_string()))?,
+                };
+                if !cached.exists() {
+                    return Err(HatchError::Encode(format!(
+                        "dependency '{}@{}' isn't cached. Run `hatch install {}@{}` first.",
+                        dep_name, version, dep_name, version
+                    )));
+                }
+                std::fs::read(&cached)?
+            }
+        };
         let dep_hatch = load(&dep_bytes)?;
 
         // Prepend dep modules so they install before ours. Collisions
@@ -1070,6 +1119,110 @@ libcounter = { path = "../libcounter" }
             crate::runtime::engine::InterpretResult::Success
         ));
         assert_eq!(vm.take_output().trim(), "42");
+    }
+
+    #[test]
+    fn build_resolves_version_deps_from_cache() {
+        // Simulate a full "install → build → run" cycle without
+        // going over the wire. Pre-populate the registry cache with a
+        // `libgreet-0.1.0.hatch` artifact, then build an app whose
+        // hatchfile pins it by version. The build-side resolver must
+        // find the cached artifact and inline its modules.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let cache_dir = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // 1. Build the library out of a fake workspace, then write
+        //    its bytes to the cache under the expected filename.
+        let lib_workspace = scratch.path().join("lib_src");
+        std::fs::create_dir_all(&lib_workspace).unwrap();
+        std::fs::write(
+            lib_workspace.join("greet.wren"),
+            "class Greet {\n  static hello { \"hi\" }\n}",
+        )
+        .unwrap();
+        std::fs::write(
+            lib_workspace.join("hatchfile"),
+            r#"name = "libgreet"
+version = "0.1.0"
+entry = "greet"
+"#,
+        )
+        .unwrap();
+        let lib_bytes = build_from_source_tree(&lib_workspace).unwrap();
+        std::fs::write(cache_dir.join("libgreet-0.1.0.hatch"), &lib_bytes).unwrap();
+
+        // 2. The app workspace pins `libgreet` by version.
+        let app_workspace = scratch.path().join("app");
+        std::fs::create_dir_all(&app_workspace).unwrap();
+        std::fs::write(
+            app_workspace.join("main.wren"),
+            "import \"greet\" for Greet\nSystem.print(Greet.hello)",
+        )
+        .unwrap();
+        std::fs::write(
+            app_workspace.join("hatchfile"),
+            r#"name = "app"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+libgreet = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        // 3. Point the registry cache at our scratch dir, then build.
+        let bytes = build_from_source_tree_with_cache(&app_workspace, Some(&cache_dir))
+            .expect("build");
+
+        let hatch = load(&bytes).unwrap();
+        // Dep module prepended so imports resolve during install loop.
+        assert_eq!(hatch.manifest.modules, vec!["greet", "main"]);
+        // Dep stripped once folded in.
+        assert!(!hatch.manifest.dependencies.contains_key("libgreet"));
+
+        // And the bundled app actually runs.
+        let mut vm = crate::runtime::vm::VM::new_default();
+        vm.output_buffer = Some(String::new());
+        assert!(matches!(
+            vm.interpret_hatch(&bytes),
+            crate::runtime::engine::InterpretResult::Success
+        ));
+        assert_eq!(vm.take_output().trim(), "hi");
+    }
+
+    #[test]
+    fn build_reports_missing_cached_version() {
+        // A version-pinned dep with nothing in the cache must surface
+        // a pointed error — not silently succeed, not reach the
+        // network during `hatch build`.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let cache_dir = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let workspace = scratch.path().join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("main.wren"), "1").unwrap();
+        std::fs::write(
+            workspace.join("hatchfile"),
+            r#"name = "app"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+ghost = "9.9.9"
+"#,
+        )
+        .unwrap();
+
+        let result = build_from_source_tree_with_cache(&workspace, Some(&cache_dir));
+        match result {
+            Err(HatchError::Encode(msg)) => {
+                assert!(msg.contains("ghost"));
+                assert!(msg.contains("hatch install"));
+            }
+            other => panic!("expected install hint, got {:?}", other),
+        }
     }
 
     #[test]

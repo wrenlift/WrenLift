@@ -79,6 +79,20 @@ enum Command {
         #[arg(default_value = "*")]
         version: String,
     },
+    /// Pull a package from the hatch registry into the local cache
+    /// and record it under `[dependencies]` in the workspace's
+    /// `hatchfile`. Accepts `<name>@<version>` (pinned) or a bare
+    /// `<name>`, which only works when the hatchfile already lists
+    /// the package.
+    Install {
+        /// Package name, optionally `@<version>`. Omitted means
+        /// "fetch every entry already declared in `[dependencies]`".
+        #[arg(value_name = "PACKAGE")]
+        package: Option<String>,
+        /// Workspace directory. Defaults to `.`.
+        #[arg(long = "dir", short = 'C', default_value = ".")]
+        dir: PathBuf,
+    },
     /// Drop a dependency from the current workspace's `hatchfile`.
     /// Planned — placeholder today.
     Remove { name: String },
@@ -104,6 +118,7 @@ fn main() {
         Command::Add { name, version } => cmd_stub(&format!(
             "add {name}@{version} — resolver + registry lookups are planned; see the README roadmap"
         )),
+        Command::Install { package, dir } => cmd_install(&dir, package.as_deref()),
         Command::Remove { name } => cmd_stub(&format!(
             "remove {name} — needs the resolver to land first; see the README roadmap"
         )),
@@ -295,6 +310,145 @@ fn cmd_inspect(path: &Path) {
             section.data.len(),
             section.name
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// install
+// ---------------------------------------------------------------------------
+
+/// `hatch install <name>@<version>` — fetch the release artifact into
+/// the local cache and record the dependency in the workspace's
+/// hatchfile. `hatch install` (no arg) walks `[dependencies]` and
+/// ensures every pinned-version entry is cached, leaving path entries
+/// alone.
+fn cmd_install(dir: &Path, package: Option<&str>) {
+    let hatchfile_path = dir.join(HATCHFILE);
+    let text = match std::fs::read_to_string(&hatchfile_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "error: cannot read '{}': {} (run `hatch init` first?)",
+                hatchfile_path.display(),
+                e
+            );
+            process::exit(1);
+        }
+    };
+    let mut doc: toml_edit::DocumentMut = match text.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: cannot parse hatchfile: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let registry = wren_lift::hatch_registry::registry_url();
+
+    match package {
+        Some(spec) => {
+            let (name, version) = wren_lift::hatch_registry::split_name_version(spec);
+            let resolved_version = match version {
+                Some(v) => v.to_string(),
+                None => match declared_version(&doc, name) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!(
+                            "error: no version given and `{name}` isn't in [dependencies]. Use `{name}@<version>`."
+                        );
+                        process::exit(1);
+                    }
+                },
+            };
+
+            install_one(&registry, name, &resolved_version);
+            record_in_hatchfile(&mut doc, name, &resolved_version);
+
+            if let Err(e) = std::fs::write(&hatchfile_path, doc.to_string()) {
+                eprintln!(
+                    "error: cannot update '{}': {}",
+                    hatchfile_path.display(),
+                    e
+                );
+                process::exit(1);
+            }
+            println!("installed {}@{}", name, resolved_version);
+        }
+        None => {
+            // Resolve every pinned-version entry already in [dependencies].
+            let Some(deps) = doc
+                .get("dependencies")
+                .and_then(toml_edit::Item::as_table_like)
+            else {
+                println!("no [dependencies] to install");
+                return;
+            };
+            let mut to_install: Vec<(String, String)> = Vec::new();
+            for (name, item) in deps.iter() {
+                if let Some(version) = extract_version(item) {
+                    to_install.push((name.to_string(), version));
+                }
+            }
+            if to_install.is_empty() {
+                println!("nothing to install (no version-pinned dependencies)");
+                return;
+            }
+            for (name, version) in &to_install {
+                install_one(&registry, name, version);
+                println!("installed {}@{}", name, version);
+            }
+        }
+    }
+}
+
+fn install_one(registry: &str, name: &str, version: &str) {
+    match wren_lift::hatch_registry::ensure_in_cache(registry, name, version) {
+        Ok(path) => {
+            eprintln!("  cached at {}", path.display());
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            eprintln!(
+                "  (registry = {}, release URL = {})",
+                registry,
+                wren_lift::hatch_registry::release_url(registry, name, version),
+            );
+            process::exit(1);
+        }
+    }
+}
+
+/// Read the declared version of `name` (if any) out of the hatchfile
+/// so `hatch install <name>` can use it without the user retyping.
+fn declared_version(doc: &toml_edit::DocumentMut, name: &str) -> Option<String> {
+    let deps = doc.get("dependencies")?.as_table_like()?;
+    let item = deps.get(name)?;
+    extract_version(item)
+}
+
+fn extract_version(item: &toml_edit::Item) -> Option<String> {
+    // `name = "1.0.0"` — bare string dep.
+    if let Some(v) = item.as_str() {
+        return Some(v.to_string());
+    }
+    // `name = { version = "1.0.0", path = "..." }` — inline table.
+    if let Some(tbl) = item.as_table_like() {
+        if let Some(v) = tbl.get("version").and_then(|i| i.as_str()) {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Merge `name = "version"` into the hatchfile's `[dependencies]`
+/// table, preserving surrounding comments + formatting via
+/// `toml_edit`.
+fn record_in_hatchfile(doc: &mut toml_edit::DocumentMut, name: &str, version: &str) {
+    let deps = doc
+        .entry("dependencies")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    if let Some(tbl) = deps.as_table_like_mut() {
+        tbl.insert(name, toml_edit::value(version));
     }
 }
 
