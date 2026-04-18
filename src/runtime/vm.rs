@@ -228,9 +228,15 @@ pub struct VM {
 
     /// Extra filesystem directories to search when resolving a
     /// `#!native = "..."` library reference, tried ahead of the OS
-    /// loader's ambient search. Populated from the workspace's
-    /// `hatchfile` at VM setup time.
+    /// loader's ambient search. Populated from a hatchfile's
+    /// `native_search_paths` key (or CLI flags in the future).
     pub native_search_paths: Vec<std::path::PathBuf>,
+
+    /// Per-name overrides for `#!native = "key"`. A hit in this map
+    /// wins over candidate-filename mangling: the loader uses the
+    /// mapped path verbatim. Populated from a hatchfile's
+    /// `[native_libs]` section.
+    pub native_lib_paths: std::collections::HashMap<String, std::path::PathBuf>,
 }
 
 impl VM {
@@ -299,6 +305,7 @@ impl VM {
             hot_method_symbols: HotMethodSymbols::default(),
             native_libs: Vec::new(),
             native_search_paths: Vec::new(),
+            native_lib_paths: HashMap::new(),
         };
 
         // Bootstrap core classes.
@@ -473,8 +480,32 @@ impl VM {
         self.install_hatch_sections(&hatch)
     }
 
+    /// Fold a hatch manifest's native-library declarations into the
+    /// VM's foreign-loader state. Search paths accumulate across
+    /// hatches; explicit `[native_libs]` entries with the same key
+    /// overwrite (last writer wins) so a consuming hatch can override
+    /// a dependency's defaults.
+    fn apply_hatch_native_manifest(&mut self, manifest: &crate::hatch::Manifest) {
+        for raw in &manifest.native_search_paths {
+            let path = std::path::PathBuf::from(raw);
+            if !self.native_search_paths.contains(&path) {
+                self.native_search_paths.push(path);
+            }
+        }
+        for (name, entry) in &manifest.native_libs {
+            if let Some(path) = entry.path() {
+                self.native_lib_paths
+                    .insert(name.clone(), std::path::PathBuf::from(path));
+            }
+        }
+    }
+
     /// Shared body: install every `Wlbc` section named in
-    /// `manifest.modules`. Rejects `NativeLib` sections (commit 3b).
+    /// `manifest.modules`. Applies the manifest's native-library
+    /// declarations (`[native_libs]` overrides + `native_search_paths`)
+    /// so any `#!native` directive inside the hatch resolves against
+    /// them at class install time. `NativeLib` sections themselves are
+    /// still refused here — extraction lands in Phase 3c-ii.
     fn install_hatch_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
         for section in &hatch.sections {
             if matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
@@ -485,6 +516,8 @@ impl VM {
                 return InterpretResult::CompileError;
             }
         }
+
+        self.apply_hatch_native_manifest(&hatch.manifest);
 
         for module_name in &hatch.manifest.modules {
             // Skip modules already loaded (e.g. by a previously
@@ -912,6 +945,7 @@ impl VM {
                 match crate::runtime::foreign::load_library(
                     lib_name,
                     &self.native_search_paths,
+                    &self.native_lib_paths,
                 ) {
                     Ok(lib) => {
                         if trace {

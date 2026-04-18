@@ -10,6 +10,7 @@
 //! symbols stay valid for the VM's lifetime; dropping the VM unloads
 //! everything in one pass.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use libloading::Library;
@@ -88,17 +89,25 @@ pub fn library_candidates(name: &str) -> Vec<String> {
 }
 
 /// Open a library, trying each candidate filename produced by
-/// [`library_candidates`]. If `search_paths` is non-empty, each
-/// candidate is also tried prefixed with every search path before
-/// falling back to the OS loader's default search (which already
-/// honors `LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `/usr/lib`,
-/// `/opt/homebrew/lib`, etc.).
+/// [`library_candidates`]. Resolution order:
+///
+/// 1. `name` hits in `name_overrides` — use the mapped path verbatim.
+///    This is how hatchfile `[native_libs]` entries win over bare-name
+///    resolution.
+/// 2. Each `search_paths` directory, tried for every candidate. Useful
+///    for workspace-local native libs or `hatchfile.native_search_paths`.
+/// 3. The OS loader's ambient search (honors `LD_LIBRARY_PATH`,
+///    `DYLD_LIBRARY_PATH`, `/usr/lib`, `/opt/homebrew/lib`, etc.).
 ///
 /// The name `"self"` is a sentinel that resolves to the current
 /// process image (equivalent to `dlopen(NULL)`). Useful for tests and
 /// for wiring foreign methods against symbols linked into the host
 /// executable.
-pub fn load_library(name: &str, search_paths: &[PathBuf]) -> Result<Library, ForeignLoadError> {
+pub fn load_library(
+    name: &str,
+    search_paths: &[PathBuf],
+    name_overrides: &HashMap<String, PathBuf>,
+) -> Result<Library, ForeignLoadError> {
     if name == "self" {
         // Open the current process image so exported symbols linked
         // into the host executable are discoverable via `dlsym`. This
@@ -121,8 +130,21 @@ pub fn load_library(name: &str, search_paths: &[PathBuf]) -> Result<Library, For
         }
     }
 
-    let candidates = library_candidates(name);
     let mut tried = Vec::new();
+
+    // Explicit hatchfile override wins over everything else.
+    if let Some(override_path) = name_overrides.get(name) {
+        tried.push(override_path.display().to_string());
+        if let Ok(lib) = unsafe { Library::new(override_path) } {
+            return Ok(lib);
+        }
+        return Err(ForeignLoadError::LibraryNotFound {
+            name: name.to_string(),
+            tried,
+        });
+    }
+
+    let candidates = library_candidates(name);
 
     // Try each search path first (explicit locations win over ambient ones).
     for dir in search_paths {
@@ -234,7 +256,22 @@ mod tests {
 
     #[test]
     fn load_library_missing_returns_error() {
-        let result = load_library("__wrenlift_does_not_exist__", &[]);
+        let result = load_library("__wrenlift_does_not_exist__", &[], &HashMap::new());
+        assert!(matches!(result, Err(ForeignLoadError::LibraryNotFound { .. })));
+    }
+
+    #[test]
+    fn load_library_override_miss_does_not_fall_through() {
+        // Explicit hatchfile path overrides must not silently fall back
+        // to bare-name search — a wrong path in the manifest should be
+        // a hard error, not a surprise load of a system library that
+        // happens to share the key.
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "sqlite3".to_string(),
+            PathBuf::from("/definitely/not/here/libsqlite3.dylib"),
+        );
+        let result = load_library("sqlite3", &[], &overrides);
         assert!(matches!(result, Err(ForeignLoadError::LibraryNotFound { .. })));
     }
 

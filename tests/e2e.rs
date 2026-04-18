@@ -3360,6 +3360,8 @@ System.print("main says %(c.count)")
             entry: "main".to_string(),
             modules: vec!["main".to_string()],
             dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
@@ -3407,6 +3409,8 @@ fn e2e_hatch_rejects_missing_entry_module() {
             entry: "ghost".to_string(),
             modules: vec!["ghost".to_string()],
             dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
         sections: vec![],
     };
@@ -3457,6 +3461,8 @@ System.print(g.hello)
             entry: "main".to_string(),
             modules: vec!["util".to_string(), "main".to_string()],
             dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
         sections: vec![
             Section {
@@ -3526,6 +3532,8 @@ System.print(c.value)
             entry: "counter".to_string(),
             modules: vec!["counter".to_string()],
             dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
@@ -3546,6 +3554,8 @@ System.print(c.value)
                 d.insert("libcounter".to_string(), "0.1.0".to_string());
                 d
             },
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
@@ -3592,6 +3602,8 @@ fn e2e_hatch_rejects_native_lib_section() {
             entry: "main".to_string(),
             modules: vec!["main".to_string()],
             dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
         sections: vec![Section {
             kind: SectionKind::NativeLib,
@@ -3713,4 +3725,63 @@ Bogus.go()
 "#;
     let (result, _output, _) = run(source);
     assert!(matches!(result, InterpretResult::RuntimeError));
+}
+
+// ===========================================================================
+// Hatchfile [native_libs] + native_search_paths (Phase 3c-i)
+// ===========================================================================
+
+#[test]
+fn e2e_hatch_manifest_applies_native_search_paths_and_overrides() {
+    // Install a hatch whose manifest declares a `[native_libs]`
+    // override and a custom search path, then confirm both have been
+    // folded into the VM's foreign-loader state. This verifies the
+    // manifest plumbing without needing a real shared library to load.
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest, NativeLibEntry, Section, SectionKind};
+
+    // Build a tiny self-contained hatch so we exercise the real
+    // install path end-to-end.
+    let mut vm_compile = VM::new_default();
+    let main_wlbc = vm_compile
+        .compile_source_to_blob("System.print(\"ok\")")
+        .expect("compile main");
+
+    let mut native_libs = BTreeMap::new();
+    native_libs.insert(
+        "custom_db".to_string(),
+        NativeLibEntry::Path("/opt/custom/libdb.dylib".to_string()),
+    );
+
+    let hatch_bytes = emit(&Hatch {
+        manifest: Manifest {
+            name: "native-decls".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "main".to_string(),
+            modules: vec!["main".to_string()],
+            dependencies: BTreeMap::new(),
+            native_libs,
+            native_search_paths: vec!["/opt/homebrew/lib".to_string()],
+        },
+        sections: vec![Section {
+            kind: SectionKind::Wlbc,
+            name: "main".to_string(),
+            data: main_wlbc,
+        }],
+    })
+    .expect("emit");
+
+    let mut vm = VM::new_default();
+    let result = vm.interpret_hatch(&hatch_bytes);
+    assert!(matches!(result, InterpretResult::Success));
+
+    // The manifest's declarations must have seeded the loader state.
+    assert!(vm
+        .native_search_paths
+        .iter()
+        .any(|p| p == std::path::Path::new("/opt/homebrew/lib")));
+    assert_eq!(
+        vm.native_lib_paths.get("custom_db"),
+        Some(&std::path::PathBuf::from("/opt/custom/libdb.dylib"))
+    );
 }

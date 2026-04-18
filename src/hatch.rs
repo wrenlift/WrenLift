@@ -118,6 +118,51 @@ pub struct Manifest {
     /// can declare their deps for tooling.
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    /// Native library declarations. Keys match the string a Wren
+    /// `#!native = "..."` attribute resolves; values describe how the
+    /// loader should find the underlying `.dylib` / `.so` / `.dll` —
+    /// either an explicit path (relative to the workspace, or
+    /// absolute for system locations like `/usr/lib/libssl.dylib`)
+    /// or a bare name that's looked up through the ambient OS search
+    /// plus `native_search_paths`.
+    #[serde(default)]
+    pub native_libs: BTreeMap<String, NativeLibEntry>,
+    /// Extra filesystem directories to search when resolving a
+    /// `#!native` reference, tried ahead of the OS loader's ambient
+    /// search. Absolute paths (`/opt/homebrew/lib`) and workspace-
+    /// relative paths both work.
+    #[serde(default)]
+    pub native_search_paths: Vec<String>,
+}
+
+/// Shape of a `[native_libs.<name>]` entry in a hatchfile. Accepts
+/// either a bare string (treated as `path = "..."`) or a table with
+/// richer fields so future keys (e.g. `version`, `symbols`) can land
+/// without breaking existing manifests.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum NativeLibEntry {
+    /// `libssl = "/usr/lib/libssl.dylib"` — path-only shorthand.
+    Path(String),
+    /// `[native_libs.libssl]` table form with `path = "..."`.
+    Detailed {
+        /// Filesystem path (absolute for system locations, relative to
+        /// the workspace otherwise). If omitted, the loader falls back
+        /// to platform-specific bare-name resolution using the key.
+        #[serde(default)]
+        path: Option<String>,
+    },
+}
+
+impl NativeLibEntry {
+    /// Extract the explicit path, if any. `None` means "use the key as
+    /// a bare name and let the OS loader find it".
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            NativeLibEntry::Path(p) => Some(p.as_str()),
+            NativeLibEntry::Detailed { path } => path.as_deref(),
+        }
+    }
 }
 
 /// One named blob inside a hatch. Owns its payload; for very large
@@ -445,6 +490,8 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
             entry: pick_default_entry(&module_names),
             modules: module_names.clone(),
             dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
         },
     };
 
@@ -503,6 +550,8 @@ mod tests {
                 entry: "main".to_string(),
                 modules: vec!["main".to_string(), "util".to_string()],
                 dependencies: BTreeMap::new(),
+                native_libs: BTreeMap::new(),
+                native_search_paths: Vec::new(),
             },
             sections: vec![
                 Section {
@@ -605,5 +654,40 @@ mod tests {
         assert!(looks_like_hatch(b"HATCH"));
         assert!(looks_like_hatch(b"HATCHxtra"));
         assert!(!looks_like_hatch(b"ABCDE"));
+    }
+
+    #[test]
+    fn manifest_native_libs_accepts_both_forms() {
+        // Shorthand: key = "path" and table form must both deserialize.
+        // Bare keys with no path become `Detailed { path: None }`,
+        // meaning "use the key as a bare name".
+        let text = r#"
+name = "x"
+version = "0.0.0"
+entry = "main"
+
+native_search_paths = ["/opt/custom/lib"]
+
+[native_libs]
+libssl = "/usr/lib/libssl.dylib"
+
+[native_libs.sqlite3]
+path = "vendor/libsqlite3.dylib"
+
+[native_libs.curl]
+# no path — fall back to bare-name resolution
+"#;
+        let m: Manifest = toml::from_str(text).expect("parse");
+        assert_eq!(m.native_search_paths, vec!["/opt/custom/lib"]);
+        assert_eq!(
+            m.native_libs.get("libssl").and_then(|e| e.path()),
+            Some("/usr/lib/libssl.dylib")
+        );
+        assert_eq!(
+            m.native_libs.get("sqlite3").and_then(|e| e.path()),
+            Some("vendor/libsqlite3.dylib")
+        );
+        assert!(m.native_libs.contains_key("curl"));
+        assert_eq!(m.native_libs.get("curl").and_then(|e| e.path()), None);
     }
 }
