@@ -6466,6 +6466,9 @@ mod tests {
 
     // -- Full pipeline tests --
 
+    // Legacy hand-rolled backend pipeline tests. Superseded by the Cranelift
+    // path for default builds; re-enabled when the `cranelift` feature is off.
+    #[cfg(not(feature = "cranelift"))]
     #[test]
     fn test_compile_function_x86_64() {
         // Use unboxed f64 ops (no runtime calls needed).
@@ -6496,6 +6499,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "cranelift"))]
     #[test]
     fn test_compile_function_f64_ops_x86_64() {
         let mut interner = Interner::new();
@@ -6516,6 +6520,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(not(feature = "cranelift"))]
     #[test]
     fn test_compile_function_with_branch_x86_64() {
         use crate::mir::MirType;
@@ -6615,7 +6620,7 @@ mod tests {
         assert!(!entries[0].ptr.is_null());
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_compile_function_aarch64() {
         let mut interner = Interner::new();
@@ -6642,7 +6647,7 @@ mod tests {
 
     // -- JIT execution tests (native arch only) --
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_jit_execute_add_f64() {
         // MIR: return 3.0 + 4.0 = 7.0 (as NaN-boxed bits in GP return reg)
@@ -6672,7 +6677,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_jit_execute_fma_add() {
         // MIR: (2.0 * 3.0) + 1.0 = 7.0, should fuse to FMADD
@@ -6708,7 +6713,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_jit_execute_fma_sub() {
         // MIR: (10.0 * 3.0) - 5.0 = 25.0, should fuse to FMSUB
@@ -6744,7 +6749,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_jit_execute_fma_neg_add() {
         // MIR: 100.0 - (10.0 * 3.0) = 70.0, should fuse to FNMADD (c - a*b)
@@ -6780,7 +6785,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_jit_execute_const_num_boxed() {
         // MIR: return ConstNum(42.0) — returns NaN-boxed Value bits
@@ -6810,7 +6815,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", not(feature = "cranelift")))]
     #[test]
     fn test_jit_execute_return_null() {
         use crate::runtime::value::Value;
@@ -6835,6 +6840,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "cranelift"))]
     #[test]
     fn test_into_executable_x86_64() {
         // Verify x86_64 code can be made executable (mmap succeeds).

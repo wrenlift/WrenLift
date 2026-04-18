@@ -301,6 +301,17 @@ pub mod cl {
         }
 
         // 6. Compile
+        if std::env::var_os("WLIFT_CL_VERIFY").is_some() {
+            if let Err(errs) = cranelift_codegen::verify_function(&func, module.isa()) {
+                eprintln!(
+                    "cl-verify: {} (FuncId u0:{}) failed:\n{}\nIR:\n{}",
+                    safe_name,
+                    func_id.as_u32(),
+                    errs,
+                    func.display()
+                );
+            }
+        }
         let mut ctx = Context::for_function(func);
         module
             .define_function(func_id, &mut ctx)
@@ -2171,6 +2182,19 @@ pub mod cl {
         match term {
             Terminator::Return(val) => {
                 let v = get(val);
+                // Coerce to the function's declared return type. The outer
+                // JIT calling convention is i64 (NaN-boxed); the f64
+                // inner-specialized helpers return f64. When the live value's
+                // Cranelift type doesn't match, bit-reinterpret it — an f64
+                // is its own valid NaN box and vice versa, so a bitcast is
+                // the correct coercion either way.
+                let return_ty = builder.func.signature.returns[0].value_type;
+                let v_ty = builder.func.dfg.value_type(v);
+                let v = if v_ty != return_ty {
+                    builder.ins().bitcast(return_ty, MemFlags::new(), v)
+                } else {
+                    v
+                };
                 builder.ins().return_(&[v]);
             }
             Terminator::ReturnNull => {

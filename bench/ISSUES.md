@@ -1,153 +1,162 @@
 # Benchmark Issues & Remediation Plan
 
-Discovered during benchmark comparison against standard Wren 0.4.0.
+Status snapshot. Re-run against standard Wren 0.4.0 and LuaJIT to keep
+the head-to-head numbers honest.
 
-## Current Results (Apple M3, release build, best of 5 runs)
+## Current Results
 
-| Benchmark       | WrenLift   | Wren 0.4 | Ratio  | Status               |
-|-----------------|------------|----------|--------|----------------------|
-| Recursive Fib   | 0.62s      | 0.17s    | 3.5x   | Runs, improving      |
-| Method Call     | 0.36s      | 0.09s    | 4.1x   | Runs, improving      |
-| Binary Trees    | CRASH      | 0.97s    | —      | SIGABRT at depth ~10 |
-| DeltaBlue       | COMPILE_ERR| —        | —      | Blocked by Issue 4   |
+### CI (ubuntu-latest x86_64, best of 10 runs — 2026-04-18)
 
-*History: original 27.2x/29.8x → P2 hot-path fixes 24.0x/25.4x → Vec registers 12.4x/13.5x → bytecode VM 5.4x/5.5x → method cache 3.5x/4.1x*
+| Benchmark      | WrenLift  | Wren 0.4 | LuaJIT   | LuaJIT (-joff) | Ratio vs Wren | Ratio vs LuaJIT |
+|----------------|-----------|----------|----------|----------------|---------------|-----------------|
+| Recursive Fib  | 0.0144s   | 0.208s   | 0.010s   | 0.068s         | 14.4x faster  | 1.4x slower     |
+| Method Call    | 0.0550s   | 0.102s   | 0.007s   | 0.125s         | 1.9x faster   | 7.9x slower     |
+| Binary Trees   | 0.533s    | 0.995s   | 1.045s   | 1.373s         | 1.9x faster   | **faster**      |
+| DeltaBlue      | (on CI)   | (on CI)  | n/a      | n/a            | —             | —               |
+
+### Local (Apple M3, release build, best of 3 runs — tiered mode)
+
+| Benchmark      | WrenLift  |
+|----------------|-----------|
+| Recursive Fib  | 0.008s    |
+| Method Call    | 0.089s    |
+| Binary Trees   | 0.88s     |
+| DeltaBlue      | 0.20s     |
+
+History (aarch64 tiered):
+- Oct 2025: HashMap registers + tree-walking interpreter — 3.5x / 4.1x slower than std Wren.
+- Dec 2025: Vec registers + bytecode VM + method cache — caught up to std Wren.
+- Mar 2026: Cranelift JIT backend + OSR — 14x faster than std Wren on fib.
+- Apr 2026: Method OSR + nested-caller OSR + trivial setter / List fast paths + leaf IC
+  context elision + Cranelift return-type coercion — current numbers above.
 
 ---
 
-## Issue 1: MIR interpreter is ~13x slower than Wren's bytecode VM
+## Resolved (closed)
+
+All four of the original P0–P2 issues from the Oct/Dec 2025 audit are fixed.
+
+- **`HashMap<ValueId, InterpValue>` register file** → `Vec<Value>` with
+  `UNDEF` sentinels, reused via a per-VM register pool.
+- **String-allocating dispatch hot path** → SymbolId comparisons + pre-interned
+  `static:` and `[_,...]=(_)` signatures.
+- **Double method lookup per call** → single `find_method_with_class`.
+- **`Vec` allocation per method call** → `SmallVec<[Value; 8]>`.
+- **Block-param binding extra allocation** → direct pre-bind via
+  `BytecodeFunction::param_offsets`.
+- **SIGABRT under binary_trees GC pressure** → thread-local JIT root stack
+  + shadow-frame rooting for live boxed values; covered by
+  `e2e_tiered_nested_nonleaf_closure_call_survives_gc_pressure`,
+  `e2e_bench_gc_pressure_10k`, and
+  `e2e_tiered_backedge_osr_survives_gc_pressure`.
+- **`super(x)` arity bug** — MIR builder now counts super-call args, not the
+  enclosing constructor's params.
+- **Implicit `this.member` resolution** — resolver rewrites bare
+  identifiers as `this`-dispatched calls when no local/upvalue/module
+  binding is found. DeltaBlue relies on this pattern throughout and runs.
+- **Cranelift return-type mismatch on direct f64 returns** — the Return
+  terminator now coerces the live Cranelift type to the function's
+  declared return type. Silenced the three `COMPILE ERR FuncId(...)`
+  lines on DeltaBlue and unblocked
+  `jit_exec::test_jit_exec_f64_add` / `test_tier_up_compiles_function`.
+
+---
+
+## Open
+
+### Issue A: Method dispatch overhead vs LuaJIT on `method_call`
 
 **Severity:** Performance
-**Benchmarks affected:** All
+**Gap:** ~8x slower than LuaJIT on CI; ~1.9x faster than standard Wren.
 
-### 1a. HashMap register file (highest impact)
+Cranelift already devirtualizes `kind=1` monomorphic IC sites via
+`CallKnownFunc`, which emits a class-check + direct `call_indirect` with
+zero FFI. The remaining cost is in the Call sites that were *not*
+populated by the interpreter before the module tiered up — those fall
+back to `wren_call_N`, which walks the method cache, saves/restores the
+48-byte JIT context and bumps `jit_depth`.
 
-**File:** `src/runtime/object.rs:721` — `MirCallFrame.values: HashMap<ValueId, InterpValue>`
-**Hot path:** `vm_interp.rs:752` `values.insert()` per instruction, `vm_interp.rs:928` `values.get()` per operand.
+Prior attempts:
+- Inline IC class-check + direct call inside Cranelift for all call
+  sites with a live IC pointer — crashed DeltaBlue with SIGSEGV under
+  GC because the native fast path skipped `push_jit_frame`, leaving the
+  caller invisible to the stack walker.
+- Leaf fast path in `call_closure_jit_or_sync` — no effect on
+  `method_call` because that path isn't hot for the module's own
+  call sites.
+- Leaf fast path in `dispatch_method` — broke DeltaBlue correctness
+  (`14097848` vs `14065400`). Some call path reads `current_func_id`
+  through a helper I didn't trace, despite `is_mir_inline_safe`
+  claiming a leaf doesn't need it.
 
-Every instruction does 2-4 HashMap lookups (get operands + insert result). ValueId is a dense u32.
+**Plan:**
+1. Teach the native fast path to register a JIT frame. Easiest route is a
+   `#[naked]` `wren_call_ic_N` wrapper that captures fp/ret_addr the same
+   way `wren_call_N` does.
+2. Re-attempt the inline Cranelift IC check on top of the naked wrapper
+   so a class-match picks up the stable `jit_code[func_id]` slot and
+   bypasses `wren_call_N` entirely.
+3. Alternatively: after the module is installed, detect that the IC
+   table has crossed a populated-ratio threshold and kick off a
+   re-compile so the devirt pass catches the newly-hot call sites.
 
-**Fix:** Replace `HashMap<ValueId, InterpValue>` with `Vec<InterpValue>` indexed by `ValueId.0 as usize`. O(1) array index vs O(1)-amortized hash probe (~3-4x speedup on value access alone).
+**Files:** `src/codegen/cranelift_backend.rs`, `src/codegen/runtime_fns.rs`.
 
-### 1b. String allocations in dispatch hot path
+### Issue B: `delta_blue` still 2x std Wren on aarch64
 
-Every method call allocates strings that could be avoided:
+**Severity:** Performance
+**Gap:** 0.20s vs ~0.09s.
 
-| Location | Pattern | Why unnecessary |
-|----------|---------|-----------------|
-| `vm_interp.rs:222` | `vm.interner.resolve(*method).to_string()` for `starts_with("call")` check | Compare against interned "call" SymbolId instead |
-| `vm_interp.rs:254` | `format!("static:{}", method_name_str)` | Pre-intern static prefixed symbols at class bind time |
-| `vm_interp.rs:450` | `format!("[{}]", vec!["_"; n].join(","))` per subscript | Cache the 5 common signatures `[_]`..`[_,_,_,_,_]` |
-| `vm_interp.rs:489` | `format!("[{}]=(_)", ...)` per subscript set | Same — pre-intern |
-| `vm_interp.rs:569` | `to_string()` per class in IsType hierarchy walk | Compare `SymbolId` (u32 ==) instead of String == |
+`execute()` OSRs into native but its inner calls (`addPropagate`,
+`chooseMethod`, `addConstraintsConsumingTo`) aren't hot enough
+individually to hit the tier-up threshold per-call, so they execute
+bytecode inside a native caller. The `jit_depth > 0` gate is already
+lifted, so nested OSR is available — the bottleneck is that each
+short method call pays `wren_call_N` overhead.
 
-### 1c. Double method lookup per call
+**Plan:** overlaps with Issue A. Specifically: a faster non-leaf
+native-from-native dispatch (which tier-stats call `native2native`)
+would let the hot protocol methods stay native once compiled instead
+of stepping back into the interpreter.
 
-`vm_interp.rs:245-248` — calls `find_method()` then `find_method_class()`, both walking the full superclass chain with HashMap lookups.
+### Issue C: `delta_blue` in the CI manifest
 
-**Fix:** Single `find_method_with_class()` that returns `(Method, *mut ObjClass)` in one pass.
+**Severity:** Tooling
+**Status:** Landed in `f65e8ea` — CI now runs DeltaBlue alongside
+`fib`, `method_call` and `binary_trees`. LuaJIT / Ruby / Python ports
+don't exist yet, so only wrenlift and wren_cli numbers show up for
+that row.
 
-### 1d. Vec allocation per method call
+### Issue D: dominance-violation verifier errors on three DeltaBlue functions
 
-`vm_interp.rs:216-219` — `vec![recv_val]` + push args for every call. `vm_interp.rs:328` — `arg_vals.clone()` for constructors.
+**Severity:** Bug — performance-only (runtime stays correct via fallback)
+**Status:** open
 
-**Fix:** Use a reusable `SmallVec<[Value; 8]>` or a thread-local scratch buffer. Most Wren methods have ≤4 args.
+DeltaBlue prints three `COMPILE ERR FuncId(N): Compilation error: Verifier errors`
+lines on startup. With `WLIFT_CL_VERIFY=1` the detailed messages are of the
+form:
 
-### 1e. Block param binding allocations
-
-`vm_interp.rs:936` — `collect()` args into intermediate Vec, then insert each into HashMap.
-
-**Fix:** Direct single-pass: read each arg from values and insert the target param in one loop.
-
-### Expected impact
-
-| Fix | Estimated speedup | Effort |
-|-----|-------------------|--------|
-| 1a (Vec registers) | 3-5x | Medium — touch MirCallFrame + all access sites |
-| 1b (kill string allocs) | 1.5-2x | Small — targeted changes |
-| 1c (single method walk) | 1.1-1.3x | Small — refactor one function |
-| 1d (SmallVec args) | 1.1-1.2x | Small — swap Vec for SmallVec |
-| 1e (block param pass) | 1.05x | Trivial |
-| **Combined** | **~5-10x** | |
-
-Steps 1a+1b alone should bring ratio from 30x → ~5-8x. JIT tier-up would eliminate the remaining gap.
-
----
-
-## Issue 2: super() constructor dispatches with wrong arity
-
-**Severity:** Bug — correctness
-**Benchmarks affected:** method_call (blocked NthToggle inheritance pattern)
-
-**Repro:**
-```wren
-class Base {
-  construct new(x) { _x = x }
-}
-class Child is Base {
-  construct new(x, y) {
-    super(x)  // ERROR: looks for Base.new(_,_) instead of Base.new(_)
-    _y = y
-  }
-}
+```
+- inst94 (jump block17(..., v40, ...)): uses value v40 from non-dominating inst32
 ```
 
-**Root cause:** When lowering `super(args...)` inside a constructor, the MIR builder constructs the method signature using the *enclosing* constructor's parameter count (2 params → `new(_,_)`) instead of counting the actual `super(...)` call arguments (1 arg → `new(_)`).
+i.e. the Cranelift IR we emit contains a block argument that was defined in
+a block that doesn't dominate the jump. The affected functions stay on the
+bytecode interpreter, which costs a bit of perf but produces the correct
+answer (`14065400`).
 
-**Fix:** In the MIR builder's super-call handling, build the signature from `super_call.args.len()`, not from the enclosing method's parameter list.
+Previous related fix (commit in progress): the `Terminator::Return` emitter
+now coerces the live Cranelift type to the function's declared return type,
+which cleared the `result 0 has type f64, must match function signature of i64`
+class of errors on `jit_exec::test_jit_exec_f64_add` and
+`test_tier_up_compiles_function`. The dominance errors are a separate class —
+likely in the inline IC / fast-path merge paths that introduce extra blocks.
 
-**Files:** `src/mir/builder.rs` — super call lowering in constructor context.
+**Reproduce:** `WLIFT_CL_VERIFY=1 ./target/release/wlift bench/delta_blue.wren --mode tiered`
 
----
-
-## Issue 3: SIGABRT under heavy GC pressure (binary_trees)
-
-**Severity:** Crash — correctness
-**Benchmarks affected:** binary_trees
-
-**Repro:** `bench/binary_trees.wren` at `maxDepth = 14` — processes stretch tree and first few iterations of depth-4 and depth-6 loops, then crashes with SIGABRT during depth-10 iteration (~500K+ cumulative allocations).
-
-**Root cause candidates (most to least likely):**
-1. **Missing GC roots** — temporary `Value` objects in MIR interpreter frames (`HashMap<ValueId, InterpValue>`) aren't registered as GC roots during collection. When GC fires mid-iteration, live references get collected.
-2. **Dangling pointer after collection** — an `ObjInstance` field or constructor return value points to memory that was freed during a GC sweep.
-3. **Nursery overflow** — objects allocated faster than promotion can handle, leading to memory corruption in the bump allocator.
-
-**Fix plan:**
-1. Audit `vm_interp.rs` to ensure all live `InterpValue::Boxed(Value)` in every active `MirCallFrame` are traced as GC roots.
-2. Add a stress-test GC mode (`GC_STRESS=1`) that collects on every allocation to surface dangling pointers deterministically.
-3. Run binary_trees under AddressSanitizer: `RUSTFLAGS="-Zsanitizer=address" cargo run bench/binary_trees.wren`
-
-**Files:** `src/runtime/gc.rs`, `src/runtime/vm_interp.rs`
-
----
-
-## Issue 4: Implicit `this` method calls not resolved
-
-**Severity:** Bug — correctness
-**Benchmarks affected:** delta_blue (and any real-world Wren code using this pattern)
-
-**Repro:**
-```wren
-class Foo {
-  construct new() { _val = 42 }
-  value { _val }
-  test() {
-    return value  // ERROR: "undefined variable 'value'"
-    // Should resolve to: return this.value
-  }
-}
-```
-
-In standard Wren, bare identifiers inside a method body that don't match any local/module variable are resolved as method calls on `this`. This is extremely common in real Wren code — nearly every class with getters/methods relies on it.
-
-**Root cause:** The semantic resolver (`src/sema/resolve.rs`) only checks local variables, upvalues, and module-level variables. It doesn't fall back to checking whether the identifier is a method/getter on the current class (or its superclass chain).
-
-**Fix plan:**
-1. In `resolve.rs`, when a bare identifier lookup fails all scopes and we're inside a class method body, emit it as an implicit `this.identifier` call instead of an error.
-2. In Wren, this applies to: getters (`value`), methods with args (`doSomething(x)`), and the setter pattern (`value = x` → `this.value = x`).
-3. The resolver doesn't need to verify the method exists at compile time — that's a runtime dispatch. It just needs to rewrite bare identifiers as `this`-dispatched calls when no variable binding is found.
-
-**Files:** `src/sema/resolve.rs`, possibly `src/mir/builder.rs`
+**Next step:** dump the full IR for one failing function, identify which
+emitter path creates the cross-block value use, and re-route the live-in
+through a block param.
 
 ---
 
@@ -155,9 +164,6 @@ In standard Wren, bare identifiers inside a method body that don't match any loc
 
 | Priority | Issue | Why |
 |----------|-------|-----|
-| **P0** | Issue 4 (implicit this) | Blocks most real-world Wren programs |
-| **P0** | Issue 2 (super arity) | Blocks inheritance, a core language feature |
-| **P1** | Issue 3 (GC crash) | Blocks allocation-heavy workloads |
-| **P2** | Issue 1b (string allocs) | Low-hanging fruit, ~2x improvement |
-| **P2** | Issue 1c-1e (dispatch overhead) | Small targeted fixes, ~1.3x combined |
-| **P3** | Issue 1a (Vec registers) | Biggest perf win but most invasive change |
+| **P0**   | Issue A (inline IC with frame rooting) | Biggest headroom vs LuaJIT on method-heavy benches |
+| **P1**   | Issue B (native2native dispatch)       | Unblocks DeltaBlue and any non-leaf protocol-heavy workload |
+| **P2**   | Port `delta_blue.{py,rb,lua}`          | Makes Issue C a fair multi-language comparison |
