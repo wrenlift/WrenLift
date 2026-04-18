@@ -831,6 +831,7 @@ impl VM {
                     0
                 };
                 (*class_ptr).num_fields = class_mir.num_fields + inherited_fields;
+                (*class_ptr).attributes = class_mir.attributes;
             }
 
             // Register each method's MIR and bind to the class
@@ -883,6 +884,10 @@ impl VM {
                         cls.methods.resize(idx + 1, None);
                     }
                     cls.methods[idx] = Some(method);
+                    if !method_mir.attributes.is_empty() {
+                        cls.method_attributes
+                            .insert(bind_sym, method_mir.attributes);
+                    }
                 }
             }
 

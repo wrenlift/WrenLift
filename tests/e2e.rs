@@ -3608,3 +3608,51 @@ fn e2e_hatch_rejects_native_lib_section() {
         "hatch with native lib section should be refused in commit 3a"
     );
 }
+
+// ===========================================================================
+// Attribute reflection (Phase 2)
+// ===========================================================================
+
+#[test]
+fn e2e_class_attributes_runtime_visible() {
+    // Flag, value, and group attributes must all round-trip through MIR
+    // and surface as a nested map via Class.attributes.
+    let source = r#"
+#runnable
+#author = "Bob"
+#doc(brief = "sum")
+class Foo {}
+
+var a = Foo.attributes
+System.print(a[null]["runnable"][0])
+System.print(a[null]["author"][0])
+System.print(a["doc"]["brief"][0])
+"#;
+    assert_output(source, "null\nBob\nsum");
+}
+
+#[test]
+fn e2e_compile_time_attributes_hidden() {
+    // `#!` attributes live only for the compiler — the runtime must not see
+    // them even as an empty group.
+    let source = r#"
+#!internal
+class Foo {}
+System.print(Foo.attributes)
+"#;
+    assert_output(source, "null");
+}
+
+#[test]
+fn e2e_method_attributes_reflected() {
+    let source = r#"
+class C {
+  #pinned
+  foo() { 1 }
+  bar() { 2 }
+}
+var m = C.methodAttributes
+System.print(m["foo()"][null]["pinned"][0])
+"#;
+    assert_output(source, "null");
+}

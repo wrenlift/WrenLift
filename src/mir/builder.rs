@@ -1584,6 +1584,7 @@ fn compile_class(
             is_static: method.is_static,
             is_constructor,
             mir: builder.func,
+            attributes: lower_runtime_attributes(&method.attributes, interner),
         });
     }
 
@@ -1603,9 +1604,55 @@ fn compile_class(
                 .filter(|s| !parent_field_map.contains_key(s))
                 .count() as u16,
             protocols: conformance.conforms,
+            attributes: lower_runtime_attributes(&decl.attributes, interner),
         },
         all_closures,
     )
+}
+
+/// Flatten AST attributes into MIR-side records, dropping compile-time
+/// (`#!`) entries. Groups expand one entry per inner pair so the runtime
+/// reflection builder sees a uniform `(group, key, value)` stream.
+fn lower_runtime_attributes(attrs: &[Attribute], interner: &Interner) -> Vec<AttrEntry> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if !attr.is_runtime {
+            continue;
+        }
+        let outer = interner.resolve(attr.name.0).to_string();
+        match &attr.body {
+            AttributeBody::Flag => out.push(AttrEntry {
+                group: None,
+                key: outer,
+                value: None,
+            }),
+            AttributeBody::Value((lit, _)) => out.push(AttrEntry {
+                group: None,
+                key: outer,
+                value: Some(lower_attr_value(lit, interner)),
+            }),
+            AttributeBody::Group(pairs) => {
+                for (key_sym, (lit, _)) in pairs {
+                    out.push(AttrEntry {
+                        group: Some(outer.clone()),
+                        key: interner.resolve(key_sym.0).to_string(),
+                        value: Some(lower_attr_value(lit, interner)),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn lower_attr_value(lit: &AttributeLiteral, interner: &Interner) -> AttrValue {
+    match lit {
+        AttributeLiteral::Num(n) => AttrValue::Num(*n),
+        AttributeLiteral::Str(s) => AttrValue::Str(s.clone()),
+        AttributeLiteral::Bool(b) => AttrValue::Bool(*b),
+        AttributeLiteral::Null => AttrValue::Null,
+        AttributeLiteral::Ident(sym) => AttrValue::Ident(interner.resolve(*sym).to_string()),
+    }
 }
 
 /// Scan a statement body for field accesses (_name) and register them.
@@ -1767,6 +1814,60 @@ mod tests {
         let resolve_result = crate::sema::resolve::resolve(&result.module, &result.interner);
         let module_mir = lower_module(&result.module, &mut result.interner, &resolve_result);
         (module_mir.top_level, result.interner)
+    }
+
+    fn lower_full(source: &str) -> ModuleMir {
+        let mut result = parse(source);
+        assert!(
+            result.errors.is_empty(),
+            "parse errors: {:?}",
+            result.errors
+        );
+        let resolve_result = crate::sema::resolve::resolve(&result.module, &result.interner);
+        lower_module(&result.module, &mut result.interner, &resolve_result)
+    }
+
+    #[test]
+    fn test_lower_class_attributes_runtime_only() {
+        // `#runnable`  → runtime Flag
+        // `#!internal` → compile-time, must be stripped
+        // `#author = "Bob"` → runtime Value
+        let module = lower_full(
+            "#runnable\n#!internal\n#author = \"Bob\"\nclass Foo {}",
+        );
+        let class = &module.classes[0];
+        assert_eq!(class.attributes.len(), 2, "compile-time attr must be dropped");
+        assert_eq!(class.attributes[0].key, "runnable");
+        assert!(class.attributes[0].value.is_none());
+        assert_eq!(class.attributes[1].key, "author");
+        matches!(class.attributes[1].value, Some(AttrValue::Str(_)));
+    }
+
+    #[test]
+    fn test_lower_class_group_attribute_flattens() {
+        let module = lower_full(
+            "#doc(brief = \"sum\", example = 42)\nclass Math {\n  static go() { 1 }\n}",
+        );
+        let class = &module.classes[0];
+        assert_eq!(class.attributes.len(), 2);
+        assert_eq!(class.attributes[0].group.as_deref(), Some("doc"));
+        assert_eq!(class.attributes[0].key, "brief");
+        assert_eq!(class.attributes[1].group.as_deref(), Some("doc"));
+        assert_eq!(class.attributes[1].key, "example");
+    }
+
+    #[test]
+    fn test_lower_method_attributes_attached_to_method() {
+        let source = "class C {\n  #pinned\n  foo() { 1 }\n}";
+        let module = lower_full(source);
+        let class = &module.classes[0];
+        let method = class
+            .methods
+            .iter()
+            .find(|m| m.signature == "foo()")
+            .expect("foo() method");
+        assert_eq!(method.attributes.len(), 1);
+        assert_eq!(method.attributes[0].key, "pinned");
     }
 
     fn assert_has_instruction(func: &MirFunction, pred: impl Fn(&Instruction) -> bool) {

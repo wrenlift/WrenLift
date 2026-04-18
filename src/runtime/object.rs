@@ -879,6 +879,12 @@ pub struct ObjClass {
     pub protocols: crate::sema::protocol::ProtocolSet,
     /// Static fields (__name) — per-class storage shared across instances.
     pub static_fields: HashMap<SymbolId, Value>,
+    /// Class-level runtime attributes (`#key`). Populated from
+    /// `ClassMir::attributes` at class installation; empty for builtin
+    /// and foreign-wrapper classes.
+    pub attributes: Vec<crate::mir::AttrEntry>,
+    /// Per-method runtime attributes keyed by signature symbol.
+    pub method_attributes: HashMap<SymbolId, Vec<crate::mir::AttrEntry>>,
 }
 
 /// A method entry in the class method table.
@@ -1010,6 +1016,8 @@ impl ObjClass {
             is_foreign: false,
             protocols,
             static_fields: HashMap::new(),
+            attributes: Vec::new(),
+            method_attributes: HashMap::new(),
         }
     }
 

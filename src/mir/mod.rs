@@ -662,6 +662,9 @@ pub struct ClassMir {
     pub num_fields: u16,
     /// Protocols this class conforms to (computed during compilation).
     pub protocols: crate::sema::protocol::ProtocolSet,
+    /// Runtime-visible attributes (`#key`, `#!` ones are stripped).
+    #[serde(default)]
+    pub attributes: Vec<AttrEntry>,
 }
 
 /// MIR for a single method within a class.
@@ -672,6 +675,32 @@ pub struct MethodMir {
     pub is_static: bool,
     pub is_constructor: bool,
     pub mir: MirFunction,
+    /// Runtime-visible attributes attached to the method declaration.
+    #[serde(default)]
+    pub attributes: Vec<AttrEntry>,
+}
+
+/// Flattened attribute record stored on MIR classes and methods. Each
+/// entry represents one `key [= value]` pair; group entries share a
+/// `group` name and flags store `value = None`. Compile-time attributes
+/// (`#!`) are stripped before an `AttrEntry` is ever constructed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AttrEntry {
+    pub group: Option<String>,
+    pub key: String,
+    pub value: Option<AttrValue>,
+}
+
+/// Literal payload of an attribute. Mirrors the parse-side
+/// `ast::AttributeLiteral`, but owns its data so it can survive
+/// `ModuleBlob` round-trips.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AttrValue {
+    Num(f64),
+    Str(String),
+    Bool(bool),
+    Null,
+    Ident(String),
 }
 
 // ---------------------------------------------------------------------------
