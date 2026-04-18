@@ -135,33 +135,73 @@ pub struct Manifest {
     pub native_search_paths: Vec<String>,
 }
 
-/// Shape of a `[native_libs.<name>]` entry in a hatchfile. Accepts
-/// either a bare string (treated as `path = "..."`) or a table with
-/// richer fields so future keys (e.g. `version`, `symbols`) can land
-/// without breaking existing manifests.
+/// Shape of a `[native_libs.<name>]` entry in a hatchfile. Either a
+/// bare string path, or an inline table whose keys select a path per
+/// runtime platform:
+///
+/// ```toml
+/// [native_libs]
+/// libssl  = "/usr/lib/libssl.dylib"            # bare shorthand
+/// sqlite3 = { macos = "libs/libsqlite3.dylib",
+///             linux = "libs/libsqlite3.so" }
+/// openssl = { any = "libssl",                  # catch-all fallback
+///             macos = "libs/libssl.dylib" }
+/// zlib    = { "macos-arm64"  = "libs/arm64/libz.dylib",
+///             "macos-x86_64" = "libs/x86_64/libz.dylib" }
+/// ```
+///
+/// Recognized table keys:
+///
+/// * `<os>-<arch>` — most specific; e.g. `macos-arm64`, `linux-x86_64`.
+/// * `<os>` — OS bucket; e.g. `macos`, `linux`, `windows`, `freebsd`.
+/// * `any` — fallback for any platform with no more specific match.
+/// * `path` — legacy alias for `any`, kept for backward compat.
+///
+/// Architecture names use the short Wren-user vocabulary — `arm64`
+/// (not `aarch64`), `x86_64`, `x86`. OS names match the values of
+/// [`std::env::consts::OS`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum NativeLibEntry {
     /// `libssl = "/usr/lib/libssl.dylib"` — path-only shorthand.
+    /// Equivalent to `{ any = "/usr/lib/libssl.dylib" }`.
     Path(String),
-    /// `[native_libs.libssl]` table form with `path = "..."`.
-    Detailed {
-        /// Filesystem path (absolute for system locations, relative to
-        /// the workspace otherwise). If omitted, the loader falls back
-        /// to platform-specific bare-name resolution using the key.
-        #[serde(default)]
-        path: Option<String>,
-    },
+    /// Inline table with platform-selector keys. Any key not matching
+    /// the lookup vocabulary above is ignored.
+    Map(BTreeMap<String, String>),
 }
 
 impl NativeLibEntry {
-    /// Extract the explicit path, if any. `None` means "use the key as
-    /// a bare name and let the OS loader find it".
-    pub fn path(&self) -> Option<&str> {
+    /// Pick the best path for the current runtime platform.
+    pub fn resolve(&self) -> Option<&str> {
+        self.resolve_for(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// Testable variant — caller supplies the OS/arch names.
+    pub fn resolve_for(&self, os: &str, arch: &str) -> Option<&str> {
         match self {
             NativeLibEntry::Path(p) => Some(p.as_str()),
-            NativeLibEntry::Detailed { path } => path.as_deref(),
+            NativeLibEntry::Map(map) => {
+                let arch_short = canonical_arch_name(arch);
+                let os_arch = format!("{}-{}", os, arch_short);
+                map.get(&os_arch)
+                    .or_else(|| map.get(os))
+                    .or_else(|| map.get("any"))
+                    .or_else(|| map.get("path"))
+                    .map(String::as_str)
+            }
         }
+    }
+}
+
+/// Map a Rust/LLVM architecture name to the short form hatchfiles use.
+/// Only rewrites `aarch64 → arm64`; everything else (`x86_64`, `x86`,
+/// `riscv64`, `wasm32`, …) passes through, which matches standard
+/// naming already.
+fn canonical_arch_name(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        other => other,
     }
 }
 
@@ -658,9 +698,8 @@ mod tests {
 
     #[test]
     fn manifest_native_libs_accepts_both_forms() {
-        // Shorthand: key = "path" and table form must both deserialize.
-        // Bare keys with no path become `Detailed { path: None }`,
-        // meaning "use the key as a bare name".
+        // Bare shorthand + inline-table + section-header forms all
+        // deserialize into the same enum.
         let text = r#"
 name = "x"
 version = "0.0.0"
@@ -669,25 +708,92 @@ entry = "main"
 native_search_paths = ["/opt/custom/lib"]
 
 [native_libs]
-libssl = "/usr/lib/libssl.dylib"
+libssl  = "/usr/lib/libssl.dylib"
+sqlite3 = { path = "vendor/libsqlite3.dylib" }
 
-[native_libs.sqlite3]
-path = "vendor/libsqlite3.dylib"
-
-[native_libs.curl]
-# no path — fall back to bare-name resolution
+[native_libs.openssl]
+any = "libssl"
+macos = "libs/libssl.dylib"
 "#;
         let m: Manifest = toml::from_str(text).expect("parse");
         assert_eq!(m.native_search_paths, vec!["/opt/custom/lib"]);
+        // Bare shorthand resolves to its string everywhere.
         assert_eq!(
-            m.native_libs.get("libssl").and_then(|e| e.path()),
+            m.native_libs
+                .get("libssl")
+                .and_then(|e| e.resolve_for("macos", "aarch64")),
             Some("/usr/lib/libssl.dylib")
         );
+        // `path` key still resolves via the legacy alias.
         assert_eq!(
-            m.native_libs.get("sqlite3").and_then(|e| e.path()),
+            m.native_libs
+                .get("sqlite3")
+                .and_then(|e| e.resolve_for("linux", "x86_64")),
             Some("vendor/libsqlite3.dylib")
         );
-        assert!(m.native_libs.contains_key("curl"));
-        assert_eq!(m.native_libs.get("curl").and_then(|e| e.path()), None);
+        // OS-specific key wins over `any`.
+        assert_eq!(
+            m.native_libs
+                .get("openssl")
+                .and_then(|e| e.resolve_for("macos", "x86_64")),
+            Some("libs/libssl.dylib")
+        );
+        // Non-matching OS falls back to `any`.
+        assert_eq!(
+            m.native_libs
+                .get("openssl")
+                .and_then(|e| e.resolve_for("linux", "x86_64")),
+            Some("libssl")
+        );
+    }
+
+    #[test]
+    fn native_lib_resolve_prefers_most_specific_key() {
+        // `<os>-<arch>` beats `<os>` beats `any`.
+        let text = r#"
+[native_libs.zlib]
+any = "libs/libz"
+macos = "libs/mac/libz.dylib"
+"macos-arm64" = "libs/mac-arm64/libz.dylib"
+"#;
+        let m: Manifest = toml::from_str(&format!(
+            "name = \"x\"\nversion = \"0\"\nentry = \"m\"\n{}",
+            text
+        ))
+        .expect("parse");
+        let entry = &m.native_libs["zlib"];
+        // Exact arch match — `aarch64` should canonicalize to `arm64`.
+        assert_eq!(
+            entry.resolve_for("macos", "aarch64"),
+            Some("libs/mac-arm64/libz.dylib")
+        );
+        // OS match only (x86_64 on macos isn't listed explicitly).
+        assert_eq!(
+            entry.resolve_for("macos", "x86_64"),
+            Some("libs/mac/libz.dylib")
+        );
+        // No OS match — fall back to `any`.
+        assert_eq!(entry.resolve_for("linux", "x86_64"), Some("libs/libz"));
+    }
+
+    #[test]
+    fn native_lib_resolve_unknown_keys_are_ignored() {
+        // A table with no recognized keys resolves to None — the
+        // loader then leaves the library unbound rather than picking
+        // some arbitrary entry.
+        let text = r#"
+[native_libs.mystery]
+unsupported = "nope"
+notes = "hello"
+"#;
+        let m: Manifest = toml::from_str(&format!(
+            "name = \"x\"\nversion = \"0\"\nentry = \"m\"\n{}",
+            text
+        ))
+        .expect("parse");
+        assert_eq!(
+            m.native_libs["mystery"].resolve_for("macos", "arm64"),
+            None
+        );
     }
 }

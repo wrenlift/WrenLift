@@ -501,7 +501,7 @@ impl VM {
             }
         }
         for (name, entry) in &manifest.native_libs {
-            if let Some(path) = entry.path() {
+            if let Some(path) = entry.resolve() {
                 self.native_lib_paths
                     .insert(name.clone(), std::path::PathBuf::from(path));
             }
