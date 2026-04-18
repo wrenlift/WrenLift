@@ -192,6 +192,38 @@ pub fn resolve_symbol(
     }
 }
 
+/// Pick the on-disk filename for a `.hatch` `NativeLib` section whose
+/// name is `raw`. If the name already carries a platform-appropriate
+/// extension the caller's choice is preserved; otherwise we apply the
+/// canonical dynamic-library suffix so `dlopen` can find it.
+pub fn default_native_lib_filename(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let has_ext = lower.ends_with(".dylib") || lower.ends_with(".so") || lower.ends_with(".dll");
+    if has_ext {
+        return raw.to_string();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if raw.starts_with("lib") {
+            format!("{}.dylib", raw)
+        } else {
+            format!("lib{}.dylib", raw)
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if raw.starts_with("lib") {
+            format!("{}.so", raw)
+        } else {
+            format!("lib{}.so", raw)
+        }
+    }
+    #[cfg(windows)]
+    {
+        format!("{}.dll", raw)
+    }
+}
+
 /// Base name of a Wren method signature (e.g. `"open(_)"` → `"open"`).
 /// Used when a `foreign` method omits `#!symbol` — we default to the
 /// Wren method name.
@@ -258,6 +290,30 @@ mod tests {
     fn load_library_missing_returns_error() {
         let result = load_library("__wrenlift_does_not_exist__", &[], &HashMap::new());
         assert!(matches!(result, Err(ForeignLoadError::LibraryNotFound { .. })));
+    }
+
+    #[test]
+    fn default_native_lib_filename_adds_platform_suffix() {
+        // Names with an existing extension pass through unchanged.
+        assert_eq!(default_native_lib_filename("libfoo.dylib"), "libfoo.dylib");
+        assert_eq!(default_native_lib_filename("foo.so"), "foo.so");
+        assert_eq!(default_native_lib_filename("BAR.DLL"), "BAR.DLL");
+
+        // Bare names get the canonical suffix + `lib` prefix on unix.
+        let bare = default_native_lib_filename("sqlite3");
+        #[cfg(target_os = "macos")]
+        assert_eq!(bare, "libsqlite3.dylib");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(bare, "libsqlite3.so");
+        #[cfg(windows)]
+        assert_eq!(bare, "sqlite3.dll");
+
+        // Names already prefixed with `lib` don't get double-prefixed.
+        let libbed = default_native_lib_filename("libcrypto");
+        #[cfg(target_os = "macos")]
+        assert_eq!(libbed, "libcrypto.dylib");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(libbed, "libcrypto.so");
     }
 
     #[test]

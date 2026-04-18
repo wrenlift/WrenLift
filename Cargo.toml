@@ -28,6 +28,7 @@ bincode = { version = "2", features = ["serde"] }
 toml = "0.8"
 zstd = "0.13"
 libloading = "0.8"
+tempfile = "3"
 cranelift-codegen = { version = "0.130", optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }

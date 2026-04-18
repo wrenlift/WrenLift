@@ -3588,16 +3588,24 @@ System.print(c.value)
 }
 
 #[test]
-fn e2e_hatch_rejects_native_lib_section() {
+fn e2e_hatch_extracts_native_lib_sections_to_disk() {
     use std::collections::BTreeMap;
     use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
 
-    // Native-lib sections are reserved for commit 3b. Hatches that
-    // declare one should be refused today rather than silently
-    // ignoring the dependency.
+    // A hatch carrying a `NativeLib` section must write that section
+    // to a temp directory at load time, register a `<name> → path`
+    // override in `native_lib_paths`, and prepend the temp directory
+    // to `native_search_paths`. We stuff arbitrary bytes in (not a
+    // real .dylib) — this test only checks the extraction, not
+    // dlopen, so any payload works.
+    let mut vm_compile = VM::new_default();
+    let main_wlbc = vm_compile
+        .compile_source_to_blob("System.print(\"ok\")")
+        .expect("compile main");
+
     let hatch = Hatch {
         manifest: Manifest {
-            name: "native".to_string(),
+            name: "bundled".to_string(),
             version: "0.1.0".to_string(),
             entry: "main".to_string(),
             modules: vec!["main".to_string()],
@@ -3605,20 +3613,40 @@ fn e2e_hatch_rejects_native_lib_section() {
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
         },
-        sections: vec![Section {
-            kind: SectionKind::NativeLib,
-            name: "libdb".to_string(),
-            data: b"stub".to_vec(),
-        }],
+        sections: vec![
+            Section {
+                kind: SectionKind::Wlbc,
+                name: "main".to_string(),
+                data: main_wlbc,
+            },
+            Section {
+                kind: SectionKind::NativeLib,
+                name: "libdb".to_string(),
+                data: b"MACH-O-or-ELF-bytes-here".to_vec(),
+            },
+        ],
     };
     let bytes = emit(&hatch).expect("emit");
 
     let mut vm = VM::new_default();
     let result = vm.interpret_hatch(&bytes);
-    assert!(
-        matches!(result, InterpretResult::CompileError),
-        "hatch with native lib section should be refused in commit 3a"
-    );
+    assert!(matches!(result, InterpretResult::Success));
+
+    // The extraction dir must be the first entry in the search paths
+    // so bundled libs win over ambient OS search.
+    assert!(!vm.native_search_paths.is_empty());
+    let extract_dir = &vm.native_search_paths[0];
+    assert!(extract_dir.exists(), "extraction dir should live on disk");
+
+    // The section name must map directly to the extracted file so a
+    // matching `#!native = "libdb"` attribute finds it.
+    let path = vm
+        .native_lib_paths
+        .get("libdb")
+        .expect("libdb path registered");
+    assert!(path.exists(), "extracted lib file must exist");
+    let written = std::fs::read(path).expect("read back");
+    assert_eq!(written, b"MACH-O-or-ELF-bytes-here");
 }
 
 // ===========================================================================

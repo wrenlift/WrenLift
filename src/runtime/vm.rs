@@ -235,8 +235,15 @@ pub struct VM {
     /// Per-name overrides for `#!native = "key"`. A hit in this map
     /// wins over candidate-filename mangling: the loader uses the
     /// mapped path verbatim. Populated from a hatchfile's
-    /// `[native_libs]` section.
+    /// `[native_libs]` section and from `SectionKind::NativeLib`
+    /// entries extracted out of a `.hatch` bundle.
     pub native_lib_paths: std::collections::HashMap<String, std::path::PathBuf>,
+
+    /// Temp directories holding bundled native libs extracted from
+    /// `.hatch` `NativeLib` sections. Held so the directories (and the
+    /// `.dylib` / `.so` files inside) survive as long as the VM does.
+    /// Dropped automatically at VM teardown, which reclaims disk.
+    native_temp_dirs: Vec<tempfile::TempDir>,
 }
 
 impl VM {
@@ -306,6 +313,7 @@ impl VM {
             native_libs: Vec::new(),
             native_search_paths: Vec::new(),
             native_lib_paths: HashMap::new(),
+            native_temp_dirs: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -500,24 +508,80 @@ impl VM {
         }
     }
 
-    /// Shared body: install every `Wlbc` section named in
-    /// `manifest.modules`. Applies the manifest's native-library
-    /// declarations (`[native_libs]` overrides + `native_search_paths`)
-    /// so any `#!native` directive inside the hatch resolves against
-    /// them at class install time. `NativeLib` sections themselves are
-    /// still refused here — extraction lands in Phase 3c-ii.
-    fn install_hatch_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
+    /// Extract every `NativeLib` section to a per-hatch temp directory
+    /// and register the resulting paths in `native_lib_paths` so
+    /// `#!native = "<section name>"` resolves to the extracted file.
+    /// The temp directory is prepended to `native_search_paths` so
+    /// bare-name lookups without an explicit override also find the
+    /// bundled library. Returns `CompileError` on any I/O failure —
+    /// partial extraction would leave the hatch in an inconsistent
+    /// state.
+    fn extract_hatch_native_sections(
+        &mut self,
+        hatch: &crate::hatch::Hatch,
+    ) -> InterpretResult {
+        let has_native = hatch
+            .sections
+            .iter()
+            .any(|s| matches!(s.kind, crate::hatch::SectionKind::NativeLib));
+        if !has_native {
+            return InterpretResult::Success;
+        }
+
+        let temp_dir = match tempfile::Builder::new()
+            .prefix(&format!("wrenlift-{}-", hatch.manifest.name))
+            .tempdir()
+        {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("failed to create temp dir for bundled native libs: {}", e);
+                return InterpretResult::CompileError;
+            }
+        };
+        let dir_path = temp_dir.path().to_path_buf();
+
         for section in &hatch.sections {
-            if matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
+            if !matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
+                continue;
+            }
+            let filename =
+                crate::runtime::foreign::default_native_lib_filename(&section.name);
+            let full = dir_path.join(&filename);
+            if let Err(e) = std::fs::write(&full, &section.data) {
                 eprintln!(
-                    "hatch '{}' requires native library support (section '{}') — not yet implemented in this build",
-                    hatch.manifest.name, section.name
+                    "failed to write bundled native lib '{}' to {}: {}",
+                    section.name,
+                    full.display(),
+                    e
                 );
                 return InterpretResult::CompileError;
             }
+            // Per-name override wins over candidate mangling, so
+            // `#!native = "<section name>"` maps directly to the
+            // extracted file.
+            self.native_lib_paths.insert(section.name.clone(), full);
         }
 
+        // Prepend the extraction dir so bundled libs are reachable by
+        // bare name / candidate search even without an explicit
+        // override (e.g. a dependency referencing the same lib).
+        self.native_search_paths.insert(0, dir_path);
+        self.native_temp_dirs.push(temp_dir);
+        InterpretResult::Success
+    }
+
+    /// Shared body: install every `Wlbc` section named in
+    /// `manifest.modules`. Applies the manifest's native-library
+    /// declarations (`[native_libs]` overrides + `native_search_paths`)
+    /// and extracts any bundled `NativeLib` sections to a temp
+    /// directory so `#!native` directives inside the hatch resolve
+    /// against both sources at class install time.
+    fn install_hatch_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
         self.apply_hatch_native_manifest(&hatch.manifest);
+        let result = self.extract_hatch_native_sections(hatch);
+        if !matches!(result, InterpretResult::Success) {
+            return result;
+        }
 
         for module_name in &hatch.manifest.modules {
             // Skip modules already loaded (e.g. by a previously
