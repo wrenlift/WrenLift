@@ -24,6 +24,7 @@ dynasm = "2"
 wasm-encoder = "0.245"
 smallvec = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 toml = "0.8"
 toml_edit = "0.22"

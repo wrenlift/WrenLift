@@ -103,9 +103,33 @@ enum Command {
     /// Download + cache a single dependency without modifying the
     /// `hatchfile`. Planned — placeholder today.
     Get { name: String },
-    /// Publish the current workspace's hatch to a registry.
-    /// Planned — placeholder today.
-    Publish,
+    /// Register the current workspace's package with the hatch
+    /// catalog so others can `hatch find` and pin it. Requires a
+    /// prior `hatch login`.
+    Publish {
+        /// Workspace directory. Defaults to `.`.
+        #[arg(long = "dir", short = 'C', default_value = ".")]
+        dir: PathBuf,
+        /// Override the git URL written to the catalog. Defaults to
+        /// the workspace's `origin` remote.
+        #[arg(long = "git", value_name = "URL")]
+        git: Option<String>,
+    },
+    /// Look up a package by name and print where it's hosted. Read-
+    /// only — works without `hatch login`.
+    Find { name: String },
+    /// Authenticate against the hatch service. Full GitHub OAuth
+    /// device flow is landing in a follow-up; for now this command
+    /// accepts a pre-minted JWT via `--token`.
+    Login {
+        /// Store the supplied JWT directly instead of running the
+        /// interactive flow. Lets CI and early testers sign in
+        /// while the OAuth implementation is still in flight.
+        #[arg(long = "token", value_name = "JWT")]
+        token: Option<String>,
+    },
+    /// Drop the stored credentials file. Safe to run anytime.
+    Logout,
 }
 
 fn main() {
@@ -128,9 +152,10 @@ fn main() {
         Command::Get { name } => cmd_stub(&format!(
             "get {name} — needs the registry client to land first; see the README roadmap"
         )),
-        Command::Publish => cmd_stub(
-            "publish — needs the registry client + auth to land first; see the README roadmap",
-        ),
+        Command::Publish { dir, git } => cmd_publish(&dir, git.as_deref()),
+        Command::Find { name } => cmd_find(&name),
+        Command::Login { token } => cmd_login(token.as_deref()),
+        Command::Logout => cmd_logout(),
     }
 }
 
@@ -550,6 +575,170 @@ fn record_in_hatchfile(doc: &mut toml_edit::DocumentMut, name: &str, version: &s
         .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
     if let Some(tbl) = deps.as_table_like_mut() {
         tbl.insert(name, toml_edit::value(version));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// login / logout / find / publish
+// ---------------------------------------------------------------------------
+
+/// Store a JWT so subsequent `hatch publish` calls can authenticate.
+/// Full interactive GitHub OAuth device flow lands in a follow-up;
+/// for now we accept a token directly from `--token` so early
+/// adopters / CI jobs can exercise the pipeline.
+fn cmd_login(token: Option<&str>) {
+    let Some(jwt) = token else {
+        eprintln!(
+            "hatch: interactive login isn't wired yet. For now, pass the JWT directly:\n\
+             \n    hatch login --token <JWT>\n\n\
+             (full GitHub OAuth device flow is landing in a follow-up.)"
+        );
+        process::exit(2);
+    };
+
+    let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
+    let creds = wren_lift::hatch_service::Credentials {
+        access_token: jwt.to_string(),
+        refresh_token: None,
+        service_url: Some(cfg.url.clone()),
+    };
+    match wren_lift::hatch_service::save_credentials(&creds) {
+        Ok(path) => println!("logged in (credentials stored at {})", path.display()),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn cmd_logout() {
+    match wren_lift::hatch_service::clear_credentials() {
+        Ok(true) => println!("logged out"),
+        Ok(false) => println!("not logged in"),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn cmd_find(name: &str) {
+    let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
+    match wren_lift::hatch_service::find_package(&cfg, name) {
+        Ok(Some(rec)) => {
+            println!("{} — {}", rec.name, rec.git);
+            if let Some(desc) = rec.description.as_deref() {
+                if !desc.is_empty() {
+                    println!("  {}", desc);
+                }
+            }
+            if let Some(owner) = rec.owner.as_deref() {
+                println!("  owner: {}", owner);
+            }
+            // Suggest the exact hatchfile line so users don't have
+            // to hand-craft the inline-table form.
+            println!(
+                "\nTo use, add to your hatchfile:\n  [dependencies]\n  {} = {{ git = \"{}\", tag = \"<your tag>\" }}",
+                rec.name, rec.git,
+            );
+        }
+        Ok(None) => {
+            eprintln!("hatch: no package '{}' in the catalog", name);
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn cmd_publish(dir: &Path, git_override: Option<&str>) {
+    // Read the workspace's hatchfile for name + description.
+    let hatchfile_path = dir.join(HATCHFILE);
+    let text = match std::fs::read_to_string(&hatchfile_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "error: cannot read '{}': {} (run `hatch init` first?)",
+                hatchfile_path.display(),
+                e
+            );
+            process::exit(1);
+        }
+    };
+    let manifest: wren_lift::hatch::Manifest = match toml::from_str(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: cannot parse hatchfile: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Git URL: explicit --git wins; else probe the workspace's
+    // `origin` remote. If neither is available, the user hasn't
+    // committed anywhere yet and publishing would produce a
+    // dangling catalog entry.
+    let git = match git_override {
+        Some(g) => g.to_string(),
+        None => match detect_origin_remote(dir) {
+            Some(g) => g,
+            None => {
+                eprintln!(
+                    "error: workspace has no `origin` git remote and --git wasn't given.\n\
+                     Set one with `git remote add origin <URL>` and retry."
+                );
+                process::exit(1);
+            }
+        },
+    };
+
+    // Load credentials.
+    let creds = match wren_lift::hatch_service::load_credentials() {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            eprintln!("error: not logged in — run `hatch login` first");
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
+    let record = wren_lift::hatch_service::PackageRecord {
+        name: manifest.name.clone(),
+        git: git.clone(),
+        description: None,
+        owner: None, // server sets from JWT
+    };
+
+    match wren_lift::hatch_service::publish_package(&cfg, &creds, &record) {
+        Ok(()) => {
+            println!("published {} → {}", record.name, record.git);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+fn detect_origin_remote(dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
     }
 }
 
