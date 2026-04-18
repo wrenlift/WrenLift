@@ -587,21 +587,27 @@ fn record_in_hatchfile(doc: &mut toml_edit::DocumentMut, name: &str, version: &s
 /// for now we accept a token directly from `--token` so early
 /// adopters / CI jobs can exercise the pipeline.
 fn cmd_login(token: Option<&str>) {
-    let Some(jwt) = token else {
-        eprintln!(
-            "hatch: interactive login isn't wired yet. For now, pass the JWT directly:\n\
-             \n    hatch login --token <JWT>\n\n\
-             (full GitHub OAuth device flow is landing in a follow-up.)"
-        );
-        process::exit(2);
+    let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
+
+    let creds = match token {
+        Some(jwt) => {
+            // Escape hatch for CI / scripted flows: skip the browser
+            // dance entirely and trust a pre-minted token.
+            wren_lift::hatch_service::Credentials {
+                access_token: jwt.to_string(),
+                refresh_token: None,
+                service_url: Some(cfg.url.clone()),
+            }
+        }
+        None => match wren_lift::hatch_service::interactive_login(&cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
+            }
+        },
     };
 
-    let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
-    let creds = wren_lift::hatch_service::Credentials {
-        access_token: jwt.to_string(),
-        refresh_token: None,
-        service_url: Some(cfg.url.clone()),
-    };
     match wren_lift::hatch_service::save_credentials(&creds) {
         Ok(path) => println!("logged in (credentials stored at {})", path.display()),
         Err(e) => {

@@ -31,6 +31,8 @@ toml_edit = "0.22"
 zstd = "0.13"
 libloading = "0.8"
 tempfile = "3"
+sha2 = "0.10"
+rand = "0.9"
 cranelift-codegen = { version = "0.130", optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }

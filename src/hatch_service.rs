@@ -20,8 +20,13 @@
 //! lines up with how a typical user's environment already has curl +
 //! git on PATH.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
+
+use sha2::Digest;
 
 /// Supabase project URL for the hatch catalog. Override via
 /// `HATCH_SERVICE_URL` for tests, private mirrors, or forks.
@@ -248,6 +253,256 @@ pub fn publish_package(
 }
 
 // ---------------------------------------------------------------------------
+// Interactive login (GitHub OAuth via Supabase + PKCE)
+// ---------------------------------------------------------------------------
+//
+// CLI OAuth flow: CLI starts a one-shot HTTP listener on localhost,
+// opens a browser against Supabase's authorize endpoint with a PKCE
+// challenge, waits for Supabase to redirect back with an auth code,
+// then exchanges the code for access/refresh tokens. Entirely
+// self-contained — no `gh`, no pre-minted tokens, no manual copy-
+// paste. A timeout short-circuits stuck browsers so an abandoned
+// `hatch login` doesn't hang indefinitely.
+
+/// Default maximum time we'll wait for the browser redirect before
+/// giving up. User can Ctrl-C sooner.
+const LOGIN_TIMEOUT_SECS: u64 = 180;
+
+/// Run the full interactive login. Blocks until the user completes
+/// (or abandons) the browser flow. Returns the stored credentials on
+/// success. The listener port is chosen by the OS — whatever it
+/// picks gets plugged into `redirect_to` and the Supabase GitHub
+/// OAuth app must have `http://localhost:*` on its allowed redirect
+/// list (Supabase treats `http://localhost` loopback specially and
+/// permits any port).
+pub fn interactive_login(config: &ServiceConfig) -> Result<Credentials, ServiceError> {
+    if !config.is_configured() {
+        return Err(ServiceError::NotConfigured);
+    }
+
+    let verifier = gen_pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(ServiceError::Io)?;
+    let port = listener.local_addr().map_err(ServiceError::Io)?.port();
+    let redirect = format!("http://localhost:{}/callback", port);
+
+    let auth_url = format!(
+        "{}/auth/v1/authorize?provider=github&flow_type=pkce&redirect_to={}&code_challenge={}&code_challenge_method=s256",
+        config.url.trim_end_matches('/'),
+        urlencode(&redirect),
+        challenge,
+    );
+
+    eprintln!("opening browser for GitHub authorization…");
+    eprintln!("if it doesn't open, visit:\n  {}", auth_url);
+    let _ = open_in_browser(&auth_url);
+
+    let code = accept_callback(&listener, Duration::from_secs(LOGIN_TIMEOUT_SECS))?;
+
+    // Exchange the auth code for tokens.
+    let body = format!(
+        "{{\"auth_code\":\"{}\",\"code_verifier\":\"{}\"}}",
+        code, verifier
+    );
+    let url = format!(
+        "{}/auth/v1/token?grant_type=pkce",
+        config.url.trim_end_matches('/')
+    );
+    let resp = curl_post(
+        &url,
+        &[
+            &format!("apikey: {}", config.anon_key),
+            "Content-Type: application/json",
+        ],
+        &body,
+    )?;
+
+    let tokens: TokenResponse = serde_json::from_str(&resp)
+        .map_err(|e| ServiceError::Decode(format!("token response: {}", e)))?;
+    Ok(Credentials {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        service_url: Some(config.url.clone()),
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+/// Generate a PKCE code verifier — 96 random bytes encoded
+/// base64url, yielding a 128-char string. Well above the 43-char
+/// RFC 7636 minimum.
+fn gen_pkce_verifier() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 96];
+    rand::rng().fill_bytes(&mut bytes);
+    base64url_encode(&bytes)
+}
+
+/// PKCE S256 challenge: SHA-256 of the verifier, base64url-encoded
+/// without padding (RFC 7636 §4.2).
+pub(crate) fn pkce_challenge(verifier: &str) -> String {
+    let hash = sha2::Sha256::digest(verifier.as_bytes());
+    base64url_encode(&hash)
+}
+
+/// Base64url without padding — RFC 7636 / 4648. Tiny hand-rolled
+/// impl to avoid pulling in the `base64` crate for 20 lines of
+/// output.
+pub(crate) fn base64url_encode(input: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHA[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHA[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHA[((n >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHA[(n & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Accept one HTTP request on `listener`, extract `?code=<CODE>`
+/// from the request line, respond with a friendly "you can close
+/// this tab" page, and return the code. Bounded by `timeout` so a
+/// user who never completes the browser flow doesn't leave the CLI
+/// wedged.
+fn accept_callback(listener: &TcpListener, timeout: Duration) -> Result<String, ServiceError> {
+    listener.set_nonblocking(true).map_err(ServiceError::Io)?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(s) => break s,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ServiceError::Decode(
+                        "timed out waiting for browser redirect".to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(ServiceError::Io(e)),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(ServiceError::Io)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(ServiceError::Io)?;
+
+    // Read until we see the end of headers. A 2KB cap covers any
+    // reasonable GET + a few hundred bytes of headers; OAuth
+    // redirects don't carry bodies.
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).map_err(ServiceError::Io)?;
+    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+
+    let code = extract_code_from_request(&req)
+        .ok_or_else(|| ServiceError::Decode("callback missing `code` query param".to_string()))?;
+
+    let html = b"<!doctype html><html><head><meta charset=utf-8><title>hatch login</title></head>\
+        <body style='font-family:system-ui;text-align:center;padding-top:4rem'>\
+        <h2>You're signed in to hatch.</h2>\
+        <p>Return to your terminal - you can close this tab.</p>\
+        </body></html>";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        html.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(html);
+    let _ = stream.flush();
+
+    Ok(code)
+}
+
+/// Pull the `code` query param out of a raw HTTP request. Exposed
+/// for unit tests.
+pub(crate) fn extract_code_from_request(req: &str) -> Option<String> {
+    let first = req.lines().next()?;
+    let path = first.split_whitespace().nth(1)?;
+    let (_, query) = path.split_once('?')?;
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k == "code" {
+                return Some(urldecode(v));
+            }
+        }
+    }
+    None
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) =
+                (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+            {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/c", "start", "", url]);
+        c
+    };
+    cmd.spawn()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // curl plumbing
 // ---------------------------------------------------------------------------
 
@@ -401,6 +656,56 @@ mod tests {
         }"#;
         let r: PackageRecord = serde_json::from_str(json).unwrap();
         assert_eq!(r.owner.as_deref(), Some("01234567-89ab-cdef-0123-456789abcdef"));
+    }
+
+    #[test]
+    fn base64url_encodes_rfc_vectors() {
+        // RFC 4648 test vectors (no padding).
+        assert_eq!(base64url_encode(b""), "");
+        assert_eq!(base64url_encode(b"f"), "Zg");
+        assert_eq!(base64url_encode(b"fo"), "Zm8");
+        assert_eq!(base64url_encode(b"foo"), "Zm9v");
+        assert_eq!(base64url_encode(b"foob"), "Zm9vYg");
+        assert_eq!(base64url_encode(b"fooba"), "Zm9vYmE");
+        assert_eq!(base64url_encode(b"foobar"), "Zm9vYmFy");
+        // `-` and `_` instead of `+` and `/`.
+        let with_plus_slash = [0xfb, 0xff, 0xbf];
+        let out = base64url_encode(&with_plus_slash);
+        assert!(!out.contains('+'));
+        assert!(!out.contains('/'));
+        assert!(!out.contains('='));
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc_7636_appendix_b() {
+        // From RFC 7636 Appendix B — canonical PKCE vector.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn extract_code_handles_happy_path_and_reorderings() {
+        // Standard callback from Supabase.
+        let req = "GET /callback?code=abc123&state=xyz HTTP/1.1\r\nHost: localhost:51234\r\n\r\n";
+        assert_eq!(extract_code_from_request(req).as_deref(), Some("abc123"));
+        // Order-independent.
+        let req = "GET /callback?state=xyz&code=abc123 HTTP/1.1\r\n\r\n";
+        assert_eq!(extract_code_from_request(req).as_deref(), Some("abc123"));
+        // URL-encoded payload decodes.
+        let req = "GET /callback?code=a%20b HTTP/1.1\r\n\r\n";
+        assert_eq!(extract_code_from_request(req).as_deref(), Some("a b"));
+    }
+
+    #[test]
+    fn extract_code_none_when_missing() {
+        let req = "GET /callback?state=xyz HTTP/1.1\r\n\r\n";
+        assert_eq!(extract_code_from_request(req), None);
+        // Not a callback path at all.
+        let req = "GET /favicon.ico HTTP/1.1\r\n\r\n";
+        assert_eq!(extract_code_from_request(req), None);
     }
 
     #[test]
