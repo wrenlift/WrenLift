@@ -299,6 +299,20 @@ fn cmd_inspect(path: &Path) {
                     Some(v) => println!("    {} = {{ path = \"{}\", version = \"{}\" }}", name, path, v),
                     None => println!("    {} = {{ path = \"{}\" }}", name, path),
                 },
+                wren_lift::hatch::Dependency::Git {
+                    git,
+                    tag,
+                    rev,
+                    branch,
+                } => {
+                    let r = tag
+                        .as_deref()
+                        .map(|t| format!("tag = \"{}\"", t))
+                        .or_else(|| rev.as_deref().map(|r| format!("rev = \"{}\"", r)))
+                        .or_else(|| branch.as_deref().map(|b| format!("branch = \"{}\"", b)))
+                        .unwrap_or_else(|| "ref = <none>".to_string());
+                    println!("    {} = {{ git = \"{}\", {} }}", name, git, r);
+                }
             }
         }
     }
@@ -344,10 +358,32 @@ fn cmd_install(dir: &Path, package: Option<&str>) {
     };
 
     let registry = wren_lift::hatch_registry::registry_url();
+    let cache_dir = match wren_lift::hatch_registry::cache_root() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    };
 
     match package {
         Some(spec) => {
             let (name, version) = wren_lift::hatch_registry::split_name_version(spec);
+            if let Some(entry) = doc
+                .get("dependencies")
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(|t| t.get(name))
+            {
+                if let Some(spec) = extract_git_spec(entry) {
+                    // Git-hosted dep: ignore any `@version` the user
+                    // typed and use the declared ref. Downgrading
+                    // pinned commits via CLI would be surprising.
+                    install_git(&cache_dir, name, &spec);
+                    println!("installed {} from {}", name, spec.git);
+                    return;
+                }
+            }
+
             let resolved_version = match version {
                 Some(v) => v.to_string(),
                 None => match declared_version(&doc, name) {
@@ -361,7 +397,7 @@ fn cmd_install(dir: &Path, package: Option<&str>) {
                 },
             };
 
-            install_one(&registry, name, &resolved_version);
+            install_one(&cache_dir, &registry, name, &resolved_version);
             record_in_hatchfile(&mut doc, name, &resolved_version);
 
             if let Err(e) = std::fs::write(&hatchfile_path, doc.to_string()) {
@@ -375,7 +411,10 @@ fn cmd_install(dir: &Path, package: Option<&str>) {
             println!("installed {}@{}", name, resolved_version);
         }
         None => {
-            // Resolve every pinned-version entry already in [dependencies].
+            // Resolve every entry already in [dependencies]: version-
+            // pinned ones hit the release cache, git-hosted ones get
+            // shallow-cloned. Path deps need nothing — `hatch build`
+            // reads them from the filesystem directly.
             let Some(deps) = doc
                 .get("dependencies")
                 .and_then(toml_edit::Item::as_table_like)
@@ -383,26 +422,33 @@ fn cmd_install(dir: &Path, package: Option<&str>) {
                 println!("no [dependencies] to install");
                 return;
             };
-            let mut to_install: Vec<(String, String)> = Vec::new();
+            let mut registry_installs: Vec<(String, String)> = Vec::new();
+            let mut git_installs: Vec<(String, GitSpec)> = Vec::new();
             for (name, item) in deps.iter() {
-                if let Some(version) = extract_version(item) {
-                    to_install.push((name.to_string(), version));
+                if let Some(spec) = extract_git_spec(item) {
+                    git_installs.push((name.to_string(), spec));
+                } else if let Some(version) = extract_version(item) {
+                    registry_installs.push((name.to_string(), version));
                 }
             }
-            if to_install.is_empty() {
-                println!("nothing to install (no version-pinned dependencies)");
+            if registry_installs.is_empty() && git_installs.is_empty() {
+                println!("nothing to install (no version-pinned or git dependencies)");
                 return;
             }
-            for (name, version) in &to_install {
-                install_one(&registry, name, version);
+            for (name, version) in &registry_installs {
+                install_one(&cache_dir, &registry, name, version);
                 println!("installed {}@{}", name, version);
+            }
+            for (name, spec) in &git_installs {
+                install_git(&cache_dir, name, spec);
+                println!("installed {} from {}", name, spec.git);
             }
         }
     }
 }
 
-fn install_one(registry: &str, name: &str, version: &str) {
-    match wren_lift::hatch_registry::ensure_in_cache(registry, name, version) {
+fn install_one(cache_dir: &Path, registry: &str, name: &str, version: &str) {
+    match wren_lift::hatch_registry::ensure_in_cache_dir(cache_dir, registry, name, version) {
         Ok(path) => {
             eprintln!("  cached at {}", path.display());
         }
@@ -416,6 +462,61 @@ fn install_one(registry: &str, name: &str, version: &str) {
             process::exit(1);
         }
     }
+}
+
+fn install_git(cache_dir: &Path, name: &str, spec: &GitSpec) {
+    let git_ref = match spec.git_ref() {
+        Some(r) => r,
+        None => {
+            eprintln!(
+                "error: git dependency `{name}` needs one of `tag`, `rev`, or `branch`"
+            );
+            process::exit(1);
+        }
+    };
+    match wren_lift::hatch_registry::ensure_git_checkout(cache_dir, &spec.git, git_ref) {
+        Ok(path) => {
+            eprintln!("  cached at {}", path.display());
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+/// Minimal owned copy of a `[dependencies.<name>]` git table — keeps
+/// the install path decoupled from toml_edit's borrow lifetimes.
+struct GitSpec {
+    git: String,
+    tag: Option<String>,
+    rev: Option<String>,
+    branch: Option<String>,
+}
+
+impl GitSpec {
+    fn git_ref(&self) -> Option<wren_lift::hatch::GitRef<'_>> {
+        if let Some(r) = self.rev.as_deref() {
+            Some(wren_lift::hatch::GitRef::Rev(r))
+        } else if let Some(t) = self.tag.as_deref() {
+            Some(wren_lift::hatch::GitRef::Tag(t))
+        } else {
+            self.branch
+                .as_deref()
+                .map(wren_lift::hatch::GitRef::Branch)
+        }
+    }
+}
+
+fn extract_git_spec(item: &toml_edit::Item) -> Option<GitSpec> {
+    let tbl = item.as_table_like()?;
+    let git = tbl.get("git")?.as_str()?.to_string();
+    Some(GitSpec {
+        git,
+        tag: tbl.get("tag").and_then(|i| i.as_str()).map(str::to_string),
+        rev: tbl.get("rev").and_then(|i| i.as_str()).map(str::to_string),
+        branch: tbl.get("branch").and_then(|i| i.as_str()).map(str::to_string),
+    })
 }
 
 /// Read the declared version of `name` (if any) out of the hatchfile

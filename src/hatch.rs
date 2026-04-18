@@ -137,19 +137,29 @@ pub struct Manifest {
     pub native_search_paths: Vec<String>,
 }
 
-/// Shape of a `[dependencies.<name>]` entry. Accepts a bare version
-/// string (advisory — no registry resolution today) or an inline
-/// table pointing at another workspace directory via `path`:
+/// Shape of a `[dependencies.<name>]` entry. Four shapes, in rising
+/// order of specificity:
 ///
 /// ```toml
 /// [dependencies]
-/// json       = "1.0"                          # advisory version
-/// libcounter = { path = "../libcounter" }     # bundled at build
+/// json     = "1.0.0"                                        # official registry
+/// counter  = { path = "../counter" }                        # workspace sibling
+/// mylib    = { git = "https://github.com/alice/mylib.git",  # self-hosted git
+///              tag = "v0.3.0" }
+/// otherlib = { git = "https://github.com/bob/otherlib.git",
+///              rev = "deadbeef..." }
 /// ```
+///
+/// Published packages take two routes: contributors either open a PR
+/// against the official registry monorepo (which builds + releases a
+/// `.hatch` on tag push) and consumers pin by version, or they host
+/// a package in their own git repo and consumers pin by tag / rev /
+/// branch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum Dependency {
-    /// `name = "1.2.3"` — advisory-only until a registry lands.
+    /// `name = "1.2.3"` — resolved through the registry release
+    /// artifact cache populated by `hatch install`.
     Version(String),
     /// `name = { path = "../sibling" }` — workspace-relative path
     /// resolved at `hatch build`, recursively built, and its sections
@@ -159,13 +169,78 @@ pub enum Dependency {
         #[serde(default)]
         version: Option<String>,
     },
+    /// `name = { git = "...", tag/rev/branch = "..." }` — self-hosted
+    /// package. `hatch install` shallow-clones the repo at the given
+    /// ref into the git cache; `hatch build` reads the checkout like
+    /// a path dep.
+    Git {
+        git: String,
+        #[serde(default)]
+        tag: Option<String>,
+        #[serde(default)]
+        rev: Option<String>,
+        #[serde(default)]
+        branch: Option<String>,
+    },
 }
 
 impl Dependency {
     pub fn path(&self) -> Option<&str> {
         match self {
             Dependency::Path { path, .. } => Some(path.as_str()),
-            Dependency::Version(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Pick the single git ref the user declared, enforcing the "only
+    /// one of tag / rev / branch" invariant. Returns the stringified
+    /// ref plus a label suitable for the cache-directory name.
+    pub fn git_ref(&self) -> Option<GitRef<'_>> {
+        match self {
+            Dependency::Git {
+                tag, rev, branch, ..
+            } => {
+                // Prefer the most specific form if multiple set (rev
+                // pins harder than tag, tag harder than branch), but
+                // publishers really shouldn't list more than one.
+                if let Some(r) = rev.as_deref() {
+                    Some(GitRef::Rev(r))
+                } else if let Some(t) = tag.as_deref() {
+                    Some(GitRef::Tag(t))
+                } else {
+                    branch.as_deref().map(GitRef::Branch)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A checkout target inside a git-hosted dependency. Variants differ
+/// in how much the cache dedupes: tags + revs are immutable, branches
+/// aren't (could be refreshed with a future `hatch install --update`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitRef<'a> {
+    Tag(&'a str),
+    Rev(&'a str),
+    Branch(&'a str),
+}
+
+impl GitRef<'_> {
+    pub fn as_str(&self) -> &str {
+        match self {
+            GitRef::Tag(s) | GitRef::Rev(s) | GitRef::Branch(s) => s,
+        }
+    }
+
+    /// Short label that goes into cache paths — keeps rev / tag /
+    /// branch namespaces separate so a branch named `v1` can coexist
+    /// with a tag named `v1`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            GitRef::Tag(_) => "tag",
+            GitRef::Rev(_) => "rev",
+            GitRef::Branch(_) => "branch",
         }
     }
 }
@@ -667,6 +742,38 @@ fn merge_path_dependencies(
                     )));
                 }
                 std::fs::read(&cached)?
+            }
+            Dependency::Git { git, .. } => {
+                let git_ref = dep.git_ref().ok_or_else(|| {
+                    HatchError::Encode(format!(
+                        "git dependency '{}' must specify one of tag / rev / branch",
+                        dep_name
+                    ))
+                })?;
+                let cache_base = match cache_dir {
+                    Some(p) => p.to_path_buf(),
+                    None => crate::hatch_registry::cache_root()
+                        .map_err(|e| HatchError::Encode(e.to_string()))?,
+                };
+                let checkout =
+                    crate::hatch_registry::cached_git_checkout_path(&cache_base, git, git_ref);
+                if !checkout.exists() {
+                    return Err(HatchError::Encode(format!(
+                        "git dependency '{}' ({} @ {}) isn't cached. Run `hatch install {}` first.",
+                        dep_name,
+                        git,
+                        git_ref.as_str(),
+                        dep_name
+                    )));
+                }
+                // Treat the cached checkout like any path dep:
+                // recursively build so transitive deps resolve too.
+                build_recursive(&checkout, visited, cache_dir).map_err(|e| {
+                    HatchError::Encode(format!(
+                        "failed to build git dependency '{}': {}",
+                        dep_name, e
+                    ))
+                })?
             }
         };
         let dep_hatch = load(&dep_bytes)?;
@@ -1190,6 +1297,107 @@ libgreet = "0.1.0"
             crate::runtime::engine::InterpretResult::Success
         ));
         assert_eq!(vm.take_output().trim(), "hi");
+    }
+
+    #[test]
+    fn build_resolves_git_deps_from_cache() {
+        // End-to-end: pre-populate the git cache with a checked-out
+        // workspace, declare the dep in the consumer's hatchfile, and
+        // make sure `hatch build` folds the dep's modules in and the
+        // whole thing runs.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let cache_dir = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // The git-dep checkout path — `hatch install` would have
+        // populated this by shallow-cloning the remote. We fake it
+        // directly so the test doesn't spawn git.
+        let git_url = "https://example.invalid/alice/mylib.git";
+        let checkout = crate::hatch_registry::cached_git_checkout_path(
+            &cache_dir,
+            git_url,
+            GitRef::Tag("v1.2.3"),
+        );
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join("hatchfile"),
+            "name = \"mylib\"\nversion = \"1.2.3\"\nentry = \"mylib\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join("mylib.wren"),
+            "class MyLib {\n  static answer { 42 }\n}",
+        )
+        .unwrap();
+
+        // Consumer workspace pins the git dep.
+        let app = scratch.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("main.wren"),
+            "import \"mylib\" for MyLib\nSystem.print(MyLib.answer)",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("hatchfile"),
+            format!(
+                r#"name = "app"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+mylib = {{ git = "{}", tag = "v1.2.3" }}
+"#,
+                git_url
+            ),
+        )
+        .unwrap();
+
+        let bytes = build_from_source_tree_with_cache(&app, Some(&cache_dir)).expect("build");
+
+        let hatch = load(&bytes).unwrap();
+        assert_eq!(hatch.manifest.modules, vec!["mylib", "main"]);
+        assert!(!hatch.manifest.dependencies.contains_key("mylib"));
+
+        let mut vm = crate::runtime::vm::VM::new_default();
+        vm.output_buffer = Some(String::new());
+        assert!(matches!(
+            vm.interpret_hatch(&bytes),
+            crate::runtime::engine::InterpretResult::Success
+        ));
+        assert_eq!(vm.take_output().trim(), "42");
+    }
+
+    #[test]
+    fn build_reports_missing_cached_git_dep() {
+        // A git dep with no prior `hatch install` must surface a
+        // pointed error — no silent network I/O during build.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let cache_dir = scratch.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let workspace = scratch.path().join("app");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("main.wren"), "1").unwrap();
+        std::fs::write(
+            workspace.join("hatchfile"),
+            r#"name = "app"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+mylib = { git = "https://example.invalid/alice/mylib.git", tag = "v0.1.0" }
+"#,
+        )
+        .unwrap();
+
+        let result = build_from_source_tree_with_cache(&workspace, Some(&cache_dir));
+        match result {
+            Err(HatchError::Encode(msg)) => {
+                assert!(msg.contains("mylib"));
+                assert!(msg.contains("hatch install"));
+            }
+            other => panic!("expected install hint, got {:?}", other),
+        }
     }
 
     #[test]

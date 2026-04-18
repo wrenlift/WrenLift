@@ -49,10 +49,12 @@ pub const DEFAULT_REGISTRY_URL: &str = "https://github.com/wrenlift/hatch";
 #[derive(Debug)]
 pub enum RegistryError {
     CurlFailed { code: Option<i32>, stderr: String },
+    GitFailed { code: Option<i32>, stderr: String },
     Io(std::io::Error),
     NoHome,
     BadArtifact { path: PathBuf, reason: String },
     NoCurl,
+    NoGit,
 }
 
 impl std::fmt::Display for RegistryError {
@@ -61,6 +63,10 @@ impl std::fmt::Display for RegistryError {
             RegistryError::CurlFailed { code, stderr } => {
                 let c = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
                 write!(f, "curl exited with {}: {}", c, stderr.trim())
+            }
+            RegistryError::GitFailed { code, stderr } => {
+                let c = code.map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+                write!(f, "git exited with {}: {}", c, stderr.trim())
             }
             RegistryError::Io(e) => write!(f, "io error: {}", e),
             RegistryError::NoHome => write!(
@@ -76,6 +82,10 @@ impl std::fmt::Display for RegistryError {
             RegistryError::NoCurl => write!(
                 f,
                 "`curl` is required to fetch from the registry but wasn't found on PATH"
+            ),
+            RegistryError::NoGit => write!(
+                f,
+                "`git` is required to resolve git-hosted dependencies but wasn't found on PATH"
             ),
         }
     }
@@ -178,6 +188,134 @@ pub fn split_name_version(spec: &str) -> (&str, Option<&str>) {
         Some((n, v)) => (n, Some(v)),
         None => (spec, None),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Git-hosted packages
+// ---------------------------------------------------------------------------
+//
+// Separate code path from the release-artifact flow: each git
+// dependency lives in its own repo, so there's no "don't clone the
+// whole monorepo" concern. A plain shallow clone at the requested ref
+// is fine and keeps each dependency one self-contained checkout.
+
+/// Checkout path a git dep would land at inside the cache. Doesn't
+/// check that it exists — callers do that after `ensure_git_checkout`.
+/// Structured as `<cache>/git/<sanitized-url>/<kind>/<ref>/` so a
+/// branch named `v1` and a tag named `v1` can coexist without
+/// collision.
+pub fn cached_git_checkout_path(
+    cache_dir: &std::path::Path,
+    git_url: &str,
+    git_ref: crate::hatch::GitRef<'_>,
+) -> PathBuf {
+    cache_dir
+        .join("git")
+        .join(sanitize_url_for_path(git_url))
+        .join(git_ref.kind())
+        .join(sanitize_ref_for_path(git_ref.as_str()))
+}
+
+/// Shallow-clone (or re-fetch) `git_url` at `git_ref` into the git
+/// cache. Tags and revs are immutable — a cached checkout is reused
+/// verbatim. Branches refetch on every call so a subsequent `hatch
+/// install` can pick up upstream updates; pinned deps don't pay that
+/// cost.
+pub fn ensure_git_checkout(
+    cache_dir: &std::path::Path,
+    git_url: &str,
+    git_ref: crate::hatch::GitRef<'_>,
+) -> Result<PathBuf, RegistryError> {
+    let checkout = cached_git_checkout_path(cache_dir, git_url, git_ref);
+
+    let is_branch = matches!(git_ref, crate::hatch::GitRef::Branch(_));
+    let already_has_hatchfile = checkout.join("hatchfile").exists();
+    if already_has_hatchfile && !is_branch {
+        return Ok(checkout);
+    }
+
+    if let Some(parent) = checkout.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !checkout.exists() {
+        std::fs::create_dir_all(&checkout)?;
+        run_git(Some(&checkout), &["init", "-q"])?;
+        run_git(Some(&checkout), &["remote", "add", "origin", git_url])?;
+    }
+
+    // `git fetch --depth 1 origin <ref>` works uniformly for tags,
+    // branch heads, and (on servers that allow it — GitHub, GitLab)
+    // specific commits. Falls back to a plain clone + checkout if the
+    // one-liner errors out.
+    let fetch = run_git(
+        Some(&checkout),
+        &["fetch", "--depth", "1", "origin", git_ref.as_str()],
+    );
+    if fetch.is_err() {
+        // Retry without depth in case the remote rejected the
+        // shallow fetch for this ref (e.g. servers without
+        // allowAnySHA1InWant for raw revs).
+        run_git(
+            Some(&checkout),
+            &["fetch", "origin", git_ref.as_str()],
+        )?;
+    }
+    run_git(Some(&checkout), &["checkout", "-q", "FETCH_HEAD", "--"])?;
+
+    if !checkout.join("hatchfile").exists() {
+        return Err(RegistryError::BadArtifact {
+            path: checkout,
+            reason: format!(
+                "git ref '{}' on '{}' contains no hatchfile",
+                git_ref.as_str(),
+                git_url
+            ),
+        });
+    }
+    Ok(checkout)
+}
+
+fn run_git(
+    cwd: Option<&std::path::Path>,
+    args: &[&str],
+) -> Result<(), RegistryError> {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RegistryError::NoGit);
+        }
+        Err(e) => return Err(RegistryError::Io(e)),
+    };
+    if !output.status.success() {
+        return Err(RegistryError::GitFailed {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Flatten a git URL into a single directory name. Different URLs
+/// produce different sanitized strings in practice — separators
+/// (`/`, `:`, `.`, `?`, etc.) collapse to `_`.
+fn sanitize_url_for_path(url: &str) -> String {
+    url.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// Refs can contain `/` (branch `release/1.x`) or other characters
+/// we can't drop on disk unchanged; flatten them the same way.
+fn sanitize_ref_for_path(git_ref: &str) -> String {
+    sanitize_url_for_path(git_ref)
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +446,74 @@ mod tests {
         std::fs::remove_file(asset_dir.join("json-1.0.0.hatch")).unwrap();
         let again = ensure_in_cache_dir(&cache_dir, &url, "json", "1.0.0").expect("cache hit");
         assert_eq!(again, cached);
+    }
+
+    /// Drive `ensure_git_checkout` against a local bare-ish git
+    /// fixture. Verifies tags resolve via shallow fetch and that a
+    /// second call is a cache hit (tags are immutable, so we don't
+    /// refetch).
+    #[test]
+    fn ensure_git_checkout_clones_tag_and_is_cache_idempotent() {
+        // Skip if git or curl are missing (we only need git here,
+        // but consistent guard style).
+        if Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let scratch = tempfile::tempdir().expect("tempdir");
+
+        // Build a real git repo at scratch/upstream with a hatchfile
+        // and a tagged commit.
+        let upstream = scratch.path().join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(
+            upstream.join("hatchfile"),
+            "name = \"mylib\"\nversion = \"0.3.0\"\nentry = \"mylib\"\n",
+        )
+        .unwrap();
+        std::fs::write(upstream.join("mylib.wren"), "1").unwrap();
+        let _ = run_git(Some(&upstream), &["init", "-q", "-b", "main"]);
+        let _ = run_git(
+            Some(&upstream),
+            &["-c", "user.email=t@t", "-c", "user.name=t", "add", "."],
+        );
+        let _ = run_git(
+            Some(&upstream),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--no-gpg-sign",
+                "-m",
+                "first",
+            ],
+        );
+        // Tag the first commit so the shallow fetch has something
+        // stable to pull.
+        let _ = run_git(Some(&upstream), &["tag", "v0.3.0"]);
+
+        let cache_dir = scratch.path().join("cache");
+        let url = upstream.to_string_lossy().into_owned();
+
+        let ref_ = crate::hatch::GitRef::Tag("v0.3.0");
+        let first = ensure_git_checkout(&cache_dir, &url, ref_).expect("checkout");
+        assert!(first.join("hatchfile").exists());
+        assert!(first.join("mylib.wren").exists());
+
+        // Second call: must not re-fetch. Delete upstream to prove
+        // we're hitting the cache (tags are immutable — no reason to
+        // refresh).
+        std::fs::remove_dir_all(&upstream).unwrap();
+        let second = ensure_git_checkout(&cache_dir, &url, ref_).expect("cache hit");
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -523,6 +523,20 @@ fn inspect_hatch(bytes: &[u8]) {
                     ),
                     None => println!("    {} = {{ path = \"{}\" }}", name, path),
                 },
+                wren_lift::hatch::Dependency::Git {
+                    git,
+                    tag,
+                    rev,
+                    branch,
+                } => {
+                    let r = tag
+                        .as_deref()
+                        .map(|t| format!("tag = \"{}\"", t))
+                        .or_else(|| rev.as_deref().map(|r| format!("rev = \"{}\"", r)))
+                        .or_else(|| branch.as_deref().map(|b| format!("branch = \"{}\"", b)))
+                        .unwrap_or_else(|| "ref = <none>".to_string());
+                    println!("    {} = {{ git = \"{}\", {} }}", name, git, r);
+                }
             }
         }
     }
