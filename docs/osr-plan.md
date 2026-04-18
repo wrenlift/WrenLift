@@ -198,15 +198,16 @@ Implemented so far:
   `dispatch_call`, IC attempts/hits, resolved-method dispatch, closure fallback,
   and JIT context save/restore pairs. This confirmed that `method_call` was
   spending its time in full resolved-method dispatch, not in successful IC hits.
-- Trivial getters are classified once at function registration, copied onto
-  `ObjFn`, and served directly from resolved `Method::Closure` dispatch. This
-  avoids the temp-fiber / context-save path for getter calls while leaving the
-  crashy packed-IC path disabled by default.
-- Current spot checks (2026-04-18, after resolved trivial-getter fast path):
+- Trivial getters and setters are classified once at function registration,
+  copied onto `ObjFn`, and served directly from resolved `Method::Closure`
+  dispatch. This avoids the temp-fiber / context-save path for simple field
+  accessors while leaving the crashy packed-IC path disabled by default.
+- Current spot checks (2026-04-18, after resolved trivial getter/setter fast
+  paths):
   - `bench/fib.wren --mode tiered`: about 0.008s
-  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.23s
+  - `bench/delta_blue.wren --mode tiered`: `14065400`, about 0.22s
   - `bench/binary_trees.wren --mode tiered`: about 0.84s
-  - `bench/method_call.wren --mode tiered`: about 0.12s
+  - `bench/method_call.wren --mode tiered`: about 0.10s
 - Nested OSR does not move these benchmarks on its own: the inner methods in
   `delta_blue` back-edge too few times per call to reach the tier-up
   threshold, so opening the `jit_depth > 0` gate unlocks a capability without

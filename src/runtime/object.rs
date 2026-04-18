@@ -571,6 +571,8 @@ pub struct ObjFn {
     pub fn_id: u32,
     /// Cached field index for trivial getters, or u16::MAX when not a getter.
     pub trivial_getter_field: u16,
+    /// Cached field index for trivial setters, or u16::MAX when not a setter.
+    pub trivial_setter_field: u16,
 }
 
 impl ObjFn {
@@ -582,6 +584,7 @@ impl ObjFn {
             upvalue_count,
             fn_id,
             trivial_getter_field: u16::MAX,
+            trivial_setter_field: u16::MAX,
         }
     }
 }

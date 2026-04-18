@@ -2574,6 +2574,13 @@ fn run_fiber_with_stop_depth(
                             .copied()
                             .flatten()
                             .unwrap_or(u16::MAX);
+                        (*fn_ptr).trivial_setter_field = vm
+                            .engine
+                            .trivial_setter_fields
+                            .get(fn_id as usize)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(u16::MAX);
                     }
                     let closure_ptr = vm.gc.alloc_closure(fn_ptr);
                     unsafe {

@@ -159,6 +159,7 @@ pub struct RuntimeCallStats {
     pub dispatch_method_closure: u64,
     pub dispatch_method_constructor: u64,
     pub dispatch_method_trivial_getter: u64,
+    pub dispatch_method_trivial_setter: u64,
     pub call_closure_entries: u64,
     pub call_closure_native_candidates: u64,
     pub call_closure_native_entries: u64,
@@ -403,6 +404,8 @@ pub struct ExecutionEngine {
     pub runtime_call_stats: RuntimeCallStats,
     /// Cached field index for trivial getters of the form `{ _field }`.
     pub trivial_getter_fields: Vec<Option<u16>>,
+    /// Cached field index for trivial setters of the form `{ _field = value }`.
+    pub trivial_setter_fields: Vec<Option<u16>>,
     /// Baseline native code pointers indexed by FuncId.
     pub baseline_code: Vec<*const u8>,
     /// Baseline native OSR entry points indexed by FuncId.
@@ -486,6 +489,7 @@ impl ExecutionEngine {
             tier_stats: Vec::new(),
             runtime_call_stats: RuntimeCallStats::default(),
             trivial_getter_fields: Vec::new(),
+            trivial_setter_fields: Vec::new(),
             baseline_code: Vec::new(),
             baseline_osr_entries: Vec::new(),
             baseline_leaf: Vec::new(),
@@ -505,6 +509,7 @@ impl ExecutionEngine {
     pub fn register_function(&mut self, mir: MirFunction) -> FuncId {
         let id = FuncId(self.functions.len() as u32);
         let trivial_getter = Self::mir_trivial_getter_field(&mir);
+        let trivial_setter = Self::mir_trivial_setter_field(&mir);
         self.functions.push(FuncBody::Interpreted {
             mir: Arc::new(mir),
             bytecode: None,
@@ -518,6 +523,7 @@ impl ExecutionEngine {
         self.tier_states.push(TierState::Interpreted);
         self.tier_stats.push(FuncTierStats::default());
         self.trivial_getter_fields.push(trivial_getter);
+        self.trivial_setter_fields.push(trivial_setter);
         self.baseline_code.push(std::ptr::null());
         self.baseline_osr_entries.push(Vec::new());
         self.baseline_leaf.push(false);
@@ -805,6 +811,40 @@ impl ExecutionEngine {
         }
     }
 
+    /// Check if a MIR function is a trivial setter: `set_field this, #N, value; return`.
+    fn mir_trivial_setter_field(mir: &crate::mir::MirFunction) -> Option<u16> {
+        use crate::mir::{Instruction, Terminator};
+        if mir.blocks.len() != 1 || mir.arity != 2 {
+            return None;
+        }
+        let block = &mir.blocks[0];
+        let mut self_param = None;
+        let mut value_param = None;
+        let mut value_alias = None;
+        let mut setter = None;
+        for (vid, inst) in &block.instructions {
+            match inst {
+                Instruction::BlockParam(0) if self_param.is_none() => self_param = Some(*vid),
+                Instruction::BlockParam(1) if value_param.is_none() => value_param = Some(*vid),
+                Instruction::Move(src) if Some(*src) == value_param && value_alias.is_none() => {
+                    value_alias = Some(*vid);
+                }
+                Instruction::SetField(recv, idx, val)
+                    if setter.is_none()
+                        && Some(*recv) == self_param
+                        && (Some(*val) == value_param || Some(*val) == value_alias) =>
+                {
+                    setter = Some((*vid, *idx));
+                }
+                _ => return None,
+            }
+        }
+        match (setter, &block.terminator) {
+            (Some((ret_vid, field_idx)), Terminator::Return(v)) if *v == ret_vid => Some(field_idx),
+            _ => None,
+        }
+    }
+
     /// Whether any background compilations are waiting to be installed.
     #[inline(always)]
     pub fn has_pending_compilations(&self) -> bool {
@@ -1019,11 +1059,12 @@ impl ExecutionEngine {
                 runtime.dispatch_call_method_cache_misses,
             );
             eprintln!(
-                "dispatch_method native={} closure={} ctor={} trivial_getter={} call_closure={} native_candidates={} native_entries={} interp_fallbacks={} ctx_save_restore={}",
+                "dispatch_method native={} closure={} ctor={} trivial_getter={} trivial_setter={} call_closure={} native_candidates={} native_entries={} interp_fallbacks={} ctx_save_restore={}",
                 runtime.dispatch_method_native,
                 runtime.dispatch_method_closure,
                 runtime.dispatch_method_constructor,
                 runtime.dispatch_method_trivial_getter,
+                runtime.dispatch_method_trivial_setter,
                 runtime.call_closure_entries,
                 runtime.call_closure_native_candidates,
                 runtime.call_closure_native_entries,

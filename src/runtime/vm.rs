@@ -558,6 +558,13 @@ impl VM {
                         .copied()
                         .flatten()
                         .unwrap_or(u16::MAX);
+                    (*fn_ptr).trivial_setter_field = self
+                        .engine
+                        .trivial_setter_fields
+                        .get(method_func_id.0 as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(u16::MAX);
                 }
 
                 let closure_ptr = self.gc.alloc_closure(fn_ptr);
@@ -2075,6 +2082,13 @@ impl VM {
             (*fn_ptr).trivial_getter_field = self
                 .engine
                 .trivial_getter_fields
+                .get(func_id.0 as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(u16::MAX);
+            (*fn_ptr).trivial_setter_field = self
+                .engine
+                .trivial_setter_fields
                 .get(func_id.0 as usize)
                 .copied()
                 .flatten()

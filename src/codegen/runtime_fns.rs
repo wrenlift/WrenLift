@@ -1688,8 +1688,8 @@ fn dispatch_method(
             vm.engine
                 .note_runtime_call_stats(|s| s.dispatch_method_closure += 1);
             let func_id = crate::runtime::engine::FuncId(unsafe { (*(*cp).function).fn_id });
-            let trivial_getter_field = unsafe { (*(*cp).function).trivial_getter_field };
-            if trivial_getter_field != u16::MAX && args.len() == 1 {
+            let fn_ref = unsafe { &*(*cp).function };
+            if fn_ref.trivial_getter_field != u16::MAX && args.len() == 1 {
                 {
                     let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
                     if !receiver_obj.is_null()
@@ -1702,9 +1702,29 @@ fn dispatch_method(
                             vm.engine
                                 .note_runtime_call_stats(|s| s.dispatch_method_trivial_getter += 1);
                             return unsafe {
-                                (*fields.add(trivial_getter_field as usize)).to_bits()
+                                (*fields.add(fn_ref.trivial_getter_field as usize)).to_bits()
                             };
                         }
+                    }
+                }
+            }
+            if fn_ref.trivial_setter_field != u16::MAX && args.len() == 2 {
+                let receiver_obj = args[0].as_object().unwrap_or(std::ptr::null_mut());
+                if !receiver_obj.is_null()
+                    && unsafe { (*(receiver_obj as *const ObjHeader)).obj_type }
+                        == ObjType::Instance
+                {
+                    let instance = receiver_obj as *mut ObjInstance;
+                    let fields = unsafe { (*instance).fields };
+                    if !fields.is_null() {
+                        let value = args[1];
+                        unsafe {
+                            *fields.add(fn_ref.trivial_setter_field as usize) = value;
+                        }
+                        vm.gc.write_barrier(receiver_obj as *mut ObjHeader, value);
+                        vm.engine
+                            .note_runtime_call_stats(|s| s.dispatch_method_trivial_setter += 1);
+                        return value.to_bits();
                     }
                 }
             }
@@ -2692,6 +2712,13 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
         (*fn_ptr).trivial_getter_field = vm
             .engine
             .trivial_getter_fields
+            .get(func_id as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(u16::MAX);
+        (*fn_ptr).trivial_setter_field = vm
+            .engine
+            .trivial_setter_fields
             .get(func_id as usize)
             .copied()
             .flatten()
