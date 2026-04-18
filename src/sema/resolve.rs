@@ -340,7 +340,11 @@ impl<'a> Resolver<'a> {
         match &stmt.0 {
             Stmt::Expr(expr) => self.resolve_expr(expr),
 
-            Stmt::Var { name, initializer } => {
+            Stmt::Var {
+                name,
+                initializer,
+                attributes: _,
+            } => {
                 if let Some(init) = initializer {
                     self.resolve_expr(init);
                 }

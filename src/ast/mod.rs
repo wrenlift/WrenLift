@@ -16,6 +16,66 @@ pub type Spanned<T> = (T, Span);
 pub type Module = Vec<Spanned<Stmt>>;
 
 // ---------------------------------------------------------------------------
+// Attributes
+// ---------------------------------------------------------------------------
+//
+// Wren 0.4-style attributes. Attach to the declaration immediately
+// following their decl-prefix block. Two flavours:
+//
+// * `#name` — runtime attribute. Survives compilation; reflectable via
+//   `Meta.attributes(...)` at runtime.
+// * `#!name` — compile-time attribute. Consumed by the compiler / VM
+//   (e.g. native-library binding); discarded before execution so
+//   runtime reflection never sees them.
+//
+// Forms we accept (matches standard Wren):
+//
+// * boolean:       `#runnable`
+// * key=value:     `#author = "Bob"`
+// * group:         `#doc(brief = "sum", example = 1)`
+
+/// A single parsed attribute block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attribute {
+    /// Top-level key. For a boolean attribute this is the only payload;
+    /// for `key = value` the value sits in [`AttributeBody::Value`];
+    /// for a group it's the group name.
+    pub name: Spanned<SymbolId>,
+    /// How the attribute is shaped.
+    pub body: AttributeBody,
+    /// `true` for `#`, `false` for `#!`. Compile-time-only attributes
+    /// (`#!`) are stripped during sema and never reach the runtime
+    /// reflection table.
+    pub is_runtime: bool,
+    /// Full span including the leading `#` / `#!`.
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeBody {
+    /// `#flag` — presence-only.
+    Flag,
+    /// `#key = 42` / `#key = "literal"`.
+    Value(Spanned<AttributeLiteral>),
+    /// `#doc(brief = "sum", example = 1)` — nested `key = value` pairs.
+    Group(Vec<(Spanned<SymbolId>, Spanned<AttributeLiteral>)>),
+}
+
+/// Literal payloads permitted inside an attribute. Matches what standard
+/// Wren accepts: numbers, strings, booleans, null. Arbitrary expressions
+/// are intentionally not allowed — attributes are metadata, not code.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttributeLiteral {
+    Num(f64),
+    Str(String),
+    Bool(bool),
+    Null,
+    /// Bare identifier, e.g. `#platform = macOS`. Stored as a symbol so
+    /// downstream consumers can treat it identifier-ish.
+    Ident(SymbolId),
+}
+
+// ---------------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------------
 
@@ -28,6 +88,9 @@ pub enum Stmt {
     Var {
         name: Spanned<SymbolId>,
         initializer: Option<Spanned<Expr>>,
+        /// Attributes attached to this `var` declaration. Empty when
+        /// there are no `#` / `#!` blocks preceding it.
+        attributes: Vec<Attribute>,
     },
 
     /// Class declaration.
@@ -94,6 +157,9 @@ pub struct ClassDecl {
     pub superclass: Option<Spanned<SymbolId>>,
     pub is_foreign: bool,
     pub methods: Vec<Spanned<Method>>,
+    /// Attributes attached to the class declaration itself (not its
+    /// methods — those hang off [`Method::attributes`]).
+    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +169,8 @@ pub struct Method {
     pub signature: MethodSig,
     /// `None` for foreign methods.
     pub body: Option<Spanned<Stmt>>,
+    /// Attributes attached directly to this method.
+    pub attributes: Vec<Attribute>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -392,6 +460,7 @@ mod tests {
         let _ = Stmt::Var {
             name: (x, span(4, 5)),
             initializer: Some((Expr::Num(42.0), span(8, 10))),
+            attributes: vec![],
         };
         let _ = Stmt::Block(vec![]);
         let _ = Stmt::Import {
@@ -462,6 +531,7 @@ mod tests {
             name: (animal, span(6, 12)),
             superclass: Some((object, span(16, 22))),
             is_foreign: false,
+            attributes: vec![],
             methods: vec![
                 (
                     Method {
@@ -472,6 +542,7 @@ mod tests {
                             params: vec![(name_sym, span(40, 44))],
                         },
                         body: Some((Stmt::Block(vec![]), span(46, 48))),
+                        attributes: vec![],
                     },
                     span(30, 48),
                 ),
@@ -484,6 +555,7 @@ mod tests {
                             Stmt::Expr((Expr::Field(name_sym), span(55, 60))),
                             span(55, 60),
                         )),
+                        attributes: vec![],
                     },
                     span(50, 62),
                 ),
@@ -499,6 +571,7 @@ mod tests {
                             Stmt::Return(Some((Expr::Str("Animal".into()), span(90, 98)))),
                             span(83, 98),
                         )),
+                        attributes: vec![],
                     },
                     span(70, 100),
                 ),
@@ -511,6 +584,7 @@ mod tests {
                             params: vec![(other, span(110, 115))],
                         },
                         body: Some((Stmt::Block(vec![]), span(117, 119))),
+                        attributes: vec![],
                     },
                     span(105, 119),
                 ),
@@ -522,6 +596,7 @@ mod tests {
                             params: vec![(index, span(125, 130))],
                         },
                         body: Some((Stmt::Block(vec![]), span(132, 134))),
+                        attributes: vec![],
                     },
                     span(120, 134),
                 ),

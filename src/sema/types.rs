@@ -232,7 +232,11 @@ impl TypeInferrer {
                 self.infer_expr(expr);
             }
 
-            Stmt::Var { name, initializer } => {
+            Stmt::Var {
+                name,
+                initializer,
+                attributes: _,
+            } => {
                 let ty = if let Some(init) = initializer {
                     self.infer_expr(init)
                 } else {

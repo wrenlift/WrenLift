@@ -197,15 +197,201 @@ impl Parser {
         self.skip_newlines();
         let start = self.current_span().start;
 
+        // Any `#` / `#!` blocks at this position attach to the
+        // declaration that follows. Accumulate them first, then dispatch
+        // to the concrete decl parser and hand the list over.
+        let attributes = self.parse_attributes();
+        self.skip_newlines();
+        let decl_start = if attributes.is_empty() {
+            start
+        } else {
+            // Keep the span starting at the first attribute so
+            // diagnostics underline the whole `#foo class Bar` region.
+            start
+        };
+
         match self.peek()? {
-            Token::Class | Token::Foreign => self.class_declaration(start),
-            Token::Import => self.import_declaration(start),
-            Token::Var => self.var_declaration(start),
-            _ => self.statement(start),
+            Token::Class | Token::Foreign => self.class_declaration(decl_start, attributes),
+            Token::Import => {
+                self.reject_attributes_on(&attributes, "import statements");
+                self.import_declaration(decl_start)
+            }
+            Token::Var => self.var_declaration(decl_start, attributes),
+            _ => {
+                self.reject_attributes_on(
+                    &attributes,
+                    "expressions and non-declaration statements",
+                );
+                self.statement(decl_start)
+            }
         }
     }
 
-    fn var_declaration(&mut self, start: usize) -> Option<Spanned<Stmt>> {
+    /// Consume a run of `#` / `#!` attribute blocks at the current
+    /// position. Returns the empty vec when nothing matches.
+    fn parse_attributes(&mut self) -> Vec<crate::ast::Attribute> {
+        use crate::ast::Attribute;
+
+        let mut attributes: Vec<Attribute> = Vec::new();
+        loop {
+            self.skip_newlines();
+            let is_runtime = match self.peek() {
+                Some(Token::Hash) => true,
+                Some(Token::HashBang) => false,
+                _ => break,
+            };
+            let start = self.current_span().start;
+            self.advance(); // consume `#` / `#!`
+
+            // Attribute name — a bare identifier.
+            if !self.check(&Token::Ident) {
+                let span = self.current_span();
+                self.errors.push(
+                    Diagnostic::error("expected attribute name after `#`")
+                        .with_label(span, "here"),
+                );
+                // Best-effort recovery: skip to end of line and carry on.
+                while !self.is_at_end() && !self.check(&Token::Newline) {
+                    self.advance();
+                }
+                continue;
+            }
+            self.advance();
+            let name_text = self.previous().text.clone();
+            let name_span = self.previous_span();
+            let name_sym = self.intern(&name_text);
+
+            let body = if self.match_token(&Token::Eq) {
+                // `#key = literal`
+                self.skip_newlines();
+                match self.parse_attribute_literal() {
+                    Some(lit) => crate::ast::AttributeBody::Value(lit),
+                    None => {
+                        // Diagnostic already emitted; keep the attribute
+                        // as a flag so downstream passes still see it.
+                        crate::ast::AttributeBody::Flag
+                    }
+                }
+            } else if self.match_token(&Token::LeftParen) {
+                // `#group(k = v, k = v, ...)`
+                let mut pairs = Vec::new();
+                self.skip_newlines();
+                if !self.check(&Token::RightParen) {
+                    loop {
+                        self.skip_newlines();
+                        if !self.check(&Token::Ident) {
+                            let span = self.current_span();
+                            self.errors.push(
+                                Diagnostic::error("expected key in attribute group")
+                                    .with_label(span, "here"),
+                            );
+                            break;
+                        }
+                        self.advance();
+                        let k_text = self.previous().text.clone();
+                        let k_span = self.previous_span();
+                        let k_sym = self.intern(&k_text);
+                        self.skip_newlines();
+                        self.expect(&Token::Eq, "expected '=' after attribute key");
+                        self.skip_newlines();
+                        if let Some(lit) = self.parse_attribute_literal() {
+                            pairs.push(((k_sym, k_span), lit));
+                        }
+                        self.skip_newlines();
+                        if !self.match_token(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.skip_newlines();
+                self.expect(&Token::RightParen, "expected ')' to close attribute group");
+                crate::ast::AttributeBody::Group(pairs)
+            } else {
+                crate::ast::AttributeBody::Flag
+            };
+
+            let end = self.previous_span().end;
+            attributes.push(Attribute {
+                name: (name_sym, name_span),
+                body,
+                is_runtime,
+                span: start..end,
+            });
+        }
+        attributes
+    }
+
+    /// Parse a single literal permitted inside an attribute. Errors
+    /// emitted to `self.errors`; returns `None` on parse failure so the
+    /// caller can skip recovery.
+    fn parse_attribute_literal(&mut self) -> Option<Spanned<crate::ast::AttributeLiteral>> {
+        use crate::ast::AttributeLiteral;
+
+        let span_start = self.current_span().start;
+        let tok = self.peek()?.clone();
+        match tok {
+            Token::Number => {
+                self.advance();
+                let text = self.previous().text.clone();
+                let n = text.parse::<f64>().unwrap_or(0.0);
+                let end = self.previous_span().end;
+                Some((AttributeLiteral::Num(n), span_start..end))
+            }
+            Token::StringLit => {
+                self.advance();
+                let s = self.previous().text.clone();
+                let end = self.previous_span().end;
+                Some((AttributeLiteral::Str(s), span_start..end))
+            }
+            Token::True => {
+                self.advance();
+                let end = self.previous_span().end;
+                Some((AttributeLiteral::Bool(true), span_start..end))
+            }
+            Token::False => {
+                self.advance();
+                let end = self.previous_span().end;
+                Some((AttributeLiteral::Bool(false), span_start..end))
+            }
+            Token::Null => {
+                self.advance();
+                let end = self.previous_span().end;
+                Some((AttributeLiteral::Null, span_start..end))
+            }
+            Token::Ident => {
+                self.advance();
+                let name_text = self.previous().text.clone();
+                let sym = self.intern(&name_text);
+                let end = self.previous_span().end;
+                Some((AttributeLiteral::Ident(sym), span_start..end))
+            }
+            _ => {
+                let span = self.current_span();
+                self.errors.push(
+                    Diagnostic::error("expected attribute value (number, string, bool, null, or identifier)")
+                        .with_label(span, "here"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Emit a diagnostic for every attribute in `attributes`, pinned
+    /// to its span, explaining that attributes can't attach here.
+    fn reject_attributes_on(&mut self, attributes: &[crate::ast::Attribute], target: &str) {
+        for attr in attributes {
+            self.errors.push(
+                Diagnostic::error(format!("attributes cannot attach to {}", target))
+                    .with_label(attr.span.clone(), "attribute here"),
+            );
+        }
+    }
+
+    fn var_declaration(
+        &mut self,
+        start: usize,
+        attributes: Vec<crate::ast::Attribute>,
+    ) -> Option<Spanned<Stmt>> {
         self.advance(); // consume `var`
         self.skip_newlines();
 
@@ -233,6 +419,7 @@ impl Parser {
             Stmt::Var {
                 name: (name_sym, name_span),
                 initializer,
+                attributes,
             },
             start..end,
         ))
@@ -309,7 +496,11 @@ impl Parser {
         ))
     }
 
-    fn class_declaration(&mut self, start: usize) -> Option<Spanned<Stmt>> {
+    fn class_declaration(
+        &mut self,
+        start: usize,
+        attributes: Vec<crate::ast::Attribute>,
+    ) -> Option<Spanned<Stmt>> {
         let is_foreign = self.match_token(&Token::Foreign);
         self.expect(&Token::Class, "expected 'class'");
         self.skip_newlines();
@@ -348,7 +539,16 @@ impl Parser {
 
         let mut methods = Vec::new();
         while !self.check(&Token::RightBrace) && !self.is_at_end() {
-            if let Some(method) = self.method_definition(is_foreign) {
+            // Methods can carry their own attributes. Collect them
+            // before dispatching to `method_definition`.
+            let method_attrs = self.parse_attributes();
+            self.skip_newlines();
+            if self.check(&Token::RightBrace) {
+                // Dangling attributes at class-body tail.
+                self.reject_attributes_on(&method_attrs, "the closing brace of a class");
+                break;
+            }
+            if let Some(method) = self.method_definition(is_foreign, method_attrs) {
                 methods.push(method);
             } else {
                 self.advance();
@@ -365,12 +565,17 @@ impl Parser {
                 superclass,
                 is_foreign,
                 methods,
+                attributes,
             }),
             start..end,
         ))
     }
 
-    fn method_definition(&mut self, class_is_foreign: bool) -> Option<Spanned<Method>> {
+    fn method_definition(
+        &mut self,
+        class_is_foreign: bool,
+        attributes: Vec<crate::ast::Attribute>,
+    ) -> Option<Spanned<Method>> {
         let start = self.current_span().start;
         let is_foreign = self.match_token(&Token::Foreign);
         let is_static = self.match_token(&Token::Static);
@@ -397,6 +602,7 @@ impl Parser {
                 is_foreign: is_foreign || class_is_foreign,
                 signature,
                 body,
+                attributes,
             },
             start..end,
         ))
@@ -2232,6 +2438,149 @@ mod tests {
                 assert!(c.methods[0].0.is_foreign);
                 assert!(c.methods[0].0.body.is_none());
             }
+            _ => panic!("expected Class"),
+        }
+    }
+
+    // -- Attribute tests ----------------------------------------------------
+    //
+    // Phase 1 only parses attributes and attaches them to the relevant
+    // decl. Sema / runtime consumption lands in later phases; for now
+    // these tests just confirm the AST carries what the lexer / parser
+    // saw.
+
+    #[test]
+    fn test_parse_flag_attribute_on_class() {
+        use crate::ast::AttributeBody;
+        let result = parse("#runnable\nclass Foo {}");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Class(c) => {
+                assert_eq!(c.attributes.len(), 1);
+                assert!(c.attributes[0].is_runtime);
+                assert!(matches!(c.attributes[0].body, AttributeBody::Flag));
+                assert_eq!(
+                    result.interner.resolve(c.attributes[0].name.0),
+                    "runnable"
+                );
+            }
+            _ => panic!("expected Class"),
+        }
+    }
+
+    #[test]
+    fn test_parse_compile_time_attribute_on_class() {
+        use crate::ast::{AttributeBody, AttributeLiteral};
+        let result = parse("#!native = \"sqlite3\"\nforeign class Db {}");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Class(c) => {
+                assert_eq!(c.attributes.len(), 1);
+                let a = &c.attributes[0];
+                assert!(!a.is_runtime, "should be compile-time (`#!`)");
+                assert_eq!(result.interner.resolve(a.name.0), "native");
+                match &a.body {
+                    AttributeBody::Value((AttributeLiteral::Str(s), _)) => assert_eq!(s, "sqlite3"),
+                    other => panic!("expected string value, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Class"),
+        }
+    }
+
+    #[test]
+    fn test_parse_group_attribute() {
+        use crate::ast::{AttributeBody, AttributeLiteral};
+        let result = parse("#doc(brief = \"sum\", example = 42)\nclass Math {}");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Class(c) => {
+                let a = &c.attributes[0];
+                assert_eq!(result.interner.resolve(a.name.0), "doc");
+                match &a.body {
+                    AttributeBody::Group(pairs) => {
+                        assert_eq!(pairs.len(), 2);
+                        assert_eq!(result.interner.resolve(pairs[0].0 .0), "brief");
+                        assert!(matches!(&pairs[0].1 .0, AttributeLiteral::Str(s) if s == "sum"));
+                        assert_eq!(result.interner.resolve(pairs[1].0 .0), "example");
+                        assert!(matches!(pairs[1].1 .0, AttributeLiteral::Num(n) if n == 42.0));
+                    }
+                    other => panic!("expected Group, got {:?}", other),
+                }
+            }
+            _ => panic!("expected Class"),
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_attributes_on_class() {
+        let result = parse("#runnable\n#author = \"Bob\"\n#!internal\nclass Foo {}");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Class(c) => {
+                assert_eq!(c.attributes.len(), 3);
+                assert!(c.attributes[0].is_runtime);
+                assert!(c.attributes[1].is_runtime);
+                assert!(!c.attributes[2].is_runtime);
+            }
+            _ => panic!("expected Class"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attributes_on_var() {
+        let result = parse("#pinned\nvar x = 1");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Var { attributes, .. } => {
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(result.interner.resolve(attributes[0].name.0), "pinned");
+            }
+            _ => panic!("expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_parse_attributes_on_method() {
+        use crate::ast::{AttributeBody, AttributeLiteral};
+        let source = "foreign class Db {\n  #!symbol = \"sqlite3_open\"\n  foreign open(path)\n}";
+        let result = parse(source);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Class(c) => {
+                let method = &c.methods[0].0;
+                assert_eq!(method.attributes.len(), 1);
+                let a = &method.attributes[0];
+                assert!(!a.is_runtime);
+                match &a.body {
+                    AttributeBody::Value((AttributeLiteral::Str(s), _)) => {
+                        assert_eq!(s, "sqlite3_open");
+                    }
+                    _ => panic!("expected string value"),
+                }
+            }
+            _ => panic!("expected Class"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rejects_attribute_on_import() {
+        let result = parse("#pinned\nimport \"foo\"");
+        assert!(
+            !result.errors.is_empty(),
+            "expected a diagnostic for attribute on import"
+        );
+    }
+
+    #[test]
+    fn test_parse_shebang_still_works_alongside_attributes() {
+        // Shebang is pre-lex'd and skipped; `#!` anywhere else is an
+        // attribute marker. Confirm both co-exist.
+        let source = "#!/usr/bin/env wren\n#runnable\nclass Foo {}";
+        let result = parse(source);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        match &result.module[0].0 {
+            Stmt::Class(c) => assert_eq!(c.attributes.len(), 1),
             _ => panic!("expected Class"),
         }
     }

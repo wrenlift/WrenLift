@@ -185,7 +185,11 @@ impl<'a> MirBuilder<'a> {
                 self.lower_expr(expr);
             }
 
-            Stmt::Var { name, initializer } => {
+            Stmt::Var {
+                name,
+                initializer,
+                attributes: _,
+            } => {
                 let val = if let Some(init) = initializer {
                     self.lower_expr(init)
                 } else {

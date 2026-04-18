@@ -28,6 +28,11 @@ pub enum Token {
     Colon,
     #[token("#")]
     Hash,
+    // Wren 0.4 attributes distinguish `#` (runtime) from `#!`
+    // (compile-time). Order matters here — logos picks the longest
+    // match, but being explicit keeps intent obvious.
+    #[token("#!")]
+    HashBang,
     #[token("?")]
     Question,
 
@@ -247,8 +252,14 @@ pub fn lex(source: &str) -> (Vec<Lexeme>, Vec<crate::diagnostics::Diagnostic>) {
             continue;
         }
 
-        // Shebang on first line
-        if pos == 0 && pos + 1 < source.len() && bytes[0] == b'#' && bytes[1] == b'!' {
+        // Shebang on first line. Distinguished from a `#!` attribute by
+        // the required `/` (shebangs are paths, e.g. `#!/usr/bin/env wren`).
+        if pos == 0
+            && pos + 2 < source.len()
+            && bytes[0] == b'#'
+            && bytes[1] == b'!'
+            && bytes[2] == b'/'
+        {
             while pos < source.len() && bytes[pos] != b'\n' {
                 pos += 1;
             }
