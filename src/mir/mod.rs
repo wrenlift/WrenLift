@@ -25,7 +25,7 @@ use crate::intern::SymbolId;
 // ---------------------------------------------------------------------------
 
 /// A reference to an SSA value.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct ValueId(pub u32);
 
 impl fmt::Debug for ValueId {
@@ -41,7 +41,7 @@ impl fmt::Display for ValueId {
 }
 
 /// A reference to a basic block.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct BlockId(pub u32);
 
 impl fmt::Debug for BlockId {
@@ -61,7 +61,7 @@ impl fmt::Display for BlockId {
 // ---------------------------------------------------------------------------
 
 /// MIR-level type for SSA values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MirType {
     /// A NaN-boxed Wren value (64-bit).
     Value,
@@ -80,7 +80,7 @@ pub enum MirType {
 // ---------------------------------------------------------------------------
 
 /// Unary math operation on an unboxed f64.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MathUnaryOp {
     Abs,
     Acos,
@@ -161,7 +161,7 @@ impl MathUnaryOp {
 }
 
 /// Binary math operation on two unboxed f64 values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MathBinaryOp {
     Atan2,
     Min,
@@ -192,7 +192,7 @@ impl MathBinaryOp {
 }
 
 /// A single MIR instruction. Each produces at most one `ValueId`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Instruction {
     // -- Constants ----------------------------------------------------------
     /// Load an f64 constant as a boxed Value.
@@ -529,7 +529,7 @@ impl Instruction {
 // ---------------------------------------------------------------------------
 
 /// How a basic block ends.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Terminator {
     /// Return a value from the function.
     Return(ValueId),
@@ -589,7 +589,7 @@ impl Terminator {
 // ---------------------------------------------------------------------------
 
 /// A basic block in the MIR CFG.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BasicBlock {
     /// Block identifier.
     pub id: BlockId,
@@ -641,7 +641,7 @@ impl BasicBlock {
 // ---------------------------------------------------------------------------
 
 /// The complete MIR output for a module: top-level code + class definitions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModuleMir {
     pub top_level: MirFunction,
     pub classes: Vec<ClassMir>,
@@ -650,7 +650,7 @@ pub struct ModuleMir {
 }
 
 /// MIR for a user-defined class.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ClassMir {
     pub name: SymbolId,
     pub superclass: Option<SymbolId>,
@@ -661,7 +661,7 @@ pub struct ClassMir {
 }
 
 /// MIR for a single method within a class.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodMir {
     /// Wren method signature (e.g. "foo(_)", "bar", "[_]").
     pub signature: String,
@@ -675,7 +675,7 @@ pub struct MethodMir {
 // ---------------------------------------------------------------------------
 
 /// A compiled function in MIR form.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MirFunction {
     /// Function name (for debugging).
     pub name: SymbolId,

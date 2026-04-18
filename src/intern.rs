@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 /// An interned string identifier. Cheap to copy and compare.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct SymbolId(u32);
 
 impl SymbolId {
@@ -41,7 +41,7 @@ impl std::fmt::Display for SymbolId {
 }
 
 /// Append-only string interner.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Interner {
     /// Maps string content → symbol id for dedup lookup.
     map: HashMap<String, SymbolId>,

@@ -23,6 +23,8 @@ dynasmrt = "2"
 dynasm = "2"
 wasm-encoder = "0.245"
 smallvec = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
 cranelift-codegen = { version = "0.130", optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }

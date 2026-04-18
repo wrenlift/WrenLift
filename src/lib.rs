@@ -7,3 +7,4 @@ pub mod mir;
 pub mod parse;
 pub mod runtime;
 pub mod sema;
+pub mod serialize;
