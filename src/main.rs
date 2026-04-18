@@ -66,6 +66,12 @@ struct Cli {
     #[arg(long)]
     gc_stats: bool,
 
+    /// Report which registered functions are unreachable from any
+    /// module's top-level after compilation. Conservative: assumes no
+    /// reflection, `Meta.eval`, or other runtime source-to-MIR path.
+    #[arg(long)]
+    tree_shake_stats: bool,
+
     /// Maximum interpreter steps before aborting.
     /// Defaults to 1B (interpreter) or 10B (tiered/jit).
     #[arg(long)]
@@ -218,6 +224,22 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         }
         InterpretResult::RuntimeError => {
             process::exit(70);
+        }
+    }
+
+    if cli.tree_shake_stats {
+        let report = wren_lift::mir::opt::tree_shake::analyse(&vm.engine);
+        eprintln!("--- Tree-shake ---");
+        eprintln!("  total functions: {}", report.total);
+        eprintln!("  reachable:       {}", report.reachable);
+        eprintln!("  unreachable:     {}", report.dead.len());
+        for id in &report.dead {
+            let name = vm
+                .engine
+                .get_mir(*id)
+                .map(|mir| vm.interner.resolve(mir.name).to_string())
+                .unwrap_or_else(|| "<missing mir>".to_string());
+            eprintln!("    FuncId({}) {}", id.0, name);
         }
     }
 

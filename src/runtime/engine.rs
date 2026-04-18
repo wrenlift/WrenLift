@@ -595,6 +595,12 @@ impl ExecutionEngine {
             .map(|body| Arc::clone(body.mir()))
     }
 
+    /// Number of registered functions across all modules. Every id in
+    /// `0..function_count()` has an entry in `self.functions`.
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
     /// Get or lazily create threaded code for a function.
     /// Returns a reference to the ThreadedCode if available.
     /// Only creates threaded code for functions where ALL instructions

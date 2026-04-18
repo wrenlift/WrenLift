@@ -11,6 +11,7 @@ pub mod inline;
 pub mod licm;
 pub mod range_loop;
 pub mod sra;
+pub mod tree_shake;
 
 use std::collections::HashMap;
 
