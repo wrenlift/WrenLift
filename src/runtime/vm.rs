@@ -300,6 +300,153 @@ impl VM {
         Self::new(VMConfig::default())
     }
 
+    /// Compile Wren source to a portable `.wlbc` bytecode cache.
+    ///
+    /// Runs the full front-end pipeline (lex → parse → sema → lower →
+    /// optimize) once and hands the resulting MIR + interner off to
+    /// `serialize::emit`. Produces bytes suitable for writing to a
+    /// `.wlbc` file and later loading via `interpret_bytecode`.
+    ///
+    /// Reports all compile-time diagnostics to stderr the same way
+    /// `interpret` does, returning `InterpretResult::CompileError` on
+    /// any parse / sema failure.
+    pub fn compile_source_to_blob(
+        &mut self,
+        source: &str,
+    ) -> Result<Vec<u8>, InterpretResult> {
+        use crate::diagnostics::Severity;
+        use crate::mir::opt::{
+            self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
+            sra::Sra, MirPass,
+        };
+        use crate::parse::parser;
+        use crate::sema;
+
+        // 1. Parse
+        let parse_result = parser::parse(source);
+        if parse_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &parse_result.errors {
+                err.eprint(source);
+            }
+            return Err(InterpretResult::CompileError);
+        }
+
+        let mut interner = parse_result.interner;
+
+        // 2. Prelude + sema
+        let core_names = [
+            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
+            "Fiber", "System", "Sequence",
+        ];
+        let prelude: Vec<crate::intern::SymbolId> =
+            core_names.iter().map(|n| interner.intern(n)).collect();
+        let resolve_result =
+            sema::resolve::resolve_with_prelude(&parse_result.module, &interner, &prelude);
+        if resolve_result
+            .errors
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            for err in &resolve_result.errors {
+                err.eprint(source);
+            }
+            return Err(InterpretResult::CompileError);
+        }
+
+        // `.wlbc` snapshots are single-module today. Imports are AST-
+        // level; by the time we serialize MIR they've been resolved
+        // into `GetModuleVar` references against the module's own var
+        // slot. For an import to be useful post-load, the importing
+        // process must separately load the imported module first —
+        // either via another `.wlbc` or via `interpret`. The `.hatch`
+        // distribution format (commit 3) will bundle all imports
+        // together so `wlift run pkg.hatch` just works.
+        let has_imports = parse_result
+            .module
+            .iter()
+            .any(|stmt| matches!(&stmt.0, crate::ast::Stmt::Import { .. }));
+        if has_imports {
+            eprintln!(
+                "warning: module has `import` statements; .wlbc does not bundle imports. \
+Load imported modules separately before running the cache, or use a .hatch package."
+            );
+        }
+
+        // 3. Lower to MIR
+        let mut module_mir =
+            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+
+        // 4. Optimize top-level + method + closure bodies
+        let constfold = ConstFold;
+        let dce = Dce;
+        let cse = Cse;
+        let type_spec = TypeSpecialize::with_math(&interner);
+        let licm = Licm;
+        let sra = Sra;
+        let passes: Vec<&dyn MirPass> = vec![
+            &constfold, &dce, &cse, &type_spec, &constfold, &dce, &licm, &sra, &dce,
+        ];
+        opt::run_to_fixpoint(&mut module_mir.top_level, &passes, 10);
+        for class in &mut module_mir.classes {
+            for method in &mut class.methods {
+                opt::run_to_fixpoint(&mut method.mir, &passes, 10);
+            }
+        }
+        for closure in &mut module_mir.closures {
+            opt::run_to_fixpoint(closure, &passes, 10);
+        }
+
+        // 5. Project module var symbols to strings for the snapshot.
+        let var_names: Vec<String> = resolve_result
+            .module_vars
+            .iter()
+            .map(|&sym| interner.resolve(sym).to_string())
+            .collect();
+
+        // 6. Serialize.
+        crate::serialize::emit(&interner, &module_mir, &var_names).map_err(|e| {
+            eprintln!("failed to emit .wlbc: {}", e);
+            InterpretResult::CompileError
+        })
+    }
+
+    /// Load and execute a module from a `.wlbc` bytecode cache.
+    ///
+    /// Skips parse / sema / MIR-build / optimize — goes straight to the
+    /// shared install path. The snapshot's interner is merged into the
+    /// VM interner, closures and classes are registered, and the
+    /// top-level fiber runs. Same semantics as `interpret(name, src)`
+    /// modulo anything that depended on having source text (e.g. span
+    /// diagnostics carry snapshot spans, not fresh source byte ranges).
+    pub fn interpret_bytecode(
+        &mut self,
+        module_name: &str,
+        bytes: &[u8],
+    ) -> InterpretResult {
+        let module_key = module_name.to_string();
+        if !self.loading_modules.insert(module_key.clone()) {
+            self.report_error(&format!(
+                "Circular import detected: module '{}' is already being loaded",
+                module_name
+            ));
+            return InterpretResult::CompileError;
+        }
+
+        let blob = match crate::serialize::load(bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("failed to load .wlbc: {}", e);
+                self.loading_modules.remove(&module_key);
+                return InterpretResult::CompileError;
+            }
+        };
+        self.install_module_mir_and_run(module_name, &blob.interner, blob.module, blob.var_names)
+    }
+
     /// Compile and execute Wren source code.
     ///
     /// Pipeline: lex → parse → sema → lower to MIR → optimize → execute.
@@ -310,7 +457,6 @@ impl VM {
             self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
             sra::Sra, MirPass,
         };
-        use crate::mir::BlockId;
         use crate::parse::parser;
         use crate::sema;
         // 0. Cycle detection for imports
@@ -436,7 +582,38 @@ impl VM {
             opt::run_to_fixpoint(closure, &passes, 10);
         }
 
-        // 6. Remap symbols: the parse interner and VM interner have different
+        // Project resolve_result.module_vars to strings (in the parse
+        // interner's frame). The install helper takes ownership of the
+        // list and uses it both to pre-populate the module's var slots
+        // and to route class definitions to the right slot.
+        let var_names: Vec<String> = resolve_result
+            .module_vars
+            .iter()
+            .map(|&sym| interner.resolve(sym).to_string())
+            .collect();
+
+        self.install_module_mir_and_run(module_name, &interner, module_mir, var_names)
+    }
+
+    /// Install a freshly compiled (or freshly loaded) `ModuleMir` into
+    /// the engine, build its classes, and run its top-level fiber.
+    ///
+    /// This is the shared suffix of the compilation pipeline — steps 6
+    /// through 10 of `interpret`, reused by the `.wlbc` load path so
+    /// snapshots don't have to pay for parse / sema / MIR-build / opt.
+    /// `interner` is in the snapshot's (or parser's) symbol frame and
+    /// gets remapped into `self.interner` on entry. `var_names` is the
+    /// module's declared top-level var order — normally derived from
+    /// `resolve_result.module_vars` or loaded verbatim from a snapshot.
+    fn install_module_mir_and_run(
+        &mut self,
+        module_name: &str,
+        interner: &crate::intern::Interner,
+        mut module_mir: crate::mir::ModuleMir,
+        var_names: Vec<String>,
+    ) -> InterpretResult {
+        use crate::mir::BlockId;
+        // 6. Remap symbols: the source interner and VM interner have different
         // indices for the same strings. Build a mapping and rewrite the MIR.
         let mut sym_map: Vec<crate::intern::SymbolId> = Vec::with_capacity(interner.len());
         for i in 0..interner.len() {
@@ -485,11 +662,8 @@ impl VM {
         // 8. Create module var storage, pre-populated with core class values
         // and imported module vars.
         let module_key = module_name.to_string();
-        let mut module_vars = Vec::with_capacity(resolve_result.module_vars.len());
-        let mut var_names = Vec::with_capacity(resolve_result.module_vars.len());
-        for &parse_sym in &resolve_result.module_vars {
-            let name = interner.resolve(parse_sym);
-            var_names.push(name.to_string());
+        let mut module_vars = Vec::with_capacity(var_names.len());
+        for name in &var_names {
             if let Some(value) = self.core_class_value(name) {
                 module_vars.push(value);
             } else if let Some(value) = self.find_imported_var(name) {
@@ -503,18 +677,15 @@ impl VM {
             super::engine::ModuleEntry {
                 top_level: func_id,
                 vars: module_vars,
-                var_names,
+                var_names: var_names.clone(),
             },
         );
 
         // 8b. Create user-defined classes and bind their methods.
         for class_mir in module_mir.classes {
-            // Find module var slot for this class
+            // Find module var slot for this class.
             let class_name_str = self.interner.resolve(class_mir.name).to_string();
-            let slot = resolve_result
-                .module_vars
-                .iter()
-                .position(|&sym| interner.resolve(sym) == class_name_str);
+            let slot = var_names.iter().position(|name| name == &class_name_str);
 
             // Resolve superclass (check core classes, then module vars)
             let superclass = class_mir

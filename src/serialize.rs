@@ -38,15 +38,22 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 /// are additive from bincode's perspective as long as we never reorder
 /// existing variants, so most upgrades won't need a version bump — but
 /// reshuffling a struct field or swapping enum variant order will).
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Combined payload: everything a fresh `VM` needs to materialise the
 /// module without touching the parser, resolver, MIR builder, or the
 /// optimizer.
+///
+/// `var_names` is the declared module-var layout (one entry per slot,
+/// in the order the resolver assigned them). On load, the VM looks up
+/// each name against its own core classes / imported modules and fills
+/// the corresponding slot, falling back to `null`. This replaces the
+/// `resolve_result.module_vars` list that the source path produces.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModuleBlob {
     pub interner: Interner,
     pub module: ModuleMir,
+    pub var_names: Vec<String>,
 }
 
 /// Errors surfaced by `emit` / `load`.
@@ -91,10 +98,18 @@ impl std::error::Error for SerializeError {}
 
 /// Serialize a compiled module + its interner into a self-describing
 /// blob suitable for `.wlbc` files.
-pub fn emit(interner: &Interner, module: &ModuleMir) -> Result<Vec<u8>, SerializeError> {
+///
+/// `var_names` is the module's declared top-level variable order. The
+/// loader uses it to reconstruct the module's var slot layout.
+pub fn emit(
+    interner: &Interner,
+    module: &ModuleMir,
+    var_names: &[String],
+) -> Result<Vec<u8>, SerializeError> {
     let blob = ModuleBlob {
         interner: interner.clone(),
         module: module.clone(),
+        var_names: var_names.to_vec(),
     };
 
     let payload = bincode::serde::encode_to_vec(&blob, bincode::config::standard())
@@ -110,7 +125,7 @@ pub fn emit(interner: &Interner, module: &ModuleMir) -> Result<Vec<u8>, Serializ
 
 /// Parse a blob produced by `emit`. Validates magic + version + declared
 /// payload length before handing bytes to bincode.
-pub fn load(bytes: &[u8]) -> Result<(Interner, ModuleMir), SerializeError> {
+pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
     if bytes.len() < 12 || bytes[..4] != MAGIC {
         return Err(SerializeError::BadMagic);
     }
@@ -132,7 +147,13 @@ pub fn load(bytes: &[u8]) -> Result<(Interner, ModuleMir), SerializeError> {
     let (blob, _consumed) =
         bincode::serde::decode_from_slice::<ModuleBlob, _>(payload, bincode::config::standard())
             .map_err(|e| SerializeError::Decode(e.to_string()))?;
-    Ok((blob.interner, blob.module))
+    Ok(blob)
+}
+
+/// Cheap magic-bytes probe so the CLI can pick the .wlbc path without
+/// committing to a full `load()` up front (and its bincode dependency).
+pub fn looks_like_wlbc(bytes: &[u8]) -> bool {
+    bytes.len() >= 4 && bytes[..4] == MAGIC
 }
 
 #[cfg(test)]
@@ -156,19 +177,21 @@ mod tests {
     fn emit_load_round_trips_empty_module() {
         let mut interner = Interner::new();
         let module = empty_module(&mut interner);
+        let var_names = vec!["System".to_string(), "greeting".to_string()];
 
-        let blob = emit(&interner, &module).expect("emit");
-        let (interner_back, module_back) = load(&blob).expect("load");
+        let blob_bytes = emit(&interner, &module, &var_names).expect("emit");
+        let blob = load(&blob_bytes).expect("load");
 
         assert_eq!(
             interner.resolve(module.top_level.name),
-            interner_back.resolve(module_back.top_level.name)
+            blob.interner.resolve(blob.module.top_level.name)
         );
-        assert_eq!(module.top_level.arity, module_back.top_level.arity);
+        assert_eq!(module.top_level.arity, blob.module.top_level.arity);
         assert_eq!(
             module.top_level.blocks.len(),
-            module_back.top_level.blocks.len()
+            blob.module.top_level.blocks.len()
         );
+        assert_eq!(blob.var_names, var_names);
     }
 
     #[test]
@@ -193,11 +216,20 @@ mod tests {
     fn load_rejects_truncated_payload() {
         let mut interner = Interner::new();
         let module = empty_module(&mut interner);
-        let blob = emit(&interner, &module).expect("emit");
+        let blob = emit(&interner, &module, &[]).expect("emit");
         let truncated = &blob[..blob.len() - 1];
         assert!(matches!(
             load(truncated),
             Err(SerializeError::TruncatedPayload { .. })
         ));
+    }
+
+    #[test]
+    fn looks_like_wlbc_matches_magic() {
+        assert!(!looks_like_wlbc(&[]));
+        assert!(!looks_like_wlbc(b"WLB"));
+        assert!(looks_like_wlbc(b"WLBC"));
+        assert!(looks_like_wlbc(b"WLBCextra"));
+        assert!(!looks_like_wlbc(b"ABCD"));
     }
 }

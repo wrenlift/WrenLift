@@ -72,6 +72,16 @@ struct Cli {
     #[arg(long)]
     tree_shake_stats: bool,
 
+    /// Compile the input `.wren` source into a portable `.wlbc`
+    /// bytecode cache at the given path and exit without running.
+    /// Subsequent launches can pass the `.wlbc` path instead of the
+    /// source file to skip parse / sema / MIR-build / optimize.
+    ///
+    /// (The `--bundle` flag is reserved for multi-module `.hatch`
+    /// packaging, landing in a later commit.)
+    #[arg(long, value_name = "OUT_PATH")]
+    build: Option<String>,
+
     /// Maximum interpreter steps before aborting.
     /// Defaults to 1B (interpreter) or 10B (tiered/jit).
     #[arg(long)]
@@ -419,18 +429,99 @@ fn run_repl() {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Compile a source file to a `.wlbc` bytecode cache and write it.
+///
+/// `--build` short-circuits execution — no fiber is run. If compilation
+/// fails, diagnostics are printed to stderr and the process exits with
+/// a compile-error code so shells / build systems can branch on it.
+fn build_bytecode_cache(source: &str, filename: &str, out_path: &str, cli: &Cli) {
+    // Route through the same parse / sema / MIR / opt passes the VM
+    // would run on `interpret`; we just stop before installing the
+    // module and serialize the compiled artifact instead.
+    let mut vm = make_vm(cli);
+    let bytes = match vm.compile_source_to_blob(source) {
+        Ok(b) => b,
+        Err(InterpretResult::CompileError) => process::exit(65),
+        Err(_) => process::exit(70),
+    };
+    if let Err(e) = fs::write(out_path, &bytes) {
+        eprintln!("error: cannot write '{}': {}", out_path, e);
+        process::exit(1);
+    }
+    eprintln!(
+        "built {} bytes from {} → {}",
+        bytes.len(),
+        filename,
+        out_path
+    );
+}
+
+/// Load + run a `.wlbc` bytecode cache.
+fn run_bytecode(bytes: &[u8], filename: &str, cli: &Cli) {
+    let mut vm = make_vm(cli);
+    // Strip directory + extension so module_name matches what `interpret`
+    // would have used for the same source file. Keeps behaviour stable
+    // if a runtime error points at module name.
+    let module_name = std::path::Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename)
+        .strip_suffix(".wren")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            std::path::Path::new(filename)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(filename)
+                .to_string()
+        });
+    match vm.interpret_bytecode(&module_name, bytes) {
+        InterpretResult::Success => {}
+        InterpretResult::CompileError => process::exit(65),
+        InterpretResult::RuntimeError => process::exit(70),
+    }
+    if cli.gc_stats {
+        let stats = vm.gc.stats();
+        eprintln!("--- GC Stats ---");
+        eprintln!("  minor collections: {}", stats.minor_collections);
+        eprintln!("  major collections: {}", stats.major_collections);
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match &cli.file {
         Some(filename) => {
-            let source = match fs::read_to_string(filename) {
-                Ok(s) => s,
+            // Read the file as raw bytes first so we can sniff the
+            // `.wlbc` magic and route the bytecode path without trying
+            // to UTF-8-decode a binary blob.
+            let bytes = match fs::read(filename) {
+                Ok(b) => b,
                 Err(e) => {
                     eprintln!("error: cannot read '{}': {}", filename, e);
                     process::exit(1);
                 }
             };
+
+            if wren_lift::serialize::looks_like_wlbc(&bytes) {
+                run_bytecode(&bytes, filename, &cli);
+                return;
+            }
+
+            let source = match std::str::from_utf8(&bytes) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    eprintln!("error: '{}' is not valid UTF-8: {}", filename, e);
+                    process::exit(1);
+                }
+            };
+
+            if let Some(out_path) = &cli.build {
+                build_bytecode_cache(&source, filename, out_path, &cli);
+                return;
+            }
+
             run_file(&source, filename, &cli);
         }
         None => {

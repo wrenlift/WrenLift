@@ -3252,3 +3252,80 @@ fn e2e_delta_blue_chain_then_projection_debug_values() {
 
     eprintln!("{}", output);
 }
+
+// ---------------------------------------------------------------------------
+// .wlbc bytecode cache round-trip
+// ---------------------------------------------------------------------------
+
+/// Compiling to `.wlbc` and loading the resulting blob must produce the
+/// same output as running the source directly. Guards against symbol-
+/// table drift, closure-id remapping bugs, and class-var-slot mismatches.
+#[test]
+fn e2e_bytecode_cache_round_trip_matches_source() {
+    // Program touches classes (with a constructor, a setter, and a
+    // getter), closures via `for`, arithmetic, string interpolation,
+    // and `System.print` — enough moving parts to catch most
+    // serialization / install regressions.
+    let source = r#"
+class Counter {
+  construct new() { _n = 0 }
+  tick() { _n = _n + 1 }
+  count { _n }
+}
+
+var c = Counter.new()
+for (i in 0..9) c.tick()
+System.print("count: %(c.count)")
+"#;
+
+    // Baseline run: fresh VM, normal source path.
+    let mut vm_src = VM::new_default();
+    vm_src.output_buffer = Some(String::new());
+    let result_src = vm_src.interpret("main", source);
+    let output_src = vm_src.take_output();
+    assert!(
+        matches!(result_src, InterpretResult::Success),
+        "source path should succeed, got {:?}\n{}",
+        result_src,
+        output_src
+    );
+
+    // Compile-only run: produce a .wlbc blob.
+    let mut vm_build = VM::new_default();
+    let blob = vm_build
+        .compile_source_to_blob(source)
+        .expect("compile_source_to_blob");
+    assert!(
+        wren_lift::serialize::looks_like_wlbc(&blob),
+        "emitted blob must start with the WLBC magic"
+    );
+
+    // Load + run path: fresh VM again, this time from the blob.
+    let mut vm_load = VM::new_default();
+    vm_load.output_buffer = Some(String::new());
+    let result_load = vm_load.interpret_bytecode("main", &blob);
+    let output_load = vm_load.take_output();
+    assert!(
+        matches!(result_load, InterpretResult::Success),
+        "bytecode path should succeed, got {:?}\n{}",
+        result_load,
+        output_load
+    );
+
+    assert_eq!(
+        output_load, output_src,
+        "bytecode cache output must match source output"
+    );
+}
+
+#[test]
+fn e2e_bytecode_cache_rejects_garbage() {
+    // Anything that isn't a WLBC header should cause a clean
+    // CompileError, not a panic.
+    let mut vm = VM::new_default();
+    let result = vm.interpret_bytecode("main", b"not a cache file");
+    assert!(
+        matches!(result, InterpretResult::CompileError),
+        "loader should reject non-wlbc bytes with CompileError"
+    );
+}
