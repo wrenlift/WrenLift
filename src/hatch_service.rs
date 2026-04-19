@@ -63,10 +63,14 @@ impl ServiceConfig {
 }
 
 /// One row in the `packages` table — what `hatch find` returns and
-/// what `hatch publish` sends.
+/// what `hatch publish` sends. `(name, version)` is the compound
+/// primary key: each published version lands as its own row so
+/// consumers can pin exactly (`@hatch:assert-0.1.0` in the index
+/// mirror, `@hatch:assert = "0.1.0"` in hatchfiles).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct PackageRecord {
     pub name: String,
+    pub version: String,
     pub git: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -199,27 +203,60 @@ pub fn clear_credentials() -> Result<bool, ServiceError> {
 // Catalog reads: `hatch find`
 // ---------------------------------------------------------------------------
 
-/// Look up a single package by name. Returns `Ok(None)` if the
-/// catalog doesn't know the name (distinct from a transport error —
-/// the caller can tell the user "not published yet" vs "couldn't
-/// reach the service").
-pub fn find_package(
+/// Look up every published version of a package by name. Returns
+/// an empty list if the catalog has nothing under the name —
+/// distinct from a transport error, which returns `Err`.
+///
+/// The rows arrive sorted newest-first by `version`-desc so
+/// `find_versions(...)?.first()` is always the latest entry.
+pub fn find_versions(
     config: &ServiceConfig,
     name: &str,
-) -> Result<Option<PackageRecord>, ServiceError> {
+) -> Result<Vec<PackageRecord>, ServiceError> {
     if !config.is_configured() {
         return Err(ServiceError::NotConfigured);
     }
-    // PostgREST: exact-match filter + single-row response header.
     let url = format!(
-        "{}/rest/v1/packages?select=*&name=eq.{}",
+        "{}/rest/v1/packages?select=*&name=eq.{}&order=version.desc",
         config.url.trim_end_matches('/'),
         urlencode(name),
     );
     let body = curl_get(&url, &[&format!("apikey: {}", config.anon_key)])?;
     let rows: Vec<PackageRecord> = serde_json::from_str(&body)
-        .map_err(|e| ServiceError::Decode(format!("find_package: {}", e)))?;
+        .map_err(|e| ServiceError::Decode(format!("find_versions: {}", e)))?;
+    Ok(rows)
+}
+
+/// Look up one specific `(name, version)` row. Used by the build-
+/// time resolver before it reaches for the cached artifact.
+pub fn find_exact(
+    config: &ServiceConfig,
+    name: &str,
+    version: &str,
+) -> Result<Option<PackageRecord>, ServiceError> {
+    if !config.is_configured() {
+        return Err(ServiceError::NotConfigured);
+    }
+    let url = format!(
+        "{}/rest/v1/packages?select=*&name=eq.{}&version=eq.{}",
+        config.url.trim_end_matches('/'),
+        urlencode(name),
+        urlencode(version),
+    );
+    let body = curl_get(&url, &[&format!("apikey: {}", config.anon_key)])?;
+    let rows: Vec<PackageRecord> = serde_json::from_str(&body)
+        .map_err(|e| ServiceError::Decode(format!("find_exact: {}", e)))?;
     Ok(rows.into_iter().next())
+}
+
+/// Backwards-compatible shim for `find_versions(...)?.first()` —
+/// kept so existing callers continue to work while we roll out
+/// version-aware clients.
+pub fn find_package(
+    config: &ServiceConfig,
+    name: &str,
+) -> Result<Option<PackageRecord>, ServiceError> {
+    Ok(find_versions(config, name)?.into_iter().next())
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +275,11 @@ pub fn publish_package(
     if !config.is_configured() {
         return Err(ServiceError::NotConfigured);
     }
+    // Upsert on the `(name, version)` compound primary key so
+    // repeated publishes of the same version update the row in
+    // place instead of erroring on the PK violation.
     let url = format!(
-        "{}/rest/v1/packages?on_conflict=name",
+        "{}/rest/v1/packages?on_conflict=name,version",
         config.url.trim_end_matches('/')
     );
     let body = serde_json::to_string(&record)
@@ -734,9 +774,11 @@ mod tests {
     fn package_record_omits_owner_on_submit() {
         // Submissions shouldn't include the owner field — the server
         // sets it from the auth'd JWT. We rely on skip_serializing_if
-        // to keep the payload clean.
+        // to keep the payload clean. Version IS included so the
+        // compound primary key gets populated.
         let r = PackageRecord {
             name: "json".into(),
+            version: "1.0.0".into(),
             git: "https://github.com/wrenlift/hatch.git".into(),
             description: Some("JSON parsing".into()),
             owner: None,
@@ -744,6 +786,7 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(!json.contains("owner"), "owner leaked into submit body: {}", json);
         assert!(json.contains("json"));
+        assert!(json.contains("1.0.0"));
     }
 
     #[test]
@@ -752,12 +795,14 @@ mod tests {
         // who holds the name in `hatch find`.
         let json = r#"{
             "name": "json",
+            "version": "1.0.0",
             "git": "https://github.com/wrenlift/hatch.git",
             "description": "JSON parsing",
             "owner": "01234567-89ab-cdef-0123-456789abcdef"
         }"#;
         let r: PackageRecord = serde_json::from_str(json).unwrap();
         assert_eq!(r.owner.as_deref(), Some("01234567-89ab-cdef-0123-456789abcdef"));
+        assert_eq!(r.version, "1.0.0");
     }
 
     #[test]

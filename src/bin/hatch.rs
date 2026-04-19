@@ -634,33 +634,53 @@ fn cmd_logout() {
 
 fn cmd_find(name: &str) {
     let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
-    match wren_lift::hatch_service::find_package(&cfg, name) {
-        Ok(Some(rec)) => {
-            println!("{} — {}", rec.name, rec.git);
-            if let Some(desc) = rec.description.as_deref() {
-                if !desc.is_empty() {
-                    println!("  {}", desc);
-                }
+    // Accept `<name>@<version>` to narrow down; otherwise list every
+    // published version with the newest first.
+    let (bare_name, version_filter) =
+        wren_lift::hatch_registry::split_name_version(name);
+    let rows = match version_filter {
+        Some(v) => match wren_lift::hatch_service::find_exact(&cfg, bare_name, v) {
+            Ok(Some(r)) => vec![r],
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
             }
-            if let Some(owner) = rec.owner.as_deref() {
-                println!("  owner: {}", owner);
+        },
+        None => match wren_lift::hatch_service::find_versions(&cfg, bare_name) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
             }
-            // Suggest the exact hatchfile line so users don't have
-            // to hand-craft the inline-table form.
-            println!(
-                "\nTo use, add to your hatchfile:\n  [dependencies]\n  {} = {{ git = \"{}\", tag = \"<your tag>\" }}",
-                rec.name, rec.git,
-            );
-        }
-        Ok(None) => {
-            eprintln!("hatch: no package '{}' in the catalog", name);
-            process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            process::exit(1);
+        },
+    };
+
+    if rows.is_empty() {
+        eprintln!("hatch: no package '{}' in the catalog", name);
+        process::exit(1);
+    }
+
+    let latest = &rows[0];
+    println!("{}@{} — {}", latest.name, latest.version, latest.git);
+    if let Some(desc) = latest.description.as_deref() {
+        if !desc.is_empty() {
+            println!("  {}", desc);
         }
     }
+    if let Some(owner) = latest.owner.as_deref() {
+        println!("  owner: {}", owner);
+    }
+    if rows.len() > 1 {
+        println!("  versions:");
+        for row in rows.iter().skip(1) {
+            println!("    {}", row.version);
+        }
+    }
+    println!(
+        "\nTo use, add to your hatchfile:\n  [dependencies]\n  \"{}\" = \"{}\"",
+        latest.name, latest.version,
+    );
 }
 
 fn cmd_publish(dir: &Path, git_override: Option<&str>) {
@@ -734,6 +754,7 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
 
     let record = wren_lift::hatch_service::PackageRecord {
         name: manifest.name.clone(),
+        version: manifest.version.clone(),
         git: git.clone(),
         description: None,
         owner: None, // server sets from JWT
@@ -741,7 +762,10 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
 
     match wren_lift::hatch_service::publish_package(&cfg, &creds, &record) {
         Ok(()) => {
-            println!("published {} → {}", record.name, record.git);
+            println!(
+                "published {}@{} → {}",
+                record.name, record.version, record.git
+            );
         }
         Err(e) => {
             eprintln!("error: {}", e);
