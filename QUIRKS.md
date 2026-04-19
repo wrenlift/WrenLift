@@ -89,7 +89,46 @@ formatting. Required threading `&dyn NativeContext` into
 
 ## Open
 
-### (none currently tracked)
+### Fiber abort through an intermediate closure call corrupts caller state
 
-Add entries as they surface; ideal shape is a minimal repro +
-expected-vs-actual + where the offending code lives.
+Status: **open**
+
+```wren
+class T {
+  static outer(body) { body.call() }
+  static inner(arg) {
+    if (!(arg is Fn)) Fiber.abort("bad arg")
+  }
+}
+
+// Direct abort in the fiber's entry closure — works:
+var a = Fiber.new { T.inner("nope") }.try()
+System.print(Expect.that("x"))            // "instance of Assertion"  ✓
+
+// Abort one frame deeper (through an intermediate body.call()):
+var b = Fiber.new {
+  T.outer { T.inner("nope") }             // closure inside closure
+}.try()
+System.print(Expect.that("x"))            // "?"  ✗  UNDEFINED returned
+```
+
+After the nested abort, the next call in the outer fiber returns
+`UNDEFINED` (hence `"?"` via interpolation). Suggests the fiber
+unwind isn't fully restoring the caller's register file or call
+frame when the abort crosses a `body.call()`-style re-entry.
+
+The simpler single-frame case (fiber → native that aborts) works
+fine, as does the single-frame case where the fiber body itself
+calls `Fiber.abort` directly. Only the *two-frame-deep* pattern
+(fiber → Wren closure → native abort) triggers it.
+
+Impact on the ecosystem: blocks `@hatch:test` from running a spec
+that tests a non-Fn `Test.it` argument inside a `Test.describe`
+block — we work around by asserting the abort against a bare
+`Test.it` call. Also blocks any user-level "try this block, catch
+the error" pattern that has nested closures.
+
+Next step: instrument the fiber-unwind path in
+`src/runtime/vm_interp.rs` (look at `resume_caller` /
+`try_run_root_frame` / the abort propagation loop) to see what
+state survives vs. what gets clobbered.
