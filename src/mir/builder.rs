@@ -841,12 +841,28 @@ impl<'a> MirBuilder<'a> {
             Expr::LogicalOp { op, left, right } => self.lower_logical(*op, left, right),
 
             Expr::Is { value, type_name } => {
+                // Lower `x is Klass` uniformly as `x.is(Klass)` so
+                // it works for *any* class-valued RHS — a literal
+                // class name, a parameter, a field access, or the
+                // result of `.type`. The previous fast-path used
+                // `IsType` with a compile-time symbol, which
+                // silently returned false when the RHS wasn't a
+                // literal class identifier (e.g. `is klass` where
+                // `klass` was a local holding a class).
+                //
+                // `Object.is(_)` compares actual class pointers
+                // while walking the superclass chain; a future
+                // devirtualization pass can fold it back to
+                // `IsType` when the RHS is statically known to
+                // reference a core class.
                 let val = self.lower_expr(value);
-                let class_sym = match &type_name.0 {
-                    Expr::Ident(sym) => *sym,
-                    _ => self.intern("<unknown>"),
-                };
-                self.emit(Instruction::IsType(val, class_sym))
+                let class_val = self.lower_expr(type_name);
+                let sig = self.intern("is(_)");
+                self.emit(Instruction::Call {
+                    receiver: val,
+                    method: sig,
+                    args: vec![class_val],
+                })
             }
 
             Expr::Assign { target, value } => {
@@ -2145,8 +2161,16 @@ foreign class Db {
 
     #[test]
     fn test_lower_is_type() {
-        let (func, _) = lower("var x = 1\nx is Num");
-        assert_has_instruction(&func, |i| matches!(i, Instruction::IsType(..)));
+        // `is` now always dispatches through `Object.is(_)` so it
+        // works for both literal class idents and class-valued
+        // variables. The static `IsType` opcode is kept for a
+        // future devirt pass to re-introduce when the RHS is a
+        // known core class.
+        let (func, interner) = lower("var x = 1\nx is Num");
+        let is_sym = interner.lookup("is(_)").expect("is(_) interned");
+        assert_has_instruction(&func, |i| {
+            matches!(i, Instruction::Call { method, .. } if *method == is_sym)
+        });
     }
 
     #[test]

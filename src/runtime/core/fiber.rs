@@ -29,8 +29,16 @@ unsafe fn as_closure(val: Value) -> Option<*mut ObjClosure> {
     }
 }
 
-/// Set up a fiber's initial MIR frame from a closure.
-unsafe fn setup_fiber_from_closure(fiber: *mut ObjFiber, closure: *mut ObjClosure) {
+/// Set up a fiber's initial MIR frame from a closure. `module_name`
+/// inherits from the caller so module-scope identifiers (classes,
+/// top-level vars) remain reachable inside the fiber's closure — a
+/// hardcoded "main" used to silently return null for references
+/// defined in any other module.
+unsafe fn setup_fiber_from_closure(
+    fiber: *mut ObjFiber,
+    closure: *mut ObjClosure,
+    module_name: std::rc::Rc<String>,
+) {
     let fn_ptr = (*closure).function;
     let func_id = FuncId((*fn_ptr).fn_id);
 
@@ -42,13 +50,28 @@ unsafe fn setup_fiber_from_closure(fiber: *mut ObjFiber, closure: *mut ObjClosur
         ip: 0,
         pc: 0,
         values: Vec::new(),
-        module_name: std::rc::Rc::new(String::from("main")),
+        module_name,
         return_dst: None,
         closure: Some(closure),
         defining_class: None,
         bc_ptr: std::ptr::null(),
     });
     (*fiber).state = FiberState::New;
+}
+
+/// Pull the module name from the caller's topmost frame so a
+/// newly-spawned fiber resolves `Greet` (etc.) against the module
+/// where it was defined, not a hardcoded "main".
+unsafe fn current_module_name(ctx: &mut dyn NativeContext) -> std::rc::Rc<String> {
+    let caller = ctx.get_current_fiber();
+    if caller.is_null() {
+        return std::rc::Rc::new(String::from("main"));
+    }
+    (*caller)
+        .mir_frames
+        .last()
+        .map(|f| f.module_name.clone())
+        .unwrap_or_else(|| std::rc::Rc::new(String::from("main")))
 }
 
 // --- Static methods ---
@@ -60,10 +83,14 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(closure) => {
             // Capture spawn-site stack trace if opt-in is enabled
             let spawn_trace = ctx.capture_spawn_trace();
+            // Resolve the module name BEFORE allocating the fiber — the
+            // allocation borrows ctx mutably and we need to keep the
+            // borrow free when we reach in for the caller's frame.
+            let module_name = unsafe { current_module_name(ctx) };
             let fiber = ctx.alloc_fiber();
             unsafe {
                 (*fiber).header.class = ctx.get_fiber_class();
-                setup_fiber_from_closure(fiber, closure);
+                setup_fiber_from_closure(fiber, closure, module_name);
                 (*fiber).spawn_trace = spawn_trace;
             }
             Value::object(fiber as *mut u8)

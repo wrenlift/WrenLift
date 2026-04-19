@@ -112,6 +112,71 @@ pub fn initialize(vm: &mut VM) {
     fn_obj::bind(vm);
     fiber::bind(vm);
     system::bind(vm);
+
+    // Re-propagate inherited methods so every core class sees its
+    // ancestors' fully-populated method tables.
+    //
+    // `make_class` clones the superclass's method table at creation
+    // time, but during bootstrap the superclass's table is still
+    // empty — it only gets populated by the `*::bind` calls above.
+    // Without this fixup, `[1, 2] == [3]` would throw "List does
+    // not implement '==(_)'" because `Object.==(_)` never trickles
+    // down to `List`.
+    propagate_inherited_methods(vm);
+}
+
+/// Walk the core class list and ensure every subclass's method
+/// table reflects its superclass's final state. A method is only
+/// copied down when the subclass's own slot is empty, so overrides
+/// defined in `list::bind` (etc.) stay put.
+fn propagate_inherited_methods(vm: &mut super::vm::VM) {
+    let classes = [
+        vm.object_class,
+        vm.class_class,
+        vm.bool_class,
+        vm.num_class,
+        vm.null_class,
+        vm.fn_class,
+        vm.fiber_class,
+        vm.system_class,
+        vm.sequence_class,
+        vm.string_class,
+        vm.list_class,
+        vm.map_class,
+        vm.range_class,
+        vm.map_sequence_class,
+        vm.skip_sequence_class,
+        vm.take_sequence_class,
+        vm.where_sequence_class,
+        vm.string_byte_seq_class,
+        vm.string_code_point_seq_class,
+        vm.map_entry_class,
+    ];
+    for &cls in &classes {
+        if cls.is_null() {
+            continue;
+        }
+        unsafe {
+            let superclass = (*cls).superclass;
+            if superclass.is_null() {
+                continue;
+            }
+            let parent_methods_ptr = &raw const (*superclass).methods;
+            let parent_methods = (&*parent_methods_ptr).clone();
+            let cls_methods_ptr = &raw mut (*cls).methods;
+            let cls_methods = &mut *cls_methods_ptr;
+            for (idx, method) in parent_methods.iter().enumerate() {
+                if let Some(m) = method {
+                    if idx >= cls_methods.len() {
+                        cls_methods.resize(idx + 1, None);
+                    }
+                    if cls_methods[idx].is_none() {
+                        cls_methods[idx] = Some(*m);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -3759,6 +3759,48 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
                 let obj = unsafe { &*(ptr as *const ObjString) };
                 obj.value.clone()
             }
+            // Core object types format with their shape, matching
+            // what `System.print` emits. Prior to this fix, string
+            // interpolation (`"%(x)"`) hit the "instance of <class>"
+            // fallback for everything non-String, so `"%([1,2])"`
+            // read as "instance of List" instead of "[1, 2]".
+            ObjType::List => {
+                let list = unsafe { &*(ptr as *const crate::runtime::object::ObjList) };
+                let parts: Vec<String> = (0..list.len())
+                    .map(|i| value_to_string(vm, list.get(i).unwrap_or(Value::null())))
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            }
+            ObjType::Map => {
+                let map = unsafe { &*(ptr as *const crate::runtime::object::ObjMap) };
+                let parts: Vec<String> = map
+                    .entries
+                    .iter()
+                    .map(|(k, v)| {
+                        format!("{}: {}", value_to_string(vm, k.0), value_to_string(vm, *v))
+                    })
+                    .collect();
+                format!("{{{}}}", parts.join(", "))
+            }
+            ObjType::Range => {
+                let range = unsafe { &*(ptr as *const crate::runtime::object::ObjRange) };
+                let op = if range.is_inclusive { ".." } else { "..." };
+                format!(
+                    "{}{}{}",
+                    value_to_string(vm, Value::num(range.from)),
+                    op,
+                    value_to_string(vm, Value::num(range.to))
+                )
+            }
+            ObjType::Fn | ObjType::Closure => "Fn".to_string(),
+            ObjType::Fiber => "Fiber".to_string(),
+            // Classes stringify to their own name (`List`, `String`,
+            // a user class's declared name, etc.), matching what
+            // `Class.toString` returns when dispatched explicitly.
+            ObjType::Class => {
+                let class = unsafe { &*(ptr as *const crate::runtime::object::ObjClass) };
+                vm.interner.resolve(class.name).to_string()
+            }
             _ => {
                 let class_name = vm.class_name_of(value);
                 format!("instance of {}", class_name)

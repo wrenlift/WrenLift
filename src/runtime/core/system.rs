@@ -21,7 +21,7 @@ fn system_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     args[1]
 }
 
-fn format_object(value: Value) -> String {
+fn format_object(ctx: &dyn NativeContext, value: Value) -> String {
     if value.is_null() {
         "null".to_string()
     } else if value.is_num() {
@@ -49,7 +49,7 @@ fn format_object(value: Value) -> String {
                 super::super::object::ObjType::List => {
                     let list = unsafe { &*(ptr as *const super::super::object::ObjList) };
                     let parts: Vec<String> = (0..list.len())
-                        .map(|i| format_object(list.get(i).unwrap_or(Value::null())))
+                        .map(|i| format_object(ctx, list.get(i).unwrap_or(Value::null())))
                         .collect();
                     format!("[{}]", parts.join(", "))
                 }
@@ -58,9 +58,9 @@ fn format_object(value: Value) -> String {
                     let op = if range.is_inclusive { ".." } else { "..." };
                     format!(
                         "{}{}{}",
-                        format_object(Value::num(range.from)),
+                        format_object(ctx, Value::num(range.from)),
                         op,
-                        format_object(Value::num(range.to))
+                        format_object(ctx, Value::num(range.to))
                     )
                 }
                 super::super::object::ObjType::Map => {
@@ -68,13 +68,23 @@ fn format_object(value: Value) -> String {
                     let parts: Vec<String> = map
                         .entries
                         .iter()
-                        .map(|(k, v)| format!("{}: {}", format_object(k.0), format_object(*v)))
+                        .map(|(k, v)| format!("{}: {}", format_object(ctx, k.0), format_object(ctx, *v)))
                         .collect();
                     format!("{{{}}}", parts.join(", "))
                 }
                 super::super::object::ObjType::Fn => "Fn".to_string(),
                 super::super::object::ObjType::Closure => "Fn".to_string(),
                 super::super::object::ObjType::Fiber => "Fiber".to_string(),
+                super::super::object::ObjType::Class => {
+                    // `System.print(List)` should render the class's
+                    // name, matching what `Class.toString` returns
+                    // when dispatched explicitly. Falling through
+                    // to "instance" would hide the real value and
+                    // make dispatch-path bugs harder to spot.
+                    let class =
+                        unsafe { &*(ptr as *const super::super::object::ObjClass) };
+                    ctx.resolve_symbol(class.name).to_string()
+                }
                 _ => "instance".to_string(),
             }
         }
@@ -89,14 +99,14 @@ fn system_print_no_arg(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 fn system_print(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let s = format_object(args[1]);
+    let s = format_object(ctx, args[1]);
     ctx.write_output(&s);
     ctx.write_output("\n");
     args[1]
 }
 
 fn system_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let s = format_object(args[1]);
+    let s = format_object(ctx, args[1]);
     ctx.write_output(&s);
     args[1]
 }
@@ -108,13 +118,13 @@ fn system_print_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         if unsafe { (*header).obj_type } == super::super::object::ObjType::List {
             let list = unsafe { &*(ptr as *const super::super::object::ObjList) };
             for elem in list.as_slice() {
-                ctx.write_output(&format_object(*elem));
+                ctx.write_output(&format_object(ctx, *elem));
             }
         } else {
-            ctx.write_output(&format_object(args[1]));
+            ctx.write_output(&format_object(ctx, args[1]));
         }
     } else {
-        ctx.write_output(&format_object(args[1]));
+        ctx.write_output(&format_object(ctx, args[1]));
     }
     ctx.write_output("\n");
     args[1]
@@ -127,13 +137,13 @@ fn system_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         if unsafe { (*header).obj_type } == super::super::object::ObjType::List {
             let list = unsafe { &*(ptr as *const super::super::object::ObjList) };
             for elem in list.as_slice() {
-                ctx.write_output(&format_object(*elem));
+                ctx.write_output(&format_object(ctx, *elem));
             }
         } else {
-            ctx.write_output(&format_object(args[1]));
+            ctx.write_output(&format_object(ctx, args[1]));
         }
     } else {
-        ctx.write_output(&format_object(args[1]));
+        ctx.write_output(&format_object(ctx, args[1]));
     }
     args[1]
 }
