@@ -678,11 +678,75 @@ fn build_recursive(
         },
     };
 
+    rename_entry_to_manifest_name(&mut manifest, &mut sections)?;
     pack_bundled_native_libs(root, &mut manifest, &mut sections)?;
     merge_path_dependencies(root, &mut manifest, &mut sections, visited, cache_dir)?;
 
     let hatch = Hatch { manifest, sections };
     emit(&hatch)
+}
+
+/// When `manifest.name` differs from the entry file's module name,
+/// rename the entry section so the published module's import name
+/// matches how consumers spell the dep. This is what makes
+/// `@hatch:assert` work: the package source lives at an ordinary
+/// filesystem path (`packages/hatch-assert/assert.wren`) but the
+/// module surfaces as `"@hatch:assert"` at install time because
+/// that's the package's declared name.
+///
+/// Only the *entry* module is renamed. Multi-file packages keep
+/// their internal file-stem names for non-entry modules; a package
+/// named `@hatch:fs` with `fs.wren` + `fs/stat.wren` would install
+/// modules `@hatch:fs` and `fs/stat` (or `fs.stat` — whatever the
+/// file layout produces).
+fn rename_entry_to_manifest_name(
+    manifest: &mut Manifest,
+    sections: &mut [Section],
+) -> Result<(), HatchError> {
+    // Only rename for *scoped* packages. A bare name like
+    // `libcounter` is a perfectly normal package whose entry file
+    // can still be `counter.wren`; we shouldn't surprise its
+    // consumers by renaming the module. The scoping characters
+    // (`:` for `@hatch:*`, `@` and `/` for future scopes) are what
+    // signal "this package wants its module imported under the
+    // package name."
+    let is_scoped = manifest
+        .name
+        .chars()
+        .any(|c| matches!(c, ':' | '@' | '/'));
+    if !is_scoped || manifest.name == manifest.entry {
+        return Ok(());
+    }
+
+    let old = manifest.entry.clone();
+    let new = manifest.name.clone();
+
+    // If the entry section doesn't exist, the hatchfile is
+    // pointing at a module that isn't on disk — surface that now
+    // rather than at consumer install time.
+    let entry_section = sections
+        .iter_mut()
+        .find(|s| matches!(s.kind, SectionKind::Wlbc) && s.name == old);
+    let Some(section) = entry_section else {
+        return Err(HatchError::Encode(format!(
+            "manifest.entry '{}' has no matching .wren source",
+            old
+        )));
+    };
+    section.name = new.clone();
+
+    // Mirror the rename in the module list so the install loop
+    // asks for the new name when it iterates manifest.modules.
+    for m in &mut manifest.modules {
+        if m == &old {
+            *m = new.clone();
+        }
+    }
+    // And in the entry field itself, so consumers inspecting the
+    // manifest see consistent naming.
+    manifest.entry = new;
+
+    Ok(())
 }
 
 /// Recursively resolve every dependency and fold its sections into
@@ -884,6 +948,17 @@ fn collect_wren_files(
             continue;
         }
         if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("wren") {
+            // `*.spec.wren` is the convention for test files. They
+            // run under `hatch test`, never ship in built hatches —
+            // publishing test code would bloat the artifact and
+            // create a runtime dependency on the test runner.
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if stem.ends_with(".spec") {
+                continue;
+            }
             let relative = path.strip_prefix(root).unwrap_or(&path);
             let module_name = relative
                 .with_extension("")
@@ -1105,6 +1180,112 @@ macos = "libs/mac/libz.dylib"
         );
         // No OS match — fall back to `any`.
         assert_eq!(entry.resolve_for("linux", "x86_64"), Some("libs/libz"));
+    }
+
+    #[test]
+    fn build_renames_entry_section_to_scoped_manifest_name() {
+        // First-party packages declare their name with a scoped
+        // prefix (`@hatch:assert`) but the source lives on disk
+        // under a shell-safe directory. The build pass must rename
+        // the entry section so consumers can `import "@hatch:assert"`
+        // at runtime.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::write(
+            root.join("assert.wren"),
+            "class Expect {\n  static that(a) { a }\n}",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hatchfile"),
+            r#"name = "@hatch:assert"
+version = "0.1.0"
+entry = "assert"
+"#,
+        )
+        .unwrap();
+
+        let bytes = build_from_source_tree(root).expect("build");
+        let hatch = load(&bytes).unwrap();
+
+        assert_eq!(hatch.manifest.modules, vec!["@hatch:assert"]);
+        assert_eq!(hatch.manifest.entry, "@hatch:assert");
+        assert!(
+            hatch
+                .sections
+                .iter()
+                .any(|s| matches!(s.kind, SectionKind::Wlbc) && s.name == "@hatch:assert"),
+            "expected a Wlbc section named '@hatch:assert', got: {:?}",
+            hatch
+                .sections
+                .iter()
+                .map(|s| (&s.kind, &s.name))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn build_excludes_spec_files_from_sections() {
+        // `*.spec.wren` is test-only and must not land in the
+        // published hatch. `hatch test` loads specs directly from
+        // source — no reason to ship bytecode for them.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("assert.wren"), "class Expect {}").unwrap();
+        std::fs::write(
+            root.join("assert.spec.wren"),
+            "System.print(\"would have run a test\")",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hatchfile"),
+            r#"name = "assert"
+version = "0.1.0"
+entry = "assert"
+"#,
+        )
+        .unwrap();
+
+        let bytes = build_from_source_tree(root).expect("build");
+        let hatch = load(&bytes).unwrap();
+
+        // Only the non-spec module should land in sections + modules.
+        let section_names: Vec<&str> = hatch
+            .sections
+            .iter()
+            .filter(|s| matches!(s.kind, SectionKind::Wlbc))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(section_names, vec!["assert"]);
+        assert!(
+            !hatch.manifest.modules.iter().any(|m| m.contains("spec")),
+            "spec leaked into modules list: {:?}",
+            hatch.manifest.modules
+        );
+    }
+
+    #[test]
+    fn build_errors_when_manifest_entry_has_no_source() {
+        // Author typo — entry points at a file that doesn't exist.
+        // Must fail at build, not at consumer install.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(root.join("main.wren"), "1").unwrap();
+        std::fs::write(
+            root.join("hatchfile"),
+            r#"name = "@hatch:wrong"
+version = "0.1.0"
+entry = "nope"
+"#,
+        )
+        .unwrap();
+
+        let result = build_from_source_tree(root);
+        match result {
+            Err(HatchError::Encode(msg)) => assert!(msg.contains("nope")),
+            other => panic!("expected encode error, got {:?}", other),
+        }
     }
 
     #[test]
