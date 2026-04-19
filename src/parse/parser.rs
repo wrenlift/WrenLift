@@ -263,8 +263,7 @@ impl Parser {
             if !self.check(&Token::Ident) {
                 let span = self.current_span();
                 self.errors.push(
-                    Diagnostic::error("expected attribute name after `#`")
-                        .with_label(span, "here"),
+                    Diagnostic::error("expected attribute name after `#`").with_label(span, "here"),
                 );
                 // Best-effort recovery: skip to end of line and carry on.
                 while !self.is_at_end() && !self.check(&Token::Newline) {
@@ -384,8 +383,10 @@ impl Parser {
             _ => {
                 let span = self.current_span();
                 self.errors.push(
-                    Diagnostic::error("expected attribute value (number, string, bool, null, or identifier)")
-                        .with_label(span, "here"),
+                    Diagnostic::error(
+                        "expected attribute value (number, string, bool, null, or identifier)",
+                    )
+                    .with_label(span, "here"),
                 );
                 None
             }
@@ -2488,10 +2489,7 @@ mod tests {
                 assert_eq!(c.attributes.len(), 1);
                 assert!(c.attributes[0].is_runtime);
                 assert!(matches!(c.attributes[0].body, AttributeBody::Flag));
-                assert_eq!(
-                    result.interner.resolve(c.attributes[0].name.0),
-                    "runnable"
-                );
+                assert_eq!(result.interner.resolve(c.attributes[0].name.0), "runnable");
             }
             _ => panic!("expected Class"),
         }

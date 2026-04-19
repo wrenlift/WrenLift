@@ -321,7 +321,10 @@ fn cmd_inspect(path: &Path) {
             match dep {
                 wren_lift::hatch::Dependency::Version(v) => println!("    {} = {}", name, v),
                 wren_lift::hatch::Dependency::Path { path, version } => match version {
-                    Some(v) => println!("    {} = {{ path = \"{}\", version = \"{}\" }}", name, path, v),
+                    Some(v) => println!(
+                        "    {} = {{ path = \"{}\", version = \"{}\" }}",
+                        name, path, v
+                    ),
                     None => println!("    {} = {{ path = \"{}\" }}", name, path),
                 },
                 wren_lift::hatch::Dependency::Git {
@@ -426,11 +429,7 @@ fn cmd_install(dir: &Path, package: Option<&str>) {
             record_in_hatchfile(&mut doc, name, &resolved_version);
 
             if let Err(e) = std::fs::write(&hatchfile_path, doc.to_string()) {
-                eprintln!(
-                    "error: cannot update '{}': {}",
-                    hatchfile_path.display(),
-                    e
-                );
+                eprintln!("error: cannot update '{}': {}", hatchfile_path.display(), e);
                 process::exit(1);
             }
             println!("installed {}@{}", name, resolved_version);
@@ -493,9 +492,7 @@ fn install_git(cache_dir: &Path, name: &str, spec: &GitSpec) {
     let git_ref = match spec.git_ref() {
         Some(r) => r,
         None => {
-            eprintln!(
-                "error: git dependency `{name}` needs one of `tag`, `rev`, or `branch`"
-            );
+            eprintln!("error: git dependency `{name}` needs one of `tag`, `rev`, or `branch`");
             process::exit(1);
         }
     };
@@ -526,9 +523,7 @@ impl GitSpec {
         } else if let Some(t) = self.tag.as_deref() {
             Some(wren_lift::hatch::GitRef::Tag(t))
         } else {
-            self.branch
-                .as_deref()
-                .map(wren_lift::hatch::GitRef::Branch)
+            self.branch.as_deref().map(wren_lift::hatch::GitRef::Branch)
         }
     }
 }
@@ -540,7 +535,10 @@ fn extract_git_spec(item: &toml_edit::Item) -> Option<GitSpec> {
         git,
         tag: tbl.get("tag").and_then(|i| i.as_str()).map(str::to_string),
         rev: tbl.get("rev").and_then(|i| i.as_str()).map(str::to_string),
-        branch: tbl.get("branch").and_then(|i| i.as_str()).map(str::to_string),
+        branch: tbl
+            .get("branch")
+            .and_then(|i| i.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -636,8 +634,7 @@ fn cmd_find(name: &str) {
     let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
     // Accept `<name>@<version>` to narrow down; otherwise list every
     // published version with the newest first.
-    let (bare_name, version_filter) =
-        wren_lift::hatch_registry::split_name_version(name);
+    let (bare_name, version_filter) = wren_lift::hatch_registry::split_name_version(name);
     let rows = match version_filter {
         Some(v) => match wren_lift::hatch_service::find_exact(&cfg, bare_name, v) {
             Ok(Some(r)) => vec![r],

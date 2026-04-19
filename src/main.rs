@@ -188,9 +188,7 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 /// they must already be installed into the VM (see
 /// [`preinstall_spec_dependencies`]), so this loader only covers
 /// imports that sit next to the source file on disk.
-fn make_module_loader(
-    running_file_dir: PathBuf,
-) -> Box<dyn Fn(&str) -> Option<String>> {
+fn make_module_loader(running_file_dir: PathBuf) -> Box<dyn Fn(&str) -> Option<String>> {
     Box::new(move |name: &str| -> Option<String> {
         if name.starts_with("./") || name.starts_with("../") {
             let rel = Path::new(name);
@@ -222,18 +220,13 @@ fn preinstall_spec_dependencies(vm: &mut VM, source_dir: &Path) -> Result<(), St
     };
     let text = fs::read_to_string(&hatchfile)
         .map_err(|e| format!("reading {}: {}", hatchfile.display(), e))?;
-    let manifest: wren_lift::hatch::Manifest = toml::from_str(&text)
-        .map_err(|e| format!("parsing {}: {}", hatchfile.display(), e))?;
+    let manifest: wren_lift::hatch::Manifest =
+        toml::from_str(&text).map_err(|e| format!("parsing {}: {}", hatchfile.display(), e))?;
 
     let workspace_root = hatchfile.parent().unwrap_or(Path::new("."));
     for (dep_name, dep) in &manifest.spec_dependencies {
-        let bytes = wren_lift::hatch::resolve_dependency_bytes(
-            workspace_root,
-            dep_name,
-            dep,
-            None,
-        )
-        .map_err(|e| format!("resolving spec-dep '{}': {}", dep_name, e))?;
+        let bytes = wren_lift::hatch::resolve_dependency_bytes(workspace_root, dep_name, dep, None)
+            .map_err(|e| format!("resolving spec-dep '{}': {}", dep_name, e))?;
         match vm.install_hatch_modules(&bytes) {
             InterpretResult::Success => {}
             InterpretResult::CompileError => {
@@ -612,12 +605,7 @@ fn build_hatch_package(root: &str, out_path: &str) {
         eprintln!("error: cannot write '{}': {}", out_path, e);
         process::exit(1);
     }
-    eprintln!(
-        "bundled {} bytes from {} → {}",
-        bytes.len(),
-        root,
-        out_path
-    );
+    eprintln!("bundled {} bytes from {} → {}", bytes.len(), root, out_path);
 }
 
 /// Parse a `.hatch` byte stream and print its manifest + section

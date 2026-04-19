@@ -61,7 +61,11 @@ fn list_subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             };
             let from = normalize(range.from as i64);
             let to_raw = normalize(range.to as i64);
-            let end = if range.is_inclusive { to_raw + 1 } else { to_raw };
+            let end = if range.is_inclusive {
+                to_raw + 1
+            } else {
+                to_raw
+            };
             if from < 0 || end < from || end > len {
                 ctx.runtime_error(format!(
                     "List slice {}..{} out of bounds.",

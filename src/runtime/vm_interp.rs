@@ -1902,10 +1902,20 @@ fn run_fiber_with_stop_depth(
                         Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
-                                    vm, fiber, pc, &mut values, func, &arg_vals,
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &arg_vals,
                                 ),
                                 Method::ForeignC(func) => call_foreign_c_with_frame_sync(
-                                    vm, fiber, pc, &mut values, func, &arg_vals,
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &arg_vals,
                                 ),
                                 _ => unreachable!(),
                             };
@@ -2375,10 +2385,20 @@ fn run_fiber_with_stop_depth(
                             Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
                                 let result = match m {
                                     Method::Native(func) => call_native_with_frame_sync(
-                                        vm, fiber, pc, &mut values, func, &arg_vals,
+                                        vm,
+                                        fiber,
+                                        pc,
+                                        &mut values,
+                                        func,
+                                        &arg_vals,
                                     ),
                                     Method::ForeignC(func) => call_foreign_c_with_frame_sync(
-                                        vm, fiber, pc, &mut values, func, &arg_vals,
+                                        vm,
+                                        fiber,
+                                        pc,
+                                        &mut values,
+                                        func,
+                                        &arg_vals,
                                     ),
                                     _ => unreachable!(),
                                 };
@@ -2451,10 +2471,20 @@ fn run_fiber_with_stop_depth(
                         Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
-                                    vm, fiber, pc, &mut values, func, &all_args,
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &all_args,
                                 ),
                                 Method::ForeignC(func) => call_foreign_c_with_frame_sync(
-                                    vm, fiber, pc, &mut values, func, &all_args,
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &all_args,
                                 ),
                                 _ => unreachable!(),
                             };
@@ -2502,10 +2532,20 @@ fn run_fiber_with_stop_depth(
                         Some(m @ (Method::Native(_) | Method::ForeignC(_))) => {
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
-                                    vm, fiber, pc, &mut values, func, &all_args,
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &all_args,
                                 ),
                                 Method::ForeignC(func) => call_foreign_c_with_frame_sync(
-                                    vm, fiber, pc, &mut values, func, &all_args,
+                                    vm,
+                                    fiber,
+                                    pc,
+                                    &mut values,
+                                    func,
+                                    &all_args,
                                 ),
                                 _ => unreachable!(),
                             };
@@ -2874,8 +2914,7 @@ fn run_fiber_with_stop_depth(
                         // Parallel-assign true-branch bindings (read all
                         // sources before any write — see Op::Branch).
                         let mut p = true_params_start;
-                        let mut bindings: [(u16, Value); 16] =
-                            [(0, Value::null()); 16];
+                        let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
                         let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
                         let use_heap = t_argc > bindings.len();
                         for idx in 0..t_argc {
@@ -2901,8 +2940,7 @@ fn run_fiber_with_stop_depth(
                     } else {
                         // Same parallel-assign for the false path.
                         let mut p = false_params_start;
-                        let mut bindings: [(u16, Value); 16] =
-                            [(0, Value::null()); 16];
+                        let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
                         let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
                         let use_heap = f_argc > bindings.len();
                         for idx in 0..f_argc {

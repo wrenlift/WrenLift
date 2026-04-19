@@ -68,7 +68,9 @@ fn format_object(ctx: &dyn NativeContext, value: Value) -> String {
                     let parts: Vec<String> = map
                         .entries
                         .iter()
-                        .map(|(k, v)| format!("{}: {}", format_object(ctx, k.0), format_object(ctx, *v)))
+                        .map(|(k, v)| {
+                            format!("{}: {}", format_object(ctx, k.0), format_object(ctx, *v))
+                        })
                         .collect();
                     format!("{{{}}}", parts.join(", "))
                 }
@@ -81,8 +83,7 @@ fn format_object(ctx: &dyn NativeContext, value: Value) -> String {
                     // when dispatched explicitly. Falling through
                     // to "instance" would hide the real value and
                     // make dispatch-path bugs harder to spot.
-                    let class =
-                        unsafe { &*(ptr as *const super::super::object::ObjClass) };
+                    let class = unsafe { &*(ptr as *const super::super::object::ObjClass) };
                     ctx.resolve_symbol(class.name).to_string()
                 }
                 _ => "instance".to_string(),

@@ -259,10 +259,7 @@ pub fn ensure_git_checkout(
         // Retry without depth in case the remote rejected the
         // shallow fetch for this ref (e.g. servers without
         // allowAnySHA1InWant for raw revs).
-        run_git(
-            Some(&checkout),
-            &["fetch", "origin", git_ref.as_str()],
-        )?;
+        run_git(Some(&checkout), &["fetch", "origin", git_ref.as_str()])?;
     }
     run_git(Some(&checkout), &["checkout", "-q", "FETCH_HEAD", "--"])?;
 
@@ -279,10 +276,7 @@ pub fn ensure_git_checkout(
     Ok(checkout)
 }
 
-fn run_git(
-    cwd: Option<&std::path::Path>,
-    args: &[&str],
-) -> Result<(), RegistryError> {
+fn run_git(cwd: Option<&std::path::Path>, args: &[&str]) -> Result<(), RegistryError> {
     let mut cmd = Command::new("git");
     cmd.args(args);
     if let Some(dir) = cwd {
@@ -328,13 +322,7 @@ fn sanitize_ref_for_path(git_ref: &str) -> String {
 
 fn download(url: &str, dest: &std::path::Path) -> Result<(), RegistryError> {
     let mut cmd = Command::new("curl");
-    cmd.args([
-        "-sSL",
-        "--fail",
-        "-o",
-        dest.to_string_lossy().as_ref(),
-        url,
-    ]);
+    cmd.args(["-sSL", "--fail", "-o", dest.to_string_lossy().as_ref(), url]);
     let output = match cmd.output() {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

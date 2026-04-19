@@ -338,10 +338,7 @@ impl VM {
     /// Reports all compile-time diagnostics to stderr the same way
     /// `interpret` does, returning `InterpretResult::CompileError` on
     /// any parse / sema failure.
-    pub fn compile_source_to_blob(
-        &mut self,
-        source: &str,
-    ) -> Result<Vec<u8>, InterpretResult> {
+    pub fn compile_source_to_blob(&mut self, source: &str) -> Result<Vec<u8>, InterpretResult> {
         use crate::diagnostics::Severity;
         use crate::mir::opt::{
             self, constfold::ConstFold, cse::Cse, dce::Dce, inline::TypeSpecialize, licm::Licm,
@@ -442,11 +439,7 @@ impl VM {
     /// top-level fiber runs. Same semantics as `interpret(name, src)`
     /// modulo anything that depended on having source text (e.g. span
     /// diagnostics carry snapshot spans, not fresh source byte ranges).
-    pub fn interpret_bytecode(
-        &mut self,
-        module_name: &str,
-        bytes: &[u8],
-    ) -> InterpretResult {
+    pub fn interpret_bytecode(&mut self, module_name: &str, bytes: &[u8]) -> InterpretResult {
         let module_key = module_name.to_string();
         if !self.loading_modules.insert(module_key.clone()) {
             self.report_error(&format!(
@@ -516,10 +509,7 @@ impl VM {
     /// bundled library. Returns `CompileError` on any I/O failure —
     /// partial extraction would leave the hatch in an inconsistent
     /// state.
-    fn extract_hatch_native_sections(
-        &mut self,
-        hatch: &crate::hatch::Hatch,
-    ) -> InterpretResult {
+    fn extract_hatch_native_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
         let has_native = hatch
             .sections
             .iter()
@@ -544,8 +534,7 @@ impl VM {
             if !matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
                 continue;
             }
-            let filename =
-                crate::runtime::foreign::default_native_lib_filename(&section.name);
+            let filename = crate::runtime::foreign::default_native_lib_filename(&section.name);
             let full = dir_path.join(&filename);
             if let Err(e) = std::fs::write(&full, &section.data) {
                 eprintln!(
@@ -591,11 +580,9 @@ impl VM {
                 continue;
             }
 
-            let section = match hatch
-                .sections
-                .iter()
-                .find(|s| matches!(s.kind, crate::hatch::SectionKind::Wlbc) && &s.name == module_name)
-            {
+            let section = match hatch.sections.iter().find(|s| {
+                matches!(s.kind, crate::hatch::SectionKind::Wlbc) && &s.name == module_name
+            }) {
                 Some(s) => s,
                 None => {
                     eprintln!(
@@ -1050,7 +1037,9 @@ impl VM {
                                     if trace {
                                         eprintln!(
                                             "wrenlift: bound '{}' → {} (sym={})",
-                                            fm.signature, symbol_name, bind_sym.index(),
+                                            fm.signature,
+                                            symbol_name,
+                                            bind_sym.index(),
                                         );
                                     }
                                     unsafe {

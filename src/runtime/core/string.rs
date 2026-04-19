@@ -72,8 +72,7 @@ fn subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         let ptr = args[1].as_object().unwrap();
         let header = unsafe { &*(ptr as *const super::super::object::ObjHeader) };
         if header.obj_type == super::super::object::ObjType::Range {
-            let range =
-                unsafe { &*(ptr as *const super::super::object::ObjRange) };
+            let range = unsafe { &*(ptr as *const super::super::object::ObjRange) };
             let char_count = s.chars().count() as i64;
             let (start, end) = match normalize_range(range, char_count) {
                 Some(pair) => pair,
@@ -148,7 +147,11 @@ fn normalize_range(range: &super::super::object::ObjRange, len: i64) -> Option<(
     // allows reversed ranges, but substring slicing reads strangest
     // when the result would be empty or reversed, so require
     // non-decreasing bounds here.
-    let end = if range.is_inclusive { to_raw + 1 } else { to_raw };
+    let end = if range.is_inclusive {
+        to_raw + 1
+    } else {
+        to_raw
+    };
     if from < 0 || end < from || end > len {
         return None;
     }

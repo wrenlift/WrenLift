@@ -182,12 +182,12 @@ pub fn resolve_symbol(
 ) -> Result<ForeignCFn, ForeignLoadError> {
     unsafe {
         let sym: libloading::Symbol<ForeignCFn> =
-            library.get(symbol.as_bytes()).map_err(|_| {
-                ForeignLoadError::SymbolNotFound {
+            library
+                .get(symbol.as_bytes())
+                .map_err(|_| ForeignLoadError::SymbolNotFound {
                     library: library_name.to_string(),
                     symbol: symbol.to_string(),
-                }
-            })?;
+                })?;
         Ok(*sym)
     }
 }
@@ -289,7 +289,10 @@ mod tests {
     #[test]
     fn load_library_missing_returns_error() {
         let result = load_library("__wrenlift_does_not_exist__", &[], &HashMap::new());
-        assert!(matches!(result, Err(ForeignLoadError::LibraryNotFound { .. })));
+        assert!(matches!(
+            result,
+            Err(ForeignLoadError::LibraryNotFound { .. })
+        ));
     }
 
     #[test]
@@ -328,7 +331,10 @@ mod tests {
             PathBuf::from("/definitely/not/here/libsqlite3.dylib"),
         );
         let result = load_library("sqlite3", &[], &overrides);
-        assert!(matches!(result, Err(ForeignLoadError::LibraryNotFound { .. })));
+        assert!(matches!(
+            result,
+            Err(ForeignLoadError::LibraryNotFound { .. })
+        ));
     }
 
     extern "C" fn test_doubler(vm: *mut VM) {

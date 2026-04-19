@@ -1886,11 +1886,13 @@ mod tests {
         // `#runnable`  → runtime Flag
         // `#!internal` → compile-time, must be stripped
         // `#author = "Bob"` → runtime Value
-        let module = lower_full(
-            "#runnable\n#!internal\n#author = \"Bob\"\nclass Foo {}",
-        );
+        let module = lower_full("#runnable\n#!internal\n#author = \"Bob\"\nclass Foo {}");
         let class = &module.classes[0];
-        assert_eq!(class.attributes.len(), 2, "compile-time attr must be dropped");
+        assert_eq!(
+            class.attributes.len(),
+            2,
+            "compile-time attr must be dropped"
+        );
         assert_eq!(class.attributes[0].key, "runnable");
         assert!(class.attributes[0].value.is_none());
         assert_eq!(class.attributes[1].key, "author");
@@ -1899,9 +1901,8 @@ mod tests {
 
     #[test]
     fn test_lower_class_group_attribute_flattens() {
-        let module = lower_full(
-            "#doc(brief = \"sum\", example = 42)\nclass Math {\n  static go() { 1 }\n}",
-        );
+        let module =
+            lower_full("#doc(brief = \"sum\", example = 42)\nclass Math {\n  static go() { 1 }\n}");
         let class = &module.classes[0];
         assert_eq!(class.attributes.len(), 2);
         assert_eq!(class.attributes[0].group.as_deref(), Some("doc"));
@@ -2168,9 +2169,10 @@ foreign class Db {
         // known core class.
         let (func, interner) = lower("var x = 1\nx is Num");
         let is_sym = interner.lookup("is(_)").expect("is(_) interned");
-        assert_has_instruction(&func, |i| {
-            matches!(i, Instruction::Call { method, .. } if *method == is_sym)
-        });
+        assert_has_instruction(
+            &func,
+            |i| matches!(i, Instruction::Call { method, .. } if *method == is_sym),
+        );
     }
 
     #[test]

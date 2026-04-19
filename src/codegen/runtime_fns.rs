@@ -1894,8 +1894,8 @@ fn dispatch_method(
         Method::ForeignC(foreign_fn) => {
             vm.engine
                 .note_runtime_call_stats(|s| s.dispatch_method_native += 1);
-            let result = crate::runtime::foreign::dispatch_foreign_c(vm, foreign_fn, args)
-                .to_bits();
+            let result =
+                crate::runtime::foreign::dispatch_foreign_c(vm, foreign_fn, args).to_bits();
             if let Some(action) = vm.pending_fiber_action.take() {
                 return handle_jit_fiber_action(vm, action);
             }

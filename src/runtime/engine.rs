@@ -540,11 +540,7 @@ impl ExecutionEngine {
     }
 
     /// Register a MIR function bound to the given defining module.
-    pub fn register_function_in(
-        &mut self,
-        mir: MirFunction,
-        module: Option<Rc<String>>,
-    ) -> FuncId {
+    pub fn register_function_in(&mut self, mir: MirFunction, module: Option<Rc<String>>) -> FuncId {
         let id = FuncId(self.functions.len() as u32);
         let trivial_getter = Self::mir_trivial_getter_field(&mir);
         let trivial_setter = Self::mir_trivial_setter_field(&mir);
@@ -582,7 +578,9 @@ impl ExecutionEngine {
     /// so `GetModuleVar` binds against the slots the function was
     /// compiled against.
     pub fn func_module(&self, id: FuncId) -> Option<&Rc<String>> {
-        self.func_modules.get(id.0 as usize).and_then(|m| m.as_ref())
+        self.func_modules
+            .get(id.0 as usize)
+            .and_then(|m| m.as_ref())
     }
 
     /// Register a compiled function's code range for GC stack walking.

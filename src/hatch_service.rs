@@ -37,8 +37,7 @@ pub const DEFAULT_SERVICE_URL: &str = "https://bncbgsfttafynyalrrbb.supabase.co"
 /// additionally require the user's JWT from `hatch login`, so
 /// leaking this key only exposes what's already public: reads of
 /// the `packages` table. Override via `HATCH_SERVICE_ANON_KEY`.
-pub const DEFAULT_SERVICE_ANON_KEY: &str =
-    "sb_publishable_uTNCHuGnN5mzsWbuJI8CQg_0qFEBQRz";
+pub const DEFAULT_SERVICE_ANON_KEY: &str = "sb_publishable_uTNCHuGnN5mzsWbuJI8CQg_0qFEBQRz";
 
 /// Runtime configuration resolved from env vars (with defaults).
 #[derive(Debug, Clone)]
@@ -166,8 +165,8 @@ pub fn load_credentials() -> Result<Option<Credentials>, ServiceError> {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path)?;
-    let creds: Credentials = toml::from_str(&text)
-        .map_err(|e| ServiceError::Decode(format!("credentials: {}", e)))?;
+    let creds: Credentials =
+        toml::from_str(&text).map_err(|e| ServiceError::Decode(format!("credentials: {}", e)))?;
     Ok(Some(creds))
 }
 
@@ -592,9 +591,7 @@ fn urldecode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) =
-                (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-            {
+            if let (Some(h), Some(l)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2])) {
                 out.push((h << 4) | l);
                 i += 3;
                 continue;
@@ -658,10 +655,7 @@ fn curl_get(url: &str, headers: &[&str]) -> Result<String, ServiceError> {
 
 fn curl_post(url: &str, headers: &[&str], body: &str) -> Result<String, ServiceError> {
     let mut cmd = Command::new("curl");
-    cmd.arg("-sS")
-        .arg("--fail-with-body")
-        .arg("-X")
-        .arg("POST");
+    cmd.arg("-sS").arg("--fail-with-body").arg("-X").arg("POST");
     for h in headers {
         cmd.arg("-H").arg(h);
     }
@@ -784,7 +778,11 @@ mod tests {
             owner: None,
         };
         let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains("owner"), "owner leaked into submit body: {}", json);
+        assert!(
+            !json.contains("owner"),
+            "owner leaked into submit body: {}",
+            json
+        );
         assert!(json.contains("json"));
         assert!(json.contains("1.0.0"));
     }
@@ -801,7 +799,10 @@ mod tests {
             "owner": "01234567-89ab-cdef-0123-456789abcdef"
         }"#;
         let r: PackageRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(r.owner.as_deref(), Some("01234567-89ab-cdef-0123-456789abcdef"));
+        assert_eq!(
+            r.owner.as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
         assert_eq!(r.version, "1.0.0");
     }
 

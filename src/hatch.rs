@@ -352,9 +352,15 @@ pub struct Hatch {
 #[derive(Debug)]
 pub enum HatchError {
     BadMagic,
-    VersionMismatch { expected: u32, found: u32 },
+    VersionMismatch {
+        expected: u32,
+        found: u32,
+    },
     /// Header advertises a payload length the buffer can't cover.
-    TruncatedPayload { declared: u64, available: usize },
+    TruncatedPayload {
+        declared: u64,
+        available: usize,
+    },
     /// zstd decompression failed (corrupt blob or wrong flag bit).
     Decompress(String),
     /// A section header's utf-8 name didn't parse or data_len went past
@@ -378,7 +384,10 @@ impl std::fmt::Display for HatchError {
                 f,
                 "hatch version mismatch: expected {expected}, found {found}"
             ),
-            HatchError::TruncatedPayload { declared, available } => write!(
+            HatchError::TruncatedPayload {
+                declared,
+                available,
+            } => write!(
                 f,
                 "hatch payload truncated: header says {declared} bytes, only {available} available"
             ),
@@ -560,8 +569,7 @@ fn parse_sections(payload: &[u8]) -> Result<Vec<Section>, HatchError> {
             .to_string();
         cursor += name_len;
 
-        let data_len =
-            u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         if payload.len() < cursor + data_len {
             return Err(HatchError::MalformedSection(format!(
@@ -722,10 +730,7 @@ fn rename_entry_to_manifest_name(
     // (`:` for `@hatch:*`, `@` and `/` for future scopes) are what
     // signal "this package wants its module imported under the
     // package name."
-    let is_scoped = manifest
-        .name
-        .chars()
-        .any(|c| matches!(c, ':' | '@' | '/'));
+    let is_scoped = manifest.name.chars().any(|c| matches!(c, ':' | '@' | '/'));
     if !is_scoped || manifest.name == manifest.entry {
         return Ok(());
     }
@@ -804,17 +809,12 @@ fn resolve_dep_bytes_inner(
         Dependency::Path { path, .. } => {
             let dep_root = root.join(path);
             build_recursive(&dep_root, visited, cache_dir).map_err(|e| {
-                HatchError::Encode(format!(
-                    "failed to build dependency '{}': {}",
-                    dep_name, e
-                ))
+                HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
             })
         }
         Dependency::Version(version) => {
             let cached = match cache_dir {
-                Some(dir) => crate::hatch_registry::cached_artifact_path_in(
-                    dir, dep_name, version,
-                ),
+                Some(dir) => crate::hatch_registry::cached_artifact_path_in(dir, dep_name, version),
                 None => crate::hatch_registry::cached_artifact_path(dep_name, version)
                     .map_err(|e| HatchError::Encode(e.to_string()))?,
             };
@@ -879,10 +879,7 @@ fn merge_path_dependencies(
             Dependency::Path { path, .. } => {
                 let dep_root = root.join(path);
                 build_recursive(&dep_root, visited, cache_dir).map_err(|e| {
-                    HatchError::Encode(format!(
-                        "failed to build dependency '{}': {}",
-                        dep_name, e
-                    ))
+                    HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
                 })?
             }
             Dependency::Version(version) => {
@@ -890,9 +887,9 @@ fn merge_path_dependencies(
                 // this; during `hatch build` we refuse to fetch so
                 // offline builds remain deterministic.
                 let cached = match cache_dir {
-                    Some(dir) => crate::hatch_registry::cached_artifact_path_in(
-                        dir, &dep_name, version,
-                    ),
+                    Some(dir) => {
+                        crate::hatch_registry::cached_artifact_path_in(dir, &dep_name, version)
+                    }
                     None => crate::hatch_registry::cached_artifact_path(&dep_name, version)
                         .map_err(|e| HatchError::Encode(e.to_string()))?,
                 };
@@ -957,7 +954,10 @@ fn merge_path_dependencies(
         // and any absolute-path system refs it declared.
         for section in dep_hatch.sections {
             if matches!(section.kind, SectionKind::Wlbc | SectionKind::NativeLib) {
-                if sections.iter().any(|s| s.name == section.name && s.kind == section.kind) {
+                if sections
+                    .iter()
+                    .any(|s| s.name == section.name && s.kind == section.kind)
+                {
                     return Err(HatchError::Encode(format!(
                         "dependency '{}' carries section '{:?}/{}' that collides with the enclosing hatch",
                         dep_name, section.kind, section.name
@@ -1049,10 +1049,7 @@ fn collect_wren_files(
             // run under `hatch test`, never ship in built hatches —
             // publishing test code would bloat the artifact and
             // create a runtime dependency on the test runner.
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             if stem.ends_with(".spec") {
                 continue;
             }
@@ -1560,8 +1557,8 @@ libgreet = "0.1.0"
         .unwrap();
 
         // 3. Point the registry cache at our scratch dir, then build.
-        let bytes = build_from_source_tree_with_cache(&app_workspace, Some(&cache_dir))
-            .expect("build");
+        let bytes =
+            build_from_source_tree_with_cache(&app_workspace, Some(&cache_dir)).expect("build");
 
         let hatch = load(&bytes).unwrap();
         // Dep module prepended so imports resolve during install loop.
@@ -1773,9 +1770,6 @@ notes = "hello"
             text
         ))
         .expect("parse");
-        assert_eq!(
-            m.native_libs["mystery"].resolve_for("macos", "arm64"),
-            None
-        );
+        assert_eq!(m.native_libs["mystery"].resolve_for("macos", "arm64"), None);
     }
 }
