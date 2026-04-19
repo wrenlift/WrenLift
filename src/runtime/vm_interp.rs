@@ -2737,12 +2737,34 @@ fn run_fiber_with_stop_depth(
                     let branch_offset = pc - 1;
                     let target = read_u32(code, &mut pc);
                     let argc = read_u8(code, &mut pc) as usize;
-                    // Bind block params: read [dst, src] pairs
-                    for _ in 0..argc {
+                    // Block-param bindings are a PARALLEL assignment:
+                    // every `dst = src` logically happens "at once."
+                    // Read all sources before writing any destinations
+                    // so cyclic patterns (a = b, b = a) work —
+                    // especially on loop back-edges where argv-style
+                    // phis feed their own slot through mutated
+                    // neighbours.
+                    let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
+                    let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
+                    let use_heap = argc > bindings.len();
+                    for idx in 0..argc {
                         let dst_reg = read_u16(code, &mut pc);
                         let src_reg = read_u16(code, &mut pc);
                         let val = get_reg(&values, src_reg);
-                        set_reg(&mut values, dst_reg, val);
+                        if use_heap {
+                            heap_bindings.push((dst_reg, val));
+                        } else {
+                            bindings[idx] = (dst_reg, val);
+                        }
+                    }
+                    if use_heap {
+                        for &(dst_reg, val) in &heap_bindings {
+                            set_reg(&mut values, dst_reg, val);
+                        }
+                    } else {
+                        for &(dst_reg, val) in &bindings[..argc] {
+                            set_reg(&mut values, dst_reg, val);
+                        }
                     }
                     // Back-edge detection: if jumping backward, this is a
                     // loop iteration. Trigger JIT compilation after enough
@@ -2847,23 +2869,58 @@ fn run_fiber_with_stop_depth(
                     // Don't need to advance pc — both branches jump to target offset
 
                     let target = if cond.is_truthy_wren() {
-                        // Bind true params
+                        // Parallel-assign true-branch bindings (read all
+                        // sources before any write — see Op::Branch).
                         let mut p = true_params_start;
-                        for _ in 0..t_argc {
+                        let mut bindings: [(u16, Value); 16] =
+                            [(0, Value::null()); 16];
+                        let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
+                        let use_heap = t_argc > bindings.len();
+                        for idx in 0..t_argc {
                             let dst_reg = read_u16(code, &mut p);
                             let src_reg = read_u16(code, &mut p);
                             let val = get_reg(&values, src_reg);
-                            set_reg(&mut values, dst_reg, val);
+                            if use_heap {
+                                heap_bindings.push((dst_reg, val));
+                            } else {
+                                bindings[idx] = (dst_reg, val);
+                            }
+                        }
+                        if use_heap {
+                            for &(dst_reg, val) in &heap_bindings {
+                                set_reg(&mut values, dst_reg, val);
+                            }
+                        } else {
+                            for &(dst_reg, val) in &bindings[..t_argc] {
+                                set_reg(&mut values, dst_reg, val);
+                            }
                         }
                         true_off
                     } else {
-                        // Bind false params
+                        // Same parallel-assign for the false path.
                         let mut p = false_params_start;
-                        for _ in 0..f_argc {
+                        let mut bindings: [(u16, Value); 16] =
+                            [(0, Value::null()); 16];
+                        let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
+                        let use_heap = f_argc > bindings.len();
+                        for idx in 0..f_argc {
                             let dst_reg = read_u16(code, &mut p);
                             let src_reg = read_u16(code, &mut p);
                             let val = get_reg(&values, src_reg);
-                            set_reg(&mut values, dst_reg, val);
+                            if use_heap {
+                                heap_bindings.push((dst_reg, val));
+                            } else {
+                                bindings[idx] = (dst_reg, val);
+                            }
+                        }
+                        if use_heap {
+                            for &(dst_reg, val) in &heap_bindings {
+                                set_reg(&mut values, dst_reg, val);
+                            }
+                        } else {
+                            for &(dst_reg, val) in &bindings[..f_argc] {
+                                set_reg(&mut values, dst_reg, val);
+                            }
                         }
                         false_off
                     };

@@ -26,11 +26,17 @@ impl MirPass for Licm {
             return false;
         }
 
+        // Merge loops that share a header. Multiple back edges to the same
+        // header (e.g. a `while` body with multiple `continue` paths) all
+        // represent the same loop — processing them independently creates
+        // orphaned preheader chains that hoist code into unreachable blocks.
+        let merged = merge_loops_by_header(&loops);
+
         // Collect which block defines each value.
         let def_block = build_def_map(func);
 
         let mut changed = false;
-        for lp in &loops {
+        for lp in &merged {
             let body_set: HashSet<BlockId> = lp.body.iter().copied().collect();
 
             // Find loop-invariant instructions (fixpoint).
@@ -46,6 +52,9 @@ impl MirPass for Licm {
             if hoist_to_preheader(func, &invariants, &body_set, preheader) {
                 changed = true;
             }
+            // Refresh predecessor info so subsequent header processing sees
+            // the redirected edges from this loop's preheader insertion.
+            func.compute_predecessors();
         }
 
         if changed {
@@ -172,6 +181,37 @@ fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
         }
         cur = idom[cur];
     }
+}
+
+/// Collapse loops that share a header into one. The merged body is the
+/// union of each individual loop body; the latch is left as one of the
+/// original latches (not used downstream — LICM only reads the header and
+/// body).
+fn merge_loops_by_header(loops: &[Loop]) -> Vec<Loop> {
+    let mut by_header: HashMap<BlockId, (BlockId, HashSet<BlockId>)> = HashMap::new();
+    for lp in loops {
+        let entry = by_header
+            .entry(lp.header)
+            .or_insert_with(|| (lp.latch, HashSet::new()));
+        for &b in &lp.body {
+            entry.1.insert(b);
+        }
+    }
+    let mut out: Vec<Loop> = by_header
+        .into_iter()
+        .map(|(header, (latch, body_set))| {
+            let mut body: Vec<BlockId> = body_set.into_iter().collect();
+            body.sort();
+            Loop {
+                header,
+                latch,
+                body,
+            }
+        })
+        .collect();
+    // Sort for deterministic processing order.
+    out.sort_by_key(|lp| lp.header.0);
+    out
 }
 
 /// Detect natural loops via back edges.
@@ -810,6 +850,143 @@ mod tests {
         let licm = Licm;
         let changed = licm.run(&mut f);
         assert!(!changed, "loop-variant instructions should not be hoisted");
+    }
+
+    /// Regression: a loop body with multiple back edges (e.g. `while`
+    /// with `continue` branches) produces several natural loops that all
+    /// share the same header. LICM must treat them as one loop — processing
+    /// each back edge independently used to leave invariant instructions in
+    /// orphaned preheader blocks, breaking all uses of the hoisted value.
+    #[test]
+    fn test_licm_multiple_back_edges_same_header() {
+        // CFG:
+        //   bb0 -> bb1 (header, param i)
+        //   bb1 -> bb2 (body) | bb3 (exit)
+        //   bb2 -> bb4 (continue A) | bb5 (continue B)
+        //   bb4: i = i + 1; jump bb1          <- back edge 1
+        //   bb5 -> bb6: i = i + 1; jump bb1   <- back edge 2
+        //   bb3: return i
+        let mut interner = Interner::new();
+        let mut f = make_func(&mut interner);
+
+        let bb0 = f.new_block();
+        let bb1 = f.new_block();
+        let bb2 = f.new_block();
+        let bb3 = f.new_block();
+        let bb4 = f.new_block();
+        let bb5 = f.new_block();
+        let bb6 = f.new_block();
+
+        let v_zero = f.new_value();
+        let v_limit = f.new_value();
+        let v_i = f.new_value();
+        let v_cond = f.new_value();
+        let v_branch_cond = f.new_value();
+        let v_one_a = f.new_value();
+        let v_new_i_a = f.new_value();
+        let v_one_b = f.new_value();
+        let v_new_i_b = f.new_value();
+        let v_exit_i = f.new_value();
+
+        {
+            let b = f.block_mut(bb0);
+            b.instructions.push((v_zero, Instruction::ConstNum(0.0)));
+            b.instructions.push((v_limit, Instruction::ConstNum(3.0)));
+            b.terminator = Terminator::Branch {
+                target: bb1,
+                args: vec![v_zero],
+            };
+        }
+        {
+            let b = f.block_mut(bb1);
+            b.params = vec![(v_i, MirType::Value)];
+            b.instructions
+                .push((v_cond, Instruction::CmpLt(v_i, v_limit)));
+            b.terminator = Terminator::CondBranch {
+                condition: v_cond,
+                true_target: bb2,
+                true_args: vec![],
+                false_target: bb3,
+                false_args: vec![v_i],
+            };
+        }
+        {
+            let b = f.block_mut(bb2);
+            b.instructions
+                .push((v_branch_cond, Instruction::ConstBool(true)));
+            b.terminator = Terminator::CondBranch {
+                condition: v_branch_cond,
+                true_target: bb4,
+                true_args: vec![],
+                false_target: bb5,
+                false_args: vec![],
+            };
+        }
+        {
+            let b = f.block_mut(bb3);
+            b.params = vec![(v_exit_i, MirType::Value)];
+            b.terminator = Terminator::Return(v_exit_i);
+        }
+        {
+            let b = f.block_mut(bb4);
+            b.instructions.push((v_one_a, Instruction::ConstNum(1.0)));
+            b.instructions
+                .push((v_new_i_a, Instruction::Add(v_i, v_one_a)));
+            b.terminator = Terminator::Branch {
+                target: bb1,
+                args: vec![v_new_i_a],
+            };
+        }
+        {
+            let b = f.block_mut(bb5);
+            b.terminator = Terminator::Branch {
+                target: bb6,
+                args: vec![],
+            };
+        }
+        {
+            let b = f.block_mut(bb6);
+            b.instructions.push((v_one_b, Instruction::ConstNum(1.0)));
+            b.instructions
+                .push((v_new_i_b, Instruction::Add(v_i, v_one_b)));
+            b.terminator = Terminator::Branch {
+                target: bb1,
+                args: vec![v_new_i_b],
+            };
+        }
+
+        let before = eval(&f).unwrap();
+        let licm = Licm;
+        licm.run(&mut f);
+        let after = eval(&f).unwrap();
+        assert_eq!(
+            before, after,
+            "LICM with multiple back edges must preserve semantics"
+        );
+
+        // Every use must have a dominating definition — no orphan uses.
+        let defined: HashSet<ValueId> = f
+            .blocks
+            .iter()
+            .flat_map(|blk| {
+                blk.params
+                    .iter()
+                    .map(|&(v, _)| v)
+                    .chain(blk.instructions.iter().map(|&(v, _)| v))
+            })
+            .collect();
+        for blk in &f.blocks {
+            for &(_, ref inst) in &blk.instructions {
+                for op in inst.operands() {
+                    assert!(
+                        defined.contains(&op),
+                        "undefined value {:?} used in bb{}",
+                        op,
+                        blk.id.0
+                    );
+                }
+            }
+        }
     }
 
     #[test]
