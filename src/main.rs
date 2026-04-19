@@ -188,6 +188,7 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 /// they must already be installed into the VM (see
 /// [`preinstall_spec_dependencies`]), so this loader only covers
 /// imports that sit next to the source file on disk.
+#[allow(clippy::type_complexity)]
 fn make_module_loader(running_file_dir: PathBuf) -> Box<dyn Fn(&str) -> Option<String>> {
     Box::new(move |name: &str| -> Option<String> {
         if name.starts_with("./") || name.starts_with("../") {

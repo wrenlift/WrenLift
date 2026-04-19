@@ -976,7 +976,7 @@ mod tests {
             })
             .collect();
         for blk in &f.blocks {
-            for &(_, ref inst) in &blk.instructions {
+            for (_, inst) in &blk.instructions {
                 for op in inst.operands() {
                     assert!(
                         defined.contains(&op),
