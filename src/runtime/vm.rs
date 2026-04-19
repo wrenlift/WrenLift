@@ -856,9 +856,16 @@ impl VM {
 
         // 7a. Register closure functions with the engine first, so we can
         // patch MakeClosure fn_ids to use actual engine FuncIds.
+        // Binding each function to its defining module lets
+        // `GetModuleVar @idx` resolve against the slots the MIR was
+        // compiled against, even when the caller lives in a different
+        // module.
+        let module_rc = std::rc::Rc::new(module_name.to_string());
         let mut closure_func_ids: Vec<u32> = Vec::new();
         for closure in module_mir.closures.drain(..) {
-            let fid = self.engine.register_function(closure);
+            let fid = self
+                .engine
+                .register_function_in(closure, Some(std::rc::Rc::clone(&module_rc)));
             closure_func_ids.push(fid.0);
         }
 
@@ -871,7 +878,9 @@ impl VM {
         }
 
         // 7b. Register top-level function with the engine
-        let func_id = self.engine.register_function(module_mir.top_level);
+        let func_id = self
+            .engine
+            .register_function_in(module_mir.top_level, Some(std::rc::Rc::clone(&module_rc)));
 
         // 8. Create module var storage, pre-populated with core class values
         // and imported module vars.
@@ -946,7 +955,9 @@ impl VM {
 
             // Register each method's MIR and bind to the class
             for method_mir in class_mir.methods {
-                let method_func_id = self.engine.register_function(method_mir.mir);
+                let method_func_id = self
+                    .engine
+                    .register_function_in(method_mir.mir, Some(std::rc::Rc::clone(&module_rc)));
 
                 // Create ObjFn + ObjClosure for the method
                 let sig_sym = self.interner.intern(&method_mir.signature);
@@ -2390,15 +2401,20 @@ impl VM {
             .remap_symbols(|old| sym_map[old.index() as usize]);
 
         // 5. Register closures if any
+        let eval_module_rc = std::rc::Rc::new(module_name.to_string());
         let mut closure_func_ids: Vec<u32> = Vec::new();
         for closure in module_mir.closures.drain(..) {
-            let fid = self.engine.register_function(closure);
+            let fid = self
+                .engine
+                .register_function_in(closure, Some(std::rc::Rc::clone(&eval_module_rc)));
             closure_func_ids.push(fid.0);
         }
         patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
 
         // 6. Register the eval function and execute on temp fiber with module vars
-        let func_id = self.engine.register_function(module_mir.top_level);
+        let func_id = self
+            .engine
+            .register_function_in(module_mir.top_level, Some(eval_module_rc));
 
         // Build eval module vars in the order the resolver expects, looking up
         // values by name from the calling module (to match slot indices).
@@ -2665,13 +2681,22 @@ impl VM {
                 }
             }
 
-            let mod_name = unsafe {
-                (*current_fiber)
-                    .mir_frames
-                    .last()
-                    .map(|f| f.module_name.clone())
-                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
-            };
+            // Prefer the callee's defining module (recorded at
+            // register time). Fall back to the current frame's module
+            // for test paths that don't go through the module registry.
+            let mod_name = self
+                .engine
+                .func_module(func_id)
+                .cloned()
+                .unwrap_or_else(|| unsafe {
+                    (*current_fiber)
+                        .mir_frames
+                        .last()
+                        .map(|f| f.module_name.clone())
+                        .unwrap_or_else(|| {
+                            std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                        })
+                });
             let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
             if stop_depth >= self.config.max_call_depth {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
@@ -2733,17 +2758,26 @@ impl VM {
                 }
             }
 
-            // Resolve module_name from the current fiber's frame (avoids
-            // reading a potentially stale JIT context pointer).
-            let mod_name = if !self.fiber.is_null() {
-                (*self.fiber)
-                    .mir_frames
-                    .last()
-                    .map(|f| f.module_name.clone())
-                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
-            } else {
-                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
-            };
+            // Prefer the callee's defining module. Fall back to the
+            // current fiber's module for test paths that don't
+            // register functions through the module registry.
+            let mod_name = self
+                .engine
+                .func_module(func_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if !self.fiber.is_null() {
+                        (*self.fiber)
+                            .mir_frames
+                            .last()
+                            .map(|f| f.module_name.clone())
+                            .unwrap_or_else(|| {
+                                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                            })
+                    } else {
+                        std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                    }
+                });
 
             (*temp_fiber).mir_frames.push(MirCallFrame {
                 func_id,
@@ -2910,13 +2944,19 @@ impl VM {
                 }
             }
 
-            let mod_name = unsafe {
-                (*current_fiber)
-                    .mir_frames
-                    .last()
-                    .map(|f| f.module_name.clone())
-                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
-            };
+            let mod_name = self
+                .engine
+                .func_module(func_id)
+                .cloned()
+                .unwrap_or_else(|| unsafe {
+                    (*current_fiber)
+                        .mir_frames
+                        .last()
+                        .map(|f| f.module_name.clone())
+                        .unwrap_or_else(|| {
+                            std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                        })
+                });
             let stop_depth = unsafe { (*current_fiber).mir_frames.len() };
             if stop_depth >= self.config.max_call_depth {
                 crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
@@ -2979,15 +3019,23 @@ impl VM {
                 }
             }
 
-            let mod_name = if !self.fiber.is_null() {
-                (*self.fiber)
-                    .mir_frames
-                    .last()
-                    .map(|f| f.module_name.clone())
-                    .unwrap_or_else(|| std::rc::Rc::new(crate::codegen::runtime_fns::module_name()))
-            } else {
-                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
-            };
+            let mod_name = self
+                .engine
+                .func_module(func_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if !self.fiber.is_null() {
+                        (*self.fiber)
+                            .mir_frames
+                            .last()
+                            .map(|f| f.module_name.clone())
+                            .unwrap_or_else(|| {
+                                std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                            })
+                    } else {
+                        std::rc::Rc::new(crate::codegen::runtime_fns::module_name())
+                    }
+                });
 
             (*temp_fiber).mir_frames.push(MirCallFrame {
                 func_id,
@@ -4241,6 +4289,49 @@ System.print(MathUtils.double(21))
         let output = vm.take_output();
         assert!(matches!(result, InterpretResult::Success), "{:?}", result);
         assert_eq!(output, "hello from import\n42\n");
+    }
+
+    /// Regression: a method defined in module A that references a
+    /// sibling class (also in A) must resolve that reference against
+    /// A's module-var slots even when the method is invoked from
+    /// module B. Previously each pushed frame copied the caller's
+    /// `module_name`, so `GetModuleVar @0` inside the callee read
+    /// the caller's slot 0 (a different variable), and importing
+    /// `Outer` from a module and calling `Outer.make` that internally
+    /// used `Inner.new` crashed with `Class does not implement new(_)`.
+    #[test]
+    fn test_cross_module_sibling_class_reference() {
+        let mut config = VMConfig::default();
+        config.load_module_fn = Some(Box::new(|name: &str| -> Option<String> {
+            if name == "pair" {
+                Some(
+                    r#"
+class Inner {
+  construct new(v) { _v = v }
+  value { _v }
+}
+class Outer {
+  static make(v) { Inner.new(v) }
+}
+"#
+                    .to_string(),
+                )
+            } else {
+                None
+            }
+        }));
+        let mut vm = VM::new(config);
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret(
+            "main",
+            r#"
+import "pair" for Outer
+System.print(Outer.make(42).value)
+"#,
+        );
+        let output = vm.take_output();
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "42\n");
     }
 
     #[test]

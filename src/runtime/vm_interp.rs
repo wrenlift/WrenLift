@@ -796,10 +796,13 @@ fn run_fiber_with_stop_depth(
             return Ok(resume_val.unwrap_or(Value::null()));
         }
 
-        // Load execution state from the top frame into locals.
-        // These are mutable so that inline call/return can update them
-        // without restarting the fiber loop.
-        let (mut func_id, mut pc, mut values, module_name, closure, _defining_class, return_dst) = unsafe {
+        // Load execution state from the top frame into locals. Inline
+        // call/return sites re-enter `'fiber_loop` rather than mutating
+        // these in place so `module_name` (and the `module_vars_ptr`
+        // cache derived from it) always match the active frame —
+        // crucial when the callee lives in a different module than the
+        // caller.
+        let (func_id, mut pc, mut values, module_name, closure, _defining_class, return_dst) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
             (
                 frame.func_id,
@@ -866,6 +869,9 @@ fn run_fiber_with_stop_depth(
 
         // Cache raw pointer to module vars — eliminates HashMap lookup per
         // GetModuleVar/SetModuleVar (was 42% of runtime in method_call).
+        // Recomputed on each `'fiber_loop` iteration so inline
+        // call/return into a different module picks up the right
+        // slot table.
         let module_vars_ptr: *mut Vec<Value> = vm
             .engine
             .modules
@@ -2121,8 +2127,19 @@ fn run_fiber_with_stop_depth(
                                 (*fiber).mir_frames.last_mut().unwrap().bc_ptr = bc_ptr;
                             }
 
-                            // Push new frame
+                            // Push new frame. `module_name` must be the callee's
+                            // defining module, not the caller's — otherwise
+                            // `GetModuleVar @idx` inside the callee reads the
+                            // caller's slot, which is a different variable
+                            // (see `Engine::func_module`). Fall back to the
+                            // caller's module only when the callee has no
+                            // recorded module (isolated test paths).
                             vm.engine.note_interpreted_entry(target_func_id);
+                            let callee_module = vm
+                                .engine
+                                .func_module(target_func_id)
+                                .cloned()
+                                .unwrap_or_else(|| Rc::clone(&module_name));
                             unsafe {
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
@@ -2130,7 +2147,7 @@ fn run_fiber_with_stop_depth(
                                     ip: 0,
                                     pc: 0,
                                     values: new_values,
-                                    module_name: Rc::clone(&module_name),
+                                    module_name: callee_module,
                                     return_dst: Some(ValueId(dst as u32)),
                                     closure: Some(closure_ptr),
                                     defining_class,
@@ -2138,18 +2155,12 @@ fn run_fiber_with_stop_depth(
                                 });
                             }
 
-                            // Update locals to execute callee inline (skip fiber_loop restart).
-                            // Keep `func_id` in sync with the active frame so back-edge
-                            // tier-up and OSR lookups target the callee, not the caller.
-                            func_id = target_func_id;
-                            pc = 0;
-                            values = unsafe {
-                                std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
-                            };
-                            bc_ptr = target_bc_ptr;
-                            bc = unsafe { &*target_bc_ptr };
-                            code = &bc.code;
-                            continue;
+                            // Re-enter the fiber loop so locals refresh from
+                            // the newly pushed callee frame — including
+                            // `module_name` and the derived `module_vars_ptr`,
+                            // which determine how `GetModuleVar` resolves
+                            // inside the callee.
+                            continue 'fiber_loop;
                         }
                         Some(Method::Constructor(closure_ptr)) => {
                             let recv_class = recv_val.as_object().unwrap() as *mut ObjClass;
@@ -2255,13 +2266,18 @@ fn run_fiber_with_stop_depth(
 
                             unsafe {
                                 vm.engine.note_interpreted_entry(target_func_id);
+                                let callee_module = vm
+                                    .engine
+                                    .func_module(target_func_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| Rc::clone(&module_name));
                                 (*fiber).mir_frames.push(MirCallFrame {
                                     func_id: target_func_id,
                                     current_block: BlockId(0),
                                     ip: 0,
                                     pc: 0,
                                     values: new_values,
-                                    module_name: Rc::clone(&module_name),
+                                    module_name: callee_module,
                                     return_dst: Some(ValueId(dst as u32)),
                                     closure: Some(closure_ptr),
                                     defining_class,
@@ -2269,15 +2285,7 @@ fn run_fiber_with_stop_depth(
                                 });
                             }
 
-                            func_id = target_func_id;
-                            pc = 0;
-                            values = unsafe {
-                                std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values)
-                            };
-                            bc_ptr = target_bc_ptr;
-                            bc = unsafe { &*target_bc_ptr };
-                            code = &bc.code;
-                            continue;
+                            continue 'fiber_loop;
                         }
                         None => {
                             let method_name = vm.interner.resolve(method).to_string();
@@ -2666,26 +2674,24 @@ fn run_fiber_with_stop_depth(
                         }
                         return Ok(return_val);
                     }
-                    // ── Inline return: restore caller state without fiber_loop restart ──
+                    // Write return value into the caller's slot, then
+                    // re-enter the fiber loop so all locals refresh
+                    // from the (now-top) caller frame — including
+                    // `module_name` / `module_vars_ptr`, which may
+                    // differ when the callee lived in another module.
                     unsafe {
                         let frame = (*fiber).mir_frames.last_mut().unwrap();
                         if let Some(dst) = return_dst {
                             set_reg(&mut frame.values, dst.0 as u16, return_val);
                         }
-                        func_id = frame.func_id;
-                        pc = frame.pc;
-                        values = std::mem::take(&mut frame.values);
-                        bc_ptr = if !frame.bc_ptr.is_null() {
-                            frame.bc_ptr
-                        } else {
-                            vm.engine
-                                .ensure_bytecode(func_id)
-                                .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?
-                        };
+                        if frame.bc_ptr.is_null() {
+                            frame.bc_ptr = vm
+                                .engine
+                                .ensure_bytecode(frame.func_id)
+                                .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
+                        }
                     }
-                    bc = unsafe { &*bc_ptr };
-                    code = &bc.code;
-                    continue;
+                    continue 'fiber_loop;
                 }
                 Op::ReturnNull => {
                     let return_dst = unsafe { (*fiber).mir_frames.last().unwrap().return_dst };
@@ -2709,26 +2715,22 @@ fn run_fiber_with_stop_depth(
                         }
                         return Ok(Value::null());
                     }
-                    // ── Inline return: restore caller state without fiber_loop restart ──
+                    // Write null into the caller's slot, then
+                    // re-enter the fiber loop (see Op::Return for the
+                    // module-refresh rationale).
                     unsafe {
                         let frame = (*fiber).mir_frames.last_mut().unwrap();
                         if let Some(dst) = return_dst {
                             set_reg(&mut frame.values, dst.0 as u16, Value::null());
                         }
-                        func_id = frame.func_id;
-                        pc = frame.pc;
-                        values = std::mem::take(&mut frame.values);
-                        bc_ptr = if !frame.bc_ptr.is_null() {
-                            frame.bc_ptr
-                        } else {
-                            vm.engine
-                                .ensure_bytecode(func_id)
-                                .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?
-                        };
+                        if frame.bc_ptr.is_null() {
+                            frame.bc_ptr = vm
+                                .engine
+                                .ensure_bytecode(frame.func_id)
+                                .ok_or_else(|| RuntimeError::Error("invalid func_id".into()))?;
+                        }
                     }
-                    bc = unsafe { &*bc_ptr };
-                    code = &bc.code;
-                    continue;
+                    continue 'fiber_loop;
                 }
                 Op::Unreachable => {
                     return Err(RuntimeError::Unreachable);
@@ -3478,7 +3480,14 @@ fn dispatch_closure_bc_inner(
         frame.bc_ptr = caller_bc_ptr;
     }
 
-    // Push new frame (Rc::clone is cheap — just refcount bump)
+    // Push new frame. Use the callee's defining module if recorded so
+    // `GetModuleVar` inside reads against its own module's slots, not
+    // the caller's (Rc::clone is cheap — just a refcount bump).
+    let frame_module = vm
+        .engine
+        .func_module(target_func_id)
+        .cloned()
+        .unwrap_or_else(|| Rc::clone(module_name));
     unsafe {
         (*fiber).mir_frames.push(MirCallFrame {
             func_id: target_func_id,
@@ -3486,7 +3495,7 @@ fn dispatch_closure_bc_inner(
             ip: 0,
             pc: 0,
             values: new_values,
-            module_name: Rc::clone(module_name),
+            module_name: frame_module,
             return_dst: Some(return_dst),
             closure: Some(closure_ptr),
             defining_class,

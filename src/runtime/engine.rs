@@ -12,6 +12,7 @@
 /// thread. The interpreter continues using bytecode until compilation
 /// finishes, then swaps to native code on the next dispatch.
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -416,6 +417,15 @@ pub struct ExecutionEngine {
     pub tier_states: Vec<TierState>,
     /// Per-function tier and dispatch statistics.
     pub tier_stats: Vec<FuncTierStats>,
+    /// Defining module for each function indexed by FuncId.
+    /// `GetModuleVar @idx` inside the function's body is bound to
+    /// *this* module's variable slots (where the function was
+    /// compiled), not the caller's. Call dispatch reads this to set
+    /// each pushed frame's `module_name`, so a class imported from
+    /// module A keeps resolving its sibling classes against A even
+    /// when invoked from module B. `None` is only used by isolated
+    /// unit-test paths that don't run through the full VM pipeline.
+    pub func_modules: Vec<Option<Rc<String>>>,
     pub runtime_call_stats: RuntimeCallStats,
     /// Cached field index for trivial getters of the form `{ _field }`.
     pub trivial_getter_fields: Vec<Option<u16>>,
@@ -502,6 +512,7 @@ impl ExecutionEngine {
             jit_metadata: Vec::new(),
             tier_states: Vec::new(),
             tier_stats: Vec::new(),
+            func_modules: Vec::new(),
             runtime_call_stats: RuntimeCallStats::default(),
             trivial_getter_fields: Vec::new(),
             trivial_setter_fields: Vec::new(),
@@ -520,8 +531,20 @@ impl ExecutionEngine {
         }
     }
 
-    /// Register a MIR function and return its FuncId.
+    /// Register a MIR function and return its FuncId. The function is
+    /// recorded as module-less — only suitable for isolated tests.
+    /// Production paths should use [`register_function_in`] so call
+    /// dispatch can bind frames to the function's defining module.
     pub fn register_function(&mut self, mir: MirFunction) -> FuncId {
+        self.register_function_in(mir, None)
+    }
+
+    /// Register a MIR function bound to the given defining module.
+    pub fn register_function_in(
+        &mut self,
+        mir: MirFunction,
+        module: Option<Rc<String>>,
+    ) -> FuncId {
         let id = FuncId(self.functions.len() as u32);
         let trivial_getter = Self::mir_trivial_getter_field(&mir);
         let trivial_setter = Self::mir_trivial_setter_field(&mir);
@@ -537,6 +560,7 @@ impl ExecutionEngine {
         self.jit_metadata.push(None);
         self.tier_states.push(TierState::Interpreted);
         self.tier_stats.push(FuncTierStats::default());
+        self.func_modules.push(module);
         self.trivial_getter_fields.push(trivial_getter);
         self.trivial_setter_fields.push(trivial_setter);
         self.baseline_code.push(std::ptr::null());
@@ -551,6 +575,14 @@ impl ExecutionEngine {
         self.threaded_code.push(None); // None = not yet checked
         self.type_profiles.push(None);
         id
+    }
+
+    /// Defining module for a function, if recorded. Callers push new
+    /// frames using this rather than propagating the caller's module
+    /// so `GetModuleVar` binds against the slots the function was
+    /// compiled against.
+    pub fn func_module(&self, id: FuncId) -> Option<&Rc<String>> {
+        self.func_modules.get(id.0 as usize).and_then(|m| m.as_ref())
     }
 
     /// Register a compiled function's code range for GC stack walking.
