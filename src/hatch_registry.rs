@@ -184,9 +184,13 @@ pub fn ensure_in_cache_dir(
 /// `<name>@<version>`. Returns `(name, version_opt)` — no version
 /// means "resolve against the hatchfile's `[dependencies]` entry".
 pub fn split_name_version(spec: &str) -> (&str, Option<&str>) {
-    match spec.split_once('@') {
-        Some((n, v)) => (n, Some(v)),
-        None => (spec, None),
+    // Scoped names start with `@` (e.g. `@hatch:assert`), so
+    // splitting on the FIRST `@` mis-parses the scope prefix as a
+    // version separator. Use the LAST `@` instead — `@hatch:assert`
+    // → (spec, None), `@hatch:assert@0.1.0` → (name, version).
+    match spec.rsplit_once('@') {
+        Some((n, v)) if !n.is_empty() => (n, Some(v)),
+        _ => (spec, None),
     }
 }
 
@@ -373,6 +377,13 @@ mod tests {
         assert_eq!(
             split_name_version("counter@0.2.0-alpha"),
             ("counter", Some("0.2.0-alpha"))
+        );
+        // Scoped names own a leading `@` — it's part of the name,
+        // not a version separator.
+        assert_eq!(split_name_version("@hatch:assert"), ("@hatch:assert", None));
+        assert_eq!(
+            split_name_version("@hatch:assert@0.1.0"),
+            ("@hatch:assert", Some("0.1.0"))
         );
     }
 
