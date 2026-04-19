@@ -756,7 +756,7 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         git: git.clone(),
-        description: None,
+        description: manifest.description.clone(),
         owner: None, // server sets from JWT
     };
 

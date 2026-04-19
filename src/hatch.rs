@@ -107,6 +107,10 @@ pub struct Manifest {
     /// Module name to run as the entry point (e.g. `"main"` for a
     /// package whose `main.wren` is the program's top-level).
     pub entry: String,
+    /// One-line description surfaced in the catalog and `hatch find`
+    /// output. Optional but strongly encouraged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Ordered list of module names in this hatch. The loader installs
     /// them in this order so a module's imports resolve against
     /// already-loaded peers. Producers are expected to write this in
@@ -120,6 +124,12 @@ pub struct Manifest {
     /// merged into the enclosing hatch at build time.
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
+    /// Dependencies only needed while running `*.spec.wren` files —
+    /// test runners, assertion libraries, fixtures. Not installed when
+    /// a consumer builds against this package. Same shape as
+    /// `[dependencies]`.
+    #[serde(default, rename = "spec-dependencies")]
+    pub spec_dependencies: BTreeMap<String, Dependency>,
     /// Native library declarations. Keys match the string a Wren
     /// `#!native = "..."` attribute resolves; values describe how the
     /// loader should find the underlying `.dylib` / `.so` / `.dll` —
@@ -671,8 +681,10 @@ fn build_recursive(
                 .to_string(),
             version: "0.1.0".to_string(),
             entry: pick_default_entry(&module_names),
+            description: None,
             modules: module_names.clone(),
             dependencies: BTreeMap::new(),
+            spec_dependencies: BTreeMap::new(),
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
         },
@@ -762,6 +774,91 @@ fn rename_entry_to_manifest_name(
 /// already-installed class. Name collisions between modules /
 /// sections are rejected loudly so ambiguous imports never slip
 /// through to runtime.
+/// Resolve a single dependency declaration to the `.hatch` bytes it
+/// represents. Handles all three `Dependency` shapes — path (build
+/// the sibling workspace), version (registry cache), git (git cache).
+///
+/// `root` is the directory containing the hatchfile that declared this
+/// dep; used to resolve relative `path = "..."` deps. `cache_dir` lets
+/// callers pin the registry cache root (tests pass an explicit path;
+/// production passes `None` → `$HOME/.hatch/cache`).
+pub fn resolve_dependency_bytes(
+    root: &Path,
+    dep_name: &str,
+    dep: &Dependency,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>, HatchError> {
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    resolve_dep_bytes_inner(root, dep_name, dep, &mut visited, cache_dir)
+}
+
+fn resolve_dep_bytes_inner(
+    root: &Path,
+    dep_name: &str,
+    dep: &Dependency,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>, HatchError> {
+    match dep {
+        Dependency::Path { path, .. } => {
+            let dep_root = root.join(path);
+            build_recursive(&dep_root, visited, cache_dir).map_err(|e| {
+                HatchError::Encode(format!(
+                    "failed to build dependency '{}': {}",
+                    dep_name, e
+                ))
+            })
+        }
+        Dependency::Version(version) => {
+            let cached = match cache_dir {
+                Some(dir) => crate::hatch_registry::cached_artifact_path_in(
+                    dir, dep_name, version,
+                ),
+                None => crate::hatch_registry::cached_artifact_path(dep_name, version)
+                    .map_err(|e| HatchError::Encode(e.to_string()))?,
+            };
+            if !cached.exists() {
+                return Err(HatchError::Encode(format!(
+                    "dependency '{}@{}' isn't cached. Run `hatch install {}@{}` first.",
+                    dep_name, version, dep_name, version
+                )));
+            }
+            Ok(std::fs::read(&cached)?)
+        }
+        Dependency::Git { git, .. } => {
+            let git_ref = dep.git_ref().ok_or_else(|| {
+                HatchError::Encode(format!(
+                    "git dependency '{}' must specify one of tag / rev / branch",
+                    dep_name
+                ))
+            })?;
+            let cache_base = match cache_dir {
+                Some(p) => p.to_path_buf(),
+                None => crate::hatch_registry::cache_root()
+                    .map_err(|e| HatchError::Encode(e.to_string()))?,
+            };
+            let checkout =
+                crate::hatch_registry::cached_git_checkout_path(&cache_base, git, git_ref);
+            if !checkout.exists() {
+                return Err(HatchError::Encode(format!(
+                    "git dependency '{}' ({} @ {}) isn't cached. Run `hatch install {}` first.",
+                    dep_name,
+                    git,
+                    git_ref.as_str(),
+                    dep_name
+                )));
+            }
+            build_recursive(&checkout, visited, cache_dir).map_err(|e| {
+                HatchError::Encode(format!(
+                    "failed to build git dependency '{}': {}",
+                    dep_name, e
+                ))
+            })
+        }
+    }
+}
+
 fn merge_path_dependencies(
     root: &Path,
     manifest: &mut Manifest,
@@ -994,8 +1091,10 @@ mod tests {
                 name: "sample".to_string(),
                 version: "0.1.0".to_string(),
                 entry: "main".to_string(),
+                description: None,
                 modules: vec!["main".to_string(), "util".to_string()],
                 dependencies: BTreeMap::new(),
+                spec_dependencies: BTreeMap::new(),
                 native_libs: BTreeMap::new(),
                 native_search_paths: Vec::new(),
             },

@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, ValueEnum};
@@ -149,6 +150,10 @@ impl From<Mode> for ExecutionMode {
 // ---------------------------------------------------------------------------
 
 fn make_vm(cli: &Cli) -> VM {
+    make_vm_with_loader(cli, None)
+}
+
+fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
     let mode = cli.mode.into();
     let step_limit = cli.step_limit.unwrap_or(match mode {
         ExecutionMode::Interpreter => 1_000_000_000,
@@ -159,6 +164,7 @@ fn make_vm(cli: &Cli) -> VM {
         GcMode::Arena => GcStrategy::Arena,
         GcMode::MarkSweep => GcStrategy::MarkSweep,
     };
+    let load_module_fn = source_dir.map(make_module_loader);
     let config = VMConfig {
         execution_mode: mode,
         step_limit,
@@ -166,9 +172,93 @@ fn make_vm(cli: &Cli) -> VM {
         opt_threshold: cli
             .opt_threshold
             .unwrap_or(VMConfig::default().opt_threshold),
+        load_module_fn,
         ..VMConfig::default()
     };
     VM::new(config)
+}
+
+// ---------------------------------------------------------------------------
+// Module loader + spec-dep pre-installer
+// ---------------------------------------------------------------------------
+
+/// Build a `load_module_fn` that resolves filesystem-relative imports
+/// (`./foo`, `../foo`, bare `foo`) against the running file's
+/// directory. Scoped imports like `@hatch:test` are *not* handled here —
+/// they must already be installed into the VM (see
+/// [`preinstall_spec_dependencies`]), so this loader only covers
+/// imports that sit next to the source file on disk.
+fn make_module_loader(
+    running_file_dir: PathBuf,
+) -> Box<dyn Fn(&str) -> Option<String>> {
+    Box::new(move |name: &str| -> Option<String> {
+        if name.starts_with("./") || name.starts_with("../") {
+            let rel = Path::new(name);
+            let candidate = running_file_dir.join(rel).with_extension("wren");
+            return fs::read_to_string(candidate).ok();
+        }
+        // Bare names (no scope chars) → sibling file in the same dir.
+        let is_scoped = name.chars().any(|c| matches!(c, ':' | '@' | '/'));
+        if is_scoped {
+            // Scoped imports must have been pre-installed — returning
+            // None here surfaces a clear "Could not load module" error
+            // rather than silently finding the wrong file.
+            return None;
+        }
+        let candidate = running_file_dir.join(format!("{}.wren", name));
+        fs::read_to_string(candidate).ok()
+    })
+}
+
+/// Look for a `hatchfile` next to (or above) the running file; if one
+/// exists, resolve every `[spec-dependencies]` entry through the same
+/// machinery `hatch build` uses (path → recursive build, version →
+/// `~/.hatch/cache/...`, git → cached checkout) and install each
+/// resulting `.hatch` into the VM. Imports like `@hatch:test` then hit
+/// an already-loaded module.
+fn preinstall_spec_dependencies(vm: &mut VM, source_dir: &Path) -> Result<(), String> {
+    let Some(hatchfile) = find_hatchfile(source_dir) else {
+        return Ok(());
+    };
+    let text = fs::read_to_string(&hatchfile)
+        .map_err(|e| format!("reading {}: {}", hatchfile.display(), e))?;
+    let manifest: wren_lift::hatch::Manifest = toml::from_str(&text)
+        .map_err(|e| format!("parsing {}: {}", hatchfile.display(), e))?;
+
+    let workspace_root = hatchfile.parent().unwrap_or(Path::new("."));
+    for (dep_name, dep) in &manifest.spec_dependencies {
+        let bytes = wren_lift::hatch::resolve_dependency_bytes(
+            workspace_root,
+            dep_name,
+            dep,
+            None,
+        )
+        .map_err(|e| format!("resolving spec-dep '{}': {}", dep_name, e))?;
+        match vm.install_hatch_modules(&bytes) {
+            InterpretResult::Success => {}
+            InterpretResult::CompileError => {
+                return Err(format!("compile error installing spec-dep '{}'", dep_name));
+            }
+            InterpretResult::RuntimeError => {
+                return Err(format!("runtime error installing spec-dep '{}'", dep_name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk upward from `start` until a `hatchfile` is found. Returns the
+/// absolute path to the hatchfile, or `None` if none exists.
+fn find_hatchfile(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start.to_path_buf());
+    while let Some(d) = dir {
+        let candidate = d.join("hatchfile");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +326,20 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
 
     // --- Execution path: route through VM ---
 
-    let mut vm = make_vm(cli);
+    let source_dir = Path::new(filename)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut vm = make_vm_with_loader(cli, Some(source_dir.clone()));
+
+    // Resolve `[spec-dependencies]` declared in a sibling `hatchfile`
+    // through the ambient hatch cache and install them so imports like
+    // `@hatch:test` find an already-loaded module.
+    if let Err(e) = preinstall_spec_dependencies(&mut vm, &source_dir) {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    }
+
     let module_name = filename.strip_suffix(".wren").unwrap_or(filename);
 
     match vm.interpret(module_name, source) {
@@ -325,16 +428,35 @@ fn run_manual_pipeline(
 
     if cli.dump_mir {
         println!("{}", mir.pretty_print(&interner));
+        for class in &module_mir.classes {
+            println!("\n=== class {} ===", interner.resolve(class.name));
+            for method in &class.methods {
+                println!("\n--- method {} ---", method.signature);
+                println!("{}", method.mir.pretty_print(&interner));
+            }
+        }
         return;
     }
 
     // Optimize
     if !cli.no_opt {
         run_opt_pipeline(mir, &interner);
+        for class in &mut module_mir.classes {
+            for method in &mut class.methods {
+                run_opt_pipeline(&mut method.mir, &interner);
+            }
+        }
     }
 
     if cli.dump_opt {
         println!("{}", mir.pretty_print(&interner));
+        for class in &module_mir.classes {
+            println!("\n=== class {} ===", interner.resolve(class.name));
+            for method in &class.methods {
+                println!("\n--- method {} ---", method.signature);
+                println!("{}", method.mir.pretty_print(&interner));
+            }
+        }
         return;
     }
 
