@@ -42,6 +42,41 @@ fn list_filled(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn list_subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let list = receiver_list(args);
     let count = list.len();
+
+    // Range subscript: `xs[a..b]` / `xs[a...b]` returns a new list
+    // containing the slice. Stock Wren supports this; prior to the
+    // fix it fell through to `validate_index` which only accepts
+    // Num, so any idiomatic slice errored.
+    if args[1].is_object() {
+        let ptr = args[1].as_object().unwrap();
+        let header = unsafe { &*(ptr as *const crate::runtime::object::ObjHeader) };
+        if header.obj_type == crate::runtime::object::ObjType::Range {
+            let range = unsafe { &*(ptr as *const crate::runtime::object::ObjRange) };
+            let len = count as i64;
+            let normalize = |mut v: i64| -> i64 {
+                if v < 0 {
+                    v += len
+                }
+                v
+            };
+            let from = normalize(range.from as i64);
+            let to_raw = normalize(range.to as i64);
+            let end = if range.is_inclusive { to_raw + 1 } else { to_raw };
+            if from < 0 || end < from || end > len {
+                ctx.runtime_error(format!(
+                    "List slice {}..{} out of bounds.",
+                    range.from, range.to
+                ));
+                return Value::null();
+            }
+            let mut out = Vec::with_capacity((end - from) as usize);
+            for i in from..end {
+                out.push(list.get(i as usize).unwrap_or(Value::null()));
+            }
+            return ctx.alloc_list(out);
+        }
+    }
+
     let index = match super::validate_index(ctx, args[1], count, "Subscript") {
         Some(v) => v,
         None => return Value::null(),
@@ -119,8 +154,16 @@ fn list_iterate(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 fn list_iterator_value(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    // Defensive: the iterator-protocol contract guarantees a Num
+    // here, but a buggy caller (or upstream dispatch quirk) could
+    // pass something else. Panicking here turns a recoverable
+    // runtime error into a process abort — prefer a null value so
+    // the caller's `for..in` ends quietly.
     let list = receiver_list(args);
-    let index = args[1].as_num().unwrap() as usize;
+    let index = match args[1].as_num() {
+        Some(n) => n as usize,
+        None => return Value::null(),
+    };
     list.get(index).unwrap_or(Value::null())
 }
 

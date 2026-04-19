@@ -133,6 +133,22 @@ impl Parser {
         }
     }
 
+    /// Look past any run of newlines and report the first non-newline
+    /// token. Used by the postfix-expression loop to let method-call
+    /// chains wrap across lines (`foo()\n  .bar()` reads the same as
+    /// `foo().bar()`).
+    fn peek_past_newlines(&self) -> Option<&Token> {
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            if matches!(tok.token, Token::Newline) {
+                i += 1;
+                continue;
+            }
+            return Some(&tok.token);
+        }
+        None
+    }
+
     fn expect_statement_end(&mut self) {
         if self.is_at_end() {
             return;
@@ -1319,6 +1335,19 @@ impl Parser {
         let mut expr = self.primary()?;
 
         loop {
+            // Method-call chains may wrap across lines:
+            //
+            //   foo()
+            //     .bar()
+            //     .baz()
+            //
+            // The lexer emits a Newline before the `.`; peek past
+            // any run of newlines and, if a `.` follows, treat the
+            // newlines as whitespace instead of as a statement
+            // terminator.
+            if matches!(self.peek_past_newlines(), Some(Token::Dot)) {
+                self.skip_newlines();
+            }
             if self.match_token(&Token::Dot) {
                 self.skip_newlines();
                 // Method call or field access

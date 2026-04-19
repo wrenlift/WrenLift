@@ -7,6 +7,48 @@ rationale for anyone who reads just this file.
 
 ## Fixed
 
+### Parser rejected method-call chains that wrapped across lines
+
+Status: **fixed**
+
+```wren
+var m = foo()
+  .bar()        // prior: "unexpected token '.'"
+  .baz()        // prior: same
+```
+
+Stock Wren lets a method chain span lines — the newline between
+`)` and `.` is swallowed because the `.` would be nonsense as the
+start of a new statement. Our `postfix()` loop was calling
+`match_token(&Token::Dot)` directly, which failed on any newline
+in between and returned from the expression.
+
+Fix: added `peek_past_newlines()` that reports the first
+non-newline token; `postfix()` calls it before the dot match and
+skips newlines only when a dot actually follows. Safe because `.`
+can't legitimately begin a statement on its own.
+
+### `str[a..b]` / `list[a..b]` threw "Subscript must be a number"
+
+Status: **fixed**
+
+Stock Wren accepts a `Range` as a subscript argument for strings
+(returns substring) and lists (returns sublist). WrenLift's
+`subscript` natives hard-required `Num`. Fix: added an
+`ObjRange` path to both with `from..to` (inclusive) and
+`from...to` (exclusive) handling, negative-index normalization,
+and bounds checking.
+
+### `list_iterator_value` panicked on a non-Num iterator
+
+Status: **fixed**
+
+`args[1].as_num().unwrap()` panicked when the iterator protocol
+handed the native a non-Num value. Fix: treat "not a Num" as end
+of iteration (return null) instead of aborting the process.
+Doesn't address the *cause* of the bad iterator state (see the
+open entry below), but removes the panic as a symptom.
+
 ### Classes invisible inside `Fiber.new { ... }` closures
 
 Status: **fixed**
@@ -88,6 +130,45 @@ formatting. Required threading `&dyn NativeContext` into
 `format_object` so it can resolve symbols.
 
 ## Open
+
+### Consecutive `startsWith` calls with different args return stale/wrong arg
+
+Status: **open**
+
+```wren
+var tok = "alice"
+if (tok.startsWith("--")) { /* ... */ }
+if (tok.startsWith("-")) { /* ... */ }    // aborts: "Argument must be a string"
+```
+
+The first call succeeds (both receiver and arg are strings). The
+second call, with a different literal arg, aborts inside the
+`starts_with` native with "Argument must be a string" — as if
+`args[1]` is not the string literal we passed.
+
+Reproduces only when surrounded by enough code (empty standalone
+file doesn't trigger). Suspect an IC / inline-cache bug where the
+argument register is read from a stale slot on the second
+dispatch.
+
+Worked around in `@hatch:cli` by collapsing both branches into a
+single index-based check (`tok[0] == "-"`).
+
+### `for` iteration over a list that has just been built leaves `iteratorValue` passed a non-number
+
+Status: **open (partial mitigation)**
+
+A `for (a in list) { ... }` loop inside a method body, where the
+list was populated earlier in the same method, sometimes hands
+`iteratorValue` a non-numeric iterator. Prior to the mitigation,
+this panicked via `unwrap()`. The list native now tolerates the
+bad input (returns null), so the process no longer aborts — but
+the loop terminates early, which usually surfaces as silent
+misbehavior rather than an error.
+
+Same class of bug as the `startsWith` one above — likely an IC /
+register-file quirk across method calls. Needs proper
+investigation in `vm_interp.rs`.
 
 ### Fiber abort through an intermediate closure call corrupts caller state
 

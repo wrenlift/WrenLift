@@ -65,8 +65,40 @@ fn plus(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let s = receiver_str(args);
 
+    // `str[range]` slices. Stock Wren accepts any Range here; the
+    // prior version rejected everything that wasn't a Num, which
+    // broke idiomatic substring grabs like `str[2...str.count]`.
+    if args[1].is_object() {
+        let ptr = args[1].as_object().unwrap();
+        let header = unsafe { &*(ptr as *const super::super::object::ObjHeader) };
+        if header.obj_type == super::super::object::ObjType::Range {
+            let range =
+                unsafe { &*(ptr as *const super::super::object::ObjRange) };
+            let char_count = s.chars().count() as i64;
+            let (start, end) = match normalize_range(range, char_count) {
+                Some(pair) => pair,
+                None => {
+                    ctx.runtime_error(format!(
+                        "String slice {}..{} out of bounds.",
+                        range.from, range.to
+                    ));
+                    return Value::null();
+                }
+            };
+            // Walk chars from start..end and collect. We do the
+            // char-level walk (not byte slicing) so the result is
+            // always a valid utf-8 substring.
+            let slice: String = s
+                .chars()
+                .skip(start as usize)
+                .take((end - start) as usize)
+                .collect();
+            return ctx.alloc_string(slice);
+        }
+    }
+
     if !args[1].is_num() {
-        ctx.runtime_error("Subscript must be a number.".to_string());
+        ctx.runtime_error("Subscript must be a number or range.".to_string());
         return Value::null();
     }
 
@@ -96,6 +128,31 @@ fn subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             Value::null()
         }
     }
+}
+
+/// Resolve a `Range` against a sequence length, producing the
+/// `[start, end)` half-open char-index pair expected by slicing.
+/// Supports negative indices (counted from the end) and inclusive /
+/// exclusive bounds. Returns `None` when the requested slice falls
+/// outside the string.
+fn normalize_range(range: &super::super::object::ObjRange, len: i64) -> Option<(i64, i64)> {
+    let normalize = |mut v: i64| -> i64 {
+        if v < 0 {
+            v += len
+        }
+        v
+    };
+    let from = normalize(range.from as i64);
+    let to_raw = normalize(range.to as i64);
+    // `from..to` is inclusive; `from...to` is exclusive. Wren also
+    // allows reversed ranges, but substring slicing reads strangest
+    // when the result would be empty or reversed, so require
+    // non-decreasing bounds here.
+    let end = if range.is_inclusive { to_raw + 1 } else { to_raw };
+    if from < 0 || end < from || end > len {
+        return None;
+    }
+    Some((from, end))
 }
 
 fn byte_at(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
