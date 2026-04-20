@@ -20,11 +20,36 @@
 //! `Set-Cookie`. Callers who want the "just give me one value"
 //! behaviour pick the first element.
 
+use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
+
+// --- Streaming registry ---------------------------------------
+
+/// A single live streaming response. Held in the registry until
+/// the caller either drains it to EOF or calls `streamClose`.
+///
+/// `reader` is a boxed `Read` because `ureq::Response::into_reader`
+/// returns an opaque `Box<dyn Read + Send>` — we just forward it.
+struct StreamEntry {
+    reader: Box<dyn Read + Send>,
+}
+
+fn stream_registry() -> &'static Mutex<HashMap<u64, StreamEntry>> {
+    static REG: OnceLock<Mutex<HashMap<u64, StreamEntry>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_stream_id() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::SeqCst)
+}
 
 // --- Helpers --------------------------------------------------
 
@@ -298,10 +323,198 @@ fn http_request(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     out
 }
 
+// --- Streaming ------------------------------------------------
+//
+// `stream(method, url, headers, body, timeout)` — issues the
+// request synchronously but doesn't read the body. Returns a Map
+// {id, status, headers} where `id` is a registry handle. The
+// caller drains the body via `streamReadBytes(id, max)` which
+// returns `List<Num>` chunks or null at EOF. `streamClose(id)`
+// drops the entry if the caller bails early.
+//
+// Large responses (downloads, SSE, chunked endpoints) no longer
+// need to fit in memory: the response body is pulled lazily from
+// the socket as the Wren side consumes it.
+
+fn http_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(method) = string_of(ctx, args[1], "Method") else {
+        return Value::null();
+    };
+    let Some(url) = string_of(ctx, args[2], "Url") else {
+        return Value::null();
+    };
+    let Some(headers) = flatten_request_headers(ctx, args[3]) else {
+        return Value::null();
+    };
+    let body = if args[4].is_null() {
+        None
+    } else {
+        match unsafe { string_value(args[4]) } {
+            Some(s) => Some(s),
+            None => {
+                ctx.runtime_error("Http.stream: body must be a string or null.".to_string());
+                return Value::null();
+            }
+        }
+    };
+    let timeout = if args[5].is_null() {
+        Some(Duration::from_secs(30))
+    } else {
+        match args[5].as_num() {
+            Some(n) if n > 0.0 && n.is_finite() => Some(Duration::from_secs_f64(n)),
+            _ => {
+                ctx.runtime_error(
+                    "Http.stream: timeout must be a positive finite number.".to_string(),
+                );
+                return Value::null();
+            }
+        }
+    };
+
+    let agent = ureq::AgentBuilder::new().timeout(timeout.unwrap()).build();
+    let mut req = agent.request(&method, &url);
+    for (k, v) in &headers {
+        req = req.set(k, v);
+    }
+    let result = if let Some(b) = body {
+        req.send_string(&b)
+    } else {
+        req.call()
+    };
+
+    let response = match result {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(_, resp)) => resp,
+        Err(ureq::Error::Transport(t)) => {
+            ctx.runtime_error(format!("Http.stream: {}: {}", url, t));
+            return Value::null();
+        }
+    };
+
+    let status = response.status();
+    // Gather headers the same way `request` does, before consuming
+    // the response into its streaming reader.
+    let names: Vec<String> = response
+        .headers_names()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
+    let mut resp_headers: Vec<(String, Vec<String>)> = Vec::with_capacity(names.len());
+    for name in &names {
+        let values: Vec<String> = response
+            .all(name)
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect();
+        resp_headers.push((name.to_ascii_lowercase(), values));
+    }
+
+    // Hand the body reader to the registry. From here the Wren
+    // side drives pacing via streamReadBytes.
+    let reader = response.into_reader();
+    let id = next_stream_id();
+    stream_registry().lock().unwrap().insert(
+        id,
+        StreamEntry {
+            reader,
+        },
+    );
+
+    let out = ctx.alloc_map();
+    let out_ptr = out.as_object().unwrap() as *mut ObjMap;
+    put_num(ctx, out_ptr, "id", id as f64);
+    put_num(ctx, out_ptr, "status", status as f64);
+    let hdr_val = ctx.alloc_map();
+    let hdr_ptr = hdr_val.as_object().unwrap() as *mut ObjMap;
+    for (k, values) in resp_headers {
+        let list_elems: Vec<Value> = values.into_iter().map(|s| ctx.alloc_string(s)).collect();
+        let list = ctx.alloc_list(list_elems);
+        let key = ctx.alloc_string(k);
+        unsafe { (*hdr_ptr).set(key, list) };
+    }
+    let hdr_key = ctx.alloc_string("headers".to_string());
+    unsafe { (*out_ptr).set(hdr_key, hdr_val) };
+    out
+}
+
+fn http_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let id = match args[1].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
+        _ => {
+            ctx.runtime_error(
+                "Http.streamReadBytes: id must be a non-negative integer.".to_string(),
+            );
+            return Value::null();
+        }
+    };
+    let max = match args[2].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+        _ => {
+            ctx.runtime_error(
+                "Http.streamReadBytes: max must be a non-negative integer.".to_string(),
+            );
+            return Value::null();
+        }
+    };
+    if max == 0 {
+        return ctx.alloc_list(Vec::new());
+    }
+
+    // Read with the lock held for the lifetime of the call. The
+    // registry is a HashMap behind a Mutex — no nested Wren calls
+    // can re-enter, so this can't deadlock.
+    let mut reg = stream_registry().lock().unwrap();
+    let Some(entry) = reg.get_mut(&id) else {
+        ctx.runtime_error(format!(
+            "Http.streamReadBytes: unknown stream id {}.",
+            id
+        ));
+        return Value::null();
+    };
+    let mut buf = vec![0u8; max];
+    let n = match entry.reader.read(&mut buf) {
+        Ok(0) => {
+            // EOF. Drop the registry entry so the connection
+            // underneath gets freed.
+            reg.remove(&id);
+            drop(reg);
+            return Value::null();
+        }
+        Ok(n) => n,
+        Err(e) => {
+            reg.remove(&id);
+            drop(reg);
+            ctx.runtime_error(format!("Http.streamReadBytes: {}", e));
+            return Value::null();
+        }
+    };
+    let chunk: Vec<u8> = buf[..n].to_vec();
+    drop(reg);
+    let elements: Vec<Value> = chunk.iter().map(|&b| Value::num(b as f64)).collect();
+    ctx.alloc_list(elements)
+}
+
+fn http_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let id = match args[1].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
+        _ => {
+            ctx.runtime_error(
+                "Http.streamClose: id must be a non-negative integer.".to_string(),
+            );
+            return Value::null();
+        }
+    };
+    stream_registry().lock().unwrap().remove(&id);
+    Value::null()
+}
+
 // --- Registration --------------------------------------------
 
 pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
     let class = vm.make_class("HttpCore", vm.object_class);
     vm.primitive_static(class, "request(_,_,_,_,_)", http_request);
+    vm.primitive_static(class, "stream(_,_,_,_,_)", http_stream);
+    vm.primitive_static(class, "streamReadBytes(_,_)", http_stream_read_bytes);
+    vm.primitive_static(class, "streamClose(_)", http_stream_close);
     class
 }
