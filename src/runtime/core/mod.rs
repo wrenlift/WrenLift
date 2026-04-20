@@ -10,6 +10,7 @@ pub mod fs;
 mod list;
 mod map;
 pub mod meta;
+pub mod os;
 mod null;
 mod num;
 mod obj;
