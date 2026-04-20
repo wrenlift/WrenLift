@@ -8,6 +8,7 @@ mod fiber;
 mod fn_obj;
 pub mod fs;
 pub mod hash;
+pub mod http;
 mod list;
 mod map;
 pub mod meta;

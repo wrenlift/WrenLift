@@ -7,6 +7,28 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### `JSON.parse` fails on second HTTP response body in tiered mode
+
+Status: **open**
+
+Two `Http.get`/`Http.post` calls in sequence, where the second's
+body is parsed as JSON, reproduce:
+
+```
+p1 ok                                 // first parse fine
+Runtime error: JSON: expected string key at offset 1
+```
+
+Minimal repro requires a real network call; `JSON.parse` on the
+same body string typed inline passes. Smells like a JIT state
+leak around `String` operations that follow a large native-side
+allocation (ureq's response body). `--opt-threshold 100000`
+doesn't clear it, so it's not purely opt-tier.
+
+Workaround: run affected scripts with `--mode interpreter`. All
+@hatch:http spec cases pass cleanly there; tiered mode exposes
+3 of 9 failures (all on the "second request" shape).
+
 ### `for..in` with `continue` corrupts the next iteration's binding
 
 Status: **open (workaround: use `while` + index)**

@@ -1694,6 +1694,19 @@ impl VM {
                 );
                 true
             }
+            "http" => {
+                let class = super::core::http::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "http".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["HttpCore".to_string()],
+                    },
+                );
+                true
+            }
             _ => false,
         }
     }
