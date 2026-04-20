@@ -918,7 +918,39 @@ impl VM {
 
         // 8. Create module var storage, pre-populated with core class values
         // and imported module vars.
+        //
+        // The installed module's imports can reference builtin optional
+        // modules (e.g. a .hatch-bundled `@hatch:io` that does `import
+        // "io" for IoCore`). Those only show up in `find_imported_var`
+        // once the backing runtime module is registered — which normally
+        // happens lazily via the interpret-path's import loop. Under
+        // `install_hatch_sections`, imports don't re-run, so we pre-load
+        // every builtin whose exported class name appears as one of this
+        // module's required vars. Idempotent; a no-op when the module's
+        // already registered.
         let module_key = module_name.to_string();
+        let builtin_for_var: &[(&str, &str)] = &[
+            ("Meta", "meta"),
+            ("Random", "random"),
+            ("FS", "fs"),
+            ("OS", "os"),
+            ("TimeCore", "time"),
+            ("HashCore", "hash"),
+            ("HttpCore", "http"),
+            ("ProcCore", "proc"),
+            ("RegexCore", "regex"),
+            ("UuidCore", "uuid"),
+            ("IoCore", "io"),
+        ];
+        for name in &var_names {
+            if let Some(&(_, module_id)) =
+                builtin_for_var.iter().find(|(cls, _)| *cls == name)
+            {
+                if !self.engine.modules.contains_key(module_id) {
+                    let _ = self.try_load_builtin_module(module_id);
+                }
+            }
+        }
         let mut module_vars = Vec::with_capacity(var_names.len());
         for name in &var_names {
             if let Some(value) = self.core_class_value(name) {

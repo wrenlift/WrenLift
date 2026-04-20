@@ -49,27 +49,35 @@ struct ProcEntry {
     /// Writable stdin end. `None` once `closeStdin` was called
     /// or once the child exited.
     stdin: Option<ChildStdin>,
-    /// Child's stdout, held *unread*. Two possible futures:
+    /// Child's stdout, held *unread* until one of:
     ///   * Another process asks to chain from us — we take() it
     ///     out and hand it over as that child's stdin.
-    ///   * Nobody chains; on first `wait` / `tryWait` completion
-    ///     we start a reader thread that drains it.
-    /// Eager reader threads would otherwise race with chaining.
+    ///   * A streaming `read_stdout_bytes` call pulls bytes off
+    ///     it directly (appending to `stdout_buf`).
+    ///   * On first `wait` / `tryWait` completion we start a
+    ///     reader thread that drains whatever's left.
+    /// Lazy reader threads make all three paths compose.
     stdout: Option<ChildStdout>,
-    /// Reader thread spawned lazily. `None` means either
-    /// "stdout was chained" (captured_stdout stays empty) or
-    /// "we haven't reaped yet".
-    stdout_thread: Option<JoinHandle<String>>,
-    /// Stderr always gets an eager reader — we never chain
-    /// stderr, and eager reading avoids deadlocks against the
-    /// pipe buffer for verbose programs.
-    stderr_thread: Option<JoinHandle<String>>,
-    /// Populated once `join`-ed. Memoised so repeat reads are
-    /// free and survive `wait`-after-`tryWait` orderings.
-    captured_stdout: Option<String>,
-    captured_stderr: Option<String>,
+    stderr: Option<ChildStderr>,
+    /// Reader threads spawned lazily by `ensure_*_reader`. They
+    /// drain the pipe into a `Vec<u8>` on a background thread so
+    /// large output doesn't deadlock the caller on a full pipe
+    /// buffer. At reap, we join them and extend `stdout_buf` /
+    /// `stderr_buf`.
+    stdout_thread: Option<JoinHandle<Vec<u8>>>,
+    stderr_thread: Option<JoinHandle<Vec<u8>>>,
+    /// Accumulated stdout/stderr bytes across streaming reads and
+    /// the reader-thread tail. After reap this holds the full
+    /// output; before reap, just what streaming reads have pulled.
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+    /// Streaming-read cursor into {stdout,stderr}_buf. Advances
+    /// on each `read_*_bytes` call so repeat reads yield new
+    /// bytes rather than redelivering old ones.
+    stdout_cursor: usize,
+    stderr_cursor: usize,
     /// True if the stdout handle was transferred to another
-    /// process — our captured_stdout will stay empty.
+    /// process — our stdout_buf stays empty.
     stdout_chained: bool,
     exit_code: Option<i32>,
     /// Set by our own `kill` when it was a timeout-driven kill.
@@ -284,22 +292,11 @@ fn spawn_entry(
         stdin_handle = None;
     }
 
-    // Stdout: keep the handle idle so chaining can still claim
-    // it later. Reader thread starts lazily when we reap.
+    // Keep both stdout and stderr idle. Reader threads start
+    // lazily at reap unless streaming reads or chaining got there
+    // first. Eager readers would race against streaming callers.
     let stdout_handle = child.stdout.take();
-
-    // Stderr: spawn the reader eagerly. Programs that trickle
-    // error lines across a long run would deadlock on a full
-    // pipe buffer otherwise, and we never chain stderr.
-    let stderr_thread: Option<JoinHandle<String>> = child.stderr.take().map(
-        |mut s: ChildStderr| -> JoinHandle<String> {
-            std::thread::spawn(move || -> String {
-                let mut buf = String::new();
-                let _ = s.read_to_string(&mut buf);
-                buf
-            })
-        },
-    );
+    let stderr_handle = child.stderr.take();
 
     let pid = child.id();
     let id = next_id();
@@ -312,10 +309,13 @@ fn spawn_entry(
         child: Some(child),
         stdin: stdin_handle,
         stdout: stdout_handle,
+        stderr: stderr_handle,
         stdout_thread: None,
-        stderr_thread,
-        captured_stdout: None,
-        captured_stderr: None,
+        stderr_thread: None,
+        stdout_buf: Vec::new(),
+        stderr_buf: Vec::new(),
+        stdout_cursor: 0,
+        stderr_cursor: 0,
         stdout_chained: false,
         exit_code: None,
         timed_out: false,
@@ -329,33 +329,52 @@ fn spawn_entry(
 /// we observe it's already exited (tryWait). No-op if the
 /// stdout was chained or the reader already started.
 fn ensure_stdout_reader(entry: &mut ProcEntry) {
-    if entry.stdout_thread.is_some() || entry.captured_stdout.is_some() {
+    if entry.stdout_thread.is_some() {
         return;
     }
     let Some(mut s) = entry.stdout.take() else {
         return;
     };
-    entry.stdout_thread = Some(std::thread::spawn(move || -> String {
-        let mut buf = String::new();
-        let _ = s.read_to_string(&mut buf);
+    entry.stdout_thread = Some(std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
+        buf
+    }));
+}
+
+/// Symmetric helper for stderr. Stderr used to read eagerly at
+/// spawn, but that races with streaming reads — making stderr
+/// lazy matches stdout's lifecycle.
+fn ensure_stderr_reader(entry: &mut ProcEntry) {
+    if entry.stderr_thread.is_some() {
+        return;
+    }
+    let Some(mut s) = entry.stderr.take() else {
+        return;
+    };
+    entry.stderr_thread = Some(std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::new();
+        let _ = s.read_to_end(&mut buf);
         buf
     }));
 }
 
 // --- Wait helpers ---------------------------------------------
 
-/// Block on the child, collect reader threads, memoise captured
-/// output. Idempotent — repeat calls after the first just echo
-/// the stored values.
+/// Block on the child, collect reader threads, append their
+/// output to the streaming buffers. Idempotent — repeat calls
+/// after the first just echo the stored values.
 fn reap(entry: &mut ProcEntry) {
     if entry.exit_code.is_some() || entry.timed_out {
         return;
     }
-    // Kick off the stdout reader now so it drains in parallel
-    // with child.wait(). Without this, programs that fill their
-    // stdout pipe buffer would deadlock waiting for someone to
-    // read.
+    // Kick off the reader threads now so they drain in parallel
+    // with child.wait(). Without this, verbose programs could
+    // deadlock on a full pipe buffer. If a streaming read has
+    // already drained a handle, the corresponding ensure_* is a
+    // no-op.
     ensure_stdout_reader(entry);
+    ensure_stderr_reader(entry);
     let Some(mut child) = entry.child.take() else {
         return;
     };
@@ -368,14 +387,12 @@ fn reap(entry: &mut ProcEntry) {
         }
     }
     if let Some(th) = entry.stdout_thread.take() {
-        entry.captured_stdout = Some(th.join().unwrap_or_default());
-    } else if entry.captured_stdout.is_none() {
-        entry.captured_stdout = Some(String::new());
+        let bytes = th.join().unwrap_or_default();
+        entry.stdout_buf.extend_from_slice(&bytes);
     }
     if let Some(th) = entry.stderr_thread.take() {
-        entry.captured_stderr = Some(th.join().unwrap_or_default());
-    } else if entry.captured_stderr.is_none() {
-        entry.captured_stderr = Some(String::new());
+        let bytes = th.join().unwrap_or_default();
+        entry.stderr_buf.extend_from_slice(&bytes);
     }
     // Drop stdin so writes after reap fail cleanly rather than
     // silently buffering into a dead pipe.
@@ -398,13 +415,13 @@ fn build_result(ctx: &mut dyn NativeContext, entry: &ProcEntry) -> Value {
         ctx,
         out_ptr,
         "stdout",
-        entry.captured_stdout.clone().unwrap_or_default(),
+        String::from_utf8_lossy(&entry.stdout_buf).into_owned(),
     );
     put_str(
         ctx,
         out_ptr,
         "stderr",
-        entry.captured_stderr.clone().unwrap_or_default(),
+        String::from_utf8_lossy(&entry.stderr_buf).into_owned(),
     );
     put_bool(ctx, out_ptr, "timedOut", entry.timed_out);
     out
@@ -470,12 +487,15 @@ fn proc_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     registry().lock().unwrap().insert(id, entry);
 
-    // Start the stdout reader before blocking so the pipe
-    // doesn't fill while we wait. Stderr reader is already
-    // running from spawn_entry.
+    // Start both reader threads before blocking so neither pipe
+    // fills up while we poll. Stderr is lazy now (see the
+    // spawn_entry comment); without this kick, a chatty program
+    // would deadlock before we got to reap.
     {
         let mut reg = registry().lock().unwrap();
-        ensure_stdout_reader(reg.get_mut(&id).unwrap());
+        let entry = reg.get_mut(&id).unwrap();
+        ensure_stdout_reader(entry);
+        ensure_stderr_reader(entry);
     }
 
     // Wait with optional timeout.
@@ -511,14 +531,12 @@ fn proc_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             entry.exit_code = Some(code.unwrap_or(-1));
             entry.timed_out = timed_out;
             if let Some(th) = entry.stdout_thread.take() {
-                entry.captured_stdout = Some(th.join().unwrap_or_default());
-            } else {
-                entry.captured_stdout = Some(String::new());
+                let bytes = th.join().unwrap_or_default();
+                entry.stdout_buf.extend_from_slice(&bytes);
             }
             if let Some(th) = entry.stderr_thread.take() {
-                entry.captured_stderr = Some(th.join().unwrap_or_default());
-            } else {
-                entry.captured_stderr = Some(String::new());
+                let bytes = th.join().unwrap_or_default();
+                entry.stderr_buf.extend_from_slice(&bytes);
             }
             entry.stdin = None;
             // Drop the Child to release any remaining handles.
@@ -665,19 +683,18 @@ fn proc_try_wait(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     match child.try_wait() {
         Ok(Some(status)) => {
             entry.exit_code = Some(status.code().unwrap_or(-1));
-            // Start the reader if it's not running yet, then
-            // join it. Child already exited so this returns
+            // Start the readers if they're not running yet, then
+            // join them. Child already exited so joins return
             // quickly.
             ensure_stdout_reader(entry);
+            ensure_stderr_reader(entry);
             if let Some(th) = entry.stdout_thread.take() {
-                entry.captured_stdout = Some(th.join().unwrap_or_default());
-            } else {
-                entry.captured_stdout = Some(String::new());
+                let bytes = th.join().unwrap_or_default();
+                entry.stdout_buf.extend_from_slice(&bytes);
             }
             if let Some(th) = entry.stderr_thread.take() {
-                entry.captured_stderr = Some(th.join().unwrap_or_default());
-            } else {
-                entry.captured_stderr = Some(String::new());
+                let bytes = th.join().unwrap_or_default();
+                entry.stderr_buf.extend_from_slice(&bytes);
             }
             entry.stdin = None;
             let _ = entry.child.take();
@@ -767,6 +784,238 @@ fn proc_forget(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::null()
 }
 
+// --- Streaming I/O --------------------------------------------
+
+/// Convert a `&[u8]` slice to a Wren `List<Num>`. Allocates
+/// through the ctx so the caller doesn't reach into GC details.
+fn bytes_slice_to_list(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Value {
+    let elements: Vec<Value> = bytes.iter().map(|&b| Value::num(b as f64)).collect();
+    ctx.alloc_list(elements)
+}
+
+/// Pull a `Vec<u8>` out of a Wren `List<Num>` argument. Rejects
+/// non-byte-shaped entries; used by `write_stdin_bytes`.
+fn bytes_from_list_arg(
+    ctx: &mut dyn NativeContext,
+    v: Value,
+    label: &str,
+) -> Option<Vec<u8>> {
+    let ptr = match v.as_object() {
+        Some(p) => p as *const ObjList,
+        None => {
+            ctx.runtime_error(format!("{}: expected a list of bytes.", label));
+            return None;
+        }
+    };
+    let (count, data) = unsafe { ((*ptr).count as usize, (*ptr).elements) };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let v = unsafe { *data.add(i) };
+        let n = match v.as_num() {
+            Some(n) => n,
+            None => {
+                ctx.runtime_error(format!("{}: bytes must be numbers.", label));
+                return None;
+            }
+        };
+        if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
+            ctx.runtime_error(format!(
+                "{}: bytes must be integers in 0..=255.",
+                label
+            ));
+            return None;
+        }
+        out.push(n as u8);
+    }
+    Some(out)
+}
+
+/// Shared body for `readStdoutBytes` / `readStderrBytes`. Returns
+/// either a List<Num> of up to `max` bytes or null at EOF.
+///
+/// Contract: returning `null` means "no more bytes will ever
+/// arrive". Returning an empty list means "nothing right now, try
+/// again" — we never hit that case today because we block reading
+/// from the pipe, but callers should treat it as a transient.
+fn read_stream_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    which: Stream,
+) -> Value {
+    let label = match which {
+        Stream::Stdout => "Proc.readStdoutBytes",
+        Stream::Stderr => "Proc.readStderrBytes",
+    };
+    let Some(id) = resolve_id(ctx, args[1], label) else {
+        return Value::null();
+    };
+    let max = match args[2].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+        _ => {
+            ctx.runtime_error(format!("{}: max must be a non-negative integer.", label));
+            return Value::null();
+        }
+    };
+    if max == 0 {
+        return ctx.alloc_list(Vec::new());
+    }
+
+    // Step 1: serve from the already-buffered bytes if the
+    // streaming cursor trails the buffer.
+    {
+        let mut reg = registry().lock().unwrap();
+        let Some(entry) = reg.get_mut(&id) else {
+            ctx.runtime_error(format!("{}: unknown process id {}.", label, id));
+            return Value::null();
+        };
+        let (buf, cursor) = match which {
+            Stream::Stdout => (&mut entry.stdout_buf, &mut entry.stdout_cursor),
+            Stream::Stderr => (&mut entry.stderr_buf, &mut entry.stderr_cursor),
+        };
+        if *cursor < buf.len() {
+            let end = (*cursor + max).min(buf.len());
+            let slice = buf[*cursor..end].to_vec();
+            *cursor = end;
+            drop(reg);
+            return bytes_slice_to_list(ctx, &slice);
+        }
+    }
+
+    // Step 2: try to read more bytes from the live pipe if we
+    // still own it. ChildStdout and ChildStderr are distinct
+    // types in Rust, so we branch rather than using a trait
+    // object (which would force a Box allocation per read).
+    let read_outcome: Option<Result<Vec<u8>, std::io::Error>> = match which {
+        Stream::Stdout => {
+            let handle_opt = {
+                let mut reg = registry().lock().unwrap();
+                reg.get_mut(&id).unwrap().stdout.take()
+            };
+            handle_opt.map(|mut h| {
+                let mut buf = vec![0u8; max];
+                match h.read(&mut buf) {
+                    Ok(0) => Ok(Vec::new()), // EOF
+                    Ok(n) => {
+                        // Put handle back; drop-lock happens in caller path.
+                        let mut reg = registry().lock().unwrap();
+                        reg.get_mut(&id).unwrap().stdout = Some(h);
+                        Ok(buf[..n].to_vec())
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+        }
+        Stream::Stderr => {
+            let handle_opt = {
+                let mut reg = registry().lock().unwrap();
+                reg.get_mut(&id).unwrap().stderr.take()
+            };
+            handle_opt.map(|mut h| {
+                let mut buf = vec![0u8; max];
+                match h.read(&mut buf) {
+                    Ok(0) => Ok(Vec::new()),
+                    Ok(n) => {
+                        let mut reg = registry().lock().unwrap();
+                        reg.get_mut(&id).unwrap().stderr = Some(h);
+                        Ok(buf[..n].to_vec())
+                    }
+                    Err(e) => Err(e),
+                }
+            })
+        }
+    };
+    if let Some(outcome) = read_outcome {
+        match outcome {
+            Ok(chunk) if chunk.is_empty() => Value::null(),
+            Ok(chunk) => {
+                let mut reg = registry().lock().unwrap();
+                let entry = reg.get_mut(&id).unwrap();
+                let (sbuf, cursor) = match which {
+                    Stream::Stdout => (&mut entry.stdout_buf, &mut entry.stdout_cursor),
+                    Stream::Stderr => (&mut entry.stderr_buf, &mut entry.stderr_cursor),
+                };
+                sbuf.extend_from_slice(&chunk);
+                *cursor = sbuf.len();
+                drop(reg);
+                bytes_slice_to_list(ctx, &chunk)
+            }
+            Err(e) => {
+                ctx.runtime_error(format!("{}: {}", label, e));
+                Value::null()
+            }
+        }
+    } else {
+        // Step 3: handle is gone. Either a reader thread took it
+        // (in which case we need to wait for the thread to finish
+        // to see any more bytes), or the pipe already EOF'd.
+        let thread_opt = {
+            let mut reg = registry().lock().unwrap();
+            let entry = reg.get_mut(&id).unwrap();
+            match which {
+                Stream::Stdout => entry.stdout_thread.take(),
+                Stream::Stderr => entry.stderr_thread.take(),
+            }
+        };
+        if let Some(th) = thread_opt {
+            let bytes = th.join().unwrap_or_default();
+            let mut reg = registry().lock().unwrap();
+            let entry = reg.get_mut(&id).unwrap();
+            let (sbuf, cursor) = match which {
+                Stream::Stdout => (&mut entry.stdout_buf, &mut entry.stdout_cursor),
+                Stream::Stderr => (&mut entry.stderr_buf, &mut entry.stderr_cursor),
+            };
+            sbuf.extend_from_slice(&bytes);
+            if *cursor < sbuf.len() {
+                let end = (*cursor + max).min(sbuf.len());
+                let slice = sbuf[*cursor..end].to_vec();
+                *cursor = end;
+                drop(reg);
+                return bytes_slice_to_list(ctx, &slice);
+            }
+        }
+        Value::null()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+fn proc_read_stdout_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    read_stream_bytes(ctx, args, Stream::Stdout)
+}
+
+fn proc_read_stderr_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    read_stream_bytes(ctx, args, Stream::Stderr)
+}
+
+fn proc_write_stdin_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(id) = resolve_id(ctx, args[1], "Proc.writeStdinBytes") else {
+        return Value::null();
+    };
+    let Some(bytes) = bytes_from_list_arg(ctx, args[2], "Proc.writeStdinBytes") else {
+        return Value::null();
+    };
+    let mut reg = registry().lock().unwrap();
+    let Some(entry) = reg.get_mut(&id) else {
+        ctx.runtime_error(format!(
+            "Proc.writeStdinBytes: unknown process id {}.",
+            id
+        ));
+        return Value::null();
+    };
+    let Some(pipe) = entry.stdin.as_mut() else {
+        ctx.runtime_error("Proc.writeStdinBytes: stdin is closed.".to_string());
+        return Value::null();
+    };
+    if let Err(e) = pipe.write_all(&bytes) {
+        ctx.runtime_error(format!("Proc.writeStdinBytes: {}", e));
+    }
+    Value::null()
+}
+
 // --- Registration ---------------------------------------------
 
 pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
@@ -774,7 +1023,10 @@ pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
     vm.primitive_static(class, "run(_,_,_,_,_)", proc_run);
     vm.primitive_static(class, "spawn(_,_,_,_,_)", proc_spawn);
     vm.primitive_static(class, "writeStdin(_,_)", proc_write_stdin);
+    vm.primitive_static(class, "writeStdinBytes(_,_)", proc_write_stdin_bytes);
     vm.primitive_static(class, "closeStdin(_)", proc_close_stdin);
+    vm.primitive_static(class, "readStdoutBytes(_,_)", proc_read_stdout_bytes);
+    vm.primitive_static(class, "readStderrBytes(_,_)", proc_read_stderr_bytes);
     vm.primitive_static(class, "tryWait(_)", proc_try_wait);
     vm.primitive_static(class, "wait(_)", proc_wait);
     vm.primitive_static(class, "kill(_)", proc_kill);
