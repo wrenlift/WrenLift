@@ -1406,11 +1406,32 @@ fn method_params(sig: &MethodSig) -> Vec<&Spanned<SymbolId>> {
 }
 
 /// Convenience: lower a parsed module to MIR (including class definitions).
+///
+/// Thin wrapper around [`lower_module_with_known_classes`] that passes an
+/// empty known-classes table. Callers with a live VM should prefer the
+/// `_with_known_classes` variant so cross-module inheritance works.
 pub fn lower_module(
     module: &Module,
     interner: &mut Interner,
     resolve: &ResolveResult,
 ) -> ModuleMir {
+    lower_module_with_known_classes(module, interner, resolve, &HashMap::new()).0
+}
+
+/// Lower a module to MIR, threading a cross-module field-layout table so
+/// subclasses whose parent lives in a different module inherit the right
+/// field slots.
+///
+/// `known_classes` maps class name → ordered list of field names (inherited +
+/// own). Returned alongside the `ModuleMir` is a `new_layouts` map describing
+/// every class defined in this module, ready to merge back into the caller's
+/// registry before the next compile.
+pub fn lower_module_with_known_classes(
+    module: &Module,
+    interner: &mut Interner,
+    resolve: &ResolveResult,
+    known_classes: &HashMap<String, Vec<String>>,
+) -> (ModuleMir, HashMap<String, Vec<String>>) {
     // Run type inference to enable typed instruction emission.
     let type_env = crate::sema::types::infer_types(module);
 
@@ -1429,17 +1450,38 @@ pub fn lower_module(
     // Compile class definitions.
     // Track each class's full field map (inherited + own) so subclasses can
     // inherit correct field indices from their parent without re-assigning them.
+    // `class_field_maps` is keyed by the class name's SymbolId *in this
+    // module's interner* — newly-defined classes land directly. For classes
+    // that only exist in another module, `known_classes` is consulted via
+    // name lookup when resolving a superclass reference.
     let mut class_field_maps: HashMap<SymbolId, HashMap<SymbolId, u16>> = HashMap::new();
+    // Full ordered field-name layout for every class we compile, so the
+    // caller can extend its cross-module registry.
+    let mut emitted_layouts: HashMap<String, Vec<String>> = HashMap::new();
     let mut classes = Vec::new();
     let mut all_closures = closures;
     for stmt in module {
         if let Stmt::Class(decl) = &stmt.0 {
-            // Clone parent field map eagerly so there's no lingering borrow of class_field_maps.
-            let parent_field_map: HashMap<SymbolId, u16> = decl
-                .superclass
-                .as_ref()
-                .and_then(|s| class_field_maps.get(&s.0).cloned())
-                .unwrap_or_default();
+            // Look up the parent. Prefer an in-module match (already in
+            // `class_field_maps`); fall back to `known_classes` for an
+            // imported parent.
+            let parent_field_map: HashMap<SymbolId, u16> = if let Some(sc) = &decl.superclass {
+                if let Some(map) = class_field_maps.get(&sc.0) {
+                    map.clone()
+                } else {
+                    let sc_name = interner.resolve(sc.0).to_string();
+                    match known_classes.get(&sc_name) {
+                        Some(names) => names
+                            .iter()
+                            .enumerate()
+                            .map(|(i, n)| (interner.intern(n), i as u16))
+                            .collect(),
+                        None => HashMap::new(),
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
             let inherited_fields = parent_field_map.len() as u16;
             let (class_mir, method_closures) = compile_class(
                 decl,
@@ -1465,17 +1507,32 @@ pub fn lower_module(
                     own_idx += 1;
                 }
             }
+            // Reconstruct the ordered-by-slot list of field names for the
+            // cross-module registry.
+            let mut ordered: Vec<(u16, String)> = full_map
+                .iter()
+                .map(|(sym, idx)| (*idx, interner.resolve(*sym).to_string()))
+                .collect();
+            ordered.sort_by_key(|(idx, _)| *idx);
+            let class_name = interner.resolve(decl.name.0).to_string();
+            emitted_layouts.insert(
+                class_name,
+                ordered.into_iter().map(|(_, n)| n).collect(),
+            );
             class_field_maps.insert(decl.name.0, full_map);
             classes.push(class_mir);
             all_closures.extend(method_closures);
         }
     }
 
-    ModuleMir {
-        top_level,
-        classes,
-        closures: all_closures,
-    }
+    (
+        ModuleMir {
+            top_level,
+            classes,
+            closures: all_closures,
+        },
+        emitted_layouts,
+    )
 }
 
 /// Compile a class declaration into ClassMir (plus any closures found in method bodies).

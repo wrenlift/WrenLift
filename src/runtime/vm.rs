@@ -244,6 +244,15 @@ pub struct VM {
     /// `.dylib` / `.so` files inside) survive as long as the VM does.
     /// Dropped automatically at VM teardown, which reclaims disk.
     native_temp_dirs: Vec<tempfile::TempDir>,
+
+    /// Per-class field layouts, keyed by class name. Value is the
+    /// ordered list of field names (`_foo`, `_bar`, ...), including
+    /// inherited fields, where the slot index equals the list index.
+    /// The compiler consults this when lowering a subclass whose
+    /// parent lives in a different module so inherited field slots
+    /// line up — without it, the subclass would start its own fields
+    /// at slot 0 and clobber the parent's state.
+    pub field_layouts: HashMap<String, Vec<String>>,
 }
 
 impl VM {
@@ -314,6 +323,7 @@ impl VM {
             native_search_paths: Vec::new(),
             native_lib_paths: HashMap::new(),
             native_temp_dirs: Vec::new(),
+            field_layouts: HashMap::new(),
         };
 
         // Bootstrap core classes.
@@ -394,8 +404,15 @@ impl VM {
         let _ = &parse_result.module;
 
         // 3. Lower to MIR
-        let mut module_mir =
-            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+        let (mut module_mir, new_layouts) = crate::mir::builder::lower_module_with_known_classes(
+            &parse_result.module,
+            &mut interner,
+            &resolve_result,
+            &self.field_layouts,
+        );
+        for (name, layout) in new_layouts {
+            self.field_layouts.insert(name, layout);
+        }
 
         // 4. Optimize top-level + method + closure bodies
         let constfold = ConstFold;
@@ -757,9 +774,18 @@ impl VM {
             }
         }
 
-        // 4. Lower to MIR
-        let mut module_mir =
-            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+        // 4. Lower to MIR. Thread `field_layouts` through so subclasses
+        // whose parent lives in a previously-loaded module inherit the
+        // right slot offsets.
+        let (mut module_mir, new_layouts) = crate::mir::builder::lower_module_with_known_classes(
+            &parse_result.module,
+            &mut interner,
+            &resolve_result,
+            &self.field_layouts,
+        );
+        for (name, layout) in new_layouts {
+            self.field_layouts.insert(name, layout);
+        }
 
         // 5. Optimize top-level function
         let constfold = ConstFold;
@@ -1694,6 +1720,19 @@ impl VM {
                 );
                 true
             }
+            "io" => {
+                let class = super::core::io::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "io".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["IoCore".to_string()],
+                    },
+                );
+                true
+            }
             "http" => {
                 let class = super::core::http::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2494,9 +2533,18 @@ impl VM {
             return false;
         }
 
-        // 3. Lower + optimize
-        let mut module_mir =
-            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+        // 3. Lower + optimize. `Meta.eval` compiles against the
+        // calling module's scope; thread field_layouts through so
+        // any subclass of an already-loaded parent lines up.
+        let (mut module_mir, new_layouts) = crate::mir::builder::lower_module_with_known_classes(
+            &parse_result.module,
+            &mut interner,
+            &resolve_result,
+            &self.field_layouts,
+        );
+        for (name, layout) in new_layouts {
+            self.field_layouts.insert(name, layout);
+        }
         let constfold = ConstFold;
         let dce = Dce;
         let cse = Cse;
@@ -2678,9 +2726,18 @@ impl VM {
             return None;
         }
 
-        // 3. Lower to MIR and optimize
-        let mut module_mir =
-            crate::mir::builder::lower_module(&parse_result.module, &mut interner, &resolve_result);
+        // 3. Lower to MIR and optimize. This is `Meta.compile` —
+        // compile source against the VM's module graph so inherited
+        // fields line up with parents in other modules.
+        let (mut module_mir, new_layouts) = crate::mir::builder::lower_module_with_known_classes(
+            &parse_result.module,
+            &mut interner,
+            &resolve_result,
+            &self.field_layouts,
+        );
+        for (name, layout) in new_layouts {
+            self.field_layouts.insert(name, layout);
+        }
         let constfold = ConstFold;
         let dce = Dce;
         let cse = Cse;

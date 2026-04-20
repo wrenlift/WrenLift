@@ -576,9 +576,15 @@ fn lex_string(
             continue;
         }
 
-        // Regular character
-        buf.push(ch as char);
-        *pos += 1;
+        // Regular character — consume a full UTF-8 codepoint rather
+        // than a single byte. Treating bytes as chars via `as char`
+        // would re-encode multi-byte sequences (e.g. 0xC3 0xA9 for
+        // "é") as *individual* code points in the Latin-1 supplement,
+        // which UTF-8-encode to 4 bytes instead of the original 2.
+        let rest = &source[*pos..];
+        let c = rest.chars().next().expect("byte at *pos implies at least one char");
+        buf.push(c);
+        *pos += c.len_utf8();
     }
 
     if has_interpolation {

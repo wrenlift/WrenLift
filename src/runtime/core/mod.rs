@@ -9,6 +9,7 @@ mod fn_obj;
 pub mod fs;
 pub mod hash;
 pub mod http;
+pub mod io;
 mod list;
 mod map;
 pub mod meta;
