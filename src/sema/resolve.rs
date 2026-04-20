@@ -43,6 +43,14 @@ pub struct ResolveResult {
     pub errors: Vec<Diagnostic>,
     /// Upvalue info for each scope that captures variables.
     pub upvalues: HashMap<usize, Vec<UpvalueInfo>>,
+    /// Locals of each scope that get captured by a nested closure.
+    /// The MIR builder boxes these (wraps in a 1-element List) so the
+    /// inner closure's capture shares storage with the outer's local —
+    /// otherwise writes to an "upvalue" would just mutate a fresh cell
+    /// and the outer wouldn't see them. Keyed by the originating scope's
+    /// scope_id; the value is the set of captured-local names in that
+    /// scope.
+    pub boxed_locals: HashMap<usize, std::collections::HashSet<SymbolId>>,
     /// Module-level variable names, in declaration order.
     pub module_vars: Vec<SymbolId>,
 }
@@ -136,6 +144,10 @@ pub struct Resolver<'a> {
     module_vars: Vec<SymbolId>,
     resolutions: HashMap<usize, ResolvedName>,
     upvalue_map: HashMap<usize, Vec<UpvalueInfo>>,
+    /// Locals captured by nested closures, keyed by the originating
+    /// scope's scope_id. Populated by `capture_upvalue` whenever it
+    /// walks back to a local and marks it for boxing.
+    boxed_locals: HashMap<usize, std::collections::HashSet<SymbolId>>,
     errors: Vec<Diagnostic>,
     loop_depth: usize,
     in_class: bool,
@@ -150,6 +162,7 @@ impl<'a> Resolver<'a> {
             module_vars: Vec::new(),
             resolutions: HashMap::new(),
             upvalue_map: HashMap::new(),
+            boxed_locals: HashMap::new(),
             errors: Vec::new(),
             loop_depth: 0,
             in_class: false,
@@ -192,6 +205,7 @@ impl<'a> Resolver<'a> {
             resolutions: self.resolutions,
             errors: self.errors,
             upvalues: self.upvalue_map,
+            boxed_locals: self.boxed_locals,
             module_vars: self.module_vars,
         }
     }
@@ -315,6 +329,30 @@ impl<'a> Resolver<'a> {
         // Skip Block scopes — they aren't closure boundaries at runtime.
         // Only Closure/Method scopes get upvalue entries.
         let name = self.scopes[source_scope].locals[local_idx as usize].name;
+
+        // If the path from source to target crosses a Method or
+        // Closure boundary, this is a real cross-closure capture
+        // and the local needs to be boxed. Pure block-scoping
+        // lookups (e.g. reading a param from within the method's
+        // body block) aren't closures and don't need boxing —
+        // they compile to direct SSA access.
+        let crosses_closure = ((source_scope + 1)..=target_scope)
+            .any(|i| !matches!(self.scopes[i].kind, ScopeKind::Block));
+        if crosses_closure {
+            // Attribute to the nearest enclosing non-block scope so
+            // the MIR builder can key on the same scope_id it sees
+            // at compile time.
+            let mut attr_scope = source_scope;
+            while attr_scope > 0 && self.scopes[attr_scope].kind == ScopeKind::Block {
+                attr_scope -= 1;
+            }
+            let owner_scope_id = self.scopes[attr_scope].scope_id;
+            self.boxed_locals
+                .entry(owner_scope_id)
+                .or_default()
+                .insert(name);
+        }
+
         let mut index = local_idx;
         let mut is_local = true;
 

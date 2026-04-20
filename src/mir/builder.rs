@@ -22,6 +22,21 @@ pub struct MirBuilder<'a> {
     module_vars: &'a [SymbolId],
     /// Sema upvalue info: scope_id → Vec<UpvalueInfo> for closures that capture variables.
     upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
+    /// Locals that are captured by nested closures, keyed by the
+    /// scope_id they belong to. A boxed local lives inside a
+    /// 1-element List so the inner closure's upvalue (which holds
+    /// the list reference) sees writes from the outer scope and
+    /// vice-versa. Populated by sema's `boxed_locals`.
+    boxed_locals_map: &'a HashMap<usize, std::collections::HashSet<SymbolId>>,
+    /// Names of locals to box in the *current* function being lowered.
+    /// Derived from `boxed_locals_map` by looking up this function's
+    /// scope_id when entering the builder.
+    current_boxed: std::collections::HashSet<SymbolId>,
+    /// Upvalues in the current function are always heap boxes (every
+    /// captured local gets boxed), so upvalue reads / writes always
+    /// go through a subscript. Stored as a flag rather than a per-
+    /// upvalue set because the rule is uniform.
+    upvalues_are_boxed: bool,
     current_block: BlockId,
     variables: HashMap<SymbolId, ValueId>,
     /// Break targets: (exit_block, tracked variable names for phi propagation)
@@ -59,6 +74,38 @@ impl<'a> MirBuilder<'a> {
         module_vars: &'a [SymbolId],
         upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
     ) -> Self {
+        // Keep the legacy constructor as a thin wrapper over the
+        // full form so existing call sites that don't have a
+        // `boxed_locals_map` keep working (closure capture just
+        // won't box in that mode).
+        static EMPTY_BOXED: std::sync::OnceLock<
+            HashMap<usize, std::collections::HashSet<SymbolId>>,
+        > = std::sync::OnceLock::new();
+        let empty = EMPTY_BOXED.get_or_init(HashMap::new);
+        // The `OnceLock` lives for the program's lifetime so we can
+        // safely widen its lifetime to `'a`.
+        let empty_ref: &'a HashMap<usize, std::collections::HashSet<SymbolId>> =
+            unsafe { &*(empty as *const _) };
+        Self::with_boxed(
+            name,
+            arity,
+            interner,
+            resolutions,
+            module_vars,
+            upvalue_map,
+            empty_ref,
+        )
+    }
+
+    pub fn with_boxed(
+        name: SymbolId,
+        arity: u8,
+        interner: &'a mut Interner,
+        resolutions: &'a HashMap<usize, ResolvedName>,
+        module_vars: &'a [SymbolId],
+        upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
+        boxed_locals_map: &'a HashMap<usize, std::collections::HashSet<SymbolId>>,
+    ) -> Self {
         let mut func = MirFunction::new(name, arity);
         let entry = func.new_block();
         Self {
@@ -67,6 +114,9 @@ impl<'a> MirBuilder<'a> {
             resolutions,
             module_vars,
             upvalue_map,
+            boxed_locals_map,
+            current_boxed: std::collections::HashSet::new(),
+            upvalues_are_boxed: false,
             current_block: entry,
             variables: HashMap::new(),
             break_targets: Vec::new(),
@@ -81,6 +131,34 @@ impl<'a> MirBuilder<'a> {
             block_shadows: Vec::new(),
             type_env: None,
         }
+    }
+
+    /// If `name` is captured by a nested closure, wrap `val` in a
+    /// 1-element List and return the list value. Otherwise return
+    /// `val` unchanged. Callers use this when first binding a
+    /// variable (param or `Stmt::Var`) so subsequent reads and
+    /// writes go through the box uniformly.
+    pub fn box_if_captured(&mut self, name: SymbolId, val: ValueId) -> ValueId {
+        if self.current_boxed.contains(&name) {
+            self.emit(Instruction::MakeList(vec![val]))
+        } else {
+            val
+        }
+    }
+
+    /// Tell the builder which scope it's about to compile. Looks up
+    /// the scope's captured-local set so we know what to box. Call
+    /// this right after construction, before lowering the body.
+    pub fn set_scope(&mut self, scope_id: usize, is_closure: bool) {
+        self.current_boxed = self
+            .boxed_locals_map
+            .get(&scope_id)
+            .cloned()
+            .unwrap_or_default();
+        // Inside a closure, every captured name is boxed (that's
+        // how this whole scheme works), so upvalue reads/writes
+        // always go through a subscript.
+        self.upvalues_are_boxed = is_closure;
     }
 
     /// Set the type environment for type-directed instruction emission.
@@ -104,9 +182,20 @@ impl<'a> MirBuilder<'a> {
     }
 
     pub fn build_body(mut self, body: &Spanned<Stmt>, params: &[Spanned<SymbolId>]) -> MirFunction {
-        for (i, param) in params.iter().enumerate() {
-            let val = self.emit(Instruction::BlockParam(i as u16));
-            self.variables.insert(param.0, val);
+        // Emit BlockParams contiguously so register indices align
+        // with the caller's argument positions. Only then wrap any
+        // captured params in their List boxes.
+        let raw_params: Vec<(SymbolId, ValueId)> = params
+            .iter()
+            .enumerate()
+            .map(|(i, param)| {
+                let val = self.emit(Instruction::BlockParam(i as u16));
+                (param.0, val)
+            })
+            .collect();
+        for (name, val) in raw_params {
+            let stored = self.box_if_captured(name, val);
+            self.variables.insert(name, stored);
         }
         self.lower_stmt(body);
         if matches!(
@@ -195,14 +284,23 @@ impl<'a> MirBuilder<'a> {
                 } else {
                     self.emit(Instruction::ConstNull)
                 };
+                // If this local is captured by a nested closure,
+                // wrap it in a 1-element List so the closure's
+                // upvalue (which will grab the list reference) and
+                // the outer's writes share storage.
+                let stored = if self.current_boxed.contains(&name.0) {
+                    self.emit(Instruction::MakeList(vec![val]))
+                } else {
+                    val
+                };
                 // Inside a block scope, `var x` creates a local variable that
                 // may shadow a module var or outer local. Only use the module
                 // var path when at the top level (no block scope active).
                 if self.block_shadows.is_empty() {
                     if let Some(idx) = self.module_var_index(name.0) {
-                        self.emit(Instruction::SetModuleVar(idx, val));
+                        self.emit(Instruction::SetModuleVar(idx, stored));
                     } else {
-                        self.variables.insert(name.0, val);
+                        self.variables.insert(name.0, stored);
                     }
                 } else {
                     // Record the shadow so we can restore on block exit.
@@ -210,7 +308,7 @@ impl<'a> MirBuilder<'a> {
                         let old = self.variables.get(&name.0).copied();
                         shadows.push((name.0, old));
                     }
-                    self.variables.insert(name.0, val);
+                    self.variables.insert(name.0, stored);
                 }
             }
 
@@ -678,11 +776,36 @@ impl<'a> MirBuilder<'a> {
 
             Expr::Ident(name) => {
                 if let Some(&val) = self.variables.get(name) {
-                    self.emit(Instruction::Move(val))
+                    if self.current_boxed.contains(name) {
+                        // Boxed local: the SSA value is a list ref.
+                        // Deref via subscript so reads see whatever
+                        // any nested closure most recently wrote.
+                        let zero = self.emit(Instruction::ConstNum(0.0));
+                        self.emit(Instruction::SubscriptGet {
+                            receiver: val,
+                            args: vec![zero],
+                        })
+                    } else {
+                        self.emit(Instruction::Move(val))
+                    }
                 } else if let Some(resolved) = self.resolutions.get(&expr.1.start) {
                     match resolved {
                         ResolvedName::ModuleVar(idx) => self.emit(Instruction::GetModuleVar(*idx)),
-                        ResolvedName::Upvalue(idx) => self.emit(Instruction::GetUpvalue(*idx)),
+                        ResolvedName::Upvalue(idx) => {
+                            let raw = self.emit(Instruction::GetUpvalue(*idx));
+                            if self.upvalues_are_boxed {
+                                // The upvalue holds a list reference
+                                // to a boxed outer-scope local. Deref
+                                // element 0 to get the current value.
+                                let zero = self.emit(Instruction::ConstNum(0.0));
+                                self.emit(Instruction::SubscriptGet {
+                                    receiver: raw,
+                                    args: vec![zero],
+                                })
+                            } else {
+                                raw
+                            }
+                        }
                         ResolvedName::ImplicitThis(method_name) => {
                             // Bare identifier in a method → implicit `this.name` getter.
                             let this_sym = self.intern("this");
@@ -1019,7 +1142,7 @@ impl<'a> MirBuilder<'a> {
 
             Expr::Closure { params, body } => {
                 let scope_id = expr.1.start;
-                let fn_idx = self.compile_closure(params, body);
+                let fn_idx = self.compile_closure(params, body, scope_id);
                 // Build upvalue capture list from sema info
                 let upvalue_vals = if let Some(uv_info) = self.upvalue_map.get(&scope_id) {
                     uv_info
@@ -1145,14 +1268,41 @@ impl<'a> MirBuilder<'a> {
         match &target.0 {
             Expr::Ident(name) => {
                 if self.variables.contains_key(name) {
-                    self.variables.insert(*name, value);
+                    if self.current_boxed.contains(name) {
+                        // Boxed local: write through the list box
+                        // instead of rebinding the SSA slot, so a
+                        // previously-captured closure sees the new
+                        // value.
+                        let list = *self.variables.get(name).unwrap();
+                        let zero = self.emit(Instruction::ConstNum(0.0));
+                        self.emit(Instruction::SubscriptSet {
+                            receiver: list,
+                            args: vec![zero],
+                            value,
+                        });
+                    } else {
+                        self.variables.insert(*name, value);
+                    }
                 } else if let Some(resolved) = self.resolutions.get(&target.1.start) {
                     match resolved {
                         ResolvedName::ModuleVar(idx) => {
                             self.emit(Instruction::SetModuleVar(*idx, value));
                         }
                         ResolvedName::Upvalue(idx) => {
-                            self.emit(Instruction::SetUpvalue(*idx, value));
+                            if self.upvalues_are_boxed {
+                                // Upvalue holds a list box; write
+                                // into element 0 so the outer
+                                // scope's local reads see it.
+                                let list = self.emit(Instruction::GetUpvalue(*idx));
+                                let zero = self.emit(Instruction::ConstNum(0.0));
+                                self.emit(Instruction::SubscriptSet {
+                                    receiver: list,
+                                    args: vec![zero],
+                                    value,
+                                });
+                            } else {
+                                self.emit(Instruction::SetUpvalue(*idx, value));
+                            }
                         }
                         ResolvedName::ImplicitThis(method_name) => {
                             // Bare identifier assignment in a method → `this.name=(value)`
@@ -1226,7 +1376,12 @@ impl<'a> MirBuilder<'a> {
     }
 
     /// Compile a closure body into a separate MirFunction, returning its index.
-    fn compile_closure(&mut self, params: &[Spanned<SymbolId>], body: &Spanned<Stmt>) -> u32 {
+    fn compile_closure(
+        &mut self,
+        params: &[Spanned<SymbolId>],
+        body: &Spanned<Stmt>,
+        scope_id: usize,
+    ) -> u32 {
         let fn_idx = self.closure_base + self.closures.len() as u32;
 
         let (closure_func, nested_closures) = compile_closure_body(
@@ -1236,6 +1391,8 @@ impl<'a> MirBuilder<'a> {
             self.resolutions,
             self.module_vars,
             self.upvalue_map,
+            self.boxed_locals_map,
+            scope_id,
             fn_idx + 1, // nested closures start after this one
         );
 
@@ -1256,25 +1413,39 @@ fn compile_closure_body(
     resolutions: &HashMap<usize, ResolvedName>,
     module_vars: &[SymbolId],
     upvalue_map: &HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
+    boxed_locals_map: &HashMap<usize, std::collections::HashSet<SymbolId>>,
+    scope_id: usize,
     nested_base: u32,
 ) -> (MirFunction, Vec<MirFunction>) {
     let closure_name = interner.intern("<closure>");
     let arity = params.len() as u8;
 
-    let mut builder = MirBuilder::new(
+    let mut builder = MirBuilder::with_boxed(
         closure_name,
         arity,
         interner,
         resolutions,
         module_vars,
         upvalue_map,
+        boxed_locals_map,
     );
+    builder.set_scope(scope_id, true);
     builder.closure_base = nested_base;
 
-    // Bind parameters
-    for (i, param) in params.iter().enumerate() {
-        let val = builder.emit(Instruction::BlockParam(i as u16));
-        builder.variables.insert(param.0, val);
+    // Emit BlockParams contiguously FIRST so register numbering
+    // stays aligned with the caller's argument setup; then box
+    // the ones that a deeper closure captures.
+    let raw_params: Vec<(SymbolId, ValueId)> = params
+        .iter()
+        .enumerate()
+        .map(|(i, param)| {
+            let val = builder.emit(Instruction::BlockParam(i as u16));
+            (param.0, val)
+        })
+        .collect();
+    for (name, val) in raw_params {
+        let stored = builder.box_if_captured(name, val);
+        builder.variables.insert(name, stored);
     }
 
     // Lower body
@@ -1436,15 +1607,19 @@ pub fn lower_module_with_known_classes(
     let type_env = crate::sema::types::infer_types(module);
 
     let name = interner.intern("<module>");
-    let builder = MirBuilder::new(
+    let mut builder = MirBuilder::with_boxed(
         name,
         0,
         interner,
         &resolve.resolutions,
         &resolve.module_vars,
         &resolve.upvalues,
+        &resolve.boxed_locals,
     )
     .with_type_env(type_env);
+    // Module scope has scope_id=0 in sema; mirror that here so
+    // top-level block locals that get captured get boxed too.
+    builder.set_scope(0, false);
     let (top_level, closures) = builder.build_module(module);
 
     // Compile class definitions.
@@ -1578,14 +1753,20 @@ fn compile_class(
         let params = method_params(&method.signature);
         let arity = params.len() as u8 + 1; // +1 for receiver (this)
 
-        let mut builder = MirBuilder::new(
+        // Method's scope_id matches what sema used: the method
+        // AST node's span start.
+        let method_scope_id = method_spanned.1.start;
+
+        let mut builder = MirBuilder::with_boxed(
             method_name,
             arity,
             interner,
             &resolve.resolutions,
             &resolve.module_vars,
             &resolve.upvalues,
+            &resolve.boxed_locals,
         );
+        builder.set_scope(method_scope_id, false);
         builder.closure_base = closure_base_offset + all_closures.len() as u32;
 
         // Build the combined field map: inherited fields keep their parent indices;
@@ -1611,10 +1792,20 @@ fn compile_class(
         let this_val = builder.emit(Instruction::BlockParam(0));
         builder.variables.insert(this_sym, this_val);
 
-        // Bind explicit parameters (param index 1, 2, ...)
-        for (i, param) in params.iter().enumerate() {
-            let val = builder.emit(Instruction::BlockParam((i + 1) as u16));
-            builder.variables.insert(param.0, val);
+        // Emit BlockParams contiguously (registers 1..=N) before
+        // allocating any List boxes, so argument register layout
+        // matches the caller's Call instruction.
+        let raw_params: Vec<(SymbolId, ValueId)> = params
+            .iter()
+            .enumerate()
+            .map(|(i, param)| {
+                let val = builder.emit(Instruction::BlockParam((i + 1) as u16));
+                (param.0, val)
+            })
+            .collect();
+        for (name, val) in raw_params {
+            let stored = builder.box_if_captured(name, val);
+            builder.variables.insert(name, stored);
         }
 
         // Lower the body
