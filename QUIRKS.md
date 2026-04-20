@@ -129,87 +129,59 @@ class name via the interner) and filled out the other core types in
 formatting. Required threading `&dyn NativeContext` into
 `format_object` so it can resolve symbols.
 
-## Open
+### Consecutive `startsWith` calls with different args aborted the second call
 
-### Consecutive `startsWith` calls with different args return stale/wrong arg
-
-Status: **open**
+Status: **fixed (as a side-effect of the call-dispatch / closure-patching pass)**
 
 ```wren
 var tok = "alice"
 if (tok.startsWith("--")) { /* ... */ }
-if (tok.startsWith("-")) { /* ... */ }    // aborts: "Argument must be a string"
+if (tok.startsWith("-")) { /* ... */ }    // used to abort: "Argument must be a string"
 ```
 
-The first call succeeds (both receiver and arg are strings). The
-second call, with a different literal arg, aborts inside the
-`starts_with` native with "Argument must be a string" — as if
-`args[1]` is not the string literal we passed.
+Previously reproduced when the two calls sat inside a hot method
+body; the second call arrived with a stale arg register. After
+the cross-module call-dispatch fix (frame binds to the callee's
+defining module) and nested `MakeClosure` fn_id patching, the
+repro no longer triggers in any mode. `@hatch:cli` reverted its
+`tok[0] == "-"` workaround back to idiomatic `tok.startsWith(...)`
+and its spec passes.
 
-Reproduces only when surrounded by enough code (empty standalone
-file doesn't trigger). Suspect an IC / inline-cache bug where the
-argument register is read from a stale slot on the second
-dispatch.
+### `for` iteration over a freshly-built list handed `iteratorValue` a non-number
 
-Worked around in `@hatch:cli` by collapsing both branches into a
-single index-based check (`tok[0] == "-"`).
+Status: **fixed (same class as `startsWith`)**
 
-### `for` iteration over a list that has just been built leaves `iteratorValue` passed a non-number
+The `list[0]` dispatch receiving a non-`Num` iterator stemmed from
+the same underlying call-dispatch bug. Once the call-frame module
+binding and closure-patching fixes landed, iteration over a list
+built in the same method body runs cleanly. The defensive null
+fallback in the `list_iterator_value` native is left in place as
+belt-and-braces.
 
-Status: **open (partial mitigation)**
+### Fiber abort through an intermediate closure call corrupted caller state
 
-A `for (a in list) { ... }` loop inside a method body, where the
-list was populated earlier in the same method, sometimes hands
-`iteratorValue` a non-numeric iterator. Prior to the mitigation,
-this panicked via `unwrap()`. The list native now tolerates the
-bad input (returns null), so the process no longer aborts — but
-the loop terminates early, which usually surfaces as silent
-misbehavior rather than an error.
-
-Same class of bug as the `startsWith` one above — likely an IC /
-register-file quirk across method calls. Needs proper
-investigation in `vm_interp.rs`.
-
-### Fiber abort through an intermediate closure call corrupts caller state
-
-Status: **open**
+Status: **fixed**
 
 ```wren
-class T {
-  static outer(body) { body.call() }
-  static inner(arg) {
-    if (!(arg is Fn)) Fiber.abort("bad arg")
-  }
-}
-
-// Direct abort in the fiber's entry closure — works:
-var a = Fiber.new { T.inner("nope") }.try()
-System.print(Expect.that("x"))            // "instance of Assertion"  ✓
-
-// Abort one frame deeper (through an intermediate body.call()):
 var b = Fiber.new {
   T.outer { T.inner("nope") }             // closure inside closure
 }.try()
-System.print(Expect.that("x"))            // "?"  ✗  UNDEFINED returned
+System.print(Expect.that("x"))            // used to print "?"  (UNDEFINED)
 ```
 
-After the nested abort, the next call in the outer fiber returns
-`UNDEFINED` (hence `"?"` via interpolation). Suggests the fiber
-unwind isn't fully restoring the caller's register file or call
-frame when the abort crosses a `body.call()`-style re-entry.
+Root cause: `run_fiber_until_depth` (the native-to-Wren bridge used
+by JIT trampolines and the constructor sync path) compared its
+`stop_depth` against whatever fiber was currently active. When
+`Fiber.try` / `Fiber.abort` switched `vm.fiber` from the try-fiber
+back to main mid-run, the stop-depth check fired against main's
+frame count — which matched coincidentally on the first nested
+return after the abort — so the bridge returned early with the
+wrong value, leaving the caller's register UNDEFINED.
 
-The simpler single-frame case (fiber → native that aborts) works
-fine, as does the single-frame case where the fiber body itself
-calls `Fiber.abort` directly. Only the *two-frame-deep* pattern
-(fiber → Wren closure → native abort) triggers it.
+Fix: the run loop captures `stop_fiber` at entry; both Op::Return
+and Op::ReturnNull gate the `stop_depth` check on
+`fiber == stop_fiber`, so a fiber switch mid-run can no longer
+masquerade as the original completion.
 
-Impact on the ecosystem: blocks `@hatch:test` from running a spec
-that tests a non-Fn `Test.it` argument inside a `Test.describe`
-block — we work around by asserting the abort against a bare
-`Test.it` call. Also blocks any user-level "try this block, catch
-the error" pattern that has nested closures.
-
-Next step: instrument the fiber-unwind path in
-`src/runtime/vm_interp.rs` (look at `resume_caller` /
-`try_run_root_frame` / the abort propagation loop) to see what
-state survives vs. what gets clobbered.
+Regression test:
+`runtime::vm::tests::test_fiber_abort_through_closure_preserves_subsequent_calls`.

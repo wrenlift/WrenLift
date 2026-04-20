@@ -774,6 +774,16 @@ fn run_fiber_with_stop_depth(
         return Err(RuntimeError::Error("no active fiber".into()));
     }
 
+    // `stop_depth` is a frame count on the fiber that was active when
+    // this run loop was entered — typically a native-to-Wren bridge
+    // (`vm.call_fn_native`, constructor sync path) that pushes a frame
+    // and waits for it to unwind. If a `Fiber.try` / `Fiber.abort`
+    // switches fibers mid-run, frame counts on the new fiber are
+    // unrelated, and comparing `stop_depth` against them would
+    // prematurely bail out — returning the wrong value to the bridge.
+    // Remember the starting fiber and only honour `stop_depth` on it.
+    let stop_fiber = vm.fiber;
+
     let mut steps: usize = 0;
     // Back-edge counter: sampled for tier-up polling on hot loops.
     let mut backedge_counter: u32 = 0;
@@ -879,10 +889,17 @@ fn run_fiber_with_stop_depth(
             .map(|m| &mut m.vars as *mut Vec<Value>)
             .unwrap_or(std::ptr::null_mut());
 
-        // Set JIT context for the current frame so JIT-compiled functions
-        // dispatched from the IC fast path have access to vm + module_vars.
-        // Only set when ctx.vm is null (check raw field without copying).
-        if crate::codegen::runtime_fns::jit_ctx_vm_is_null() {
+        // Set JIT context for the current frame so JIT-compiled
+        // functions dispatched from the IC fast path see the active
+        // frame's module vars, func id, etc. Refreshed on every
+        // `'fiber_loop` iteration rather than once per fiber —
+        // a fiber switch (from `fib.try()`, `Fiber.abort`, etc.)
+        // re-enters the loop with the same non-null `ctx.vm`, but
+        // `module_vars` / `current_func_id` now belong to the
+        // previous fiber. Skipping the refresh made the first call
+        // after a cross-fiber abort read stale pointers and return
+        // UNDEFINED.
+        {
             let (mv_ptr, mv_count) = if !module_vars_ptr.is_null() {
                 let v = unsafe { &*module_vars_ptr };
                 (v.as_ptr() as *mut u64, v.len() as u32)
@@ -2701,7 +2718,7 @@ fn run_fiber_with_stop_depth(
                         vm.register_pool.push(values);
                     }
                     let remaining_depth = unsafe { (*fiber).mir_frames.len() };
-                    if stop_depth == Some(remaining_depth) {
+                    if fiber == stop_fiber && stop_depth == Some(remaining_depth) {
                         return Ok(return_val);
                     }
                     if remaining_depth == 0 {
@@ -2742,7 +2759,7 @@ fn run_fiber_with_stop_depth(
                         vm.register_pool.push(values);
                     }
                     let remaining_depth = unsafe { (*fiber).mir_frames.len() };
-                    if stop_depth == Some(remaining_depth) {
+                    if fiber == stop_fiber && stop_depth == Some(remaining_depth) {
                         return Ok(Value::null());
                     }
                     if remaining_depth == 0 {

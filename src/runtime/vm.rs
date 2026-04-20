@@ -4350,6 +4350,39 @@ System.print(Outer.make(42).value)
         assert_eq!(output, "42\n");
     }
 
+    /// Regression: a `Fiber.abort` that propagates back through an
+    /// intermediate `body.call()` frame used to corrupt the next
+    /// static-method call in the caller fiber, which returned
+    /// UNDEFINED instead of its actual value.
+    ///
+    /// Root cause: `run_fiber_until_depth` compared its `stop_depth`
+    /// against whatever fiber was currently active. When an abort
+    /// switched `vm.fiber` from the try-fiber back to main mid-run,
+    /// the stop_depth check fired against main's frame count — which
+    /// happened to match on the first nested return after the abort
+    /// — so `run_fiber_until_depth` returned early with the wrong
+    /// value. Fix gates the check on `fiber == stop_fiber`.
+    #[test]
+    fn test_fiber_abort_through_closure_preserves_subsequent_calls() {
+        let (result, output) = run_and_capture(
+            r#"
+class A { construct new(x) { _x = x } val { _x } }
+class B { static make(x) { A.new(x) } }
+class T {
+  static call(body) { body.call() }
+  static it(arg) { if (!(arg is Fn)) Fiber.abort("bad") }
+}
+
+var test = Fn.new { T.it("x") }
+var aborted = Fiber.new { T.call(test) }.try()
+System.print(aborted)
+System.print(B.make(99).val)
+"#,
+        );
+        assert!(matches!(result, InterpretResult::Success), "{:?}", result);
+        assert_eq!(output, "bad\n99\n");
+    }
+
     #[test]
     fn test_runtime_error_has_source_location() {
         // Trigger a MethodNotFound error, verify extract_error_location returns
