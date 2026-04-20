@@ -841,27 +841,48 @@ impl VM {
             closure.remap_symbols(|old| sym_map[old.index() as usize]);
         }
 
-        // 7a. Register closure functions with the engine first, so we can
-        // patch MakeClosure fn_ids to use actual engine FuncIds.
+        // 7a. Resolve closure FuncIds up front so every MIR that
+        // contains `MakeClosure` — top-level, class methods, and the
+        // closures themselves (a closure can declare a nested closure
+        // of its own) — can be patched before any of them are frozen
+        // via `register_function_in`. Pre-computing `closure_func_ids`
+        // from the engine's current length lets us patch *all* MIR
+        // first and register second.
+        //
         // Binding each function to its defining module lets
         // `GetModuleVar @idx` resolve against the slots the MIR was
         // compiled against, even when the caller lives in a different
         // module.
         let module_rc = std::rc::Rc::new(module_name.to_string());
-        let mut closure_func_ids: Vec<u32> = Vec::new();
-        for closure in module_mir.closures.drain(..) {
-            let fid = self
-                .engine
-                .register_function_in(closure, Some(std::rc::Rc::clone(&module_rc)));
-            closure_func_ids.push(fid.0);
-        }
+        let closure_count = module_mir.closures.len();
+        let base_fid = self.engine.functions.len() as u32;
+        let closure_func_ids: Vec<u32> =
+            (0..closure_count as u32).map(|i| base_fid + i).collect();
 
-        // Patch MakeClosure instructions in top-level and method bodies
+        // Patch every MIR that might emit `MakeClosure`, including
+        // nested closures (e.g. a test `describe { ... }` body whose
+        // inner `Test.it { ... }` blocks are themselves closures).
         patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
         for class in &mut module_mir.classes {
             for method in &mut class.methods {
                 patch_closure_ids(&mut method.mir, &closure_func_ids);
             }
+        }
+        for closure in &mut module_mir.closures {
+            patch_closure_ids(closure, &closure_func_ids);
+        }
+
+        // Register closures now that their MIR is fully patched. The
+        // order matches the pre-computed ids.
+        for (i, closure) in module_mir.closures.drain(..).enumerate() {
+            let fid = self
+                .engine
+                .register_function_in(closure, Some(std::rc::Rc::clone(&module_rc)));
+            debug_assert_eq!(
+                fid.0, closure_func_ids[i],
+                "closure fid drift: expected {}, got {}",
+                closure_func_ids[i], fid.0
+            );
         }
 
         // 7b. Register top-level function with the engine
@@ -2300,6 +2321,12 @@ impl NativeContext for VM {
         if let Some(ptr) = source.as_object() {
             self.gc.write_barrier(ptr as *mut ObjHeader, value);
         }
+    }
+
+    fn func_module(&self, func_id: u32) -> Option<std::rc::Rc<String>> {
+        self.engine
+            .func_module(crate::runtime::engine::FuncId(func_id))
+            .cloned()
     }
 }
 

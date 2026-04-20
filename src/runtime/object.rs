@@ -999,6 +999,12 @@ pub trait NativeContext {
     // -- Garbage collection --
     fn trigger_gc(&mut self);
     fn write_barrier(&mut self, source: Value, value: Value);
+
+    // -- Function metadata --
+    /// Defining module for the function with this id, if one was
+    /// recorded at registration. `None` for isolated-test functions
+    /// registered without a module binding.
+    fn func_module(&self, func_id: u32) -> Option<std::rc::Rc<String>>;
 }
 
 impl ObjClass {

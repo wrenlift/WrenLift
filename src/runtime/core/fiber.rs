@@ -83,10 +83,16 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(closure) => {
             // Capture spawn-site stack trace if opt-in is enabled
             let spawn_trace = ctx.capture_spawn_trace();
-            // Resolve the module name BEFORE allocating the fiber — the
-            // allocation borrows ctx mutably and we need to keep the
-            // borrow free when we reach in for the caller's frame.
-            let module_name = unsafe { current_module_name(ctx) };
+            // Prefer the closure's defining module: a closure passed
+            // across an import boundary still has to resolve
+            // `GetModuleVar` against the slots it was compiled for.
+            // Fall back to the caller's module for test closures
+            // that aren't registered with a module.
+            let fn_ptr = unsafe { (*closure).function };
+            let func_id = unsafe { (*fn_ptr).fn_id };
+            let module_name = ctx
+                .func_module(func_id)
+                .unwrap_or_else(|| unsafe { current_module_name(ctx) });
             let fiber = ctx.alloc_fiber();
             unsafe {
                 (*fiber).header.class = ctx.get_fiber_class();
