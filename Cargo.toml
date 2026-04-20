@@ -37,6 +37,8 @@ md-5 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 rand = "0.9"
+regex = "1"
+uuid = { version = "1", features = ["v4", "v5", "v7"] }
 ureq = { version = "2", features = ["tls"] }
 cranelift-codegen = { version = "0.130", optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
