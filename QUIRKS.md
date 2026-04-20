@@ -5,6 +5,71 @@ status and references to the fixing commit. New entries land at the
 top; once an item ships, it keeps its row so the git log retains
 rationale for anyone who reads just this file.
 
+## Open
+
+### `for..in` with `continue` corrupts the next iteration's binding
+
+Status: **open (workaround: use `while` + index)**
+
+```wren
+for (p in ["foo", "", "bar"]) {
+  if (p == "") continue
+  if (!(p is String)) Fiber.abort("!")   // fires on the third iteration
+}
+```
+
+After a `continue`, the next iteration's `p` binds to something
+other than the list element — on several repros it was the class
+metaobject of the previous element. Reproducible under pure
+interpreter mode; survives `--no-opt`. Stems from how the
+iterator state is saved/restored across the continue target.
+
+Worked around across `@hatch:path` and `@hatch:json` by
+materialising the sequence to a list and walking it via
+`while (i < xs.count) { var p = xs[i]; i = i + 1; ... }`.
+
+### `Fiber.try` doesn't catch "does not implement" method-dispatch errors
+
+Status: **open**
+
+```wren
+class B { construct new() {} }
+Fiber.new { B.new().missing() }.try()   // process aborts; fiber.error not set
+```
+
+Regular `Fiber.abort` is caught. `ctx.runtime_error` from native
+code is caught. But Wren's own "class X does not implement Y"
+method-not-found runtime error propagates straight through
+`Fiber.try`. Blocks any code that wants to probe for a method's
+existence by attempting the call — `@hatch:json` worked around
+it by documenting `toJson()` as a required hook rather than
+optionally-checked.
+
+### `obj.name` compiled via `Meta.compile` dispatches to `Class.name`
+
+Status: **open**
+
+A closure compiled through `Meta.compile` and invoked from
+inside another module's class method returns the *class's*
+`name` rather than the instance's `name` getter:
+
+```wren
+var acc = Meta.compile("return Fn.new { |obj| obj.name }\n").call()
+acc.call(Shape.new("alpha"))    // direct, at module scope: "alpha"  ✓
+Enc.invoke(acc, Shape.new("b")) // inside a class static method: "Class"  ✗
+```
+
+Renaming the getter (`displayName`, `label`, etc.) sidesteps the
+issue — the bug is specific to a small set of names that clash
+with methods on `Class` itself (`name`, `type`, `toString` all
+candidate suspects). Reproduces even with `--no-opt`, so not MIR
+optimizer. Method cache / dispatch path is the next place to
+look.
+
+Impact: blocked `@hatch:json`'s attribute-driven (`#json`)
+auto-serialization path from landing; the library ships with
+the `toJson()` hook alone for v0.1.
+
 ## Fixed
 
 ### Parser rejected method-call chains that wrapped across lines

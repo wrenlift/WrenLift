@@ -2599,9 +2599,70 @@ impl VM {
         module_mir
             .top_level
             .remap_symbols(|old| sym_map[old.index() as usize]);
+        for closure in &mut module_mir.closures {
+            closure.remap_symbols(|old| sym_map[old.index() as usize]);
+        }
 
-        // 5. Register and create closure
-        let func_id = self.engine.register_function(module_mir.top_level);
+        // 5. Patch + register nested closures before the top-level so
+        // `MakeClosure` ops inside the compiled source resolve to the
+        // engine FuncIds we actually assigned. Without this the local
+        // 0-based closure slots are taken literally, which maps to
+        // whatever function happens to sit at that engine FuncId
+        // (often the `Meta.compile` top-level itself — hence the
+        // infinite-recursion stack overflow we used to see when
+        // calling the returned Fn).
+        //
+        // The compiled code was resolved against a core-only prelude,
+        // so it expects module vars laid out in that order. Build a
+        // fresh module entry populated with the core-class values and
+        // bind every function we register here to it. Using a unique
+        // name keeps repeat `Meta.compile` calls from stomping each
+        // other's slot tables.
+        let module_key = format!(
+            "<compiled#{}>",
+            self.engine.functions.len()
+        );
+        let compile_module_rc = std::rc::Rc::new(module_key.clone());
+
+        let mut compiled_vars: Vec<Value> = Vec::with_capacity(core_names.len());
+        let mut compiled_var_names: Vec<String> = Vec::with_capacity(core_names.len());
+        for name in core_names.iter() {
+            let v = self.core_class_value(name).unwrap_or(Value::null());
+            compiled_vars.push(v);
+            compiled_var_names.push((*name).to_string());
+        }
+
+        let closure_count = module_mir.closures.len();
+        let base_fid = self.engine.functions.len() as u32;
+        let closure_func_ids: Vec<u32> =
+            (0..closure_count as u32).map(|i| base_fid + i).collect();
+        patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
+        for closure in &mut module_mir.closures {
+            patch_closure_ids(closure, &closure_func_ids);
+        }
+        for (i, closure) in module_mir.closures.drain(..).enumerate() {
+            let fid = self
+                .engine
+                .register_function_in(closure, Some(std::rc::Rc::clone(&compile_module_rc)));
+            debug_assert_eq!(fid.0, closure_func_ids[i]);
+        }
+
+        // 6. Register and create closure for the top-level.
+        let func_id = self
+            .engine
+            .register_function_in(module_mir.top_level, Some(compile_module_rc));
+
+        // 6b. Register the synthetic module so `GetModuleVar` can
+        // resolve the core-class slots the compiled code was bound
+        // against.
+        self.engine.modules.insert(
+            module_key,
+            super::engine::ModuleEntry {
+                top_level: func_id,
+                vars: compiled_vars,
+                var_names: compiled_var_names,
+            },
+        );
         let fn_name = self.interner.intern("<compiled>");
         let fn_ptr = self.gc.alloc_fn(fn_name, 0, 0, func_id.0);
         unsafe {
