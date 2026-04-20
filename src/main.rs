@@ -225,16 +225,20 @@ fn preinstall_spec_dependencies(vm: &mut VM, source_dir: &Path) -> Result<(), St
         toml::from_str(&text).map_err(|e| format!("parsing {}: {}", hatchfile.display(), e))?;
 
     let workspace_root = hatchfile.parent().unwrap_or(Path::new("."));
-    for (dep_name, dep) in &manifest.spec_dependencies {
+    // Install `[dependencies]` too — when the spec imports the
+    // package under test and that package in turn imports a real
+    // dep, the dep has to already be resolvable. Specs declared in
+    // `[spec-dependencies]` layer on top.
+    for (dep_name, dep) in manifest.dependencies.iter().chain(manifest.spec_dependencies.iter()) {
         let bytes = wren_lift::hatch::resolve_dependency_bytes(workspace_root, dep_name, dep, None)
-            .map_err(|e| format!("resolving spec-dep '{}': {}", dep_name, e))?;
+            .map_err(|e| format!("resolving dep '{}': {}", dep_name, e))?;
         match vm.install_hatch_modules(&bytes) {
             InterpretResult::Success => {}
             InterpretResult::CompileError => {
-                return Err(format!("compile error installing spec-dep '{}'", dep_name));
+                return Err(format!("compile error installing dep '{}'", dep_name));
             }
             InterpretResult::RuntimeError => {
-                return Err(format!("runtime error installing spec-dep '{}'", dep_name));
+                return Err(format!("runtime error installing dep '{}'", dep_name));
             }
         }
     }
