@@ -11,6 +11,7 @@ mod list;
 mod map;
 pub mod meta;
 pub mod os;
+pub mod time;
 mod null;
 mod num;
 mod obj;
