@@ -13,6 +13,7 @@ mod list;
 mod map;
 pub mod meta;
 pub mod os;
+pub mod proc;
 pub mod time;
 mod null;
 mod num;
