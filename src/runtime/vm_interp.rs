@@ -123,7 +123,20 @@ fn call_native_with_frame_sync(
         }
     }
 
-    let result = func(vm, args);
+    // Catch panics so a native-code crash surfaces as a
+    // fiber-catchable runtime error instead of aborting the
+    // whole process. Wren is a library runtime — a bug in a
+    // third-party crate called from a Wren script shouldn't
+    // take down the host.
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func(vm, args))) {
+        Ok(v) => v,
+        Err(panic) => {
+            let msg = panic_message(&panic);
+            vm.has_error = true;
+            vm.last_error = Some(format!("native panic: {}", msg));
+            Value::null()
+        }
+    };
 
     unsafe {
         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -132,6 +145,21 @@ fn call_native_with_frame_sync(
     }
 
     result
+}
+
+/// Recover the payload string of a caught panic. Panics can
+/// carry any type via `panic!(some_value)`, but in practice the
+/// vast majority are either `&'static str` (literal panic
+/// messages) or `String` (formatted `panic!("{}", ...)`). Fall
+/// back to a placeholder for anything else.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&'static str>() {
+        return s.to_string();
+    }
+    if let Some(s) = panic.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "(no message)".to_string()
 }
 
 /// Mirror of `call_native_with_frame_sync` for C-ABI foreign methods
@@ -154,7 +182,19 @@ fn call_foreign_c_with_frame_sync(
         }
     }
 
-    let result = crate::runtime::foreign::dispatch_foreign_c(vm, func, args);
+    // Foreign code is even less trustworthy than first-party
+    // natives — the same panic protection applies.
+    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
+    })) {
+        Ok(v) => v,
+        Err(panic) => {
+            let msg = panic_message(&panic);
+            vm.has_error = true;
+            vm.last_error = Some(format!("foreign panic: {}", msg));
+            Value::null()
+        }
+    };
 
     unsafe {
         if let Some(frame) = (*fiber).mir_frames.last_mut() {
