@@ -2,3 +2,4 @@
 bench/site/results.json
 profile.json.gz
 /hatch/
+.DS_Store
