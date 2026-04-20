@@ -6,6 +6,7 @@ mod bool;
 mod cls;
 mod fiber;
 mod fn_obj;
+pub mod fs;
 mod list;
 mod map;
 pub mod meta;
