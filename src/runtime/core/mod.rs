@@ -7,6 +7,7 @@ mod cls;
 mod fiber;
 mod fn_obj;
 pub mod fs;
+pub mod crypto;
 pub mod hash;
 pub mod http;
 pub mod io;

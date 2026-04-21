@@ -973,6 +973,7 @@ impl VM {
             ("UuidCore", "uuid"),
             ("IoCore", "io"),
             ("TomlCore", "toml"),
+            ("CryptoCore", "crypto"),
         ];
         for name in &var_names {
             if let Some(&(_, module_id)) =
@@ -1780,6 +1781,19 @@ impl VM {
                         top_level: super::engine::FuncId(u32::MAX),
                         vars: vec![class_value],
                         var_names: vec!["HashCore".to_string()],
+                    },
+                );
+                true
+            }
+            "crypto" => {
+                let class = super::core::crypto::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "crypto".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["CryptoCore".to_string()],
                     },
                 );
                 true
