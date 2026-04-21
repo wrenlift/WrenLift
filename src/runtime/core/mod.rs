@@ -17,6 +17,7 @@ pub mod os;
 pub mod proc;
 pub mod regex;
 pub mod time;
+pub mod toml;
 pub mod uuid;
 mod null;
 mod num;
