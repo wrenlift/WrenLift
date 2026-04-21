@@ -7,6 +7,71 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### `for..in` iterator variable leaks past the loop — Cranelift verifier rejects 3 functions in `delta_blue` / tiered mode
+
+Status: **open (non-fatal; compiler falls back to interpreter for the affected functions)**
+
+Symptom: running `bench/delta_blue.wren` in tiered mode prints
+
+```
+COMPILE ERR FuncId(0):  Compilation error: Verifier errors
+COMPILE ERR FuncId(2):  Compilation error: Verifier errors
+COMPILE ERR FuncId(81): Compilation error: Verifier errors
+14065400
+elapsed: 1.44
+```
+
+The program still produces the correct output via the interpreter
+fallback, but the three rejected functions pay interpreter
+dispatch instead of JIT code — measurable latency cost on
+delta_blue's hot path.
+
+Exact Cranelift complaint:
+
+```
+inst94 (jump block17(v94, v40, v93, v73, v74, v75, v76, v88)):
+uses value v40 from non-dominating inst32
+```
+
+Root cause — identified, **not yet fixed**:
+
+`src/mir/builder.rs::lower_for` binds the iterator variable (`i`
+in `for (i in 0..n) { ... }`) by doing
+`self.variables.insert(name, elem_val)` inside `body_bb`. At the
+end of the loop it never removes `name` again, so the outer
+scope's `self.variables` table keeps pointing at `elem_val` —
+an SSA value defined in `body_bb`. If surrounding code later
+references that name (e.g. `delta_blue`'s `chainTest` closure
+runs *two* `for (i in 0..n)` loops back-to-back and the second
+loop snapshots `i` into its phi map), the block-arg list carries
+a `ValueId` whose definition doesn't dominate the use. Cranelift
+catches it; the verifier message points at exactly that phi arg.
+
+Naive fix (tried):
+
+```rust
+// after the loop exits
+match prior_iter_binding {
+    Some(v) => self.variables.insert(variable.0, v),
+    None    => self.variables.remove(&variable.0),
+}
+```
+
+This eliminates the verifier errors and keeps all 818 lib tests +
+every `@hatch:*` spec green. But it unmasks a second bug: with
+the three newly-eligible functions now compiling and tier-upping,
+`delta_blue --mode tiered` SIGSEGVs. Full JIT mode (compile
+everything upfront) still runs fine, so the crash is specific to
+the interpreter→JIT transition for one of these functions — most
+likely a mismatch between the interpreter's view of live locals
+and the JIT entry's expected layout.
+
+Follow-up needed: debug the tier-up state mismatch (probably in
+`codegen/cranelift_backend.rs`'s OSR entry layout analysis),
+confirm no interpreter code still relies on the iterator name
+staying live past the loop, then land the builder fix. Until
+then the verifier rejection is the lesser regression.
+
 ### `JSON.parse` fails on second HTTP response body in tiered mode
 
 Status: **open**
