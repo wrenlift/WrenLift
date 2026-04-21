@@ -262,10 +262,25 @@ pub fn find_package(
 // Catalog writes: `hatch publish`
 // ---------------------------------------------------------------------------
 
-/// Submit a package record to the catalog. Supabase's row-level
-/// security policies enforce name ownership — a first insert claims
-/// the name for the caller's GitHub identity; subsequent updates
-/// require that same identity. The caller supplies the auth'd JWT.
+/// Submit a package record to the catalog. Two transport paths:
+///
+/// 1. **Default** — PostgREST at `<service_url>/rest/v1/packages`.
+///    Supabase's RLS policies enforce name ownership: the first
+///    insert claims the name for the caller's GitHub identity,
+///    subsequent updates require that same JWT-carried identity.
+///
+/// 2. **`HATCH_BOT_URL` override** — POST to a custom endpoint
+///    (the hatch-bot Edge Function is the canonical one). The
+///    function owns its own auth via a shared-secret bearer, and
+///    writes to the same `packages` table from inside Supabase's
+///    trust domain. Used by CI pipelines where the legacy JWT
+///    flow isn't viable (e.g. projects migrated to asymmetric
+///    JWT signing keys where no HS256-signed CI tokens exist).
+///
+/// When `HATCH_BOT_URL` is set, the `access_token` is sent as
+/// `Authorization: Bearer <token>` directly — no PostgREST-
+/// specific `apikey` / `Prefer` headers. The body is still the
+/// same `PackageRecord` JSON.
 pub fn publish_package(
     config: &ServiceConfig,
     creds: &Credentials,
@@ -274,15 +289,25 @@ pub fn publish_package(
     if !config.is_configured() {
         return Err(ServiceError::NotConfigured);
     }
-    // Upsert on the `(name, version)` compound primary key so
-    // repeated publishes of the same version update the row in
-    // place instead of erroring on the PK violation.
+    let body = serde_json::to_string(&record)
+        .map_err(|e| ServiceError::Decode(format!("publish payload: {}", e)))?;
+
+    if let Ok(bot_url) = std::env::var("HATCH_BOT_URL") {
+        let url = bot_url.trim_end_matches('/').to_string();
+        let headers = [
+            format!("Authorization: Bearer {}", creds.access_token),
+            "Content-Type: application/json".to_string(),
+        ];
+        let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+        let _ = curl_post(&url, &header_refs, &body)?;
+        return Ok(());
+    }
+
+    // Default: direct PostgREST upsert.
     let url = format!(
         "{}/rest/v1/packages?on_conflict=name,version",
         config.url.trim_end_matches('/')
     );
-    let body = serde_json::to_string(&record)
-        .map_err(|e| ServiceError::Decode(format!("publish payload: {}", e)))?;
     let headers = [
         format!("apikey: {}", config.anon_key),
         format!("Authorization: Bearer {}", creds.access_token),
