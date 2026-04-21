@@ -8,9 +8,10 @@ description = "SQLite plugin for the WrenLift runtime — distributed as a dylib
 crate-type = ["cdylib"]
 
 [dependencies]
-# Inherit default features (cranelift) because the wren_lift source
-# doesn't currently build with `--no-default-features` — see the
-# `is_leaf` fallback path in codegen. The plugin doesn't itself emit
-# JIT code but needs the types.
-wren_lift = { path = "../.." }
+# Skip cranelift: the plugin doesn't emit JIT code, it just uses
+# the Value / VM / NativeContext types. Pulling in cranelift-jit
+# bloats the dylib by ~10 MB and drags cranelift-native into
+# cross-compile paths where it fails to detect the target CPU
+# (notably linux-arm64 under `cross`).
+wren_lift = { path = "../..", default-features = false }
 rusqlite = { version = "0.31", features = ["bundled"] }

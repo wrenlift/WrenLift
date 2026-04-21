@@ -1934,14 +1934,17 @@ fn dispatch_method(
                     .get(fn_idx)
                     .copied()
                     .unwrap_or(std::ptr::null());
-                let _is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
                 // With Cranelift, allow non-leaf JIT dispatch — Cranelift
                 // handles register allocation and call conventions correctly.
-                // The old backend required is_leaf to avoid spill-slot bugs.
+                // The old backend required is_leaf to avoid spill-slot bugs,
+                // so the non-cranelift fallback still gates on it.
                 #[cfg(feature = "cranelift")]
                 let allow_jit = !fn_ptr.is_null();
                 #[cfg(not(feature = "cranelift"))]
-                let allow_jit = !fn_ptr.is_null() && is_leaf;
+                let allow_jit = {
+                    let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
+                    !fn_ptr.is_null() && is_leaf
+                };
                 if allow_jit {
                     let saved_ctx = read_jit_ctx();
                     vm.engine

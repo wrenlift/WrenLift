@@ -3289,7 +3289,6 @@ fn dispatch_closure_bc_inner(
             .unwrap_or(std::ptr::null());
 
         if !fn_ptr_raw.is_null() {
-            let _is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
             let allow_shadow_nonleaf =
                 crate::codegen::runtime_fns::allow_nonleaf_native(vm, target_func_id);
             // Only dispatch leaf functions via JIT. Non-leaf JIT dispatch is
@@ -3337,7 +3336,7 @@ fn dispatch_closure_bc_inner(
                 #[cfg(feature = "cranelift")]
                 let dispatch_jit = true;
                 #[cfg(not(feature = "cranelift"))]
-                let dispatch_jit = is_leaf;
+                let dispatch_jit = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
 
                 if dispatch_jit {
                     vm.engine.note_native_entry(target_func_id);
