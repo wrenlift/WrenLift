@@ -17,6 +17,7 @@ pub mod meta;
 pub mod os;
 pub mod proc;
 pub mod regex;
+pub mod socket;
 pub mod time;
 pub mod toml;
 pub mod uuid;
