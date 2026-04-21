@@ -13,6 +13,7 @@ pub mod http;
 pub mod io;
 mod list;
 mod map;
+mod typed_array;
 pub mod meta;
 pub mod os;
 pub mod proc;
@@ -72,6 +73,12 @@ pub fn initialize(vm: &mut VM) {
     vm.map_class = vm.make_class("Map", vm.sequence_class);
     vm.range_class = vm.make_class("Range", vm.sequence_class);
 
+    // Typed numeric buffers. Three classes share one storage
+    // type (`ObjTypedArray`) — each tags its elements differently.
+    vm.byte_array_class = vm.make_class("ByteArray", vm.sequence_class);
+    vm.float32_array_class = vm.make_class("Float32Array", vm.sequence_class);
+    vm.float64_array_class = vm.make_class("Float64Array", vm.sequence_class);
+
     // Wrapper sequence classes (lazy iterators).
     let seq = vm.sequence_class;
     vm.map_sequence_class = vm.make_class("MapSequence", seq);
@@ -120,6 +127,7 @@ pub fn initialize(vm: &mut VM) {
     sequence::bind(vm);
     string::bind(vm);
     list::bind(vm);
+    typed_array::bind(vm);
     map::bind(vm);
     range::bind(vm);
     fn_obj::bind(vm);
@@ -155,6 +163,9 @@ fn propagate_inherited_methods(vm: &mut super::vm::VM) {
         vm.sequence_class,
         vm.string_class,
         vm.list_class,
+        vm.byte_array_class,
+        vm.float32_array_class,
+        vm.float64_array_class,
         vm.map_class,
         vm.range_class,
         vm.map_sequence_class,
@@ -196,7 +207,7 @@ fn propagate_inherited_methods(vm: &mut super::vm::VM) {
 // Helpers for core primitives
 // ---------------------------------------------------------------------------
 
-use super::object::{NativeContext, ObjHeader, ObjString, ObjType};
+use super::object::{NativeContext, ObjHeader, ObjList, ObjString, ObjType, ObjTypedArray, TypedArrayKind};
 use super::value::Value;
 
 /// Validate that a value is a Num, returning the f64 or signaling a runtime error.
@@ -281,6 +292,120 @@ pub fn is_string(value: Value) -> bool {
     let ptr = value.as_object().unwrap();
     let header = ptr as *const ObjHeader;
     unsafe { (*header).obj_type == ObjType::String }
+}
+
+/// Extract a contiguous byte buffer out of a value shaped as
+/// String (UTF-8 bytes), List<Num in 0..=255>, or `ByteArray`
+/// (a `u8`-kind `ObjTypedArray`). Used by crypto/zip/socket/
+/// hash/io where every "bytes in" argument historically accepted
+/// the first two forms and now also picks up typed buffers.
+///
+/// Returns `None` and signals a runtime error on shape / element
+/// mismatches. `label` is the caller-facing name for the error.
+pub fn bytes_from_value(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    label: &str,
+) -> Option<Vec<u8>> {
+    if !value.is_object() {
+        ctx.runtime_error(format!(
+            "{}: expected a string, byte list, or ByteArray.",
+            label
+        ));
+        return None;
+    }
+    let ptr = value.as_object().unwrap();
+    let header = ptr as *const ObjHeader;
+    unsafe {
+        match (*header).obj_type {
+            ObjType::String => {
+                let s = ptr as *const ObjString;
+                Some((*s).as_str().as_bytes().to_vec())
+            }
+            ObjType::List => bytes_from_byte_list(ctx, value, label),
+            ObjType::TypedArray => {
+                let arr = ptr as *const ObjTypedArray;
+                if (*arr).kind_tag() == TypedArrayKind::U8 {
+                    Some((*arr).as_bytes().to_vec())
+                } else {
+                    ctx.runtime_error(format!(
+                        "{}: expected ByteArray (got {}).",
+                        label,
+                        (*arr).kind_tag().class_name()
+                    ));
+                    None
+                }
+            }
+            _ => {
+                ctx.runtime_error(format!(
+                    "{}: expected a string, byte list, or ByteArray.",
+                    label
+                ));
+                None
+            }
+        }
+    }
+}
+
+/// Variant that requires a byte-shaped value — no String
+/// fallback. Matches the older `bytes_from_list` behaviour but
+/// also accepts a `ByteArray`. Used when callers semantically
+/// want "bytes as data", not "a string decoded to UTF-8".
+pub fn bytes_from_byte_list(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+    label: &str,
+) -> Option<Vec<u8>> {
+    if !value.is_object() {
+        ctx.runtime_error(format!("{}: expected a list of bytes or ByteArray.", label));
+        return None;
+    }
+    let ptr = value.as_object().unwrap();
+    let header = ptr as *const ObjHeader;
+    let obj_type = unsafe { (*header).obj_type };
+    match obj_type {
+        ObjType::List => {
+            let list = ptr as *const ObjList;
+            let (count, data) = unsafe { ((*list).count as usize, (*list).elements) };
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                let v = unsafe { *data.add(i) };
+                let n = match v.as_num() {
+                    Some(n) => n,
+                    None => {
+                        ctx.runtime_error(format!("{}: bytes must be numbers.", label));
+                        return None;
+                    }
+                };
+                if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
+                    ctx.runtime_error(format!(
+                        "{}: bytes must be integers in 0..=255.",
+                        label
+                    ));
+                    return None;
+                }
+                out.push(n as u8);
+            }
+            Some(out)
+        }
+        ObjType::TypedArray => {
+            let arr = ptr as *const ObjTypedArray;
+            if unsafe { (*arr).kind_tag() } == TypedArrayKind::U8 {
+                Some(unsafe { (*arr).as_bytes() }.to_vec())
+            } else {
+                ctx.runtime_error(format!(
+                    "{}: expected ByteArray (got {}).",
+                    label,
+                    unsafe { (*arr).kind_tag() }.class_name()
+                ));
+                None
+            }
+        }
+        _ => {
+            ctx.runtime_error(format!("{}: expected a list of bytes or ByteArray.", label));
+            None
+        }
+    }
 }
 
 /// Check if a Value is an ObjList.

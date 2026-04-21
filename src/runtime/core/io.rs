@@ -8,40 +8,11 @@
 //! fs). `io` just owns the codec so callers don't have to reach
 //! into hash / os for it.
 
-use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjString, ObjType};
+use crate::runtime::object::{NativeContext, ObjHeader, ObjString, ObjType};
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
-fn bytes_from_list(ctx: &mut dyn NativeContext, value: Value, label: &str) -> Option<Vec<u8>> {
-    let ptr = match value.as_object() {
-        Some(p) => p as *const ObjList,
-        None => {
-            ctx.runtime_error(format!("{}: expected a list of bytes.", label));
-            return None;
-        }
-    };
-    let (count, data) = unsafe { ((*ptr).count as usize, (*ptr).elements) };
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let v = unsafe { *data.add(i) };
-        let n = match v.as_num() {
-            Some(n) => n,
-            None => {
-                ctx.runtime_error(format!("{}: bytes must be numbers.", label));
-                return None;
-            }
-        };
-        if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
-            ctx.runtime_error(format!(
-                "{}: bytes must be integers in 0..=255.",
-                label
-            ));
-            return None;
-        }
-        out.push(n as u8);
-    }
-    Some(out)
-}
+use super::bytes_from_byte_list as bytes_from_list;
 
 /// `IoCore.bytesToString(list)` — decode UTF-8 bytes into a Wren
 /// String. Invalid sequences become U+FFFD. We prefer lossy over

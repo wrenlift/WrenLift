@@ -28,65 +28,7 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
-/// Extract a byte slice from a Wren List<Num> argument. Each
-/// element must be an integer in 0..=255; anything else is a
-/// runtime error.
-fn bytes_from_list(ctx: &mut dyn NativeContext, value: Value, label: &str) -> Option<Vec<u8>> {
-    let ptr = value.as_object();
-    let ptr = match ptr {
-        Some(p) => p as *const crate::runtime::object::ObjList,
-        None => {
-            ctx.runtime_error(format!("{}: expected a list of bytes.", label));
-            return None;
-        }
-    };
-    let (count, data) = unsafe { ((*ptr).count as usize, (*ptr).elements) };
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let v = unsafe { *data.add(i) };
-        let n = match v.as_num() {
-            Some(n) => n,
-            None => {
-                ctx.runtime_error(format!("{}: bytes must be numbers.", label));
-                return None;
-            }
-        };
-        if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
-            ctx.runtime_error(format!("{}: bytes must be integers in 0..=255.", label));
-            return None;
-        }
-        out.push(n as u8);
-    }
-    Some(out)
-}
-
-/// Extract a byte slice from either a Wren String (UTF-8 bytes)
-/// or a List<Num>. HMAC APIs often pass either depending on the
-/// protocol.
-fn bytes_from_value(ctx: &mut dyn NativeContext, value: Value, label: &str) -> Option<Vec<u8>> {
-    if !value.is_object() {
-        ctx.runtime_error(format!("{}: expected a string or list of bytes.", label));
-        return None;
-    }
-    let ptr = value.as_object().unwrap();
-    let header = ptr as *const crate::runtime::object::ObjHeader;
-    unsafe {
-        match (*header).obj_type {
-            crate::runtime::object::ObjType::String => {
-                let s = ptr as *const crate::runtime::object::ObjString;
-                Some((*s).as_str().as_bytes().to_vec())
-            }
-            crate::runtime::object::ObjType::List => bytes_from_list(ctx, value, label),
-            _ => {
-                ctx.runtime_error(format!(
-                    "{}: expected a string or list of bytes.",
-                    label
-                ));
-                None
-            }
-        }
-    }
-}
+use super::bytes_from_value;
 
 fn bytes_to_list(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Value {
     let elements: Vec<Value> = bytes.iter().map(|&b| Value::num(b as f64)).collect();

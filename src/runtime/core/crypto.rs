@@ -15,7 +15,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 
-use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjString, ObjType};
+use crate::runtime::object::NativeContext;
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
@@ -24,69 +24,8 @@ use crate::runtime::vm::VM;
 // Shared by every function below — every input is either a String
 // or a List<Num in 0..=255>. Outputs are always List<Num>.
 
-fn bytes_from_list(
-    ctx: &mut dyn NativeContext,
-    value: Value,
-    label: &str,
-) -> Option<Vec<u8>> {
-    let ptr = match value.as_object() {
-        Some(p) => p as *const ObjList,
-        None => {
-            ctx.runtime_error(format!("{}: expected a list of bytes.", label));
-            return None;
-        }
-    };
-    let (count, data) = unsafe { ((*ptr).count as usize, (*ptr).elements) };
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let v = unsafe { *data.add(i) };
-        let n = match v.as_num() {
-            Some(n) => n,
-            None => {
-                ctx.runtime_error(format!("{}: bytes must be numbers.", label));
-                return None;
-            }
-        };
-        if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
-            ctx.runtime_error(format!(
-                "{}: bytes must be integers in 0..=255.",
-                label
-            ));
-            return None;
-        }
-        out.push(n as u8);
-    }
-    Some(out)
-}
-
-fn bytes_from_value(
-    ctx: &mut dyn NativeContext,
-    value: Value,
-    label: &str,
-) -> Option<Vec<u8>> {
-    if !value.is_object() {
-        ctx.runtime_error(format!("{}: expected a string or list of bytes.", label));
-        return None;
-    }
-    let ptr = value.as_object().unwrap();
-    let header = ptr as *const ObjHeader;
-    unsafe {
-        match (*header).obj_type {
-            ObjType::String => {
-                let s = ptr as *const ObjString;
-                Some((*s).as_str().as_bytes().to_vec())
-            }
-            ObjType::List => bytes_from_list(ctx, value, label),
-            _ => {
-                ctx.runtime_error(format!(
-                    "{}: expected a string or list of bytes.",
-                    label
-                ));
-                None
-            }
-        }
-    }
-}
+use super::bytes_from_byte_list as bytes_from_list;
+use super::bytes_from_value;
 
 fn bytes_to_list(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Value {
     let elements: Vec<Value> = bytes.iter().map(|&b| Value::num(b as f64)).collect();

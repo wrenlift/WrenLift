@@ -3085,6 +3085,33 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                     }
                 }
             }
+            ObjType::TypedArray => {
+                use crate::runtime::object::{ObjTypedArray, TypedArrayKind};
+                let arr = ptr as *const ObjTypedArray;
+                if let Some(n) = idx.as_num() {
+                    let count = unsafe { (*arr).count as i64 };
+                    // Wren negative-index convention.
+                    let raw = n as i64;
+                    let i = if raw < 0 { raw + count } else { raw };
+                    if i < 0 || i >= count {
+                        return Value::null().to_bits();
+                    }
+                    let i = i as usize;
+                    let kind = unsafe { (*arr).kind_tag() };
+                    let v = match kind {
+                        TypedArrayKind::U8 => {
+                            unsafe { (*arr).get_u8(i).unwrap_or(0) as f64 }
+                        }
+                        TypedArrayKind::F32 => {
+                            unsafe { (*arr).get_f32(i).unwrap_or(0.0) as f64 }
+                        }
+                        TypedArrayKind::F64 => {
+                            unsafe { (*arr).get_f64(i).unwrap_or(0.0) }
+                        }
+                    };
+                    return Value::num(v).to_bits();
+                }
+            }
             _ => {}
         }
     }
@@ -3130,6 +3157,32 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                     }
                 }
                 return value.to_bits();
+            }
+            ObjType::TypedArray => {
+                use crate::runtime::object::{ObjTypedArray, TypedArrayKind};
+                let arr = ptr as *mut ObjTypedArray;
+                if let Some(n) = idx.as_num() {
+                    let count = unsafe { (*arr).count as i64 };
+                    let raw = n as i64;
+                    let i = if raw < 0 { raw + count } else { raw };
+                    if i < 0 || i >= count {
+                        return value.to_bits();
+                    }
+                    let i = i as usize;
+                    let kind = unsafe { (*arr).kind_tag() };
+                    if let Some(v) = value.as_num() {
+                        match kind {
+                            TypedArrayKind::U8 => {
+                                if (0.0..=255.0).contains(&v) && v.fract() == 0.0 {
+                                    unsafe { (*arr).set_u8(i, v as u8) };
+                                }
+                            }
+                            TypedArrayKind::F32 => unsafe { (*arr).set_f32(i, v as f32) },
+                            TypedArrayKind::F64 => unsafe { (*arr).set_f64(i, v) },
+                        }
+                    }
+                    return value.to_bits();
+                }
             }
             _ => {}
         }

@@ -113,7 +113,11 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+        ObjType::String
+        | ObjType::Fn
+        | ObjType::Range
+        | ObjType::Foreign
+        | ObjType::TypedArray => {}
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
@@ -234,6 +238,7 @@ unsafe fn object_size(header: *mut ObjHeader) -> usize {
         ObjType::Instance => std::mem::size_of::<ObjInstance>(),
         ObjType::Foreign => std::mem::size_of::<ObjForeign>(),
         ObjType::Module => std::mem::size_of::<ObjModule>(),
+        ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
     }
 }
 
@@ -275,6 +280,9 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::Module => {
             let _ = Box::from_raw(header as *mut ObjModule);
         }
+        ObjType::TypedArray => {
+            let _ = Box::from_raw(header as *mut ObjTypedArray);
+        }
     }
 }
 
@@ -305,6 +313,9 @@ impl GcAllocator for MarkSweepGc {
     }
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange {
         self.alloc_boxed(ObjRange::new(from, to, inclusive))
+    }
+    fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
+        self.alloc_boxed(ObjTypedArray::new(count, kind))
     }
     fn alloc_fn(
         &mut self,

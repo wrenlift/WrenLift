@@ -37,6 +37,48 @@ pub enum ObjType {
     Instance,
     Foreign,
     Module,
+    /// Fixed-size contiguous numeric buffer (ByteArray / Float32Array /
+    /// Float64Array all share this storage; element type lives in
+    /// the `kind` byte on `ObjTypedArray`).
+    TypedArray,
+}
+
+/// Element type for `ObjTypedArray`. Stored as a `u8` on the
+/// object so the JIT can branch on it with a single-byte load
+/// later; the enum is just the ergonomic view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TypedArrayKind {
+    U8 = 0,
+    F32 = 1,
+    F64 = 2,
+}
+
+impl TypedArrayKind {
+    pub fn element_size(self) -> usize {
+        match self {
+            TypedArrayKind::U8 => 1,
+            TypedArrayKind::F32 => 4,
+            TypedArrayKind::F64 => 8,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(TypedArrayKind::U8),
+            1 => Some(TypedArrayKind::F32),
+            2 => Some(TypedArrayKind::F64),
+            _ => None,
+        }
+    }
+
+    pub fn class_name(self) -> &'static str {
+        match self {
+            TypedArrayKind::U8 => "ByteArray",
+            TypedArrayKind::F32 => "Float32Array",
+            TypedArrayKind::F64 => "Float64Array",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +395,147 @@ impl fmt::Debug for ObjList {
             unsafe { std::slice::from_raw_parts(self.elements, self.count as usize) }
         };
         write!(f, "ObjList({:?})", slice)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ObjTypedArray — fixed-size contiguous numeric buffer
+// ---------------------------------------------------------------------------
+
+/// A fixed-size contiguous buffer of numeric elements. Three
+/// concrete Wren-facing classes share this storage:
+///
+/// * `ByteArray`     — `kind = U8`,  1 byte per element
+/// * `Float32Array`  — `kind = F32`, 4 bytes per element (IEEE 754)
+/// * `Float64Array`  — `kind = F64`, 8 bytes per element (IEEE 754)
+///
+/// `data` is allocated via the global allocator with a layout
+/// whose size = `count * element_size()` and alignment = element
+/// size. `count == 0` is represented with a null `data` pointer
+/// (no allocation). The buffer is freed in `Drop`.
+#[repr(C)]
+pub struct ObjTypedArray {
+    pub header: ObjHeader,   // offset 0, 24 bytes
+    pub count: u32,          // offset 24: element count (not byte count)
+    pub kind: u8,            // offset 28: TypedArrayKind encoded as u8
+    _pad: [u8; 3],           // offset 29..32
+    pub data: *mut u8,       // offset 32: raw byte buffer
+                             // total: 40 bytes (matches ObjList)
+}
+
+impl ObjTypedArray {
+    pub fn new(count: u32, kind: TypedArrayKind) -> Self {
+        let data = if count == 0 {
+            std::ptr::null_mut()
+        } else {
+            let bytes = (count as usize) * kind.element_size();
+            let layout =
+                std::alloc::Layout::from_size_align(bytes, kind.element_size()).unwrap();
+            unsafe { std::alloc::alloc_zeroed(layout) }
+        };
+        Self {
+            header: ObjHeader::new(ObjType::TypedArray),
+            count,
+            kind: kind as u8,
+            _pad: [0; 3],
+            data,
+        }
+    }
+
+    pub fn kind_tag(&self) -> TypedArrayKind {
+        // Safe to unwrap: the only construction path sets `kind`
+        // from a valid TypedArrayKind; GC never mutates this byte.
+        TypedArrayKind::from_u8(self.kind).unwrap()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        (self.count as usize) * self.kind_tag().element_size()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.data.is_null() || self.count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.data, self.byte_len()) }
+        }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        if self.data.is_null() || self.count == 0 {
+            &mut []
+        } else {
+            let n = self.byte_len();
+            unsafe { std::slice::from_raw_parts_mut(self.data, n) }
+        }
+    }
+
+    pub fn get_u8(&self, i: usize) -> Option<u8> {
+        if i < self.count as usize {
+            Some(unsafe { *self.data.add(i) })
+        } else {
+            None
+        }
+    }
+
+    pub fn set_u8(&mut self, i: usize, v: u8) {
+        if i < self.count as usize {
+            unsafe { *self.data.add(i) = v };
+        }
+    }
+
+    pub fn get_f32(&self, i: usize) -> Option<f32> {
+        if i < self.count as usize {
+            let p = unsafe { self.data.add(i * 4) } as *const f32;
+            Some(unsafe { p.read_unaligned() })
+        } else {
+            None
+        }
+    }
+
+    pub fn set_f32(&mut self, i: usize, v: f32) {
+        if i < self.count as usize {
+            let p = unsafe { self.data.add(i * 4) } as *mut f32;
+            unsafe { p.write_unaligned(v) };
+        }
+    }
+
+    pub fn get_f64(&self, i: usize) -> Option<f64> {
+        if i < self.count as usize {
+            let p = unsafe { self.data.add(i * 8) } as *const f64;
+            Some(unsafe { p.read_unaligned() })
+        } else {
+            None
+        }
+    }
+
+    pub fn set_f64(&mut self, i: usize, v: f64) {
+        if i < self.count as usize {
+            let p = unsafe { self.data.add(i * 8) } as *mut f64;
+            unsafe { p.write_unaligned(v) };
+        }
+    }
+}
+
+impl Drop for ObjTypedArray {
+    fn drop(&mut self) {
+        if !self.data.is_null() && self.count > 0 {
+            let kind = self.kind_tag();
+            let bytes = (self.count as usize) * kind.element_size();
+            let layout =
+                std::alloc::Layout::from_size_align(bytes, kind.element_size()).unwrap();
+            unsafe { std::alloc::dealloc(self.data, layout) };
+        }
+    }
+}
+
+impl fmt::Debug for ObjTypedArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ObjTypedArray({}, count={})",
+            self.kind_tag().class_name(),
+            self.count
+        )
     }
 }
 
@@ -936,6 +1119,11 @@ pub trait NativeContext {
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value;
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value;
     fn alloc_map(&mut self) -> Value;
+    /// Allocate a fresh typed array of the given kind and element
+    /// count, zero-initialized. Returns a Value pointing at the
+    /// new `ObjTypedArray` with `header.class` set to the VM's
+    /// corresponding ByteArray/Float32Array/Float64Array class.
+    fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value;
 
     // -- Error handling --
     fn runtime_error(&mut self, msg: String);

@@ -166,6 +166,14 @@ pub struct VM {
     pub string_code_point_seq_class: *mut ObjClass,
     pub map_entry_class: *mut ObjClass,
 
+    // Typed numeric buffers. Placed at the end of the class-field
+    // block so adding them doesn't shift offsets of pre-existing
+    // fields that out-of-tree plugins (e.g. @hatch:sqlite) were
+    // compiled against.
+    pub byte_array_class: *mut ObjClass,
+    pub float32_array_class: *mut ObjClass,
+    pub float64_array_class: *mut ObjClass,
+
     // -- Execution state --
     pub fiber: *mut ObjFiber,
     pub modules: HashMap<String, *mut ObjModule>,
@@ -291,6 +299,10 @@ impl VM {
             string_code_point_seq_class: ptr::null_mut(),
             map_entry_class: ptr::null_mut(),
 
+            byte_array_class: ptr::null_mut(),
+            float32_array_class: ptr::null_mut(),
+            float64_array_class: ptr::null_mut(),
+
             fiber: ptr::null_mut(),
             modules: HashMap::new(),
 
@@ -375,7 +387,7 @@ impl VM {
         // 2. Prelude + sema
         let core_names = [
             "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence",
+            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -742,7 +754,7 @@ impl VM {
         // 3. Semantic analysis — register core class names as prelude
         let core_names = [
             "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence",
+            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -1540,6 +1552,23 @@ impl VM {
         Value::object(obj as *mut u8)
     }
 
+    /// Allocate a fresh, zero-initialized typed array. The object's
+    /// `header.class` is set to the matching ByteArray /
+    /// Float32Array / Float64Array ObjClass so method dispatch
+    /// picks the right surface.
+    pub fn new_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value {
+        let obj = self.gc.alloc_typed_array(count, kind);
+        let cls = match kind {
+            TypedArrayKind::U8 => self.byte_array_class,
+            TypedArrayKind::F32 => self.float32_array_class,
+            TypedArrayKind::F64 => self.float64_array_class,
+        };
+        unsafe {
+            (*obj).header.class = cls;
+        }
+        Value::object(obj as *mut u8)
+    }
+
     /// Create a core class with the given name and optional superclass.
     pub fn make_class(&mut self, name: &str, superclass: *mut ObjClass) -> *mut ObjClass {
         let sym = self.interner.intern(name);
@@ -1675,6 +1704,9 @@ impl VM {
             "Num" => self.num_class,
             "String" => self.string_class,
             "List" => self.list_class,
+            "ByteArray" => self.byte_array_class,
+            "Float32Array" => self.float32_array_class,
+            "Float64Array" => self.float64_array_class,
             "Map" => self.map_class,
             "Range" => self.range_class,
             "Null" => self.null_class,
@@ -2341,6 +2373,10 @@ impl NativeContext for VM {
         self.new_map()
     }
 
+    fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value {
+        self.new_typed_array(count, kind)
+    }
+
     fn runtime_error(&mut self, msg: String) {
         self.has_error = true;
         self.last_error = Some(msg.clone());
@@ -2627,7 +2663,7 @@ impl VM {
         let mut interner = parse_result.interner;
         let core_names = [
             "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence",
+            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
         ];
         let mut prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -2828,7 +2864,7 @@ impl VM {
         let mut interner = parse_result.interner;
         let core_names = [
             "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence",
+            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();

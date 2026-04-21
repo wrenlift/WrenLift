@@ -85,6 +85,10 @@ impl GcAllocator for ArenaGc {
         self.alloc_boxed(ObjRange::new(from, to, inclusive))
     }
 
+    fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
+        self.alloc_boxed(ObjTypedArray::new(count, kind))
+    }
+
     fn alloc_fn(
         &mut self,
         name: SymbolId,
@@ -198,6 +202,9 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         }
         ObjType::Module => {
             let _ = Box::from_raw(header as *mut ObjModule);
+        }
+        ObjType::TypedArray => {
+            let _ = Box::from_raw(header as *mut ObjTypedArray);
         }
     }
 }

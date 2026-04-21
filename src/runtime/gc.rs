@@ -385,7 +385,7 @@ impl Gc {
         check_raw((*header).class as *const u8, "header.class");
 
         match (*header).obj_type {
-            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -490,6 +490,10 @@ impl Gc {
 
     pub fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange {
         self.alloc(ObjRange::new(from, to, inclusive))
+    }
+
+    pub fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
+        self.alloc(ObjTypedArray::new(count, kind))
     }
 
     pub fn alloc_fn(
@@ -805,6 +809,7 @@ impl Gc {
             ObjType::Instance => self.promote_typed::<ObjInstance>(old_header),
             ObjType::Foreign => self.promote_typed::<ObjForeign>(old_header),
             ObjType::Module => self.promote_typed::<ObjModule>(old_header),
+            ObjType::TypedArray => self.promote_typed::<ObjTypedArray>(old_header),
         };
 
         // Fix ObjUpvalue self-referential location pointer.
@@ -934,7 +939,7 @@ impl Gc {
         check_raw((*header).class as *const u8, "header.class");
 
         match (*header).obj_type {
-            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -1136,7 +1141,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
@@ -1289,7 +1294,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign => {}
+        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
 
         ObjType::List => {
             let list = &mut *(header as *mut ObjList);
@@ -1400,6 +1405,7 @@ fn object_size(header: *mut ObjHeader) -> usize {
             ObjType::Instance => std::mem::size_of::<ObjInstance>(),
             ObjType::Foreign => std::mem::size_of::<ObjForeign>(),
             ObjType::Module => std::mem::size_of::<ObjModule>(),
+            ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
         }
     }
 }
@@ -1419,6 +1425,7 @@ unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
         ObjType::Instance => std::ptr::drop_in_place(header as *mut ObjInstance),
         ObjType::Foreign => std::ptr::drop_in_place(header as *mut ObjForeign),
         ObjType::Module => std::ptr::drop_in_place(header as *mut ObjModule),
+        ObjType::TypedArray => std::ptr::drop_in_place(header as *mut ObjTypedArray),
     }
 }
 
@@ -1465,6 +1472,9 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::Module => {
             let _ = Box::from_raw(header as *mut ObjModule);
         }
+        ObjType::TypedArray => {
+            std::ptr::drop_in_place(header as *mut ObjTypedArray);
+        }
     }
 }
 
@@ -1497,6 +1507,10 @@ impl super::gc_trait::GcAllocator for Gc {
     #[inline(always)]
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange {
         self.alloc_range(from, to, inclusive)
+    }
+    #[inline(always)]
+    fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
+        self.alloc_typed_array(count, kind)
     }
     #[inline(always)]
     fn alloc_fn(
