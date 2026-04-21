@@ -20,10 +20,11 @@
 //! `Set-Cookie`. Callers who want the "just give me one value"
 //! behaviour pick the first element.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
@@ -31,14 +32,29 @@ use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
 // --- Streaming registry ---------------------------------------
+//
+// `Http.stream` starts a background drain thread that pumps the
+// response body into a shared VecDeque. Both blocking
+// (`streamReadBytes`) and non-blocking (`tryStreamReadBytes`)
+// readers pull from the queue under the same mutex. A condvar
+// signals blocking readers when new bytes arrive or EOF is hit.
+//
+// The drain thread owns the boxed `Read` (returned by
+// `ureq::Response::into_reader`) and is joined either when the
+// caller EOF-drains the reader or explicitly via `streamClose`.
 
-/// A single live streaming response. Held in the registry until
-/// the caller either drains it to EOF or calls `streamClose`.
-///
-/// `reader` is a boxed `Read` because `ureq::Response::into_reader`
-/// returns an opaque `Box<dyn Read + Send>` — we just forward it.
+struct StreamState {
+    buf: VecDeque<u8>,
+    eof: bool,
+    err: Option<String>,
+}
+
+type SharedHttpStream = Arc<(Mutex<StreamState>, Condvar)>;
+
 struct StreamEntry {
-    reader: Box<dyn Read + Send>,
+    state: SharedHttpStream,
+    /// Drain thread handle. `None` once joined via close/EOF.
+    drain: Option<JoinHandle<()>>,
 }
 
 fn stream_registry() -> &'static Mutex<HashMap<u64, StreamEntry>> {
@@ -49,6 +65,40 @@ fn stream_registry() -> &'static Mutex<HashMap<u64, StreamEntry>> {
 fn next_stream_id() -> u64 {
     static N: AtomicU64 = AtomicU64::new(1);
     N.fetch_add(1, Ordering::SeqCst)
+}
+
+fn spawn_http_drain(
+    mut reader: Box<dyn Read + Send>,
+    state: SharedHttpStream,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    let (lock, cvar) = &*state;
+                    let mut s = lock.lock().unwrap();
+                    s.eof = true;
+                    cvar.notify_all();
+                    return;
+                }
+                Ok(n) => {
+                    let (lock, cvar) = &*state;
+                    let mut s = lock.lock().unwrap();
+                    s.buf.extend(&buf[..n]);
+                    cvar.notify_all();
+                }
+                Err(e) => {
+                    let (lock, cvar) = &*state;
+                    let mut s = lock.lock().unwrap();
+                    s.err = Some(e.to_string());
+                    s.eof = true;
+                    cvar.notify_all();
+                    return;
+                }
+            }
+        }
+    })
 }
 
 // --- Helpers --------------------------------------------------
@@ -409,14 +459,26 @@ fn http_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         resp_headers.push((name.to_ascii_lowercase(), values));
     }
 
-    // Hand the body reader to the registry. From here the Wren
-    // side drives pacing via streamReadBytes.
+    // Hand the body reader to a background drain thread so Wren
+    // can pull bytes (blocking or non-blocking) from a shared
+    // queue. The thread owns the `Read` until EOF; the registry
+    // holds only the shared state + join handle.
     let reader = response.into_reader();
     let id = next_stream_id();
+    let state: SharedHttpStream = Arc::new((
+        Mutex::new(StreamState {
+            buf: VecDeque::new(),
+            eof: false,
+            err: None,
+        }),
+        Condvar::new(),
+    ));
+    let drain = spawn_http_drain(reader, Arc::clone(&state));
     stream_registry().lock().unwrap().insert(
         id,
         StreamEntry {
-            reader,
+            state,
+            drain: Some(drain),
         },
     );
 
@@ -437,22 +499,33 @@ fn http_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     out
 }
 
-fn http_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+fn http_stream_read_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    nonblocking: bool,
+) -> Value {
+    let label = if nonblocking {
+        "Http.tryStreamReadBytes"
+    } else {
+        "Http.streamReadBytes"
+    };
     let id = match args[1].as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
         _ => {
-            ctx.runtime_error(
-                "Http.streamReadBytes: id must be a non-negative integer.".to_string(),
-            );
+            ctx.runtime_error(format!(
+                "{}: id must be a non-negative integer.",
+                label
+            ));
             return Value::null();
         }
     };
     let max = match args[2].as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
         _ => {
-            ctx.runtime_error(
-                "Http.streamReadBytes: max must be a non-negative integer.".to_string(),
-            );
+            ctx.runtime_error(format!(
+                "{}: max must be a non-negative integer.",
+                label
+            ));
             return Value::null();
         }
     };
@@ -460,38 +533,75 @@ fn http_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
         return ctx.alloc_list(Vec::new());
     }
 
-    // Read with the lock held for the lifetime of the call. The
-    // registry is a HashMap behind a Mutex — no nested Wren calls
-    // can re-enter, so this can't deadlock.
-    let mut reg = stream_registry().lock().unwrap();
-    let Some(entry) = reg.get_mut(&id) else {
-        ctx.runtime_error(format!(
-            "Http.streamReadBytes: unknown stream id {}.",
-            id
-        ));
-        return Value::null();
-    };
-    let mut buf = vec![0u8; max];
-    let n = match entry.reader.read(&mut buf) {
-        Ok(0) => {
-            // EOF. Drop the registry entry so the connection
-            // underneath gets freed.
-            reg.remove(&id);
-            drop(reg);
+    // Snapshot the shared state so we can drop the registry lock
+    // before blocking on the condvar.
+    let state = {
+        let reg = stream_registry().lock().unwrap();
+        let Some(entry) = reg.get(&id) else {
+            ctx.runtime_error(format!("{}: unknown stream id {}.", label, id));
             return Value::null();
-        }
-        Ok(n) => n,
-        Err(e) => {
-            reg.remove(&id);
-            drop(reg);
-            ctx.runtime_error(format!("Http.streamReadBytes: {}", e));
-            return Value::null();
+        };
+        Arc::clone(&entry.state)
+    };
+
+    let chunk_opt: Option<Vec<u8>> = {
+        let (lock, cvar) = &*state;
+        let mut s = lock.lock().unwrap();
+        if nonblocking {
+            if s.buf.is_empty() {
+                if s.eof {
+                    None
+                } else {
+                    // "Try again" — caller yields between polls.
+                    Some(Vec::new())
+                }
+            } else {
+                let take = max.min(s.buf.len());
+                Some(s.buf.drain(..take).collect())
+            }
+        } else {
+            while s.buf.is_empty() && !s.eof {
+                s = cvar.wait(s).unwrap();
+            }
+            if s.buf.is_empty() {
+                None
+            } else {
+                let take = max.min(s.buf.len());
+                Some(s.buf.drain(..take).collect())
+            }
         }
     };
-    let chunk: Vec<u8> = buf[..n].to_vec();
-    drop(reg);
-    let elements: Vec<Value> = chunk.iter().map(|&b| Value::num(b as f64)).collect();
-    ctx.alloc_list(elements)
+
+    match chunk_opt {
+        None => {
+            // We're about to report EOF to the caller — tear down
+            // the registry entry so the underlying connection is
+            // released. We deliberately wait for THIS call (not a
+            // chunk-ending-on-EOF one) so repeat reads after the
+            // last bytes still find the entry and see null.
+            let mut reg = stream_registry().lock().unwrap();
+            if let Some(mut entry) = reg.remove(&id) {
+                if let Some(th) = entry.drain.take() {
+                    drop(reg);
+                    let _ = th.join();
+                }
+            }
+            Value::null()
+        }
+        Some(chunk) => {
+            let elements: Vec<Value> =
+                chunk.iter().map(|&b| Value::num(b as f64)).collect();
+            ctx.alloc_list(elements)
+        }
+    }
+}
+
+fn http_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    http_stream_read_impl(ctx, args, false)
+}
+
+fn http_try_stream_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    http_stream_read_impl(ctx, args, true)
 }
 
 fn http_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -504,7 +614,19 @@ fn http_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             return Value::null();
         }
     };
-    stream_registry().lock().unwrap().remove(&id);
+    // Remove from the registry first so the drain thread loses
+    // its registry reference — its Arc is held separately, so the
+    // thread keeps running (it will exit on its own at EOF).
+    if let Some(mut entry) = stream_registry().lock().unwrap().remove(&id) {
+        // Detach the drain thread: joining here would wait for
+        // the server to finish sending, which is the opposite of
+        // "close early". Closing the underlying `Read` would
+        // force the drain to exit, but `Response::into_reader`
+        // returns an opaque Box<dyn Read> without a close method.
+        // Letting the thread finish in the background is the
+        // least-surprising behavior for now.
+        entry.drain.take();
+    }
     Value::null()
 }
 
@@ -515,6 +637,7 @@ pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
     vm.primitive_static(class, "request(_,_,_,_,_)", http_request);
     vm.primitive_static(class, "stream(_,_,_,_,_)", http_stream);
     vm.primitive_static(class, "streamReadBytes(_,_)", http_stream_read_bytes);
+    vm.primitive_static(class, "tryStreamReadBytes(_,_)", http_try_stream_read_bytes);
     vm.primitive_static(class, "streamClose(_)", http_stream_close);
     class
 }
