@@ -3,7 +3,21 @@
 /// Translates `MachInst` (with physical registers) into ARM64 machine code.
 /// The result is an `ExecutableBuffer` that can be called as a function pointer.
 use dynasmrt::aarch64::Assembler;
-use dynasmrt::{dynasm, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer};
+use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer};
+
+/// `dynasm!` picks its target architecture from the *build host* at
+/// proc-macro expansion time, not from the *target* Rust is compiling
+/// for. On a native aarch64 host that's fine — host and target
+/// agree. But under `cross` (docker-hosted x86_64 build container
+/// cross-compiling to aarch64) the default picks x86_64 and every
+/// ARM instruction fails to parse. Pinning `.arch aarch64` as the
+/// first directive in every invocation forces the correct backend
+/// regardless of host.
+macro_rules! dynasm {
+    ($asm:expr $(; $($tt:tt)*)?) => {
+        ::dynasmrt::dynasm!($asm ; .arch aarch64 $(; $($tt)*)?)
+    };
+}
 
 use std::collections::HashMap;
 
