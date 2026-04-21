@@ -518,6 +518,37 @@ impl VM {
         }
     }
 
+    /// Same as `apply_hatch_native_manifest` but resolves relative
+    /// paths against `root` (typically the hatchfile's directory).
+    /// Used by spec runs where the file layout on disk — not the
+    /// already-extracted temp dir from a `.hatch` bundle — is the
+    /// source of truth for native libraries.
+    pub fn apply_hatch_native_manifest_rooted(
+        &mut self,
+        manifest: &crate::hatch::Manifest,
+        root: &std::path::Path,
+    ) {
+        let resolve = |raw: &str| -> std::path::PathBuf {
+            let p = std::path::PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else {
+                root.join(p)
+            }
+        };
+        for raw in &manifest.native_search_paths {
+            let path = resolve(raw);
+            if !self.native_search_paths.contains(&path) {
+                self.native_search_paths.push(path);
+            }
+        }
+        for (name, entry) in &manifest.native_libs {
+            if let Some(raw) = entry.resolve() {
+                self.native_lib_paths.insert(name.clone(), resolve(raw));
+            }
+        }
+    }
+
     /// Extract every `NativeLib` section to a per-hatch temp directory
     /// and register the resulting paths in `native_lib_paths` so
     /// `#!native = "<section name>"` resolves to the extracted file.

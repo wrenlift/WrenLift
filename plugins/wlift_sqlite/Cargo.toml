@@ -1,0 +1,16 @@
+[package]
+name = "wlift_sqlite"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite plugin for the WrenLift runtime — distributed as a dylib bundled into @hatch:sqlite."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Inherit default features (cranelift) because the wren_lift source
+# doesn't currently build with `--no-default-features` — see the
+# `is_leaf` fallback path in codegen. The plugin doesn't itself emit
+# JIT code but needs the types.
+wren_lift = { path = "../.." }
+rusqlite = { version = "0.31", features = ["bundled"] }

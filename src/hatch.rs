@@ -145,6 +145,49 @@ pub struct Manifest {
     /// relative paths both work.
     #[serde(default)]
     pub native_search_paths: Vec<String>,
+    /// Optional declaration that this package's native library is
+    /// built from an out-of-tree Rust `cdylib` crate living in
+    /// another repo. Read by CI pipelines (not the runtime) to
+    /// reproducibly build the dylib from a pinned source rev
+    /// before bundling via `hatch publish`. Pinning lives here so
+    /// each published package version ties itself to an exact
+    /// upstream SHA — re-runs reproduce the same bytes.
+    #[serde(default, rename = "plugin_source")]
+    pub plugin_source: Option<PluginSource>,
+}
+
+/// Tells CI how to build this package's native library from an
+/// out-of-tree Rust crate. Pinned by either `rev` (commit SHA,
+/// preferred for reproducibility) or `tag` (friendly, mutable in
+/// theory but stable in practice once you own the tag).
+///
+/// ```toml
+/// [plugin_source]
+/// repo  = "https://github.com/wrenlift/WrenLift.git"
+/// rev   = "29ac35a"
+/// crate = "wlift_sqlite"
+/// ```
+///
+/// The runtime itself never reads this — it just loads whatever
+/// dylib bytes the bundle carries. The hatch CI workflow in the
+/// package's repo consumes it: clone the repo at `rev` / `tag`,
+/// `cargo build -p <crate> --release` per platform matrix, copy
+/// the output into the package's `libs/` dir, then publish.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PluginSource {
+    /// Git URL — https, ssh, or file:// for local checkouts.
+    pub repo: String,
+    /// Pinned commit SHA (short or long form).
+    #[serde(default)]
+    pub rev: Option<String>,
+    /// Alternative to `rev`: pin by git tag. One of `rev` / `tag`
+    /// should be set; CI errors out if both are absent.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Cargo package name to build from within the repo (the one
+    /// that produces the cdylib we bundle).
+    #[serde(rename = "crate")]
+    pub crate_name: String,
 }
 
 /// Shape of a `[dependencies.<name>]` entry. Four shapes, in rising
@@ -695,6 +738,7 @@ fn build_recursive(
             spec_dependencies: BTreeMap::new(),
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
+            plugin_source: None,
         },
     };
 
@@ -1094,6 +1138,7 @@ mod tests {
                 spec_dependencies: BTreeMap::new(),
                 native_libs: BTreeMap::new(),
                 native_search_paths: Vec::new(),
+                plugin_source: None,
             },
             sections: vec![
                 Section {

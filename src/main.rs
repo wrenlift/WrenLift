@@ -225,6 +225,13 @@ fn preinstall_spec_dependencies(vm: &mut VM, source_dir: &Path) -> Result<(), St
         toml::from_str(&text).map_err(|e| format!("parsing {}: {}", hatchfile.display(), e))?;
 
     let workspace_root = hatchfile.parent().unwrap_or(Path::new("."));
+
+    // Apply the package's own native-lib declarations to the VM so
+    // spec runs resolve `#!native = "libname"` without needing the
+    // source tree to be packaged into a `.hatch` first. Relative
+    // paths anchor on the hatchfile's directory.
+    vm.apply_hatch_native_manifest_rooted(&manifest, workspace_root);
+
     // Install `[dependencies]` too — when the spec imports the
     // package under test and that package in turn imports a real
     // dep, the dep has to already be resolvable. Specs declared in

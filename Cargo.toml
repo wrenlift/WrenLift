@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "plugins/wlift_sqlite"]
+resolver = "2"
+
 [package]
 name = "wren_lift"
 version = "0.1.0"
