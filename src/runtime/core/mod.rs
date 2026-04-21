@@ -20,6 +20,7 @@ pub mod regex;
 pub mod time;
 pub mod toml;
 pub mod uuid;
+pub mod zip;
 mod null;
 mod num;
 mod obj;

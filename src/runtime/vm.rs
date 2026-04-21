@@ -974,6 +974,7 @@ impl VM {
             ("IoCore", "io"),
             ("TomlCore", "toml"),
             ("CryptoCore", "crypto"),
+            ("ZipCore", "zip"),
         ];
         for name in &var_names {
             if let Some(&(_, module_id)) =
@@ -1794,6 +1795,19 @@ impl VM {
                         top_level: super::engine::FuncId(u32::MAX),
                         vars: vec![class_value],
                         var_names: vec!["CryptoCore".to_string()],
+                    },
+                );
+                true
+            }
+            "zip" => {
+                let class = super::core::zip::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "zip".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["ZipCore".to_string()],
                     },
                 );
                 true
