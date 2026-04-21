@@ -594,8 +594,28 @@ fn cmd_login(token: Option<&str>) {
             // refresh token + no known expiry — the request itself
             // will 401 when the JWT expires and the user will need
             // to re-run this command.
+            //
+            // `--token -` reads from stdin. Common Unix convention
+            // for secret-ish inputs so the token never appears in
+            // argv (visible via `ps`), and lets shell pipelines
+            // hand tokens off without intermediate files.
+            let resolved = if jwt == "-" {
+                use std::io::Read as _;
+                let mut buf = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                    eprintln!("error: reading token from stdin: {}", e);
+                    process::exit(1);
+                }
+                buf.trim().to_string()
+            } else {
+                jwt.to_string()
+            };
+            if resolved.is_empty() {
+                eprintln!("error: empty token — nothing to log in with");
+                process::exit(1);
+            }
             wren_lift::hatch_service::Credentials {
-                access_token: jwt.to_string(),
+                access_token: resolved,
                 refresh_token: None,
                 service_url: Some(cfg.url.clone()),
                 expires_at: None,
