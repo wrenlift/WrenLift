@@ -2069,28 +2069,49 @@ fn run_fiber_with_stop_depth(
                                     // The saved_ctx is restored immediately after
                                     // the JIT call returns so the interpreter
                                     // continues with its own module context.
+                                    // Fast path for intra-module calls:
+                                    // compare the callee's module name to
+                                    // the current context's. If equal, the
+                                    // module_vars pointer is already right
+                                    // and we skip the lookup + re-write.
+                                    // Keeps recursive method dispatch (fib,
+                                    // method_call, binary_trees) at zero
+                                    // additional overhead after the fix.
                                     let saved_ctx =
                                         crate::codegen::runtime_fns::read_jit_ctx();
                                     let callee_module =
                                         vm.engine.func_module(FuncId(fn_idx as u32));
+                                    let same_module = match callee_module {
+                                        Some(mn) => {
+                                            let bytes = mn.as_bytes();
+                                            bytes.as_ptr() == saved_ctx.module_name
+                                                && bytes.len() as u32
+                                                    == saved_ctx.module_name_len
+                                        }
+                                        None => true,
+                                    };
                                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                                         ctx.current_func_id = fn_idx as u64;
                                         ctx.closure = closure_ptr as *mut u8;
                                         ctx.defining_class = defining_class
                                             .map(|p| p as *mut u8)
                                             .unwrap_or(std::ptr::null_mut());
-                                        if let Some(mod_name) = callee_module {
-                                            if let Some(m) =
-                                                vm.engine.modules.get(mod_name.as_str())
-                                            {
-                                                ctx.module_vars =
-                                                    m.vars.as_ptr() as *mut u64;
-                                                ctx.module_var_count =
-                                                    m.vars.len() as u32;
-                                                let bytes = mod_name.as_bytes();
-                                                ctx.module_name = bytes.as_ptr();
-                                                ctx.module_name_len =
-                                                    bytes.len() as u32;
+                                        if !same_module {
+                                            if let Some(mod_name) = callee_module {
+                                                if let Some(m) = vm
+                                                    .engine
+                                                    .modules
+                                                    .get(mod_name.as_str())
+                                                {
+                                                    ctx.module_vars =
+                                                        m.vars.as_ptr() as *mut u64;
+                                                    ctx.module_var_count =
+                                                        m.vars.len() as u32;
+                                                    let bytes = mod_name.as_bytes();
+                                                    ctx.module_name = bytes.as_ptr();
+                                                    ctx.module_name_len =
+                                                        bytes.len() as u32;
+                                                }
                                             }
                                         }
                                     });

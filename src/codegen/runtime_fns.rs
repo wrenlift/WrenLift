@@ -378,25 +378,41 @@ pub unsafe fn call_jit_with_shadow(
     // defined in a different module) read the CALLER's slot N,
     // which silently produces Null and shows up later as
     // "Null does not implement 'foo'".
-    let saved_ctx = read_jit_ctx();
-    let mut swapped = false;
-    if let Some(mod_name) = vm.engine.func_module(func_id) {
-        if let Some(m) = vm.engine.modules.get(mod_name.as_str()) {
-            let bytes = mod_name.as_bytes();
-            mutate_jit_ctx(|ctx| {
-                ctx.module_vars = m.vars.as_ptr() as *mut u64;
-                ctx.module_var_count = m.vars.len() as u32;
-                ctx.module_name = bytes.as_ptr();
-                ctx.module_name_len = bytes.len() as u32;
-                ctx.current_func_id = func_id.0 as u64;
-            });
-            swapped = true;
+    // Fast path for intra-module calls: if the callee lives in the
+    // same module the caller's JIT context is already set up for,
+    // skip the lookup + mutate_jit_ctx + restore entirely. This is
+    // the common case for recursive / same-class method dispatch
+    // (fib, method_call, binary_trees benchmarks) and keeps the per-
+    // call overhead at ~zero. The cross-module swap only costs when
+    // we actually crossed a module boundary.
+    let cur_ctx = read_jit_ctx();
+    let callee_module = vm.engine.func_module(func_id);
+    let same_module = match callee_module {
+        Some(mn) => {
+            let bytes = mn.as_bytes();
+            bytes.as_ptr() == cur_ctx.module_name
+                && bytes.len() as u32 == cur_ctx.module_name_len
         }
+        None => true,
+    };
+    if same_module {
+        return call_jit_cached(fn_ptr, args);
+    }
+    // Cross-module call: swap context.
+    let mod_name = callee_module.unwrap();
+    let saved_ctx = cur_ctx;
+    if let Some(m) = vm.engine.modules.get(mod_name.as_str()) {
+        let bytes = mod_name.as_bytes();
+        mutate_jit_ctx(|ctx| {
+            ctx.module_vars = m.vars.as_ptr() as *mut u64;
+            ctx.module_var_count = m.vars.len() as u32;
+            ctx.module_name = bytes.as_ptr();
+            ctx.module_name_len = bytes.len() as u32;
+            ctx.current_func_id = func_id.0 as u64;
+        });
     }
     let result = call_jit_cached(fn_ptr, args);
-    if swapped {
-        set_jit_context(saved_ctx);
-    }
+    set_jit_context(saved_ctx);
     result
 }
 
