@@ -1901,7 +1901,163 @@ pub mod cl {
             }
 
             // === Subscript operations ===
+            //
+            // Single-index subscripts get an inline fast path for
+            // `ObjTypedArray` receivers: check the header's obj_type
+            // byte against the TypedArray tag, bounds-check the
+            // index, then dispatch on the kind byte to a direct
+            // f32/f64/u8 load. The fast path costs two byte loads +
+            // one compare on the way out of the receiver guard.
+            //
+            // The guard intentionally lives at EVERY single-index
+            // subscript site — no compile-time receiver-class info
+            // is required, so typed arrays passed in as params,
+            // stored in fields, or returned from factories all hit
+            // this path. The slow path is the pre-existing
+            // `wren_subscript_get` runtime function, which already
+            // handles List / Map / String / TypedArray correctly.
+            Instruction::SubscriptGet { receiver, args } if args.len() == 1 => {
+                let r = get(receiver);
+                let idx = get(&args[0]);
+
+                let after_is_obj = builder.create_block();
+                let fast_block = builder.create_block();
+                let in_bounds_block = builder.create_block();
+                let check_f32_block = builder.create_block();
+                let get_u8_block = builder.create_block();
+                let get_f32_block = builder.create_block();
+                let get_f64_block = builder.create_block();
+                let slow_block = builder.create_block();
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, types::I64);
+
+                // 1. Receiver must be an object-kind NaN-boxed
+                //    value. Object values have their top 16 bits
+                //    equal to 0xFFFC (QNAN | sign bit).
+                let shr48 = builder.ins().ushr_imm(r, 48);
+                let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
+                let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
+                builder
+                    .ins()
+                    .brif(is_obj, after_is_obj, &[], slow_block, &[]);
+
+                // 2. Unbox pointer, load obj_type byte, branch on
+                //    TypedArray tag.
+                builder.switch_to_block(after_is_obj);
+                let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                let obj_ptr = builder.ins().band(r, ptr_mask);
+                let obj_type_byte = builder.ins().uload8(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    HEADER_OBJ_TYPE,
+                );
+                let ta_tag = builder
+                    .ins()
+                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
+                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
+                builder
+                    .ins()
+                    .brif(is_ta, fast_block, &[], slow_block, &[]);
+
+                // 3. Fast path: convert NaN-boxed Num index to i64,
+                //    bounds-check against element count. Negative
+                //    indices (Wren convention: `-1` → last) fall to
+                //    the slow path for simplicity — Wren's integer
+                //    API returns the same values, just more slowly.
+                builder.switch_to_block(fast_block);
+                let idx_f = builder.ins().bitcast(types::F64, MemFlags::new(), idx);
+                let idx_i = builder.ins().fcvt_to_sint(types::I64, idx_f);
+                // `uload32` already zero-extends the 32-bit load into
+                // i64 — no separate uextend required.
+                let count = builder.ins().uload32(
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    TYPED_ARRAY_COUNT,
+                );
+                let zero = builder.ins().iconst(types::I64, 0);
+                let in_range_low =
+                    builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_i, zero);
+                let in_range_high = builder.ins().icmp(IntCC::SignedLessThan, idx_i, count);
+                let in_range = builder.ins().band(in_range_low, in_range_high);
+                builder
+                    .ins()
+                    .brif(in_range, in_bounds_block, &[], slow_block, &[]);
+
+                // 4. In-bounds: load kind byte + data pointer,
+                //    dispatch to the element-typed load.
+                builder.switch_to_block(in_bounds_block);
+                let data = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    TYPED_ARRAY_DATA,
+                );
+                let kind = builder.ins().uload8(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    TYPED_ARRAY_KIND,
+                );
+                let k_u8_const = builder.ins().iconst(types::I64, TA_KIND_U8 as i64);
+                let is_u8 = builder.ins().icmp(IntCC::Equal, kind, k_u8_const);
+                builder
+                    .ins()
+                    .brif(is_u8, get_u8_block, &[], check_f32_block, &[]);
+                builder.switch_to_block(check_f32_block);
+                let k_f32_const = builder.ins().iconst(types::I64, TA_KIND_F32 as i64);
+                let is_f32 = builder.ins().icmp(IntCC::Equal, kind, k_f32_const);
+                builder
+                    .ins()
+                    .brif(is_f32, get_f32_block, &[], get_f64_block, &[]);
+
+                // 5a. U8: byte load → f64 (unsigned convert) →
+                //     NaN-box bits.
+                builder.switch_to_block(get_u8_block);
+                let u8_addr = builder.ins().iadd(data, idx_i);
+                let byte_val =
+                    builder.ins().uload8(types::I64, MemFlags::trusted(), u8_addr, 0);
+                let byte_f64 = builder.ins().fcvt_from_uint(types::F64, byte_val);
+                let byte_bits = builder.ins().bitcast(types::I64, MemFlags::new(), byte_f64);
+                builder.ins().jump(merge_block, &[BlockArg::Value(byte_bits)]);
+
+                // 5b. F32: 4-byte float load → f64 promote → box.
+                builder.switch_to_block(get_f32_block);
+                let four = builder.ins().iconst(types::I64, 4);
+                let f32_offset = builder.ins().imul(idx_i, four);
+                let f32_addr = builder.ins().iadd(data, f32_offset);
+                let f32_val = builder
+                    .ins()
+                    .load(types::F32, MemFlags::trusted(), f32_addr, 0);
+                let f32_as_f64 = builder.ins().fpromote(types::F64, f32_val);
+                let f32_bits = builder.ins().bitcast(types::I64, MemFlags::new(), f32_as_f64);
+                builder.ins().jump(merge_block, &[BlockArg::Value(f32_bits)]);
+
+                // 5c. F64: direct 8-byte float load → box.
+                builder.switch_to_block(get_f64_block);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let f64_offset = builder.ins().imul(idx_i, eight);
+                let f64_addr = builder.ins().iadd(data, f64_offset);
+                let f64_val = builder
+                    .ins()
+                    .load(types::F64, MemFlags::trusted(), f64_addr, 0);
+                let f64_bits = builder.ins().bitcast(types::I64, MemFlags::new(), f64_val);
+                builder.ins().jump(merge_block, &[BlockArg::Value(f64_bits)]);
+
+                // 6. Slow path: existing runtime dispatch.
+                builder.switch_to_block(slow_block);
+                let slow_fn = get_runtime_fn(module, builder, "wren_subscript_get", 2)?;
+                let slow_call = builder.ins().call(slow_fn, &[r, idx]);
+                let slow_result = builder.inst_results(slow_call)[0];
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                builder.switch_to_block(merge_block);
+                Ok(Some(builder.block_params(merge_block)[0]))
+            }
             Instruction::SubscriptGet { receiver, args } => {
+                // Multi-index subscript: fall back to runtime call.
                 let f = get_runtime_fn(module, builder, "wren_subscript_get", 1 + args.len())?;
                 let mut call_args = vec![get(receiver)];
                 for a in args {
@@ -1909,6 +2065,158 @@ pub mod cl {
                 }
                 let result = builder.ins().call(f, &call_args);
                 Ok(Some(builder.inst_results(result)[0]))
+            }
+            Instruction::SubscriptSet {
+                receiver,
+                args,
+                value,
+            } if args.len() == 1 => {
+                // Mirror of the SubscriptGet inline fast path. Only
+                // F32 and F64 writes are inlined — ByteArray writes
+                // require 0..=255 integer validation which is
+                // cheaper to leave in the slow path (also less
+                // hot for the graphics / audio / physics use
+                // cases that drive this whole optimization).
+                let r = get(receiver);
+                let idx = get(&args[0]);
+                let val = get(value);
+
+                let after_is_obj = builder.create_block();
+                let fast_block = builder.create_block();
+                let in_bounds_block = builder.create_block();
+                let check_f32_block = builder.create_block();
+                let set_f32_block = builder.create_block();
+                let set_f64_block = builder.create_block();
+                let slow_block = builder.create_block();
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, types::I64);
+
+                // 1. Receiver must be an object (NaN-boxed pointer).
+                let shr48 = builder.ins().ushr_imm(r, 48);
+                let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
+                let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
+                builder
+                    .ins()
+                    .brif(is_obj, after_is_obj, &[], slow_block, &[]);
+
+                // 2. Obj_type must be TypedArray.
+                builder.switch_to_block(after_is_obj);
+                let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                let obj_ptr = builder.ins().band(r, ptr_mask);
+                let obj_type_byte = builder.ins().uload8(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    HEADER_OBJ_TYPE,
+                );
+                let ta_tag = builder
+                    .ins()
+                    .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
+                let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
+                builder
+                    .ins()
+                    .brif(is_ta, fast_block, &[], slow_block, &[]);
+
+                // 3. Index must be a Num in [0, count). Negative
+                //    indices → slow path (preserves Wren semantics
+                //    via the runtime helper).
+                builder.switch_to_block(fast_block);
+                let idx_f = builder.ins().bitcast(types::F64, MemFlags::new(), idx);
+                let idx_i = builder.ins().fcvt_to_sint(types::I64, idx_f);
+                // `uload32` already zero-extends the 32-bit load into
+                // i64 — no separate uextend required.
+                let count = builder.ins().uload32(
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    TYPED_ARRAY_COUNT,
+                );
+                let zero = builder.ins().iconst(types::I64, 0);
+                let in_range_low =
+                    builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_i, zero);
+                let in_range_high = builder.ins().icmp(IntCC::SignedLessThan, idx_i, count);
+                let in_range = builder.ins().band(in_range_low, in_range_high);
+                builder
+                    .ins()
+                    .brif(in_range, in_bounds_block, &[], slow_block, &[]);
+
+                // 4. Value must be a Num. `(value & QNAN) == QNAN`
+                //    means a singleton or object — go slow. Real
+                //    f64 NaN values ALSO fail this test (they'd be
+                //    stored correctly, but the simpler rule keeps
+                //    the fast path predictable).
+                builder.switch_to_block(in_bounds_block);
+                let qnan_const = builder.ins().iconst(types::I64, QNAN as i64);
+                let val_masked = builder.ins().band(val, qnan_const);
+                let val_is_non_num = builder
+                    .ins()
+                    .icmp(IntCC::Equal, val_masked, qnan_const);
+                let after_val_check = builder.create_block();
+                builder
+                    .ins()
+                    .brif(val_is_non_num, slow_block, &[], after_val_check, &[]);
+
+                // 5. Load kind, dispatch to the typed store. U8
+                //    falls through to the slow path (range check).
+                builder.switch_to_block(after_val_check);
+                let data = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    TYPED_ARRAY_DATA,
+                );
+                let kind = builder.ins().uload8(
+                    types::I64,
+                    MemFlags::trusted(),
+                    obj_ptr,
+                    TYPED_ARRAY_KIND,
+                );
+                let k_f32_const = builder.ins().iconst(types::I64, TA_KIND_F32 as i64);
+                let is_f32 = builder.ins().icmp(IntCC::Equal, kind, k_f32_const);
+                builder
+                    .ins()
+                    .brif(is_f32, set_f32_block, &[], check_f32_block, &[]);
+                builder.switch_to_block(check_f32_block);
+                let k_f64_const = builder.ins().iconst(types::I64, TA_KIND_F64 as i64);
+                let is_f64 = builder.ins().icmp(IntCC::Equal, kind, k_f64_const);
+                builder
+                    .ins()
+                    .brif(is_f64, set_f64_block, &[], slow_block, &[]);
+
+                // 5a. F32: demote f64 → f32 and store 4 bytes.
+                builder.switch_to_block(set_f32_block);
+                let val_f64 = builder.ins().bitcast(types::F64, MemFlags::new(), val);
+                let val_f32 = builder.ins().fdemote(types::F32, val_f64);
+                let four = builder.ins().iconst(types::I64, 4);
+                let f32_offset = builder.ins().imul(idx_i, four);
+                let f32_addr = builder.ins().iadd(data, f32_offset);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), val_f32, f32_addr, 0);
+                builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
+
+                // 5b. F64: store 8 bytes directly.
+                builder.switch_to_block(set_f64_block);
+                let val_f64b = builder.ins().bitcast(types::F64, MemFlags::new(), val);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let f64_offset = builder.ins().imul(idx_i, eight);
+                let f64_addr = builder.ins().iadd(data, f64_offset);
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), val_f64b, f64_addr, 0);
+                builder.ins().jump(merge_block, &[BlockArg::Value(val)]);
+
+                // 6. Slow path: runtime handles byte writes +
+                //    validation + anything non-TypedArray.
+                builder.switch_to_block(slow_block);
+                let slow_fn = get_runtime_fn(module, builder, "wren_subscript_set", 3)?;
+                let slow_call = builder.ins().call(slow_fn, &[r, idx, val]);
+                let slow_result = builder.inst_results(slow_call)[0];
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                builder.switch_to_block(merge_block);
+                Ok(Some(builder.block_params(merge_block)[0]))
             }
             Instruction::SubscriptSet {
                 receiver,

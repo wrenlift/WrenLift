@@ -31,6 +31,27 @@ pub const LIST_CAPACITY: i32 = 28; // u32
 pub const LIST_ELEMENTS: i32 = 32; // *mut Value
 pub const LIST_SIZE: i32 = 40;
 
+// -- ObjTypedArray (40 bytes) -----------------------------------------------
+//
+// Shared backing storage for ByteArray / Float32Array / Float64Array.
+// The `kind` byte (0=U8, 1=F32, 2=F64) drives element size + load/store
+// width.
+
+pub const TYPED_ARRAY_COUNT: i32 = 24; // u32 — element count
+pub const TYPED_ARRAY_KIND: i32 = 28; // u8 — TypedArrayKind tag
+pub const TYPED_ARRAY_DATA: i32 = 32; // *mut u8 — raw backing buffer
+pub const TYPED_ARRAY_SIZE: i32 = 40;
+
+// ObjType discriminant for TypedArray. Must match the
+// `ObjType::TypedArray` variant position (13th, 0-indexed = 12).
+pub const OBJ_TYPE_TYPED_ARRAY: u8 = 12;
+
+// TypedArrayKind tag values. Must match the repr(u8) enum in
+// `runtime::object::TypedArrayKind`.
+pub const TA_KIND_U8: u8 = 0;
+pub const TA_KIND_F32: u8 = 1;
+pub const TA_KIND_F64: u8 = 2;
+
 // -- Value size --------------------------------------------------------------
 
 pub const VALUE_SIZE: i32 = 8; // NaN-boxed u64
@@ -70,6 +91,33 @@ mod tests {
         assert_eq!(memoffset_of!(ObjList, count), LIST_COUNT as usize);
         assert_eq!(memoffset_of!(ObjList, capacity), LIST_CAPACITY as usize);
         assert_eq!(memoffset_of!(ObjList, elements), LIST_ELEMENTS as usize);
+    }
+
+    #[test]
+    fn verify_typed_array_layout() {
+        assert_eq!(
+            std::mem::size_of::<ObjTypedArray>(),
+            TYPED_ARRAY_SIZE as usize
+        );
+        assert_eq!(
+            memoffset_of!(ObjTypedArray, count),
+            TYPED_ARRAY_COUNT as usize
+        );
+        assert_eq!(
+            memoffset_of!(ObjTypedArray, kind),
+            TYPED_ARRAY_KIND as usize
+        );
+        assert_eq!(
+            memoffset_of!(ObjTypedArray, data),
+            TYPED_ARRAY_DATA as usize
+        );
+        // Discriminant + kind tag values: the JIT codegen encodes
+        // these as immediates, so a bump of the enum would break
+        // the emitted machine code.
+        assert_eq!(ObjType::TypedArray as u8, OBJ_TYPE_TYPED_ARRAY);
+        assert_eq!(TypedArrayKind::U8 as u8, TA_KIND_U8);
+        assert_eq!(TypedArrayKind::F32 as u8, TA_KIND_F32);
+        assert_eq!(TypedArrayKind::F64 as u8, TA_KIND_F64);
     }
 
     #[test]
