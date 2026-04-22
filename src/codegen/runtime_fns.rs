@@ -366,12 +366,38 @@ fn current_jit_callsite_ic(
 /// current execution context.
 #[inline(always)]
 pub unsafe fn call_jit_with_shadow(
-    _vm: &crate::runtime::vm::VM,
+    vm: &crate::runtime::vm::VM,
     fn_ptr: *const u8,
-    _func_id: crate::runtime::engine::FuncId,
+    func_id: crate::runtime::engine::FuncId,
     args: &[Value],
 ) -> u64 {
-    call_jit_cached(fn_ptr, args)
+    // Swap in the callee's module context for the duration of the
+    // JIT call. Any GetModuleVar op inside the callee resolves
+    // against the callee's own slots; without this swap, cross-
+    // module calls (e.g. a JIT'd hot loop calling `Expect.that`
+    // defined in a different module) read the CALLER's slot N,
+    // which silently produces Null and shows up later as
+    // "Null does not implement 'foo'".
+    let saved_ctx = read_jit_ctx();
+    let mut swapped = false;
+    if let Some(mod_name) = vm.engine.func_module(func_id) {
+        if let Some(m) = vm.engine.modules.get(mod_name.as_str()) {
+            let bytes = mod_name.as_bytes();
+            mutate_jit_ctx(|ctx| {
+                ctx.module_vars = m.vars.as_ptr() as *mut u64;
+                ctx.module_var_count = m.vars.len() as u32;
+                ctx.module_name = bytes.as_ptr();
+                ctx.module_name_len = bytes.len() as u32;
+                ctx.current_func_id = func_id.0 as u64;
+            });
+            swapped = true;
+        }
+    }
+    let result = call_jit_cached(fn_ptr, args);
+    if swapped {
+        set_jit_context(saved_ctx);
+    }
+    result
 }
 
 #[inline(always)]
@@ -3445,11 +3471,18 @@ pub extern "C" fn wren_cmp_ge(a: u64, b: u64) -> u64 {
 }
 
 pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
-    Value::bool(a == b).to_bits()
+    // Must honour Wren's equality semantics — which for Strings is
+    // CONTENT equality, not pointer identity. A bitwise `a == b`
+    // test is a trap: every `s[i]` subscript allocates a fresh
+    // ObjString, so `s[i] == ":"` (JIT-compiled) would return false
+    // even on a direct match. Delegate to `Value::equals`, which
+    // short-circuits on equal bits, handles NaN, and falls through
+    // to string content compare.
+    Value::bool(Value::from_bits(a).equals(Value::from_bits(b))).to_bits()
 }
 
 pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
-    Value::bool(a != b).to_bits()
+    Value::bool(!Value::from_bits(a).equals(Value::from_bits(b))).to_bits()
 }
 
 // ---------------------------------------------------------------------------

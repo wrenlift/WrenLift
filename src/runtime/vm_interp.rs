@@ -2055,16 +2055,44 @@ fn run_fiber_with_stop_depth(
                                             kind: 1, // JIT leaf
                                         };
                                     }
-                                    // Update only callee-specific fields.
-                                    // The vm/module_vars/jit_code_base were
-                                    // set at the top of the fiber loop and
-                                    // remain valid throughout this frame.
+                                    // Swap in the callee's module context.
+                                    // Cross-module calls (e.g. a hot-loop in
+                                    // crypto.spec calling `Expect.that` defined
+                                    // in @hatch:assert) need the callee's own
+                                    // `module_vars` pointer for `GetModuleVar @N`
+                                    // to resolve to the right class — otherwise
+                                    // the JIT reads the CALLER's slot N, and
+                                    // downstream method lookup fails silently
+                                    // with Null (classic tiered-mode "Null.toBe"
+                                    // flake).
+                                    //
+                                    // The saved_ctx is restored immediately after
+                                    // the JIT call returns so the interpreter
+                                    // continues with its own module context.
+                                    let saved_ctx =
+                                        crate::codegen::runtime_fns::read_jit_ctx();
+                                    let callee_module =
+                                        vm.engine.func_module(FuncId(fn_idx as u32));
                                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                                         ctx.current_func_id = fn_idx as u64;
                                         ctx.closure = closure_ptr as *mut u8;
                                         ctx.defining_class = defining_class
                                             .map(|p| p as *mut u8)
                                             .unwrap_or(std::ptr::null_mut());
+                                        if let Some(mod_name) = callee_module {
+                                            if let Some(m) =
+                                                vm.engine.modules.get(mod_name.as_str())
+                                            {
+                                                ctx.module_vars =
+                                                    m.vars.as_ptr() as *mut u64;
+                                                ctx.module_var_count =
+                                                    m.vars.len() as u32;
+                                                let bytes = mod_name.as_bytes();
+                                                ctx.module_name = bytes.as_ptr();
+                                                ctx.module_name_len =
+                                                    bytes.len() as u32;
+                                            }
+                                        }
                                     });
                                     ensure_ctx_reg();
                                     let recv_bits = recv_val.to_bits();
@@ -2101,6 +2129,10 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
+                                    // Restore the caller's module context so
+                                    // the next interpreter ops read from the
+                                    // right module_vars.
+                                    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
                                     vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
@@ -3304,13 +3336,26 @@ fn dispatch_closure_bc_inner(
                     frame.values = values;
                 }
 
-                // Set up base JitContext (module_vars, vm, module_name).
+                // Set up JitContext with the CALLEE's module context.
+                // The `module_name` parameter is the caller's module; the
+                // callee may live in a different module (e.g. a hot loop in
+                // crypto.spec calling `Expect.that` defined in
+                // @hatch:assert). Use `func_module` to recover the callee's
+                // defining module so `GetModuleVar @N` resolves correctly
+                // inside the JIT-compiled body — otherwise it reads the
+                // caller's slot N and silently returns Null, which later
+                // surfaces as "Null does not implement 'foo'".
                 let vm_ptr = vm as *mut VM as *mut u8;
-                let mod_name_bytes = module_name.as_bytes();
+                let callee_module_name = vm
+                    .engine
+                    .func_module(target_func_id)
+                    .cloned()
+                    .unwrap_or_else(|| Rc::clone(module_name));
+                let mod_name_bytes = callee_module_name.as_bytes();
                 let (mv_ptr, mv_count) = vm
                     .engine
                     .modules
-                    .get(module_name.as_str())
+                    .get(callee_module_name.as_str())
                     .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
                     .unwrap_or((std::ptr::null_mut(), 0));
                 crate::codegen::runtime_fns::set_jit_context(
