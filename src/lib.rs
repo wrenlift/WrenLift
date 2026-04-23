@@ -4,6 +4,7 @@ pub mod codegen;
 pub mod diagnostics;
 pub mod hatch;
 pub mod hatch_registry;
+pub mod hatch_runner;
 pub mod hatch_service;
 pub mod intern;
 pub mod mir;

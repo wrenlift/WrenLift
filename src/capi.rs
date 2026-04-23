@@ -885,6 +885,126 @@ pub extern "C" fn wrenSetUserData(vm: *mut WrenVM, user_data: *mut c_void) {
 }
 
 // ---------------------------------------------------------------------------
+// Hatch package loading
+//
+// Mirrors the Rust-side `hatch_runner::HatchRunner` API, but keeps
+// every function as a plain `extern "C"` so C / C++ / Swift / FFI
+// consumers can call them directly. Return values are 0 on success,
+// non-zero on error — matching the Unix-style idiom and letting C
+// callers chain with `if (wrenInstallHatchFile(...)) return 1;`.
+// ---------------------------------------------------------------------------
+
+/// Install a pre-loaded `.hatch` byte buffer into the VM. Returns
+/// 0 on success, 1 on compile error, 2 on runtime error, -1 on
+/// null-pointer inputs. Useful for embedders that ship packages
+/// baked into the binary via `include_bytes!` / a resource file.
+#[no_mangle]
+pub extern "C" fn wrenInstallHatchBytes(
+    vm: *mut WrenVM,
+    bytes: *const u8,
+    len: usize,
+) -> c_int {
+    if vm.is_null() || bytes.is_null() {
+        return -1;
+    }
+    let vm_ref = unsafe { &mut *vm };
+    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+    use crate::runtime::engine::InterpretResult;
+    match vm_ref.install_hatch_modules(slice) {
+        InterpretResult::Success => 0,
+        InterpretResult::CompileError => 1,
+        InterpretResult::RuntimeError => 2,
+    }
+}
+
+/// Install a `.hatch` file from disk. Returns 0 on success, 1 on
+/// compile error, 2 on runtime error, 3 if the file can't be read,
+/// -1 on null-pointer inputs.
+#[no_mangle]
+pub extern "C" fn wrenInstallHatchFile(
+    vm: *mut WrenVM,
+    path: *const c_char,
+) -> c_int {
+    if vm.is_null() || path.is_null() {
+        return -1;
+    }
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let bytes = match std::fs::read(path_str) {
+        Ok(b) => b,
+        Err(_) => return 3,
+    };
+    wrenInstallHatchBytes(vm, bytes.as_ptr(), bytes.len())
+}
+
+/// Append a directory to the native-library search path. The VM
+/// consults this when resolving `#!native` dylib references in
+/// imported classes. Per-hatch `native_search_paths` are already
+/// picked up automatically; this is for embedder overrides.
+/// Returns 0 on success, -1 on null-pointer inputs.
+#[no_mangle]
+pub extern "C" fn wrenAddNativeSearchPath(
+    vm: *mut WrenVM,
+    path: *const c_char,
+) -> c_int {
+    if vm.is_null() || path.is_null() {
+        return -1;
+    }
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let vm_ref = unsafe { &mut *vm };
+    let pb = std::path::PathBuf::from(path_str);
+    if !vm_ref.native_search_paths.contains(&pb) {
+        vm_ref.native_search_paths.push(pb);
+    }
+    0
+}
+
+/// Scan a directory for `.hatch` files and install every one of
+/// them. The name embedded in each hatchfile is what later code
+/// imports as. Returns the number of artifacts installed on
+/// success, or a negative error code (-1 null / -2 read-dir /
+/// -3 install failed partway through).
+#[no_mangle]
+pub extern "C" fn wrenInstallHatchDir(
+    vm: *mut WrenVM,
+    path: *const c_char,
+) -> c_int {
+    if vm.is_null() || path.is_null() {
+        return -1;
+    }
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let entries = match std::fs::read_dir(path_str) {
+        Ok(e) => e,
+        Err(_) => return -2,
+    };
+    let mut installed = 0;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("hatch") {
+            continue;
+        }
+        let bytes = match std::fs::read(&p) {
+            Ok(b) => b,
+            Err(_) => return -3,
+        };
+        let rc = wrenInstallHatchBytes(vm, bytes.as_ptr(), bytes.len());
+        if rc != 0 {
+            return -3;
+        }
+        installed += 1;
+    }
+    installed as c_int
+}
+
+// ---------------------------------------------------------------------------
 // Internal: convert C config to Rust config
 // ---------------------------------------------------------------------------
 
@@ -1327,5 +1447,12 @@ mod tests {
         wrenCollectGarbage(ptr::null_mut()); // should not crash
         assert!(!wrenHasModule(ptr::null_mut(), ptr::null()));
         assert!(!wrenHasVariable(ptr::null_mut(), ptr::null(), ptr::null()));
+        // Hatch-loader surface: every function returns -1 on null
+        // rather than dereferencing, so the bindings are safe to
+        // call from a freshly-zeroed C config.
+        assert_eq!(wrenInstallHatchBytes(ptr::null_mut(), ptr::null(), 0), -1);
+        assert_eq!(wrenInstallHatchFile(ptr::null_mut(), ptr::null()), -1);
+        assert_eq!(wrenAddNativeSearchPath(ptr::null_mut(), ptr::null()), -1);
+        assert_eq!(wrenInstallHatchDir(ptr::null_mut(), ptr::null()), -1);
     }
 }
