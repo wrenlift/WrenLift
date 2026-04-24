@@ -8,6 +8,7 @@ pub mod gc_marksweep;
 pub mod gc_trait;
 pub mod object;
 pub mod object_layout;
+pub mod tier;
 pub mod value;
 pub mod vm;
 pub mod vm_interp;
