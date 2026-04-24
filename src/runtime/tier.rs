@@ -120,23 +120,26 @@ impl TierManager {
         }
     }
 
-    /// Tick the bead AND return true iff this invocation is the one
-    /// that crosses `threshold` for the first time (i.e. matches the
-    /// legacy `call_count == jit_threshold` fire-once semantics).
+    /// Tick the bead AND return true iff this tick's count equals
+    /// `threshold` exactly — matches the legacy `count == threshold`
+    /// fire-once semantics used for both baseline and optimized tier-up.
+    ///
+    /// The bead's invocation counter is monotonically increasing and
+    /// never decrements, so exact equality fires once (and only once)
+    /// across a function's lifetime. Callers layer their own state
+    /// guards on top (e.g. `FuncBody::Interpreted` for baseline,
+    /// `TierState::BaselineNative` for optimized) to decide when a
+    /// tier-up is actually valid.
     ///
     /// `threshold` is passed at call-time rather than stored on the
-    /// manager so [`Engine::jit_threshold`] stays the single source
-    /// of truth while tests mutate it post-construction.
-    ///
-    /// Returns false for unregistered ids, beads that have already
-    /// moved past `Interpreted` (Queued/Compiling/Compiled), and
-    /// counters that haven't reached threshold yet.
+    /// manager so [`Engine::jit_threshold`] / `opt_threshold` stay
+    /// the single source of truth.
     pub fn should_promote_on_tick(&self, id: FuncId, threshold: u32) -> bool {
         let Some(bead) = self.beads.get(id.0 as usize).and_then(|b| b.as_ref()) else {
             return false;
         };
-        let (count, state) = bead.tick();
-        state == BeadState::Interpreted && count == threshold
+        let (count, _) = bead.tick();
+        count == threshold
     }
 
     /// Ignore the broker; slam a compiled code pointer into the bead

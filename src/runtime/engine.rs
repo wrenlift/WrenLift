@@ -106,9 +106,6 @@ pub enum FuncBody {
         optimized_executable: Option<ExecutableFunction>,
         mir: Arc<MirFunction>,
         bytecode: Option<Arc<BytecodeFunction>>,
-        /// Number of baseline-native calls seen before optimize tier-up.
-        /// Phase 4 will retire this in favour of the bead's counter too.
-        opt_call_count: u32,
     },
 }
 
@@ -1277,7 +1274,6 @@ impl ExecutionEngine {
                         optimized_executable: None,
                         mir,
                         bytecode,
-                        opt_call_count: 0,
                     },
                     native @ FuncBody::Native { .. } => native,
                 };
@@ -1419,23 +1415,26 @@ impl ExecutionEngine {
         let idx = id.0 as usize;
         match self.functions.get_mut(idx) {
             Some(FuncBody::Interpreted { .. }) => {
-                // Baseline tier-up counting now lives on the beadie bead.
-                // `should_promote_on_tick` ticks the bead and fires true
-                // exactly once when `jit_threshold` is crossed, matching
-                // the legacy `call_count == jit_threshold` semantics.
+                // Baseline tier-up counting lives on the beadie bead.
+                // Fires true exactly once when the bead's invocation
+                // count first equals `jit_threshold`.
                 self.tier.should_promote_on_tick(id, self.jit_threshold)
             }
             Some(FuncBody::Native {
-                opt_call_count,
                 optimized_executable,
                 ..
             }) if optimized_executable.is_none()
                 && self.tier_states.get(idx).copied() == Some(TierState::BaselineNative)
                 && self.compiling_tier.get(idx).copied().flatten().is_none() =>
             {
-                // Phase 4 will retire this branch onto the bead as well.
-                *opt_call_count += 1;
-                *opt_call_count == self.opt_threshold
+                // Optimized tier-up uses the SAME bead counter, just with
+                // an absolute threshold of (baseline_threshold + opt_threshold).
+                // Since the counter is monotonically increasing and
+                // comparison is exact equality, this fires exactly once
+                // per function — matching the legacy `opt_call_count ==
+                // opt_threshold` semantics without a second counter.
+                let total = self.jit_threshold.saturating_add(self.opt_threshold);
+                self.tier.should_promote_on_tick(id, total)
             }
             _ => false,
         }
@@ -1954,6 +1953,33 @@ mod tests {
         assert!(!engine.record_call(id)); // 1
         assert!(!engine.record_call(id)); // 2
         assert!(engine.record_call(id)); // 3 = threshold
+    }
+
+    #[test]
+    fn test_bead_should_promote_fires_at_each_absolute_threshold() {
+        // Phase 6 invariant: because the bead counter is monotonically
+        // increasing and `should_promote_on_tick` tests exact equality,
+        // the SAME bead fires true at multiple absolute thresholds in
+        // succession — once when count first equals jit_threshold, again
+        // when count first equals (jit_threshold + opt_threshold). That's
+        // how baseline and optimized tier-up share one counter.
+        let mut mgr = super::super::tier::TierManager::with_thresholds(3, 5);
+        mgr.register(FuncId(0), std::ptr::null_mut());
+
+        // Baseline: fires at tick #3.
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 3)); // count=1
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 3)); // count=2
+        assert!(mgr.should_promote_on_tick(FuncId(0), 3)); // count=3 ← fires
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 3)); // count=4 — exact-eq doesn't re-fire
+
+        // Optimized absolute threshold = 3 + 5 = 8. Queries above are
+        // called with threshold=3, so they didn't fire at 5,6,7. Now
+        // switch to the optimized threshold and count up to it.
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 8)); // count=5
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 8)); // count=6
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 8)); // count=7
+        assert!(mgr.should_promote_on_tick(FuncId(0), 8)); // count=8 ← fires
+        assert!(!mgr.should_promote_on_tick(FuncId(0), 8)); // count=9
     }
 
     #[test]
