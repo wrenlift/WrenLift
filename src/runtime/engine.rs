@@ -1267,6 +1267,13 @@ impl ExecutionEngine {
                 self.baseline_leaf[idx] = inline_safe;
                 self.baseline_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::BaselineNative;
+                // Tell the bead a compiled artifact is live so its
+                // state machine tracks reality. Non-native tiers (WASM
+                // fallback) have a null pointer and stay Interpreted
+                // on the bead side — eager_install rejects nulls.
+                if !native_ptr.is_null() {
+                    self.tier.install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                }
             }
             CompileTier::Optimized => {
                 if let Some(FuncBody::Native {
@@ -1281,6 +1288,13 @@ impl ExecutionEngine {
                 self.optimized_leaf[idx] = inline_safe;
                 self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
+                // Swap the bead's pointer over to the optimized tier.
+                // eager_install works whether the bead is currently
+                // Compiled or Interpreted, so this is safe even if the
+                // baseline install path didn't run (e.g. eager optimize).
+                if !native_ptr.is_null() {
+                    self.tier.install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                }
             }
         }
 
@@ -1997,6 +2011,11 @@ mod tests {
         assert!(engine.get_function(id).unwrap().is_compiled());
         // MIR should still be accessible after compilation
         assert!(engine.get_mir(id).is_some());
+
+        // Phase 4 invariant: after a successful baseline install the bead
+        // should be in Compiled state, so beadie's view of tier transitions
+        // matches the engine's.
+        assert_eq!(engine.tier.state(id), Some(beadie::BeadState::Compiled));
     }
 
     // -----------------------------------------------------------------------

@@ -150,6 +150,21 @@ impl TierManager {
         bead.eager_install(code)
     }
 
+    /// Install a new compiled pointer, choosing the right beadie API
+    /// based on current state: `eager_install` when the bead is still
+    /// `Interpreted` (first-time install), `swap_compiled` when it's
+    /// already `Compiled` (tier-up from baseline to optimized). Returns
+    /// true if either path accepted the pointer.
+    pub fn install_or_swap(&self, id: FuncId, code: *mut ()) -> bool {
+        let Some(bead) = self.beads.get(id.0 as usize).and_then(|b| b.as_ref()) else {
+            return false;
+        };
+        match bead.state() {
+            BeadState::Compiled => bead.swap_compiled(code).is_some(),
+            _ => bead.eager_install(code),
+        }
+    }
+
     /// Update the opaque core pointer after the runtime moves the
     /// function object (e.g. GC compaction).
     pub fn update_core(&self, id: FuncId, core: CoreHandle) {
