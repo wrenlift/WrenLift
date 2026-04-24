@@ -99,8 +99,6 @@ pub enum FuncBody {
         mir: Arc<MirFunction>,
         /// Lazily-lowered compact bytecode for the bytecode VM.
         bytecode: Option<Arc<BytecodeFunction>>,
-        /// Number of interpreted calls seen before baseline tier-up.
-        call_count: u32,
     },
     /// Baseline native code is resident; optimized code may be installed later.
     Native {
@@ -109,6 +107,7 @@ pub enum FuncBody {
         mir: Arc<MirFunction>,
         bytecode: Option<Arc<BytecodeFunction>>,
         /// Number of baseline-native calls seen before optimize tier-up.
+        /// Phase 4 will retire this in favour of the bead's counter too.
         opt_call_count: u32,
     },
 }
@@ -559,7 +558,6 @@ impl ExecutionEngine {
         self.functions.push(FuncBody::Interpreted {
             mir: Arc::new(mir),
             bytecode: None,
-            call_count: 0,
         });
         self.compiling_tier.push(None);
         self.jit_code.push(std::ptr::null());
@@ -1252,7 +1250,6 @@ impl ExecutionEngine {
                     FuncBody::Interpreted {
                         mir: Arc::new(MirFunction::new(SymbolId::from_raw(0), 0)),
                         bytecode: None,
-                        call_count: 0,
                     },
                 ) {
                     FuncBody::Interpreted { mir, bytecode, .. } => FuncBody::Native {
@@ -1378,16 +1375,14 @@ impl ExecutionEngine {
         if self.mode != ExecutionMode::Tiered {
             return false;
         }
-        // Shadow-mode tick — ticks the beadie bead's invocation counter
-        // alongside the legacy call_count field so the two can be
-        // cross-referenced in diagnostics. Does NOT drive any tier
-        // decision this phase; the match block below still owns that.
-        self.tier.tick(id);
         let idx = id.0 as usize;
         match self.functions.get_mut(idx) {
-            Some(FuncBody::Interpreted { call_count, .. }) => {
-                *call_count += 1;
-                *call_count == self.jit_threshold
+            Some(FuncBody::Interpreted { .. }) => {
+                // Baseline tier-up counting now lives on the beadie bead.
+                // `should_promote_on_tick` ticks the bead and fires true
+                // exactly once when `jit_threshold` is crossed, matching
+                // the legacy `call_count == jit_threshold` semantics.
+                self.tier.should_promote_on_tick(id, self.jit_threshold)
             }
             Some(FuncBody::Native {
                 opt_call_count,
@@ -1397,6 +1392,7 @@ impl ExecutionEngine {
                 && self.tier_states.get(idx).copied() == Some(TierState::BaselineNative)
                 && self.compiling_tier.get(idx).copied().flatten().is_none() =>
             {
+                // Phase 4 will retire this branch onto the bead as well.
                 *opt_call_count += 1;
                 *opt_call_count == self.opt_threshold
             }
@@ -1920,24 +1916,20 @@ mod tests {
     }
 
     #[test]
-    fn test_shadow_tier_tick_matches_legacy_counter() {
-        // Phase 2 invariant: every record_call ticks both the legacy
-        // call_count field and the beadie-backed bead. The two counts
-        // should stay in lockstep until one of them gates out (Tier
-        // reached, mode changed, etc.).
+    fn test_bead_counts_interpreted_calls() {
+        // Phase 3 invariant: record_call ticks the bead on each invocation
+        // of an Interpreted function. With a threshold higher than our
+        // loop, no tier-up fires and the bead stays in Interpreted state.
         let mut engine = ExecutionEngine::new(ExecutionMode::Tiered);
-        engine.jit_threshold = 1_000; // high so we never tier up in this test
+        engine.jit_threshold = 1_000;
         let mir = make_mir();
         let id = engine.register_function(mir);
 
         for _ in 0..7 {
-            engine.record_call(id);
+            assert!(!engine.record_call(id));
         }
         assert_eq!(engine.tier.invocations(id), 7);
-        match &engine.functions[id.0 as usize] {
-            FuncBody::Interpreted { call_count, .. } => assert_eq!(*call_count, 7),
-            _ => panic!("expected Interpreted body"),
-        }
+        assert_eq!(engine.tier.state(id), Some(beadie::BeadState::Interpreted));
     }
 
     #[test]
