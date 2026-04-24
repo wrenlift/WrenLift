@@ -12,7 +12,9 @@
 
 use aes_gcm::aead::{Aead, AeadCore, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use argon2::{Algorithm, Argon2, Params, Version};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand_core::{OsRng, RngCore};
 
 use crate::runtime::object::NativeContext;
@@ -259,6 +261,120 @@ fn crypto_ed25519_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::bool(verifying_key.verify(&message, &signature).is_ok())
 }
 
+// --- Argon2id password hashing ---------------------------------
+//
+// OWASP's current recommendation (2024+). Memory-hard, resistant
+// to GPU / ASIC attacks — unlike bcrypt. Produces a PHC-format
+// string that embeds the algorithm, parameters, salt, and hash,
+// so verification doesn't need the caller to remember params.
+//
+// Default params follow the OWASP "minimum" row at
+// cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+// — m=19456 KiB, t=2, p=1 — which puts a single hash at ~50-80ms
+// on commodity hardware. Callers that need a stricter profile can
+// use `Password.hashWith(password, m, t, p)`.
+
+const ARGON2_DEFAULT_M_COST_KIB: u32 = 19_456;
+const ARGON2_DEFAULT_T_COST: u32 = 2;
+const ARGON2_DEFAULT_P_COST: u32 = 1;
+
+fn argon2_hash_inner(
+    ctx: &mut dyn NativeContext,
+    password_arg: Value,
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+    label: &str,
+) -> Value {
+    let Some(password_bytes) = bytes_from_value(ctx, password_arg, label) else {
+        return Value::null();
+    };
+    let Ok(params) = Params::new(m_cost, t_cost, p_cost, None) else {
+        ctx.runtime_error(format!(
+            "{}: invalid argon2 params (m={}, t={}, p={})",
+            label, m_cost, t_cost, p_cost
+        ));
+        return Value::null();
+    };
+    let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let salt = SaltString::generate(&mut OsRng);
+    match hasher.hash_password(&password_bytes, &salt) {
+        Ok(h) => ctx.alloc_string(h.to_string()),
+        Err(e) => {
+            ctx.runtime_error(format!("{}: {}", label, e));
+            Value::null()
+        }
+    }
+}
+
+fn crypto_argon2_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    argon2_hash_inner(
+        ctx,
+        args[1],
+        ARGON2_DEFAULT_M_COST_KIB,
+        ARGON2_DEFAULT_T_COST,
+        ARGON2_DEFAULT_P_COST,
+        "Password.hash",
+    )
+}
+
+fn crypto_argon2_hash_with(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(m) = positive_int(args[2]) else {
+        ctx.runtime_error("Password.hashWith: m (memory KiB) must be a positive integer.".into());
+        return Value::null();
+    };
+    let Some(t) = positive_int(args[3]) else {
+        ctx.runtime_error("Password.hashWith: t (iterations) must be a positive integer.".into());
+        return Value::null();
+    };
+    let Some(p) = positive_int(args[4]) else {
+        ctx.runtime_error("Password.hashWith: p (parallelism) must be a positive integer.".into());
+        return Value::null();
+    };
+    argon2_hash_inner(ctx, args[1], m, t, p, "Password.hashWith")
+}
+
+fn crypto_argon2_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(password_bytes) = bytes_from_value(ctx, args[1], "Password.verify (password)") else {
+        return Value::null();
+    };
+    let Some(hash_str) = string_of(args[2]) else {
+        ctx.runtime_error("Password.verify: hash must be a String.".into());
+        return Value::null();
+    };
+    let parsed = match PasswordHash::new(&hash_str) {
+        Ok(p) => p,
+        // Malformed PHC strings are treated as failed verification
+        // rather than errors, to keep the call-site branch-free and
+        // resistant to probing for "is this a valid PHC string?".
+        Err(_) => return Value::bool(false),
+    };
+    let algs: &[&dyn PasswordVerifier] = &[&Argon2::default()];
+    Value::bool(parsed.verify_password(algs, &password_bytes).is_ok())
+}
+
+fn positive_int(v: Value) -> Option<u32> {
+    let n = v.as_num()?;
+    if !n.is_finite() || n <= 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+        return None;
+    }
+    Some(n as u32)
+}
+
+fn string_of(v: Value) -> Option<String> {
+    v.as_object().and_then(|ptr| {
+        use crate::runtime::object::{ObjHeader, ObjString, ObjType};
+        unsafe {
+            let header = ptr as *const ObjHeader;
+            if (*header).obj_type != ObjType::String {
+                return None;
+            }
+            let s = ptr as *const ObjString;
+            Some((*s).as_str().to_string())
+        }
+    })
+}
+
 // --- Registration -----------------------------------------------
 
 pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
@@ -279,6 +395,10 @@ pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
     );
     vm.primitive_static(class, "ed25519Sign(_,_)", crypto_ed25519_sign);
     vm.primitive_static(class, "ed25519Verify(_,_,_)", crypto_ed25519_verify);
+
+    vm.primitive_static(class, "argon2Hash(_)", crypto_argon2_hash);
+    vm.primitive_static(class, "argon2HashWith(_,_,_,_)", crypto_argon2_hash_with);
+    vm.primitive_static(class, "argon2Verify(_,_)", crypto_argon2_verify);
 
     class
 }
