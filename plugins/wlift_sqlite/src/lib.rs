@@ -10,6 +10,16 @@
 //! binary and this dylib. Global state is the SQLite connection
 //! registry — private to this dylib and fine that way (no
 //! sharing across platform boundaries).
+//!
+//! # Safety
+//!
+//! Every `wlift_sqlite_*` entry point is called by the runtime
+//! with a valid `*mut VM` that stays live for the duration of
+//! the call. The runtime is also responsible for providing
+//! well-formed slot arguments — we validate them defensively
+//! but trust that the pointer itself dereferences.
+
+#![allow(clippy::missing_safety_doc)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,10 +53,8 @@ fn next_id() -> u64 {
 
 unsafe fn slot(vm: *mut VM, index: usize) -> Value {
     unsafe {
-        (&(*vm).api_stack)
-            .get(index)
-            .copied()
-            .unwrap_or(Value::null())
+        let stack = &(*vm).api_stack;
+        stack.get(index).copied().unwrap_or(Value::null())
     }
 }
 
@@ -232,7 +240,7 @@ fn bind_params(stmt: &mut rusqlite::Statement<'_>, params: &Params) -> rusqlite:
 // --- Foreign C entry points ------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_open(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_open(vm: *mut VM) {
     unsafe {
         let path_val = slot(vm, 1);
         let path = match string_of(path_val) {
@@ -266,7 +274,7 @@ pub extern "C" fn wlift_sqlite_open(vm: *mut VM) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_close(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_close(vm: *mut VM) {
     unsafe {
         let id_val = slot(vm, 1);
         let Some(id) = id_of(ctx(vm), id_val, "Sqlite.close") else {
@@ -279,7 +287,7 @@ pub extern "C" fn wlift_sqlite_close(vm: *mut VM) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_execute(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_execute(vm: *mut VM) {
     unsafe {
         let id_val = slot(vm, 1);
         let sql_val = slot(vm, 2);
@@ -334,7 +342,7 @@ pub extern "C" fn wlift_sqlite_execute(vm: *mut VM) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_query(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
     unsafe {
         let id_val = slot(vm, 1);
         let sql_val = slot(vm, 2);
@@ -440,7 +448,7 @@ pub extern "C" fn wlift_sqlite_query(vm: *mut VM) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_last_insert_rowid(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_last_insert_rowid(vm: *mut VM) {
     unsafe {
         let id_val = slot(vm, 1);
         let Some(id) = id_of(ctx(vm), id_val, "Sqlite.lastInsertRowid") else {
@@ -461,7 +469,7 @@ pub extern "C" fn wlift_sqlite_last_insert_rowid(vm: *mut VM) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_changes(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_changes(vm: *mut VM) {
     unsafe {
         let id_val = slot(vm, 1);
         let Some(id) = id_of(ctx(vm), id_val, "Sqlite.changes") else {
@@ -479,7 +487,7 @@ pub extern "C" fn wlift_sqlite_changes(vm: *mut VM) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn wlift_sqlite_in_transaction(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_sqlite_in_transaction(vm: *mut VM) {
     unsafe {
         let id_val = slot(vm, 1);
         let Some(id) = id_of(ctx(vm), id_val, "Sqlite.inTransaction") else {
