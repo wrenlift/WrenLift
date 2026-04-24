@@ -46,8 +46,8 @@
 use std::sync::Arc;
 
 use beadie::{
-    BailoutInfo, Bead, BeadState, Beadie, CoreHandle, DeoptDecision, DeoptPolicy, SubmitResult,
-    ThresholdDeoptPolicy, ThresholdPolicy, TieredPolicy,
+    BailoutInfo, Bead, BeadState, Beadie, CoreHandle, DeoptDecision, DeoptPolicy, OsrCompileResult,
+    OsrEntry, SubmitResult, ThresholdDeoptPolicy, ThresholdPolicy, TieredPolicy,
 };
 
 use crate::runtime::engine::FuncId;
@@ -65,6 +65,24 @@ pub const OPTIMIZED_THRESHOLD: u32 = 1_000;
 /// is blacklisted from further JIT compilation for the remainder of the
 /// process — assumed pathologically polymorphic / unstable.
 pub const DEFAULT_DEOPT_LIMIT: u32 = 3;
+
+/// Encode a WrenLift OSR site into beadie's u64 site key.
+///
+/// OSR entries are keyed on `(target_block, param_count)` — the MIR
+/// block we're transferring INTO plus the number of block parameters
+/// the compiled entry expects (so leaf / tail variants of the same
+/// block land in the right place). We pack both into the 64-bit key
+/// beadie stores:
+///
+/// ```text
+///   +-------------------+-------------------+
+///   |  block_id (upper 32 bits)  |  param_count (lower 16) ignored rest  |
+///   +-------------------+-------------------+
+/// ```
+#[inline]
+pub fn encode_osr_site(block_id: u32, param_count: u16) -> u64 {
+    ((block_id as u64) << 16) | (param_count as u64)
+}
 
 // ── TierManager ───────────────────────────────────────────────────────────
 
@@ -205,6 +223,32 @@ impl TierManager {
         self.beadie.submit(bead, compile)
     }
 
+    /// OSR-aware submit: the closure returns an `OsrCompileResult` with
+    /// both the normal entry pointer and a vec of `OsrEntry`s (one per
+    /// hot loop header). Beadie installs both atomically — readers that
+    /// see the new generation see matching code + OSR table.
+    pub fn submit_compile_osr<F>(&self, id: FuncId, compile: F) -> SubmitResult
+    where
+        F: FnOnce(&Arc<Bead>) -> OsrCompileResult + Send + 'static,
+    {
+        let Some(bead) = self.beads.get(id.0 as usize).and_then(|b| b.as_ref()) else {
+            return SubmitResult::AlreadyQueued;
+        };
+        self.beadie.submit_osr(bead, compile)
+    }
+
+    /// Look up an OSR entry point for a given back-edge site. O(log N)
+    /// binary search on the bead's sorted OSR table. Returns `None` if
+    /// the bead isn't compiled, has no OSR table, or no entry matches
+    /// the site key.
+    #[inline]
+    pub fn osr_entry(&self, id: FuncId, site: u64) -> Option<*mut ()> {
+        self.beads
+            .get(id.0 as usize)?
+            .as_ref()?
+            .osr_entry(site)
+    }
+
     /// Install a new compiled pointer, choosing the right beadie API
     /// based on current state: `eager_install` when the bead is still
     /// `Interpreted` (first-time install), `swap_compiled` when it's
@@ -217,6 +261,35 @@ impl TierManager {
         match bead.state() {
             BeadState::Compiled => bead.swap_compiled(code).is_some(),
             _ => bead.eager_install(code),
+        }
+    }
+
+    /// Install a compiled pointer + OSR entry table, state-aware.
+    ///
+    /// - `Interpreted` → `eager_install` the code (bead goes to
+    ///   `Compiled`), then `swap_compiled_with_osr` to publish the
+    ///   OSR table on top. Two-step because beadie's public install
+    ///   API for the first-time-install path doesn't take an OSR
+    ///   vec directly (the broker-submitted path does, so normal
+    ///   tier-up via `submit_compile_osr` avoids this dance).
+    /// - `Compiled` → `swap_compiled_with_osr` directly. Used for
+    ///   tier-up from baseline to optimized; both code and OSR
+    ///   table get replaced atomically under a new generation.
+    ///
+    /// Returns true if the bead ended up with the supplied pointer
+    /// and OSR table.
+    pub fn install_or_swap_osr(&self, id: FuncId, code: *mut (), osr: Vec<OsrEntry>) -> bool {
+        let Some(bead) = self.beads.get(id.0 as usize).and_then(|b| b.as_ref()) else {
+            return false;
+        };
+        match bead.state() {
+            BeadState::Compiled => bead.swap_compiled_with_osr(code, osr).is_some(),
+            _ => {
+                if !bead.eager_install(code) {
+                    return false;
+                }
+                bead.swap_compiled_with_osr(code, osr).is_some()
+            }
         }
     }
 

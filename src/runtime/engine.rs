@@ -307,6 +307,20 @@ fn insert_speculative_guards(mir: &mut MirFunction, profile: Option<&TypeProfile
     }
 }
 
+/// Translate WrenLift's per-function `NativeOsrEntry` list into the
+/// beadie `OsrEntry` vec that gets installed on the bead. Skips
+/// entries with null pointers (non-native / WASM fallback tiers).
+fn encode_osr_entries(entries: &[NativeOsrEntry]) -> Vec<beadie::OsrEntry> {
+    entries
+        .iter()
+        .filter(|e| !e.ptr.is_null())
+        .map(|e| beadie::OsrEntry {
+            site: super::tier::encode_osr_site(e.target_block.0, e.param_count),
+            code: e.ptr as *mut (),
+        })
+        .collect()
+}
+
 fn tier_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
@@ -405,8 +419,6 @@ pub struct ExecutionEngine {
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
-    /// Active native OSR entry points indexed by FuncId.
-    pub jit_osr_entries: Vec<Vec<NativeOsrEntry>>,
     /// Whether the currently active native tier can use the direct fast path.
     pub jit_leaf: Vec<bool>,
     /// Preserved native-frame metadata for compiled functions.
@@ -509,7 +521,6 @@ impl ExecutionEngine {
             pending_count: 0,
             pending_callee_precompile: Vec::new(),
             jit_code: Vec::new(),
-            jit_osr_entries: Vec::new(),
             jit_leaf: Vec::new(),
             jit_metadata: Vec::new(),
             tier_states: Vec::new(),
@@ -559,7 +570,6 @@ impl ExecutionEngine {
         });
         self.compiling_tier.push(None);
         self.jit_code.push(std::ptr::null());
-        self.jit_osr_entries.push(Vec::new());
         self.jit_leaf.push(false);
         self.jit_metadata.push(None);
         self.tier_states.push(TierState::Interpreted);
@@ -966,24 +976,39 @@ impl ExecutionEngine {
             .get(idx)
             .copied()
             .unwrap_or(TierState::Interpreted);
+        // The active OSR table lives on the beadie bead; when a tier
+        // switch revives a previously-compiled tier (e.g. deopt back
+        // to baseline) we re-publish that tier's stashed OSR entries
+        // via `install_or_swap_osr` so the bead's table matches the
+        // code pointer we just swapped in.
+        let id = FuncId(idx as u32);
         match state {
             TierState::Interpreted => {
                 self.jit_code[idx] = std::ptr::null();
-                self.jit_osr_entries[idx].clear();
                 self.jit_leaf[idx] = false;
                 self.jit_metadata[idx] = None;
+                // Bead's OSR table is cleared by `reload()` / `blacklist()`
+                // which the deopt path in record_bailout already drives.
             }
             TierState::BaselineNative => {
                 self.jit_code[idx] = self.baseline_code[idx];
-                self.jit_osr_entries[idx] = self.baseline_osr_entries[idx].clone();
                 self.jit_leaf[idx] = self.baseline_leaf[idx];
                 self.jit_metadata[idx] = self.baseline_metadata[idx].clone();
+                if !self.baseline_code[idx].is_null() {
+                    let entries = encode_osr_entries(&self.baseline_osr_entries[idx]);
+                    self.tier
+                        .install_or_swap_osr(id, self.baseline_code[idx] as *mut (), entries);
+                }
             }
             TierState::OptimizedNative => {
                 self.jit_code[idx] = self.optimized_code[idx];
-                self.jit_osr_entries[idx] = self.optimized_osr_entries[idx].clone();
                 self.jit_leaf[idx] = self.optimized_leaf[idx];
                 self.jit_metadata[idx] = self.optimized_metadata[idx].clone();
+                if !self.optimized_code[idx].is_null() {
+                    let entries = encode_osr_entries(&self.optimized_osr_entries[idx]);
+                    self.tier
+                        .install_or_swap_osr(id, self.optimized_code[idx] as *mut (), entries);
+                }
             }
         }
     }
@@ -994,15 +1019,20 @@ impl ExecutionEngine {
         target_block: crate::mir::BlockId,
         param_count: usize,
     ) -> Option<NativeOsrEntry> {
-        self.jit_osr_entries
-            .get(id.0 as usize)?
-            .iter()
-            .copied()
-            .find(|entry| {
-                entry.target_block == target_block
-                    && entry.param_count as usize == param_count
-                    && !entry.ptr.is_null()
-            })
+        // Beadie's bead owns the active OSR table now. `osr_entry` does
+        // an O(log N) binary search on a sorted slice; the site key
+        // encodes (block_id, param_count) so this matches the exact
+        // `(target_block, param_count)` lookup the legacy Vec did.
+        let site = super::tier::encode_osr_site(target_block.0, param_count as u16);
+        let ptr = self.tier.osr_entry(id, site)?;
+        if ptr.is_null() {
+            return None;
+        }
+        Some(NativeOsrEntry {
+            target_block,
+            param_count: param_count as u16,
+            ptr: ptr as *const u8,
+        })
     }
 
     pub fn tier_state(&self, id: FuncId) -> TierState {
@@ -1221,6 +1251,8 @@ impl ExecutionEngine {
 
     /// WLIFT_TIER_TRACE helper — prints the engine's TierState alongside
     /// the beadie bead's BeadState and invocation count at a given event.
+    ///
+    /// (Helpers like encode_osr_entries live outside this impl.)
     /// Used to cross-check that the two views of the tier state machine
     /// stay in sync; drift shows up immediately as a mismatch in the
     /// trace stream rather than as a hard-to-debug flake.
@@ -1283,17 +1315,21 @@ impl ExecutionEngine {
                 };
                 self.functions[idx] = body;
                 self.baseline_code[idx] = native_ptr;
-                self.baseline_osr_entries[idx] = osr_entries;
+                self.baseline_osr_entries[idx] = osr_entries.clone();
                 self.baseline_leaf[idx] = inline_safe;
                 self.baseline_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::BaselineNative;
-                // Tell the bead a compiled artifact is live so its
-                // state machine tracks reality. Non-native tiers (WASM
+                // Publish code + OSR table to the bead atomically.
+                // `install_or_swap_osr` picks eager-install or swap
+                // based on current state. Non-native tiers (WASM
                 // fallback) have a null pointer and stay Interpreted
-                // on the bead side — install_or_swap rejects nulls.
+                // on the bead side — the helper rejects nulls.
                 if !native_ptr.is_null() {
-                    self.tier
-                        .install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                    self.tier.install_or_swap_osr(
+                        FuncId(idx as u32),
+                        native_ptr as *mut (),
+                        encode_osr_entries(&osr_entries),
+                    );
                 }
                 if tier_trace_enabled() {
                     self.emit_bead_trace(idx, tier, "install-done");
@@ -1308,16 +1344,19 @@ impl ExecutionEngine {
                     *optimized_executable = Some(executable);
                 }
                 self.optimized_code[idx] = native_ptr;
-                self.optimized_osr_entries[idx] = osr_entries;
+                self.optimized_osr_entries[idx] = osr_entries.clone();
                 self.optimized_leaf[idx] = inline_safe;
                 self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
-                // Swap the bead's pointer over to the optimized tier.
-                // install_or_swap picks `swap_compiled` when already
-                // Compiled, `eager_install` otherwise.
+                // Swap both pointer and OSR table atomically to
+                // optimized tier. Beadie bumps the bead's generation
+                // so stale baseline OSR lookups can't race.
                 if !native_ptr.is_null() {
-                    self.tier
-                        .install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                    self.tier.install_or_swap_osr(
+                        FuncId(idx as u32),
+                        native_ptr as *mut (),
+                        encode_osr_entries(&osr_entries),
+                    );
                 }
                 if tier_trace_enabled() {
                     self.emit_bead_trace(idx, tier, "install-done");
@@ -1884,7 +1923,6 @@ mod tests {
         let id = engine.register_function(mir);
         assert_eq!(id, FuncId(0));
         assert!(engine.get_function(id).is_some());
-        assert!(engine.jit_osr_entries[id.0 as usize].is_empty());
         assert!(engine.baseline_osr_entries[id.0 as usize].is_empty());
         assert!(engine.optimized_osr_entries[id.0 as usize].is_empty());
         assert!(engine
