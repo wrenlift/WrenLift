@@ -643,6 +643,14 @@ impl<'a> MirBuilder<'a> {
         let body_bb = self.new_block();
         let exit_bb = self.new_block();
 
+        // Capture prior binding of the loop variable so we can restore it
+        // after the loop — otherwise `f` leaks with its body-final ValueId
+        // (e.g. the iteratorValue call result, which is only defined inside
+        // the body block) and downstream code that snapshots `self.variables`
+        // (another lower_for, a lower_while) pulls that stale ValueId into
+        // its block params, producing invalid SSA.
+        let prev_loop_var = self.variables.get(&variable.0).copied();
+
         // Create phi block params in cond_bb for the iterator state AND all
         // live variables, so mutations in the body propagate through the
         // back-edge (same approach as lower_while).
@@ -741,6 +749,22 @@ impl<'a> MirBuilder<'a> {
         // Use exit_bb phi values for post-loop code
         for &(name, exit_phi) in &exit_phi_map {
             self.variables.insert(name, exit_phi);
+        }
+
+        // Restore the loop variable to its pre-loop binding. exit_phi_map
+        // carries an entry for the loop variable only when it already existed
+        // before the loop (then the loop shadowed it); the `for`-introduced
+        // binding itself is scoped to the loop body.
+        let was_in_prev_scope = exit_phi_map.iter().any(|&(name, _)| name == variable.0);
+        if !was_in_prev_scope {
+            match prev_loop_var {
+                Some(v) => {
+                    self.variables.insert(variable.0, v);
+                }
+                None => {
+                    self.variables.remove(&variable.0);
+                }
+            }
         }
 
         self.switch_to(exit_bb);

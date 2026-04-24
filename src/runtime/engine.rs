@@ -1703,7 +1703,9 @@ impl ExecutionEngine {
                 Some(jit_code_base_raw as *const *const u8),
             )
             .map_err(|e| {
-                eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
+                if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
+                    eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
+                }
                 e
             })
             .ok()
@@ -1715,7 +1717,9 @@ impl ExecutionEngine {
                     .code
                     .into_executable()
                     .map_err(|e| {
-                        eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
+                        if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
+                            eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
+                        }
                         e
                     })
                     .ok()

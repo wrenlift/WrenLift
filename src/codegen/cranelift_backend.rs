@@ -1378,6 +1378,19 @@ pub mod cl {
                 method,
                 args,
             } => {
+                // wren_call_N helpers only exist up to arity 4. Calls with
+                // more than 4 args silently truncated on the JIT path,
+                // which corrupts callee parameters (e.g. Render_.new with
+                // 7 args saw its final three become undefined). Bail out
+                // so the function falls back to the interpreter until we
+                // grow wren_call_5..wren_call_8 wrappers.
+                if args.len() > 4 {
+                    return Err(format!(
+                        "Call with arity {} not supported by JIT (need wren_call_{})",
+                        args.len(),
+                        args.len()
+                    ));
+                }
                 let r = get(receiver);
                 let ic_idx = *call_site_idx;
                 *call_site_idx += 1;
@@ -1499,6 +1512,14 @@ pub mod cl {
                 receiver,
                 args,
             } => {
+                // Same wren_call_N arity limit as Instruction::Call — the
+                // slow-path fallback inside this branch also truncates.
+                if args.len() > 4 {
+                    return Err(format!(
+                        "CallKnownFunc with arity {} not supported by JIT",
+                        args.len()
+                    ));
+                }
                 let r = get(receiver);
 
                 // === Pure-leaf direct call (ZERO FFI) ===
@@ -1768,6 +1789,12 @@ pub mod cl {
 
             // === Super calls ===
             Instruction::SuperCall { method, args } => {
+                if args.len() > 4 {
+                    return Err(format!(
+                        "SuperCall with arity {} not supported by JIT",
+                        args.len()
+                    ));
+                }
                 let method_val = builder.ins().iconst(types::I64, method.index() as i64);
                 let call_name = match args.len() {
                     0 => "wren_super_call_0",
