@@ -1218,6 +1218,26 @@ impl ExecutionEngine {
         }
     }
 
+    /// WLIFT_TIER_TRACE helper — prints the engine's TierState alongside
+    /// the beadie bead's BeadState and invocation count at a given event.
+    /// Used to cross-check that the two views of the tier state machine
+    /// stay in sync; drift shows up immediately as a mismatch in the
+    /// trace stream rather than as a hard-to-debug flake.
+    fn emit_bead_trace(&self, idx: usize, tier: CompileTier, event: &str) {
+        let id = FuncId(idx as u32);
+        let engine_tier = self.tier_states.get(idx).copied().unwrap_or_default();
+        let bead_state = self
+            .tier
+            .state(id)
+            .map(|s| format!("{s:?}"))
+            .unwrap_or_else(|| "Unregistered".to_string());
+        let invocations = self.tier.invocations(id);
+        eprintln!(
+            "tier-trace: {event} {tier:?} FuncId({}) engine={engine_tier:?} bead={bead_state} invocations={invocations}",
+            idx
+        );
+    }
+
     fn install_compiled_tier(
         &mut self,
         idx: usize,
@@ -1270,9 +1290,13 @@ impl ExecutionEngine {
                 // Tell the bead a compiled artifact is live so its
                 // state machine tracks reality. Non-native tiers (WASM
                 // fallback) have a null pointer and stay Interpreted
-                // on the bead side — eager_install rejects nulls.
+                // on the bead side — install_or_swap rejects nulls.
                 if !native_ptr.is_null() {
-                    self.tier.install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                    self.tier
+                        .install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                }
+                if tier_trace_enabled() {
+                    self.emit_bead_trace(idx, tier, "install-done");
                 }
             }
             CompileTier::Optimized => {
@@ -1289,11 +1313,14 @@ impl ExecutionEngine {
                 self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
                 // Swap the bead's pointer over to the optimized tier.
-                // eager_install works whether the bead is currently
-                // Compiled or Interpreted, so this is safe even if the
-                // baseline install path didn't run (e.g. eager optimize).
+                // install_or_swap picks `swap_compiled` when already
+                // Compiled, `eager_install` otherwise.
                 if !native_ptr.is_null() {
-                    self.tier.install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                    self.tier
+                        .install_or_swap(FuncId(idx as u32), native_ptr as *mut ());
+                }
+                if tier_trace_enabled() {
+                    self.emit_bead_trace(idx, tier, "install-done");
                 }
             }
         }

@@ -212,6 +212,34 @@ impl TierManager {
     pub fn registered(&self) -> usize {
         self.beads.iter().filter(|b| b.is_some()).count()
     }
+
+    /// Flat snapshot of every bead's state + invocation count, keyed by
+    /// FuncId raw index. For end-of-run diagnostics and test assertions;
+    /// not a hot-path API (walks the whole chain).
+    pub fn snapshot(&self) -> Vec<TierSnapshot> {
+        self.beads
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                slot.as_ref().map(|bead| TierSnapshot {
+                    func_id: FuncId(idx as u32),
+                    state: bead.state(),
+                    invocations: bead.invocation_count(),
+                    bailouts: bead.bailout_count(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One row of [`TierManager::snapshot`]. Cheap to clone; intended for
+/// passing across thread or module boundaries in diagnostics output.
+#[derive(Debug, Clone)]
+pub struct TierSnapshot {
+    pub func_id: FuncId,
+    pub state: BeadState,
+    pub invocations: u32,
+    pub bailouts: u32,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
