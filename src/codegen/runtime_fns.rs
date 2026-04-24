@@ -22,8 +22,8 @@
 #![allow(clippy::missing_safety_doc)]
 
 use crate::runtime::object::{
-    MapKey, Method, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap, ObjString,
-    ObjType,
+    MapKey, Method, NativeContext, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap,
+    ObjString, ObjType,
 };
 use crate::runtime::value::Value;
 use std::cell::RefCell;
@@ -3195,6 +3195,19 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                 }
             }
             _ => {}
+        }
+    }
+    // Fallback: the receiver has a `[_]` method defined on its class
+    // (user class with `subscript` overload, StringByteSequence,
+    // StringCodePointSequence, etc.). Dispatch through the method
+    // table the same way the interpreter does — missing this path
+    // silently returned null for every non-builtin `foo[bar]` in
+    // JIT'd code, which broke `c.bytes[0]`-style patterns and any
+    // user class overloading `[_]`.
+    let vm = unsafe { vm_ref() };
+    if let Some(vm) = vm {
+        if let Some(v) = vm.call_method_on(recv, "[_]", &[idx]) {
+            return v.to_bits();
         }
     }
     Value::null().to_bits()
