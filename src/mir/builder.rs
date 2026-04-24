@@ -1691,10 +1691,7 @@ pub fn lower_module_with_known_classes(
                 .collect();
             ordered.sort_by_key(|(idx, _)| *idx);
             let class_name = interner.resolve(decl.name.0).to_string();
-            emitted_layouts.insert(
-                class_name,
-                ordered.into_iter().map(|(_, n)| n).collect(),
-            );
+            emitted_layouts.insert(class_name, ordered.into_iter().map(|(_, n)| n).collect());
             class_field_maps.insert(decl.name.0, full_map);
             classes.push(class_mir);
             all_closures.extend(method_closures);

@@ -56,11 +56,7 @@ fn crypto_random_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 // Optional Additional Authenticated Data (AAD) is covered by
 // the tag but not encrypted.
 
-fn build_cipher(
-    ctx: &mut dyn NativeContext,
-    key_bytes: &[u8],
-    label: &str,
-) -> Option<Aes256Gcm> {
+fn build_cipher(ctx: &mut dyn NativeContext, key_bytes: &[u8], label: &str) -> Option<Aes256Gcm> {
     if key_bytes.len() != 32 {
         ctx.runtime_error(format!(
             "{}: key must be 32 bytes (AES-256), got {}.",
@@ -73,11 +69,7 @@ fn build_cipher(
     Some(Aes256Gcm::new(key))
 }
 
-fn check_nonce(
-    ctx: &mut dyn NativeContext,
-    nonce_bytes: &[u8],
-    label: &str,
-) -> bool {
+fn check_nonce(ctx: &mut dyn NativeContext, nonce_bytes: &[u8], label: &str) -> bool {
     if nonce_bytes.len() != 12 {
         ctx.runtime_error(format!(
             "{}: nonce must be 12 bytes, got {}.",
@@ -197,7 +189,8 @@ fn crypto_ed25519_keypair(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value
 }
 
 fn crypto_ed25519_public_from_secret(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let Some(secret_bytes) = bytes_from_list(ctx, args[1], "Ed25519.publicFromSecret (secret)") else {
+    let Some(secret_bytes) = bytes_from_list(ctx, args[1], "Ed25519.publicFromSecret (secret)")
+    else {
         return Value::null();
     };
     if secret_bytes.len() != 32 {
@@ -279,7 +272,11 @@ pub fn register(vm: &mut VM) -> *mut crate::runtime::object::ObjClass {
     vm.primitive_static(class, "aesGcmDecrypt(_,_,_,_)", crypto_aes_gcm_decrypt);
 
     vm.primitive_static(class, "ed25519Keypair()", crypto_ed25519_keypair);
-    vm.primitive_static(class, "ed25519PublicFromSecret(_)", crypto_ed25519_public_from_secret);
+    vm.primitive_static(
+        class,
+        "ed25519PublicFromSecret(_)",
+        crypto_ed25519_public_from_secret,
+    );
     vm.primitive_static(class, "ed25519Sign(_,_)", crypto_ed25519_sign);
     vm.primitive_static(class, "ed25519Verify(_,_,_)", crypto_ed25519_verify);
 

@@ -79,12 +79,7 @@ fn string_arg(ctx: &mut dyn NativeContext, v: Value, label: &str, field: &str) -
     }
 }
 
-fn with_regex<F, R>(
-    ctx: &mut dyn NativeContext,
-    id: u64,
-    label: &str,
-    f: F,
-) -> Option<R>
+fn with_regex<F, R>(ctx: &mut dyn NativeContext, id: u64, label: &str, f: F) -> Option<R>
 where
     F: FnOnce(&Regex) -> R,
 {

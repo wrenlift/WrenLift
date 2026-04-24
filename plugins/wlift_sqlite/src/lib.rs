@@ -17,9 +17,7 @@ use std::sync::{Mutex, OnceLock};
 
 use rusqlite::{types::Value as SqlValue, types::ValueRef, Connection, OpenFlags};
 
-use wren_lift::runtime::object::{
-    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType,
-};
+use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
@@ -44,7 +42,12 @@ fn next_id() -> u64 {
 // alloc_map, and surface errors via `runtime_error`.
 
 unsafe fn slot(vm: *mut VM, index: usize) -> Value {
-    unsafe { (&(*vm).api_stack).get(index).copied().unwrap_or(Value::null()) }
+    unsafe {
+        (&(*vm).api_stack)
+            .get(index)
+            .copied()
+            .unwrap_or(Value::null())
+    }
 }
 
 unsafe fn set_return(vm: *mut VM, v: Value) {
@@ -187,16 +190,10 @@ fn collect_params(v: Value, label: &str) -> Result<Params, String> {
                 let key = match unsafe { string_of(k) } {
                     Some(s) => s,
                     None => {
-                        return Err(format!(
-                            "{}: named parameter keys must be strings.",
-                            label
-                        ));
+                        return Err(format!("{}: named parameter keys must be strings.", label));
                     }
                 };
-                let key = if key.starts_with(':')
-                    || key.starts_with('@')
-                    || key.starts_with('$')
-                {
+                let key = if key.starts_with(':') || key.starts_with('@') || key.starts_with('$') {
                     key
                 } else {
                     format!(":{}", key)
@@ -209,10 +206,7 @@ fn collect_params(v: Value, label: &str) -> Result<Params, String> {
     }
 }
 
-fn bind_params(
-    stmt: &mut rusqlite::Statement<'_>,
-    params: &Params,
-) -> rusqlite::Result<()> {
+fn bind_params(stmt: &mut rusqlite::Statement<'_>, params: &Params) -> rusqlite::Result<()> {
     match params {
         Params::None => Ok(()),
         Params::Positional(vals) => {
@@ -312,10 +306,7 @@ pub extern "C" fn wlift_sqlite_execute(vm: *mut VM) {
         };
         let mut reg = registry().lock().unwrap();
         let Some(conn) = reg.get_mut(&id) else {
-            ctx(vm).runtime_error(format!(
-                "Sqlite.execute: unknown connection id {}.",
-                id
-            ));
+            ctx(vm).runtime_error(format!("Sqlite.execute: unknown connection id {}.", id));
             set_return(vm, Value::null());
             return;
         };
@@ -382,23 +373,17 @@ pub extern "C" fn wlift_sqlite_query(vm: *mut VM) {
             let mut stmt = conn
                 .prepare_cached(&sql)
                 .map_err(|e| format!("Sqlite.query: prepare: {}", e))?;
-            bind_params(&mut stmt, &params)
-                .map_err(|e| format!("Sqlite.query: bind: {}", e))?;
+            bind_params(&mut stmt, &params).map_err(|e| format!("Sqlite.query: bind: {}", e))?;
             let col_count = stmt.column_count();
             let col_names: Vec<String> = (0..col_count)
                 .map(|i| stmt.column_name(i).unwrap_or("").to_string())
                 .collect();
             let mut rows_out: Vec<Vec<SqlValue>> = Vec::new();
             let mut rows = stmt.raw_query();
-            while let Some(row) = rows
-                .next()
-                .map_err(|e| format!("Sqlite.query: {}", e))?
-            {
+            while let Some(row) = rows.next().map_err(|e| format!("Sqlite.query: {}", e))? {
                 let mut row_vals = Vec::with_capacity(col_count);
                 for i in 0..col_count {
-                    let vref = row
-                        .get_ref(i)
-                        .map_err(|e| format!("Sqlite.query: {}", e))?;
+                    let vref = row.get_ref(i).map_err(|e| format!("Sqlite.query: {}", e))?;
                     // Clone out of the borrow so we can drop the row.
                     let v: SqlValue = match vref {
                         ValueRef::Null => SqlValue::Null,
@@ -440,8 +425,7 @@ pub extern "C" fn wlift_sqlite_query(vm: *mut VM) {
                     SqlValue::Real(f) => Value::num(f),
                     SqlValue::Text(s) => context.alloc_string(s),
                     SqlValue::Blob(b) => {
-                        let elems: Vec<Value> =
-                            b.iter().map(|&x| Value::num(x as f64)).collect();
+                        let elems: Vec<Value> = b.iter().map(|&x| Value::num(x as f64)).collect();
                         context.alloc_list(elems)
                     }
                 };

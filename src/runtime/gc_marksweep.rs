@@ -113,11 +113,8 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
     }
 
     match (*header).obj_type {
-        ObjType::String
-        | ObjType::Fn
-        | ObjType::Range
-        | ObjType::Foreign
-        | ObjType::TypedArray => {}
+        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {
+        }
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);

@@ -67,10 +67,7 @@ fn next_stream_id() -> u64 {
     N.fetch_add(1, Ordering::SeqCst)
 }
 
-fn spawn_http_drain(
-    mut reader: Box<dyn Read + Send>,
-    state: SharedHttpStream,
-) -> JoinHandle<()> {
+fn spawn_http_drain(mut reader: Box<dyn Read + Send>, state: SharedHttpStream) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -122,11 +119,7 @@ unsafe fn string_value(v: Value) -> Option<String> {
 
 /// Pull a list's `String` elements, stopping at the first
 /// non-string entry with an error.
-fn list_of_strings(
-    ctx: &mut dyn NativeContext,
-    value: Value,
-    label: &str,
-) -> Option<Vec<String>> {
+fn list_of_strings(ctx: &mut dyn NativeContext, value: Value, label: &str) -> Option<Vec<String>> {
     let ptr = value.as_object()? as *const ObjList;
     let (count, data) = unsafe { ((*ptr).count as usize, (*ptr).elements) };
     let mut out = Vec::with_capacity(count);
@@ -135,10 +128,7 @@ fn list_of_strings(
         match unsafe { string_value(v) } {
             Some(s) => out.push(s),
             None => {
-                ctx.runtime_error(format!(
-                    "{}: every list entry must be a string.",
-                    label
-                ));
+                ctx.runtime_error(format!("{}: every list entry must be a string.", label));
                 return None;
             }
         }
@@ -230,13 +220,8 @@ fn flatten_request_headers(
             return None;
         }
     };
-    let entries: Vec<(Value, Value)> = unsafe {
-        (*ptr)
-            .entries
-            .iter()
-            .map(|(k, v)| (k.0, *v))
-            .collect()
-    };
+    let entries: Vec<(Value, Value)> =
+        unsafe { (*ptr).entries.iter().map(|(k, v)| (k.0, *v)).collect() };
     for (k, v) in entries {
         let Some(name) = (unsafe { string_value(k) }) else {
             ctx.runtime_error("Http.request: header names must be strings.".to_string());
@@ -499,11 +484,7 @@ fn http_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     out
 }
 
-fn http_stream_read_impl(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    nonblocking: bool,
-) -> Value {
+fn http_stream_read_impl(ctx: &mut dyn NativeContext, args: &[Value], nonblocking: bool) -> Value {
     let label = if nonblocking {
         "Http.tryStreamReadBytes"
     } else {
@@ -512,20 +493,14 @@ fn http_stream_read_impl(
     let id = match args[1].as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
         _ => {
-            ctx.runtime_error(format!(
-                "{}: id must be a non-negative integer.",
-                label
-            ));
+            ctx.runtime_error(format!("{}: id must be a non-negative integer.", label));
             return Value::null();
         }
     };
     let max = match args[2].as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
         _ => {
-            ctx.runtime_error(format!(
-                "{}: max must be a non-negative integer.",
-                label
-            ));
+            ctx.runtime_error(format!("{}: max must be a non-negative integer.", label));
             return Value::null();
         }
     };
@@ -589,8 +564,7 @@ fn http_stream_read_impl(
             Value::null()
         }
         Some(chunk) => {
-            let elements: Vec<Value> =
-                chunk.iter().map(|&b| Value::num(b as f64)).collect();
+            let elements: Vec<Value> = chunk.iter().map(|&b| Value::num(b as f64)).collect();
             ctx.alloc_list(elements)
         }
     }
@@ -608,9 +582,7 @@ fn http_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let id = match args[1].as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
         _ => {
-            ctx.runtime_error(
-                "Http.streamClose: id must be a non-negative integer.".to_string(),
-            );
+            ctx.runtime_error("Http.streamClose: id must be a non-negative integer.".to_string());
             return Value::null();
         }
     };

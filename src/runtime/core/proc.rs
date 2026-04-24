@@ -290,10 +290,7 @@ fn build_command(opts: &SpawnOpts<'_>) -> Command {
     cmd
 }
 
-fn spawn_entry(
-    ctx: &mut dyn NativeContext,
-    mut opts: SpawnOpts<'_>,
-) -> Option<(u64, ProcEntry)> {
+fn spawn_entry(ctx: &mut dyn NativeContext, mut opts: SpawnOpts<'_>) -> Option<(u64, ProcEntry)> {
     let mut cmd = build_command(&opts);
 
     // Chaining: pull the donor's (unread) stdout out of the
@@ -481,12 +478,7 @@ fn drain_remaining(state: &SharedStream, captured: &mut Vec<u8>) {
 fn build_result(ctx: &mut dyn NativeContext, entry: &ProcEntry) -> Value {
     let out = ctx.alloc_map();
     let out_ptr = out.as_object().unwrap() as *mut ObjMap;
-    put_num(
-        ctx,
-        out_ptr,
-        "code",
-        entry.exit_code.unwrap_or(-1) as f64,
-    );
+    put_num(ctx, out_ptr, "code", entry.exit_code.unwrap_or(-1) as f64);
     put_str(
         ctx,
         out_ptr,
@@ -871,11 +863,7 @@ fn bytes_slice_to_list(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Value {
 
 /// Pull a `Vec<u8>` out of a Wren `List<Num>` argument. Rejects
 /// non-byte-shaped entries; used by `write_stdin_bytes`.
-fn bytes_from_list_arg(
-    ctx: &mut dyn NativeContext,
-    v: Value,
-    label: &str,
-) -> Option<Vec<u8>> {
+fn bytes_from_list_arg(ctx: &mut dyn NativeContext, v: Value, label: &str) -> Option<Vec<u8>> {
     let ptr = match v.as_object() {
         Some(p) => p as *const ObjList,
         None => {
@@ -895,10 +883,7 @@ fn bytes_from_list_arg(
             }
         };
         if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
-            ctx.runtime_error(format!(
-                "{}: bytes must be integers in 0..=255.",
-                label
-            ));
+            ctx.runtime_error(format!("{}: bytes must be integers in 0..=255.", label));
             return None;
         }
         out.push(n as u8);
@@ -1049,10 +1034,7 @@ fn proc_write_stdin_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
     };
     let mut reg = registry().lock().unwrap();
     let Some(entry) = reg.get_mut(&id) else {
-        ctx.runtime_error(format!(
-            "Proc.writeStdinBytes: unknown process id {}.",
-            id
-        ));
+        ctx.runtime_error(format!("Proc.writeStdinBytes: unknown process id {}.", id));
         return Value::null();
     };
     let Some(pipe) = entry.stdin.as_mut() else {

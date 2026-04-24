@@ -582,7 +582,10 @@ fn lex_string(
         // "é") as *individual* code points in the Latin-1 supplement,
         // which UTF-8-encode to 4 bytes instead of the original 2.
         let rest = &source[*pos..];
-        let c = rest.chars().next().expect("byte at *pos implies at least one char");
+        let c = rest
+            .chars()
+            .next()
+            .expect("byte at *pos implies at least one char");
         buf.push(c);
         *pos += c.len_utf8();
     }

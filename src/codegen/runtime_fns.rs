@@ -390,8 +390,7 @@ pub unsafe fn call_jit_with_shadow(
     let same_module = match callee_module {
         Some(mn) => {
             let bytes = mn.as_bytes();
-            bytes.as_ptr() == cur_ctx.module_name
-                && bytes.len() as u32 == cur_ctx.module_name_len
+            bytes.as_ptr() == cur_ctx.module_name && bytes.len() as u32 == cur_ctx.module_name_len
         }
         None => true,
     };
@@ -3141,15 +3140,9 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                     let i = i as usize;
                     let kind = unsafe { (*arr).kind_tag() };
                     let v = match kind {
-                        TypedArrayKind::U8 => {
-                            unsafe { (*arr).get_u8(i).unwrap_or(0) as f64 }
-                        }
-                        TypedArrayKind::F32 => {
-                            unsafe { (*arr).get_f32(i).unwrap_or(0.0) as f64 }
-                        }
-                        TypedArrayKind::F64 => {
-                            unsafe { (*arr).get_f64(i).unwrap_or(0.0) }
-                        }
+                        TypedArrayKind::U8 => unsafe { (*arr).get_u8(i).unwrap_or(0) as f64 },
+                        TypedArrayKind::F32 => unsafe { (*arr).get_f32(i).unwrap_or(0.0) as f64 },
+                        TypedArrayKind::F64 => unsafe { (*arr).get_f64(i).unwrap_or(0.0) },
                     };
                     return Value::num(v).to_bits();
                 }

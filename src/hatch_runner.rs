@@ -163,10 +163,7 @@ impl HatchRunner {
         if !path.exists() {
             return Err(RunnerError::PathIo(
                 path.clone(),
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "search path does not exist",
-                ),
+                std::io::Error::new(std::io::ErrorKind::NotFound, "search path does not exist"),
             ));
         }
         if !self.search_paths.contains(&path) {
@@ -201,8 +198,7 @@ impl HatchRunner {
             return Ok(());
         }
         let path = self.locate(name)?;
-        let bytes = std::fs::read(&path)
-            .map_err(|e| RunnerError::PathIo(path.clone(), e))?;
+        let bytes = std::fs::read(&path).map_err(|e| RunnerError::PathIo(path.clone(), e))?;
         self.install_bytes_tagged(name, &bytes)
     }
 
@@ -233,11 +229,7 @@ impl HatchRunner {
     /// Install raw bytes but remember the name so future `install`
     /// calls for the same name no-op. Used internally; exposed in
     /// case an embedder wants to mirror that behaviour.
-    pub fn install_bytes_tagged(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-    ) -> Result<(), RunnerError> {
+    pub fn install_bytes_tagged(&mut self, name: &str, bytes: &[u8]) -> Result<(), RunnerError> {
         self.install_bytes(bytes)?;
         self.installed.push(name.to_string());
         Ok(())
@@ -284,12 +276,9 @@ impl HatchRunner {
     /// Run the contents of a file as Wren source.
     pub fn run_file<P: AsRef<Path>>(&mut self, path: P) -> Result<(), RunnerError> {
         let path = path.as_ref().to_path_buf();
-        let source = std::fs::read_to_string(&path)
-            .map_err(|e| RunnerError::PathIo(path.clone(), e))?;
-        let module = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("main");
+        let source =
+            std::fs::read_to_string(&path).map_err(|e| RunnerError::PathIo(path.clone(), e))?;
+        let module = path.file_stem().and_then(|s| s.to_str()).unwrap_or("main");
         self.run_source(module, &source)
     }
 
@@ -309,8 +298,8 @@ impl HatchRunner {
     }
 
     fn scan_dir(&mut self, dir: &Path) -> Result<(), RunnerError> {
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| RunnerError::PathIo(dir.to_path_buf(), e))?;
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| RunnerError::PathIo(dir.to_path_buf(), e))?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("hatch") {
@@ -371,8 +360,8 @@ impl Default for HatchRunner {
 /// zero-padded semver most hatches ship with.
 fn scan_cache_for(cache: &Path, name: &str) -> Result<PathBuf, RunnerError> {
     let prefix = format!("{}-", name);
-    let entries = std::fs::read_dir(cache)
-        .map_err(|e| RunnerError::PathIo(cache.to_path_buf(), e))?;
+    let entries =
+        std::fs::read_dir(cache).map_err(|e| RunnerError::PathIo(cache.to_path_buf(), e))?;
     let mut best: Option<(String, PathBuf)> = None;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -393,7 +382,8 @@ fn scan_cache_for(cache: &Path, name: &str) -> Result<PathBuf, RunnerError> {
             _ => {}
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| RunnerError::NotFound(name.to_string()))
+    best.map(|(_, p)| p)
+        .ok_or_else(|| RunnerError::NotFound(name.to_string()))
 }
 
 #[cfg(test)]

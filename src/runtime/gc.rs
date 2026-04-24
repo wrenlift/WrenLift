@@ -385,7 +385,11 @@ impl Gc {
         check_raw((*header).class as *const u8, "header.class");
 
         match (*header).obj_type {
-            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
+            ObjType::String
+            | ObjType::Fn
+            | ObjType::Range
+            | ObjType::Foreign
+            | ObjType::TypedArray => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -939,7 +943,11 @@ impl Gc {
         check_raw((*header).class as *const u8, "header.class");
 
         match (*header).obj_type {
-            ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
+            ObjType::String
+            | ObjType::Fn
+            | ObjType::Range
+            | ObjType::Foreign
+            | ObjType::TypedArray => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -1141,7 +1149,8 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
+        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {
+        }
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
@@ -1294,7 +1303,8 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {}
+        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {
+        }
 
         ObjType::List => {
             let list = &mut *(header as *mut ObjList);

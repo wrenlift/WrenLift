@@ -1946,19 +1946,15 @@ pub mod cl {
                 builder.switch_to_block(after_is_obj);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(r, ptr_mask);
-                let obj_type_byte = builder.ins().uload8(
-                    types::I64,
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    HEADER_OBJ_TYPE,
-                );
+                let obj_type_byte =
+                    builder
+                        .ins()
+                        .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
                 let ta_tag = builder
                     .ins()
                     .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
                 let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
-                builder
-                    .ins()
-                    .brif(is_ta, fast_block, &[], slow_block, &[]);
+                builder.ins().brif(is_ta, fast_block, &[], slow_block, &[]);
 
                 // 3. Fast path: convert NaN-boxed Num index to i64,
                 //    bounds-check against element count. Negative
@@ -1970,14 +1966,13 @@ pub mod cl {
                 let idx_i = builder.ins().fcvt_to_sint(types::I64, idx_f);
                 // `uload32` already zero-extends the 32-bit load into
                 // i64 — no separate uextend required.
-                let count = builder.ins().uload32(
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    TYPED_ARRAY_COUNT,
-                );
+                let count = builder
+                    .ins()
+                    .uload32(MemFlags::trusted(), obj_ptr, TYPED_ARRAY_COUNT);
                 let zero = builder.ins().iconst(types::I64, 0);
-                let in_range_low =
-                    builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_i, zero);
+                let in_range_low = builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, idx_i, zero);
                 let in_range_high = builder.ins().icmp(IntCC::SignedLessThan, idx_i, count);
                 let in_range = builder.ins().band(in_range_low, in_range_high);
                 builder
@@ -1987,12 +1982,10 @@ pub mod cl {
                 // 4. In-bounds: load kind byte + data pointer,
                 //    dispatch to the element-typed load.
                 builder.switch_to_block(in_bounds_block);
-                let data = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    TYPED_ARRAY_DATA,
-                );
+                let data =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj_ptr, TYPED_ARRAY_DATA);
                 let kind = builder.ins().uload8(
                     types::I64,
                     MemFlags::trusted(),
@@ -2015,11 +2008,14 @@ pub mod cl {
                 //     NaN-box bits.
                 builder.switch_to_block(get_u8_block);
                 let u8_addr = builder.ins().iadd(data, idx_i);
-                let byte_val =
-                    builder.ins().uload8(types::I64, MemFlags::trusted(), u8_addr, 0);
+                let byte_val = builder
+                    .ins()
+                    .uload8(types::I64, MemFlags::trusted(), u8_addr, 0);
                 let byte_f64 = builder.ins().fcvt_from_uint(types::F64, byte_val);
                 let byte_bits = builder.ins().bitcast(types::I64, MemFlags::new(), byte_f64);
-                builder.ins().jump(merge_block, &[BlockArg::Value(byte_bits)]);
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(byte_bits)]);
 
                 // 5b. F32: 4-byte float load → f64 promote → box.
                 builder.switch_to_block(get_f32_block);
@@ -2030,8 +2026,12 @@ pub mod cl {
                     .ins()
                     .load(types::F32, MemFlags::trusted(), f32_addr, 0);
                 let f32_as_f64 = builder.ins().fpromote(types::F64, f32_val);
-                let f32_bits = builder.ins().bitcast(types::I64, MemFlags::new(), f32_as_f64);
-                builder.ins().jump(merge_block, &[BlockArg::Value(f32_bits)]);
+                let f32_bits = builder
+                    .ins()
+                    .bitcast(types::I64, MemFlags::new(), f32_as_f64);
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(f32_bits)]);
 
                 // 5c. F64: direct 8-byte float load → box.
                 builder.switch_to_block(get_f64_block);
@@ -2042,7 +2042,9 @@ pub mod cl {
                     .ins()
                     .load(types::F64, MemFlags::trusted(), f64_addr, 0);
                 let f64_bits = builder.ins().bitcast(types::I64, MemFlags::new(), f64_val);
-                builder.ins().jump(merge_block, &[BlockArg::Value(f64_bits)]);
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(f64_bits)]);
 
                 // 6. Slow path: existing runtime dispatch.
                 builder.switch_to_block(slow_block);
@@ -2103,19 +2105,15 @@ pub mod cl {
                 builder.switch_to_block(after_is_obj);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(r, ptr_mask);
-                let obj_type_byte = builder.ins().uload8(
-                    types::I64,
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    HEADER_OBJ_TYPE,
-                );
+                let obj_type_byte =
+                    builder
+                        .ins()
+                        .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
                 let ta_tag = builder
                     .ins()
                     .iconst(types::I64, OBJ_TYPE_TYPED_ARRAY as i64);
                 let is_ta = builder.ins().icmp(IntCC::Equal, obj_type_byte, ta_tag);
-                builder
-                    .ins()
-                    .brif(is_ta, fast_block, &[], slow_block, &[]);
+                builder.ins().brif(is_ta, fast_block, &[], slow_block, &[]);
 
                 // 3. Index must be a Num in [0, count). Negative
                 //    indices → slow path (preserves Wren semantics
@@ -2125,14 +2123,13 @@ pub mod cl {
                 let idx_i = builder.ins().fcvt_to_sint(types::I64, idx_f);
                 // `uload32` already zero-extends the 32-bit load into
                 // i64 — no separate uextend required.
-                let count = builder.ins().uload32(
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    TYPED_ARRAY_COUNT,
-                );
+                let count = builder
+                    .ins()
+                    .uload32(MemFlags::trusted(), obj_ptr, TYPED_ARRAY_COUNT);
                 let zero = builder.ins().iconst(types::I64, 0);
-                let in_range_low =
-                    builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, idx_i, zero);
+                let in_range_low = builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, idx_i, zero);
                 let in_range_high = builder.ins().icmp(IntCC::SignedLessThan, idx_i, count);
                 let in_range = builder.ins().band(in_range_low, in_range_high);
                 builder
@@ -2147,9 +2144,7 @@ pub mod cl {
                 builder.switch_to_block(in_bounds_block);
                 let qnan_const = builder.ins().iconst(types::I64, QNAN as i64);
                 let val_masked = builder.ins().band(val, qnan_const);
-                let val_is_non_num = builder
-                    .ins()
-                    .icmp(IntCC::Equal, val_masked, qnan_const);
+                let val_is_non_num = builder.ins().icmp(IntCC::Equal, val_masked, qnan_const);
                 let after_val_check = builder.create_block();
                 builder
                     .ins()
@@ -2158,12 +2153,10 @@ pub mod cl {
                 // 5. Load kind, dispatch to the typed store. U8
                 //    falls through to the slow path (range check).
                 builder.switch_to_block(after_val_check);
-                let data = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    TYPED_ARRAY_DATA,
-                );
+                let data =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj_ptr, TYPED_ARRAY_DATA);
                 let kind = builder.ins().uload8(
                     types::I64,
                     MemFlags::trusted(),

@@ -49,9 +49,7 @@ fn time_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         }
     };
     if secs < 0.0 || !secs.is_finite() {
-        ctx.runtime_error(
-            "Time.sleep: seconds must be a non-negative finite number.".to_string(),
-        );
+        ctx.runtime_error("Time.sleep: seconds must be a non-negative finite number.".to_string());
         return Value::null();
     }
     std::thread::sleep(Duration::from_secs_f64(secs));

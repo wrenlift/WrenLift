@@ -2077,16 +2077,14 @@ fn run_fiber_with_stop_depth(
                                     // Keeps recursive method dispatch (fib,
                                     // method_call, binary_trees) at zero
                                     // additional overhead after the fix.
-                                    let saved_ctx =
-                                        crate::codegen::runtime_fns::read_jit_ctx();
+                                    let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
                                     let callee_module =
                                         vm.engine.func_module(FuncId(fn_idx as u32));
                                     let same_module = match callee_module {
                                         Some(mn) => {
                                             let bytes = mn.as_bytes();
                                             bytes.as_ptr() == saved_ctx.module_name
-                                                && bytes.len() as u32
-                                                    == saved_ctx.module_name_len
+                                                && bytes.len() as u32 == saved_ctx.module_name_len
                                         }
                                         None => true,
                                     };
@@ -2098,19 +2096,14 @@ fn run_fiber_with_stop_depth(
                                             .unwrap_or(std::ptr::null_mut());
                                         if !same_module {
                                             if let Some(mod_name) = callee_module {
-                                                if let Some(m) = vm
-                                                    .engine
-                                                    .modules
-                                                    .get(mod_name.as_str())
+                                                if let Some(m) =
+                                                    vm.engine.modules.get(mod_name.as_str())
                                                 {
-                                                    ctx.module_vars =
-                                                        m.vars.as_ptr() as *mut u64;
-                                                    ctx.module_var_count =
-                                                        m.vars.len() as u32;
+                                                    ctx.module_vars = m.vars.as_ptr() as *mut u64;
+                                                    ctx.module_var_count = m.vars.len() as u32;
                                                     let bytes = mod_name.as_bytes();
                                                     ctx.module_name = bytes.as_ptr();
-                                                    ctx.module_name_len =
-                                                        bytes.len() as u32;
+                                                    ctx.module_name_len = bytes.len() as u32;
                                                 }
                                             }
                                         }

@@ -188,10 +188,7 @@ fn tcp_listener_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Value
     };
     let reg = tcp_listeners().lock().unwrap();
     let Some(l) = reg.get(&id) else {
-        ctx.runtime_error(format!(
-            "Tcp.listenerLocalAddr: listener {} not found.",
-            id
-        ));
+        ctx.runtime_error(format!("Tcp.listenerLocalAddr: listener {} not found.", id));
         return Value::null();
     };
     match l.local_addr() {
@@ -226,8 +223,7 @@ fn tcp_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
             _ => {
                 ctx.runtime_error(
-                    "Tcp.connect: timeoutMs must be a non-negative integer or null."
-                        .to_string(),
+                    "Tcp.connect: timeoutMs must be a non-negative integer or null.".to_string(),
                 );
                 return Value::null();
             }
@@ -243,10 +239,7 @@ fn tcp_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 Ok(mut it) => match it.next() {
                     Some(a) => a,
                     None => {
-                        ctx.runtime_error(format!(
-                            "Tcp.connect: {}: no addresses resolved.",
-                            addr
-                        ));
+                        ctx.runtime_error(format!("Tcp.connect: {}: no addresses resolved.", addr));
                         return Value::null();
                     }
                 },

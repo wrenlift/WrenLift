@@ -236,7 +236,11 @@ fn preinstall_spec_dependencies(vm: &mut VM, source_dir: &Path) -> Result<(), St
     // package under test and that package in turn imports a real
     // dep, the dep has to already be resolvable. Specs declared in
     // `[spec-dependencies]` layer on top.
-    for (dep_name, dep) in manifest.dependencies.iter().chain(manifest.spec_dependencies.iter()) {
+    for (dep_name, dep) in manifest
+        .dependencies
+        .iter()
+        .chain(manifest.spec_dependencies.iter())
+    {
         let bytes = wren_lift::hatch::resolve_dependency_bytes(workspace_root, dep_name, dep, None)
             .map_err(|e| format!("resolving dep '{}': {}", dep_name, e))?;
         match vm.install_hatch_modules(&bytes) {

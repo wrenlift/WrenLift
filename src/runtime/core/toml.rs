@@ -69,9 +69,7 @@ unsafe fn string_of(v: Value) -> Option<String> {
 
 fn wren_to_toml(v: Value) -> Result<TomlValue, String> {
     if v.is_null() {
-        return Err(
-            "null isn't a representable TOML value (TOML has no null).".to_string(),
-        );
+        return Err("null isn't a representable TOML value (TOML has no null).".to_string());
     }
     if let Some(b) = v.as_bool() {
         return Ok(TomlValue::Boolean(b));
@@ -122,9 +120,7 @@ fn wren_to_toml(v: Value) -> Result<TomlValue, String> {
                 let key = match unsafe { string_of(k) } {
                     Some(s) => s,
                     None => {
-                        return Err(
-                            "TOML table keys must be strings.".to_string(),
-                        );
+                        return Err("TOML table keys must be strings.".to_string());
                     }
                 };
                 let value = wren_to_toml(v)?;
@@ -186,9 +182,7 @@ fn toml_encode_pretty(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         }
     };
     let TomlValue::Table(table) = value else {
-        ctx.runtime_error(
-            "Toml.encodePretty: top-level value must be a Map.".to_string(),
-        );
+        ctx.runtime_error("Toml.encodePretty: top-level value must be a Map.".to_string());
         return Value::null();
     };
     match toml::to_string_pretty(&table) {

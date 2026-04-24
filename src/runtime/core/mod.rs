@@ -4,33 +4,33 @@
 /// the standard Wren specification from wren-lang/wren.
 mod bool;
 mod cls;
+pub mod crypto;
 mod fiber;
 mod fn_obj;
 pub mod fs;
-pub mod crypto;
 pub mod hash;
 pub mod http;
 pub mod io;
 mod list;
 mod map;
-mod typed_array;
 pub mod meta;
-pub mod os;
-pub mod proc;
-pub mod regex;
-pub mod socket;
-pub mod time;
-pub mod toml;
-pub mod uuid;
-pub mod zip;
 mod null;
 mod num;
 mod obj;
+pub mod os;
+pub mod proc;
 pub mod random;
 mod range;
+pub mod regex;
 mod sequence;
+pub mod socket;
 mod string;
 mod system;
+pub mod time;
+pub mod toml;
+mod typed_array;
+pub mod uuid;
+pub mod zip;
 
 use super::vm::VM;
 
@@ -207,7 +207,9 @@ fn propagate_inherited_methods(vm: &mut super::vm::VM) {
 // Helpers for core primitives
 // ---------------------------------------------------------------------------
 
-use super::object::{NativeContext, ObjHeader, ObjList, ObjString, ObjType, ObjTypedArray, TypedArrayKind};
+use super::object::{
+    NativeContext, ObjHeader, ObjList, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
+};
 use super::value::Value;
 
 /// Validate that a value is a Num, returning the f64 or signaling a runtime error.
@@ -302,11 +304,7 @@ pub fn is_string(value: Value) -> bool {
 ///
 /// Returns `None` and signals a runtime error on shape / element
 /// mismatches. `label` is the caller-facing name for the error.
-pub fn bytes_from_value(
-    ctx: &mut dyn NativeContext,
-    value: Value,
-    label: &str,
-) -> Option<Vec<u8>> {
+pub fn bytes_from_value(ctx: &mut dyn NativeContext, value: Value, label: &str) -> Option<Vec<u8>> {
     if !value.is_object() {
         ctx.runtime_error(format!(
             "{}: expected a string, byte list, or ByteArray.",
@@ -378,10 +376,7 @@ pub fn bytes_from_byte_list(
                     }
                 };
                 if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
-                    ctx.runtime_error(format!(
-                        "{}: bytes must be integers in 0..=255.",
-                        label
-                    ));
+                    ctx.runtime_error(format!("{}: bytes must be integers in 0..=255.", label));
                     return None;
                 }
                 out.push(n as u8);

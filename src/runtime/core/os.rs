@@ -81,9 +81,7 @@ fn os_env_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 
 /// OS.args → List<String> of process argv.
 fn os_args(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    let elements: Vec<Value> = std::env::args()
-        .map(|a| ctx.alloc_string(a))
-        .collect();
+    let elements: Vec<Value> = std::env::args().map(|a| ctx.alloc_string(a)).collect();
     ctx.alloc_list(elements)
 }
 
@@ -133,8 +131,7 @@ fn os_is_tty(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 /// OS.username — best-effort via $USER / $USERNAME (Windows).
 /// Returns null if neither is set.
 fn os_username(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
-    let name = std::env::var_os("USER")
-        .or_else(|| std::env::var_os("USERNAME"));
+    let name = std::env::var_os("USER").or_else(|| std::env::var_os("USERNAME"));
     match name {
         Some(n) => ctx.alloc_string(n.to_string_lossy().into_owned()),
         None => Value::null(),

@@ -230,10 +230,7 @@ fn entries_from_value(
                 let name = match key_as_string(k) {
                     Some(s) => s,
                     None => {
-                        ctx.runtime_error(format!(
-                            "{}: entry names must be strings.",
-                            label
-                        ));
+                        ctx.runtime_error(format!("{}: entry names must be strings.", label));
                         return None;
                     }
                 };
@@ -279,10 +276,7 @@ fn entries_from_value(
                 let name = match key_as_string(name_val) {
                     Some(s) => s,
                     None => {
-                        ctx.runtime_error(format!(
-                            "{}: entry name must be a string.",
-                            label
-                        ));
+                        ctx.runtime_error(format!("{}: entry name must be a string.", label));
                         return None;
                     }
                 };

@@ -386,8 +386,22 @@ impl VM {
 
         // 2. Prelude + sema
         let core_names = [
-            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
+            "Object",
+            "Class",
+            "Bool",
+            "Num",
+            "String",
+            "List",
+            "Map",
+            "Range",
+            "Null",
+            "Fn",
+            "Fiber",
+            "System",
+            "Sequence",
+            "ByteArray",
+            "Float32Array",
+            "Float64Array",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -753,8 +767,22 @@ impl VM {
 
         // 3. Semantic analysis — register core class names as prelude
         let core_names = [
-            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
+            "Object",
+            "Class",
+            "Bool",
+            "Num",
+            "String",
+            "List",
+            "Map",
+            "Range",
+            "Null",
+            "Fn",
+            "Fiber",
+            "System",
+            "Sequence",
+            "ByteArray",
+            "Float32Array",
+            "Float64Array",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -925,8 +953,7 @@ impl VM {
         let module_rc = std::rc::Rc::new(module_name.to_string());
         let closure_count = module_mir.closures.len();
         let base_fid = self.engine.functions.len() as u32;
-        let closure_func_ids: Vec<u32> =
-            (0..closure_count as u32).map(|i| base_fid + i).collect();
+        let closure_func_ids: Vec<u32> = (0..closure_count as u32).map(|i| base_fid + i).collect();
 
         // Patch every MIR that might emit `MakeClosure`, including
         // nested closures (e.g. a test `describe { ... }` body whose
@@ -990,9 +1017,7 @@ impl VM {
             ("SocketCore", "socket"),
         ];
         for name in &var_names {
-            if let Some(&(_, module_id)) =
-                builtin_for_var.iter().find(|(cls, _)| *cls == name)
-            {
+            if let Some(&(_, module_id)) = builtin_for_var.iter().find(|(cls, _)| *cls == name) {
                 if !self.engine.modules.contains_key(module_id) {
                     let _ = self.try_load_builtin_module(module_id);
                 }
@@ -2662,8 +2687,22 @@ impl VM {
         // 2. Resolve with core classes + calling module's variables in prelude
         let mut interner = parse_result.interner;
         let core_names = [
-            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
+            "Object",
+            "Class",
+            "Bool",
+            "Num",
+            "String",
+            "List",
+            "Map",
+            "Range",
+            "Null",
+            "Fn",
+            "Fiber",
+            "System",
+            "Sequence",
+            "ByteArray",
+            "Float32Array",
+            "Float64Array",
         ];
         let mut prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -2863,8 +2902,22 @@ impl VM {
         // 2. Resolve names with core prelude
         let mut interner = parse_result.interner;
         let core_names = [
-            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range", "Null", "Fn",
-            "Fiber", "System", "Sequence", "ByteArray", "Float32Array", "Float64Array",
+            "Object",
+            "Class",
+            "Bool",
+            "Num",
+            "String",
+            "List",
+            "Map",
+            "Range",
+            "Null",
+            "Fn",
+            "Fiber",
+            "System",
+            "Sequence",
+            "ByteArray",
+            "Float32Array",
+            "Float64Array",
         ];
         let prelude: Vec<crate::intern::SymbolId> =
             core_names.iter().map(|n| interner.intern(n)).collect();
@@ -2934,10 +2987,7 @@ impl VM {
         // bind every function we register here to it. Using a unique
         // name keeps repeat `Meta.compile` calls from stomping each
         // other's slot tables.
-        let module_key = format!(
-            "<compiled#{}>",
-            self.engine.functions.len()
-        );
+        let module_key = format!("<compiled#{}>", self.engine.functions.len());
         let compile_module_rc = std::rc::Rc::new(module_key.clone());
 
         let mut compiled_vars: Vec<Value> = Vec::with_capacity(core_names.len());
@@ -2950,8 +3000,7 @@ impl VM {
 
         let closure_count = module_mir.closures.len();
         let base_fid = self.engine.functions.len() as u32;
-        let closure_func_ids: Vec<u32> =
-            (0..closure_count as u32).map(|i| base_fid + i).collect();
+        let closure_func_ids: Vec<u32> = (0..closure_count as u32).map(|i| base_fid + i).collect();
         patch_closure_ids(&mut module_mir.top_level, &closure_func_ids);
         for closure in &mut module_mir.closures {
             patch_closure_ids(closure, &closure_func_ids);

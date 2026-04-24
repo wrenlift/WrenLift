@@ -155,10 +155,7 @@ fn uuid_from_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let (count, data) = unsafe { ((*ptr).count as usize, (*ptr).elements) };
     if count != 16 {
-        ctx.runtime_error(format!(
-            "Uuid.fromBytes: expected 16 bytes, got {}.",
-            count
-        ));
+        ctx.runtime_error(format!("Uuid.fromBytes: expected 16 bytes, got {}.", count));
         return Value::null();
     }
     let mut buf = [0u8; 16];
@@ -172,9 +169,7 @@ fn uuid_from_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             }
         };
         if !(0.0..=255.0).contains(&n) || n.fract() != 0.0 {
-            ctx.runtime_error(
-                "Uuid.fromBytes: bytes must be integers in 0..=255.".to_string(),
-            );
+            ctx.runtime_error("Uuid.fromBytes: bytes must be integers in 0..=255.".to_string());
             return Value::null();
         }
         *byte = n as u8;

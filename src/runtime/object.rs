@@ -415,12 +415,12 @@ impl fmt::Debug for ObjList {
 /// (no allocation). The buffer is freed in `Drop`.
 #[repr(C)]
 pub struct ObjTypedArray {
-    pub header: ObjHeader,   // offset 0, 24 bytes
-    pub count: u32,          // offset 24: element count (not byte count)
-    pub kind: u8,            // offset 28: TypedArrayKind encoded as u8
-    _pad: [u8; 3],           // offset 29..32
-    pub data: *mut u8,       // offset 32: raw byte buffer
-                             // total: 40 bytes (matches ObjList)
+    pub header: ObjHeader, // offset 0, 24 bytes
+    pub count: u32,        // offset 24: element count (not byte count)
+    pub kind: u8,          // offset 28: TypedArrayKind encoded as u8
+    _pad: [u8; 3],         // offset 29..32
+    pub data: *mut u8,     // offset 32: raw byte buffer
+                           // total: 40 bytes (matches ObjList)
 }
 
 impl ObjTypedArray {
@@ -429,8 +429,7 @@ impl ObjTypedArray {
             std::ptr::null_mut()
         } else {
             let bytes = (count as usize) * kind.element_size();
-            let layout =
-                std::alloc::Layout::from_size_align(bytes, kind.element_size()).unwrap();
+            let layout = std::alloc::Layout::from_size_align(bytes, kind.element_size()).unwrap();
             unsafe { std::alloc::alloc_zeroed(layout) }
         };
         Self {
@@ -521,8 +520,7 @@ impl Drop for ObjTypedArray {
         if !self.data.is_null() && self.count > 0 {
             let kind = self.kind_tag();
             let bytes = (self.count as usize) * kind.element_size();
-            let layout =
-                std::alloc::Layout::from_size_align(bytes, kind.element_size()).unwrap();
+            let layout = std::alloc::Layout::from_size_align(bytes, kind.element_size()).unwrap();
             unsafe { std::alloc::dealloc(self.data, layout) };
         }
     }

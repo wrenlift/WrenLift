@@ -25,7 +25,7 @@
 //!   instance.toString          — debug repr
 
 use crate::runtime::object::{
-    NativeContext, ObjHeader, ObjList, ObjTypedArray, ObjType, TypedArrayKind,
+    NativeContext, ObjHeader, ObjList, ObjType, ObjTypedArray, TypedArrayKind,
 };
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
@@ -47,10 +47,7 @@ fn count_arg(ctx: &mut dyn NativeContext, v: Value, label: &str) -> Option<u32> 
             Some(n as u32)
         }
         _ => {
-            ctx.runtime_error(format!(
-                "{}: count must be a non-negative integer.",
-                label
-            ));
+            ctx.runtime_error(format!("{}: count must be a non-negative integer.", label));
             None
         }
     }
@@ -69,7 +66,10 @@ fn index_arg(ctx: &mut dyn NativeContext, v: Value, count: u32, label: &str) -> 
     let c = count as i64;
     let i = if raw < 0 { raw + c } else { raw };
     if i < 0 || i >= c {
-        ctx.runtime_error(format!("{}: index {} out of bounds (count {}).", label, raw, count));
+        ctx.runtime_error(format!(
+            "{}: index {} out of bounds (count {}).",
+            label, raw, count
+        ));
         return None;
     }
     Some(i as u32)
@@ -79,14 +79,9 @@ fn index_arg(ctx: &mut dyn NativeContext, v: Value, count: u32, label: &str) -> 
 /// ByteArray subscript-set.
 fn byte_from_value(ctx: &mut dyn NativeContext, v: Value, label: &str) -> Option<u8> {
     match v.as_num() {
-        Some(n) if n.is_finite() && (0.0..=255.0).contains(&n) && n.fract() == 0.0 => {
-            Some(n as u8)
-        }
+        Some(n) if n.is_finite() && (0.0..=255.0).contains(&n) && n.fract() == 0.0 => Some(n as u8),
         _ => {
-            ctx.runtime_error(format!(
-                "{}: value must be an integer in 0..=255.",
-                label
-            ));
+            ctx.runtime_error(format!("{}: value must be an integer in 0..=255.", label));
             None
         }
     }
@@ -144,10 +139,7 @@ fn from_list_generic(
         let n = match v.as_num() {
             Some(n) => n,
             None => {
-                ctx.runtime_error(format!(
-                    "{}: list[{}] must be a number.",
-                    label, i
-                ));
+                ctx.runtime_error(format!("{}: list[{}] must be a number.", label, i));
                 return Value::null();
             }
         };
@@ -304,11 +296,7 @@ fn ta_to_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn ta_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let arr = receiver_ta(args);
-    ctx.alloc_string(format!(
-        "{}({})",
-        arr.kind_tag().class_name(),
-        arr.count
-    ))
+    ctx.alloc_string(format!("{}({})", arr.kind_tag().class_name(), arr.count))
 }
 
 // --- Binding ----------------------------------------------------

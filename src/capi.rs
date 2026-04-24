@@ -899,11 +899,7 @@ pub extern "C" fn wrenSetUserData(vm: *mut WrenVM, user_data: *mut c_void) {
 /// null-pointer inputs. Useful for embedders that ship packages
 /// baked into the binary via `include_bytes!` / a resource file.
 #[no_mangle]
-pub extern "C" fn wrenInstallHatchBytes(
-    vm: *mut WrenVM,
-    bytes: *const u8,
-    len: usize,
-) -> c_int {
+pub extern "C" fn wrenInstallHatchBytes(vm: *mut WrenVM, bytes: *const u8, len: usize) -> c_int {
     if vm.is_null() || bytes.is_null() {
         return -1;
     }
@@ -921,10 +917,7 @@ pub extern "C" fn wrenInstallHatchBytes(
 /// compile error, 2 on runtime error, 3 if the file can't be read,
 /// -1 on null-pointer inputs.
 #[no_mangle]
-pub extern "C" fn wrenInstallHatchFile(
-    vm: *mut WrenVM,
-    path: *const c_char,
-) -> c_int {
+pub extern "C" fn wrenInstallHatchFile(vm: *mut WrenVM, path: *const c_char) -> c_int {
     if vm.is_null() || path.is_null() {
         return -1;
     }
@@ -945,10 +938,7 @@ pub extern "C" fn wrenInstallHatchFile(
 /// picked up automatically; this is for embedder overrides.
 /// Returns 0 on success, -1 on null-pointer inputs.
 #[no_mangle]
-pub extern "C" fn wrenAddNativeSearchPath(
-    vm: *mut WrenVM,
-    path: *const c_char,
-) -> c_int {
+pub extern "C" fn wrenAddNativeSearchPath(vm: *mut WrenVM, path: *const c_char) -> c_int {
     if vm.is_null() || path.is_null() {
         return -1;
     }
@@ -970,10 +960,7 @@ pub extern "C" fn wrenAddNativeSearchPath(
 /// success, or a negative error code (-1 null / -2 read-dir /
 /// -3 install failed partway through).
 #[no_mangle]
-pub extern "C" fn wrenInstallHatchDir(
-    vm: *mut WrenVM,
-    path: *const c_char,
-) -> c_int {
+pub extern "C" fn wrenInstallHatchDir(vm: *mut WrenVM, path: *const c_char) -> c_int {
     if vm.is_null() || path.is_null() {
         return -1;
     }
