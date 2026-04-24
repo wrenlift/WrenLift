@@ -138,11 +138,9 @@ fn captures_to_map(ctx: &mut dyn NativeContext, caps: &regex::Captures<'_>, re: 
     // named: only present groups. Absent-but-declared groups omitted.
     let named = ctx.alloc_map();
     let named_ptr = named.as_object().unwrap() as *mut ObjMap;
-    for name_opt in re.capture_names() {
-        if let Some(name) = name_opt {
-            if let Some(m) = caps.name(name) {
-                put_str(ctx, named_ptr, name, m.as_str().to_string());
-            }
+    for name in re.capture_names().flatten() {
+        if let Some(m) = caps.name(name) {
+            put_str(ctx, named_ptr, name, m.as_str().to_string());
         }
     }
     put_val(ctx, out_ptr, "named", named);

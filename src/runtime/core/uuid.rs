@@ -162,7 +162,7 @@ fn uuid_from_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         return Value::null();
     }
     let mut buf = [0u8; 16];
-    for i in 0..16 {
+    for (i, byte) in buf.iter_mut().enumerate() {
         let v = unsafe { *data.add(i) };
         let n = match v.as_num() {
             Some(n) => n,
@@ -177,7 +177,7 @@ fn uuid_from_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             );
             return Value::null();
         }
-        buf[i] = n as u8;
+        *byte = n as u8;
     }
     let u = Uuid::from_bytes(buf);
     ctx.alloc_string(u.hyphenated().to_string())

@@ -1406,6 +1406,7 @@ impl<'a> MirBuilder<'a> {
 }
 
 /// Standalone function to compile a closure body (avoids borrow conflicts).
+#[allow(clippy::too_many_arguments)]
 fn compile_closure_body(
     params: &[Spanned<SymbolId>],
     body: &Spanned<Stmt>,

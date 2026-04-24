@@ -1076,13 +1076,7 @@ pub fn lower_mir_to_threaded(
                     }
                 }
             }
-            Terminator::CondBranch {
-                true_target: _,
-                true_args: _,
-                false_target: _,
-                false_args: _,
-                ..
-            } => {
+            Terminator::CondBranch { .. } => {
                 // CondBranch args are trickier: we need to copy args for
                 // BOTH branches. But we can only execute one set. For now,
                 // emit moves AFTER the branch in each target's block start.

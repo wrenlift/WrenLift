@@ -53,7 +53,7 @@ use crate::runtime::vm::{VMConfig, VM};
 /// Errors from the embedder-facing loader surface. Kept narrow on
 /// purpose — the CLI's richer error machinery (with diagnostics
 /// + spans) doesn't make sense for a library caller that just
-/// wants "did it work, yes/no".
+///   wants "did it work, yes/no".
 #[derive(Debug)]
 pub enum RunnerError {
     /// A search path couldn't be read (missing directory, bad
