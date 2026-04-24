@@ -394,12 +394,14 @@ pub struct ExecutionEngine {
     compilation_rx: mpsc::Receiver<CompilationResult>,
     /// Per-function compile tier currently in flight, if any.
     compiling_tier: Vec<Option<CompileTier>>,
-    /// Number of compilations currently in flight (fast check for poll_compilations).
+    /// Number of compilations currently in flight (fast check for
+    /// `poll_compilations`). Incremented per `request_tier_up` submission
+    /// accepted by beadie's broker; decremented per mpsc install.
     pending_count: u32,
-    /// Join handle for the current compilation thread (at most 1 at a time).
-    compile_handle: Option<std::thread::JoinHandle<()>>,
-    /// Queue of functions awaiting compilation (when background thread is busy).
-    compile_queue: Vec<FuncId>,
+    /// Callee FuncIds discovered from IC data after a baseline install,
+    /// waiting to be submitted for predictive pre-compile. Drained at
+    /// the next `drain_compile_queue` call where we have interner access.
+    pending_callee_precompile: Vec<FuncId>,
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
@@ -505,8 +507,7 @@ impl ExecutionEngine {
             compilation_rx: rx,
             compiling_tier: Vec::new(),
             pending_count: 0,
-            compile_handle: None,
-            compile_queue: Vec::new(),
+            pending_callee_precompile: Vec::new(),
             jit_code: Vec::new(),
             jit_osr_entries: Vec::new(),
             jit_leaf: Vec::new(),
@@ -910,9 +911,12 @@ impl ExecutionEngine {
     }
 
     /// Whether any background compilations are waiting to be installed.
+    /// Beadie's broker owns its own queue internally, so all the engine
+    /// needs to know is whether there are compiles whose results haven't
+    /// yet been drained from the install-side mpsc channel.
     #[inline(always)]
     pub fn has_pending_compilations(&self) -> bool {
-        self.pending_count != 0 || !self.compile_queue.is_empty()
+        self.pending_count != 0
     }
 
     /// Invalidate all monomorphic call-site inline caches.
@@ -1571,29 +1575,17 @@ impl ExecutionEngine {
                 }
             }
         }
-        // Don't start optimized-tier compilation while baseline functions are
-        // waiting in the queue — the optimizer can hang on complex functions,
-        // blocking all compilation progress.
-        if tier == CompileTier::Optimized && !self.compile_queue.is_empty() {
+        // Don't start optimized-tier compilation while any other compile
+        // is in flight — the optimizer can hang on complex functions and
+        // would block all progress. `pending_count` is bumped per submit
+        // and decremented in `poll_compilations`, so it reflects all
+        // baseline submissions currently walking the broker's pipeline.
+        if tier == CompileTier::Optimized && self.pending_count != 0 {
             return;
         }
         if idx >= self.compiling_tier.len() || self.compiling_tier[idx].is_some() {
             return;
         }
-        if let Some(ref handle) = self.compile_handle {
-            if !handle.is_finished() {
-                // Background thread busy — queue for later instead of dropping.
-                if !self.compile_queue.contains(&id) {
-                    self.compile_queue.push(id);
-                }
-                return;
-            }
-            if let Some(h) = self.compile_handle.take() {
-                let _ = h.join();
-            }
-        }
-        // Remove this function from the queue if it was queued.
-        self.compile_queue.retain(|&queued| queued != id);
         let Some(body) = self.functions.get(idx) else {
             return;
         };
@@ -1633,7 +1625,12 @@ impl ExecutionEngine {
             );
         }
 
-        let compile_fn = move || {
+        // Compile closure — runs on beadie's broker thread. Returns the
+        // raw native pointer for beadie's state machine AND sends the
+        // richer install artifact (executable, metadata, tier) back to
+        // the interpreter thread through `compilation_tx` so
+        // `poll_compilations` can finish the install at a safepoint.
+        let compile_fn = move |_bead: &std::sync::Arc<beadie::Bead>| -> *mut () {
             if tier_trace_enabled() {
                 eprintln!(
                     "tier-trace: start {:?} FuncId({}) {}",
@@ -1690,16 +1687,43 @@ impl ExecutionEngine {
                     result.is_some()
                 );
             }
+            // Extract the native pointer for beadie BEFORE sending the
+            // executable across the mpsc boundary. The pointer refers
+            // into a heap-allocated mmap owned by the executable — the
+            // mmap's address doesn't change when the ExecutableFunction
+            // moves through the channel, so the pointer remains valid
+            // through install_or_swap at the receiver.
+            let native_ptr = match &result {
+                Some(CompilationResult::Compiled { executable, .. }) if executable.is_native() => {
+                    executable.native_ptr() as *mut ()
+                }
+                _ => std::ptr::null_mut(),
+            };
             let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
+            native_ptr
         };
 
-        self.compile_handle = Some(std::thread::spawn(compile_fn));
+        // Submit to beadie's broker. The bead goes Interpreted → Queued
+        // → Compiling → Compiled as the closure progresses. If the bead
+        // has already been promoted (race), `AlreadyQueued` is returned
+        // and we roll back the pending_count bookkeeping.
+        let submit_result = self.tier.submit_compile(id, compile_fn);
+        if !submit_result.is_accepted() {
+            self.compiling_tier[idx] = None;
+            self.pending_count = self.pending_count.saturating_sub(1);
+            if tier_trace_enabled() {
+                eprintln!(
+                    "tier-trace: submit-rejected {:?} FuncId({}) {:?}",
+                    tier, id.0, submit_result
+                );
+            }
+        }
     }
 
     /// Install any completed background compilations.
     #[inline]
     pub fn poll_compilations(&mut self) {
-        if self.pending_count == 0 && self.compile_queue.is_empty() {
+        if self.pending_count == 0 {
             return;
         }
         while let Ok(result) = self.compilation_rx.try_recv() {
@@ -1728,8 +1752,10 @@ impl ExecutionEngine {
                 } = result
                 {
                     self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
-                    // Eagerly queue callees discovered from IC data.
-                    self.queue_callees_from_ic(FuncId(idx as u32));
+                    // Stash callees for predictive pre-compile. The
+                    // actual submits happen later in `drain_compile_queue`
+                    // where we have interner access for env-var filtering.
+                    self.record_pending_callees(FuncId(idx as u32));
                 }
             }
             if idx < self.compiling_tier.len() {
@@ -1739,11 +1765,11 @@ impl ExecutionEngine {
         }
     }
 
-    /// Scan a function's IC table for callee FuncIds and queue uncompiled
-    /// callees for background compilation. This ensures that by the time a
-    /// JIT function runs and calls its callees, those callees are likely
-    /// already compiled (or being compiled).
-    fn queue_callees_from_ic(&mut self, caller_id: FuncId) {
+    /// Walk the caller's IC table and stash any uncompiled callees
+    /// for predictive pre-compile. Runs during `poll_compilations`
+    /// which doesn't have interner access, so the actual broker
+    /// submissions happen later in [`Self::drain_compile_queue`].
+    fn record_pending_callees(&mut self, caller_id: FuncId) {
         let bc_ptr = self
             .bc_cache
             .get(caller_id.0 as usize)
@@ -1755,11 +1781,9 @@ impl ExecutionEngine {
         let bc = unsafe { &*bc_ptr };
         let ic_table = unsafe { &*bc.ic_table.get() };
         for ic in ic_table.iter() {
-            // kind=1: JIT call with known func_id
             if ic.kind == 1 && ic.func_id != 0 {
                 let callee_id = FuncId(ic.func_id as u32);
                 let callee_idx = callee_id.0 as usize;
-                // Only queue if not yet compiled and not already queued/compiling
                 let already_compiled = self
                     .jit_code
                     .get(callee_idx)
@@ -1769,81 +1793,30 @@ impl ExecutionEngine {
                     .compiling_tier
                     .get(callee_idx)
                     .map(|t| t.is_some())
-                    .unwrap_or(false)
-                    || self.compile_queue.contains(&callee_id);
-                if !already_compiled && !already_queued && callee_idx < self.functions.len() {
-                    self.compile_queue.push(callee_id);
+                    .unwrap_or(false);
+                if !already_compiled
+                    && !already_queued
+                    && callee_idx < self.functions.len()
+                    && !self.pending_callee_precompile.contains(&callee_id)
+                {
+                    self.pending_callee_precompile.push(callee_id);
                 }
             }
         }
     }
 
-    /// Install completed compilations AND start the next queued compile
-    /// if the background thread is idle. This is the safe version that
-    /// avoids the re-entrancy issues of drain_compile_queue by only
-    /// starting ONE compile per call.
-    pub fn poll_and_advance_queue(&mut self, interner: &crate::intern::Interner) {
-        self.poll_compilations();
-        // If thread is idle and queue has work, start the next compile.
-        if !self.compile_queue.is_empty() {
-            let thread_idle = self.compile_handle.as_ref().is_none_or(|h| h.is_finished());
-            if thread_idle {
-                if let Some(h) = self.compile_handle.take() {
-                    let _ = h.join();
-                }
-                // Poll again in case the join produced a result.
-                self.poll_compilations();
-                if let Some(queued_id) = self.compile_queue.first().copied() {
-                    self.compile_queue.remove(0);
-                    self.request_tier_up(queued_id, interner);
-                }
-            }
-        }
-    }
-
-    /// Check if the background compilation thread is idle (finished or absent).
-    #[inline]
-    pub fn compile_thread_idle(&self) -> bool {
-        self.compile_handle.as_ref().is_none_or(|h| h.is_finished())
-    }
-
-    /// Drain the compile queue: if the background thread is idle and there
-    /// are queued functions, start compiling the next one. Must be called
-    /// with interner access (from the VM context).
+    /// Legacy entry point kept for vm_interp callers. Beadie's broker
+    /// owns the compile queue proper now; the engine's job here is to
+    /// (1) drain the install-side mpsc channel, and (2) submit any
+    /// callees we stashed during the last install so they get compiled
+    /// before the caller reaches them.
     pub fn drain_compile_queue(&mut self, interner: &crate::intern::Interner) {
-        while !self.compile_queue.is_empty() {
-            let thread_idle = self.compile_handle.as_ref().is_none_or(|h| h.is_finished());
-            if !thread_idle {
-                break;
-            }
-            if let Some(h) = self.compile_handle.take() {
-                let _ = h.join();
-            }
-            // Poll any newly completed results before starting next.
-            while let Ok(result) = self.compilation_rx.try_recv() {
-                let idx = match &result {
-                    CompilationResult::Compiled { id, .. }
-                    | CompilationResult::Failed { id, .. } => id.0 as usize,
-                };
-                if idx < self.functions.len() {
-                    if let CompilationResult::Compiled {
-                        tier,
-                        executable,
-                        native_meta,
-                        inline_safe,
-                        ..
-                    } = result
-                    {
-                        self.install_compiled_tier(idx, tier, executable, native_meta, inline_safe);
-                    }
-                }
-                if idx < self.compiling_tier.len() {
-                    self.compiling_tier[idx] = None;
-                }
-                self.pending_count = self.pending_count.saturating_sub(1);
-            }
-            let queued_id = self.compile_queue.remove(0);
-            self.request_tier_up(queued_id, interner);
+        self.poll_compilations();
+        let pending = std::mem::take(&mut self.pending_callee_precompile);
+        for callee_id in pending {
+            // request_tier_up runs env-var filters and re-checks state —
+            // safe to call even if the callee has since been compiled.
+            self.request_tier_up(callee_id, interner);
         }
     }
 
@@ -1866,24 +1839,10 @@ impl ExecutionEngine {
 
 impl Drop for ExecutionEngine {
     fn drop(&mut self) {
-        // Only join a finished compilation thread. Waiting for a live tier-up
-        // worker here can stall process exit long after the program has already
-        // printed its result, especially if an optimize-tier compile started
-        // right before shutdown. Dropping the JoinHandle detaches the worker.
-        if let Some(handle) = self.compile_handle.take() {
-            if handle.is_finished() {
-                if tier_trace_enabled() {
-                    eprintln!("tier-trace: drop joining finished compile thread");
-                }
-                let _ = handle.join();
-                if tier_trace_enabled() {
-                    eprintln!("tier-trace: drop compile thread joined");
-                }
-            } else if tier_trace_enabled() {
-                eprintln!("tier-trace: drop detaching live compile thread");
-            }
-        }
-        // Drain any pending results so compiled code buffers are freed.
+        // Beadie's broker owns the worker thread now; its Drop impl sends
+        // a shutdown signal and joins when TierManager drops. Any in-flight
+        // compile results that never reached `poll_compilations` get
+        // drained here so their ExecutableFunction buffers are freed.
         while self.compilation_rx.try_recv().is_ok() {}
     }
 }

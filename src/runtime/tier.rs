@@ -12,27 +12,42 @@
 //!        └────────── invalidate / deopt ──────────────────────────────┘
 //! ```
 //!
-//! ## Phase 1 scope (this commit)
+//! ## Migration status
 //!
-//! This module is **shadow-only**: it compiles, has unit tests, and is
-//! callable, but nothing in `engine.rs` or `vm_interp.rs` routes through
-//! it yet. The old path still owns all live tier decisions.
+//! The cutover ran in phases. What's live now:
 //!
-//! Subsequent commits will:
-//! - Phase 2: replace `record_call` / `call_count` fields with `on_invoke`
-//! - Phase 3: retire `compile_queue: Vec<FuncId>` in favour of the broker
-//! - Phase 4: wire tier 2 (optimized) through the same broker + TieredPolicy
+//! - **Phase 1** — adapter module added, shadow-only unit tests.
+//! - **Phase 2** — `TierManager` field on `ExecutionEngine`; bead
+//!   ticks on every `record_call` alongside the legacy counter.
+//! - **Phase 3** — `FuncBody::Interpreted.call_count` removed;
+//!   baseline tier-up drives off `should_promote_on_tick`.
+//! - **Phase 4** — install sites notify the bead via
+//!   `install_or_swap` so `BeadState` matches engine `TierState`.
+//! - **Phase 5** — `WLIFT_TIER_TRACE` prints both views side by side;
+//!   `TierManager::snapshot()` for end-of-run dumps.
+//! - **Phase 6** — `FuncBody::Native.opt_call_count` removed; both
+//!   tiers share the single bead counter using absolute thresholds.
+//! - **Phase 7** — `request_tier_up`'s `std::thread::spawn` swapped
+//!   for `Beadie::submit`; the broker's bounded channel replaces the
+//!   ad-hoc `compile_queue: Vec<FuncId>` plus `compile_handle`.
 //!
 //! ## What stays custom
 //!
-//! Beadie doesn't know about WrenLift-specific compile-time context:
-//! inline-cache snapshots, back-edge counts for OSR, or on-stack-replacement
-//! safepoints. Those stay in the engine and travel with the MIR that the
-//! compile closure captures — beadie just owns the state transitions.
+//! Beadie doesn't model WrenLift-specific compile-time context:
+//! inline-cache snapshots, back-edge counts for OSR, on-stack-
+//! replacement safepoints, the rich post-compile install that
+//! touches `jit_code`/`tier_states`/`code_ranges`. All of that lives
+//! engine-side; the compile closure captures what it needs and
+//! returns the raw native pointer for beadie's state machine, while
+//! the richer `ExecutableFunction` travels back to the main thread
+//! through an mpsc channel that `poll_compilations` drains at
+//! safepoints.
 
 use std::sync::Arc;
 
-use beadie::{Bead, Beadie, BeadState, CoreHandle, ThresholdPolicy, TieredPolicy};
+use beadie::{
+    Bead, BeadState, Beadie, CoreHandle, SubmitResult, ThresholdPolicy, TieredPolicy,
+};
 
 use crate::runtime::engine::FuncId;
 
@@ -151,6 +166,24 @@ impl TierManager {
             return false;
         };
         bead.eager_install(code)
+    }
+
+    /// Submit a bead to beadie's broker for background compilation.
+    /// The closure runs on the broker thread and must return the
+    /// compiled native pointer (or null on failure) — beadie's state
+    /// machine stores it and transitions the bead to `Compiled`.
+    ///
+    /// Returns `SubmitResult::AlreadyQueued` if the bead has already
+    /// moved past `Interpreted` (race between ticks), `QueueFull` if
+    /// the broker's bounded channel is saturated, `Accepted` on success.
+    pub fn submit_compile<F>(&self, id: FuncId, compile: F) -> SubmitResult
+    where
+        F: FnOnce(&Arc<Bead>) -> *mut () + Send + 'static,
+    {
+        let Some(bead) = self.beads.get(id.0 as usize).and_then(|b| b.as_ref()) else {
+            return SubmitResult::AlreadyQueued;
+        };
+        self.beadie.submit(bead, compile)
     }
 
     /// Install a new compiled pointer, choosing the right beadie API
