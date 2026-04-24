@@ -1553,6 +1553,11 @@ impl ExecutionEngine {
         if self.mode != ExecutionMode::Tiered {
             return;
         }
+        // Respect the deopt policy: functions blacklisted after too many
+        // bailouts stay in the interpreter for the rest of the run.
+        if self.tier.is_blacklisted(id) {
+            return;
+        }
         let idx = id.0 as usize;
         let Some(tier) = self.next_compile_tier(idx) else {
             return;

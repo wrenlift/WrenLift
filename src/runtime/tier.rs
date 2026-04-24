@@ -46,7 +46,8 @@
 use std::sync::Arc;
 
 use beadie::{
-    Bead, BeadState, Beadie, CoreHandle, SubmitResult, ThresholdPolicy, TieredPolicy,
+    BailoutInfo, Bead, BeadState, Beadie, CoreHandle, DeoptDecision, DeoptPolicy, SubmitResult,
+    ThresholdDeoptPolicy, ThresholdPolicy, TieredPolicy,
 };
 
 use crate::runtime::engine::FuncId;
@@ -60,6 +61,11 @@ pub const BASELINE_THRESHOLD: u32 = 100;
 /// Optimized promotion threshold — matches `opt_threshold`.
 pub const OPTIMIZED_THRESHOLD: u32 = 1_000;
 
+/// Default deopt recompile budget. After this many bailouts a function
+/// is blacklisted from further JIT compilation for the remainder of the
+/// process — assumed pathologically polymorphic / unstable.
+pub const DEFAULT_DEOPT_LIMIT: u32 = 3;
+
 // ── TierManager ───────────────────────────────────────────────────────────
 
 /// Per-engine tier-up manager. One instance, lives for the engine's
@@ -70,6 +76,10 @@ pub struct TierManager {
     /// gaps (slots that belong to modules, host fns, etc. with no JIT).
     /// Grown lazily; same index space as `Engine.functions`.
     beads: Vec<Option<Arc<Bead>>>,
+    /// Policy consulted on every bailout from JIT'd code. Defaults to
+    /// a simple threshold (recompile up to N times, then blacklist).
+    /// Swappable via [`Self::set_deopt_policy`] for custom strategies.
+    deopt_policy: Arc<dyn DeoptPolicy>,
 }
 
 impl Default for TierManager {
@@ -86,7 +96,16 @@ impl TierManager {
                 tier2_threshold: optimized,
             }),
             beads: Vec::new(),
+            deopt_policy: Arc::new(ThresholdDeoptPolicy::new(DEFAULT_DEOPT_LIMIT)),
         }
+    }
+
+    /// Swap out the default `ThresholdDeoptPolicy` for a different
+    /// strategy (e.g. `AlwaysRecompilePolicy` for development builds
+    /// that want every bailout to recompile, or `ExponentialBackoffPolicy`
+    /// for long-running servers that want to be more conservative).
+    pub fn set_deopt_policy(&mut self, policy: Arc<dyn DeoptPolicy>) {
+        self.deopt_policy = policy;
     }
 
     /// For tests / tools that want plain threshold semantics without a
@@ -249,6 +268,58 @@ impl TierManager {
         self.beads.iter().filter(|b| b.is_some()).count()
     }
 
+    /// Record a bailout from JIT'd code. The configured `DeoptPolicy`
+    /// decides whether to allow recompilation (the bead reverts to
+    /// `Interpreted` and the invocation counter eventually re-promotes)
+    /// or blacklist the function permanently.
+    ///
+    /// Returns the policy decision so the caller can log, emit a trace,
+    /// or take additional engine-side action (e.g. clearing the
+    /// `jit_code` slot so subsequent dispatches fall back to the
+    /// interpreter immediately).
+    ///
+    /// `guard_id` and `pc_offset` are runtime-defined — beadie stores
+    /// them on the `BailoutInfo` but doesn't inspect them. Pass any
+    /// stable identifier the compiler backend emits at the guard site.
+    /// `generation` is `bead.generation()` at the time of the bailout
+    /// — distinguishes a tier-1 bailout from a tier-2 bailout after a
+    /// swap.
+    pub fn record_bailout(
+        &self,
+        id: FuncId,
+        guard_id: u32,
+        pc_offset: u32,
+    ) -> Option<DeoptDecision> {
+        let bead = self.beads.get(id.0 as usize)?.as_ref()?;
+        let info = BailoutInfo {
+            guard_id,
+            pc_offset,
+            generation: bead.generation(),
+        };
+        Some(bead.on_bailout(info, self.deopt_policy.as_ref()))
+    }
+
+    /// Check whether a function has been permanently blacklisted by
+    /// the deopt policy. Hot path hint — callers can skip tier-up
+    /// submission and re-compile requests for blacklisted functions.
+    pub fn is_blacklisted(&self, id: FuncId) -> bool {
+        self.beads
+            .get(id.0 as usize)
+            .and_then(|b| b.as_ref())
+            .map(|b| b.is_blacklisted())
+            .unwrap_or(false)
+    }
+
+    /// Total bailouts seen by a specific function. Useful for
+    /// `WLIFT_TIER_STATS` reporting and test assertions.
+    pub fn bailouts(&self, id: FuncId) -> u32 {
+        self.beads
+            .get(id.0 as usize)
+            .and_then(|b| b.as_ref())
+            .map(|b| b.bailout_count())
+            .unwrap_or(0)
+    }
+
     /// Flat snapshot of every bead's state + invocation count, keyed by
     /// FuncId raw index. For end-of-run diagnostics and test assertions;
     /// not a hot-path API (walks the whole chain).
@@ -357,6 +428,36 @@ mod tests {
         assert_eq!(m.invocations(FuncId(99)), 0);
         // tick on an unregistered id is also a no-op (doesn't allocate, doesn't panic).
         m.tick(FuncId(99));
+    }
+
+    #[test]
+    fn record_bailout_blacklists_after_limit() {
+        // DEFAULT_DEOPT_LIMIT = 3 → recompile for bailouts 1..=3,
+        // blacklist on the 4th.
+        let mut mgr = TierManager::default();
+        mgr.register(FuncId(0), std::ptr::null_mut());
+        // Need a compiled bead to bail out of — fake-install a pointer.
+        assert!(mgr.eager_install(FuncId(0), fake_code_ptr()));
+        assert!(!mgr.is_blacklisted(FuncId(0)));
+
+        for n in 1..=3 {
+            let d = mgr.record_bailout(FuncId(0), 0, 0).unwrap();
+            assert_eq!(d, DeoptDecision::Recompile, "bailout #{} recompiles", n);
+            assert!(!mgr.is_blacklisted(FuncId(0)));
+            // After Recompile the bead reverts to Interpreted; re-install
+            // so the next bailout has something to bail from.
+            assert!(mgr.eager_install(FuncId(0), fake_code_ptr()));
+        }
+        let d = mgr.record_bailout(FuncId(0), 0, 0).unwrap();
+        assert_eq!(d, DeoptDecision::Blacklist);
+        assert!(mgr.is_blacklisted(FuncId(0)));
+        assert_eq!(mgr.bailouts(FuncId(0)), 4);
+    }
+
+    #[test]
+    fn record_bailout_on_unregistered_id_is_noop() {
+        let mgr = TierManager::default();
+        assert!(mgr.record_bailout(FuncId(42), 0, 0).is_none());
     }
 
     #[test]

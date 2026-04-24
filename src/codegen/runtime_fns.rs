@@ -3339,8 +3339,13 @@ fn deopt_impl(args: &[u64]) -> u64 {
     }
     let func_id = unsafe { (*(*closure_ptr).function).fn_id } as usize;
 
-    vm.engine
-        .note_deopt_to_baseline(crate::runtime::engine::FuncId(func_id as u32));
+    // Two sides of the same event: the engine updates its own tier
+    // bookkeeping (tier_states, stats), and the beadie bead records
+    // the bailout so the deopt policy can decide whether to allow
+    // further recompilation or blacklist the function.
+    let id = crate::runtime::engine::FuncId(func_id as u32);
+    vm.engine.note_deopt_to_baseline(id);
+    let _decision = vm.engine.tier.record_bailout(id, 0, 0);
 
     // Re-execute via interpreter with the original args.
     let defining_class = if ctx.defining_class.is_null() {
