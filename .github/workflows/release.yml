@@ -1,0 +1,190 @@
+name: Release binaries
+
+# Triggered on `v*` tag push (e.g. `v0.1.0`, `v0.2.0-rc1`). Builds
+# `wlift` + `hatch` for every supported Unix target, bundles each
+# pair into a tarball with a SHA256 checksum, and attaches
+# everything to a GitHub Release.
+#
+# Consumers grab binaries via `install.sh` (curl | bash style) —
+# the script parses this release's asset list, so the artifact
+# naming below is load-bearing: changing it breaks the installer.
+#
+# Manual dispatch is supported too, for re-cutting a release
+# without a fresh tag (or running against a preview rev).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to produce (e.g. v0.1.0). Must already exist."
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------
+  # Resolve: pull the tag once and emit it so downstream jobs can
+  # reference it without reparsing `github.ref_name`.
+  # ---------------------------------------------------------------
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag:  ${{ steps.out.outputs.tag }}
+    steps:
+      - name: Pick tag
+        id: out
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          if [[ ! "$tag" =~ ^v ]]; then
+            echo "::error::tag must start with 'v' (got '$tag')" && exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------
+  # Build: one matrix entry per supported target. Each job emits a
+  # `wlift-<tag>-<triple>.tar.gz` with both binaries and a matching
+  # `.sha256` next to it.
+  # ---------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.label }}
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: both darwin targets run on macos-14 (arm64).
+          # The Apple toolchain cross-compiles to x86_64 natively
+          # and macos-13 runners queue for minutes on free tier.
+          - label:    macos-arm64
+            os:       macos-14
+            target:   aarch64-apple-darwin
+          - label:    macos-x86_64
+            os:       macos-14
+            target:   x86_64-apple-darwin
+          - label:    linux-x86_64
+            os:       ubuntu-latest
+            target:   x86_64-unknown-linux-gnu
+          - label:    linux-arm64
+            os:       ubuntu-latest
+            target:   aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (linux-arm64)
+        if: matrix.use_cross == true
+        run: cargo install cross --locked
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ needs.resolve.outputs.tag }}-${{ matrix.target }}
+
+      - name: Build wlift + hatch (native)
+        if: matrix.use_cross != true
+        run: cargo build --release --bin wlift --bin hatch --target ${{ matrix.target }}
+
+      - name: Build wlift + hatch (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --bin wlift --bin hatch --target ${{ matrix.target }}
+
+      - name: Package tarball + checksum
+        shell: bash
+        run: |
+          set -eu
+          tag="${{ needs.resolve.outputs.tag }}"
+          triple="${{ matrix.target }}"
+          stage="wlift-${tag}-${triple}"
+          bin_dir="target/${triple}/release"
+
+          mkdir -p "dist/${stage}"
+          cp "${bin_dir}/wlift" "dist/${stage}/"
+          cp "${bin_dir}/hatch" "dist/${stage}/"
+          # Convenience: include a minimal README next to the
+          # binaries so recipients know what they are + where to
+          # find docs. Keeps the tarball self-explanatory.
+          cat > "dist/${stage}/README.txt" <<EOF
+          wlift ${tag} — Wren runtime (JIT + interpreter)
+          hatch ${tag} — Package + build tool for Wren
+
+          Add this dir to your PATH to use the binaries directly.
+          Docs: https://github.com/wrenlift/WrenLift
+          EOF
+
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            dist/wlift-*.tar.gz
+            dist/wlift-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # Publish: collect every matrix artifact, attach to a release.
+  # Uses `softprops/action-gh-release` so re-running the workflow
+  # (via workflow_dispatch) updates the existing release in place
+  # rather than failing.
+  # ---------------------------------------------------------------
+  publish:
+    name: Publish release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: "*"
+
+      - name: Flatten assets
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+            -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Attach to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          files: release/*
+          # Keep prior release body if the release already exists —
+          # avoids nuking hand-written notes on re-runs.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
