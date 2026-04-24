@@ -35,13 +35,43 @@ Optimized MIR is compiled to native code via **Cranelift** (both x86_64 and aarc
 
 The runtime uses NaN-boxed 64-bit values, a generational semi-space garbage collector with bump-pointer nursery allocation, and an object model with O(1) method dispatch via interned symbol IDs. Tiered execution runs cold code through a bytecode / pre-decoded threaded interpreter, then promotes hot functions to Cranelift-compiled native code. **On-stack replacement (OSR)** transfers hot loops into native mid-iteration without re-running function entry code — the back-edge safepoint walks live interpreter registers into a compiled loop-header entry that Cranelift emits alongside the main function. Method and closure frames, nested native callers, and both unconditional and conditional back-edges are all OSR-eligible; the MIR frame stays parked so the garbage collector still sees every live value in flight. Inline caches, speculative devirtualization (`CallKnownFunc`), and leaf fast paths shrink the method-dispatch tax on hot protocol-heavy code. Background compilation runs on a worker thread; hot module reload is planned.
 
-## Getting Started
+## Install
 
-### Build
+One curl gives you both binaries — `wlift` (the runtime) and `hatch`
+(the package + build tool) — pulled from the latest GitHub Release,
+SHA256-verified, dropped into `~/.local/bin`:
 
 ```sh
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh | bash
 ```
+
+Knobs:
+
+- `WLIFT_VERSION=v0.1.0` — pin a specific tag instead of latest.
+- `INSTALL_DIR=/usr/local/bin` — change the target dir (must be
+  pre-writable; the script doesn't elevate).
+
+Supported platforms: macOS (arm64, x86_64), Linux (x86_64, aarch64).
+Windows: grab the binaries from [Releases](https://github.com/wrenlift/WrenLift/releases)
+manually.
+
+Verify:
+
+```sh
+wlift --version
+hatch --version
+```
+
+### From source
+
+```sh
+git clone https://github.com/wrenlift/WrenLift
+cd WrenLift
+cargo build --release
+# binaries land in target/release/{wlift,hatch}
+```
+
+## Getting Started
 
 ### Run a script
 
