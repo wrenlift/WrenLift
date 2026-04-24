@@ -109,6 +109,17 @@ impl TierManager {
         self.beadie.on_invoke(bead, compile)
     }
 
+    /// Shadow-mode tick: bump the bead's invocation counter without
+    /// running the promotion policy or submitting a compile closure.
+    /// Used by Phase 2 to run the bead state machine alongside the
+    /// engine's existing `record_call` counter so the two can be
+    /// compared before the interpreter is switched over.
+    pub fn tick(&self, id: FuncId) {
+        if let Some(Some(bead)) = self.beads.get(id.0 as usize) {
+            let _ = bead.tick();
+        }
+    }
+
     /// Ignore the broker; slam a compiled code pointer into the bead
     /// immediately. Used by the synchronous tier-up path and by tests
     /// that want to verify tier transitions without spinning up the
@@ -246,6 +257,21 @@ mod tests {
         assert_eq!(m.on_invoke(FuncId(99), |_| fake_code_ptr()), None);
         assert_eq!(m.state(FuncId(99)), None);
         assert_eq!(m.invocations(FuncId(99)), 0);
+        // tick on an unregistered id is also a no-op (doesn't allocate, doesn't panic).
+        m.tick(FuncId(99));
+    }
+
+    #[test]
+    fn tick_bumps_counter_without_submitting() {
+        let mut m = TierManager::with_thresholds(3, 30);
+        m.register(FuncId(0), std::ptr::null_mut());
+        for _ in 0..100 {
+            m.tick(FuncId(0));
+        }
+        // The bead has been ticked 100 times but no promotion policy
+        // ran, so state is still Interpreted.
+        assert_eq!(m.state(FuncId(0)), Some(BeadState::Interpreted));
+        assert_eq!(m.invocations(FuncId(0)), 100);
     }
 
     #[test]

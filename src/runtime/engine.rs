@@ -460,6 +460,11 @@ pub struct ExecutionEngine {
     /// `None` = not yet checked. `Some(None)` = checked, not eligible.
     /// `Some(Some(tc))` = eligible, threaded code ready.
     pub threaded_code: Vec<Option<Option<crate::mir::threaded::ThreadedCode>>>,
+    /// Tier-up promotion broker. Phase 2 wires this up in shadow mode
+    /// alongside the existing call_count / compile_queue machinery — it
+    /// ticks on every recorded call but doesn't yet drive any tier
+    /// decision. Later phases will retire the legacy path in its favour.
+    pub tier: super::tier::TierManager,
 }
 
 /// Address range of a compiled function's native code.
@@ -528,6 +533,13 @@ impl ExecutionEngine {
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
             threaded_code: Vec::new(),
+            // Thresholds mirror the legacy jit_threshold / opt_threshold
+            // defaults above so shadow-mode tick counts stay in step with
+            // the existing counters they'll eventually replace.
+            tier: super::tier::TierManager::with_thresholds(
+                super::tier::BASELINE_THRESHOLD,
+                super::tier::OPTIMIZED_THRESHOLD,
+            ),
         }
     }
 
@@ -570,6 +582,12 @@ impl ExecutionEngine {
         self.bc_cache.push(std::ptr::null());
         self.threaded_code.push(None); // None = not yet checked
         self.type_profiles.push(None);
+        // Shadow-mode registration. The core pointer stays null for now —
+        // we don't need round-trip-to-Wren-fn yet. The bead exists purely
+        // to track per-function state transitions in parallel with the
+        // legacy call_count field. Phase 3 will hand the compile closure
+        // real context and start driving tier decisions through this.
+        self.tier.register(id, std::ptr::null_mut());
         id
     }
 
@@ -1360,6 +1378,11 @@ impl ExecutionEngine {
         if self.mode != ExecutionMode::Tiered {
             return false;
         }
+        // Shadow-mode tick — ticks the beadie bead's invocation counter
+        // alongside the legacy call_count field so the two can be
+        // cross-referenced in diagnostics. Does NOT drive any tier
+        // decision this phase; the match block below still owns that.
+        self.tier.tick(id);
         let idx = id.0 as usize;
         match self.functions.get_mut(idx) {
             Some(FuncBody::Interpreted { call_count, .. }) => {
@@ -1894,6 +1917,40 @@ mod tests {
         assert!(!engine.record_call(id)); // 1
         assert!(!engine.record_call(id)); // 2
         assert!(engine.record_call(id)); // 3 = threshold
+    }
+
+    #[test]
+    fn test_shadow_tier_tick_matches_legacy_counter() {
+        // Phase 2 invariant: every record_call ticks both the legacy
+        // call_count field and the beadie-backed bead. The two counts
+        // should stay in lockstep until one of them gates out (Tier
+        // reached, mode changed, etc.).
+        let mut engine = ExecutionEngine::new(ExecutionMode::Tiered);
+        engine.jit_threshold = 1_000; // high so we never tier up in this test
+        let mir = make_mir();
+        let id = engine.register_function(mir);
+
+        for _ in 0..7 {
+            engine.record_call(id);
+        }
+        assert_eq!(engine.tier.invocations(id), 7);
+        match &engine.functions[id.0 as usize] {
+            FuncBody::Interpreted { call_count, .. } => assert_eq!(*call_count, 7),
+            _ => panic!("expected Interpreted body"),
+        }
+    }
+
+    #[test]
+    fn test_shadow_tier_no_tick_in_interpreter_mode() {
+        // Interpreter mode short-circuits record_call before the tick,
+        // so the bead never sees any invocations either.
+        let mut engine = ExecutionEngine::new(ExecutionMode::Interpreter);
+        let mir = make_mir();
+        let id = engine.register_function(mir);
+        for _ in 0..5 {
+            engine.record_call(id);
+        }
+        assert_eq!(engine.tier.invocations(id), 0);
     }
 
     #[test]
