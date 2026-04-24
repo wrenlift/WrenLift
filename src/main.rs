@@ -183,29 +183,57 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 // ---------------------------------------------------------------------------
 
 /// Build a `load_module_fn` that resolves filesystem-relative imports
-/// (`./foo`, `../foo`, bare `foo`) against the running file's
-/// directory. Scoped imports like `@hatch:test` are *not* handled here —
-/// they must already be installed into the VM (see
-/// [`preinstall_spec_dependencies`]), so this loader only covers
-/// imports that sit next to the source file on disk.
+/// (`./foo`, `../foo`, bare `foo`) against the IMPORTER'S directory —
+/// tracked via a shared `loaded` map that records each module's
+/// on-disk path as we load it. Scoped imports like `@hatch:test` are
+/// *not* handled here — they must already be installed into the VM
+/// (see [`preinstall_spec_dependencies`]).
+///
+/// Prior to 2026-04-25 the loader pinned everything to the root
+/// entry's directory. That broke `examples/foo.wren → ../web →
+/// ./css` because `./css` would resolve against `examples/` instead
+/// of the `web.wren` sibling.
 #[allow(clippy::type_complexity)]
-fn make_module_loader(running_file_dir: PathBuf) -> Box<dyn Fn(&str) -> Option<String>> {
-    Box::new(move |name: &str| -> Option<String> {
+fn make_module_loader(running_file_dir: PathBuf) -> Box<dyn Fn(&str, &str) -> Option<String>> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    let dirs: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
+    // The root entry's caller passes `from == ""` — record root dir
+    // so top-level imports work.
+    dirs.borrow_mut()
+        .insert(String::new(), running_file_dir.clone());
+
+    Box::new(move |name: &str, from: &str| -> Option<String> {
+        // Figure out which directory relative imports resolve against.
+        let base_dir = dirs
+            .borrow()
+            .get(from)
+            .cloned()
+            .unwrap_or_else(|| running_file_dir.clone());
+
+        let resolve_against = |root: &PathBuf, rel: &Path| -> Option<(PathBuf, String)> {
+            let candidate = root.join(rel).with_extension("wren");
+            let text = fs::read_to_string(&candidate).ok()?;
+            let parent = candidate.parent()?.to_path_buf();
+            Some((parent, text))
+        };
+
         if name.starts_with("./") || name.starts_with("../") {
             let rel = Path::new(name);
-            let candidate = running_file_dir.join(rel).with_extension("wren");
-            return fs::read_to_string(candidate).ok();
+            let (parent, text) = resolve_against(&base_dir, rel)?;
+            dirs.borrow_mut().insert(name.to_string(), parent);
+            return Some(text);
         }
         // Bare names (no scope chars) → sibling file in the same dir.
         let is_scoped = name.chars().any(|c| matches!(c, ':' | '@' | '/'));
         if is_scoped {
-            // Scoped imports must have been pre-installed — returning
-            // None here surfaces a clear "Could not load module" error
-            // rather than silently finding the wrong file.
             return None;
         }
-        let candidate = running_file_dir.join(format!("{}.wren", name));
-        fs::read_to_string(candidate).ok()
+        let candidate = base_dir.join(format!("{}.wren", name));
+        let parent = candidate.parent()?.to_path_buf();
+        let text = fs::read_to_string(&candidate).ok()?;
+        dirs.borrow_mut().insert(name.to_string(), parent);
+        Some(text)
     })
 }
 

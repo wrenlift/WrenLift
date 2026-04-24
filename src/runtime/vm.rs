@@ -39,7 +39,13 @@ pub type ErrorFn = Box<dyn Fn(ErrorKind, &str, i32, &str)>;
 pub type ResolveModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 
 /// Callback to load a module's source code.
-pub type LoadModuleFn = Box<dyn Fn(&str) -> Option<String>>;
+///
+/// First argument is the requested module name (`./foo`, `@hatch:bar`,
+/// `baz`); second is the NAME of the module doing the import, so the
+/// loader can resolve relative paths (`./css`) against the importer's
+/// on-disk directory instead of the top-level entry file's directory.
+/// The second argument is empty for the root file.
+pub type LoadModuleFn = Box<dyn Fn(&str, &str) -> Option<String>>;
 
 /// Callback to bind a foreign method.
 pub type BindForeignMethodFn = Box<dyn Fn(&str, &str, bool, &str) -> Option<NativeFn>>;
@@ -815,12 +821,16 @@ impl VM {
                     if self.try_load_builtin_module(&imported_module) {
                         // Built-in module registered successfully
                     } else {
-                        // Resolve module source via config callback
+                        // Resolve module source via config callback. The
+                        // importer's module name lets the loader find
+                        // the right on-disk dir for `./foo`-style
+                        // relative imports.
+                        let importer = module_name.to_string();
                         let source_opt = self
                             .config
                             .load_module_fn
                             .as_ref()
-                            .and_then(|load_fn| load_fn(&imported_module));
+                            .and_then(|load_fn| load_fn(&imported_module, &importer));
                         if let Some(mod_source) = source_opt {
                             let result = self.interpret(&imported_module, &mod_source);
                             if result != InterpretResult::Success {
@@ -4772,7 +4782,7 @@ System.print("main continues")
     #[test]
     fn test_interpret_import_module() {
         let mut config = VMConfig::default();
-        config.load_module_fn = Some(Box::new(|name: &str| -> Option<String> {
+        config.load_module_fn = Some(Box::new(|name: &str, _from: &str| -> Option<String> {
             if name == "math_utils" {
                 Some(
                     r#"
@@ -4813,7 +4823,7 @@ System.print(MathUtils.double(21))
     #[test]
     fn test_cross_module_sibling_class_reference() {
         let mut config = VMConfig::default();
-        config.load_module_fn = Some(Box::new(|name: &str| -> Option<String> {
+        config.load_module_fn = Some(Box::new(|name: &str, _from: &str| -> Option<String> {
             if name == "pair" {
                 Some(
                     r#"
