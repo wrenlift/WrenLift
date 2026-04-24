@@ -53,9 +53,10 @@ cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }
 cranelift-jit = { version = "0.130", optional = true }
 cranelift-native = { version = "0.130", optional = true }
-# Tier-up / promotion broker. Path dep against the sibling workspace so
-# local optimizations land without a publish round-trip.
-beadie = { path = "../beadie/crates/beadie" }
+# Tier-up / promotion broker. Pinned to 0.3 — version 0.3 brought in
+# the OsrEntry / swap_compiled_with_osr APIs that `src/runtime/tier.rs`
+# relies on for OSR-aware installs.
+beadie = "0.3"
 
 [dev-dependencies]
 capstone = "0.12"

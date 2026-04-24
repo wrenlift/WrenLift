@@ -1669,12 +1669,17 @@ impl ExecutionEngine {
             );
         }
 
-        // Compile closure — runs on beadie's broker thread. Returns the
-        // raw native pointer for beadie's state machine AND sends the
-        // richer install artifact (executable, metadata, tier) back to
-        // the interpreter thread through `compilation_tx` so
-        // `poll_compilations` can finish the install at a safepoint.
-        let compile_fn = move |_bead: &std::sync::Arc<beadie::Bead>| -> *mut () {
+        // Compile closure — runs on beadie's broker thread. Returns an
+        // `OsrCompileResult` so beadie installs the native entry
+        // pointer AND the OSR table atomically under one generation
+        // bump, closing the race where a back-edge probe could see a
+        // fresh compiled pointer but a stale (empty) OSR table.
+        //
+        // The richer install artifact (ExecutableFunction ownership,
+        // native_meta, tier) still travels back to the interpreter
+        // thread through `compilation_tx` so `poll_compilations` can
+        // finish the engine-side install at a safepoint.
+        let compile_fn = move |_bead: &std::sync::Arc<beadie::Bead>| -> beadie::OsrCompileResult {
             if tier_trace_enabled() {
                 eprintln!(
                     "tier-trace: start {:?} FuncId({}) {}",
@@ -1731,27 +1736,32 @@ impl ExecutionEngine {
                     result.is_some()
                 );
             }
-            // Extract the native pointer for beadie BEFORE sending the
-            // executable across the mpsc boundary. The pointer refers
-            // into a heap-allocated mmap owned by the executable — the
-            // mmap's address doesn't change when the ExecutableFunction
-            // moves through the channel, so the pointer remains valid
-            // through install_or_swap at the receiver.
-            let native_ptr = match &result {
+            // Extract the native entry + OSR entries for beadie BEFORE
+            // sending the executable across the mpsc boundary. The
+            // pointers refer into the heap-allocated mmap owned by the
+            // executable — the mmap's address is stable when the
+            // ExecutableFunction moves through the channel, so the
+            // pointers remain valid after the engine-side install via
+            // `poll_compilations` takes ownership.
+            let (native_ptr, osr) = match &result {
                 Some(CompilationResult::Compiled { executable, .. }) if executable.is_native() => {
-                    executable.native_ptr() as *mut ()
+                    let entries = encode_osr_entries(executable.osr_entries());
+                    (executable.native_ptr() as *mut (), entries)
                 }
-                _ => std::ptr::null_mut(),
+                _ => (std::ptr::null_mut(), Vec::new()),
             };
             let _ = tx.send(result.unwrap_or(CompilationResult::Failed { id }));
-            native_ptr
+            beadie::OsrCompileResult {
+                entry: native_ptr,
+                osr,
+            }
         };
 
         // Submit to beadie's broker. The bead goes Interpreted → Queued
-        // → Compiling → Compiled as the closure progresses. If the bead
-        // has already been promoted (race), `AlreadyQueued` is returned
-        // and we roll back the pending_count bookkeeping.
-        let submit_result = self.tier.submit_compile(id, compile_fn);
+        // → Compiling → Compiled (with OSR table) as the closure
+        // progresses. If the bead has already been promoted (race),
+        // `AlreadyQueued` is returned and we roll back the pending_count.
+        let submit_result = self.tier.submit_compile_osr(id, compile_fn);
         if !submit_result.is_accepted() {
             self.compiling_tier[idx] = None;
             self.pending_count = self.pending_count.saturating_sub(1);
