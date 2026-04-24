@@ -53,6 +53,13 @@ pub struct ResolveResult {
     pub boxed_locals: HashMap<usize, std::collections::HashSet<SymbolId>>,
     /// Module-level variable names, in declaration order.
     pub module_vars: Vec<SymbolId>,
+    /// For each entry in `module_vars`, the source module it was
+    /// imported from (`Some("./foo")` for `import "./foo" for x`)
+    /// or `None` for local declarations. Parallel to `module_vars`.
+    /// Lets the runtime disambiguate when two modules export the
+    /// same class name — the generic `find_imported_var` fallback
+    /// returns any match in an unspecified order.
+    pub module_var_sources: Vec<Option<String>>,
 }
 
 /// Information about a captured upvalue.
@@ -142,6 +149,7 @@ pub struct Resolver<'a> {
     interner: &'a Interner,
     scopes: Vec<Scope>,
     module_vars: Vec<SymbolId>,
+    module_var_sources: Vec<Option<String>>,
     resolutions: HashMap<usize, ResolvedName>,
     upvalue_map: HashMap<usize, Vec<UpvalueInfo>>,
     /// Locals captured by nested closures, keyed by the originating
@@ -160,6 +168,7 @@ impl<'a> Resolver<'a> {
             interner,
             scopes: Vec::new(),
             module_vars: Vec::new(),
+            module_var_sources: Vec::new(),
             resolutions: HashMap::new(),
             upvalue_map: HashMap::new(),
             boxed_locals: HashMap::new(),
@@ -179,15 +188,15 @@ impl<'a> Resolver<'a> {
         for stmt in module {
             match &stmt.0 {
                 Stmt::Class(decl) => {
-                    self.define_module_var(decl.name.0, decl.name.1.clone());
+                    self.define_module_var(decl.name.0, decl.name.1.clone(), None);
                 }
                 Stmt::Var { name, .. } => {
-                    self.define_module_var(name.0, name.1.clone());
+                    self.define_module_var(name.0, name.1.clone(), None);
                 }
-                Stmt::Import { names, .. } => {
+                Stmt::Import { module, names } => {
                     for import_name in names {
                         let sym = import_name.alias.as_ref().unwrap_or(&import_name.name);
-                        self.define_module_var(sym.0, sym.1.clone());
+                        self.define_module_var(sym.0, sym.1.clone(), Some(module.0.clone()));
                     }
                 }
                 _ => {}
@@ -207,12 +216,13 @@ impl<'a> Resolver<'a> {
             upvalues: self.upvalue_map,
             boxed_locals: self.boxed_locals,
             module_vars: self.module_vars,
+            module_var_sources: self.module_var_sources,
         }
     }
 
     // -- Module vars --------------------------------------------------------
 
-    fn define_module_var(&mut self, name: SymbolId, span: Span) {
+    fn define_module_var(&mut self, name: SymbolId, span: Span, source: Option<String>) {
         if self.module_vars.contains(&name) {
             self.errors.push(
                 Diagnostic::error(format!(
@@ -224,6 +234,7 @@ impl<'a> Resolver<'a> {
             return;
         }
         self.module_vars.push(name);
+        self.module_var_sources.push(source);
     }
 
     fn find_module_var(&self, name: SymbolId) -> Option<u16> {
@@ -720,6 +731,7 @@ pub fn resolve_with_prelude(
     let mut resolver = Resolver::new(interner);
     for &sym in prelude {
         resolver.module_vars.push(sym);
+        resolver.module_var_sources.push(None);
     }
     resolver.resolve(module)
 }

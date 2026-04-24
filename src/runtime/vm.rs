@@ -890,7 +890,14 @@ impl VM {
             .map(|&sym| interner.resolve(sym).to_string())
             .collect();
 
-        self.install_module_mir_and_run(module_name, &interner, module_mir, var_names)
+        let var_sources = resolve_result.module_var_sources.clone();
+        self.install_module_mir_and_run_with_sources(
+            module_name,
+            &interner,
+            module_mir,
+            var_names,
+            var_sources,
+        )
     }
 
     /// Install a freshly compiled (or freshly loaded) `ModuleMir` into
@@ -907,8 +914,26 @@ impl VM {
         &mut self,
         module_name: &str,
         interner: &crate::intern::Interner,
+        module_mir: crate::mir::ModuleMir,
+        var_names: Vec<String>,
+    ) -> InterpretResult {
+        let sources = vec![None; var_names.len()];
+        self.install_module_mir_and_run_with_sources(
+            module_name,
+            interner,
+            module_mir,
+            var_names,
+            sources,
+        )
+    }
+
+    fn install_module_mir_and_run_with_sources(
+        &mut self,
+        module_name: &str,
+        interner: &crate::intern::Interner,
         mut module_mir: crate::mir::ModuleMir,
         var_names: Vec<String>,
+        var_sources: Vec<Option<String>>,
     ) -> InterpretResult {
         use crate::mir::BlockId;
         // 6. Remap symbols: the source interner and VM interner have different
@@ -1024,10 +1049,34 @@ impl VM {
             }
         }
         let mut module_vars = Vec::with_capacity(var_names.len());
-        for name in &var_names {
+        for (i, name) in var_names.iter().enumerate() {
+            let source = var_sources.get(i).and_then(|s| s.as_ref());
             if let Some(value) = self.core_class_value(name) {
+                // Prelude / builtin classes (System, Object, etc.) win
+                // over anything else — they're baked in and can't be
+                // shadowed by a module-var slot pointing elsewhere.
                 module_vars.push(value);
+            } else if let Some(import_source) = source {
+                // The var came from `import "<import_source>" for <name>`.
+                // Resolve against that specific module rather than scanning
+                // every loaded module by name — otherwise two modules that
+                // both export a class called "Response" leak into each
+                // other at runtime via whichever HashMap iteration order
+                // happens to visit first.
+                if let Some(value) =
+                    self.find_imported_var_from(name, import_source)
+                {
+                    module_vars.push(value);
+                } else {
+                    // Source module hasn't exported this name yet (e.g.
+                    // circular or forward-declared import). Start null;
+                    // class registration or post-install fixup will fill
+                    // it in when the source module is fully installed.
+                    module_vars.push(Value::null());
+                }
             } else if let Some(value) = self.find_imported_var(name) {
+                // No explicit source (prelude, re-exported, or legacy
+                // snapshot path). Fall back to the name-only scan.
                 module_vars.push(value);
             } else {
                 module_vars.push(Value::null());
@@ -1701,6 +1750,26 @@ impl VM {
     /// Map a core class name to its Value (pointer to ObjClass).
     /// Search all loaded modules for a variable with the given name.
     /// Used to resolve imported names across module boundaries.
+    /// Look up a named export in a specific source module. Used when
+    /// the call site is `import "<source>" for <name>` — we honour the
+    /// import instead of returning the first class with a matching
+    /// name from any module (which was non-deterministic under
+    /// HashMap iteration and routinely picked the wrong one when two
+    /// modules defined, say, `Response`).
+    fn find_imported_var_from(&self, name: &str, source: &str) -> Option<Value> {
+        let entry = self.engine.modules.get(source)?;
+        let idx = entry.var_names.iter().position(|n| n == name)?;
+        let value = entry.vars.get(idx).copied()?;
+        // Refuse to bind a null slot — if the source module is still
+        // initialising and hasn't written this var yet, the caller
+        // falls through to the legacy path or stores null and retries
+        // lazily.
+        if value.is_null() {
+            return None;
+        }
+        Some(value)
+    }
+
     fn find_imported_var(&self, name: &str) -> Option<Value> {
         let target_sym = self.interner.lookup(name)?;
         for entry in self.engine.modules.values() {
