@@ -1026,7 +1026,13 @@ pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<Valu
     live
 }
 
-fn osr_reachable_blocks(func: &MirFunction, start: BlockId) -> HashSet<usize> {
+/// Set of block indices reachable via successor edges from `start`.
+/// Guards against out-of-range successor targets so malformed MIR
+/// can't index out of bounds. Used by OSR entry analysis — layout
+/// validity check and `osr_external_live_values` MUST agree on
+/// reachability or val_map / external_args get out of sync and
+/// lowering blows up.
+pub fn osr_reachable_blocks(func: &MirFunction, start: BlockId) -> HashSet<usize> {
     let mut reachable = HashSet::new();
     fn dfs(idx: usize, func: &MirFunction, reachable: &mut HashSet<usize>) {
         if idx >= func.blocks.len() || !reachable.insert(idx) {

@@ -7,8 +7,8 @@
 pub mod cl {
     use crate::intern::Interner;
     use crate::mir::{
-        osr_external_live_values, osr_rematerializable_defs, BlockId, Instruction, MirFunction,
-        MirType, Terminator, ValueId,
+        osr_external_live_values, osr_reachable_blocks, osr_rematerializable_defs, BlockId,
+        Instruction, MirFunction, MirType, Terminator, ValueId,
     };
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -518,7 +518,13 @@ pub mod cl {
             return None;
         }
 
-        let reachable = reachable_from(mir, target);
+        // Use `mir::osr_reachable_blocks` — the same helper
+        // `osr_external_live_values` uses — so the `defs` set this
+        // function builds stays in lockstep with the `external_args`
+        // it consumes. A local DFS that diverges in even one edge
+        // case (e.g. missing bounds guard) lets a validity check
+        // pass while lowering subsequently panics.
+        let reachable = osr_reachable_blocks(mir, target);
         let mut defs = HashSet::new();
         for &idx in &reachable {
             let block = &mir.blocks[idx];
@@ -650,20 +656,6 @@ pub mod cl {
             }
         }
         value_types
-    }
-
-    fn reachable_from(mir: &MirFunction, start: BlockId) -> HashSet<usize> {
-        let mut reachable = HashSet::new();
-        fn dfs(idx: usize, mir: &MirFunction, reachable: &mut HashSet<usize>) {
-            if !reachable.insert(idx) {
-                return;
-            }
-            for succ in mir.blocks[idx].terminator.successors() {
-                dfs(succ.0 as usize, mir, reachable);
-            }
-        }
-        dfs(start.0 as usize, mir, &mut reachable);
-        reachable
     }
 
     fn emit_osr_external_constants(
@@ -1144,13 +1136,24 @@ pub mod cl {
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
     ) -> Result<Option<Value>, String> {
+        // Investigation mode — convert undefined-value to a graceful
+        // Err so the broker thread survives, letting other functions
+        // keep JITing. Exposes a latent miscompile we're bisecting.
+        let dummy: Value = builder.ins().iconst(types::I64, 0);
+        let err_sink: std::cell::Cell<Option<ValueId>> = std::cell::Cell::new(None);
         let get = |vid: &ValueId| -> Value {
-            *val_map
-                .get(vid)
-                .unwrap_or_else(|| panic!("undefined value {:?}", vid))
+            match val_map.get(vid) {
+                Some(v) => *v,
+                None => {
+                    if err_sink.get().is_none() {
+                        err_sink.set(Some(*vid));
+                    }
+                    dummy
+                }
+            }
         };
 
-        match inst {
+        let result = match inst {
             // === Constants ===
             Instruction::ConstNum(n) => {
                 let bits = n.to_bits() as i64;
@@ -2463,7 +2466,11 @@ pub mod cl {
                 let result = builder.ins().call(self_func_ref, &call_args);
                 Ok(Some(builder.inst_results(result)[0]))
             }
+        };
+        if let Some(vid) = err_sink.get() {
+            return Err(format!("undefined value {:?}", vid));
         }
+        result
     }
 
     /// Lower a MIR terminator to Cranelift IR.

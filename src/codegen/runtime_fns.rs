@@ -3115,13 +3115,60 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
             }
             ObjType::String => {
                 let string = ptr as *const ObjString;
+                let s = unsafe { (*string).as_str() };
+                // `str[i]` — single char at a char index.
                 if let Some(n) = idx.as_num() {
-                    let i = n as usize;
-                    let s = unsafe { (*string).as_str() };
-                    if let Some(ch) = s.chars().nth(i) {
-                        let vm = unsafe { vm_ref() };
-                        if let Some(vm) = vm {
-                            return vm.new_string(ch.to_string()).to_bits();
+                    let mut i = n as i64;
+                    let char_count = s.chars().count() as i64;
+                    if i < 0 {
+                        i += char_count;
+                    }
+                    if i >= 0 && i < char_count {
+                        if let Some(ch) = s.chars().nth(i as usize) {
+                            let vm = unsafe { vm_ref() };
+                            if let Some(vm) = vm {
+                                return vm.new_string(ch.to_string()).to_bits();
+                            }
+                        }
+                    }
+                }
+                // `str[range]` — substring slice. Without this the JIT
+                // lowering of `Instruction::SubscriptGet` silently returns
+                // null for every range-based slice on a String, which
+                // breaks any parser / string processor that tier-ups.
+                // The interpreter handles this via the native `[_]` method
+                // in `runtime/core/string.rs::subscript`; this path mirrors
+                // the Range branch of that function.
+                if idx.is_object() {
+                    let idx_ptr = idx.as_object().unwrap();
+                    let idx_header = idx_ptr as *const ObjHeader;
+                    if unsafe { (*idx_header).obj_type } == ObjType::Range {
+                        use crate::runtime::object::ObjRange;
+                        let range = unsafe { &*(idx_ptr as *const ObjRange) };
+                        let len = s.chars().count() as i64;
+                        let normalize = |mut v: i64| -> i64 {
+                            if v < 0 {
+                                v += len
+                            }
+                            v
+                        };
+                        let from = normalize(range.from as i64);
+                        let to_raw = normalize(range.to as i64);
+                        let end = if range.is_inclusive {
+                            to_raw + 1
+                        } else {
+                            to_raw
+                        };
+                        if from >= 0 && end >= from && end <= len {
+                            let slice: String = s
+                                .chars()
+                                .skip(from as usize)
+                                .take((end - from) as usize)
+                                .collect();
+                            let vm = unsafe { vm_ref() };
+                            if let Some(vm) = vm {
+                                return vm.new_string(slice).to_bits();
+                            }
                         }
                     }
                 }
