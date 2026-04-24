@@ -11,9 +11,15 @@ class Fib {
 
 var start = System.clock
 
+var result = 0
 for (i in 0...5) {
-  Fib.calc(28)
+  result = Fib.calc(28)
 }
+
+// Print the result so the bench-correctness step can diff our stdout
+// against standard Wren. fib(28) = 317811 — any silent miscompile
+// (tail-call mangling, off-by-one in recursion, etc.) will diverge.
+System.print(result)
 
 var elapsed = System.clock - start
 System.print("elapsed: %(elapsed)")

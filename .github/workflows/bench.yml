@@ -53,6 +53,48 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Verify bench correctness vs standard Wren
+        # Sanity gate before the timing run. For each Wren bench, run
+        # it once on both wlift and wren_cli, strip the `elapsed:` line,
+        # and diff stdouts. Any mismatch fails the workflow — that's
+        # the protection against a silent miscompile that would
+        # otherwise post as a speedup.
+        #
+        # stderr is captured separately (wlift may print JIT compile-
+        # diagnostic noise there) and shown alongside the diff when we
+        # fail, but doesn't participate in the comparison.
+        run: |
+          WLIFT="./target/release/wlift"
+          BENCHMARKS="fib method_call binary_trees delta_blue"
+          fail=0
+          for bench in $BENCHMARKS; do
+            echo "::group::$bench correctness"
+            wl=$(timeout 60 "$WLIFT" "bench/${bench}.wren" 2>/tmp/wl.err | grep -v '^elapsed:' || true)
+            wr=$(timeout 60 wren_cli "bench/${bench}.wren" 2>/tmp/wr.err | grep -v '^elapsed:' || true)
+            if [ "$wl" != "$wr" ]; then
+              echo "::error title=$bench::wrenlift output differs from wren_cli"
+              echo "--- wrenlift stdout ---"
+              echo "$wl"
+              echo "--- wren_cli stdout ---"
+              echo "$wr"
+              echo "--- diff ---"
+              diff <(echo "$wl") <(echo "$wr") || true
+              if [ -s /tmp/wl.err ]; then
+                echo "--- wrenlift stderr ---"
+                cat /tmp/wl.err
+              fi
+              fail=1
+            else
+              lines=$(echo "$wl" | wc -l | tr -d ' ')
+              echo "$bench: match ($lines lines)"
+            fi
+            echo "::endgroup::"
+          done
+          if [ "$fail" != "0" ]; then
+            echo "::error::bench correctness gate failed — see per-bench diffs above"
+            exit 1
+          fi
+
       - name: Run benchmarks
         # WLIFT defaults that matter for these numbers:
         # - --mode Tiered (interpret → JIT with OSR)

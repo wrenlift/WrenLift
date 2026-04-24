@@ -68,5 +68,10 @@ for (i in 0...n) {
   val = ntoggle.activate.value
 }
 
+// Print the final val so the bench-correctness step can diff our
+// stdout against standard Wren. Without this, a miscompile that
+// silently bails out of the toggle loop would look like a huge speedup.
+System.print(val)
+
 var elapsed = System.clock - start
 System.print("elapsed: %(elapsed)")
