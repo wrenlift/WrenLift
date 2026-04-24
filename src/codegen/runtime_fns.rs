@@ -3282,6 +3282,18 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
             _ => {}
         }
     }
+    // Fallback: dispatch to the `[_]=(_)` method for user classes or
+    // builtins with custom subscript-set overloads. Same rationale as
+    // the matching fallback in wren_subscript_get — without this the
+    // JIT silently drops `foo[bar] = baz` for every non-builtin
+    // receiver and returns null-but-"arity 1" runtime errors at the
+    // next use site.
+    let vm = unsafe { vm_ref() };
+    if let Some(vm) = vm {
+        if let Some(v) = vm.call_method_on(recv, "[_]=(_)", &[idx, value]) {
+            return v.to_bits();
+        }
+    }
     value.to_bits()
 }
 
