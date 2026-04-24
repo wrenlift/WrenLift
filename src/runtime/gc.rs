@@ -435,6 +435,7 @@ impl Gc {
                 }
                 check_raw(fiber.caller as *const u8, "fiber.caller");
                 check_val(fiber.error, "fiber.error");
+                check_val(fiber.context_map, "fiber.context_map");
             }
             ObjType::Class => {
                 let class = &*(header as *mut ObjClass);
@@ -993,6 +994,7 @@ impl Gc {
                 }
                 check_raw(fiber.caller as *const u8, "fiber.caller");
                 check_val(fiber.error, "fiber.error");
+                check_val(fiber.context_map, "fiber.context_map");
             }
             ObjType::Class => {
                 let class = &*(header as *mut ObjClass);
@@ -1214,6 +1216,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                 mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
             }
             mark_value(fiber.error, gray_stack);
+            mark_value(fiber.context_map, gray_stack);
         }
 
         ObjType::Class => {
@@ -1359,6 +1362,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
             }
             update_raw_ptr_inline(&mut fiber.caller, nursery);
             update_value_inline(&mut fiber.error, nursery);
+            update_value_inline(&mut fiber.context_map, nursery);
         }
 
         ObjType::Class => {

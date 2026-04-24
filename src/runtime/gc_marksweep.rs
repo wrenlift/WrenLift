@@ -177,6 +177,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                 mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
             }
             mark_value(fiber.error, gray_stack);
+            mark_value(fiber.context_map, gray_stack);
         }
 
         ObjType::Class => {

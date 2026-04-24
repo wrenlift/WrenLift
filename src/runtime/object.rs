@@ -975,6 +975,16 @@ pub struct ObjFiber {
     /// Set by the interpreter when a child fiber yields/completes back to a
     /// caller whose frames have been temporarily removed (JIT barrier).
     pub jit_resume_value: Option<Value>,
+    /// Per-fiber key/value context (Go's `context.Context` values half).
+    /// Null until first access; see `Fiber.context`. Child fibers inherit
+    /// a shallow copy from their spawn-parent at `Fiber.new` time.
+    pub context_map: Value,
+    /// Cooperative-cancellation flag. Set by `Fiber.cancel()`, polled by
+    /// the fiber itself via `Fiber.isCancelled` at yield/check points.
+    pub cancelled: bool,
+    /// Absolute deadline in millis since the Unix epoch, or None for "no
+    /// deadline". Inherits from the spawn parent at `Fiber.new`.
+    pub deadline_ms: Option<f64>,
 }
 
 impl Default for ObjFiber {
@@ -997,6 +1007,9 @@ impl ObjFiber {
             spawn_trace: None,
             is_try: false,
             jit_resume_value: None,
+            context_map: Value::null(),
+            cancelled: false,
+            deadline_ms: None,
         }
     }
 

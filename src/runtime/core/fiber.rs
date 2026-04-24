@@ -1,6 +1,6 @@
 use crate::runtime::engine::FuncId;
 use crate::runtime::object::{
-    FiberState, MirCallFrame, NativeContext, ObjClosure, ObjFiber, ObjHeader, ObjType,
+    FiberState, MirCallFrame, NativeContext, ObjClosure, ObjFiber, ObjHeader, ObjMap, ObjType,
 };
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
@@ -93,12 +93,46 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             let module_name = ctx
                 .func_module(func_id)
                 .unwrap_or_else(|| unsafe { current_module_name(ctx) });
+
+            // Snapshot parent's context bag + deadline before we alloc
+            // (alloc can move objects on nursery GC, invalidating caller).
+            // Cancellation does NOT inherit — each fiber decides its own
+            // timeline, and a cancelled parent cascades only if the user
+            // wires it up explicitly.
+            let parent = ctx.get_current_fiber();
+            let (parent_ctx_entries, parent_deadline) = unsafe {
+                if parent.is_null() {
+                    (Vec::new(), None)
+                } else {
+                    let entries = snapshot_context_entries(parent);
+                    ((*parent).deadline_ms)
+                        .map_or((entries.clone(), None), |d| (entries, Some(d)))
+                }
+            };
+
             let fiber = ctx.alloc_fiber();
             unsafe {
                 (*fiber).header.class = ctx.get_fiber_class();
                 setup_fiber_from_closure(fiber, closure, module_name);
                 (*fiber).spawn_trace = spawn_trace;
+                (*fiber).deadline_ms = parent_deadline;
             }
+
+            // Populate the child's context map (allocates) only if parent
+            // had entries. Keeps the zero-context case allocation-free.
+            if !parent_ctx_entries.is_empty() {
+                let child_map = ctx.alloc_map();
+                unsafe {
+                    if let Some(map_ptr) = child_map.as_object() {
+                        let map = map_ptr as *mut ObjMap;
+                        for (k, v) in parent_ctx_entries {
+                            (*map).set(k, v);
+                        }
+                    }
+                    (*fiber).context_map = child_map;
+                }
+            }
+
             Value::object(fiber as *mut u8)
         }
         None => {
@@ -106,6 +140,165 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             Value::null()
         }
     }
+}
+
+/// Snapshot a fiber's context entries into an owned Vec so the caller
+/// can pass them to a later `alloc_map` without worrying about GC
+/// moving the source map mid-copy.
+unsafe fn snapshot_context_entries(fiber: *mut ObjFiber) -> Vec<(Value, Value)> {
+    if fiber.is_null() || (*fiber).context_map.is_null() {
+        return Vec::new();
+    }
+    let ptr = match (*fiber).context_map.as_object() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let header = ptr as *const ObjHeader;
+    if (*header).obj_type != ObjType::Map {
+        return Vec::new();
+    }
+    let map = ptr as *const ObjMap;
+    (*map)
+        .entries
+        .iter()
+        .map(|(k, &v)| (k.value(), v))
+        .collect()
+}
+
+/// Return (or lazily create + cache) a fiber's context map.
+unsafe fn get_or_init_context_map(ctx: &mut dyn NativeContext, fiber: *mut ObjFiber) -> Value {
+    if !(*fiber).context_map.is_null() {
+        return (*fiber).context_map;
+    }
+    let map = ctx.alloc_map();
+    (*fiber).context_map = map;
+    map
+}
+
+// --- Context / cancellation / deadline ---
+
+fn fiber_context_get(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let cur = ctx.get_current_fiber();
+    if cur.is_null() {
+        ctx.runtime_error("Fiber.context called outside a fiber.".to_string());
+        return Value::null();
+    }
+    unsafe { get_or_init_context_map(ctx, cur) }
+}
+
+fn fiber_is_cancelled_static(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let cur = ctx.get_current_fiber();
+    if cur.is_null() {
+        return Value::bool(false);
+    }
+    unsafe { Value::bool((*cur).cancelled) }
+}
+
+fn fiber_cancel_static(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let cur = ctx.get_current_fiber();
+    if !cur.is_null() {
+        unsafe {
+            (*cur).cancelled = true;
+        }
+    }
+    Value::null()
+}
+
+fn fiber_deadline_ms_static(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    let cur = ctx.get_current_fiber();
+    if cur.is_null() {
+        return Value::null();
+    }
+    unsafe {
+        match (*cur).deadline_ms {
+            Some(ms) => Value::num(ms),
+            None => Value::null(),
+        }
+    }
+}
+
+fn fiber_set_deadline_ms_static(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let cur = ctx.get_current_fiber();
+    if cur.is_null() {
+        ctx.runtime_error("Fiber.setDeadlineMs called outside a fiber.".to_string());
+        return Value::null();
+    }
+    unsafe {
+        (*cur).deadline_ms = if args[1].is_null() {
+            None
+        } else {
+            args[1].as_num()
+        };
+    }
+    Value::null()
+}
+
+fn fiber_context_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => unsafe { get_or_init_context_map(ctx, f) },
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+            Value::null()
+        }
+    }
+}
+
+fn fiber_cancel_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => unsafe {
+            (*f).cancelled = true;
+        },
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+        }
+    }
+    Value::null()
+}
+
+fn fiber_is_cancelled_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => unsafe { Value::bool((*f).cancelled) },
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+            Value::null()
+        }
+    }
+}
+
+fn fiber_deadline_ms_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => unsafe {
+            match (*f).deadline_ms {
+                Some(ms) => Value::num(ms),
+                None => Value::null(),
+            }
+        },
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+            Value::null()
+        }
+    }
+}
+
+fn fiber_set_deadline_ms_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let fiber = unsafe { as_fiber(args[0]) };
+    match fiber {
+        Some(f) => unsafe {
+            (*f).deadline_ms = if args[1].is_null() {
+                None
+            } else {
+                args[1].as_num()
+            };
+        },
+        None => {
+            ctx.runtime_error("Expected a fiber.".to_string());
+        }
+    }
+    Value::null()
 }
 
 fn fiber_abort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -371,6 +564,13 @@ pub fn bind(vm: &mut VM) {
     vm.primitive_static(class, "yield()", fiber_yield_0);
     vm.primitive_static(class, "yield(_)", fiber_yield_1);
 
+    // Context / cancellation / deadline — current-fiber shortcuts.
+    vm.primitive_static(class, "context", fiber_context_get);
+    vm.primitive_static(class, "isCancelled", fiber_is_cancelled_static);
+    vm.primitive_static(class, "cancel()", fiber_cancel_static);
+    vm.primitive_static(class, "deadlineMs", fiber_deadline_ms_static);
+    vm.primitive_static(class, "setDeadlineMs(_)", fiber_set_deadline_ms_static);
+
     // Instance methods
     vm.primitive(class, "call()", fiber_call_0);
     vm.primitive(class, "call(_)", fiber_call_1);
@@ -382,4 +582,12 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "try()", fiber_try_0);
     vm.primitive(class, "try(_)", fiber_try_1);
     vm.primitive(class, "stackTrace", fiber_stack_trace);
+
+    // Per-instance context / cancellation / deadline (inspect / control
+    // a fiber from outside it).
+    vm.primitive(class, "context", fiber_context_instance);
+    vm.primitive(class, "cancel()", fiber_cancel_instance);
+    vm.primitive(class, "isCancelled", fiber_is_cancelled_instance);
+    vm.primitive(class, "deadlineMs", fiber_deadline_ms_instance);
+    vm.primitive(class, "setDeadlineMs(_)", fiber_set_deadline_ms_instance);
 }
