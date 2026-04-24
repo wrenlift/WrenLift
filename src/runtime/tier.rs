@@ -243,10 +243,7 @@ impl TierManager {
     /// the site key.
     #[inline]
     pub fn osr_entry(&self, id: FuncId, site: u64) -> Option<*mut ()> {
-        self.beads
-            .get(id.0 as usize)?
-            .as_ref()?
-            .osr_entry(site)
+        self.beads.get(id.0 as usize)?.as_ref()?.osr_entry(site)
     }
 
     /// Install a new compiled pointer, choosing the right beadie API
@@ -313,10 +310,7 @@ impl TierManager {
     /// Current state for diagnostics. Returns `None` if the id was
     /// never registered.
     pub fn state(&self, id: FuncId) -> Option<BeadState> {
-        self.beads
-            .get(id.0 as usize)?
-            .as_ref()
-            .map(|b| b.state())
+        self.beads.get(id.0 as usize)?.as_ref().map(|b| b.state())
     }
 
     /// Invocation count so far. Useful for `WLIFT_TIER_TRACE`-style
