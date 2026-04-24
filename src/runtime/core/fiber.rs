@@ -105,8 +105,7 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                     (Vec::new(), None)
                 } else {
                     let entries = snapshot_context_entries(parent);
-                    ((*parent).deadline_ms)
-                        .map_or((entries.clone(), None), |d| (entries, Some(d)))
+                    ((*parent).deadline_ms).map_or((entries.clone(), None), |d| (entries, Some(d)))
                 }
             };
 
