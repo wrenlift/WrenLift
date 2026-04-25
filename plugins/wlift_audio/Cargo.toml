@@ -1,0 +1,13 @@
+[package]
+name = "wlift_audio"
+version = "0.1.0"
+edition = "2021"
+description = "Audio playback for the WrenLift game framework. cpal-backed output stream + a tiny mixer; WAV decoding via hound. Bundled into @hatch:audio."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wren_lift = { path = "../..", default-features = false }
+cpal  = "0.17"
+hound = "3.5"
