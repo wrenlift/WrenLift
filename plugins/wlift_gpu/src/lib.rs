@@ -15,12 +15,14 @@
 //! cross-dylib drop ordering — at the cost of a `HashMap` lookup
 //! per call. Profile if it shows up.
 //!
-//! # Phase 1 scope
+//! # Current scope
 //!
-//! Headless: device + adapter, buffer, texture (as render
-//! attachment + readback target), shader module, render pipeline,
-//! command encoder, render pass, sampler, bind group + layout.
-//! No window, no surface — those land in phase 3.
+//! Headless rendering: device + adapter, buffer, texture (as
+//! render attachment or readback source), shader module, render
+//! pipeline, command encoder, render pass, sampler, bind group +
+//! layout. Windowing / surfaces are not exposed yet — render to a
+//! texture and read pixels back through `Buffer.readBytes` for
+//! off-screen pipelines and tests.
 //!
 //! # Safety
 //!
@@ -1005,11 +1007,12 @@ pub extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
                     return;
                 }
             };
-            // wgpu emits errors via the device's error callback; for
-            // phase 1 we surface them as runtime errors via the
-            // device's pollster-blocking validation path. Compile
-            // errors panic-via-callback in wgpu so wrap in
-            // catch_unwind; cleaner error mapping lands later.
+            // wgpu emits compile errors via the device's error
+            // callback rather than the create_shader_module return
+            // value. We surface them through the validation path
+            // attached to the device; cleaner per-error mapping
+            // (line + column inside the WGSL source) is a planned
+            // follow-up.
             dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: label.as_deref(),
                 source: wgpu::ShaderSource::Wgsl(code.into()),
@@ -1281,8 +1284,8 @@ pub extern "C" fn wlift_gpu_sampler_destroy(vm: *mut VM) {
 //         "visibility": List<String>, // "vertex" | "fragment" | "compute"
 //         "kind": "uniform" | "storage" | "read-only-storage" |
 //                 "sampler" | "texture" | "storage-texture",
-//         // sampler/texture extras as needed; phase 1 covers
-//         // uniform + texture + sampler (filtering)
+//         // sampler/texture extras as needed; this currently
+//         // covers uniform + texture + sampler (filtering)
 //         "viewDimension": "2d" (texture only),
 //         "sampleType":   "float" | "depth" (texture only),
 //       },
@@ -2023,7 +2026,7 @@ pub extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
         }
 
         // -- Fragment stage --------------------------------------
-        // Optional, but phase 1 spec needs it (color output).
+        // Optional but almost always present (color output).
         let fragment_v = map_get(desc, "fragment");
         struct FragInfo {
             module_id: u64,
@@ -2960,9 +2963,10 @@ pub extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut VM) {
             let _ = sender.send(res);
         });
         // Block until the GPU finishes pending work and the map
-        // completes. Maintain::Wait is the right knob here — phase
-        // 1 specs are deterministic micro-renders, no concern about
-        // stalling user fibers.
+        // completes. Maintain::Wait is the right knob for tests
+        // and one-shot CPU readback; an async/fiber-yielding map
+        // path is a planned addition for long-running pipelines
+        // that shouldn't stall the host.
         dev.device.poll(wgpu::Maintain::Wait);
         match receiver.recv() {
             Ok(Ok(())) => {}
