@@ -27,6 +27,9 @@ enum Command {
     /// Creates the directory (if missing), writes a `hatchfile` with
     /// reasonable defaults, and drops a `main.wren` stub. The result
     /// is a project `hatch build` can pack without further setup.
+    ///
+    /// Use `--template web` for a starter @hatch:web app (router,
+    /// session, htmx-ready landing page) instead of a bare hello-world.
     Init {
         /// Directory to scaffold. Defaults to the current directory.
         #[arg(value_name = "DIR", default_value = ".")]
@@ -35,6 +38,27 @@ enum Command {
         /// the directory's basename.
         #[arg(long)]
         name: Option<String>,
+        /// Starter template — `bare` (default) for a hello-world,
+        /// `web` for an @hatch:web app.
+        #[arg(long, value_name = "KIND", default_value = "bare")]
+        template: String,
+    },
+    /// Watch the workspace and re-run the entry on every save.
+    ///
+    /// Spawns `wlift --mode interpreter --step-limit 0 <entry>.wren`
+    /// as a subprocess; polls *.wren mtimes every 500ms and SIGTERMs
+    /// + restarts the subprocess when anything changes. Cheap and
+    /// good enough for the iteration loop. Ctrl-C exits.
+    Dev {
+        /// Workspace root. Defaults to the current directory.
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Run every *.spec.wren in the workspace and aggregate results.
+    Test {
+        /// Workspace root. Defaults to the current directory.
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
     },
     /// Build the current workspace into a `.hatch` artifact.
     ///
@@ -135,7 +159,13 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Command::Init { dir, name } => cmd_init(&dir, name.as_deref()),
+        Command::Init {
+            dir,
+            name,
+            template,
+        } => cmd_init(&dir, name.as_deref(), &template),
+        Command::Dev { dir } => cmd_dev(&dir),
+        Command::Test { dir } => cmd_test(&dir),
         Command::Build { dir, out } => cmd_build(&dir, out.as_deref()),
         Command::Inspect { path } => cmd_inspect(&path),
         Command::Run { target, withs } => cmd_run(&target, &withs),
@@ -171,7 +201,7 @@ fn cmd_stub(msg: &str) -> ! {
 // init
 // ---------------------------------------------------------------------------
 
-fn cmd_init(dir: &Path, name_override: Option<&str>) {
+fn cmd_init(dir: &Path, name_override: Option<&str>, template: &str) {
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("error: cannot create '{}': {}", dir.display(), e);
         process::exit(1);
@@ -189,6 +219,34 @@ fn cmd_init(dir: &Path, name_override: Option<&str>) {
     let name = name_override
         .map(str::to_string)
         .unwrap_or_else(|| default_package_name(dir));
+
+    match template {
+        "bare" => scaffold_bare(dir, &name),
+        "web" => scaffold_web(dir, &name),
+        other => {
+            eprintln!(
+                "error: unknown template '{}'. expected one of: bare, web",
+                other
+            );
+            process::exit(1);
+        }
+    }
+
+    eprintln!(
+        "initialised workspace '{}' ({}) in {}",
+        name,
+        template,
+        dir.canonicalize()
+            .unwrap_or_else(|_| dir.to_path_buf())
+            .display()
+    );
+    if template == "web" {
+        eprintln!("  next: cd {} && wlift --mode interpreter --step-limit 0 main.wren", dir.display());
+    }
+}
+
+fn scaffold_bare(dir: &Path, name: &str) {
+    let hatchfile_path = dir.join(HATCHFILE);
     let hatchfile_contents = format!(
         r#"# wrenlift workspace manifest.
 # See https://github.com/wrenlift/hatch for the full reference.
@@ -206,29 +264,105 @@ modules = ["main"]
 # libfoo = "0.2"
 "#
     );
-    if let Err(e) = std::fs::write(&hatchfile_path, hatchfile_contents) {
-        eprintln!("error: cannot write '{}': {}", hatchfile_path.display(), e);
-        process::exit(1);
-    }
+    write_or_die(&hatchfile_path, &hatchfile_contents);
 
     let main_path = dir.join("main.wren");
     if !main_path.exists() {
         let stub = format!(
             "// Entry point for package '{name}'. `hatch run` executes this file.\nSystem.print(\"hello from {name}\")\n"
         );
-        if let Err(e) = std::fs::write(&main_path, stub) {
-            eprintln!("error: cannot write '{}': {}", main_path.display(), e);
+        write_or_die(&main_path, &stub);
+    }
+}
+
+fn scaffold_web(dir: &Path, name: &str) {
+    let hatchfile_path = dir.join(HATCHFILE);
+    let hatchfile_contents = format!(
+        r#"# wrenlift workspace manifest — @hatch:web starter.
+
+name = "{name}"
+version = "0.1.0"
+entry = "main"
+description = "A @hatch:web app"
+
+modules = ["main"]
+
+[dependencies]
+"@hatch:web" = "0.1"
+"#
+    );
+    write_or_die(&hatchfile_path, &hatchfile_contents);
+
+    let main_path = dir.join("main.wren");
+    if !main_path.exists() {
+        let stub = format!(
+            r#"// Entry point for {name}. Run with:
+//
+//   wlift --mode interpreter --step-limit 0 main.wren
+//
+// Then open http://127.0.0.1:3000
+
+import "@hatch:web" for App, Css
+
+var app = App.new()
+
+var page    = Css.tw("font-sans max-w-2xl mx-auto my-10 p-6")
+var heading = Css.tw("text-3xl font-bold text-gray-900 mb-4")
+var btn     = Css.tw("inline-block bg-blue-500 text-white px-4 py-2 rounded font-semibold")
+                .hover("bg-blue-600")
+
+app.get("/") {{|req|
+  req.style(page)
+  req.style(heading)
+  req.style(btn)
+  return req.fragmentSheet.styleTag +
+    "<div class='" + page.className + "'>" +
+    "<h1 class='" + heading.className + "'>{name}</h1>" +
+    "<p>Hello from @hatch:web. Edit <code>main.wren</code> to start.</p>" +
+    "<p style='margin-top:1rem;'>" +
+    "<a class='" + btn.className + "' href='/hi/world'>Try a route</a>" +
+    "</p>" +
+    "</div>"
+}}
+
+app.get("/hi/:who") {{|req|
+  if (req.isHx) return "<span>hello %(req.param("who"))</span>"
+  return "<h1>Hello, %(req.param("who"))!</h1><p><a href='/'>back</a></p>"
+}}
+
+app.listen("127.0.0.1:3000")
+"#
+        );
+        write_or_die(&main_path, &stub);
+    }
+
+    let public_dir = dir.join("public");
+    if !public_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&public_dir) {
+            eprintln!(
+                "error: cannot create '{}': {}",
+                public_dir.display(),
+                e
+            );
             process::exit(1);
         }
     }
+    let gitkeep = public_dir.join(".gitkeep");
+    if !gitkeep.exists() {
+        write_or_die(&gitkeep, "");
+    }
 
-    eprintln!(
-        "initialised workspace '{}' in {}",
-        name,
-        dir.canonicalize()
-            .unwrap_or_else(|_| dir.to_path_buf())
-            .display()
-    );
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        write_or_die(&gitignore, "*.hatch\n.DS_Store\n");
+    }
+}
+
+fn write_or_die(path: &Path, contents: &str) {
+    if let Err(e) = std::fs::write(path, contents) {
+        eprintln!("error: cannot write '{}': {}", path.display(), e);
+        process::exit(1);
+    }
 }
 
 fn default_package_name(dir: &Path) -> String {
@@ -870,5 +1004,307 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
         InterpretResult::Success => {}
         InterpretResult::CompileError => process::exit(65),
         InterpretResult::RuntimeError => process::exit(70),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dev — file watcher + auto-restart
+// ---------------------------------------------------------------------------
+
+fn cmd_dev(dir: &Path) {
+    if !dir.is_dir() {
+        eprintln!("error: '{}' is not a directory", dir.display());
+        process::exit(1);
+    }
+    let entry = read_entry_name(&dir.join(HATCHFILE)).unwrap_or_else(|| "main".to_string());
+    let entry_path = dir.join(format!("{}.wren", entry));
+    if !entry_path.exists() {
+        eprintln!(
+            "error: entry '{}' does not exist (set `entry` in {})",
+            entry_path.display(),
+            HATCHFILE
+        );
+        process::exit(1);
+    }
+
+    let wlift = locate_wlift().unwrap_or_else(|| {
+        eprintln!("error: cannot locate `wlift` binary on PATH or alongside this hatch");
+        process::exit(1);
+    });
+
+    eprintln!(
+        "hatch dev: watching {} (entry: {})",
+        dir.display(),
+        entry_path.display()
+    );
+    eprintln!("hatch dev: ctrl-c to stop");
+
+    // Ctrl-C is delivered to the foreground process group, so both
+    // hatch and the wlift child receive SIGINT and exit cleanly
+    // without explicit handling. The child is drop-killed if the
+    // parent panics.
+    let mut last = scan_wren_mtimes(dir);
+    let mut child = spawn_dev_child(&wlift, &entry_path);
+
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Drain exit if the child died on its own (compile error,
+        // runtime abort) — surface and wait for the next file change.
+        if let Ok(Some(status)) = child.try_wait() {
+            eprintln!(
+                "hatch dev: process exited ({}) — waiting for changes",
+                status
+            );
+            // Wait until something changes, then respawn.
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let now = scan_wren_mtimes(dir);
+                if now != last {
+                    last = now;
+                    child = spawn_dev_child(&wlift, &entry_path);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        let now = scan_wren_mtimes(dir);
+        if now != last {
+            eprintln!("hatch dev: change detected — restarting");
+            let _ = child.kill();
+            let _ = child.wait();
+            child = spawn_dev_child(&wlift, &entry_path);
+            last = now;
+        }
+    }
+}
+
+fn spawn_dev_child(wlift: &Path, entry: &Path) -> std::process::Child {
+    std::process::Command::new(wlift)
+        .arg("--mode")
+        .arg("interpreter")
+        .arg("--step-limit")
+        .arg("0")
+        .arg(entry)
+        .spawn()
+        .unwrap_or_else(|e| {
+            eprintln!("error: cannot spawn wlift: {}", e);
+            process::exit(1);
+        })
+}
+
+fn scan_wren_mtimes(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time::SystemTime> {
+    let mut out = std::collections::BTreeMap::new();
+    walk_wren(dir, &mut out);
+    out
+}
+
+fn walk_wren(
+    dir: &Path,
+    out: &mut std::collections::BTreeMap<PathBuf, std::time::SystemTime>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            // Skip hidden + the OS junk + common build dirs.
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+        }
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            walk_wren(&path, out);
+        } else if ft.is_file()
+            && path.extension().and_then(|s| s.to_str()) == Some("wren")
+        {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mt) = meta.modified() {
+                    out.insert(path, mt);
+                }
+            }
+        }
+    }
+}
+
+fn read_entry_name(hatchfile: &Path) -> Option<String> {
+    // Looking for `entry = "main"` at the top level of the
+    // hatchfile. Tolerant of leading whitespace and either single
+    // or double quotes; ignores anything inside a `[section]`.
+    let text = std::fs::read_to_string(hatchfile).ok()?;
+    let mut in_section = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_section = true;
+            continue;
+        }
+        if in_section {
+            continue;
+        }
+        let (k, v) = match line.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        if k.trim() != "entry" {
+            continue;
+        }
+        let v = v.trim().trim_matches('"').trim_matches('\'');
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn locate_wlift() -> Option<PathBuf> {
+    // Prefer a `wlift` next to the hatch binary (the cargo install
+    // / release-build layout puts both in the same dir), else walk
+    // PATH for the executable. Avoids pulling in the `which` crate.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join("wlift");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for entry in std::env::split_paths(&path) {
+        let candidate = entry.join("wlift");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// test — discover and run *.spec.wren
+// ---------------------------------------------------------------------------
+
+fn cmd_test(dir: &Path) {
+    if !dir.is_dir() {
+        eprintln!("error: '{}' is not a directory", dir.display());
+        process::exit(1);
+    }
+    let wlift = locate_wlift().unwrap_or_else(|| {
+        eprintln!("error: cannot locate `wlift` binary");
+        process::exit(1);
+    });
+
+    let mut specs = Vec::new();
+    walk_specs(dir, &mut specs);
+    if specs.is_empty() {
+        eprintln!("hatch test: no *.spec.wren files found under {}", dir.display());
+        return;
+    }
+    specs.sort();
+
+    eprintln!("hatch test: {} spec file(s)", specs.len());
+    let mut total_pass = 0u32;
+    let mut total_fail = 0u32;
+    let mut failed_files = Vec::new();
+    for spec in &specs {
+        eprintln!("  · {}", spec.display());
+        let parent = spec.parent().unwrap_or(dir);
+        let output = std::process::Command::new(&wlift)
+            .arg("--mode")
+            .arg("interpreter")
+            .arg(spec.file_name().unwrap())
+            .current_dir(parent)
+            .output();
+        let output = match output {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("    error spawning wlift: {}", e);
+                failed_files.push(spec.clone());
+                total_fail += 1;
+                continue;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Last "ok: N/M passed" line wins.
+        let mut last_ok: Option<(u32, u32)> = None;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("ok: ") {
+                if let Some((p, m)) = rest.split_once('/') {
+                    let m = m.trim_end_matches(" passed");
+                    if let (Ok(p), Ok(m)) = (p.parse::<u32>(), m.parse::<u32>()) {
+                        last_ok = Some((p, m));
+                    }
+                }
+            }
+        }
+        match last_ok {
+            Some((p, m)) => {
+                total_pass += p;
+                total_fail += m - p;
+                if p < m {
+                    failed_files.push(spec.clone());
+                }
+            }
+            None if output.status.success() => {
+                // No spec-style output but exited OK — treat as a pass.
+                total_pass += 1;
+            }
+            None => {
+                failed_files.push(spec.clone());
+                total_fail += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "\nhatch test: {} passed, {} failed across {} file(s)",
+        total_pass,
+        total_fail,
+        specs.len()
+    );
+    if !failed_files.is_empty() {
+        eprintln!("failures:");
+        for f in failed_files {
+            eprintln!("  - {}", f.display());
+        }
+        process::exit(1);
+    }
+}
+
+fn walk_specs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+        }
+        let ft = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
+            walk_specs(&path, out);
+        } else if ft.is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.ends_with(".spec.wren") {
+                    out.push(path);
+                }
+            }
+        }
     }
 }
