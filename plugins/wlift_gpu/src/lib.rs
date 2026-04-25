@@ -250,37 +250,65 @@ fn samplers() -> &'static Mutex<Samplers> {
 
 fn bind_group_layouts() -> &'static Mutex<BindGroupLayouts> {
     static REG: OnceLock<Mutex<BindGroupLayouts>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(BindGroupLayouts { layouts: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(BindGroupLayouts {
+            layouts: HashMap::new(),
+        })
+    })
 }
 
 fn pipeline_layouts() -> &'static Mutex<PipelineLayouts> {
     static REG: OnceLock<Mutex<PipelineLayouts>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(PipelineLayouts { layouts: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(PipelineLayouts {
+            layouts: HashMap::new(),
+        })
+    })
 }
 
 fn bind_groups() -> &'static Mutex<BindGroups> {
     static REG: OnceLock<Mutex<BindGroups>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(BindGroups { groups: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(BindGroups {
+            groups: HashMap::new(),
+        })
+    })
 }
 
 fn render_pipelines() -> &'static Mutex<RenderPipelines> {
     static REG: OnceLock<Mutex<RenderPipelines>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(RenderPipelines { pipelines: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(RenderPipelines {
+            pipelines: HashMap::new(),
+        })
+    })
 }
 
 fn encoders() -> &'static Mutex<Encoders> {
     static REG: OnceLock<Mutex<Encoders>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(Encoders { encoders: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(Encoders {
+            encoders: HashMap::new(),
+        })
+    })
 }
 
 fn surfaces() -> &'static Mutex<Surfaces> {
     static REG: OnceLock<Mutex<Surfaces>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(Surfaces { surfaces: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(Surfaces {
+            surfaces: HashMap::new(),
+        })
+    })
 }
 
 fn surface_frames() -> &'static Mutex<SurfaceFrames> {
     static REG: OnceLock<Mutex<SurfaceFrames>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(SurfaceFrames { frames: HashMap::new() }))
+    REG.get_or_init(|| {
+        Mutex::new(SurfaceFrames {
+            frames: HashMap::new(),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +374,9 @@ unsafe fn texture_usage_from_list(vm: &mut VM, v: Value) -> Option<wgpu::Texture
         let s = match unsafe { string_of(list_get(list, i)) } {
             Some(s) => s,
             None => {
-                vm.runtime_error("Texture.create: every `usage` entry must be a string.".to_string());
+                vm.runtime_error(
+                    "Texture.create: every `usage` entry must be a string.".to_string(),
+                );
                 return None;
             }
         };
@@ -517,10 +547,7 @@ unsafe fn buffer_usage_from_list(vm: &mut VM, v: Value) -> Option<wgpu::BufferUs
             "map-write" | "mapWrite" => wgpu::BufferUsages::MAP_WRITE,
             "query-resolve" | "queryResolve" => wgpu::BufferUsages::QUERY_RESOLVE,
             other => {
-                vm.runtime_error(format!(
-                    "Buffer.create: unknown usage flag '{}'.",
-                    other
-                ));
+                vm.runtime_error(format!("Buffer.create: unknown usage flag '{}'.", other));
                 return None;
             }
         };
@@ -588,21 +615,20 @@ pub unsafe extern "C" fn wlift_gpu_request_device(vm: *mut VM) {
             ..Default::default()
         });
 
-        let adapter = match pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: power_pref,
                 compatible_surface: None,
                 force_fallback_adapter: false,
-            },
-        )) {
-            Some(a) => a,
-            None => {
-                ctx(vm).runtime_error(
-                    "Gpu.requestDevice: no compatible adapter found.".to_string(),
-                );
-                return;
-            }
-        };
+            })) {
+                Some(a) => a,
+                None => {
+                    ctx(vm).runtime_error(
+                        "Gpu.requestDevice: no compatible adapter found.".to_string(),
+                    );
+                    return;
+                }
+            };
 
         let (device, queue) = match pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -942,11 +968,7 @@ pub unsafe extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut VM) {
 /// `call_method_on` hazard — no callbacks back into the VM during
 /// the conversion loop, so the outer list's `elements` pointer
 /// stays valid for the whole pass.
-unsafe fn write_buffer_math_batch(
-    vm: *mut VM,
-    label: &str,
-    floats_per_element: usize,
-) {
+unsafe fn write_buffer_math_batch(vm: *mut VM, label: &str, floats_per_element: usize) {
     unsafe {
         let buffer_id = match id_of(ctx(vm), slot(vm, 1), label) {
             Some(i) => i,
@@ -1061,8 +1083,7 @@ pub unsafe extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
             Some(c) => c,
             None => {
                 ctx(vm).runtime_error(
-                    "ShaderModule.create: descriptor must include a `code` string."
-                        .to_string(),
+                    "ShaderModule.create: descriptor must include a `code` string.".to_string(),
                 );
                 return;
             }
@@ -1084,10 +1105,11 @@ pub unsafe extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
             // attached to the device; cleaner per-error mapping
             // (line + column inside the WGSL source) is a planned
             // follow-up.
-            dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: label.as_deref(),
-                source: wgpu::ShaderSource::Wgsl(code.into()),
-            })
+            dev.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: label.as_deref(),
+                    source: wgpu::ShaderSource::Wgsl(code.into()),
+                })
         };
 
         let id = next_id();
@@ -1147,10 +1169,7 @@ pub unsafe extern "C" fn wlift_gpu_texture_create(vm: *mut VM) {
             Some(s) => match texture_format_from_str(&s) {
                 Some(f) => f,
                 None => {
-                    ctx(vm).runtime_error(format!(
-                        "Texture.create: unknown format '{}'.",
-                        s
-                    ));
+                    ctx(vm).runtime_error(format!("Texture.create: unknown format '{}'.", s));
                     return;
                 }
             },
@@ -1247,7 +1266,8 @@ pub unsafe extern "C" fn wlift_gpu_texture_create_view(vm: *mut VM) {
                     return;
                 }
             };
-            rec.texture.create_view(&wgpu::TextureViewDescriptor::default())
+            rec.texture
+                .create_view(&wgpu::TextureViewDescriptor::default())
         };
         let id = next_id();
         views().lock().unwrap().views.insert(id, view);
@@ -1461,9 +1481,8 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut VM) {
         let entries_list = match list_view(entries_v) {
             Some(l) => l,
             None => {
-                ctx(vm).runtime_error(
-                    "BindGroupLayout.create: `entries` must be a list.".to_string(),
-                );
+                ctx(vm)
+                    .runtime_error("BindGroupLayout.create: `entries` must be a list.".to_string());
                 return;
             }
         };
@@ -1512,19 +1531,22 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut VM) {
             let dev = match reg.devices.get(&device_id) {
                 Some(d) => d,
                 None => {
-                    ctx(vm).runtime_error(
-                        "BindGroupLayout.create: unknown device id.".to_string(),
-                    );
+                    ctx(vm).runtime_error("BindGroupLayout.create: unknown device id.".to_string());
                     return;
                 }
             };
-            dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: label.as_deref(),
-                entries: &entries,
-            })
+            dev.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: label.as_deref(),
+                    entries: &entries,
+                })
         };
         let id = next_id();
-        bind_group_layouts().lock().unwrap().layouts.insert(id, layout);
+        bind_group_layouts()
+            .lock()
+            .unwrap()
+            .layouts
+            .insert(id, layout);
         set_return(vm, Value::num(id as f64));
     }
 }
@@ -1565,7 +1587,8 @@ pub unsafe extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut VM) {
             Some(v) => v,
             None => {
                 ctx(vm).runtime_error(
-                    "PipelineLayout.create: descriptor must include `bindGroupLayouts`.".to_string(),
+                    "PipelineLayout.create: descriptor must include `bindGroupLayouts`."
+                        .to_string(),
                 );
                 return;
             }
@@ -1618,16 +1641,21 @@ pub unsafe extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut VM) {
                     return;
                 }
             };
-            dev.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: label.as_deref(),
-                bind_group_layouts: &refs,
-                push_constant_ranges: &[],
-            })
+            dev.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: label.as_deref(),
+                    bind_group_layouts: &refs,
+                    push_constant_ranges: &[],
+                })
         };
         drop(bgl_reg);
 
         let id = next_id();
-        pipeline_layouts().lock().unwrap().layouts.insert(id, layout);
+        pipeline_layouts()
+            .lock()
+            .unwrap()
+            .layouts
+            .insert(id, layout);
         set_return(vm, Value::num(id as f64));
     }
 }
@@ -1701,9 +1729,17 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
         // registry locks held during create_bind_group, so we
         // resolve them in a second pass below.
         enum EntryKind {
-            Buffer { id: u64, offset: u64, size: Option<u64> },
-            Sampler { id: u64 },
-            View { id: u64 },
+            Buffer {
+                id: u64,
+                offset: u64,
+                size: Option<u64>,
+            },
+            Sampler {
+                id: u64,
+            },
+            View {
+                id: u64,
+            },
         }
         let mut decoded: Vec<(u32, EntryKind)> = Vec::with_capacity(entries_list.count as usize);
         for i in 0..entries_list.count as usize {
@@ -1727,7 +1763,14 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
                 let size = map_get(entry, "size")
                     .and_then(|v| v.as_num())
                     .map(|n| n as u64);
-                decoded.push((binding, EntryKind::Buffer { id: bid, offset, size }));
+                decoded.push((
+                    binding,
+                    EntryKind::Buffer {
+                        id: bid,
+                        offset,
+                        size,
+                    },
+                ));
             } else if let Some(sid) = map_get(entry, "sampler").and_then(|v| v.as_num()) {
                 decoded.push((binding, EntryKind::Sampler { id: sid as u64 }));
             } else if let Some(vid) = map_get(entry, "view").and_then(|v| v.as_num()) {
@@ -1764,7 +1807,8 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
                     let buf = match buf_reg.buffers.get(id) {
                         Some(b) => b,
                         None => {
-                            ctx(vm).runtime_error("BindGroup.create: unknown buffer id.".to_string());
+                            ctx(vm)
+                                .runtime_error("BindGroup.create: unknown buffer id.".to_string());
                             return;
                         }
                     };
@@ -1778,7 +1822,8 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
                     let smp = match smp_reg.samplers.get(id) {
                         Some(s) => s,
                         None => {
-                            ctx(vm).runtime_error("BindGroup.create: unknown sampler id.".to_string());
+                            ctx(vm)
+                                .runtime_error("BindGroup.create: unknown sampler id.".to_string());
                             return;
                         }
                     };
@@ -1795,7 +1840,10 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
                     wgpu::BindingResource::TextureView(view)
                 }
             };
-            entries_built.push(wgpu::BindGroupEntry { binding: *binding, resource });
+            entries_built.push(wgpu::BindGroupEntry {
+                binding: *binding,
+                resource,
+            });
         }
 
         let bg = {
@@ -1960,7 +2008,8 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                     LayoutChoice::Id(n as u64)
                 } else {
                     ctx(vm).runtime_error(
-                        "RenderPipeline.create: `layout` must be 'auto' or a layout id.".to_string(),
+                        "RenderPipeline.create: `layout` must be 'auto' or a layout id."
+                            .to_string(),
                     );
                     return;
                 }
@@ -1988,9 +2037,8 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
         let v_entry = match map_get(vertex_v, "entryPoint").and_then(|v| string_of(v)) {
             Some(s) => s,
             None => {
-                ctx(vm).runtime_error(
-                    "RenderPipeline.create: vertex.entryPoint missing.".to_string(),
-                );
+                ctx(vm)
+                    .runtime_error("RenderPipeline.create: vertex.entryPoint missing.".to_string());
                 return;
             }
         };
@@ -2032,10 +2080,8 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                 let attrs_v = match map_get(layout, "attributes") {
                     Some(v) => v,
                     None => {
-                        ctx(vm).runtime_error(format!(
-                            "vertex.buffers[{}]: `attributes` missing.",
-                            i
-                        ));
+                        ctx(vm)
+                            .runtime_error(format!("vertex.buffers[{}]: `attributes` missing.", i));
                         return;
                     }
                 };
@@ -2052,8 +2098,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                 let mut attrs: Vec<wgpu::VertexAttribute> = Vec::new();
                 for j in 0..attrs_list.count as usize {
                     let attr = list_get(attrs_list, j);
-                    let location = match map_get(attr, "shaderLocation").and_then(|v| v.as_num())
-                    {
+                    let location = match map_get(attr, "shaderLocation").and_then(|v| v.as_num()) {
                         Some(n) => n as u32,
                         None => {
                             ctx(vm).runtime_error(format!(
@@ -2092,7 +2137,11 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                         format,
                     });
                 }
-                owned_layouts.push(OwnedLayout { stride, step_mode, attrs });
+                owned_layouts.push(OwnedLayout {
+                    stride,
+                    step_mode,
+                    attrs,
+                });
             }
         }
 
@@ -2156,10 +2205,8 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                         }
                     },
                     None => {
-                        ctx(vm).runtime_error(format!(
-                            "fragment.targets[{}]: `format` missing.",
-                            i
-                        ));
+                        ctx(vm)
+                            .runtime_error(format!("fragment.targets[{}]: `format` missing.", i));
                         return;
                     }
                 };
@@ -2209,17 +2256,12 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                 Some(s) => match texture_format_from_str(&s) {
                     Some(f) => f,
                     None => {
-                        ctx(vm).runtime_error(format!(
-                            "depthStencil.format: unknown '{}'.",
-                            s
-                        ));
+                        ctx(vm).runtime_error(format!("depthStencil.format: unknown '{}'.", s));
                         return;
                     }
                 },
                 None => {
-                    ctx(vm).runtime_error(
-                        "depthStencil: `format` missing.".to_string(),
-                    );
+                    ctx(vm).runtime_error("depthStencil: `format` missing.".to_string());
                     return;
                 }
             };
@@ -2252,9 +2294,8 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
             Some(m) => m,
             None => {
                 drop(shader_reg);
-                ctx(vm).runtime_error(
-                    "RenderPipeline.create: unknown vertex shader id.".to_string(),
-                );
+                ctx(vm)
+                    .runtime_error("RenderPipeline.create: unknown vertex shader id.".to_string());
                 return;
             }
         };
@@ -2306,9 +2347,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
                 None => {
                     drop(pl_reg);
                     drop(shader_reg);
-                    ctx(vm).runtime_error(
-                        "RenderPipeline.create: unknown device id.".to_string(),
-                    );
+                    ctx(vm).runtime_error("RenderPipeline.create: unknown device id.".to_string());
                     return;
                 }
             };
@@ -2340,7 +2379,11 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
         drop(shader_reg);
 
         let id = next_id();
-        render_pipelines().lock().unwrap().pipelines.insert(id, pipeline);
+        render_pipelines()
+            .lock()
+            .unwrap()
+            .pipelines
+            .insert(id, pipeline);
         set_return(vm, Value::num(id as f64));
     }
 }
@@ -2379,9 +2422,10 @@ pub unsafe extern "C" fn wlift_gpu_encoder_create(vm: *mut VM) {
                     return;
                 }
             };
-            dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: label.as_deref(),
-            })
+            dev.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: label.as_deref(),
+                })
         };
         let id = next_id();
         encoders()
@@ -2485,9 +2529,7 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
         let color_list = match list_view(color_v) {
             Some(l) => l,
             None => {
-                ctx(vm).runtime_error(
-                    "RenderPass: `colorAttachments` must be a list.".to_string(),
-                );
+                ctx(vm).runtime_error("RenderPass: `colorAttachments` must be a list.".to_string());
                 return;
             }
         };
@@ -2533,7 +2575,10 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
                     return;
                 }
             };
-            let depth_load = match map_get(d, "depthLoadOp").and_then(|v| string_of(v)).as_deref() {
+            let depth_load = match map_get(d, "depthLoadOp")
+                .and_then(|v| string_of(v))
+                .as_deref()
+            {
                 Some("load") => wgpu::LoadOp::Load,
                 _ => wgpu::LoadOp::Clear(
                     map_get(d, "depthClearValue")
@@ -2542,7 +2587,9 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
                         .unwrap_or(1.0),
                 ),
             };
-            let depth_store = match map_get(d, "depthStoreOp").and_then(|v| string_of(v)).as_deref()
+            let depth_store = match map_get(d, "depthStoreOp")
+                .and_then(|v| string_of(v))
+                .as_deref()
             {
                 Some("discard") => wgpu::StoreOp::Discard,
                 _ => wgpu::StoreOp::Store,
@@ -2574,11 +2621,26 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
 
         enum Cmd {
             SetPipeline(u64),
-            SetVertexBuffer { slot: u32, buffer: u64 },
-            SetIndexBuffer { buffer: u64, format: wgpu::IndexFormat },
-            SetBindGroup { index: u32, group: u64 },
-            Draw { vertex_count: u32, instance_count: u32 },
-            DrawIndexed { index_count: u32, instance_count: u32 },
+            SetVertexBuffer {
+                slot: u32,
+                buffer: u64,
+            },
+            SetIndexBuffer {
+                buffer: u64,
+                format: wgpu::IndexFormat,
+            },
+            SetBindGroup {
+                index: u32,
+                group: u64,
+            },
+            Draw {
+                vertex_count: u32,
+                instance_count: u32,
+            },
+            DrawIndexed {
+                index_count: u32,
+                instance_count: u32,
+            },
         }
         let mut decoded: Vec<Cmd> = Vec::with_capacity(commands_list.count as usize);
         for i in 0..commands_list.count as usize {
@@ -2586,39 +2648,54 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
             let op = match map_get(cmd, "op").and_then(|v| string_of(v)) {
                 Some(s) => s,
                 None => {
-                    ctx(vm).runtime_error(format!(
-                        "RenderPass commands[{}]: missing `op` string.",
-                        i
-                    ));
+                    ctx(vm)
+                        .runtime_error(format!("RenderPass commands[{}]: missing `op` string.", i));
                     return;
                 }
             };
             match op.as_str() {
                 "setPipeline" => {
-                    let pid = map_get(cmd, "pipeline").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    let pid = map_get(cmd, "pipeline")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u64;
                     decoded.push(Cmd::SetPipeline(pid));
                 }
                 "setVertexBuffer" => {
                     let s = map_get(cmd, "slot").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
-                    let b = map_get(cmd, "buffer").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    let b = map_get(cmd, "buffer")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u64;
                     decoded.push(Cmd::SetVertexBuffer { slot: s, buffer: b });
                 }
                 "setIndexBuffer" => {
-                    let b = map_get(cmd, "buffer").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    let b = map_get(cmd, "buffer")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u64;
                     let f = match map_get(cmd, "format").and_then(|v| string_of(v)).as_deref() {
                         Some("uint32") => wgpu::IndexFormat::Uint32,
                         _ => wgpu::IndexFormat::Uint16,
                     };
-                    decoded.push(Cmd::SetIndexBuffer { buffer: b, format: f });
+                    decoded.push(Cmd::SetIndexBuffer {
+                        buffer: b,
+                        format: f,
+                    });
                 }
                 "setBindGroup" => {
-                    let idx = map_get(cmd, "index").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
-                    let g = map_get(cmd, "group").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
-                    decoded.push(Cmd::SetBindGroup { index: idx, group: g });
+                    let idx = map_get(cmd, "index")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u32;
+                    let g = map_get(cmd, "group")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u64;
+                    decoded.push(Cmd::SetBindGroup {
+                        index: idx,
+                        group: g,
+                    });
                 }
                 "draw" => {
-                    let vc = map_get(cmd, "vertexCount").and_then(|v| v.as_num()).unwrap_or(0.0)
-                        as u32;
+                    let vc = map_get(cmd, "vertexCount")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u32;
                     let ic = map_get(cmd, "instanceCount")
                         .and_then(|v| v.as_num())
                         .unwrap_or(1.0) as u32;
@@ -2628,8 +2705,9 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
                     });
                 }
                 "drawIndexed" => {
-                    let ic = map_get(cmd, "indexCount").and_then(|v| v.as_num()).unwrap_or(0.0)
-                        as u32;
+                    let ic = map_get(cmd, "indexCount")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(0.0) as u32;
                     let inst = map_get(cmd, "instanceCount")
                         .and_then(|v| v.as_num())
                         .unwrap_or(1.0) as u32;
@@ -2720,9 +2798,8 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
                     drop(pipe_reg);
                     drop(view_reg);
                     drop(enc_reg);
-                    ctx(vm).runtime_error(
-                        "RenderPass: unknown depth attachment view id.".to_string(),
-                    );
+                    ctx(vm)
+                        .runtime_error("RenderPass: unknown depth attachment view id.".to_string());
                     return;
                 }
             }
@@ -2809,8 +2886,12 @@ pub unsafe extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut VM) {
             None => return,
         };
         let desc = slot(vm, 4);
-        let width = map_get(desc, "width").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
-        let height = map_get(desc, "height").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let width = map_get(desc, "width")
+            .and_then(|v| v.as_num())
+            .unwrap_or(0.0) as u32;
+        let height = map_get(desc, "height")
+            .and_then(|v| v.as_num())
+            .unwrap_or(0.0) as u32;
 
         let mut enc_reg = encoders().lock().unwrap();
         let tex_reg = textures().lock().unwrap();
@@ -2821,9 +2902,8 @@ pub unsafe extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut VM) {
                 drop(buf_reg);
                 drop(tex_reg);
                 drop(enc_reg);
-                ctx(vm).runtime_error(
-                    "copyTextureToBuffer: encoder not in Open state.".to_string(),
-                );
+                ctx(vm)
+                    .runtime_error("copyTextureToBuffer: encoder not in Open state.".to_string());
                 return;
             }
         };
@@ -2934,7 +3014,9 @@ pub unsafe extern "C" fn wlift_gpu_queue_submit(vm: *mut VM) {
         let list = match list_view(slot(vm, 2)) {
             Some(l) => l,
             None => {
-                ctx(vm).runtime_error("Queue.submit: argument must be a list of encoder ids.".to_string());
+                ctx(vm).runtime_error(
+                    "Queue.submit: argument must be a list of encoder ids.".to_string(),
+                );
                 return;
             }
         };
@@ -2969,10 +3051,7 @@ pub unsafe extern "C" fn wlift_gpu_queue_submit(vm: *mut VM) {
                     }
                     None => {
                         drop(reg);
-                        ctx(vm).runtime_error(format!(
-                            "Queue.submit: unknown encoder id {}.",
-                            id
-                        ));
+                        ctx(vm).runtime_error(format!("Queue.submit: unknown encoder id {}.", id));
                         return;
                     }
                 }
@@ -3128,18 +3207,17 @@ unsafe fn decode_window_handle(
 
     match platform.as_str() {
         "appkit" => {
-            let view = match unsafe {
-                map_get(desc, "ns_view").and_then(|v| nonnull_ptr_from_num(v))
-            } {
-                Some(p) => p,
-                None => {
-                    vm.runtime_error(
-                        "Device.createSurface: appkit requires `ns_view` (NSView*) integer."
-                            .to_string(),
-                    );
-                    return None;
-                }
-            };
+            let view =
+                match unsafe { map_get(desc, "ns_view").and_then(|v| nonnull_ptr_from_num(v)) } {
+                    Some(p) => p,
+                    None => {
+                        vm.runtime_error(
+                            "Device.createSurface: appkit requires `ns_view` (NSView*) integer."
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                };
             let mut h = raw_window_handle::AppKitWindowHandle::new(view);
             let _ = &mut h; // suppress potential unused-mut on platforms that don't compile this branch
             Some((
@@ -3148,18 +3226,17 @@ unsafe fn decode_window_handle(
             ))
         }
         "uikit" => {
-            let view = match unsafe {
-                map_get(desc, "ui_view").and_then(|v| nonnull_ptr_from_num(v))
-            } {
-                Some(p) => p,
-                None => {
-                    vm.runtime_error(
-                        "Device.createSurface: uikit requires `ui_view` (UIView*) integer."
-                            .to_string(),
-                    );
-                    return None;
-                }
-            };
+            let view =
+                match unsafe { map_get(desc, "ui_view").and_then(|v| nonnull_ptr_from_num(v)) } {
+                    Some(p) => p,
+                    None => {
+                        vm.runtime_error(
+                            "Device.createSurface: uikit requires `ui_view` (UIView*) integer."
+                                .to_string(),
+                        );
+                        return None;
+                    }
+                };
             Some((
                 RawWindowHandle::UiKit(raw_window_handle::UiKitWindowHandle::new(view)),
                 RawDisplayHandle::UiKit(raw_window_handle::UiKitDisplayHandle::new()),
@@ -3175,8 +3252,11 @@ unsafe fn decode_window_handle(
                     return None;
                 }
             };
-            let hinstance_n =
-                unsafe { map_get(desc, "hinstance").and_then(|v| v.as_num()).unwrap_or(0.0) };
+            let hinstance_n = unsafe {
+                map_get(desc, "hinstance")
+                    .and_then(|v| v.as_num())
+                    .unwrap_or(0.0)
+            };
             let hwnd = match std::num::NonZeroIsize::new(hwnd_n as isize) {
                 Some(h) => h,
                 None => {
@@ -3203,9 +3283,7 @@ unsafe fn decode_window_handle(
                     return None;
                 }
             };
-            let display = unsafe {
-                map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v))
-            };
+            let display = unsafe { map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v)) };
             let visual_id = unsafe {
                 map_get(desc, "visual_id")
                     .and_then(|v| v.as_num())
@@ -3232,9 +3310,8 @@ unsafe fn decode_window_handle(
                 Some(w) => w,
                 None => return None,
             };
-            let connection = unsafe {
-                map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v))
-            };
+            let connection =
+                unsafe { map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v)) };
             let visual_n = unsafe {
                 map_get(desc, "visual_id")
                     .and_then(|v| v.as_num())
@@ -3248,30 +3325,28 @@ unsafe fn decode_window_handle(
             ))
         }
         "wayland" => {
-            let surface = match unsafe {
-                map_get(desc, "surface").and_then(|v| nonnull_ptr_from_num(v))
-            } {
-                Some(p) => p,
-                None => {
-                    vm.runtime_error(
+            let surface =
+                match unsafe { map_get(desc, "surface").and_then(|v| nonnull_ptr_from_num(v)) } {
+                    Some(p) => p,
+                    None => {
+                        vm.runtime_error(
                         "Device.createSurface: wayland requires `surface` (wl_surface*) integer."
                             .to_string(),
                     );
-                    return None;
-                }
-            };
-            let display = match unsafe {
-                map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v))
-            } {
-                Some(p) => p,
-                None => {
-                    vm.runtime_error(
+                        return None;
+                    }
+                };
+            let display =
+                match unsafe { map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v)) } {
+                    Some(p) => p,
+                    None => {
+                        vm.runtime_error(
                         "Device.createSurface: wayland requires `display` (wl_display*) integer."
                             .to_string(),
                     );
-                    return None;
-                }
-            };
+                        return None;
+                    }
+                };
             Some((
                 RawWindowHandle::Wayland(raw_window_handle::WaylandWindowHandle::new(surface)),
                 RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(display)),
@@ -3442,27 +3517,40 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut VM) {
             None => {
                 drop(dev_reg);
                 drop(surf_reg);
-                ctx(vm).runtime_error(
-                    "Surface.configure: surface's device is gone.".to_string(),
-                );
+                ctx(vm).runtime_error("Surface.configure: surface's device is gone.".to_string());
                 return;
             }
         };
+        // wgpu panics on configure if the requested dimensions exceed
+        // `max_texture_dimension_2d` for the active device. A user
+        // resizing a window past that cap (HiDPI displays trip this
+        // routinely on low-tier adapters) shouldn't crash the
+        // process — clamp to the limit and surface the clamp via a
+        // diagnostic write so it isn't silent.
+        let max_dim = dev.device.limits().max_texture_dimension_2d.max(1);
+        let cw = width.min(max_dim);
+        let ch = height.min(max_dim);
+        if cw != width || ch != height {
+            eprintln!(
+                "warning: Surface.configure clamped {}x{} to {}x{} (device max_texture_dimension_2d = {})",
+                width, height, cw, ch, max_dim
+            );
+        }
         rec.surface.configure(
             &dev.device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
-                width,
-                height,
+                width: cw,
+                height: ch,
                 present_mode,
                 desired_maximum_frame_latency: 2,
                 alpha_mode,
                 view_formats: vec![],
             },
         );
-        rec.width = width;
-        rec.height = height;
+        rec.width = cw;
+        rec.height = ch;
         rec.format = format;
         drop(dev_reg);
         drop(surf_reg);
@@ -3548,9 +3636,7 @@ unsafe fn read_byte_buffer(vm: &mut VM, v: Value) -> Option<Vec<u8>> {
     use wren_lift::runtime::object::{ObjList, ObjType, ObjTypedArray, TypedArrayKind};
 
     if !v.is_object() {
-        vm.runtime_error(
-            "Texture.fromImage: bytes must be a List<Num> or ByteArray.".to_string(),
-        );
+        vm.runtime_error("Texture.fromImage: bytes must be a List<Num> or ByteArray.".to_string());
         return None;
     }
     let ptr = v.as_object()?;
@@ -3565,10 +3651,7 @@ unsafe fn read_byte_buffer(vm: &mut VM, v: Value) -> Option<Vec<u8>> {
                 let v = match entry.as_num() {
                     Some(v) if (0.0..=255.0).contains(&v) && v.fract() == 0.0 => v as u8,
                     _ => {
-                        vm.runtime_error(format!(
-                            "Texture.fromImage: byte {} not in 0..=255.",
-                            i
-                        ));
+                        vm.runtime_error(format!("Texture.fromImage: byte {} not in 0..=255.", i));
                         return None;
                     }
                 };
@@ -3617,8 +3700,12 @@ pub unsafe extern "C" fn wlift_gpu_queue_write_texture(vm: *mut VM) {
             None => return,
         };
         let desc = slot(vm, 3);
-        let width = map_get(desc, "width").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
-        let height = map_get(desc, "height").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let width = map_get(desc, "width")
+            .and_then(|v| v.as_num())
+            .unwrap_or(0.0) as u32;
+        let height = map_get(desc, "height")
+            .and_then(|v| v.as_num())
+            .unwrap_or(0.0) as u32;
         let x = map_get(desc, "x").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
         let y = map_get(desc, "y").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
         let bytes_per_row = match map_get(desc, "bytesPerRow").and_then(|v| v.as_num()) {

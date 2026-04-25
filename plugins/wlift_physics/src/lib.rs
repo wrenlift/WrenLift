@@ -22,9 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use wren_lift::runtime::object::{
-    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType,
-};
+use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
@@ -404,7 +402,10 @@ unsafe fn read_world2d_id(vm: *mut VM, slot_index: usize, label: &str) -> Option
         match slot(vm, slot_index).as_num() {
             Some(n) if n >= 0.0 => Some(n as u64),
             _ => {
-                ctx(vm).runtime_error(format!("{}: world id must be a non-negative integer.", label));
+                ctx(vm).runtime_error(format!(
+                    "{}: world id must be a non-negative integer.",
+                    label
+                ));
                 None
             }
         }
@@ -441,7 +442,8 @@ unsafe fn spawn_2d(vm: *mut VM, body_kind: &str) {
                 Some(c) => c,
                 None => {
                     ctx(vm).runtime_error(
-                        "World2D.spawn: descriptor `shape` is missing or has unknown `kind`.".to_string(),
+                        "World2D.spawn: descriptor `shape` is missing or has unknown `kind`."
+                            .to_string(),
                     );
                     return;
                 }
@@ -725,7 +727,8 @@ unsafe fn spawn_3d(vm: *mut VM, body_kind: &str) {
                 Some(c) => c,
                 None => {
                     ctx(vm).runtime_error(
-                        "World3D.spawn: descriptor `shape` is missing or has unknown `kind`.".to_string(),
+                        "World3D.spawn: descriptor `shape` is missing or has unknown `kind`."
+                            .to_string(),
                     );
                     return;
                 }

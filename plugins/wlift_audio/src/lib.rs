@@ -164,7 +164,7 @@ struct Voice {
     /// keeps the bytes alive even if `unload` runs while the
     /// voice still has frames left.
     samples: Arc<Vec<f32>>,
-    cursor: usize,    // index into samples (already in stereo frames * 2)
+    cursor: usize, // index into samples (already in stereo frames * 2)
     volume: f32,
     looping: bool,
 }
@@ -451,11 +451,7 @@ pub unsafe extern "C" fn wlift_audio_sound_load(vm: *mut VM) {
         };
 
         let id = next_id();
-        mixer()
-            .lock()
-            .unwrap()
-            .sounds
-            .insert(id, Arc::new(stereo));
+        mixer().lock().unwrap().sounds.insert(id, Arc::new(stereo));
         set_return(vm, Value::num(id as f64));
     }
 }
@@ -466,7 +462,8 @@ pub unsafe extern "C" fn wlift_audio_sound_unload(vm: *mut VM) {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm).runtime_error("Sound.unload: id must be a non-negative number.".to_string());
+                ctx(vm)
+                    .runtime_error("Sound.unload: id must be a non-negative number.".to_string());
                 return;
             }
         };

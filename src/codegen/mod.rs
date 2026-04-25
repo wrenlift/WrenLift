@@ -2128,12 +2128,15 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     interner: &crate::intern::Interner,
     #[cfg_attr(feature = "cranelift", allow(unused_variables))] compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
-    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
-    callsite_ic_live_ptrs: Option<Vec<usize>>,
-    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
-    devirt_hints: Option<Vec<DevirtHint>>,
-    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
-    jit_code_base: Option<*const *const u8>,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] callsite_ic_live_ptrs: Option<
+        Vec<usize>,
+    >,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] devirt_hints: Option<
+        Vec<DevirtHint>,
+    >,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] jit_code_base: Option<
+        *const *const u8,
+    >,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {

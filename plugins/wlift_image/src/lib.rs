@@ -60,10 +60,7 @@ unsafe fn string_of(v: Value) -> Option<String> {
 /// Read a List<Num> or ByteArray into a Vec<u8>.
 unsafe fn read_byte_buffer(vm: &mut VM, v: Value, label: &str) -> Option<Vec<u8>> {
     if !v.is_object() {
-        vm.runtime_error(format!(
-            "{}: expected a List<Num> or ByteArray.",
-            label
-        ));
+        vm.runtime_error(format!("{}: expected a List<Num> or ByteArray.", label));
         return None;
     }
     let ptr = v.as_object()?;
@@ -96,10 +93,7 @@ unsafe fn read_byte_buffer(vm: &mut VM, v: Value, label: &str) -> Option<Vec<u8>
             }
         }
         _ => {
-            vm.runtime_error(format!(
-                "{}: expected a List<Num> or ByteArray.",
-                label
-            ));
+            vm.runtime_error(format!("{}: expected a List<Num> or ByteArray.", label));
             None
         }
     }
@@ -205,18 +199,16 @@ pub unsafe extern "C" fn wlift_image_encode(vm: *mut VM) {
         let width = match slot(vm, 2).as_num() {
             Some(n) if n.is_finite() && n > 0.0 => n as u32,
             _ => {
-                ctx(vm).runtime_error(
-                    "Image.encode: width must be a positive integer.".to_string(),
-                );
+                ctx(vm)
+                    .runtime_error("Image.encode: width must be a positive integer.".to_string());
                 return;
             }
         };
         let height = match slot(vm, 3).as_num() {
             Some(n) if n.is_finite() && n > 0.0 => n as u32,
             _ => {
-                ctx(vm).runtime_error(
-                    "Image.encode: height must be a positive integer.".to_string(),
-                );
+                ctx(vm)
+                    .runtime_error("Image.encode: height must be a positive integer.".to_string());
                 return;
             }
         };
@@ -236,7 +228,8 @@ pub unsafe extern "C" fn wlift_image_encode(vm: *mut VM) {
         let buf = match image::RgbaImage::from_raw(width, height, pixels) {
             Some(b) => b,
             None => {
-                ctx(vm).runtime_error("Image.encode: pixel buffer could not be wrapped.".to_string());
+                ctx(vm)
+                    .runtime_error("Image.encode: pixel buffer could not be wrapped.".to_string());
                 return;
             }
         };

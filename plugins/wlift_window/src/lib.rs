@@ -424,7 +424,8 @@ pub unsafe extern "C" fn wlift_window_destroy(vm: *mut VM) {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm).runtime_error("Window.destroy: id must be a non-negative number.".to_string());
+                ctx(vm)
+                    .runtime_error("Window.destroy: id must be a non-negative number.".to_string());
                 return;
             }
         };
@@ -503,8 +504,9 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut VM) {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm)
-                    .runtime_error("Window.pollEvents: id must be a non-negative number.".to_string());
+                ctx(vm).runtime_error(
+                    "Window.pollEvents: id must be a non-negative number.".to_string(),
+                );
                 return;
             }
         };
@@ -534,10 +536,8 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut VM) {
                     let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
                     let kw = context.alloc_string("width".to_string());
                     let kh = context.alloc_string("height".to_string());
-                    let _ = context
-                        .call_method_on(m, "[_]=(_)", &[kw, Value::num(width as f64)]);
-                    let _ = context
-                        .call_method_on(m, "[_]=(_)", &[kh, Value::num(height as f64)]);
+                    let _ = context.call_method_on(m, "[_]=(_)", &[kw, Value::num(width as f64)]);
+                    let _ = context.call_method_on(m, "[_]=(_)", &[kh, Value::num(height as f64)]);
                 }
                 EventRecord::KeyDown { code } => {
                     let v = context.alloc_string("keyDown".to_string());
@@ -592,7 +592,8 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm).runtime_error("Window.handle: id must be a non-negative number.".to_string());
+                ctx(vm)
+                    .runtime_error("Window.handle: id must be a non-negative number.".to_string());
                 return;
             }
         };
@@ -640,8 +641,8 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
                 let v = context.alloc_string("win32".to_string());
                 let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
                 let kh = context.alloc_string("hwnd".to_string());
-                let _ = context
-                    .call_method_on(map, "[_]=(_)", &[kh, Value::num(h.hwnd.get() as f64)]);
+                let _ =
+                    context.call_method_on(map, "[_]=(_)", &[kh, Value::num(h.hwnd.get() as f64)]);
                 if let Some(hi) = h.hinstance {
                     let key_hinstance = context.alloc_string("hinstance".to_string());
                     let _ = context.call_method_on(
@@ -655,12 +656,14 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
                 let v = context.alloc_string("xlib".to_string());
                 let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
                 let kw = context.alloc_string("window".to_string());
-                let _ = context
-                    .call_method_on(map, "[_]=(_)", &[kw, Value::num(h.window as f64)]);
+                let _ = context.call_method_on(map, "[_]=(_)", &[kw, Value::num(h.window as f64)]);
                 if h.visual_id != 0 {
                     let kvi = context.alloc_string("visual_id".to_string());
-                    let _ = context
-                        .call_method_on(map, "[_]=(_)", &[kvi, Value::num(h.visual_id as f64)]);
+                    let _ = context.call_method_on(
+                        map,
+                        "[_]=(_)",
+                        &[kvi, Value::num(h.visual_id as f64)],
+                    );
                 }
             }
             RawWindowHandle::Wayland(h) => {

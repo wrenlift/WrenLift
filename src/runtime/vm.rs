@@ -962,10 +962,7 @@ impl VM {
                                 return result;
                             }
                         } else {
-                            self.report_error(&format!(
-                                "Could not load module '{}'",
-                                requested
-                            ));
+                            self.report_error(&format!("Could not load module '{}'", requested));
                             self.loading_modules.remove(&module_key);
                             return InterpretResult::CompileError;
                         }
@@ -1102,11 +1099,9 @@ impl VM {
                 let cls_ptr = ptr as *mut ObjClass;
                 // Skip built-in / core classes — their pointer is
                 // shared across modules and must not be reset.
-                let class_name = entry
-                    .var_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| unsafe { self.interner.resolve((*cls_ptr).name).to_string() });
+                let class_name = entry.var_names.get(i).cloned().unwrap_or_else(|| unsafe {
+                    self.interner.resolve((*cls_ptr).name).to_string()
+                });
                 if self.core_class_value(&class_name).is_some() {
                     continue;
                 }
@@ -1469,9 +1464,7 @@ impl VM {
                     .as_ref()
                     .and_then(|fn_| fn_(import_source, module_name))
                     .unwrap_or_else(|| import_source.clone());
-                if let Some(value) =
-                    self.find_imported_var_from(name, &canonical)
-                {
+                if let Some(value) = self.find_imported_var_from(name, &canonical) {
                     module_vars.push(value);
                 } else {
                     // Source module hasn't exported this name yet (e.g.

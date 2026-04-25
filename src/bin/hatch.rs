@@ -267,12 +267,12 @@ fn cmd_init(dir: &Path, name_override: Option<&str>, template: &str) {
         }
     };
 
-    let canonical = dir
-        .canonicalize()
-        .unwrap_or_else(|_| dir.to_path_buf());
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     eprintln!(
         "initialised workspace '{}' ({}) in {}",
-        name, effective_template, canonical.display()
+        name,
+        effective_template,
+        canonical.display()
     );
     if effective_template == "web" {
         eprintln!("  next: cd {} && hatch web serve", dir.display());
@@ -344,7 +344,10 @@ class {class_name}Routes {{
     );
     write_or_die(&path, &stub);
     eprintln!("created {}", path.display());
-    eprintln!("  next: import in main.wren and call {}Routes.mount(app)", class_name);
+    eprintln!(
+        "  next: import in main.wren and call {}Routes.mount(app)",
+        class_name
+    );
 }
 
 fn generate_form(dir: &Path, name: &str) {
@@ -517,11 +520,7 @@ app.listen("127.0.0.1:3000")
     let public_dir = dir.join("public");
     if !public_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&public_dir) {
-            eprintln!(
-                "error: cannot create '{}': {}",
-                public_dir.display(),
-                e
-            );
+            eprintln!("error: cannot create '{}': {}", public_dir.display(), e);
             process::exit(1);
         }
     }
@@ -1288,19 +1287,11 @@ fn scan_wren_mtimes(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time
 /// `Hatch.watchFile` subscribers — typically @hatch:assets and
 /// shader hot-reload integrations on top of @hatch:gpu.
 const WATCH_EXTENSIONS: &[&str] = &[
-    "wren",
-    "wgsl", "glsl", "vert", "frag",
-    "png", "jpg", "jpeg", "bmp", "tga", "webp", "ktx2",
-    "wav", "ogg", "mp3", "flac",
-    "json", "toml", "csv",
-    "gltf", "glb", "obj",
-    "txt", "md",
+    "wren", "wgsl", "glsl", "vert", "frag", "png", "jpg", "jpeg", "bmp", "tga", "webp", "ktx2",
+    "wav", "ogg", "mp3", "flac", "json", "toml", "csv", "gltf", "glb", "obj", "txt", "md",
 ];
 
-fn walk_wren(
-    dir: &Path,
-    out: &mut std::collections::BTreeMap<PathBuf, std::time::SystemTime>,
-) {
+fn walk_wren(dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, std::time::SystemTime>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -1403,7 +1394,10 @@ fn cmd_test(dir: &Path) {
     let mut specs = Vec::new();
     walk_specs(dir, &mut specs);
     if specs.is_empty() {
-        eprintln!("hatch test: no *.spec.wren files found under {}", dir.display());
+        eprintln!(
+            "hatch test: no *.spec.wren files found under {}",
+            dir.display()
+        );
         return;
     }
     specs.sort();
