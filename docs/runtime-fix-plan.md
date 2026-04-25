@@ -40,7 +40,21 @@ phase rather than reopening this one.
 
 ## Phase 1 — `for-in` iterator family
 
-Status: **open**
+Status: **fixed (commit `1441d38`, 2026-04-26)**
+
+All three quirks shared one root cause: `lower_for` emitted the
+`seq.iterate(iter_param)` advance only on the natural fall-through
+path, and `continue` branched directly to `cond_bb` while shedding
+the iterator-state arg. The latch block introduced in this commit
+takes the same `[iter_phi, …vars_phi]` shape as `cond_bb` and
+absorbs every `continue` jump; natural fall-through stays inline so
+the hot path is unchanged. `bench/delta_blue.wren --mode tiered`
+now runs without `COMPILE ERR FuncId(...)` fallback messages.
+
+Outstanding tail: walk the `while (i < n)` workarounds in
+`@hatch:fp::dropWhile`, `@hatch:json`, `@hatch:game`'s event drain,
+and `@hatch:path`, restore the natural for-in/continue shape, and
+keep the rewrites only where they're independently clearer.
 
 Three open quirks all touch how the bytecode lowering of `for (e in
 seq) { ... }` handles iterator state across `continue`, loop exit, and

@@ -7,71 +7,6 @@ rationale for anyone who reads just this file.
 
 ## Open
 
-### `for..in` iterator variable leaks past the loop — Cranelift verifier rejects 3 functions in `delta_blue` / tiered mode
-
-Status: **open (non-fatal; compiler falls back to interpreter for the affected functions)**
-
-Symptom: running `bench/delta_blue.wren` in tiered mode prints
-
-```
-COMPILE ERR FuncId(0):  Compilation error: Verifier errors
-COMPILE ERR FuncId(2):  Compilation error: Verifier errors
-COMPILE ERR FuncId(81): Compilation error: Verifier errors
-14065400
-elapsed: 1.44
-```
-
-The program still produces the correct output via the interpreter
-fallback, but the three rejected functions pay interpreter
-dispatch instead of JIT code — measurable latency cost on
-delta_blue's hot path.
-
-Exact Cranelift complaint:
-
-```
-inst94 (jump block17(v94, v40, v93, v73, v74, v75, v76, v88)):
-uses value v40 from non-dominating inst32
-```
-
-Root cause — identified, **not yet fixed**:
-
-`src/mir/builder.rs::lower_for` binds the iterator variable (`i`
-in `for (i in 0..n) { ... }`) by doing
-`self.variables.insert(name, elem_val)` inside `body_bb`. At the
-end of the loop it never removes `name` again, so the outer
-scope's `self.variables` table keeps pointing at `elem_val` —
-an SSA value defined in `body_bb`. If surrounding code later
-references that name (e.g. `delta_blue`'s `chainTest` closure
-runs *two* `for (i in 0..n)` loops back-to-back and the second
-loop snapshots `i` into its phi map), the block-arg list carries
-a `ValueId` whose definition doesn't dominate the use. Cranelift
-catches it; the verifier message points at exactly that phi arg.
-
-Naive fix (tried):
-
-```rust
-// after the loop exits
-match prior_iter_binding {
-    Some(v) => self.variables.insert(variable.0, v),
-    None    => self.variables.remove(&variable.0),
-}
-```
-
-This eliminates the verifier errors and keeps all 818 lib tests +
-every `@hatch:*` spec green. But it unmasks a second bug: with
-the three newly-eligible functions now compiling and tier-upping,
-`delta_blue --mode tiered` SIGSEGVs. Full JIT mode (compile
-everything upfront) still runs fine, so the crash is specific to
-the interpreter→JIT transition for one of these functions — most
-likely a mismatch between the interpreter's view of live locals
-and the JIT entry's expected layout.
-
-Follow-up needed: debug the tier-up state mismatch (probably in
-`codegen/cranelift_backend.rs`'s OSR entry layout analysis),
-confirm no interpreter code still relies on the iterator name
-staying live past the loop, then land the builder fix. Until
-then the verifier rejection is the lesser regression.
-
 ### `JSON.parse` fails on second HTTP response body in tiered mode
 
 Status: **open**
@@ -93,27 +28,6 @@ doesn't clear it, so it's not purely opt-tier.
 Workaround: run affected scripts with `--mode interpreter`. All
 @hatch:http spec cases pass cleanly there; tiered mode exposes
 3 of 9 failures (all on the "second request" shape).
-
-### `for..in` with `continue` corrupts the next iteration's binding
-
-Status: **open (workaround: use `while` + index)**
-
-```wren
-for (p in ["foo", "", "bar"]) {
-  if (p == "") continue
-  if (!(p is String)) Fiber.abort("!")   // fires on the third iteration
-}
-```
-
-After a `continue`, the next iteration's `p` binds to something
-other than the list element — on several repros it was the class
-metaobject of the previous element. Reproducible under pure
-interpreter mode; survives `--no-opt`. Stems from how the
-iterator state is saved/restored across the continue target.
-
-Worked around across `@hatch:path` and `@hatch:json` by
-materialising the sequence to a list and walking it via
-`while (i < xs.count) { var p = xs[i]; i = i + 1; ... }`.
 
 ### `Fiber.try` doesn't catch "does not implement" method-dispatch errors
 
@@ -158,6 +72,50 @@ auto-serialization path from landing; the library ships with
 the `toJson()` hook alone for v0.1.
 
 ## Fixed
+
+### `for-in` + `continue` infinite-looped / corrupted next binding / failed Cranelift verifier
+
+Status: **fixed (commit 1441d38, 2026-04-26)**
+
+Three quirks, one root cause. `lower_for` emitted the iterator
+advance call (`seq.iterate(iter_param)`) only on the natural
+fall-through path. `continue` branched straight to the cond
+block with `[…vars]` while cond_bb's params were `[iter_phi,
+…vars_phi]` — so the iter slot got reassigned to whatever value
+zipped first, and the iter advance never ran. Manifested as:
+
+1. `for (p in xs) { if (cond) continue; … }` infinite-loops
+   (caught by the step-limit) — same element bound forever.
+2. `continue` inside a nested-if inside for-in MIR-miscompiles
+   (memory: `project_mir_continue_in_nested_if.md`).
+3. Cranelift verifier rejects three functions in
+   `bench/delta_blue.wren` tiered mode with "uses value
+   from non-dominating inst" — the malformed back-edge produces
+   an SSA shape Cranelift refuses; `delta_blue` falls back to
+   the interpreter for those frames.
+
+```wren
+for (p in ["foo", "", "bar"]) {
+  if (p == "") continue
+  System.print(p)            // before: prints "foo" then loops
+}                            // after:  prints "foo" then "bar"
+```
+
+Fix: introduce a `latch_bb` between the body and the cond block
+shaped `[iter_phi, …vars_phi]` like cond_bb. `continue` jumps
+to the latch with `[iter_param, …current_vars]`; the latch
+advances the iterator and branches to cond_bb. Natural
+fall-through stays inline (no extra block transition on the hot
+path), so the no-`continue` case has identical bytecode density
+to before — the latch is reachable only when at least one
+`continue` lives in the loop body, and the optimizer prunes it
+otherwise. `continue_targets` gained a "leading args" field for
+the iter_param; while-loop callers pass an empty vec.
+
+Workarounds elsewhere in the codebase (the `while (i < n)`
+rewrites in `@hatch:path`, `@hatch:json`, `@hatch:game`'s event
+drain) can come out at any time; we'll let them go in a hygiene
+pass once the framework code is otherwise stable.
 
 ### Closure-mutated outer locals were frozen at the first call's value
 
