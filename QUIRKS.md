@@ -159,6 +159,46 @@ the `toJson()` hook alone for v0.1.
 
 ## Fixed
 
+### Closure-mutated outer locals were frozen at the first call's value
+
+Status: **fixed (commit b74c653, 2026-04-26)**
+
+```wren
+var n = 0
+var bump = Fn.new { n = n + 1 }
+bump.call();  System.print(n)   // 1   correct
+bump.call();  System.print(n)   // 1   wrong — should be 2
+bump.call();  System.print(n)   // 1   wrong — should be 3
+```
+
+Inner-scope reads inside the closure correctly observed each
+prior write (`inside: n=1, 2, 3`), but the outer scope's reads
+collapsed to the first post-call value. The bug bit any code
+that captured + mutated an outer local — counters, accumulators,
+event-pumping helpers — and surfaced indirectly in
+`@hatch:game`'s loop locals, in the `for-in` body upvalue
+clobber, and in `Fiber.try` nested-resume failures.
+
+Root cause: `src/mir/opt/cse.rs` was a block-local CSE that
+skipped *caching* side-effecting instructions but never
+*invalidated* previously cached reads when one ran. Two
+`subscript_get v2[0]` reads with a `call` between them merged
+into a single read; the post-call value seen by the outer was
+whatever the first read returned. The boxed-upvalue lowering
+pattern (mutated locals captured by a closure get wrapped in a
+1-element list, both inner and outer use `subscript_get` /
+`subscript_set` against the same box) collapsed under that
+merge.
+
+Fix: split CSE's seen-instructions table into a `pure` cache
+(arithmetic, constants, allocations — never invalidated) and a
+`memory` cache (currently `SubscriptGet`). Side-effecting
+instructions that may write the heap (`Call*`, `SubscriptSet`,
+`SetField`, `SetUpvalue`, `SetStaticField`, `SetModuleVar`)
+clear the memory cache; the pure cache is untouched. Nbody and
+the rest of the e2e suite stay clean — pure-arithmetic CSE
+inside hot loops is unaffected.
+
 ### Parser rejected method-call chains that wrapped across lines
 
 Status: **fixed**
@@ -337,3 +377,34 @@ masquerade as the original completion.
 
 Regression test:
 `runtime::vm::tests::test_fiber_abort_through_closure_preserves_subsequent_calls`.
+
+## Roadmap
+
+Items that aren't bugs but are conservative-correct compromises we'd
+like to revisit once they pay off in observed benchmark / framework
+code.
+
+### Per-function memory-effect summaries for CSE / LICM / DCE
+
+Today the optimizer's memory model is binary: a `Call` instruction
+clears the memory-read cache (currently `SubscriptGet`), forcing every
+field/element read after a call to be re-issued. That's sound for
+arbitrary code but wastes optimization opportunities for calls that
+demonstrably can't write to the receiver in question — `Math.sin`,
+`Num.+`, leaf accessor methods on immutable types, etc.
+
+A real call-effect analysis would attach a per-function summary
+(reads / writes / unknown) to each MIR function, propagate through
+call edges, and use the summary at `Call` sites to invalidate only
+the memory regions that callee can actually touch. The same
+infrastructure unblocks tighter LICM (hoist a load across a call we
+can prove is loop-invariant) and tighter DCE (a call whose summary
+is "no observable effect" + unused result becomes dead).
+
+Cost vs. payoff: significant — needs an effect lattice on MIR, a
+worklist propagation pass over the call graph (with conservative
+defaults at unknown call edges), and care around foreign / native
+methods (which we have to assume `unknown` until annotated). Worth
+doing once a benchmark surfaces a CSE flush that's clearly costing
+us on a known-pure call; until then the bucket-flush captures the
+correctness story without the bookkeeping.
