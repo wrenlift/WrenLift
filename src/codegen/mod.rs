@@ -2060,6 +2060,7 @@ pub struct DevirtHint {
 /// - Other monomorphic calls → CallKnownFunc (class check + wren_known_call_N)
 ///
 /// `devirt_hints` is indexed by IC entry position (same order as ic_snapshot).
+#[cfg_attr(not(feature = "cranelift"), allow(dead_code))]
 fn devirt_calls_with_ic(
     mir: &MirFunction,
     ic_snapshot: &[crate::mir::bytecode::CallSiteIC],
@@ -2127,8 +2128,11 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     interner: &crate::intern::Interner,
     #[cfg_attr(feature = "cranelift", allow(unused_variables))] compile_tier: CompileTier,
     callsite_ic_ptrs: Option<Vec<crate::mir::bytecode::CallSiteIC>>,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
     callsite_ic_live_ptrs: Option<Vec<usize>>,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
     devirt_hints: Option<Vec<DevirtHint>>,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
     jit_code_base: Option<*const *const u8>,
 ) -> Result<CompiledArtifact, String> {
     match target {

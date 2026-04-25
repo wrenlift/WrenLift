@@ -4063,7 +4063,9 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mir::{Instruction, MirFunction, MirType, Terminator};
+    use crate::mir::{Instruction, MirFunction, Terminator};
+    #[cfg(feature = "cranelift")]
+    use crate::mir::MirType;
     use crate::runtime::vm::{VMConfig, VM};
 
     fn make_vm() -> VM {

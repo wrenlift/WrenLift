@@ -79,8 +79,15 @@ struct Textures {
 struct TextureRecord {
     texture: wgpu::Texture,
     format: wgpu::TextureFormat,
+    /// Width / height / owning-device id are diagnostic metadata
+    /// for now — kept around so future paths (sanity-check on
+    /// copy_texture_to_buffer extents, cross-device validation)
+    /// don't have to plumb them back through.
+    #[allow(dead_code)]
     width: u32,
+    #[allow(dead_code)]
     height: u32,
+    #[allow(dead_code)]
     device_id: u64,
 }
 
@@ -120,8 +127,18 @@ struct Encoders {
 }
 
 enum EncoderState {
-    Open { encoder: wgpu::CommandEncoder, device_id: u64 },
-    Finished { buffer: wgpu::CommandBuffer, device_id: u64 },
+    Open {
+        encoder: wgpu::CommandEncoder,
+        device_id: u64,
+    },
+    /// `device_id` here is preserved so `Queue.submit` can
+    /// (eventually) sanity-check that the encoder was opened on
+    /// the device it's now being submitted to.
+    Finished {
+        buffer: wgpu::CommandBuffer,
+        #[allow(dead_code)]
+        device_id: u64,
+    },
 }
 
 struct DeviceRecord {
@@ -501,7 +518,7 @@ fn backends_from_descriptor(desc: Value) -> wgpu::Backends {
 //   - "label": String — passed to wgpu for diagnostics
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_request_device(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_request_device(vm: *mut VM) {
     unsafe {
         let desc = slot(vm, 1);
         let backends = backends_from_descriptor(desc);
@@ -571,7 +588,7 @@ pub extern "C" fn wlift_gpu_request_device(vm: *mut VM) {
 // already-removed id is a no-op (no error).
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_device_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_device_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "Device.destroy") {
             Some(i) => i,
@@ -591,7 +608,7 @@ pub extern "C" fn wlift_gpu_device_destroy(vm: *mut VM) {
 // device" sanity check.
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_device_info(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_device_info(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "Device.info") {
             Some(i) => i,
@@ -640,7 +657,7 @@ pub extern "C" fn wlift_gpu_device_info(vm: *mut VM) {
 //   }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createBuffer") {
             Some(i) => i,
@@ -714,7 +731,7 @@ pub extern "C" fn wlift_gpu_buffer_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "Buffer.destroy") {
             Some(i) => i,
@@ -726,7 +743,7 @@ pub extern "C" fn wlift_gpu_buffer_destroy(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_size(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_size(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "Buffer.size") {
             Some(i) => i,
@@ -816,7 +833,7 @@ unsafe fn write_buffer_with(
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut VM) {
     unsafe {
         write_buffer_with(
             vm,
@@ -828,7 +845,7 @@ pub extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut VM) {
     unsafe {
         write_buffer_with(
             vm,
@@ -955,22 +972,22 @@ unsafe fn write_buffer_math_batch(
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_write_mat4s(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_write_mat4s(vm: *mut VM) {
     unsafe { write_buffer_math_batch(vm, "Buffer.writeMat4s", 16) }
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_write_vec3s(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_write_vec3s(vm: *mut VM) {
     unsafe { write_buffer_math_batch(vm, "Buffer.writeVec3s", 3) }
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_write_vec4s(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_write_vec4s(vm: *mut VM) {
     unsafe { write_buffer_math_batch(vm, "Buffer.writeVec4s", 4) }
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_write_quats(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_write_quats(vm: *mut VM) {
     unsafe { write_buffer_math_batch(vm, "Buffer.writeQuats", 4) }
 }
 
@@ -979,7 +996,7 @@ pub extern "C" fn wlift_gpu_buffer_write_quats(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createShaderModule") {
             Some(i) => i,
@@ -1026,7 +1043,7 @@ pub extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_shader_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_shader_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "ShaderModule.destroy") {
             Some(i) => i,
@@ -1042,7 +1059,7 @@ pub extern "C" fn wlift_gpu_shader_destroy(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_texture_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_texture_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createTexture") {
             Some(i) => i,
@@ -1149,7 +1166,7 @@ pub extern "C" fn wlift_gpu_texture_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_texture_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_texture_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "Texture.destroy") {
             Some(i) => i,
@@ -1161,7 +1178,7 @@ pub extern "C" fn wlift_gpu_texture_destroy(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_texture_create_view(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_texture_create_view(vm: *mut VM) {
     unsafe {
         let texture_id = match id_of(ctx(vm), slot(vm, 1), "Texture.createView") {
             Some(i) => i,
@@ -1185,7 +1202,7 @@ pub extern "C" fn wlift_gpu_texture_create_view(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_view_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_view_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "TextureView.destroy") {
             Some(i) => i,
@@ -1201,7 +1218,7 @@ pub extern "C" fn wlift_gpu_view_destroy(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_sampler_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_sampler_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createSampler") {
             Some(i) => i,
@@ -1262,7 +1279,7 @@ pub extern "C" fn wlift_gpu_sampler_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_sampler_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_sampler_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "Sampler.destroy") {
             Some(i) => i,
@@ -1369,7 +1386,7 @@ unsafe fn binding_type_from_entry(vm: &mut VM, entry: Value) -> Option<wgpu::Bin
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createBindGroupLayout") {
             Some(i) => i,
@@ -1459,7 +1476,7 @@ pub extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_bind_group_layout_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_bind_group_layout_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "BindGroupLayout.destroy") {
             Some(i) => i,
@@ -1481,7 +1498,7 @@ pub extern "C" fn wlift_gpu_bind_group_layout_destroy(vm: *mut VM) {
 //   }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createPipelineLayout") {
             Some(i) => i,
@@ -1562,7 +1579,7 @@ pub extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_pipeline_layout_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_pipeline_layout_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "PipelineLayout.destroy") {
             Some(i) => i,
@@ -1589,7 +1606,7 @@ pub extern "C" fn wlift_gpu_pipeline_layout_destroy(vm: *mut VM) {
 //   }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createBindGroup") {
             Some(i) => i,
@@ -1754,7 +1771,7 @@ pub extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_bind_group_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_bind_group_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "BindGroup.destroy") {
             Some(i) => i,
@@ -1859,7 +1876,7 @@ fn compare_from_str(s: &str) -> wgpu::CompareFunction {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createRenderPipeline") {
             Some(i) => i,
@@ -2275,7 +2292,7 @@ pub extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_render_pipeline_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_render_pipeline_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "RenderPipeline.destroy") {
             Some(i) => i,
@@ -2291,7 +2308,7 @@ pub extern "C" fn wlift_gpu_render_pipeline_destroy(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_encoder_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_encoder_create(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createCommandEncoder") {
             Some(i) => i,
@@ -2323,7 +2340,7 @@ pub extern "C" fn wlift_gpu_encoder_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub extern "C" fn wlift_gpu_encoder_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_encoder_destroy(vm: *mut VM) {
     unsafe {
         let id = match id_of(ctx(vm), slot(vm, 1), "CommandEncoder.destroy") {
             Some(i) => i,
@@ -2391,7 +2408,7 @@ unsafe fn store_op(attachment: Value) -> wgpu::StoreOp {
 /// descriptor's `commands` list and calls this single foreign
 /// function. Skips the wgpu-side `RenderPass<'a>` lifetime knot.
 #[no_mangle]
-pub extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
     unsafe {
         let encoder_id = match id_of(ctx(vm), slot(vm, 1), "RenderPass.end") {
             Some(i) => i,
@@ -2723,7 +2740,7 @@ pub extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
 ///     "bytesPerRow": u32?,    // computed if absent
 ///     "rowsPerImage": u32? }
 #[no_mangle]
-pub extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut VM) {
     unsafe {
         let encoder_id = match id_of(ctx(vm), slot(vm, 1), "CommandEncoder.copyTextureToBuffer") {
             Some(i) => i,
@@ -2818,7 +2835,7 @@ pub extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut VM) {
 /// Finish recording, transition to `Finished` state. Subsequent
 /// `submit` calls consume the CommandBuffer.
 #[no_mangle]
-pub extern "C" fn wlift_gpu_encoder_finish(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_encoder_finish(vm: *mut VM) {
     unsafe {
         let encoder_id = match id_of(ctx(vm), slot(vm, 1), "CommandEncoder.finish") {
             Some(i) => i,
@@ -2854,7 +2871,7 @@ pub extern "C" fn wlift_gpu_encoder_finish(vm: *mut VM) {
 /// Encoders transition out of the registry as their CommandBuffer
 /// is consumed.
 #[no_mangle]
-pub extern "C" fn wlift_gpu_queue_submit(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_queue_submit(vm: *mut VM) {
     unsafe {
         let device_id = match id_of(ctx(vm), slot(vm, 1), "Queue.submit") {
             Some(i) => i,
@@ -2928,7 +2945,7 @@ pub extern "C" fn wlift_gpu_queue_submit(vm: *mut VM) {
 /// number per byte), then unmaps. Used by the headless render specs
 /// that copy a texture into a readback buffer + verify pixel values.
 #[no_mangle]
-pub extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut VM) {
     unsafe {
         let buffer_id = match id_of(ctx(vm), slot(vm, 1), "Buffer.readBytes") {
             Some(i) => i,

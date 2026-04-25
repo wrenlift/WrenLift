@@ -3,17 +3,15 @@
 /// Exposed as `import "hatch" for Hatch`.
 ///
 /// ## Methods
-/// - `Hatch.reload(name)`         — re-parse + re-install the named module.
-///                                   Returns true on success, false on failure.
-///                                   Classes declared in the module are mutated
-///                                   in place (same `ObjClass` pointer), so
-///                                   instances that predate the reload continue
-///                                   to dispatch to the new method bodies.
-/// - `Hatch.moduleMtime(path)`    — file mtime in seconds-since-epoch, or null
-///                                   when the path can't be stat'd.
-/// - `Hatch.modulePath(name)`     — canonical on-disk path for a loaded module,
-///                                   or null for built-in / unloaded modules.
-/// - `Hatch.loadedModules`        — list of module names currently registered.
+/// - `Hatch.reload(name)` — re-parse + re-install the named module. Returns
+///   true on success, false on failure. Classes declared in the module are
+///   mutated in place (same `ObjClass` pointer), so instances that predate
+///   the reload continue to dispatch to the new method bodies.
+/// - `Hatch.moduleMtime(path)` — file mtime in seconds-since-epoch, or null
+///   when the path can't be stat'd.
+/// - `Hatch.modulePath(name)` — canonical on-disk path for a loaded module,
+///   or null for built-in / unloaded modules.
+/// - `Hatch.loadedModules` — list of module names currently registered.
 use crate::runtime::object::NativeContext;
 use crate::runtime::value::Value;
 
