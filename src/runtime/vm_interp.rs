@@ -2429,6 +2429,22 @@ fn run_fiber_with_stop_depth(
                         None => {
                             let method_name = vm.interner.resolve(method).to_string();
                             let class_name = vm.class_name_of(recv_val);
+                            // Honour `Fiber.try` for method-not-found
+                            // errors the same way the native-error path
+                            // already does.
+                            let msg = format!(
+                                "{} does not implement '{}'",
+                                class_name, method_name
+                            );
+                            if let Some(err_val) = unsafe {
+                                route_method_error_through_fiber_try(vm, fiber, msg)
+                            } {
+                                let caller_resumed = vm.fiber != fiber;
+                                if caller_resumed {
+                                    continue 'fiber_loop;
+                                }
+                                return Ok(err_val);
+                            }
                             return Err(RuntimeError::MethodNotFound {
                                 class_name,
                                 method: method_name,
@@ -2567,6 +2583,19 @@ fn run_fiber_with_stop_depth(
                                 let method_name = vm.interner.resolve(method).to_string();
                                 let class_name =
                                     unsafe { vm.interner.resolve((*super_cls).name).to_string() };
+                                let msg = format!(
+                                    "{} does not implement '{}'",
+                                    class_name, method_name
+                                );
+                                if let Some(err_val) = unsafe {
+                                    route_method_error_through_fiber_try(vm, fiber, msg)
+                                } {
+                                    let caller_resumed = vm.fiber != fiber;
+                                    if caller_resumed {
+                                        continue 'fiber_loop;
+                                    }
+                                    return Ok(err_val);
+                                }
                                 return Err(RuntimeError::MethodNotFound {
                                     class_name,
                                     method: method_name,
@@ -3749,6 +3778,41 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
 }
 
 /// Resume a caller fiber with a value.
+/// If `fiber` was launched via `.try()` / `.try(arg)`, route a
+/// raised runtime error through its `error` slot, mark it done,
+/// and resume the caller (if any). Returns `Some(value)` if the
+/// error was caught — outer caller should `continue 'fiber_loop`
+/// (caller resumed) or `return Ok(value)` (no caller, fiber run
+/// terminates here). Returns `None` if the fiber wasn't in try
+/// mode — the error should propagate to `Err(...)` like before.
+///
+/// Mirrors the native-side error catch in the bytecode `Op::Call`
+/// dispatcher so non-native error sites (method-not-found, super
+/// chain miss) get the same `Fiber.try` semantics. Without this,
+/// `Fiber.try { B.new().missing() }` aborts the process even
+/// though `Fiber.try { Fiber.abort("nope") }` is caught cleanly.
+unsafe fn route_method_error_through_fiber_try(
+    vm: &mut VM,
+    fiber: *mut ObjFiber,
+    err_msg: String,
+) -> Option<Value> {
+    unsafe {
+        if !(*fiber).is_try {
+            return None;
+        }
+        let err_val = vm.new_string(err_msg);
+        (*fiber).error = err_val;
+        (*fiber).is_try = false;
+        (*fiber).state = FiberState::Done;
+        let caller = (*fiber).caller;
+        if !caller.is_null() {
+            (*fiber).caller = std::ptr::null_mut();
+            resume_caller(vm, caller, err_val);
+        }
+        Some(err_val)
+    }
+}
+
 fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
     unsafe {
         if let Some(dst) = (*caller).resume_value_dst.take() {

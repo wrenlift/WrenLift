@@ -1433,6 +1433,71 @@ System.print(fiber.error)
     );
 }
 
+// `Fiber.try` should catch method-not-found errors, not just
+// `Fiber.abort` and native `runtime_error`. Used to abort the
+// process — the dispatch site raised RuntimeError::MethodNotFound
+// before checking the fiber's `is_try` flag.
+#[test]
+fn e2e_fiber_try_catches_missing_method() {
+    assert_output(
+        r#"
+class B { construct new() {} }
+var fiber = Fiber.new { B.new().missing() }
+fiber.try()
+System.print(fiber.error)
+System.print(fiber.isDone)
+"#,
+        "B does not implement 'missing()'\ntrue",
+    );
+}
+
+// Same path through `super` — the super-chain miss takes a
+// different code site but should follow the same fiber-try
+// routing.
+// `Meta.compile` returns a closure whose body's bare-identifier
+// getters (e.g. `obj.name`) used to misdispatch to `Class.name`
+// when invoked from inside another class's static method —
+// because the lookup resolved against the metaobject rather than
+// the receiver's class. Locks current correct behaviour so a
+// future regression in IC freshness or sema resolution doesn't
+// re-introduce the bug.
+#[test]
+fn e2e_meta_compile_closure_dispatches_through_receiver() {
+    assert_output(
+        r#"
+import "meta" for Meta
+class Shape {
+  construct new(n) { _name = n }
+  name { _name }
+}
+var acc = Meta.compile("return Fn.new { |obj| obj.name }\n").call()
+class Enc {
+  static invoke(fn, obj) { return fn.call(obj) }
+}
+System.print(acc.call(Shape.new("alpha")))
+System.print(Enc.invoke(acc, Shape.new("beta")))
+"#,
+        "alpha\nbeta",
+    );
+}
+
+#[test]
+fn e2e_fiber_try_catches_missing_super_method() {
+    assert_output(
+        r#"
+class A { construct new() {} }
+class B is A {
+  construct new() {}
+  callBad() { super.missing() }
+}
+var fiber = Fiber.new { B.new().callBad() }
+fiber.try()
+System.print(fiber.error)
+"#,
+        "A does not implement 'missing()'",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // System.gc() — explicit garbage collection
 // ---------------------------------------------------------------------------
