@@ -254,24 +254,14 @@ fn cmd_init(dir: &Path, name_override: Option<&str>, template: &str) {
         .unwrap_or_else(|| default_package_name(dir));
 
     // Any template we don't have a dedicated scaffold for falls
-    // back to the bare hatchfile + main.wren — the user still gets
-    // a working workspace they can iterate from. We just warn so
-    // they know there's no framework wiring in this slot yet.
+    // back to the bare hatchfile + main.wren so the user always
+    // gets a working workspace they can iterate from.
     let effective_template = match template {
-        "bare" => {
-            scaffold_bare(dir, &name);
-            "bare"
-        }
         "web" => {
             scaffold_web(dir, &name);
             "web"
         }
-        other => {
-            eprintln!(
-                "warning: template '{}' has no dedicated scaffold yet — using `bare`. \
-                 Run `hatch init --template web` for the @hatch:web starter.",
-                other
-            );
+        _ => {
             scaffold_bare(dir, &name);
             "bare"
         }
