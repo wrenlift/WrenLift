@@ -1,0 +1,33 @@
+[package]
+name = "wlift_gpu"
+version = "0.1.0"
+edition = "2021"
+description = "GPU plugin for the WrenLift runtime — wgpu-backed primitives bundled into @hatch:gpu."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Skip cranelift for the same reason as wlift_sqlite — the plugin
+# only needs the Value / VM / NativeContext types, not the JIT.
+wren_lift = { path = "../..", default-features = false }
+
+# wgpu pulls in naga (shader compiler), wgpu-core, wgpu-hal, plus
+# platform backends (Metal/Vulkan/DX12). We disable winit support
+# in the wgpu features list — phase 1 is headless and winit only
+# arrives in phase 3 once Window / Surface land.
+# wgpu picks backend per platform; we just opt into wgsl + the
+# native backends we care about. Vulkan/metal/dx12 are gated by
+# target_os in wgpu's build, so requesting them via features is
+# fine even on macOS — the unused ones get pruned.
+wgpu = { version = "22", default-features = false, features = [
+  "wgsl",
+  "metal",
+  "dx12",
+  "naga-ir",
+] }
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Read .wgsl shaders for hot reload.
+log = "0.4"
