@@ -3535,6 +3535,150 @@ pub unsafe extern "C" fn wlift_gpu_surface_acquire(vm: *mut VM) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// queue.writeTexture
+// ---------------------------------------------------------------------------
+//
+// CPU → texture upload. Image decoding lives in @hatch:image
+// (the wlift_image plugin); this entry point just takes raw
+// pixel bytes and a layout descriptor and routes them through
+// `queue.write_texture`.
+
+unsafe fn read_byte_buffer(vm: &mut VM, v: Value) -> Option<Vec<u8>> {
+    use wren_lift::runtime::object::{ObjList, ObjType, ObjTypedArray, TypedArrayKind};
+
+    if !v.is_object() {
+        vm.runtime_error(
+            "Texture.fromImage: bytes must be a List<Num> or ByteArray.".to_string(),
+        );
+        return None;
+    }
+    let ptr = v.as_object()?;
+    let header = ptr as *const ObjHeader;
+    match unsafe { (*header).obj_type } {
+        ObjType::List => {
+            let list = ptr as *const ObjList;
+            let n = unsafe { (*list).count } as usize;
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let entry = unsafe { *(*list).elements.add(i) };
+                let v = match entry.as_num() {
+                    Some(v) if (0.0..=255.0).contains(&v) && v.fract() == 0.0 => v as u8,
+                    _ => {
+                        vm.runtime_error(format!(
+                            "Texture.fromImage: byte {} not in 0..=255.",
+                            i
+                        ));
+                        return None;
+                    }
+                };
+                out.push(v);
+            }
+            Some(out)
+        }
+        ObjType::TypedArray => {
+            let arr = ptr as *const ObjTypedArray;
+            if unsafe { (*arr).kind_tag() } == TypedArrayKind::U8 {
+                Some(unsafe { (*arr).as_bytes() }.to_vec())
+            } else {
+                vm.runtime_error(
+                    "Texture.fromImage: typed array must be ByteArray (u8).".to_string(),
+                );
+                None
+            }
+        }
+        _ => {
+            vm.runtime_error(
+                "Texture.fromImage: bytes must be a List<Num> or ByteArray.".to_string(),
+            );
+            None
+        }
+    }
+}
+
+/// Direct byte → texture upload. The Wren caller already knows
+/// the layout (width, height, bytes-per-row); this just wraps
+/// `queue.write_texture`.
+///
+/// `descriptor`:
+///   "x", "y": Num     // offset within the texture (default 0)
+///   "width", "height": Num
+///   "bytesPerRow":  Num
+///   "rowsPerImage": Num   // optional, defaults to height
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_queue_write_texture(vm: *mut VM) {
+    unsafe {
+        let texture_id = match id_of(ctx(vm), slot(vm, 1), "Queue.writeTexture") {
+            Some(i) => i,
+            None => return,
+        };
+        let bytes = match read_byte_buffer(ctx(vm), slot(vm, 2)) {
+            Some(b) => b,
+            None => return,
+        };
+        let desc = slot(vm, 3);
+        let width = map_get(desc, "width").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let height = map_get(desc, "height").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let x = map_get(desc, "x").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let y = map_get(desc, "y").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let bytes_per_row = match map_get(desc, "bytesPerRow").and_then(|v| v.as_num()) {
+            Some(n) if n > 0.0 => n as u32,
+            _ => {
+                ctx(vm).runtime_error(
+                    "Queue.writeTexture: descriptor must include `bytesPerRow`.".to_string(),
+                );
+                return;
+            }
+        };
+        let rows_per_image = map_get(desc, "rowsPerImage")
+            .and_then(|v| v.as_num())
+            .map(|n| n as u32)
+            .unwrap_or(height);
+
+        let tex_reg = textures().lock().unwrap();
+        let rec = match tex_reg.textures.get(&texture_id) {
+            Some(t) => t,
+            None => {
+                drop(tex_reg);
+                ctx(vm).runtime_error("Queue.writeTexture: unknown texture id.".to_string());
+                return;
+            }
+        };
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&rec.device_id) {
+            Some(d) => d,
+            None => {
+                drop(dev_reg);
+                drop(tex_reg);
+                ctx(vm).runtime_error("Queue.writeTexture: device gone.".to_string());
+                return;
+            }
+        };
+        dev.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &rec.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(rows_per_image),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        drop(dev_reg);
+        drop(tex_reg);
+        set_return(vm, Value::null());
+    }
+}
+
 /// Present the in-flight frame. Consumes the `SurfaceTexture`
 /// (which schedules the swap) and drops the auxiliary `TextureView`.
 #[no_mangle]

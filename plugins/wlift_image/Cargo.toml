@@ -1,0 +1,14 @@
+[package]
+name = "wlift_image"
+version = "0.1.0"
+edition = "2021"
+description = "Image encode / decode / resize / convert for WrenLift. Backed by the `image` crate; bundled into @hatch:image as a cdylib so games + tools share the same RGBA8 pipeline."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wren_lift = { path = "../..", default-features = false }
+# Game-asset codecs only — TIFF/EXR/HDR aren't worth the binary
+# bloat for the default package. Callers that need them can fork.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
