@@ -3306,10 +3306,7 @@ unsafe fn decode_window_handle(
                     return None;
                 }
             };
-            let window = match std::num::NonZeroU32::new(window_n) {
-                Some(w) => w,
-                None => return None,
-            };
+            let window = std::num::NonZeroU32::new(window_n)?;
             let connection =
                 unsafe { map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v)) };
             let visual_n = unsafe {
@@ -3452,7 +3449,6 @@ pub unsafe extern "C" fn wlift_gpu_surface_destroy(vm: *mut VM) {
 ///   "format":      String?  (defaults to the picked sRGB or first cap)
 ///   "presentMode": String?  ("fifo" | "immediate" | "mailbox", default fifo)
 ///   "alphaMode":   String?  ("auto" | "opaque" | "premultiplied", default auto)
-
 #[no_mangle]
 pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut VM) {
     unsafe {
@@ -3554,7 +3550,16 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut VM) {
         rec.format = format;
         drop(dev_reg);
         drop(surf_reg);
-        set_return(vm, Value::null());
+        // Return the post-clamp dimensions so the caller can size
+        // its camera / depth attachment to match the actual surface
+        // (which may have been clamped to `max_texture_dimension_2d`).
+        let context = ctx(vm);
+        let map = context.alloc_map();
+        let kw = context.alloc_string("width".to_string());
+        let kh = context.alloc_string("height".to_string());
+        let _ = context.call_method_on(map, "[_]=(_)", &[kw, Value::num(cw as f64)]);
+        let _ = context.call_method_on(map, "[_]=(_)", &[kh, Value::num(ch as f64)]);
+        set_return(vm, map);
     }
 }
 

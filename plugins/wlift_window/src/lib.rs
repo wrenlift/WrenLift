@@ -119,7 +119,7 @@ fn next_id() -> u64 {
 // kernel threads, this would need a more careful design.
 
 thread_local! {
-    static EVENT_LOOP: RefCell<Option<EventLoop<()>>> = RefCell::new(None);
+    static EVENT_LOOP: RefCell<Option<EventLoop<()>>> = const { RefCell::new(None) };
     static APP: RefCell<App> = RefCell::new(App::new());
 }
 

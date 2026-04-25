@@ -359,10 +359,9 @@ mod d3 {
 pub unsafe extern "C" fn wlift_physics_world2d_create(vm: *mut VM) {
     unsafe {
         let desc = slot(vm, 1);
-        let (gx, gy) = match map_get(desc, "gravity").and_then(|v| read_2d(v)) {
-            Some(p) => p,
-            None => (0.0, -9.81),
-        };
+        let (gx, gy) = map_get(desc, "gravity")
+            .and_then(|v| read_2d(v))
+            .unwrap_or((0.0, -9.81));
         let world = d2::World::new(gx, gy);
         let id = next_id();
         d2::worlds().lock().unwrap().insert(id, world);
@@ -574,15 +573,15 @@ pub unsafe extern "C" fn wlift_physics_world2d_linear_velocity(vm: *mut VM) {
         };
         let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
         let reg = d2::worlds().lock().unwrap();
-        let (vx, vy) = match reg.get(&world_id).and_then(|w| {
-            w.bodies_by_id.get(&body_id).map(|h| {
-                let v = w.bodies[*h].linvel();
-                (v.x, v.y)
+        let (vx, vy) = reg
+            .get(&world_id)
+            .and_then(|w| {
+                w.bodies_by_id.get(&body_id).map(|h| {
+                    let v = w.bodies[*h].linvel();
+                    (v.x, v.y)
+                })
             })
-        }) {
-            Some(v) => v,
-            None => (0.0, 0.0),
-        };
+            .unwrap_or((0.0, 0.0));
         drop(reg);
         return_2d_pair(vm, vx, vy);
     }
@@ -659,10 +658,9 @@ pub unsafe extern "C" fn wlift_physics_world2d_apply_force(vm: *mut VM) {
 pub unsafe extern "C" fn wlift_physics_world3d_create(vm: *mut VM) {
     unsafe {
         let desc = slot(vm, 1);
-        let (gx, gy, gz) = match map_get(desc, "gravity").and_then(|v| read_3d(v)) {
-            Some(p) => p,
-            None => (0.0, -9.81, 0.0),
-        };
+        let (gx, gy, gz) = map_get(desc, "gravity")
+            .and_then(|v| read_3d(v))
+            .unwrap_or((0.0, -9.81, 0.0));
         let world = d3::World::new(gx, gy, gz);
         let id = next_id();
         d3::worlds().lock().unwrap().insert(id, world);
@@ -785,15 +783,15 @@ pub unsafe extern "C" fn wlift_physics_world3d_position(vm: *mut VM) {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
         let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
         let reg = d3::worlds().lock().unwrap();
-        let (x, y, z) = match reg.get(&world_id).and_then(|w| {
-            w.bodies_by_id.get(&body_id).map(|h| {
-                let t = w.bodies[*h].translation();
-                (t.x, t.y, t.z)
+        let (x, y, z) = reg
+            .get(&world_id)
+            .and_then(|w| {
+                w.bodies_by_id.get(&body_id).map(|h| {
+                    let t = w.bodies[*h].translation();
+                    (t.x, t.y, t.z)
+                })
             })
-        }) {
-            Some(p) => p,
-            None => (0.0, 0.0, 0.0),
-        };
+            .unwrap_or((0.0, 0.0, 0.0));
         drop(reg);
         let context = ctx(vm);
         let list = context.alloc_list(vec![
@@ -811,15 +809,15 @@ pub unsafe extern "C" fn wlift_physics_world3d_linear_velocity(vm: *mut VM) {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
         let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
         let reg = d3::worlds().lock().unwrap();
-        let (vx, vy, vz) = match reg.get(&world_id).and_then(|w| {
-            w.bodies_by_id.get(&body_id).map(|h| {
-                let v = w.bodies[*h].linvel();
-                (v.x, v.y, v.z)
+        let (vx, vy, vz) = reg
+            .get(&world_id)
+            .and_then(|w| {
+                w.bodies_by_id.get(&body_id).map(|h| {
+                    let v = w.bodies[*h].linvel();
+                    (v.x, v.y, v.z)
+                })
             })
-        }) {
-            Some(v) => v,
-            None => (0.0, 0.0, 0.0),
-        };
+            .unwrap_or((0.0, 0.0, 0.0));
         drop(reg);
         let context = ctx(vm);
         let list = context.alloc_list(vec![
