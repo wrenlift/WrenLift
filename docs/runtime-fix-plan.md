@@ -103,7 +103,19 @@ These are most likely one bug, one fix.
 
 ## Phase 2 — FFI ABI safety hardening
 
-Status: **open**
+Status: **fixed (commit `c22768c`, 2026-04-26)**
+
+`WLIFT_PLUGIN_ABI_VERSION` lives in `runtime::foreign` and starts at
+v1. Every cdylib plugin (`wlift_gpu`, `wlift_window`, `wlift_image`,
+`wlift_audio`, `wlift_physics`, `wlift_sqlite`) exports
+`wlift_plugin_abi_version()` → `u32`. The host calls it immediately
+after `dlopen`; a mismatched (or missing — read as v0) value short-
+circuits `load_library` with a clean `ForeignLoadError::AbiMismatch`
+that names both versions in its message. Test coverage in
+`runtime::foreign::tests` covers the message format and the `"self"`
+sentinel exemption. Bump the constant whenever `NativeContext` or
+the `ForeignCFn` shape changes; the docstring carries the bump
+rationale.
 
 Stale plugin dylibs SIGSEGV silently when the host runtime's vtable
 shape moves underneath them. Diagnosed once by accident this session;
@@ -141,7 +153,16 @@ boundary.
 
 ## Phase 3 — Tiered / JIT correctness
 
-Status: **open** (multiple symptoms; suspect overlap)
+Status: **mostly fixed downstream of Phase 0 / 1; one new sub-issue
+deferred**
+
+| Item | Status |
+|---|---|
+| `Null does not implement 'view'` in sprite-grid tiered | Fixed (downstream of for-in / CSE — sprite-grid runs cleanly under `--mode tiered` post-1441d38) |
+| `@hatch:web` Stylesheet IC tier-up miscompile | Likely fixed (downstream of CSE memory-cache fix — chat builds + tiers without IC errors) |
+| OSR entry "undefined value v53" | Not reproducing (30/30 clean runs of `template.spec.wren` in tiered) |
+| Constructor JIT dispatch SIGSEGV under GC pressure | Still disabled (deferred) |
+| **NEW: `@hatch:web` `App.listen` hangs in tiered mode** | Logged in QUIRKS as open — separate root cause, not downstream of Phase 0 / 1 |
 
 Group of bugs that fire only under `--mode tiered`, where a hot
 function gets compiled and the JIT dispatch path mis-handles

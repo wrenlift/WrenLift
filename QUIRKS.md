@@ -7,6 +7,38 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### `@hatch:web` `App.listen` hangs in tiered mode
+
+Status: **open (workaround: `--mode interpreter`)**
+
+```
+$ wlift --mode tiered web-hello.hatch &
+@hatch:web listening on http://127.0.0.1:3000
+$ curl http://127.0.0.1:3000/                       # never returns
+```
+
+Server binds, prints the listening message, never responds to
+HTTP. The TCP handshake completes (curl gets ESTABLISHED), but
+the request body hangs in the kernel — `tryAccept` either never
+fires or `serve_` hangs once it does. Adding Wren-level
+`System.print` traces into the listen loop produced no output
+even with curl connected, so the loop body doesn't enter the
+`conn != null` branch.
+
+`--mode interpreter` runs the same code correctly. Reproduces
+under `--opt-threshold 999999999` (no JIT compilation), so the
+divergence is in the tiered execution mode's interpreter path,
+not in JIT'd code. Leading suspect: the back-edge tier-up
+machinery on a `while (true)` accept loop somehow elides the
+`listener.tryAccept` foreign call or `sched.spawn` side effect
+even though both have `has_side_effects` set.
+
+Smaller fiber tests (Fiber.new + .try() in a tight loop) pass
+in tiered mode, so the bug is specific to the listen-loop
+shape — likely the combination of an unconditional infinite
+loop, a foreign-fn call returning null, and the cooperative
+fiber scheduler.
+
 ### `JSON.parse` fails on second HTTP response body in tiered mode
 
 Status: **open**
