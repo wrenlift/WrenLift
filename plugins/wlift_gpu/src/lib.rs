@@ -66,6 +66,30 @@ struct BufferRecord {
     device_id: u64,
 }
 
+struct Shaders {
+    shaders: HashMap<u64, wgpu::ShaderModule>,
+}
+
+struct Textures {
+    textures: HashMap<u64, TextureRecord>,
+}
+
+struct TextureRecord {
+    texture: wgpu::Texture,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+    device_id: u64,
+}
+
+struct Views {
+    views: HashMap<u64, wgpu::TextureView>,
+}
+
+struct Samplers {
+    samplers: HashMap<u64, wgpu::Sampler>,
+}
+
 struct DeviceRecord {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -92,6 +116,139 @@ fn buffers() -> &'static Mutex<Buffers> {
             buffers: HashMap::new(),
         })
     })
+}
+
+fn shaders() -> &'static Mutex<Shaders> {
+    static REG: OnceLock<Mutex<Shaders>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(Shaders {
+            shaders: HashMap::new(),
+        })
+    })
+}
+
+fn textures() -> &'static Mutex<Textures> {
+    static REG: OnceLock<Mutex<Textures>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(Textures {
+            textures: HashMap::new(),
+        })
+    })
+}
+
+fn views() -> &'static Mutex<Views> {
+    static REG: OnceLock<Mutex<Views>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(Views {
+            views: HashMap::new(),
+        })
+    })
+}
+
+fn samplers() -> &'static Mutex<Samplers> {
+    static REG: OnceLock<Mutex<Samplers>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(Samplers {
+            samplers: HashMap::new(),
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Format / usage decoders
+// ---------------------------------------------------------------------------
+
+fn texture_format_from_str(s: &str) -> Option<wgpu::TextureFormat> {
+    use wgpu::TextureFormat as F;
+    Some(match s {
+        "rgba8unorm" => F::Rgba8Unorm,
+        "rgba8unorm-srgb" => F::Rgba8UnormSrgb,
+        "bgra8unorm" => F::Bgra8Unorm,
+        "bgra8unorm-srgb" => F::Bgra8UnormSrgb,
+        "r8unorm" => F::R8Unorm,
+        "r16float" => F::R16Float,
+        "r32float" => F::R32Float,
+        "rg8unorm" => F::Rg8Unorm,
+        "rg16float" => F::Rg16Float,
+        "rg32float" => F::Rg32Float,
+        "rgba16float" => F::Rgba16Float,
+        "rgba32float" => F::Rgba32Float,
+        "depth32float" => F::Depth32Float,
+        "depth24plus" => F::Depth24Plus,
+        "depth24plus-stencil8" => F::Depth24PlusStencil8,
+        _ => return None,
+    })
+}
+
+fn format_bytes_per_pixel(format: wgpu::TextureFormat) -> u32 {
+    use wgpu::TextureFormat as F;
+    match format {
+        F::R8Unorm => 1,
+        F::Rg8Unorm | F::R16Float => 2,
+        F::Rgba8Unorm
+        | F::Rgba8UnormSrgb
+        | F::Bgra8Unorm
+        | F::Bgra8UnormSrgb
+        | F::R32Float
+        | F::Rg16Float => 4,
+        F::Rg32Float | F::Rgba16Float => 8,
+        F::Rgba32Float => 16,
+        F::Depth32Float => 4,
+        // 24-bit depth formats can't be copy-src readable in wgpu;
+        // callers shouldn't try to read them back. Return 4 as a
+        // placeholder so size math doesn't divide-by-zero.
+        F::Depth24Plus | F::Depth24PlusStencil8 => 4,
+        _ => 4,
+    }
+}
+
+unsafe fn texture_usage_from_list(vm: &mut VM, v: Value) -> Option<wgpu::TextureUsages> {
+    let list = match unsafe { list_view(v) } {
+        Some(l) => l,
+        None => {
+            vm.runtime_error(
+                "Texture.create: descriptor `usage` must be a list of strings.".to_string(),
+            );
+            return None;
+        }
+    };
+    let mut flags = wgpu::TextureUsages::empty();
+    for i in 0..list.count as usize {
+        let s = match unsafe { string_of(list_get(list, i)) } {
+            Some(s) => s,
+            None => {
+                vm.runtime_error("Texture.create: every `usage` entry must be a string.".to_string());
+                return None;
+            }
+        };
+        flags |= match s.as_str() {
+            "render-attachment" | "renderAttachment" => wgpu::TextureUsages::RENDER_ATTACHMENT,
+            "texture-binding" | "textureBinding" => wgpu::TextureUsages::TEXTURE_BINDING,
+            "storage-binding" | "storageBinding" => wgpu::TextureUsages::STORAGE_BINDING,
+            "copy-src" | "copySrc" => wgpu::TextureUsages::COPY_SRC,
+            "copy-dst" | "copyDst" => wgpu::TextureUsages::COPY_DST,
+            other => {
+                vm.runtime_error(format!("Texture.create: unknown usage flag '{}'.", other));
+                return None;
+            }
+        };
+    }
+    Some(flags)
+}
+
+fn filter_from_str(s: &str) -> wgpu::FilterMode {
+    match s {
+        "linear" => wgpu::FilterMode::Linear,
+        _ => wgpu::FilterMode::Nearest,
+    }
+}
+
+fn address_mode_from_str(s: &str) -> wgpu::AddressMode {
+    match s {
+        "repeat" => wgpu::AddressMode::Repeat,
+        "mirror-repeat" | "mirrorRepeat" => wgpu::AddressMode::MirrorRepeat,
+        _ => wgpu::AddressMode::ClampToEdge,
+    }
 }
 
 fn next_id() -> u64 {
@@ -756,4 +913,302 @@ pub extern "C" fn wlift_gpu_buffer_write_vec4s(vm: *mut VM) {
 #[no_mangle]
 pub extern "C" fn wlift_gpu_buffer_write_quats(vm: *mut VM) {
     unsafe { write_buffer_math_batch(vm, "Buffer.writeQuats", 4) }
+}
+
+// ---------------------------------------------------------------------------
+// ShaderModule
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_shader_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createShaderModule") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+        let code = match map_get(desc, "code").and_then(|v| string_of(v)) {
+            Some(c) => c,
+            None => {
+                ctx(vm).runtime_error(
+                    "ShaderModule.create: descriptor must include a `code` string."
+                        .to_string(),
+                );
+                return;
+            }
+        };
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+
+        let module = {
+            let reg = devices().lock().unwrap();
+            let dev = match reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error("ShaderModule.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            // wgpu emits errors via the device's error callback; for
+            // phase 1 we surface them as runtime errors via the
+            // device's pollster-blocking validation path. Compile
+            // errors panic-via-callback in wgpu so wrap in
+            // catch_unwind; cleaner error mapping lands later.
+            dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: label.as_deref(),
+                source: wgpu::ShaderSource::Wgsl(code.into()),
+            })
+        };
+
+        let id = next_id();
+        shaders().lock().unwrap().shaders.insert(id, module);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_shader_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "ShaderModule.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        shaders().lock().unwrap().shaders.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Texture + TextureView
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_texture_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createTexture") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let width = match map_get(desc, "width").and_then(|v| v.as_num()) {
+            Some(n) if n.is_finite() && n > 0.0 && n.fract() == 0.0 => n as u32,
+            _ => {
+                ctx(vm).runtime_error(
+                    "Texture.create: `width` must be a positive integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let height = match map_get(desc, "height").and_then(|v| v.as_num()) {
+            Some(n) if n.is_finite() && n > 0.0 && n.fract() == 0.0 => n as u32,
+            _ => {
+                ctx(vm).runtime_error(
+                    "Texture.create: `height` must be a positive integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let depth = map_get(desc, "depth")
+            .and_then(|v| v.as_num())
+            .map(|n| n as u32)
+            .unwrap_or(1);
+        let format = match map_get(desc, "format").and_then(|v| string_of(v)) {
+            Some(s) => match texture_format_from_str(&s) {
+                Some(f) => f,
+                None => {
+                    ctx(vm).runtime_error(format!(
+                        "Texture.create: unknown format '{}'.",
+                        s
+                    ));
+                    return;
+                }
+            },
+            None => {
+                ctx(vm).runtime_error(
+                    "Texture.create: descriptor must include a `format` string.".to_string(),
+                );
+                return;
+            }
+        };
+        let usage = match map_get(desc, "usage") {
+            Some(v) => match texture_usage_from_list(ctx(vm), v) {
+                Some(u) => u,
+                None => return,
+            },
+            None => {
+                ctx(vm).runtime_error(
+                    "Texture.create: descriptor must include a `usage` list.".to_string(),
+                );
+                return;
+            }
+        };
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+        let sample_count = map_get(desc, "sampleCount")
+            .and_then(|v| v.as_num())
+            .map(|n| n as u32)
+            .unwrap_or(1);
+
+        let texture = {
+            let reg = devices().lock().unwrap();
+            let dev = match reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error("Texture.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            dev.device.create_texture(&wgpu::TextureDescriptor {
+                label: label.as_deref(),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: depth,
+                },
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+
+        let id = next_id();
+        textures().lock().unwrap().textures.insert(
+            id,
+            TextureRecord {
+                texture,
+                format,
+                width,
+                height,
+                device_id,
+            },
+        );
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_texture_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "Texture.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        textures().lock().unwrap().textures.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_texture_create_view(vm: *mut VM) {
+    unsafe {
+        let texture_id = match id_of(ctx(vm), slot(vm, 1), "Texture.createView") {
+            Some(i) => i,
+            None => return,
+        };
+        let view = {
+            let reg = textures().lock().unwrap();
+            let rec = match reg.textures.get(&texture_id) {
+                Some(r) => r,
+                None => {
+                    ctx(vm).runtime_error("Texture.createView: unknown texture id.".to_string());
+                    return;
+                }
+            };
+            rec.texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let id = next_id();
+        views().lock().unwrap().views.insert(id, view);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_view_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "TextureView.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        views().lock().unwrap().views.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sampler
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_sampler_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createSampler") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let mag = map_get(desc, "magFilter")
+            .and_then(|v| string_of(v))
+            .map(|s| filter_from_str(&s))
+            .unwrap_or(wgpu::FilterMode::Linear);
+        let min = map_get(desc, "minFilter")
+            .and_then(|v| string_of(v))
+            .map(|s| filter_from_str(&s))
+            .unwrap_or(wgpu::FilterMode::Linear);
+        let mip = map_get(desc, "mipmapFilter")
+            .and_then(|v| string_of(v))
+            .map(|s| filter_from_str(&s))
+            .unwrap_or(wgpu::FilterMode::Nearest);
+        let au = map_get(desc, "addressModeU")
+            .and_then(|v| string_of(v))
+            .map(|s| address_mode_from_str(&s))
+            .unwrap_or(wgpu::AddressMode::ClampToEdge);
+        let av = map_get(desc, "addressModeV")
+            .and_then(|v| string_of(v))
+            .map(|s| address_mode_from_str(&s))
+            .unwrap_or(wgpu::AddressMode::ClampToEdge);
+        let aw = map_get(desc, "addressModeW")
+            .and_then(|v| string_of(v))
+            .map(|s| address_mode_from_str(&s))
+            .unwrap_or(wgpu::AddressMode::ClampToEdge);
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+
+        let sampler = {
+            let reg = devices().lock().unwrap();
+            let dev = match reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error("Sampler.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            dev.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: label.as_deref(),
+                address_mode_u: au,
+                address_mode_v: av,
+                address_mode_w: aw,
+                mag_filter: mag,
+                min_filter: min,
+                mipmap_filter: mip,
+                ..Default::default()
+            })
+        };
+        let id = next_id();
+        samplers().lock().unwrap().samplers.insert(id, sampler);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_sampler_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "Sampler.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        samplers().lock().unwrap().samplers.remove(&id);
+        set_return(vm, Value::null());
+    }
 }
