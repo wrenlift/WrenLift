@@ -31,6 +31,12 @@ use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjS
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
+/// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
+#[no_mangle]
+pub extern "C" fn wlift_plugin_abi_version() -> u32 {
+    wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+}
+
 // --- Registry --------------------------------------------------
 
 fn registry() -> &'static Mutex<HashMap<u64, Connection>> {

@@ -40,6 +40,18 @@ use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjS
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
+/// Plugin ABI handshake. The host calls this immediately after
+/// `dlopen` and refuses to bind any other symbols if the value
+/// disagrees with its own compiled-in
+/// `wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION`. Keeps
+/// stale dylibs (built against a different runtime tree) from
+/// SIGSEGVing when their first foreign method dispatches against a
+/// vtable laid out for a different `NativeContext`.
+#[no_mangle]
+pub extern "C" fn wlift_plugin_abi_version() -> u32 {
+    wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------

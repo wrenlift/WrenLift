@@ -19,13 +19,53 @@ use crate::runtime::object::ForeignCFn;
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
+/// ABI version for wlift cdylib plugins. Bump whenever the
+/// `NativeContext` trait, `ForeignCFn` signature, or any other
+/// type that crosses the host ⇄ plugin boundary changes shape.
+///
+/// Plugins MUST export
+///
+/// ```
+/// #[no_mangle]
+/// pub extern "C" fn wlift_plugin_abi_version() -> u32 {
+///     wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+/// }
+/// ```
+///
+/// The host calls `wlift_plugin_abi_version` immediately after
+/// `dlopen` and refuses to bind any symbols if the value differs
+/// from the host's compiled-in version. A missing symbol is
+/// treated as v0 so older plugins fail loudly rather than
+/// silently SIGSEGV under a vtable mismatch.
+///
+/// History:
+/// - v1 (2026-04-26): introduced. Marker for the current
+///   `NativeContext` trait surface as of commit `955235d`.
+pub const WLIFT_PLUGIN_ABI_VERSION: u32 = 1;
+
+/// Symbol name plugins export to advertise their ABI version.
+/// Lives in this module so the host and the plugin both reference
+/// one canonical string.
+pub const WLIFT_PLUGIN_ABI_SYMBOL: &str = "wlift_plugin_abi_version";
+
 /// Errors surfaced by the foreign loader. Emitted as runtime errors at
 /// class install time so the failure is visible to Wren code rather
 /// than aborting the process.
 #[derive(Debug)]
 pub enum ForeignLoadError {
-    LibraryNotFound { name: String, tried: Vec<String> },
-    SymbolNotFound { library: String, symbol: String },
+    LibraryNotFound {
+        name: String,
+        tried: Vec<String>,
+    },
+    SymbolNotFound {
+        library: String,
+        symbol: String,
+    },
+    AbiMismatch {
+        library: String,
+        expected: u32,
+        found: u32,
+    },
 }
 
 impl std::fmt::Display for ForeignLoadError {
@@ -41,6 +81,18 @@ impl std::fmt::Display for ForeignLoadError {
             }
             ForeignLoadError::SymbolNotFound { library, symbol } => {
                 write!(f, "symbol '{}' not found in '{}'", symbol, library)
+            }
+            ForeignLoadError::AbiMismatch {
+                library,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "plugin '{}' was built against wlift ABI v{} but the host expects v{}; \
+                     rebuild the plugin against the current wlift sources",
+                    library, found, expected
+                )
             }
         }
     }
@@ -103,6 +155,43 @@ pub fn library_candidates(name: &str) -> Vec<String> {
 /// process image (equivalent to `dlopen(NULL)`). Useful for tests and
 /// for wiring foreign methods against symbols linked into the host
 /// executable.
+/// Read the plugin's advertised ABI version. Plugins that don't
+/// export the symbol are treated as v0 — same as a stale dylib
+/// built before the version-stamp landed; the caller's
+/// `verify_plugin_abi` then surfaces an explicit `AbiMismatch`
+/// rather than letting the plugin's vtable run with stale offsets.
+fn read_plugin_abi(library: &Library) -> u32 {
+    unsafe {
+        match library.get::<unsafe extern "C" fn() -> u32>(WLIFT_PLUGIN_ABI_SYMBOL.as_bytes()) {
+            Ok(sym) => sym(),
+            Err(_) => 0,
+        }
+    }
+}
+
+/// Confirm a freshly-loaded plugin advertises the same ABI version
+/// the host was compiled against. Called immediately after
+/// `dlopen` so a mismatch surfaces as a clean runtime error
+/// instead of a SIGSEGV when the first foreign method dispatches
+/// against a stale vtable.
+///
+/// The "self" image (host process) is exempt — it's the host's
+/// own symbols, by definition matching itself.
+pub fn verify_plugin_abi(library: &Library, name: &str) -> Result<(), ForeignLoadError> {
+    if name == "self" {
+        return Ok(());
+    }
+    let found = read_plugin_abi(library);
+    if found != WLIFT_PLUGIN_ABI_VERSION {
+        return Err(ForeignLoadError::AbiMismatch {
+            library: name.to_string(),
+            expected: WLIFT_PLUGIN_ABI_VERSION,
+            found,
+        });
+    }
+    Ok(())
+}
+
 pub fn load_library(
     name: &str,
     search_paths: &[PathBuf],
@@ -136,6 +225,7 @@ pub fn load_library(
     if let Some(override_path) = name_overrides.get(name) {
         tried.push(override_path.display().to_string());
         if let Ok(lib) = unsafe { Library::new(override_path) } {
+            verify_plugin_abi(&lib, name)?;
             return Ok(lib);
         }
         return Err(ForeignLoadError::LibraryNotFound {
@@ -152,6 +242,7 @@ pub fn load_library(
             let full = dir.join(cand);
             tried.push(full.display().to_string());
             if let Ok(lib) = unsafe { Library::new(&full) } {
+                verify_plugin_abi(&lib, name)?;
                 return Ok(lib);
             }
         }
@@ -162,6 +253,7 @@ pub fn load_library(
     for cand in &candidates {
         tried.push(cand.clone());
         if let Ok(lib) = unsafe { Library::new(cand) } {
+            verify_plugin_abi(&lib, name)?;
             return Ok(lib);
         }
     }
@@ -317,6 +409,32 @@ mod tests {
         assert_eq!(libbed, "libcrypto.dylib");
         #[cfg(all(unix, not(target_os = "macos")))]
         assert_eq!(libbed, "libcrypto.so");
+    }
+
+    #[test]
+    fn abi_mismatch_error_message_includes_versions() {
+        let err = ForeignLoadError::AbiMismatch {
+            library: "wlift_gpu".to_string(),
+            expected: 5,
+            found: 3,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("'wlift_gpu'"));
+        assert!(msg.contains("v3"));
+        assert!(msg.contains("v5"));
+    }
+
+    #[test]
+    fn verify_plugin_abi_treats_self_image_as_pass() {
+        // The host's own image isn't a plugin and doesn't export
+        // `wlift_plugin_abi_version`. Verification should short-
+        // circuit on the "self" sentinel rather than reporting
+        // a v0 mismatch.
+        let lib = match load_library("self", &[], &HashMap::new()) {
+            Ok(l) => l,
+            Err(e) => panic!("self load failed: {}", e),
+        };
+        assert!(verify_plugin_abi(&lib, "self").is_ok());
     }
 
     #[test]
