@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "plugins/wlift_sqlite", "plugins/wlift_gpu", "plugins/wlift_window", "plugins/wlift_image", "plugins/wlift_audio"]
+members = [".", "plugins/wlift_sqlite", "plugins/wlift_gpu", "plugins/wlift_window", "plugins/wlift_image", "plugins/wlift_audio", "plugins/wlift_physics"]
 resolver = "2"
 
 [package]

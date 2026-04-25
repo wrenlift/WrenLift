@@ -1,0 +1,15 @@
+[package]
+name = "wlift_physics"
+version = "0.1.0"
+edition = "2021"
+description = "Rapier-backed physics for the WrenLift game framework. One cdylib bundles rapier2d + rapier3d so @hatch:physics can expose World2D and World3D from a single import."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wren_lift = { path = "../..", default-features = false }
+# Pinned to 0.32 — the API has changed across versions; if we
+# bump these, audit the descriptor decoders below.
+rapier2d = "0.32"
+rapier3d = "0.32"
