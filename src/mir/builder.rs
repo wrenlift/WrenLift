@@ -40,9 +40,17 @@ pub struct MirBuilder<'a> {
     current_block: BlockId,
     variables: HashMap<SymbolId, ValueId>,
     /// Break targets: (exit_block, tracked variable names for phi propagation)
+    /// Stack of (target_block, tracked_var_names) for `break`. The branch
+    /// emitted by `Stmt::Break` passes the current `self.variables[name]`
+    /// for each name as block-param arguments.
     break_targets: Vec<(BlockId, Vec<SymbolId>)>,
+    /// Stack of (target_block, leading_args, tracked_var_names) for
+    /// `continue`. `leading_args` are prepended before the var values —
+    /// for-in's continue uses this to pass the iterator state into a
+    /// latch block that advances the iterator before branching back to
+    /// the condition. Plain `while` loops leave it empty.
     /// Continue targets: (header_block, tracked variable names for phi propagation)
-    continue_targets: Vec<(BlockId, Vec<SymbolId>)>,
+    continue_targets: Vec<(BlockId, Vec<ValueId>, Vec<SymbolId>)>,
     /// Field name → index mapping for the current class (None if not in a method).
     field_map: Option<HashMap<SymbolId, u16>>,
     /// Compiled closure bodies collected during lowering.
@@ -366,12 +374,10 @@ impl<'a> MirBuilder<'a> {
             }
 
             Stmt::Continue => {
-                if let Some((target, tracked_vars)) = self.continue_targets.last() {
+                if let Some((target, leading, tracked_vars)) = self.continue_targets.last() {
                     let target = *target;
-                    let args: Vec<ValueId> = tracked_vars
-                        .iter()
-                        .map(|name| self.variables[name])
-                        .collect();
+                    let mut args: Vec<ValueId> = leading.clone();
+                    args.extend(tracked_vars.iter().map(|name| self.variables[name]));
                     self.set_terminator(Terminator::Branch { target, args });
                     let dead = self.new_block();
                     self.switch_to(dead);
@@ -586,7 +592,7 @@ impl<'a> MirBuilder<'a> {
         // Lower body (cond_bb dominates body_bb, so phi values are accessible)
         self.switch_to(body_bb);
         self.break_targets.push((exit_bb, tracked_names.clone()));
-        self.continue_targets.push((cond_bb, tracked_names));
+        self.continue_targets.push((cond_bb, vec![], tracked_names));
         self.lower_stmt(body);
         self.break_targets.pop();
         self.continue_targets.pop();
@@ -641,6 +647,13 @@ impl<'a> MirBuilder<'a> {
 
         let cond_bb = self.new_block();
         let body_bb = self.new_block();
+        // Latch block sits between the body and the cond. Its job is
+        // to advance the iterator (`iter_obj.iterate(iter_param)`) and
+        // branch back to cond_bb. Both the body's natural fall-through
+        // *and* `continue` jump into the latch — without the latch,
+        // `continue` would skip the iterator advance and infinite-loop
+        // on the same element.
+        let latch_bb = self.new_block();
         let exit_bb = self.new_block();
 
         // Capture prior binding of the loop variable so we can restore it
@@ -693,6 +706,25 @@ impl<'a> MirBuilder<'a> {
             exit_phi_map.push((name, exit_phi));
         }
 
+        // Create phi params in latch_bb mirroring cond_bb's shape.
+        // Body fall-through and `continue` both branch here with
+        // [iter_param, ...vars]; the latch then advances the iterator
+        // and branches to cond_bb with [next_iter, ...vars_phi].
+        let latch_iter_phi = self.func.new_value();
+        self.func
+            .block_mut(latch_bb)
+            .params
+            .push((latch_iter_phi, MirType::Value));
+        let mut latch_phi_map: Vec<(SymbolId, ValueId)> = Vec::new();
+        for &(name, _) in &vars_snapshot {
+            let lphi = self.func.new_value();
+            self.func
+                .block_mut(latch_bb)
+                .params
+                .push((lphi, MirType::Value));
+            latch_phi_map.push((name, lphi));
+        }
+
         self.set_terminator(Terminator::Branch {
             target: cond_bb,
             args: entry_args,
@@ -719,32 +751,56 @@ impl<'a> MirBuilder<'a> {
         self.variables.insert(variable.0, elem_val);
 
         self.break_targets.push((exit_bb, tracked_names.clone()));
-        self.continue_targets.push((cond_bb, tracked_names));
+        // `continue` branches to latch_bb with [iter_param, ...vars] so
+        // the iterator advances before re-entering cond_bb. Natural
+        // fall-through skips the latch and emits the iter advance
+        // inline — the hot path that doesn't use `continue` shouldn't
+        // pay for an extra block transition every iteration.
+        self.continue_targets
+            .push((latch_bb, vec![iter_param], tracked_names.clone()));
         self.lower_stmt(body);
         self.break_targets.pop();
         self.continue_targets.pop();
 
-        let next_iter = self.emit(Instruction::Call {
-            receiver: iter_obj,
-            method: iterate_sig,
-            args: vec![iter_param],
-        });
-
-        // Back-edge: pass iterator state + current (possibly mutated) variable values
-        let mut backedge_args = vec![next_iter];
-        for &(name, _) in &phi_map {
-            backedge_args.push(self.variables[&name]);
-        }
-
+        // Body fall-through: emit iter advance inline and branch
+        // straight to cond_bb. Same shape as the original lowering,
+        // so the no-`continue` case has identical bytecode density.
         if matches!(
             self.func.block(self.current_block).terminator,
             Terminator::Unreachable
         ) {
+            let next_iter = self.emit(Instruction::Call {
+                receiver: iter_obj,
+                method: iterate_sig,
+                args: vec![iter_param],
+            });
+            let mut backedge_args = vec![next_iter];
+            for &name in &tracked_names {
+                backedge_args.push(self.variables[&name]);
+            }
             self.set_terminator(Terminator::Branch {
                 target: cond_bb,
                 args: backedge_args,
             });
         }
+
+        // Latch body: only reachable from `continue`. Advance the
+        // iterator using the captured iter_param phi, then branch to
+        // cond_bb with [next_iter, ...latch_var_phis].
+        self.switch_to(latch_bb);
+        let next_iter_latch = self.emit(Instruction::Call {
+            receiver: iter_obj,
+            method: iterate_sig,
+            args: vec![latch_iter_phi],
+        });
+        let mut latch_backedge_args = vec![next_iter_latch];
+        for &(_, lphi) in &latch_phi_map {
+            latch_backedge_args.push(lphi);
+        }
+        self.set_terminator(Terminator::Branch {
+            target: cond_bb,
+            args: latch_backedge_args,
+        });
 
         // Use exit_bb phi values for post-loop code
         for &(name, exit_phi) in &exit_phi_map {
