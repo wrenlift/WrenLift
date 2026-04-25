@@ -813,26 +813,44 @@ impl VM {
                 names: _,
             } = &stmt.0
             {
-                let imported_module = mod_path.0.clone();
+                let requested = mod_path.0.clone();
+
+                // Resolve the requested name to its canonical form.
+                // For relative paths (`./foo`, `../foo`) the loader's
+                // resolver returns the absolute on-disk path so that
+                // `./foo` and `../foo` referring to the same file
+                // dedupe to a single ModuleEntry — without this the
+                // engine registers two modules for one file and
+                // class-identity (`is`) checks fail across the
+                // boundary. Scoped names (`@hatch:foo`) and bare
+                // builtins resolve to themselves.
+                let importer = module_name.to_string();
+                let canonical = self
+                    .config
+                    .resolve_module_fn
+                    .as_ref()
+                    .and_then(|fn_| fn_(&requested, &importer))
+                    .unwrap_or_else(|| requested.clone());
 
                 // Skip if already loaded
-                if !self.engine.modules.contains_key(&imported_module) {
+                if !self.engine.modules.contains_key(&canonical) {
                     // Check for built-in optional modules first
-                    if self.try_load_builtin_module(&imported_module) {
+                    if self.try_load_builtin_module(&canonical) {
                         // Built-in module registered successfully
                     } else {
-                        // Resolve module source via config callback. The
-                        // importer's module name lets the loader find
-                        // the right on-disk dir for `./foo`-style
-                        // relative imports.
-                        let importer = module_name.to_string();
+                        // Resolve module source via config callback.
+                        // Pass the canonical name so the loader's
+                        // `dirs` registry stays keyed by canonical
+                        // — subsequent imports from inside this
+                        // module use the canonical name as `from`,
+                        // which has to match what we recorded here.
                         let source_opt = self
                             .config
                             .load_module_fn
                             .as_ref()
-                            .and_then(|load_fn| load_fn(&imported_module, &importer));
+                            .and_then(|load_fn| load_fn(&canonical, &importer));
                         if let Some(mod_source) = source_opt {
-                            let result = self.interpret(&imported_module, &mod_source);
+                            let result = self.interpret(&canonical, &mod_source);
                             if result != InterpretResult::Success {
                                 self.loading_modules.remove(&module_key);
                                 return result;
@@ -840,7 +858,7 @@ impl VM {
                         } else {
                             self.report_error(&format!(
                                 "Could not load module '{}'",
-                                imported_module
+                                requested
                             ));
                             self.loading_modules.remove(&module_key);
                             return InterpretResult::CompileError;
@@ -1073,8 +1091,20 @@ impl VM {
                 // both export a class called "Response" leak into each
                 // other at runtime via whichever HashMap iteration order
                 // happens to visit first.
+                //
+                // The import_source is the requested name (`./live`); the
+                // engine keys ModuleEntry by canonical name (the absolute
+                // path for relative imports). Resolve through the same
+                // hook the import-loop uses so they line up. Falls back
+                // to the raw name for builtin / scoped imports.
+                let canonical = self
+                    .config
+                    .resolve_module_fn
+                    .as_ref()
+                    .and_then(|fn_| fn_(import_source, module_name))
+                    .unwrap_or_else(|| import_source.clone());
                 if let Some(value) =
-                    self.find_imported_var_from(name, import_source)
+                    self.find_imported_var_from(name, &canonical)
                 {
                     module_vars.push(value);
                 } else {

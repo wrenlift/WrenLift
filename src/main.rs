@@ -95,8 +95,10 @@ struct Cli {
     #[arg(long)]
     inspect: bool,
 
-    /// Maximum interpreter steps before aborting.
-    /// Defaults to 1B (interpreter) or 10B (tiered/jit).
+    /// Maximum interpreter steps before aborting. Pass `0` to disable
+    /// the limit entirely — recommended for long-running servers
+    /// where the default cap (1B interp / 10B tiered) caps out after
+    /// ~10-30 minutes of polling-loop instructions.
     #[arg(long)]
     step_limit: Option<usize>,
 
@@ -164,7 +166,13 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
         GcMode::Arena => GcStrategy::Arena,
         GcMode::MarkSweep => GcStrategy::MarkSweep,
     };
-    let load_module_fn = source_dir.map(make_module_loader);
+    let (load_module_fn, resolve_module_fn) = match source_dir {
+        Some(dir) => {
+            let (l, r) = make_module_io(dir);
+            (Some(l), Some(r))
+        }
+        None => (None, None),
+    };
     let config = VMConfig {
         execution_mode: mode,
         step_limit,
@@ -173,6 +181,7 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
             .opt_threshold
             .unwrap_or(VMConfig::default().opt_threshold),
         load_module_fn,
+        resolve_module_fn,
         ..VMConfig::default()
     };
     VM::new(config)
@@ -182,59 +191,126 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 // Module loader + spec-dep pre-installer
 // ---------------------------------------------------------------------------
 
-/// Build a `load_module_fn` that resolves filesystem-relative imports
-/// (`./foo`, `../foo`, bare `foo`) against the IMPORTER'S directory —
-/// tracked via a shared `loaded` map that records each module's
-/// on-disk path as we load it. Scoped imports like `@hatch:test` are
-/// *not* handled here — they must already be installed into the VM
-/// (see [`preinstall_spec_dependencies`]).
+/// Build the loader + resolver pair that the VM's import flow uses.
 ///
-/// Prior to 2026-04-25 the loader pinned everything to the root
-/// entry's directory. That broke `examples/foo.wren → ../web →
-/// ./css` because `./css` would resolve against `examples/` instead
-/// of the `web.wren` sibling.
+/// The resolver canonicalises relative imports (`./foo`, `../foo`)
+/// to absolute on-disk paths so two different relative spellings
+/// of the same file collapse to a single ModuleEntry — without
+/// this, `./live` and `../live` register as two distinct modules,
+/// each with its own copy of the file's classes, and `is`-checks
+/// across the boundary fail.
+///
+/// The loader returns the source text for the canonical module
+/// name. Both share an internal `dirs` registry so that an import
+/// from inside an already-loaded module resolves against THAT
+/// module's directory, not the root entry's. (Pre-2026-04-25 the
+/// loader pinned everything to the root entry's directory, which
+/// broke `examples/foo.wren → ../web → ./css` because `./css`
+/// would look in `examples/` rather than next to `web.wren`.)
+///
+/// Scoped names (`@hatch:foo`) and missing files leave the
+/// canonical name unchanged — the engine falls back to its
+/// builtin / pre-installed module table.
 #[allow(clippy::type_complexity)]
-fn make_module_loader(running_file_dir: PathBuf) -> Box<dyn Fn(&str, &str) -> Option<String>> {
+fn make_module_io(
+    running_file_dir: PathBuf,
+) -> (
+    Box<dyn Fn(&str, &str) -> Option<String>>,
+    Box<dyn Fn(&str, &str) -> Option<String>>,
+) {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    let dirs: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
-    // The root entry's caller passes `from == ""` — record root dir
-    // so top-level imports work.
+    use std::rc::Rc;
+
+    // dirs maps a CANONICAL module name -> the directory that name
+    // lives in. Resolving a relative import against an already-known
+    // canonical module just looks up its dir here.
+    let dirs: Rc<RefCell<HashMap<String, PathBuf>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Root entry has empty importer name — record root dir.
     dirs.borrow_mut()
         .insert(String::new(), running_file_dir.clone());
 
-    Box::new(move |name: &str, from: &str| -> Option<String> {
-        // Figure out which directory relative imports resolve against.
-        let base_dir = dirs
-            .borrow()
-            .get(from)
-            .cloned()
-            .unwrap_or_else(|| running_file_dir.clone());
-
-        let resolve_against = |root: &PathBuf, rel: &Path| -> Option<(PathBuf, String)> {
-            let candidate = root.join(rel).with_extension("wren");
-            let text = fs::read_to_string(&candidate).ok()?;
-            let parent = candidate.parent()?.to_path_buf();
-            Some((parent, text))
-        };
-
-        if name.starts_with("./") || name.starts_with("../") {
+    let resolve_to_canonical = {
+        let dirs = Rc::clone(&dirs);
+        let root_dir = running_file_dir.clone();
+        Box::new(move |name: &str, from: &str| -> Option<String> {
+            // Scoped names and bare-non-relative pass through as-is
+            // — they're builtin modules or scoped packages keyed by
+            // their canonical scope-string already.
+            if !(name.starts_with("./") || name.starts_with("../")) {
+                return None;
+            }
+            let base_dir = dirs
+                .borrow()
+                .get(from)
+                .cloned()
+                .unwrap_or_else(|| root_dir.clone());
             let rel = Path::new(name);
-            let (parent, text) = resolve_against(&base_dir, rel)?;
-            dirs.borrow_mut().insert(name.to_string(), parent);
-            return Some(text);
-        }
-        // Bare names (no scope chars) → sibling file in the same dir.
-        let is_scoped = name.chars().any(|c| matches!(c, ':' | '@' | '/'));
-        if is_scoped {
-            return None;
-        }
-        let candidate = base_dir.join(format!("{}.wren", name));
-        let parent = candidate.parent()?.to_path_buf();
-        let text = fs::read_to_string(&candidate).ok()?;
-        dirs.borrow_mut().insert(name.to_string(), parent);
-        Some(text)
-    })
+            let candidate = base_dir.join(rel).with_extension("wren");
+            // Try fs::canonicalize for a normalised absolute path
+            // (resolves `..` segments and symlinks). Fall back to
+            // `candidate.to_string_lossy()` if the file doesn't
+            // exist — the loader will surface the missing-file
+            // error in that case rather than masking it here.
+            let canonical = std::fs::canonicalize(&candidate)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| candidate.to_string_lossy().into_owned());
+            Some(canonical)
+        }) as Box<dyn Fn(&str, &str) -> Option<String>>
+    };
+
+    let load_source = {
+        let dirs = Rc::clone(&dirs);
+        let root_dir = running_file_dir.clone();
+        Box::new(move |name: &str, from: &str| -> Option<String> {
+            // The VM passes the canonical name back here for
+            // relative imports (resolver returned an absolute
+            // path) — the file is reachable directly.
+            if Path::new(name).is_absolute() {
+                let p = Path::new(name);
+                let text = fs::read_to_string(p).ok()?;
+                if let Some(parent) = p.parent() {
+                    dirs.borrow_mut()
+                        .insert(name.to_string(), parent.to_path_buf());
+                }
+                return Some(text);
+            }
+
+            // Otherwise resolve against the importer's directory
+            // (or root if not yet recorded).
+            let base_dir = dirs
+                .borrow()
+                .get(from)
+                .cloned()
+                .unwrap_or_else(|| root_dir.clone());
+
+            if name.starts_with("./") || name.starts_with("../") {
+                let candidate = base_dir.join(name).with_extension("wren");
+                let text = fs::read_to_string(&candidate).ok()?;
+                if let Some(parent) = candidate.parent() {
+                    dirs.borrow_mut()
+                        .insert(name.to_string(), parent.to_path_buf());
+                }
+                return Some(text);
+            }
+            // Bare names (no scope chars) — sibling file in the
+            // same dir as the importer.
+            let is_scoped = name.chars().any(|c| matches!(c, ':' | '@' | '/'));
+            if is_scoped {
+                return None;
+            }
+            let candidate = base_dir.join(format!("{}.wren", name));
+            let text = fs::read_to_string(&candidate).ok()?;
+            if let Some(parent) = candidate.parent() {
+                dirs.borrow_mut()
+                    .insert(name.to_string(), parent.to_path_buf());
+            }
+            Some(text)
+        }) as Box<dyn Fn(&str, &str) -> Option<String>>
+    };
+
+    (load_source, resolve_to_canonical)
 }
 
 /// Look for a `hatchfile` next to (or above) the running file; if one
