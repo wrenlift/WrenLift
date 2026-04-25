@@ -1282,6 +1282,21 @@ fn scan_wren_mtimes(dir: &Path) -> std::collections::BTreeMap<PathBuf, std::time
     out
 }
 
+/// Source + asset extensions the dev watcher tracks. Wren files
+/// drive the runtime's module reload pass; everything else
+/// (shaders, images, audio, JSON config, glTF) flows through
+/// `Hatch.watchFile` subscribers — typically @hatch:assets and
+/// shader hot-reload integrations on top of @hatch:gpu.
+const WATCH_EXTENSIONS: &[&str] = &[
+    "wren",
+    "wgsl", "glsl", "vert", "frag",
+    "png", "jpg", "jpeg", "bmp", "tga", "webp", "ktx2",
+    "wav", "ogg", "mp3", "flac",
+    "json", "toml", "csv",
+    "gltf", "glb", "obj",
+    "txt", "md",
+];
+
 fn walk_wren(
     dir: &Path,
     out: &mut std::collections::BTreeMap<PathBuf, std::time::SystemTime>,
@@ -1303,12 +1318,13 @@ fn walk_wren(
         };
         if ft.is_dir() {
             walk_wren(&path, out);
-        } else if ft.is_file()
-            && path.extension().and_then(|s| s.to_str()) == Some("wren")
-        {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mt) = meta.modified() {
-                    out.insert(path, mt);
+        } else if ft.is_file() {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if WATCH_EXTENSIONS.contains(&ext) {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(mt) = meta.modified() {
+                        out.insert(path, mt);
+                    }
                 }
             }
         }

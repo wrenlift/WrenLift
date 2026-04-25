@@ -351,6 +351,23 @@ pub struct VM {
     /// module top-level can re-register cleanly without
     /// accumulating duplicate handlers.
     before_reload_callbacks: Vec<Value>,
+
+    /// File-watch entries registered via `Hatch.watchFile(path, fn)`.
+    /// Each is a `(path, callback, last_mtime_secs)` triple; on
+    /// every SIGUSR1 pass the runtime stats the path and, if the
+    /// mtime advanced, invokes the callback with the path string.
+    /// Callbacks held as GC roots for the same reason as the
+    /// module reload callbacks.
+    file_watches: Vec<FileWatch>,
+}
+
+/// One entry in `vm.file_watches`. Held as plain fields so the GC
+/// can walk just the `callback` Value, leaving the path / mtime as
+/// inert metadata.
+struct FileWatch {
+    path: String,
+    callback: Value,
+    last_mtime: f64,
 }
 
 impl VM {
@@ -430,6 +447,7 @@ impl VM {
             module_mtimes: HashMap::new(),
             reload_callbacks: Vec::new(),
             before_reload_callbacks: Vec::new(),
+            file_watches: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -1182,6 +1200,13 @@ impl VM {
         for path in reloaded {
             self.invoke_reload_callbacks(&path);
         }
+
+        // After module reloads run, drain file-watch entries:
+        // anything registered via Hatch.watchFile fires now if its
+        // on-disk mtime advanced. Used by asset systems and other
+        // non-Wren-source watchers that piggyback on the same SIGUSR1
+        // signal as the module reload pass.
+        self.drain_file_watches();
     }
 
     /// Drive every registered `Hatch.onReload` callback with the just-
@@ -1206,6 +1231,44 @@ impl VM {
                     .is_none()
                 {
                     eprintln!("wlift: reload callback returned an error");
+                }
+            }
+        }
+    }
+
+    /// Walk every registered file watch, refresh its mtime
+    /// baseline, and invoke the callback for any path whose mtime
+    /// advanced since the last check. The callback receives the
+    /// watched path as its single argument.
+    fn drain_file_watches(&mut self) {
+        if self.file_watches.is_empty() {
+            return;
+        }
+        // Collect (callback, path, new_mtime) for entries to fire,
+        // and update the baseline in the same pass. Snapshotting
+        // before invoking keeps the loop independent of any
+        // re-entrant `Hatch.watchFile` calls the callback might
+        // make.
+        let mut to_fire: Vec<(Value, String)> = Vec::new();
+        for fw in &mut self.file_watches {
+            let mt = match file_mtime_secs(&fw.path) {
+                Some(t) => t,
+                None => continue,
+            };
+            if mt > fw.last_mtime + 0.0001 {
+                fw.last_mtime = mt;
+                to_fire.push((fw.callback, fw.path.clone()));
+            }
+        }
+        for (cb, path) in to_fire {
+            let path_value = self.new_string(path);
+            if let Some(closure_ptr) = cb.as_object() {
+                let closure = closure_ptr as *mut ObjClosure;
+                if self
+                    .call_closure_sync(closure, &[path_value], None)
+                    .is_none()
+                {
+                    eprintln!("wlift: file-watch callback returned an error");
                 }
             }
         }
@@ -2733,6 +2796,13 @@ impl VM {
         roots.extend_from_slice(&self.before_reload_callbacks);
         let before_reload_cb_end = roots.len();
 
+        // 10c. File-watch callbacks — Hatch.watchFile.
+        let file_watch_start = roots.len();
+        for fw in &self.file_watches {
+            roots.push(fw.callback);
+        }
+        let file_watch_end = roots.len();
+
         #[cfg(debug_assertions)]
         if std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some() {
             self.gc.validate_write_barriers();
@@ -2838,6 +2908,11 @@ impl VM {
         if before_reload_cb_end > before_reload_cb_start {
             self.before_reload_callbacks
                 .copy_from_slice(&roots[before_reload_cb_start..before_reload_cb_end]);
+        }
+        if file_watch_end > file_watch_start {
+            for (i, fw) in self.file_watches.iter_mut().enumerate() {
+                fw.callback = roots[file_watch_start + i];
+            }
         }
     }
 }
@@ -3176,6 +3251,27 @@ impl NativeContext for VM {
             }
         }
         self.before_reload_callbacks.push(callback);
+    }
+
+    fn register_file_watch(&mut self, path: String, callback: Value) {
+        // De-dupe by (path, callback ptr). Same path watched with a
+        // different closure registers a second entry — useful when
+        // multiple subsystems care about the same file.
+        let new_ptr = callback.as_object().map(|p| p as usize);
+        for fw in &self.file_watches {
+            if fw.path == path && fw.callback.as_object().map(|p| p as usize) == new_ptr {
+                return;
+            }
+        }
+        // Capture the current mtime as the baseline so the next
+        // signal compares against it (we don't fire immediately on
+        // registration).
+        let last_mtime = file_mtime_secs(&path).unwrap_or(0.0);
+        self.file_watches.push(FileWatch {
+            path,
+            callback,
+            last_mtime,
+        });
     }
 }
 

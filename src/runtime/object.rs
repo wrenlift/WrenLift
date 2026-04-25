@@ -1224,6 +1224,11 @@ pub trait NativeContext {
     /// each reload re-runs top-level. Frameworks use this to clear
     /// state the reloaded module is about to repopulate.
     fn register_before_reload_callback(&mut self, callback: Value);
+    /// Register a Wren `Fn` to fire when an arbitrary file's
+    /// mtime advances. Driven by the same SIGUSR1 + safepoint
+    /// pass as module reloads — asset systems and shader
+    /// hot-reload paths use this for non-`.wren` sources.
+    fn register_file_watch(&mut self, path: String, callback: Value);
 }
 
 impl ObjClass {

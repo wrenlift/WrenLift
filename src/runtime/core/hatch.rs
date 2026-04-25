@@ -89,6 +89,23 @@ fn hatch_before_reload(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     Value::null()
 }
 
+/// `Hatch.watchFile(path, fn)` — fire `fn(path)` whenever the file
+/// at `path` has its on-disk mtime advance. Driven by the same
+/// SIGUSR1 + safepoint pass as module reloads, so asset systems
+/// and shader hot-reload paths get the same trigger as the rest
+/// of the dev loop without owning their own poll thread.
+fn hatch_watch_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(path) = super::validate_string(ctx, args[1], "Path") else {
+        return Value::null();
+    };
+    if !is_closure(args[2]) {
+        ctx.runtime_error("Hatch.watchFile: callback must be a function.".to_string());
+        return Value::null();
+    }
+    ctx.register_file_watch(path, args[2]);
+    Value::null()
+}
+
 fn is_closure(v: Value) -> bool {
     if !v.is_object() {
         return false;
@@ -110,6 +127,7 @@ pub fn register(vm: &mut crate::runtime::vm::VM) -> *mut crate::runtime::object:
     vm.primitive_static(class, "loadedModules", hatch_loaded_modules);
     vm.primitive_static(class, "onReload(_)", hatch_on_reload);
     vm.primitive_static(class, "beforeReload(_)", hatch_before_reload);
+    vm.primitive_static(class, "watchFile(_,_)", hatch_watch_file);
 
     class
 }
