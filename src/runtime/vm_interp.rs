@@ -1036,7 +1036,14 @@ fn run_fiber_with_stop_depth(
         }
 
         // Pre-compute safepoint interval (config doesn't change mid-loop).
-        let check_interval: usize = if vm.config.step_limit <= 0xFF {
+        // step_limit == 0 means "unlimited" — common for long-running
+        // servers and event loops. Use a large interval so the per-tick
+        // safepoint cost stays negligible while still hitting GC + bg
+        // compile polls reasonably often.
+        let unlimited_steps = vm.config.step_limit == 0;
+        let check_interval: usize = if unlimited_steps {
+            0xFFF
+        } else if vm.config.step_limit <= 0xFF {
             0xF
         } else if vm.config.step_limit <= 0xFFF {
             0xFF
@@ -1047,7 +1054,7 @@ fn run_fiber_with_stop_depth(
         // Inner dispatch loop: decodes opcodes from the flat bytecode stream.
         loop {
             if steps & check_interval == 0 {
-                if steps > vm.config.step_limit {
+                if !unlimited_steps && steps > vm.config.step_limit {
                     return Err(RuntimeError::StepLimitExceeded);
                 }
                 if vm.gc.should_collect() || vm.gc_requested {
