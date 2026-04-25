@@ -1211,30 +1211,31 @@ fn cmd_dev(dir: &Path) {
     });
 
     eprintln!(
-        "hatch dev: watching {} (entry: {})",
+        "hatch web serve: {} (entry: {})",
         dir.display(),
         entry_path.display()
     );
-    eprintln!("hatch dev: ctrl-c to stop");
+    eprintln!("hatch web serve: watching for changes — ctrl-c to stop");
 
-    // Ctrl-C is delivered to the foreground process group, so both
-    // hatch and the wlift child receive SIGINT and exit cleanly
-    // without explicit handling. The child is drop-killed if the
-    // parent panics.
-    let mut last = scan_wren_mtimes(dir);
+    // Spawn the runtime with --watch so it installs a SIGUSR1 handler
+    // and reloads any module whose mtime advances. We poll mtimes
+    // here in the supervisor and fire the signal — keeping all the
+    // file-watching out of the framework / runtime.
     let mut child = spawn_dev_child(&wlift, &entry_path);
+    let child_pid = child.id();
+    let mut last = scan_wren_mtimes(dir);
 
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Drain exit if the child died on its own (compile error,
-        // runtime abort) — surface and wait for the next file change.
+        // If the runtime died (compile error, panic), wait for the
+        // next file change and respawn — same pattern as before, but
+        // *only* on hard exits, never on save.
         if let Ok(Some(status)) = child.try_wait() {
             eprintln!(
-                "hatch dev: process exited ({}) — waiting for changes",
+                "hatch web serve: runtime exited ({}) — waiting for changes",
                 status
             );
-            // Wait until something changes, then respawn.
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let now = scan_wren_mtimes(dir);
@@ -1249,11 +1250,13 @@ fn cmd_dev(dir: &Path) {
 
         let now = scan_wren_mtimes(dir);
         if now != last {
-            eprintln!("hatch dev: change detected — restarting");
-            let _ = child.kill();
-            let _ = child.wait();
-            child = spawn_dev_child(&wlift, &entry_path);
             last = now;
+            // SIGUSR1 to the wlift child triggers an in-process
+            // module reload at the next safepoint — no respawn, no
+            // lost in-memory state.
+            unsafe {
+                libc::kill(child_pid as libc::pid_t, libc::SIGUSR1);
+            }
         }
     }
 }
@@ -1264,6 +1267,7 @@ fn spawn_dev_child(wlift: &Path, entry: &Path) -> std::process::Child {
         .arg("interpreter")
         .arg("--step-limit")
         .arg("0")
+        .arg("--watch")
         .arg(entry)
         .spawn()
         .unwrap_or_else(|e| {
@@ -1289,7 +1293,6 @@ fn walk_wren(
     for entry in entries.flatten() {
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            // Skip hidden + the OS junk + common build dirs.
             if name.starts_with('.') || name == "target" || name == "node_modules" {
                 continue;
             }

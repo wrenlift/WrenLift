@@ -109,6 +109,17 @@ struct Cli {
     /// Garbage collector strategy.
     #[arg(long, value_enum, default_value_t = GcMode::Generational)]
     gc: GcMode,
+
+    /// Enable SIGUSR1-driven in-process hot reload.
+    ///
+    /// When passed, `wlift` installs a SIGUSR1 handler that flips a
+    /// reload-pending flag; the interpreter checks the flag at safe-
+    /// points and re-installs any user module whose on-disk mtime
+    /// has advanced since install. Designed for the `hatch` dev
+    /// supervisor — it watches the workspace and signals the
+    /// `wlift` child on every file save.
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -153,6 +164,16 @@ impl From<Mode> for ExecutionMode {
 
 fn make_vm(cli: &Cli) -> VM {
     make_vm_with_loader(cli, None)
+}
+
+/// Install signal-driven hot reload when `--watch` was passed.
+///
+/// Idempotent — calling again from a different VM still binds the
+/// same handler. Safe to invoke before or after VM construction.
+fn maybe_install_reload_signal(cli: &Cli) {
+    if cli.watch {
+        wren_lift::runtime::vm::install_reload_signal_handler();
+    }
 }
 
 fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
@@ -443,6 +464,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    maybe_install_reload_signal(cli);
     let mut vm = make_vm_with_loader(cli, Some(source_dir.clone()));
 
     // Resolve `[spec-dependencies]` declared in a sibling `hatchfile`

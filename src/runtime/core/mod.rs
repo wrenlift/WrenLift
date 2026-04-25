@@ -9,6 +9,7 @@ mod fiber;
 mod fn_obj;
 pub mod fs;
 pub mod hash;
+pub mod hatch;
 pub mod http;
 pub mod io;
 mod list;

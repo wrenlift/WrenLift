@@ -1204,6 +1204,26 @@ pub trait NativeContext {
     /// recorded at registration. `None` for isolated-test functions
     /// registered without a module binding.
     fn func_module(&self, func_id: u32) -> Option<std::rc::Rc<String>>;
+
+    // -- Module reload (for Hatch module) --
+    /// Re-parse and re-install a previously loaded module, preserving
+    /// the identity of any `ObjClass` already in its var slots. Returns
+    /// `Ok(())` on success, `Err(message)` on failure.
+    fn reload_module(&mut self, name: &str) -> Result<(), String>;
+    /// Canonical on-disk path associated with a loaded module, or
+    /// `None` for built-in modules and unknown names.
+    fn module_canonical_path(&self, name: &str) -> Option<String>;
+    /// Names of every module currently registered with the engine.
+    fn loaded_module_names(&self) -> Vec<String>;
+    /// Register a Wren `Fn` to be invoked with the reloaded module's
+    /// path after every successful `Hatch.reload` / SIGUSR1 reload pass.
+    /// Stored as a GC root so the closure survives until the next
+    /// reload. Idempotent on the same closure value.
+    fn register_reload_callback(&mut self, callback: Value);
+    /// Register a Wren `Fn` invoked with the module's path BEFORE
+    /// each reload re-runs top-level. Frameworks use this to clear
+    /// state the reloaded module is about to repopulate.
+    fn register_before_reload_callback(&mut self, callback: Value);
 }
 
 impl ObjClass {

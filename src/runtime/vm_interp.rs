@@ -1077,6 +1077,25 @@ fn run_fiber_with_stop_depth(
                         }
                     }
                 }
+                // SIGUSR1-driven hot reload — cheap atomic load when
+                // no signal is pending. Snapshots the current frame
+                // around the reload because reload_module re-enters
+                // the interpreter to run the new module's top-level.
+                if super::vm::reload_pending() {
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            frame.values = std::mem::take(&mut values);
+                            frame.pc = pc;
+                        }
+                    }
+                    vm.check_pending_reload();
+                    fiber = vm.fiber;
+                    unsafe {
+                        if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                            values = std::mem::take(&mut frame.values);
+                        }
+                    }
+                }
             }
             steps += 1;
 

@@ -5,6 +5,58 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ---------------------------------------------------------------------------
+// Hot reload — SIGUSR1-driven reload-pending flag.
+// ---------------------------------------------------------------------------
+
+/// Set asynchronously by the SIGUSR1 handler when an external watcher
+/// (typically the `hatch` CLI) signals that one or more user modules
+/// have changed on disk. Drained at interpreter safepoints by
+/// [`VM::check_pending_reload`].
+static RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn reload_signal_handler(_sig: libc::c_int) {
+    // Async-signal-safe: AtomicBool::store with Release ordering is
+    // documented to be lock-free on every platform we run on, so
+    // setting a flag is safe inside a signal handler. No allocation,
+    // no syscalls beyond the implicit memory barrier.
+    RELOAD_PENDING.store(true, Ordering::Release);
+}
+
+/// Install the SIGUSR1 handler that flips [`RELOAD_PENDING`].
+///
+/// Idempotent — calling twice rebinds the same handler harmlessly.
+/// Intended to be invoked by the `wlift` binary when a `--watch`
+/// flag (or `WLIFT_WATCH=1` env var) is present, so the parent
+/// `hatch` CLI can drive in-process reload via `kill(pid, SIGUSR1)`.
+pub fn install_reload_signal_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGUSR1,
+            reload_signal_handler as *const () as usize as libc::sighandler_t,
+        );
+    }
+}
+
+/// True when the signal handler has flagged a pending reload pass.
+/// Used by integration tests / the CLI to assert delivery.
+pub fn reload_pending() -> bool {
+    RELOAD_PENDING.load(Ordering::Acquire)
+}
+
+/// Stat-and-extract the file mtime as fractional seconds since the
+/// Unix epoch. Returns `None` for missing files or non-Unix-epoch
+/// stat results. Used to baseline modules at install time and decide
+/// which ones to reload on a SIGUSR1 pass.
+fn file_mtime_secs(path: &str) -> Option<f64> {
+    let m = std::fs::metadata(path).ok()?;
+    let mt = m.modified().ok()?;
+    mt.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64())
+}
 
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};
 use super::gc_trait::{GcImpl, GcStrategy};
@@ -267,6 +319,38 @@ pub struct VM {
     /// line up — without it, the subclass would start its own fields
     /// at slot 0 and clobber the parent's state.
     pub field_layouts: HashMap<String, Vec<String>>,
+
+    /// During `reload_module`, maps class-name → existing `ObjClass`
+    /// pointer so the re-install loop can mutate the old class in
+    /// place (new methods, updated num_fields) instead of allocating
+    /// a fresh one. Keeping identity means instances created before
+    /// the reload continue to dispatch against up-to-date methods.
+    /// `None` outside of a reload.
+    reload_class_table: Option<HashMap<String, *mut ObjClass>>,
+
+    /// Last-seen mtime per absolute-path module, captured at install
+    /// time and updated on each reload. Used by
+    /// [`Self::check_pending_reload`] to decide which modules a
+    /// SIGUSR1 should reload — only modules whose on-disk mtime has
+    /// advanced past their captured baseline. Empty until at least
+    /// one user module is installed.
+    module_mtimes: HashMap<String, f64>,
+
+    /// Wren callbacks registered via `Hatch.onReload(fn)`. Each entry
+    /// is an `ObjClosure` value invoked with the just-reloaded
+    /// module's canonical name after every successful reload pass.
+    /// Traced as a GC root so the closures don't get collected
+    /// between registration and the first reload that fires them.
+    reload_callbacks: Vec<Value>,
+
+    /// Callbacks registered via `Hatch.beforeReload(fn)`. Fired with
+    /// the module's canonical name BEFORE the reload's `interpret`
+    /// call re-runs top-level. Frameworks use this to drop state
+    /// owned by the about-to-rerun module — e.g. `App` clears its
+    /// route table here so direct `app.get/post(...)` calls at
+    /// module top-level can re-register cleanly without
+    /// accumulating duplicate handlers.
+    before_reload_callbacks: Vec<Value>,
 }
 
 impl VM {
@@ -342,6 +426,10 @@ impl VM {
             native_lib_paths: HashMap::new(),
             native_temp_dirs: Vec::new(),
             field_layouts: HashMap::new(),
+            reload_class_table: None,
+            module_mtimes: HashMap::new(),
+            reload_callbacks: Vec::new(),
+            before_reload_callbacks: Vec::new(),
         };
 
         // Bootstrap core classes.
@@ -928,6 +1016,220 @@ impl VM {
         )
     }
 
+    /// Re-parse and re-install a previously loaded module. Preserves
+    /// the identity of classes declared in the module so instances
+    /// created before the reload keep working — their `class` pointer
+    /// still points at the same `ObjClass`, now carrying the newly
+    /// compiled method bodies.
+    ///
+    /// Side effects:
+    /// - Invalidates every beadie bead whose function belongs to
+    ///   `name`, so JIT-compiled copies are dropped on the next call.
+    /// - Clears every inline cache globally — callers from other
+    ///   modules may have cached the pre-reload `FuncId`.
+    /// - Re-runs the module's top-level. Top-level side effects
+    ///   (`var app = App.new`, handler registration, etc.) run afresh;
+    ///   state preservation across reloads is a framework concern.
+    pub fn reload_module(&mut self, name: &str) -> Result<(), String> {
+        if !self.engine.modules.contains_key(name) {
+            return Err(format!("Module '{}' is not loaded.", name));
+        }
+
+        // Load fresh source. The stored module name is already the
+        // canonical form the loader keys against, so passing an empty
+        // importer is enough — the loader reads it directly.
+        let source = self
+            .config
+            .load_module_fn
+            .as_ref()
+            .and_then(|load_fn| load_fn(name, ""))
+            .ok_or_else(|| format!("Could not load source for module '{}'.", name))?;
+
+        // Invalidate beads for functions owned by this module. Other
+        // modules' ICs get cleared wholesale below so cross-module
+        // cached FuncIds refresh on the next call.
+        let name_string = name.to_string();
+        let func_count = self.engine.function_count() as u32;
+        for i in 0..func_count {
+            let fid = super::engine::FuncId(i);
+            let belongs = self
+                .engine
+                .func_module(fid)
+                .map(|m| m.as_str() == name_string)
+                .unwrap_or(false);
+            if belongs {
+                self.engine.tier.invalidate(fid);
+            }
+        }
+        self.engine.invalidate_inline_caches();
+        // The interpreter's global (class_ptr, method_sym) -> Method
+        // cache holds closure pointers that are about to be replaced
+        // under the same class_ptr — flush or dispatch keeps returning
+        // the old closure.
+        self.method_cache.invalidate();
+
+        // Stash existing class pointers so the re-install loop can
+        // reuse them instead of allocating fresh ObjClasses.
+        let mut preserved: HashMap<String, *mut ObjClass> = HashMap::new();
+        if let Some(entry) = self.engine.modules.get(name) {
+            for (i, var) in entry.vars.iter().enumerate() {
+                if !var.is_object() {
+                    continue;
+                }
+                let ptr = var.as_object().unwrap();
+                let header = ptr as *const ObjHeader;
+                if unsafe { (*header).obj_type } != ObjType::Class {
+                    continue;
+                }
+                let cls_ptr = ptr as *mut ObjClass;
+                // Skip built-in / core classes — their pointer is
+                // shared across modules and must not be reset.
+                let class_name = entry
+                    .var_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| unsafe { self.interner.resolve((*cls_ptr).name).to_string() });
+                if self.core_class_value(&class_name).is_some() {
+                    continue;
+                }
+                preserved.insert(class_name, cls_ptr);
+            }
+        }
+
+        // Drop the module entry + loading guard so `interpret`
+        // re-installs cleanly. `self.module_sources` gets overwritten
+        // in `interpret` itself.
+        self.engine.modules.remove(name);
+        self.loading_modules.remove(name);
+
+        if std::env::var_os("WLIFT_RELOAD_TRACE").is_some() {
+            eprintln!(
+                "wlift: reload '{}' — preserved {} classes, source {} bytes",
+                name,
+                preserved.len(),
+                source.len()
+            );
+        }
+        // Fire before-reload callbacks so frameworks can drop state
+        // (route tables, watchers, etc.) the about-to-rerun top-level
+        // is going to re-establish. Done AFTER cache invalidation so
+        // the callbacks themselves run against the latest dispatch
+        // tables.
+        self.invoke_before_reload_callbacks(name);
+        self.reload_class_table = Some(preserved);
+        let result = self.interpret(name, &source);
+        self.reload_class_table = None;
+
+        match result {
+            InterpretResult::Success => {
+                if let Some(mt) = file_mtime_secs(name) {
+                    self.module_mtimes.insert(name.to_string(), mt);
+                }
+                Ok(())
+            }
+            InterpretResult::CompileError => {
+                Err(format!("Reload of '{}' failed: compile error.", name))
+            }
+            InterpretResult::RuntimeError => {
+                Err(format!("Reload of '{}' failed: runtime error.", name))
+            }
+        }
+    }
+
+    /// Drain a pending SIGUSR1 reload signal: scan every absolute-path
+    /// module, reload those whose on-disk mtime advanced past the
+    /// baseline captured at install time. Cheap when the flag is
+    /// clear (one atomic load); only does the stat-walk when an
+    /// external watcher has signalled a change.
+    ///
+    /// Called from the interpreter safepoint check — no-op when the
+    /// process didn't opt in to `install_reload_signal_handler`.
+    pub fn check_pending_reload(&mut self) {
+        if !RELOAD_PENDING.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let names: Vec<String> = self.engine.modules.keys().cloned().collect();
+        let mut reloaded: Vec<String> = Vec::new();
+        for name in names {
+            if !std::path::Path::new(&name).is_absolute() {
+                continue;
+            }
+            let mtime = match file_mtime_secs(&name) {
+                Some(t) => t,
+                None => continue,
+            };
+            let last = self.module_mtimes.get(&name).copied();
+            match last {
+                Some(prev) if mtime > prev + 0.0001 => {
+                    eprintln!("wlift: reloading {}", name);
+                    if let Err(e) = self.reload_module(&name) {
+                        eprintln!("wlift: reload failed: {}", e);
+                    } else {
+                        reloaded.push(name);
+                    }
+                }
+                None => {
+                    // First time we've tracked this path — record
+                    // baseline so the next signal compares against it.
+                    self.module_mtimes.insert(name, mtime);
+                }
+                _ => {}
+            }
+        }
+        // Fire registered Hatch.onReload callbacks for each module that
+        // actually reloaded. Done after the reload loop so ALL classes
+        // are in their post-reload state before the first callback runs.
+        for path in reloaded {
+            self.invoke_reload_callbacks(&path);
+        }
+    }
+
+    /// Drive every registered `Hatch.onReload` callback with the just-
+    /// reloaded module's path. Each callback is a Wren `Fn`; we
+    /// dispatch synchronously through the standard `call(_)` path on
+    /// a temporary fiber. Errors are logged but don't propagate — a
+    /// broken reload hook shouldn't abort the host fiber.
+    fn invoke_reload_callbacks(&mut self, module_path: &str) {
+        if self.reload_callbacks.is_empty() {
+            return;
+        }
+        // Snapshot — invoking a callback could (in principle) mutate
+        // `reload_callbacks` via re-entrant `Hatch.onReload`. Snapshot
+        // before iterating so the loop doesn't observe the mutation.
+        let callbacks = self.reload_callbacks.clone();
+        let path_value = self.new_string(module_path.to_string());
+        for cb in callbacks {
+            if let Some(closure_ptr) = cb.as_object() {
+                let closure = closure_ptr as *mut ObjClosure;
+                if self
+                    .call_closure_sync(closure, &[path_value], None)
+                    .is_none()
+                {
+                    eprintln!("wlift: reload callback returned an error");
+                }
+            }
+        }
+    }
+
+    fn invoke_before_reload_callbacks(&mut self, module_path: &str) {
+        if self.before_reload_callbacks.is_empty() {
+            return;
+        }
+        let callbacks = self.before_reload_callbacks.clone();
+        let path_value = self.new_string(module_path.to_string());
+        for cb in callbacks {
+            if let Some(closure_ptr) = cb.as_object() {
+                let closure = closure_ptr as *mut ObjClosure;
+                if self
+                    .call_closure_sync(closure, &[path_value], None)
+                    .is_none()
+                {
+                    eprintln!("wlift: before-reload callback returned an error");
+                }
+            }
+        }
+    }
+
     /// Install a freshly compiled (or freshly loaded) `ModuleMir` into
     /// the engine, build its classes, and run its top-level fiber.
     ///
@@ -1068,6 +1370,7 @@ impl VM {
             ("CryptoCore", "crypto"),
             ("ZipCore", "zip"),
             ("SocketCore", "socket"),
+            ("Hatch", "hatch"),
         ];
         for name in &var_names {
             if let Some(&(_, module_id)) = builtin_for_var.iter().find(|(cls, _)| *cls == name) {
@@ -1130,6 +1433,13 @@ impl VM {
                 var_names: var_names.clone(),
             },
         );
+        // Baseline mtime for the SIGUSR1 watcher. Only meaningful for
+        // user modules whose canonical name is an absolute path.
+        if std::path::Path::new(module_name).is_absolute() {
+            if let Some(mt) = file_mtime_secs(module_name) {
+                self.module_mtimes.insert(module_name.to_string(), mt);
+            }
+        }
 
         // 8b. Create user-defined classes and bind their methods.
         for class_mir in module_mir.classes {
@@ -1166,8 +1476,39 @@ impl VM {
                 })
                 .unwrap_or(self.object_class);
 
-            // Create the class
-            let class_ptr = self.gc.alloc_class(class_mir.name, superclass);
+            // Create the class — or, during `reload_module`, reuse the
+            // existing ObjClass pointer and reset its method table so
+            // instances that predate the reload continue to dispatch
+            // against the new methods.
+            let reused = self
+                .reload_class_table
+                .as_ref()
+                .and_then(|t| t.get(&class_name_str).copied());
+            let class_ptr = match reused {
+                Some(existing) => {
+                    unsafe {
+                        // Drop stale methods/attributes; the method-
+                        // binding loop below repopulates. Seed the
+                        // table with whatever the (possibly new)
+                        // superclass exposes so inherited methods
+                        // still resolve.
+                        let parent_methods = if !superclass.is_null() {
+                            (*superclass).methods.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        (*existing).methods = parent_methods;
+                        (*existing).static_fields.clear();
+                        (*existing).method_attributes.clear();
+                        (*existing).attributes.clear();
+                        (*existing).superclass = superclass;
+                        (*existing).name = class_mir.name;
+                        (*existing).is_foreign = false;
+                    }
+                    existing
+                }
+                None => self.gc.alloc_class(class_mir.name, superclass),
+            };
             unsafe {
                 (*class_ptr).header.class = self.class_class;
                 // Total fields = own fields + inherited fields from superclass chain
@@ -2070,6 +2411,19 @@ impl VM {
                 );
                 true
             }
+            "hatch" => {
+                let class = super::core::hatch::register(self);
+                let class_value = Value::object(class as *mut u8);
+                self.engine.modules.insert(
+                    "hatch".to_string(),
+                    super::engine::ModuleEntry {
+                        top_level: super::engine::FuncId(u32::MAX),
+                        vars: vec![class_value],
+                        var_names: vec!["Hatch".to_string()],
+                    },
+                );
+                true
+            }
             _ => false,
         }
     }
@@ -2369,6 +2723,16 @@ impl VM {
             module_ranges.push((name.clone(), start, roots.len()));
         }
 
+        // 10. Reload callbacks — closures registered via Hatch.onReload.
+        let reload_cb_start = roots.len();
+        roots.extend_from_slice(&self.reload_callbacks);
+        let reload_cb_end = roots.len();
+
+        // 10b. Pre-reload callbacks — Hatch.beforeReload.
+        let before_reload_cb_start = roots.len();
+        roots.extend_from_slice(&self.before_reload_callbacks);
+        let before_reload_cb_end = roots.len();
+
         #[cfg(debug_assertions)]
         if std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some() {
             self.gc.validate_write_barriers();
@@ -2463,6 +2827,17 @@ impl VM {
             if let Some(entry) = self.engine.modules.get_mut(name) {
                 entry.vars.copy_from_slice(&roots[*start..*end]);
             }
+        }
+
+        // Write back reload callbacks (forwarded if their closures were
+        // promoted out of the nursery).
+        if reload_cb_end > reload_cb_start {
+            self.reload_callbacks
+                .copy_from_slice(&roots[reload_cb_start..reload_cb_end]);
+        }
+        if before_reload_cb_end > before_reload_cb_start {
+            self.before_reload_callbacks
+                .copy_from_slice(&roots[before_reload_cb_start..before_reload_cb_end]);
         }
     }
 }
@@ -2759,6 +3134,48 @@ impl NativeContext for VM {
         self.engine
             .func_module(crate::runtime::engine::FuncId(func_id))
             .cloned()
+    }
+
+    fn reload_module(&mut self, name: &str) -> Result<(), String> {
+        VM::reload_module(self, name)
+    }
+
+    fn module_canonical_path(&self, name: &str) -> Option<String> {
+        // Relative imports are canonicalised to absolute paths before
+        // being registered, so the module name IS the on-disk path
+        // for user modules. Built-ins register under short names
+        // (`meta`, `hatch`) which don't correspond to a file.
+        if std::path::Path::new(name).is_absolute() {
+            Some(name.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn loaded_module_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.engine.modules.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    fn register_reload_callback(&mut self, callback: Value) {
+        let new_ptr = callback.as_object().map(|p| p as usize);
+        for existing in &self.reload_callbacks {
+            if existing.as_object().map(|p| p as usize) == new_ptr {
+                return;
+            }
+        }
+        self.reload_callbacks.push(callback);
+    }
+
+    fn register_before_reload_callback(&mut self, callback: Value) {
+        let new_ptr = callback.as_object().map(|p| p as usize);
+        for existing in &self.before_reload_callbacks {
+            if existing.as_object().map(|p| p as usize) == new_ptr {
+                return;
+            }
+        }
+        self.before_reload_callbacks.push(callback);
     }
 }
 
