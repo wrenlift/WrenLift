@@ -115,6 +115,45 @@ struct RenderPipelines {
     pipelines: HashMap<u64, wgpu::RenderPipeline>,
 }
 
+struct Surfaces {
+    /// Surface + (latest configured size, format) for diagnostics
+    /// and to drive `getCurrentTexture` allocations. wgpu::Surface
+    /// is `Surface<'static>` because we built it via
+    /// `create_surface_unsafe` from raw handles — the underlying
+    /// window lives in the embedder (winit-backed @hatch:window or
+    /// a custom host); their lifetime is the user's responsibility.
+    surfaces: HashMap<u64, SurfaceRecord>,
+}
+
+struct SurfaceRecord {
+    surface: wgpu::Surface<'static>,
+    /// One adapter handle is needed at configure time so we can
+    /// resolve preferred formats / capabilities. Stored alongside
+    /// to avoid reaching back into the device registry on the hot
+    /// configure path.
+    #[allow(dead_code)]
+    device_id: u64,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+}
+
+/// Registry of in-flight `SurfaceTexture` frames acquired via
+/// `Surface.acquire()`. Holds both the SurfaceTexture (so it
+/// stays alive across the render pass) and a TextureView built
+/// from it. The view's id can be used in render-pass color
+/// attachments exactly like a normal TextureView. `frame.present`
+/// drops the entry, which consumes the SurfaceTexture and
+/// schedules the swap.
+struct SurfaceFrames {
+    frames: HashMap<u64, SurfaceFrameRecord>,
+}
+
+struct SurfaceFrameRecord {
+    surface_texture: wgpu::SurfaceTexture,
+    view_id: u64,
+}
+
 /// CommandEncoder + finished CommandBuffer registry.
 ///
 /// Render passes aren't exposed as long-lived Wren objects — their
@@ -149,6 +188,10 @@ struct DeviceRecord {
     /// we hold this for diagnostics — `adapter.get_info()` etc.).
     #[allow(dead_code)]
     adapter: wgpu::Adapter,
+    /// The Instance the device was created from. Surfaces have to
+    /// be built off the same Instance, so retain it here for the
+    /// `device.createSurface(handle)` path to reach.
+    instance: wgpu::Instance,
 }
 
 fn devices() -> &'static Mutex<Devices> {
@@ -228,6 +271,16 @@ fn render_pipelines() -> &'static Mutex<RenderPipelines> {
 fn encoders() -> &'static Mutex<Encoders> {
     static REG: OnceLock<Mutex<Encoders>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(Encoders { encoders: HashMap::new() }))
+}
+
+fn surfaces() -> &'static Mutex<Surfaces> {
+    static REG: OnceLock<Mutex<Surfaces>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Surfaces { surfaces: HashMap::new() }))
+}
+
+fn surface_frames() -> &'static Mutex<SurfaceFrames> {
+    static REG: OnceLock<Mutex<SurfaceFrames>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(SurfaceFrames { frames: HashMap::new() }))
 }
 
 // ---------------------------------------------------------------------------
@@ -574,6 +627,7 @@ pub unsafe extern "C" fn wlift_gpu_request_device(vm: *mut VM) {
                 device,
                 queue,
                 adapter,
+                instance,
             },
         );
         set_return(vm, Value::num(id as f64));
@@ -3012,5 +3066,497 @@ pub unsafe extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut VM) {
         let elements: Vec<Value> = bytes.into_iter().map(|b| Value::num(b as f64)).collect();
         let list = context.alloc_list(elements);
         set_return(vm, list);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface — bring-your-own-window
+// ---------------------------------------------------------------------------
+//
+// `Device.createSurface(handle)` accepts a platform-tagged Map
+// of raw window-handle integers and produces a `wgpu::Surface`
+// from them. Lets any embedder — the default winit-backed
+// @hatch:window package, an IDE viewport, a future C/host shell
+// — bring its own window without dragging winit into this dylib.
+//
+// Handle Map shape (all keys "Num"; pointers passed as integers
+// — native side reinterprets via NonNull):
+//
+//   AppKit (macOS):     "platform": "appkit",  "ns_view": Num
+//   UIKit (iOS):        "platform": "uikit",   "ui_view": Num
+//   Win32:              "platform": "win32",   "hwnd": Num,
+//                                              "hinstance": Num
+//   Xlib (Linux X11):   "platform": "xlib",    "window": Num,
+//                                              "display": Num
+//   Xcb (Linux X11):    "platform": "xcb",     "window": Num,
+//                                              "connection": Num
+//   Wayland:            "platform": "wayland", "surface": Num,
+//                                              "display": Num
+//
+// The caller is responsible for keeping the underlying window
+// alive — wgpu won't pin it. If the window dies before the
+// Surface, configure / acquire surface a runtime error rather
+// than crashing.
+
+unsafe fn nonnull_ptr_from_num(v: Value) -> Option<std::ptr::NonNull<std::ffi::c_void>> {
+    let n = v.as_num()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    let raw = n as u64 as usize as *mut std::ffi::c_void;
+    std::ptr::NonNull::new(raw)
+}
+
+unsafe fn decode_window_handle(
+    vm: &mut VM,
+    desc: Value,
+) -> Option<(
+    raw_window_handle::RawWindowHandle,
+    raw_window_handle::RawDisplayHandle,
+)> {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
+    let platform = match unsafe { map_get(desc, "platform").and_then(|v| string_of(v)) } {
+        Some(s) => s,
+        None => {
+            vm.runtime_error(
+                "Device.createSurface: descriptor must include `platform` string.".to_string(),
+            );
+            return None;
+        }
+    };
+
+    match platform.as_str() {
+        "appkit" => {
+            let view = match unsafe {
+                map_get(desc, "ns_view").and_then(|v| nonnull_ptr_from_num(v))
+            } {
+                Some(p) => p,
+                None => {
+                    vm.runtime_error(
+                        "Device.createSurface: appkit requires `ns_view` (NSView*) integer."
+                            .to_string(),
+                    );
+                    return None;
+                }
+            };
+            let mut h = raw_window_handle::AppKitWindowHandle::new(view);
+            let _ = &mut h; // suppress potential unused-mut on platforms that don't compile this branch
+            Some((
+                RawWindowHandle::AppKit(raw_window_handle::AppKitWindowHandle::new(view)),
+                RawDisplayHandle::AppKit(raw_window_handle::AppKitDisplayHandle::new()),
+            ))
+        }
+        "uikit" => {
+            let view = match unsafe {
+                map_get(desc, "ui_view").and_then(|v| nonnull_ptr_from_num(v))
+            } {
+                Some(p) => p,
+                None => {
+                    vm.runtime_error(
+                        "Device.createSurface: uikit requires `ui_view` (UIView*) integer."
+                            .to_string(),
+                    );
+                    return None;
+                }
+            };
+            Some((
+                RawWindowHandle::UiKit(raw_window_handle::UiKitWindowHandle::new(view)),
+                RawDisplayHandle::UiKit(raw_window_handle::UiKitDisplayHandle::new()),
+            ))
+        }
+        "win32" => {
+            let hwnd_n = match unsafe { map_get(desc, "hwnd").and_then(|v| v.as_num()) } {
+                Some(n) if n.is_finite() => n as i64,
+                _ => {
+                    vm.runtime_error(
+                        "Device.createSurface: win32 requires `hwnd` integer.".to_string(),
+                    );
+                    return None;
+                }
+            };
+            let hinstance_n =
+                unsafe { map_get(desc, "hinstance").and_then(|v| v.as_num()).unwrap_or(0.0) };
+            let hwnd = match std::num::NonZeroIsize::new(hwnd_n as isize) {
+                Some(h) => h,
+                None => {
+                    vm.runtime_error(
+                        "Device.createSurface: win32 `hwnd` must be non-zero.".to_string(),
+                    );
+                    return None;
+                }
+            };
+            let mut wh = raw_window_handle::Win32WindowHandle::new(hwnd);
+            wh.hinstance = std::num::NonZeroIsize::new(hinstance_n as isize);
+            Some((
+                RawWindowHandle::Win32(wh),
+                RawDisplayHandle::Windows(raw_window_handle::WindowsDisplayHandle::new()),
+            ))
+        }
+        "xlib" => {
+            let window_id = match unsafe { map_get(desc, "window").and_then(|v| v.as_num()) } {
+                Some(n) if n.is_finite() => n as u64,
+                _ => {
+                    vm.runtime_error(
+                        "Device.createSurface: xlib requires `window` (XID) integer.".to_string(),
+                    );
+                    return None;
+                }
+            };
+            let display = unsafe {
+                map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v))
+            };
+            let visual_id = unsafe {
+                map_get(desc, "visual_id")
+                    .and_then(|v| v.as_num())
+                    .unwrap_or(0.0)
+            } as u64;
+            let mut wh = raw_window_handle::XlibWindowHandle::new(window_id);
+            wh.visual_id = visual_id;
+            Some((
+                RawWindowHandle::Xlib(wh),
+                RawDisplayHandle::Xlib(raw_window_handle::XlibDisplayHandle::new(display, 0)),
+            ))
+        }
+        "xcb" => {
+            let window_n = match unsafe { map_get(desc, "window").and_then(|v| v.as_num()) } {
+                Some(n) if n.is_finite() && n > 0.0 => n as u32,
+                _ => {
+                    vm.runtime_error(
+                        "Device.createSurface: xcb requires `window` integer (> 0).".to_string(),
+                    );
+                    return None;
+                }
+            };
+            let window = match std::num::NonZeroU32::new(window_n) {
+                Some(w) => w,
+                None => return None,
+            };
+            let connection = unsafe {
+                map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v))
+            };
+            let visual_n = unsafe {
+                map_get(desc, "visual_id")
+                    .and_then(|v| v.as_num())
+                    .unwrap_or(0.0)
+            } as u32;
+            let mut wh = raw_window_handle::XcbWindowHandle::new(window);
+            wh.visual_id = std::num::NonZeroU32::new(visual_n);
+            Some((
+                RawWindowHandle::Xcb(wh),
+                RawDisplayHandle::Xcb(raw_window_handle::XcbDisplayHandle::new(connection, 0)),
+            ))
+        }
+        "wayland" => {
+            let surface = match unsafe {
+                map_get(desc, "surface").and_then(|v| nonnull_ptr_from_num(v))
+            } {
+                Some(p) => p,
+                None => {
+                    vm.runtime_error(
+                        "Device.createSurface: wayland requires `surface` (wl_surface*) integer."
+                            .to_string(),
+                    );
+                    return None;
+                }
+            };
+            let display = match unsafe {
+                map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v))
+            } {
+                Some(p) => p,
+                None => {
+                    vm.runtime_error(
+                        "Device.createSurface: wayland requires `display` (wl_display*) integer."
+                            .to_string(),
+                    );
+                    return None;
+                }
+            };
+            Some((
+                RawWindowHandle::Wayland(raw_window_handle::WaylandWindowHandle::new(surface)),
+                RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(display)),
+            ))
+        }
+        other => {
+            vm.runtime_error(format!(
+                "Device.createSurface: unknown platform '{}'.",
+                other
+            ));
+            None
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_surface_create_from_handle(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createSurface") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let (raw_window, raw_display) = match decode_window_handle(ctx(vm), desc) {
+            Some(pair) => pair,
+            None => return,
+        };
+
+        // Build the unsafe target. wgpu 22 has a SAFETY contract:
+        // the handles must remain valid for the surface's
+        // lifetime; the embedder owns the window so it's their
+        // job to enforce that.
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: raw_display,
+            raw_window_handle: raw_window,
+        };
+
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&device_id) {
+            Some(d) => d,
+            None => {
+                drop(dev_reg);
+                ctx(vm).runtime_error("Device.createSurface: unknown device id.".to_string());
+                return;
+            }
+        };
+
+        let surface = match dev.instance.create_surface_unsafe(target) {
+            Ok(s) => s,
+            Err(e) => {
+                drop(dev_reg);
+                ctx(vm).runtime_error(format!("Device.createSurface: {}", e));
+                return;
+            }
+        };
+
+        // Pick a sensible default format from the surface's
+        // capabilities — first sRGB candidate, else first.
+        let caps = surface.get_capabilities(&dev.adapter);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .or_else(|| caps.formats.first().copied())
+            .unwrap_or(wgpu::TextureFormat::Bgra8UnormSrgb);
+        drop(dev_reg);
+
+        let id = next_id();
+        surfaces().lock().unwrap().surfaces.insert(
+            id,
+            SurfaceRecord {
+                surface,
+                device_id,
+                width: 0,
+                height: 0,
+                format,
+            },
+        );
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_surface_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "Surface.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        surfaces().lock().unwrap().surfaces.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+/// Configure / re-configure the surface. Required before the
+/// first `acquire`, and again on every window resize.
+///
+/// Descriptor:
+///   "width":  Num,
+///   "height": Num,
+///   "format":      String?  (defaults to the picked sRGB or first cap)
+///   "presentMode": String?  ("fifo" | "immediate" | "mailbox", default fifo)
+///   "alphaMode":   String?  ("auto" | "opaque" | "premultiplied", default auto)
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut VM) {
+    unsafe {
+        let surface_id = match id_of(ctx(vm), slot(vm, 1), "Surface.configure") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let width = match map_get(desc, "width").and_then(|v| v.as_num()) {
+            Some(n) if n.is_finite() && n > 0.0 => n as u32,
+            _ => {
+                ctx(vm).runtime_error(
+                    "Surface.configure: `width` must be a positive integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let height = match map_get(desc, "height").and_then(|v| v.as_num()) {
+            Some(n) if n.is_finite() && n > 0.0 => n as u32,
+            _ => {
+                ctx(vm).runtime_error(
+                    "Surface.configure: `height` must be a positive integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let override_format = map_get(desc, "format")
+            .and_then(|v| string_of(v))
+            .and_then(|s| texture_format_from_str(&s));
+
+        let present_mode = match map_get(desc, "presentMode")
+            .and_then(|v| string_of(v))
+            .as_deref()
+        {
+            Some("immediate") => wgpu::PresentMode::Immediate,
+            Some("mailbox") => wgpu::PresentMode::Mailbox,
+            _ => wgpu::PresentMode::Fifo,
+        };
+        let alpha_mode = match map_get(desc, "alphaMode")
+            .and_then(|v| string_of(v))
+            .as_deref()
+        {
+            Some("opaque") => wgpu::CompositeAlphaMode::Opaque,
+            Some("premultiplied") => wgpu::CompositeAlphaMode::PreMultiplied,
+            _ => wgpu::CompositeAlphaMode::Auto,
+        };
+
+        let mut surf_reg = surfaces().lock().unwrap();
+        let rec = match surf_reg.surfaces.get_mut(&surface_id) {
+            Some(r) => r,
+            None => {
+                drop(surf_reg);
+                ctx(vm).runtime_error("Surface.configure: unknown surface id.".to_string());
+                return;
+            }
+        };
+        let format = override_format.unwrap_or(rec.format);
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&rec.device_id) {
+            Some(d) => d,
+            None => {
+                drop(dev_reg);
+                drop(surf_reg);
+                ctx(vm).runtime_error(
+                    "Surface.configure: surface's device is gone.".to_string(),
+                );
+                return;
+            }
+        };
+        rec.surface.configure(
+            &dev.device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width,
+                height,
+                present_mode,
+                desired_maximum_frame_latency: 2,
+                alpha_mode,
+                view_formats: vec![],
+            },
+        );
+        rec.width = width;
+        rec.height = height;
+        rec.format = format;
+        drop(dev_reg);
+        drop(surf_reg);
+        set_return(vm, Value::null());
+    }
+}
+
+/// Acquire the next swap-chain frame. Returns a `Map` with two
+/// `Num` ids: `frame` (consumed by `surface_present_frame`) and
+/// `view` (a TextureView usable in render-pass attachments).
+///
+/// On `Outdated` / `Lost` results, surface a runtime error so the
+/// Wren caller can re-configure (typically on a window resize).
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_surface_acquire(vm: *mut VM) {
+    unsafe {
+        let surface_id = match id_of(ctx(vm), slot(vm, 1), "Surface.acquire") {
+            Some(i) => i,
+            None => return,
+        };
+
+        let surface_texture = {
+            let surf_reg = surfaces().lock().unwrap();
+            let rec = match surf_reg.surfaces.get(&surface_id) {
+                Some(r) => r,
+                None => {
+                    drop(surf_reg);
+                    ctx(vm).runtime_error("Surface.acquire: unknown surface id.".to_string());
+                    return;
+                }
+            };
+            match rec.surface.get_current_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(surf_reg);
+                    ctx(vm).runtime_error(format!("Surface.acquire: {:?}", e));
+                    return;
+                }
+            }
+        };
+
+        // Build a TextureView and stash both alongside the
+        // SurfaceTexture so the view borrows safely until present.
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let view_id = next_id();
+        views().lock().unwrap().views.insert(view_id, view);
+
+        let frame_id = next_id();
+        surface_frames().lock().unwrap().frames.insert(
+            frame_id,
+            SurfaceFrameRecord {
+                surface_texture,
+                view_id,
+            },
+        );
+
+        // Return a Wren Map { "frame": frame_id, "view": view_id }.
+        let context = ctx(vm);
+        let map = context.alloc_map();
+        let key_frame = context.alloc_string("frame".to_string());
+        let key_view = context.alloc_string("view".to_string());
+        let frame_v = Value::num(frame_id as f64);
+        let view_v = Value::num(view_id as f64);
+        let _ = context.call_method_on(map, "[_]=(_)", &[key_frame, frame_v]);
+        let _ = context.call_method_on(map, "[_]=(_)", &[key_view, view_v]);
+        set_return(vm, map);
+    }
+}
+
+/// Present the in-flight frame. Consumes the `SurfaceTexture`
+/// (which schedules the swap) and drops the auxiliary `TextureView`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_surface_present_frame(vm: *mut VM) {
+    unsafe {
+        let frame_id = match id_of(ctx(vm), slot(vm, 1), "SurfaceFrame.present") {
+            Some(i) => i,
+            None => return,
+        };
+        let entry = match surface_frames().lock().unwrap().frames.remove(&frame_id) {
+            Some(e) => e,
+            None => {
+                ctx(vm).runtime_error(
+                    "SurfaceFrame.present: unknown frame id (already presented?)".to_string(),
+                );
+                return;
+            }
+        };
+        // Drop the view first so the SurfaceTexture's Drop /
+        // present chain isn't confused by an outstanding borrow.
+        views().lock().unwrap().views.remove(&entry.view_id);
+        entry.surface_texture.present();
+        set_return(vm, Value::null());
     }
 }

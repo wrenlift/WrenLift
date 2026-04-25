@@ -28,6 +28,12 @@ wgpu = { version = "22", default-features = false, features = [
 ] }
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
+# raw-window-handle 0.6 matches wgpu 22's SurfaceTargetUnsafe path.
+# We deliberately don't pull winit here — the Surface API takes
+# decoded raw handles, so any window provider (winit-backed
+# @hatch:window, an IDE viewport, a C embedder's NSView) can
+# bring its own window without dragging winit into this dylib.
+raw-window-handle = "0.6"
 
 # Read .wgsl shaders for hot reload.
 log = "0.4"

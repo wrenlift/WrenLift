@@ -1,0 +1,20 @@
+[package]
+name = "wlift_window"
+version = "0.1.0"
+edition = "2021"
+description = "Default window provider for the WrenLift game framework — a winit-backed cdylib bundled into @hatch:window. Exposes a polled event loop and a raw-window-handle Map that @hatch:gpu's Device.createSurface accepts."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Match the gpu plugin's pattern: pull only the runtime types
+# we need from wren_lift, no cranelift bloat.
+wren_lift = { path = "../..", default-features = false }
+
+# winit 0.30: pump_events drives a polled loop that fits Wren's
+# cooperative-fiber game loop. Earlier versions (≤ 0.29) require
+# blocking run_event_loop / EventLoopExtRunReturn shims that
+# don't compose cleanly with the polling shape we want.
+winit = { version = "0.30", features = ["rwh_06"] }
+raw-window-handle = "0.6"
