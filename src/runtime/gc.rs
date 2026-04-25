@@ -332,7 +332,27 @@ impl Gc {
     }
 
     pub fn should_collect(&self) -> bool {
-        self.nursery.used() > self.nursery.capacity() * 3 / 4 || self.old_count >= self.gc_threshold
+        // Trigger when:
+        //   - the nursery is past 75% of its allocated arena (the
+        //     fast path for short-lived churn — we can absorb up
+        //     to nursery_size of allocations per cycle without
+        //     paying GC overhead), OR
+        //   - the nursery's *used* bytes have crossed a fixed
+        //     ceiling (default 64 MB). Long-running event loops
+        //     with a giant nursery would otherwise sit at hundreds
+        //     of megabytes of dead objects before the 75% trigger
+        //     fires, OR
+        //   - the old gen has accumulated `gc_threshold` objects.
+        //
+        // The 64 MB ceiling is a compromise: small enough that an
+        // idle server stays around tens of MB instead of hundreds,
+        // big enough that allocation-heavy benchmarks (binary_trees)
+        // still amortise GC across a meaningful chunk of work.
+        const NURSERY_BYTE_CEILING: usize = 64 * 1024 * 1024;
+        let nursery_used = self.nursery.used();
+        nursery_used > self.nursery.capacity() * 3 / 4
+            || nursery_used > NURSERY_BYTE_CEILING
+            || self.old_count >= self.gc_threshold
     }
 
     /// Debug: validate that every old→young reference has a corresponding
