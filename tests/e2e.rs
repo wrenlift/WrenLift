@@ -932,7 +932,7 @@ System.print(s.count)
 #[test]
 fn e2e_module_import() {
     let config = VMConfig {
-        load_module_fn: Some(Box::new(|name: &str| -> Option<String> {
+        load_module_fn: Some(Box::new(|name: &str, _from: &str| -> Option<String> {
             if name == "math_helpers" {
                 Some(
                     r#"
@@ -1476,7 +1476,7 @@ System.print(list[999])
 #[test]
 fn e2e_circular_import_detected() {
     let config = VMConfig {
-        load_module_fn: Some(Box::new(|name: &str| -> Option<String> {
+        load_module_fn: Some(Box::new(|name: &str, _from: &str| -> Option<String> {
             match name {
                 "module_a" => Some(r#"import "module_b" for B"#.to_string()),
                 "module_b" => Some(r#"import "module_a" for A"#.to_string()),

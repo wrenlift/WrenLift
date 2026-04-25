@@ -1019,7 +1019,7 @@ pub mod cl {
             }
 
             // Lower terminator
-            lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools);
+            lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools)?;
         }
 
         Ok(())
@@ -2507,11 +2507,24 @@ pub mod cl {
         val_map: &HashMap<ValueId, Value>,
         block_map: &HashMap<BlockId, cranelift_codegen::ir::Block>,
         raw_bools: &std::collections::HashSet<ValueId>,
-    ) {
+    ) -> Result<(), String> {
+        // Surface undefined-value lookups as `Err` instead of
+        // panicking the broker thread. The compile fails, the
+        // function falls back to the interpreter, and the user
+        // sees a slow-but-correct execution rather than a process
+        // crash. Matches the `lower_instruction` handler.
+        let undefined: std::cell::Cell<Option<ValueId>> = std::cell::Cell::new(None);
+        let dummy_const = builder.ins().iconst(types::I64, 0);
         let get = |vid: &ValueId| -> Value {
-            *val_map
-                .get(vid)
-                .unwrap_or_else(|| panic!("undefined value {:?} in terminator", vid))
+            match val_map.get(vid) {
+                Some(v) => *v,
+                None => {
+                    if undefined.get().is_none() {
+                        undefined.set(Some(*vid));
+                    }
+                    dummy_const
+                }
+            }
         };
 
         match term {
@@ -2580,6 +2593,10 @@ pub mod cl {
                     .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             }
         }
+        if let Some(vid) = undefined.get() {
+            return Err(format!("undefined value {:?} in terminator", vid));
+        }
+        Ok(())
     }
 
     /// Compute reverse post-order of MIR blocks starting from bb0.
