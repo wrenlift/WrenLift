@@ -22,16 +22,39 @@ impl MirPass for Cse {
         // dominance analysis to avoid referencing values from non-dominating
         // blocks (e.g. merging constants between then/else branches).
         for block in &func.blocks {
-            let mut seen: HashMap<CseKey, ValueId> = HashMap::new();
+            // Two caches:
+            //  - `pure`: instructions whose result never depends on heap state
+            //    (Add, ConstNum, Move, etc.). Free to merge across the whole
+            //    block; calls / stores can't change their answer.
+            //  - `memory`: reads that DO depend on heap state (SubscriptGet,
+            //    method dispatches, etc.). A side-effecting instruction in
+            //    between two such reads can have mutated the receiver, so we
+            //    drop this cache whenever one is encountered. This is the
+            //    minimal memory-dependency tracking the pass needs to stay
+            //    sound around boxed-upvalue closures (where outer's read of
+            //    the box can't be merged across the closure call that
+            //    mutates it).
+            let mut pure: HashMap<CseKey, ValueId> = HashMap::new();
+            let mut memory: HashMap<CseKey, ValueId> = HashMap::new();
             for (val_id, inst) in &block.instructions {
+                // Side-effecting instructions invalidate every cached
+                // memory-dependent read. Pure cache survives.
                 if inst.has_side_effects() {
+                    if inst_may_write_memory(inst) {
+                        memory.clear();
+                    }
                     continue;
                 }
                 if let Some(key) = make_key(inst, &replacements) {
-                    if let Some(&existing) = seen.get(&key) {
+                    let cache = if inst_reads_memory(inst) {
+                        &mut memory
+                    } else {
+                        &mut pure
+                    };
+                    if let Some(&existing) = cache.get(&key) {
                         replacements.insert(*val_id, existing);
                     } else {
-                        seen.insert(key, *val_id);
+                        cache.insert(key, *val_id);
                     }
                 }
             }
@@ -66,8 +89,35 @@ fn resolve(v: ValueId, replacements: &HashMap<ValueId, ValueId>) -> ValueId {
     current
 }
 
+/// True for instructions whose result depends on mutable heap state, so
+/// they should be dropped from the CSE cache whenever a side-effecting
+/// instruction (call, store, etc.) intervenes within the block.
+fn inst_reads_memory(inst: &Instruction) -> bool {
+    matches!(inst, Instruction::SubscriptGet { .. })
+}
+
+/// True for instructions that can mutate observable heap state — anything
+/// else cached as a memory read may now return a stale value. `Call` is
+/// the conservative choice (we don't have call-graph effects), but we can
+/// still keep pure caches alive across them.
+fn inst_may_write_memory(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::Call { .. }
+            | Instruction::CallKnownFunc { .. }
+            | Instruction::CallStaticSelf { .. }
+            | Instruction::SuperCall { .. }
+            | Instruction::SetField(..)
+            | Instruction::SetUpvalue(..)
+            | Instruction::SubscriptSet { .. }
+            | Instruction::SetStaticField(..)
+            | Instruction::SetModuleVar(..)
+    )
+}
+
 fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Option<CseKey> {
-    // Don't CSE block params, mutable reads, or identity-creating allocations.
+    // Don't CSE block params, mutable reads that need observed identity,
+    // or allocations (each must produce a distinct object).
     if matches!(
         inst,
         Instruction::BlockParam(_)
