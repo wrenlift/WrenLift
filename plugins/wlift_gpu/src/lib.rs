@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjMap, ObjString, ObjType};
+use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
@@ -53,6 +53,19 @@ struct Devices {
     devices: HashMap<u64, DeviceRecord>,
 }
 
+struct Buffers {
+    /// Buffer + (size in bytes, owning device id) for diagnostics.
+    /// wgpu::Buffer is itself ref-counted internally; we hold one
+    /// strong handle per Wren id.
+    buffers: HashMap<u64, BufferRecord>,
+}
+
+struct BufferRecord {
+    buffer: wgpu::Buffer,
+    size: u64,
+    device_id: u64,
+}
+
 struct DeviceRecord {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -68,6 +81,15 @@ fn devices() -> &'static Mutex<Devices> {
     REG.get_or_init(|| {
         Mutex::new(Devices {
             devices: HashMap::new(),
+        })
+    })
+}
+
+fn buffers() -> &'static Mutex<Buffers> {
+    static REG: OnceLock<Mutex<Buffers>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(Buffers {
+            buffers: HashMap::new(),
         })
     })
 }
@@ -153,6 +175,72 @@ fn id_of(vm: &mut VM, v: Value, label: &str) -> Option<u64> {
             None
         }
     }
+}
+
+unsafe fn list_view<'a>(v: Value) -> Option<&'a ObjList> {
+    if !v.is_object() {
+        return None;
+    }
+    let ptr = v.as_object()?;
+    let header = ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::List {
+        return None;
+    }
+    Some(unsafe { &*(ptr as *const ObjList) })
+}
+
+unsafe fn list_get(list: &ObjList, i: usize) -> Value {
+    debug_assert!(i < list.count as usize);
+    unsafe { *list.elements.add(i) }
+}
+
+/// Decode a List<String> of usage flags into a `wgpu::BufferUsages`
+/// bitmask. Unknown entries surface as a runtime error so typos
+/// don't silently fail at submit time.
+unsafe fn buffer_usage_from_list(vm: &mut VM, v: Value) -> Option<wgpu::BufferUsages> {
+    let list = match unsafe { list_view(v) } {
+        Some(l) => l,
+        None => {
+            vm.runtime_error(
+                "Buffer.create: descriptor `usage` must be a list of strings.".to_string(),
+            );
+            return None;
+        }
+    };
+    let mut flags = wgpu::BufferUsages::empty();
+    for i in 0..list.count as usize {
+        let item = unsafe { list_get(list, i) };
+        let s = match unsafe { string_of(item) } {
+            Some(s) => s,
+            None => {
+                vm.runtime_error(
+                    "Buffer.create: every `usage` entry must be a string.".to_string(),
+                );
+                return None;
+            }
+        };
+        let bit = match s.as_str() {
+            "vertex" => wgpu::BufferUsages::VERTEX,
+            "index" => wgpu::BufferUsages::INDEX,
+            "uniform" => wgpu::BufferUsages::UNIFORM,
+            "storage" => wgpu::BufferUsages::STORAGE,
+            "indirect" => wgpu::BufferUsages::INDIRECT,
+            "copy-src" | "copySrc" => wgpu::BufferUsages::COPY_SRC,
+            "copy-dst" | "copyDst" => wgpu::BufferUsages::COPY_DST,
+            "map-read" | "mapRead" => wgpu::BufferUsages::MAP_READ,
+            "map-write" | "mapWrite" => wgpu::BufferUsages::MAP_WRITE,
+            "query-resolve" | "queryResolve" => wgpu::BufferUsages::QUERY_RESOLVE,
+            other => {
+                vm.runtime_error(format!(
+                    "Buffer.create: unknown usage flag '{}'.",
+                    other
+                ));
+                return None;
+            }
+        };
+        flags |= bit;
+    }
+    Some(flags)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,4 +410,350 @@ pub extern "C" fn wlift_gpu_device_info(vm: *mut VM) {
         let _ = context.call_method_on(result, "[_]=(_)", &[key_device_type, device_type]);
         set_return(vm, result);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Buffer
+// ---------------------------------------------------------------------------
+//
+// Descriptor:
+//   {
+//     "size":  Num,             // bytes, must be > 0 and <= u32::MAX for now
+//     "usage": List<String>,    // see buffer_usage_from_list
+//     "label": String?,         // diagnostics
+//   }
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createBuffer") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let size = match map_get(desc, "size").and_then(|v| v.as_num()) {
+            Some(n) if n.is_finite() && n > 0.0 && n.fract() == 0.0 => n as u64,
+            _ => {
+                ctx(vm).runtime_error(
+                    "Buffer.create: descriptor `size` must be a positive integer.".to_string(),
+                );
+                return;
+            }
+        };
+        // wgpu requires buffer sizes be aligned to 4 — surface the
+        // misalignment instead of silently rounding.
+        if size % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
+            ctx(vm).runtime_error(format!(
+                "Buffer.create: size {} not aligned to {} bytes.",
+                size,
+                wgpu::COPY_BUFFER_ALIGNMENT,
+            ));
+            return;
+        }
+
+        let usage = match map_get(desc, "usage") {
+            Some(v) => match buffer_usage_from_list(ctx(vm), v) {
+                Some(u) => u,
+                None => return,
+            },
+            None => {
+                ctx(vm).runtime_error(
+                    "Buffer.create: descriptor must include a `usage` list.".to_string(),
+                );
+                return;
+            }
+        };
+
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+
+        let buffer = {
+            let reg = devices().lock().unwrap();
+            let dev = match reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error("Buffer.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            dev.device.create_buffer(&wgpu::BufferDescriptor {
+                label: label.as_deref(),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+
+        let id = next_id();
+        buffers().lock().unwrap().buffers.insert(
+            id,
+            BufferRecord {
+                buffer,
+                size,
+                device_id,
+            },
+        );
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "Buffer.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        buffers().lock().unwrap().buffers.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_size(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "Buffer.size") {
+            Some(i) => i,
+            None => return,
+        };
+        let size = buffers()
+            .lock()
+            .unwrap()
+            .buffers
+            .get(&id)
+            .map(|b| b.size)
+            .unwrap_or(0);
+        set_return(vm, Value::num(size as f64));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffer writes — float / uint scalar lists
+// ---------------------------------------------------------------------------
+//
+// Walks a `List<Num>` and writes the values into the buffer at
+// `offset`. Always one `queue.write_buffer` call regardless of
+// list length — the f64→f32 / f64→u32 conversion happens in this
+// function so per-element overhead stays negligible.
+
+unsafe fn write_buffer_with(
+    vm: *mut VM,
+    label: &str,
+    converter: fn(f64) -> Vec<u8>,
+    bytes_per_element: usize,
+) {
+    unsafe {
+        let buffer_id = match id_of(ctx(vm), slot(vm, 1), label) {
+            Some(i) => i,
+            None => return,
+        };
+        let offset = match slot(vm, 2).as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
+            _ => {
+                ctx(vm).runtime_error(format!("{}: offset must be a non-negative integer.", label));
+                return;
+            }
+        };
+        let list = match list_view(slot(vm, 3)) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error(format!("{}: data must be a list of numbers.", label));
+                return;
+            }
+        };
+
+        let count = list.count as usize;
+        let mut bytes: Vec<u8> = Vec::with_capacity(count * bytes_per_element);
+        for i in 0..count {
+            let n = match list_get(list, i).as_num() {
+                Some(n) => n,
+                None => {
+                    ctx(vm).runtime_error(format!(
+                        "{}: every element must be a number (index {}).",
+                        label, i
+                    ));
+                    return;
+                }
+            };
+            bytes.extend_from_slice(&converter(n));
+        }
+
+        let buf_reg = buffers().lock().unwrap();
+        let buf = match buf_reg.buffers.get(&buffer_id) {
+            Some(b) => b,
+            None => {
+                ctx(vm).runtime_error(format!("{}: unknown buffer id.", label));
+                return;
+            }
+        };
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&buf.device_id) {
+            Some(d) => d,
+            None => {
+                ctx(vm).runtime_error(format!("{}: device dropped before write.", label));
+                return;
+            }
+        };
+        dev.queue.write_buffer(&buf.buffer, offset, &bytes);
+        set_return(vm, Value::null());
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut VM) {
+    unsafe {
+        write_buffer_with(
+            vm,
+            "Buffer.writeFloats",
+            |n| (n as f32).to_le_bytes().to_vec(),
+            4,
+        );
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut VM) {
+    unsafe {
+        write_buffer_with(
+            vm,
+            "Buffer.writeUints",
+            |n| {
+                let v = if n.is_finite() && n >= 0.0 {
+                    (n as u32).to_le_bytes()
+                } else {
+                    [0u8; 4]
+                };
+                v.to_vec()
+            },
+            4,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Buffer batched math uploads
+// ---------------------------------------------------------------------------
+//
+// Each variant takes a Wren List of math objects and packs every
+// element's `.data` list as f32 into a single buffered write.
+// The expected element types are:
+//
+//   writeMat4s  — Mat4   (16 f32, row-major; user passes a layout-
+//                         aware shader that transposes if needed)
+//   writeVec3s  — Vec3   (3 f32, no padding — caller pads if the
+//                         shader expects std140-aligned vec3s)
+//   writeVec4s  — Vec4   (4 f32)
+//   writeQuats  — Quat   (4 f32, w-x-y-z order — matches Quat.data)
+
+/// Pack a `List<List<Num>>` of math components into a contiguous
+/// `Vec<u8>` of f32, writing the result into the buffer.
+///
+/// The outer Wren list contains one inner list per element; each
+/// inner list MUST already be the math object's `.data` (i.e. the
+/// Wren wrapper extracted it before crossing the FFI boundary).
+/// Going through Wren-side extraction sidesteps the GC-during-
+/// `call_method_on` hazard — no callbacks back into the VM during
+/// the conversion loop, so the outer list's `elements` pointer
+/// stays valid for the whole pass.
+unsafe fn write_buffer_math_batch(
+    vm: *mut VM,
+    label: &str,
+    floats_per_element: usize,
+) {
+    unsafe {
+        let buffer_id = match id_of(ctx(vm), slot(vm, 1), label) {
+            Some(i) => i,
+            None => return,
+        };
+        let offset = match slot(vm, 2).as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
+            _ => {
+                ctx(vm).runtime_error(format!("{}: offset must be a non-negative integer.", label));
+                return;
+            }
+        };
+        let outer = match list_view(slot(vm, 3)) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error(format!("{}: data must be a list of lists.", label));
+                return;
+            }
+        };
+
+        let count = outer.count as usize;
+        let mut bytes: Vec<u8> = Vec::with_capacity(count * floats_per_element * 4);
+
+        for i in 0..count {
+            let inner_v = list_get(outer, i);
+            let inner = match list_view(inner_v) {
+                Some(l) => l,
+                None => {
+                    ctx(vm).runtime_error(format!(
+                        "{}: element {} must be a list (use `obj.data`).",
+                        label, i
+                    ));
+                    return;
+                }
+            };
+            if inner.count as usize != floats_per_element {
+                ctx(vm).runtime_error(format!(
+                    "{}: element {} has {} components, expected {}.",
+                    label, i, inner.count, floats_per_element
+                ));
+                return;
+            }
+            for j in 0..floats_per_element {
+                let n = match list_get(inner, j).as_num() {
+                    Some(n) => n,
+                    None => {
+                        ctx(vm).runtime_error(format!(
+                            "{}: element {} component {} not a number.",
+                            label, i, j
+                        ));
+                        return;
+                    }
+                };
+                bytes.extend_from_slice(&(n as f32).to_le_bytes());
+            }
+        }
+
+        let buf_reg = buffers().lock().unwrap();
+        let buf = match buf_reg.buffers.get(&buffer_id) {
+            Some(b) => b,
+            None => {
+                ctx(vm).runtime_error(format!("{}: unknown buffer id.", label));
+                return;
+            }
+        };
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&buf.device_id) {
+            Some(d) => d,
+            None => {
+                ctx(vm).runtime_error(format!("{}: device dropped before write.", label));
+                return;
+            }
+        };
+        dev.queue.write_buffer(&buf.buffer, offset, &bytes);
+        set_return(vm, Value::null());
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_write_mat4s(vm: *mut VM) {
+    unsafe { write_buffer_math_batch(vm, "Buffer.writeMat4s", 16) }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_write_vec3s(vm: *mut VM) {
+    unsafe { write_buffer_math_batch(vm, "Buffer.writeVec3s", 3) }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_write_vec4s(vm: *mut VM) {
+    unsafe { write_buffer_math_batch(vm, "Buffer.writeVec4s", 4) }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_write_quats(vm: *mut VM) {
+    unsafe { write_buffer_math_batch(vm, "Buffer.writeQuats", 4) }
 }
