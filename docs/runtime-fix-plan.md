@@ -217,7 +217,22 @@ something the interpreter handled correctly.
 
 ## Phase 4 — Method dispatch edge cases
 
-Status: **open**
+Status: **fixed (commit `260633a`, 2026-04-26) + one closure-dispatch
+case auto-resolved by Phase 0 / 1**
+
+`Fiber.try` now catches method-not-found errors through the same
+fiber-error path that `Fiber.abort` and native runtime errors take —
+the dispatcher hands the message to `route_method_error_through_fiber_try`
+which writes the error to `fiber.error`, marks the fiber `Done`, and
+resumes the caller. Both raise sites (main dispatch + super-chain
+dispatch) covered. Regression tests in
+`e2e_fiber_try_catches_missing_method` and
+`e2e_fiber_try_catches_missing_super_method`.
+
+The `Meta.compile` + `obj.name` dispatch quirk doesn't reproduce on
+the current build — likely fixed downstream of the CSE / for-in
+work. Locked in via
+`e2e_meta_compile_closure_dispatches_through_receiver`.
 
 Two bugs whose symptoms diverge but share the dispatch path:
 

@@ -63,7 +63,13 @@ Workaround: run affected scripts with `--mode interpreter`. All
 
 ### `Fiber.try` doesn't catch "does not implement" method-dispatch errors
 
-Status: **open**
+Status: **fixed (commit 260633a, 2026-04-26)**
+
+`Fiber.try` now routes method-not-found errors through the same
+fiber-error catch the native-side `ctx.runtime_error` path already
+used. The dispatcher converts the error message to a String,
+stores it on `fiber.error`, marks the fiber `Done`, and resumes
+the caller — same shape `Fiber.abort` already followed.
 
 ```wren
 class B { construct new() {} }
@@ -80,7 +86,19 @@ optionally-checked.
 
 ### `obj.name` compiled via `Meta.compile` dispatches to `Class.name`
 
-Status: **open**
+Status: **not currently reproducing (likely fixed downstream of
+Phase 0 / 1 — regression test landed in commit 260633a)**
+
+The original symptom (a `Meta.compile("return Fn.new { |obj|
+obj.name }").call()` invocation returning `"Class"` when called
+from inside another class's static method) doesn't reproduce in
+the current build. Locked in
+`e2e_meta_compile_closure_dispatches_through_receiver` so a
+re-occurrence flags loudly.
+
+Original observation kept below for context — re-open this entry
+if anyone hits the symptom again on real `@hatch:json` `#json`
+attribute code.
 
 A closure compiled through `Meta.compile` and invoked from
 inside another module's class method returns the *class's*
