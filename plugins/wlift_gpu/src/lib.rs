@@ -90,6 +90,38 @@ struct Samplers {
     samplers: HashMap<u64, wgpu::Sampler>,
 }
 
+struct BindGroupLayouts {
+    layouts: HashMap<u64, wgpu::BindGroupLayout>,
+}
+
+struct PipelineLayouts {
+    layouts: HashMap<u64, wgpu::PipelineLayout>,
+}
+
+struct BindGroups {
+    groups: HashMap<u64, wgpu::BindGroup>,
+}
+
+struct RenderPipelines {
+    pipelines: HashMap<u64, wgpu::RenderPipeline>,
+}
+
+/// CommandEncoder + finished CommandBuffer registry.
+///
+/// Render passes aren't exposed as long-lived Wren objects — their
+/// lifetime is tied to the encoder via wgpu's borrow rules. The
+/// Wren wrapper builds a command list, then a single
+/// `encoder_record_pass` foreign call begins the pass, replays the
+/// commands, and ends it inside a tight Rust scope.
+struct Encoders {
+    encoders: HashMap<u64, EncoderState>,
+}
+
+enum EncoderState {
+    Open { encoder: wgpu::CommandEncoder, device_id: u64 },
+    Finished { buffer: wgpu::CommandBuffer, device_id: u64 },
+}
+
 struct DeviceRecord {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -152,6 +184,31 @@ fn samplers() -> &'static Mutex<Samplers> {
             samplers: HashMap::new(),
         })
     })
+}
+
+fn bind_group_layouts() -> &'static Mutex<BindGroupLayouts> {
+    static REG: OnceLock<Mutex<BindGroupLayouts>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(BindGroupLayouts { layouts: HashMap::new() }))
+}
+
+fn pipeline_layouts() -> &'static Mutex<PipelineLayouts> {
+    static REG: OnceLock<Mutex<PipelineLayouts>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(PipelineLayouts { layouts: HashMap::new() }))
+}
+
+fn bind_groups() -> &'static Mutex<BindGroups> {
+    static REG: OnceLock<Mutex<BindGroups>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(BindGroups { groups: HashMap::new() }))
+}
+
+fn render_pipelines() -> &'static Mutex<RenderPipelines> {
+    static REG: OnceLock<Mutex<RenderPipelines>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(RenderPipelines { pipelines: HashMap::new() }))
+}
+
+fn encoders() -> &'static Mutex<Encoders> {
+    static REG: OnceLock<Mutex<Encoders>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Encoders { encoders: HashMap::new() }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,5 +1267,1729 @@ pub extern "C" fn wlift_gpu_sampler_destroy(vm: *mut VM) {
         };
         samplers().lock().unwrap().samplers.remove(&id);
         set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BindGroupLayout
+// ---------------------------------------------------------------------------
+//
+// Descriptor:
+//   {
+//     "entries": [
+//       { "binding": Num,
+//         "visibility": List<String>, // "vertex" | "fragment" | "compute"
+//         "kind": "uniform" | "storage" | "read-only-storage" |
+//                 "sampler" | "texture" | "storage-texture",
+//         // sampler/texture extras as needed; phase 1 covers
+//         // uniform + texture + sampler (filtering)
+//         "viewDimension": "2d" (texture only),
+//         "sampleType":   "float" | "depth" (texture only),
+//       },
+//       ...
+//     ]
+//   }
+
+unsafe fn shader_stages_from_list(vm: &mut VM, v: Value) -> Option<wgpu::ShaderStages> {
+    let list = match unsafe { list_view(v) } {
+        Some(l) => l,
+        None => {
+            vm.runtime_error("`visibility` must be a list of strings.".to_string());
+            return None;
+        }
+    };
+    let mut s = wgpu::ShaderStages::empty();
+    for i in 0..list.count as usize {
+        let str_v = match unsafe { string_of(list_get(list, i)) } {
+            Some(s) => s,
+            None => {
+                vm.runtime_error("`visibility` entries must be strings.".to_string());
+                return None;
+            }
+        };
+        s |= match str_v.as_str() {
+            "vertex" => wgpu::ShaderStages::VERTEX,
+            "fragment" => wgpu::ShaderStages::FRAGMENT,
+            "compute" => wgpu::ShaderStages::COMPUTE,
+            other => {
+                vm.runtime_error(format!("Unknown shader stage '{}'.", other));
+                return None;
+            }
+        };
+    }
+    Some(s)
+}
+
+unsafe fn binding_type_from_entry(vm: &mut VM, entry: Value) -> Option<wgpu::BindingType> {
+    let kind = match map_get(entry, "kind").and_then(|v| string_of(v)) {
+        Some(s) => s,
+        None => {
+            vm.runtime_error("BindGroupLayout entry: missing `kind` string.".to_string());
+            return None;
+        }
+    };
+    Some(match kind.as_str() {
+        "uniform" => wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        "storage" => wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        "read-only-storage" => wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        "sampler" => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        "texture" => {
+            let sample_type = match map_get(entry, "sampleType").and_then(|v| string_of(v)) {
+                Some(s) if s == "depth" => wgpu::TextureSampleType::Depth,
+                Some(s) if s == "uint" => wgpu::TextureSampleType::Uint,
+                Some(s) if s == "sint" => wgpu::TextureSampleType::Sint,
+                _ => wgpu::TextureSampleType::Float { filterable: true },
+            };
+            wgpu::BindingType::Texture {
+                sample_type,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            }
+        }
+        other => {
+            vm.runtime_error(format!("Unknown bind group entry kind '{}'.", other));
+            return None;
+        }
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createBindGroupLayout") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+
+        let entries_v = match map_get(desc, "entries") {
+            Some(v) => v,
+            None => {
+                ctx(vm).runtime_error(
+                    "BindGroupLayout.create: descriptor must include `entries`.".to_string(),
+                );
+                return;
+            }
+        };
+        let entries_list = match list_view(entries_v) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error(
+                    "BindGroupLayout.create: `entries` must be a list.".to_string(),
+                );
+                return;
+            }
+        };
+
+        let mut entries: Vec<wgpu::BindGroupLayoutEntry> =
+            Vec::with_capacity(entries_list.count as usize);
+        for i in 0..entries_list.count as usize {
+            let entry = list_get(entries_list, i);
+            let binding = match map_get(entry, "binding").and_then(|v| v.as_num()) {
+                Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u32,
+                _ => {
+                    ctx(vm).runtime_error(format!(
+                        "BindGroupLayout entry {}: `binding` must be a non-negative integer.",
+                        i
+                    ));
+                    return;
+                }
+            };
+            let visibility = match map_get(entry, "visibility") {
+                Some(v) => match shader_stages_from_list(ctx(vm), v) {
+                    Some(s) => s,
+                    None => return,
+                },
+                None => {
+                    ctx(vm).runtime_error(format!(
+                        "BindGroupLayout entry {}: missing `visibility`.",
+                        i
+                    ));
+                    return;
+                }
+            };
+            let ty = match binding_type_from_entry(ctx(vm), entry) {
+                Some(t) => t,
+                None => return,
+            };
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility,
+                ty,
+                count: None,
+            });
+        }
+
+        let layout = {
+            let reg = devices().lock().unwrap();
+            let dev = match reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error(
+                        "BindGroupLayout.create: unknown device id.".to_string(),
+                    );
+                    return;
+                }
+            };
+            dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: label.as_deref(),
+                entries: &entries,
+            })
+        };
+        let id = next_id();
+        bind_group_layouts().lock().unwrap().layouts.insert(id, layout);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_bind_group_layout_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "BindGroupLayout.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        bind_group_layouts().lock().unwrap().layouts.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PipelineLayout
+// ---------------------------------------------------------------------------
+//
+// Descriptor:
+//   {
+//     "bindGroupLayouts": [layoutId, layoutId, ...],
+//     "label": String?
+//   }
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createPipelineLayout") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+        let bgl_ids_v = match map_get(desc, "bindGroupLayouts") {
+            Some(v) => v,
+            None => {
+                ctx(vm).runtime_error(
+                    "PipelineLayout.create: descriptor must include `bindGroupLayouts`.".to_string(),
+                );
+                return;
+            }
+        };
+        let bgl_list = match list_view(bgl_ids_v) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error(
+                    "PipelineLayout.create: `bindGroupLayouts` must be a list.".to_string(),
+                );
+                return;
+            }
+        };
+
+        let bgl_reg = bind_group_layouts().lock().unwrap();
+        let mut refs: Vec<&wgpu::BindGroupLayout> = Vec::with_capacity(bgl_list.count as usize);
+        for i in 0..bgl_list.count as usize {
+            let id = match list_get(bgl_list, i).as_num() {
+                Some(n) if n.is_finite() && n >= 0.0 => n as u64,
+                _ => {
+                    drop(bgl_reg);
+                    ctx(vm).runtime_error(format!(
+                        "PipelineLayout.create: bindGroupLayouts[{}] must be an id.",
+                        i
+                    ));
+                    return;
+                }
+            };
+            let bgl = match bgl_reg.layouts.get(&id) {
+                Some(l) => l,
+                None => {
+                    drop(bgl_reg);
+                    ctx(vm).runtime_error(format!(
+                        "PipelineLayout.create: unknown bind group layout id {}.",
+                        id
+                    ));
+                    return;
+                }
+            };
+            refs.push(bgl);
+        }
+
+        let layout = {
+            let dev_reg = devices().lock().unwrap();
+            let dev = match dev_reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    drop(bgl_reg);
+                    ctx(vm).runtime_error("PipelineLayout.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            dev.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: label.as_deref(),
+                bind_group_layouts: &refs,
+                push_constant_ranges: &[],
+            })
+        };
+        drop(bgl_reg);
+
+        let id = next_id();
+        pipeline_layouts().lock().unwrap().layouts.insert(id, layout);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_pipeline_layout_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "PipelineLayout.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        pipeline_layouts().lock().unwrap().layouts.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BindGroup
+// ---------------------------------------------------------------------------
+//
+// Descriptor:
+//   {
+//     "layout": layoutId,
+//     "entries": [
+//       { "binding": Num, "buffer":  bufferId, "offset"?: Num, "size"?: Num },
+//       { "binding": Num, "sampler": samplerId },
+//       { "binding": Num, "view":    textureViewId },
+//     ],
+//     "label": String?
+//   }
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_bind_group_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createBindGroup") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        let layout_id = match map_get(desc, "layout").and_then(|v| v.as_num()) {
+            Some(n) if n.is_finite() && n >= 0.0 => n as u64,
+            _ => {
+                ctx(vm).runtime_error(
+                    "BindGroup.create: descriptor must include a numeric `layout` id.".to_string(),
+                );
+                return;
+            }
+        };
+
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+        let entries_v = match map_get(desc, "entries") {
+            Some(v) => v,
+            None => {
+                ctx(vm).runtime_error(
+                    "BindGroup.create: descriptor must include `entries`.".to_string(),
+                );
+                return;
+            }
+        };
+        let entries_list = match list_view(entries_v) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error("BindGroup.create: `entries` must be a list.".to_string());
+                return;
+            }
+        };
+
+        // Walk entries, capturing (binding, kind, ids) — actual
+        // wgpu::BindingResource refs need lifetimes against the
+        // registry locks held during create_bind_group, so we
+        // resolve them in a second pass below.
+        enum EntryKind {
+            Buffer { id: u64, offset: u64, size: Option<u64> },
+            Sampler { id: u64 },
+            View { id: u64 },
+        }
+        let mut decoded: Vec<(u32, EntryKind)> = Vec::with_capacity(entries_list.count as usize);
+        for i in 0..entries_list.count as usize {
+            let entry = list_get(entries_list, i);
+            let binding = match map_get(entry, "binding").and_then(|v| v.as_num()) {
+                Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u32,
+                _ => {
+                    ctx(vm).runtime_error(format!(
+                        "BindGroup entry {}: `binding` must be a non-negative integer.",
+                        i
+                    ));
+                    return;
+                }
+            };
+            if let Some(b) = map_get(entry, "buffer").and_then(|v| v.as_num()) {
+                let bid = b as u64;
+                let offset = map_get(entry, "offset")
+                    .and_then(|v| v.as_num())
+                    .map(|n| n as u64)
+                    .unwrap_or(0);
+                let size = map_get(entry, "size")
+                    .and_then(|v| v.as_num())
+                    .map(|n| n as u64);
+                decoded.push((binding, EntryKind::Buffer { id: bid, offset, size }));
+            } else if let Some(sid) = map_get(entry, "sampler").and_then(|v| v.as_num()) {
+                decoded.push((binding, EntryKind::Sampler { id: sid as u64 }));
+            } else if let Some(vid) = map_get(entry, "view").and_then(|v| v.as_num()) {
+                decoded.push((binding, EntryKind::View { id: vid as u64 }));
+            } else {
+                ctx(vm).runtime_error(format!(
+                    "BindGroup entry {}: must include one of `buffer`, `sampler`, `view`.",
+                    i
+                ));
+                return;
+            }
+        }
+
+        // Resolve resource refs and create the bind group while
+        // every needed registry is locked. The Mutex guards live
+        // exactly long enough for create_bind_group to consume the
+        // refs.
+        let bgl_reg = bind_group_layouts().lock().unwrap();
+        let layout = match bgl_reg.layouts.get(&layout_id) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error("BindGroup.create: unknown layout id.".to_string());
+                return;
+            }
+        };
+        let buf_reg = buffers().lock().unwrap();
+        let smp_reg = samplers().lock().unwrap();
+        let view_reg = views().lock().unwrap();
+
+        let mut entries_built: Vec<wgpu::BindGroupEntry> = Vec::with_capacity(decoded.len());
+        for (binding, kind) in &decoded {
+            let resource = match kind {
+                EntryKind::Buffer { id, offset, size } => {
+                    let buf = match buf_reg.buffers.get(id) {
+                        Some(b) => b,
+                        None => {
+                            ctx(vm).runtime_error("BindGroup.create: unknown buffer id.".to_string());
+                            return;
+                        }
+                    };
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buf.buffer,
+                        offset: *offset,
+                        size: size.and_then(std::num::NonZeroU64::new),
+                    })
+                }
+                EntryKind::Sampler { id } => {
+                    let smp = match smp_reg.samplers.get(id) {
+                        Some(s) => s,
+                        None => {
+                            ctx(vm).runtime_error("BindGroup.create: unknown sampler id.".to_string());
+                            return;
+                        }
+                    };
+                    wgpu::BindingResource::Sampler(smp)
+                }
+                EntryKind::View { id } => {
+                    let view = match view_reg.views.get(id) {
+                        Some(v) => v,
+                        None => {
+                            ctx(vm).runtime_error("BindGroup.create: unknown view id.".to_string());
+                            return;
+                        }
+                    };
+                    wgpu::BindingResource::TextureView(view)
+                }
+            };
+            entries_built.push(wgpu::BindGroupEntry { binding: *binding, resource });
+        }
+
+        let bg = {
+            let dev_reg = devices().lock().unwrap();
+            let dev = match dev_reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error("BindGroup.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: label.as_deref(),
+                layout,
+                entries: &entries_built,
+            })
+        };
+        drop(view_reg);
+        drop(smp_reg);
+        drop(buf_reg);
+        drop(bgl_reg);
+
+        let id = next_id();
+        bind_groups().lock().unwrap().groups.insert(id, bg);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_bind_group_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "BindGroup.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        bind_groups().lock().unwrap().groups.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RenderPipeline
+// ---------------------------------------------------------------------------
+//
+// Descriptor (large but flat — no nested DSL beyond two layers):
+//
+//   {
+//     "layout": pipelineLayoutId | "auto",
+//     "vertex": {
+//       "module":     shaderId,
+//       "entryPoint": String,
+//       "buffers":    [
+//         { "arrayStride": Num,
+//           "stepMode":    "vertex" | "instance" (default "vertex"),
+//           "attributes":  [
+//             { "shaderLocation": Num,
+//               "offset":         Num,
+//               "format":         "float32x2" | "float32x3" | "float32x4" |
+//                                 "uint32" | "uint32x2" | "uint32x3" |
+//                                 "uint32x4" | "sint32" | "sint32x2" | ... }
+//           ]
+//         }, ...
+//       ]
+//     },
+//     "fragment": {
+//       "module":     shaderId,
+//       "entryPoint": String,
+//       "targets": [
+//         { "format": String, "blend"?: { ... }, "writeMask"?: Num },
+//         ...
+//       ]
+//     },
+//     "primitive": {
+//       "topology":  "triangle-list" (default) | "triangle-strip" |
+//                    "line-list" | "line-strip" | "point-list",
+//       "cullMode":  "none" (default) | "front" | "back",
+//       "frontFace": "ccw" (default) | "cw"
+//     },
+//     "depthStencil"?: {
+//       "format":         "depth32float" | "depth24plus" | ...,
+//       "depthWriteEnabled": Bool (default true),
+//       "depthCompare":   "less" (default) | "less-equal" | "always" | ...
+//     },
+//     "label": String?
+//   }
+
+fn vertex_format_from_str(s: &str) -> Option<wgpu::VertexFormat> {
+    use wgpu::VertexFormat as V;
+    Some(match s {
+        "float32" => V::Float32,
+        "float32x2" => V::Float32x2,
+        "float32x3" => V::Float32x3,
+        "float32x4" => V::Float32x4,
+        "uint32" => V::Uint32,
+        "uint32x2" => V::Uint32x2,
+        "uint32x3" => V::Uint32x3,
+        "uint32x4" => V::Uint32x4,
+        "sint32" => V::Sint32,
+        "sint32x2" => V::Sint32x2,
+        "sint32x3" => V::Sint32x3,
+        "sint32x4" => V::Sint32x4,
+        "uint8x2" => V::Uint8x2,
+        "uint8x4" => V::Uint8x4,
+        "unorm8x2" => V::Unorm8x2,
+        "unorm8x4" => V::Unorm8x4,
+        _ => return None,
+    })
+}
+
+fn topology_from_str(s: &str) -> wgpu::PrimitiveTopology {
+    match s {
+        "triangle-strip" => wgpu::PrimitiveTopology::TriangleStrip,
+        "line-list" => wgpu::PrimitiveTopology::LineList,
+        "line-strip" => wgpu::PrimitiveTopology::LineStrip,
+        "point-list" => wgpu::PrimitiveTopology::PointList,
+        _ => wgpu::PrimitiveTopology::TriangleList,
+    }
+}
+
+fn compare_from_str(s: &str) -> wgpu::CompareFunction {
+    use wgpu::CompareFunction as C;
+    match s {
+        "never" => C::Never,
+        "less" => C::Less,
+        "equal" => C::Equal,
+        "less-equal" => C::LessEqual,
+        "greater" => C::Greater,
+        "not-equal" => C::NotEqual,
+        "greater-equal" => C::GreaterEqual,
+        _ => C::Always,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createRenderPipeline") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+
+        // -- Layout: "auto" | id ----------------------------------
+        enum LayoutChoice {
+            Auto,
+            Id(u64),
+        }
+        let layout_choice = match map_get(desc, "layout") {
+            Some(v) => {
+                if let Some(s) = string_of(v) {
+                    if s == "auto" {
+                        LayoutChoice::Auto
+                    } else {
+                        ctx(vm).runtime_error(format!(
+                            "RenderPipeline.create: layout '{}' not recognized; use 'auto' or a layout id.",
+                            s
+                        ));
+                        return;
+                    }
+                } else if let Some(n) = v.as_num() {
+                    LayoutChoice::Id(n as u64)
+                } else {
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: `layout` must be 'auto' or a layout id.".to_string(),
+                    );
+                    return;
+                }
+            }
+            None => LayoutChoice::Auto,
+        };
+
+        // -- Vertex stage ----------------------------------------
+        let vertex_v = match map_get(desc, "vertex") {
+            Some(v) => v,
+            None => {
+                ctx(vm).runtime_error(
+                    "RenderPipeline.create: descriptor must include `vertex`.".to_string(),
+                );
+                return;
+            }
+        };
+        let v_module_id = match map_get(vertex_v, "module").and_then(|v| v.as_num()) {
+            Some(n) => n as u64,
+            None => {
+                ctx(vm).runtime_error("RenderPipeline.create: vertex.module missing.".to_string());
+                return;
+            }
+        };
+        let v_entry = match map_get(vertex_v, "entryPoint").and_then(|v| string_of(v)) {
+            Some(s) => s,
+            None => {
+                ctx(vm).runtime_error(
+                    "RenderPipeline.create: vertex.entryPoint missing.".to_string(),
+                );
+                return;
+            }
+        };
+
+        // Vertex buffer layouts. Each layout owns its attributes
+        // Vec; both have to outlive the wgpu pipeline create call.
+        struct OwnedLayout {
+            stride: u64,
+            step_mode: wgpu::VertexStepMode,
+            attrs: Vec<wgpu::VertexAttribute>,
+        }
+        let mut owned_layouts: Vec<OwnedLayout> = Vec::new();
+        if let Some(buffers_v) = map_get(vertex_v, "buffers") {
+            let buffers_list = match list_view(buffers_v) {
+                Some(l) => l,
+                None => {
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: vertex.buffers must be a list.".to_string(),
+                    );
+                    return;
+                }
+            };
+            for i in 0..buffers_list.count as usize {
+                let layout = list_get(buffers_list, i);
+                let stride = match map_get(layout, "arrayStride").and_then(|v| v.as_num()) {
+                    Some(n) => n as u64,
+                    None => {
+                        ctx(vm).runtime_error(format!(
+                            "vertex.buffers[{}]: `arrayStride` missing.",
+                            i
+                        ));
+                        return;
+                    }
+                };
+                let step_mode = match map_get(layout, "stepMode").and_then(|v| string_of(v)) {
+                    Some(s) if s == "instance" => wgpu::VertexStepMode::Instance,
+                    _ => wgpu::VertexStepMode::Vertex,
+                };
+                let attrs_v = match map_get(layout, "attributes") {
+                    Some(v) => v,
+                    None => {
+                        ctx(vm).runtime_error(format!(
+                            "vertex.buffers[{}]: `attributes` missing.",
+                            i
+                        ));
+                        return;
+                    }
+                };
+                let attrs_list = match list_view(attrs_v) {
+                    Some(l) => l,
+                    None => {
+                        ctx(vm).runtime_error(format!(
+                            "vertex.buffers[{}]: `attributes` must be a list.",
+                            i
+                        ));
+                        return;
+                    }
+                };
+                let mut attrs: Vec<wgpu::VertexAttribute> = Vec::new();
+                for j in 0..attrs_list.count as usize {
+                    let attr = list_get(attrs_list, j);
+                    let location = match map_get(attr, "shaderLocation").and_then(|v| v.as_num())
+                    {
+                        Some(n) => n as u32,
+                        None => {
+                            ctx(vm).runtime_error(format!(
+                                "vertex.buffers[{}].attributes[{}]: `shaderLocation` missing.",
+                                i, j
+                            ));
+                            return;
+                        }
+                    };
+                    let offset = map_get(attr, "offset")
+                        .and_then(|v| v.as_num())
+                        .map(|n| n as u64)
+                        .unwrap_or(0);
+                    let format = match map_get(attr, "format").and_then(|v| string_of(v)) {
+                        Some(s) => match vertex_format_from_str(&s) {
+                            Some(f) => f,
+                            None => {
+                                ctx(vm).runtime_error(format!(
+                                    "vertex.buffers[{}].attributes[{}]: unknown format '{}'.",
+                                    i, j, s
+                                ));
+                                return;
+                            }
+                        },
+                        None => {
+                            ctx(vm).runtime_error(format!(
+                                "vertex.buffers[{}].attributes[{}]: `format` missing.",
+                                i, j
+                            ));
+                            return;
+                        }
+                    };
+                    attrs.push(wgpu::VertexAttribute {
+                        shader_location: location,
+                        offset,
+                        format,
+                    });
+                }
+                owned_layouts.push(OwnedLayout { stride, step_mode, attrs });
+            }
+        }
+
+        // -- Fragment stage --------------------------------------
+        // Optional, but phase 1 spec needs it (color output).
+        let fragment_v = map_get(desc, "fragment");
+        struct FragInfo {
+            module_id: u64,
+            entry: String,
+            targets: Vec<Option<wgpu::ColorTargetState>>,
+        }
+        let frag_info = if let Some(fv) = fragment_v {
+            let module_id = match map_get(fv, "module").and_then(|v| v.as_num()) {
+                Some(n) => n as u64,
+                None => {
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: fragment.module missing.".to_string(),
+                    );
+                    return;
+                }
+            };
+            let entry = match map_get(fv, "entryPoint").and_then(|v| string_of(v)) {
+                Some(s) => s,
+                None => {
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: fragment.entryPoint missing.".to_string(),
+                    );
+                    return;
+                }
+            };
+            let targets_v = match map_get(fv, "targets") {
+                Some(v) => v,
+                None => {
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: fragment.targets missing.".to_string(),
+                    );
+                    return;
+                }
+            };
+            let targets_list = match list_view(targets_v) {
+                Some(l) => l,
+                None => {
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: fragment.targets must be a list.".to_string(),
+                    );
+                    return;
+                }
+            };
+            let mut targets: Vec<Option<wgpu::ColorTargetState>> = Vec::new();
+            for i in 0..targets_list.count as usize {
+                let t = list_get(targets_list, i);
+                let format = match map_get(t, "format").and_then(|v| string_of(v)) {
+                    Some(s) => match texture_format_from_str(&s) {
+                        Some(f) => f,
+                        None => {
+                            ctx(vm).runtime_error(format!(
+                                "fragment.targets[{}]: unknown format '{}'.",
+                                i, s
+                            ));
+                            return;
+                        }
+                    },
+                    None => {
+                        ctx(vm).runtime_error(format!(
+                            "fragment.targets[{}]: `format` missing.",
+                            i
+                        ));
+                        return;
+                    }
+                };
+                targets.push(Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }));
+            }
+            Some(FragInfo {
+                module_id,
+                entry,
+                targets,
+            })
+        } else {
+            None
+        };
+
+        // -- Primitive --------------------------------------------
+        let primitive = if let Some(pv) = map_get(desc, "primitive") {
+            let topology = map_get(pv, "topology")
+                .and_then(|v| string_of(v))
+                .map(|s| topology_from_str(&s))
+                .unwrap_or(wgpu::PrimitiveTopology::TriangleList);
+            let cull_mode = match map_get(pv, "cullMode").and_then(|v| string_of(v)) {
+                Some(s) if s == "front" => Some(wgpu::Face::Front),
+                Some(s) if s == "back" => Some(wgpu::Face::Back),
+                _ => None,
+            };
+            let front_face = match map_get(pv, "frontFace").and_then(|v| string_of(v)) {
+                Some(s) if s == "cw" => wgpu::FrontFace::Cw,
+                _ => wgpu::FrontFace::Ccw,
+            };
+            wgpu::PrimitiveState {
+                topology,
+                cull_mode,
+                front_face,
+                ..Default::default()
+            }
+        } else {
+            wgpu::PrimitiveState::default()
+        };
+
+        // -- DepthStencil ----------------------------------------
+        let depth_stencil = if let Some(dv) = map_get(desc, "depthStencil") {
+            let format = match map_get(dv, "format").and_then(|v| string_of(v)) {
+                Some(s) => match texture_format_from_str(&s) {
+                    Some(f) => f,
+                    None => {
+                        ctx(vm).runtime_error(format!(
+                            "depthStencil.format: unknown '{}'.",
+                            s
+                        ));
+                        return;
+                    }
+                },
+                None => {
+                    ctx(vm).runtime_error(
+                        "depthStencil: `format` missing.".to_string(),
+                    );
+                    return;
+                }
+            };
+            let depth_write_enabled = map_get(dv, "depthWriteEnabled")
+                .map(|v| {
+                    // Treat any non-falsy bool as true. Wren has
+                    // exactly two boolean singletons; missing key
+                    // defaults to true (the common case).
+                    !v.is_falsy()
+                })
+                .unwrap_or(true);
+            let depth_compare = map_get(dv, "depthCompare")
+                .and_then(|v| string_of(v))
+                .map(|s| compare_from_str(&s))
+                .unwrap_or(wgpu::CompareFunction::Less);
+            Some(wgpu::DepthStencilState {
+                format,
+                depth_write_enabled,
+                depth_compare,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            })
+        } else {
+            None
+        };
+
+        // -- Build the pipeline ----------------------------------
+        let shader_reg = shaders().lock().unwrap();
+        let v_module = match shader_reg.shaders.get(&v_module_id) {
+            Some(m) => m,
+            None => {
+                drop(shader_reg);
+                ctx(vm).runtime_error(
+                    "RenderPipeline.create: unknown vertex shader id.".to_string(),
+                );
+                return;
+            }
+        };
+        let f_module_opt = match &frag_info {
+            Some(f) => match shader_reg.shaders.get(&f.module_id) {
+                Some(m) => Some(m),
+                None => {
+                    drop(shader_reg);
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: unknown fragment shader id.".to_string(),
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+        let pl_reg = pipeline_layouts().lock().unwrap();
+        let layout_ref = match &layout_choice {
+            LayoutChoice::Auto => None,
+            LayoutChoice::Id(id) => match pl_reg.layouts.get(id) {
+                Some(l) => Some(l),
+                None => {
+                    drop(pl_reg);
+                    drop(shader_reg);
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: unknown pipeline layout id.".to_string(),
+                    );
+                    return;
+                }
+            },
+        };
+
+        // Build vertex buffer layout refs from owned data — the
+        // attrs vecs are addressed via `&attrs[..]` so they live
+        // for the duration of the create call.
+        let vertex_buffer_layouts: Vec<wgpu::VertexBufferLayout> = owned_layouts
+            .iter()
+            .map(|ol| wgpu::VertexBufferLayout {
+                array_stride: ol.stride,
+                step_mode: ol.step_mode,
+                attributes: &ol.attrs,
+            })
+            .collect();
+
+        let pipeline = {
+            let dev_reg = devices().lock().unwrap();
+            let dev = match dev_reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    drop(pl_reg);
+                    drop(shader_reg);
+                    ctx(vm).runtime_error(
+                        "RenderPipeline.create: unknown device id.".to_string(),
+                    );
+                    return;
+                }
+            };
+
+            dev.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: label.as_deref(),
+                    layout: layout_ref,
+                    vertex: wgpu::VertexState {
+                        module: v_module,
+                        entry_point: &v_entry,
+                        compilation_options: Default::default(),
+                        buffers: &vertex_buffer_layouts,
+                    },
+                    fragment: frag_info.as_ref().map(|f| wgpu::FragmentState {
+                        module: f_module_opt.unwrap(),
+                        entry_point: &f.entry,
+                        compilation_options: Default::default(),
+                        targets: &f.targets,
+                    }),
+                    primitive,
+                    depth_stencil,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                })
+        };
+        drop(pl_reg);
+        drop(shader_reg);
+
+        let id = next_id();
+        render_pipelines().lock().unwrap().pipelines.insert(id, pipeline);
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_render_pipeline_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "RenderPipeline.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        render_pipelines().lock().unwrap().pipelines.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CommandEncoder + RenderPass (record-and-replay)
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_encoder_create(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Device.createCommandEncoder") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+        let label = map_get(desc, "label").and_then(|v| string_of(v));
+        let encoder = {
+            let reg = devices().lock().unwrap();
+            let dev = match reg.devices.get(&device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error("CommandEncoder.create: unknown device id.".to_string());
+                    return;
+                }
+            };
+            dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: label.as_deref(),
+            })
+        };
+        let id = next_id();
+        encoders()
+            .lock()
+            .unwrap()
+            .encoders
+            .insert(id, EncoderState::Open { encoder, device_id });
+        set_return(vm, Value::num(id as f64));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wlift_gpu_encoder_destroy(vm: *mut VM) {
+    unsafe {
+        let id = match id_of(ctx(vm), slot(vm, 1), "CommandEncoder.destroy") {
+            Some(i) => i,
+            None => return,
+        };
+        encoders().lock().unwrap().encoders.remove(&id);
+        set_return(vm, Value::null());
+    }
+}
+
+/// Decode a `loadOp` string into a `wgpu::LoadOp<wgpu::Color>`. The
+/// `clearValue` Map / List<Num> on the descriptor supplies the clear
+/// color when load == "clear".
+unsafe fn load_op_color(attachment: Value) -> wgpu::LoadOp<wgpu::Color> {
+    let op = unsafe { map_get(attachment, "loadOp").and_then(|v| string_of(v)) };
+    match op.as_deref() {
+        Some("load") => wgpu::LoadOp::Load,
+        _ => {
+            // Default to clear so a missing loadOp is the safe choice.
+            let clear_v = unsafe { map_get(attachment, "clearValue") };
+            let mut color = wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            };
+            if let Some(v) = clear_v {
+                if let Some(list) = unsafe { list_view(v) } {
+                    let n = list.count as usize;
+                    if n > 0 {
+                        color.r = unsafe { list_get(list, 0) }.as_num().unwrap_or(0.0);
+                    }
+                    if n > 1 {
+                        color.g = unsafe { list_get(list, 1) }.as_num().unwrap_or(0.0);
+                    }
+                    if n > 2 {
+                        color.b = unsafe { list_get(list, 2) }.as_num().unwrap_or(0.0);
+                    }
+                    if n > 3 {
+                        color.a = unsafe { list_get(list, 3) }.as_num().unwrap_or(1.0);
+                    }
+                }
+            }
+            wgpu::LoadOp::Clear(color)
+        }
+    }
+}
+
+unsafe fn store_op(attachment: Value) -> wgpu::StoreOp {
+    let op = unsafe { map_get(attachment, "storeOp").and_then(|v| string_of(v)) };
+    match op.as_deref() {
+        Some("discard") => wgpu::StoreOp::Discard,
+        _ => wgpu::StoreOp::Store,
+    }
+}
+
+/// Record a render pass into the named encoder.
+///
+/// Wren wrapper drives this via:
+/// ```
+/// pass = encoder.beginRenderPass({...descriptor...})
+/// pass.setPipeline(p); pass.draw(3); ... ; pass.end
+/// ```
+/// Internally `pass.end` packages every recorded command into the
+/// descriptor's `commands` list and calls this single foreign
+/// function. Skips the wgpu-side `RenderPass<'a>` lifetime knot.
+#[no_mangle]
+pub extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut VM) {
+    unsafe {
+        let encoder_id = match id_of(ctx(vm), slot(vm, 1), "RenderPass.end") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 2);
+
+        // Color attachments — we own ResolvedColorAttachment so the
+        // texture views borrowed from the registry stay alive for
+        // the begin_render_pass call.
+        let color_v = match map_get(desc, "colorAttachments") {
+            Some(v) => v,
+            None => {
+                ctx(vm).runtime_error(
+                    "RenderPass: descriptor must include `colorAttachments`.".to_string(),
+                );
+                return;
+            }
+        };
+        let color_list = match list_view(color_v) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error(
+                    "RenderPass: `colorAttachments` must be a list.".to_string(),
+                );
+                return;
+            }
+        };
+
+        struct Color {
+            view_id: u64,
+            load: wgpu::LoadOp<wgpu::Color>,
+            store: wgpu::StoreOp,
+        }
+        let mut colors: Vec<Color> = Vec::with_capacity(color_list.count as usize);
+        for i in 0..color_list.count as usize {
+            let att = list_get(color_list, i);
+            let view_id = match map_get(att, "view").and_then(|v| v.as_num()) {
+                Some(n) => n as u64,
+                None => {
+                    ctx(vm).runtime_error(format!(
+                        "RenderPass: colorAttachments[{}].view missing.",
+                        i
+                    ));
+                    return;
+                }
+            };
+            colors.push(Color {
+                view_id,
+                load: load_op_color(att),
+                store: store_op(att),
+            });
+        }
+
+        // Optional depth-stencil attachment.
+        struct Depth {
+            view_id: u64,
+            depth_load: wgpu::LoadOp<f32>,
+            depth_store: wgpu::StoreOp,
+        }
+        let depth = if let Some(d) = map_get(desc, "depthStencilAttachment") {
+            let view_id = match map_get(d, "view").and_then(|v| v.as_num()) {
+                Some(n) => n as u64,
+                None => {
+                    ctx(vm).runtime_error(
+                        "RenderPass: depthStencilAttachment.view missing.".to_string(),
+                    );
+                    return;
+                }
+            };
+            let depth_load = match map_get(d, "depthLoadOp").and_then(|v| string_of(v)).as_deref() {
+                Some("load") => wgpu::LoadOp::Load,
+                _ => wgpu::LoadOp::Clear(
+                    map_get(d, "depthClearValue")
+                        .and_then(|v| v.as_num())
+                        .map(|n| n as f32)
+                        .unwrap_or(1.0),
+                ),
+            };
+            let depth_store = match map_get(d, "depthStoreOp").and_then(|v| string_of(v)).as_deref()
+            {
+                Some("discard") => wgpu::StoreOp::Discard,
+                _ => wgpu::StoreOp::Store,
+            };
+            Some(Depth {
+                view_id,
+                depth_load,
+                depth_store,
+            })
+        } else {
+            None
+        };
+
+        // Decode the commands list.
+        let commands_v = match map_get(desc, "commands") {
+            Some(v) => v,
+            None => {
+                ctx(vm).runtime_error("RenderPass: missing `commands` list.".to_string());
+                return;
+            }
+        };
+        let commands_list = match list_view(commands_v) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error("RenderPass: `commands` must be a list.".to_string());
+                return;
+            }
+        };
+
+        enum Cmd {
+            SetPipeline(u64),
+            SetVertexBuffer { slot: u32, buffer: u64 },
+            SetIndexBuffer { buffer: u64, format: wgpu::IndexFormat },
+            SetBindGroup { index: u32, group: u64 },
+            Draw { vertex_count: u32, instance_count: u32 },
+            DrawIndexed { index_count: u32, instance_count: u32 },
+        }
+        let mut decoded: Vec<Cmd> = Vec::with_capacity(commands_list.count as usize);
+        for i in 0..commands_list.count as usize {
+            let cmd = list_get(commands_list, i);
+            let op = match map_get(cmd, "op").and_then(|v| string_of(v)) {
+                Some(s) => s,
+                None => {
+                    ctx(vm).runtime_error(format!(
+                        "RenderPass commands[{}]: missing `op` string.",
+                        i
+                    ));
+                    return;
+                }
+            };
+            match op.as_str() {
+                "setPipeline" => {
+                    let pid = map_get(cmd, "pipeline").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    decoded.push(Cmd::SetPipeline(pid));
+                }
+                "setVertexBuffer" => {
+                    let s = map_get(cmd, "slot").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+                    let b = map_get(cmd, "buffer").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    decoded.push(Cmd::SetVertexBuffer { slot: s, buffer: b });
+                }
+                "setIndexBuffer" => {
+                    let b = map_get(cmd, "buffer").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    let f = match map_get(cmd, "format").and_then(|v| string_of(v)).as_deref() {
+                        Some("uint32") => wgpu::IndexFormat::Uint32,
+                        _ => wgpu::IndexFormat::Uint16,
+                    };
+                    decoded.push(Cmd::SetIndexBuffer { buffer: b, format: f });
+                }
+                "setBindGroup" => {
+                    let idx = map_get(cmd, "index").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+                    let g = map_get(cmd, "group").and_then(|v| v.as_num()).unwrap_or(0.0) as u64;
+                    decoded.push(Cmd::SetBindGroup { index: idx, group: g });
+                }
+                "draw" => {
+                    let vc = map_get(cmd, "vertexCount").and_then(|v| v.as_num()).unwrap_or(0.0)
+                        as u32;
+                    let ic = map_get(cmd, "instanceCount")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(1.0) as u32;
+                    decoded.push(Cmd::Draw {
+                        vertex_count: vc,
+                        instance_count: ic,
+                    });
+                }
+                "drawIndexed" => {
+                    let ic = map_get(cmd, "indexCount").and_then(|v| v.as_num()).unwrap_or(0.0)
+                        as u32;
+                    let inst = map_get(cmd, "instanceCount")
+                        .and_then(|v| v.as_num())
+                        .unwrap_or(1.0) as u32;
+                    decoded.push(Cmd::DrawIndexed {
+                        index_count: ic,
+                        instance_count: inst,
+                    });
+                }
+                other => {
+                    ctx(vm).runtime_error(format!(
+                        "RenderPass commands[{}]: unknown op '{}'.",
+                        i, other
+                    ));
+                    return;
+                }
+            }
+        }
+
+        // Begin pass + replay + end. Lock all resource registries
+        // to keep refs alive for the duration of the render pass.
+        let mut enc_reg = encoders().lock().unwrap();
+        let enc = match enc_reg.encoders.get_mut(&encoder_id) {
+            Some(e) => e,
+            None => {
+                drop(enc_reg);
+                ctx(vm).runtime_error("RenderPass: unknown encoder id.".to_string());
+                return;
+            }
+        };
+        let encoder = match enc {
+            EncoderState::Open { encoder, .. } => encoder,
+            EncoderState::Finished { .. } => {
+                drop(enc_reg);
+                ctx(vm).runtime_error(
+                    "RenderPass: encoder already finished; create a new one.".to_string(),
+                );
+                return;
+            }
+        };
+
+        let view_reg = views().lock().unwrap();
+        let pipe_reg = render_pipelines().lock().unwrap();
+        let buf_reg = buffers().lock().unwrap();
+        let bg_reg = bind_groups().lock().unwrap();
+
+        // Build attachment ref structs against the registries.
+        let color_ref_specs: Vec<wgpu::RenderPassColorAttachment> = colors
+            .iter()
+            .filter_map(|c| {
+                view_reg
+                    .views
+                    .get(&c.view_id)
+                    .map(|v| wgpu::RenderPassColorAttachment {
+                        view: v,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: c.load,
+                            store: c.store,
+                        },
+                    })
+            })
+            .collect();
+        if color_ref_specs.len() != colors.len() {
+            drop(bg_reg);
+            drop(buf_reg);
+            drop(pipe_reg);
+            drop(view_reg);
+            drop(enc_reg);
+            ctx(vm).runtime_error("RenderPass: unknown color attachment view id.".to_string());
+            return;
+        }
+        let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> =
+            color_ref_specs.into_iter().map(Some).collect();
+
+        let depth_attachment = if let Some(d) = &depth {
+            match view_reg.views.get(&d.view_id) {
+                Some(v) => Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: v,
+                    depth_ops: Some(wgpu::Operations {
+                        load: d.depth_load,
+                        store: d.depth_store,
+                    }),
+                    stencil_ops: None,
+                }),
+                None => {
+                    drop(bg_reg);
+                    drop(buf_reg);
+                    drop(pipe_reg);
+                    drop(view_reg);
+                    drop(enc_reg);
+                    ctx(vm).runtime_error(
+                        "RenderPass: unknown depth attachment view id.".to_string(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &color_attachments,
+                depth_stencil_attachment: depth_attachment,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            for cmd in &decoded {
+                match cmd {
+                    Cmd::SetPipeline(pid) => {
+                        if let Some(p) = pipe_reg.pipelines.get(pid) {
+                            pass.set_pipeline(p);
+                        }
+                    }
+                    Cmd::SetVertexBuffer { slot, buffer } => {
+                        if let Some(b) = buf_reg.buffers.get(buffer) {
+                            pass.set_vertex_buffer(*slot, b.buffer.slice(..));
+                        }
+                    }
+                    Cmd::SetIndexBuffer { buffer, format } => {
+                        if let Some(b) = buf_reg.buffers.get(buffer) {
+                            pass.set_index_buffer(b.buffer.slice(..), *format);
+                        }
+                    }
+                    Cmd::SetBindGroup { index, group } => {
+                        if let Some(g) = bg_reg.groups.get(group) {
+                            pass.set_bind_group(*index, g, &[]);
+                        }
+                    }
+                    Cmd::Draw {
+                        vertex_count,
+                        instance_count,
+                    } => {
+                        pass.draw(0..*vertex_count, 0..*instance_count);
+                    }
+                    Cmd::DrawIndexed {
+                        index_count,
+                        instance_count,
+                    } => {
+                        pass.draw_indexed(0..*index_count, 0, 0..*instance_count);
+                    }
+                }
+            }
+            // pass dropped here, ending the render pass
+        }
+
+        drop(bg_reg);
+        drop(buf_reg);
+        drop(pipe_reg);
+        drop(view_reg);
+        drop(enc_reg);
+        set_return(vm, Value::null());
+    }
+}
+
+/// `encoder.copyTextureToBuffer(srcTextureId, dstBufferId, descriptor)`
+///
+/// Descriptor:
+///   { "width": u32, "height": u32,
+///     "bytesPerRow": u32?,    // computed if absent
+///     "rowsPerImage": u32? }
+#[no_mangle]
+pub extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut VM) {
+    unsafe {
+        let encoder_id = match id_of(ctx(vm), slot(vm, 1), "CommandEncoder.copyTextureToBuffer") {
+            Some(i) => i,
+            None => return,
+        };
+        let texture_id = match id_of(ctx(vm), slot(vm, 2), "CommandEncoder.copyTextureToBuffer") {
+            Some(i) => i,
+            None => return,
+        };
+        let buffer_id = match id_of(ctx(vm), slot(vm, 3), "CommandEncoder.copyTextureToBuffer") {
+            Some(i) => i,
+            None => return,
+        };
+        let desc = slot(vm, 4);
+        let width = map_get(desc, "width").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+        let height = map_get(desc, "height").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+
+        let mut enc_reg = encoders().lock().unwrap();
+        let tex_reg = textures().lock().unwrap();
+        let buf_reg = buffers().lock().unwrap();
+        let enc = match enc_reg.encoders.get_mut(&encoder_id) {
+            Some(EncoderState::Open { encoder, .. }) => encoder,
+            _ => {
+                drop(buf_reg);
+                drop(tex_reg);
+                drop(enc_reg);
+                ctx(vm).runtime_error(
+                    "copyTextureToBuffer: encoder not in Open state.".to_string(),
+                );
+                return;
+            }
+        };
+        let tex = match tex_reg.textures.get(&texture_id) {
+            Some(t) => t,
+            None => {
+                drop(buf_reg);
+                drop(tex_reg);
+                drop(enc_reg);
+                ctx(vm).runtime_error("copyTextureToBuffer: unknown texture id.".to_string());
+                return;
+            }
+        };
+        let buf = match buf_reg.buffers.get(&buffer_id) {
+            Some(b) => b,
+            None => {
+                drop(buf_reg);
+                drop(tex_reg);
+                drop(enc_reg);
+                ctx(vm).runtime_error("copyTextureToBuffer: unknown buffer id.".to_string());
+                return;
+            }
+        };
+
+        let bpp = format_bytes_per_pixel(tex.format);
+        let bytes_per_row = map_get(desc, "bytesPerRow")
+            .and_then(|v| v.as_num())
+            .map(|n| n as u32)
+            .unwrap_or(width * bpp);
+        let rows_per_image = map_get(desc, "rowsPerImage")
+            .and_then(|v| v.as_num())
+            .map(|n| n as u32)
+            .unwrap_or(height);
+
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buf.buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(rows_per_image),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        drop(buf_reg);
+        drop(tex_reg);
+        drop(enc_reg);
+        set_return(vm, Value::null());
+    }
+}
+
+/// Finish recording, transition to `Finished` state. Subsequent
+/// `submit` calls consume the CommandBuffer.
+#[no_mangle]
+pub extern "C" fn wlift_gpu_encoder_finish(vm: *mut VM) {
+    unsafe {
+        let encoder_id = match id_of(ctx(vm), slot(vm, 1), "CommandEncoder.finish") {
+            Some(i) => i,
+            None => return,
+        };
+        let mut reg = encoders().lock().unwrap();
+        let entry = match reg.encoders.remove(&encoder_id) {
+            Some(e) => e,
+            None => {
+                drop(reg);
+                ctx(vm).runtime_error("CommandEncoder.finish: unknown encoder id.".to_string());
+                return;
+            }
+        };
+        let new_state = match entry {
+            EncoderState::Open { encoder, device_id } => EncoderState::Finished {
+                buffer: encoder.finish(),
+                device_id,
+            },
+            EncoderState::Finished { .. } => {
+                drop(reg);
+                ctx(vm).runtime_error("CommandEncoder.finish: already finished.".to_string());
+                return;
+            }
+        };
+        reg.encoders.insert(encoder_id, new_state);
+        drop(reg);
+        set_return(vm, Value::null());
+    }
+}
+
+/// Submit a list of finished encoder ids to their device's queue.
+/// Encoders transition out of the registry as their CommandBuffer
+/// is consumed.
+#[no_mangle]
+pub extern "C" fn wlift_gpu_queue_submit(vm: *mut VM) {
+    unsafe {
+        let device_id = match id_of(ctx(vm), slot(vm, 1), "Queue.submit") {
+            Some(i) => i,
+            None => return,
+        };
+        let list = match list_view(slot(vm, 2)) {
+            Some(l) => l,
+            None => {
+                ctx(vm).runtime_error("Queue.submit: argument must be a list of encoder ids.".to_string());
+                return;
+            }
+        };
+        let mut buffers_to_submit: Vec<wgpu::CommandBuffer> = Vec::new();
+        {
+            let mut reg = encoders().lock().unwrap();
+            for i in 0..list.count as usize {
+                let id = match list_get(list, i).as_num() {
+                    Some(n) => n as u64,
+                    None => {
+                        drop(reg);
+                        ctx(vm).runtime_error(format!(
+                            "Queue.submit: list[{}] must be an encoder id.",
+                            i
+                        ));
+                        return;
+                    }
+                };
+                match reg.encoders.remove(&id) {
+                    Some(EncoderState::Finished { buffer, .. }) => {
+                        buffers_to_submit.push(buffer);
+                    }
+                    Some(other) => {
+                        // Put it back since we couldn't use it.
+                        reg.encoders.insert(id, other);
+                        drop(reg);
+                        ctx(vm).runtime_error(format!(
+                            "Queue.submit: encoder {} not finished — call .finish first.",
+                            id
+                        ));
+                        return;
+                    }
+                    None => {
+                        drop(reg);
+                        ctx(vm).runtime_error(format!(
+                            "Queue.submit: unknown encoder id {}.",
+                            id
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&device_id) {
+            Some(d) => d,
+            None => {
+                drop(dev_reg);
+                ctx(vm).runtime_error("Queue.submit: unknown device id.".to_string());
+                return;
+            }
+        };
+        dev.queue.submit(buffers_to_submit);
+        drop(dev_reg);
+        set_return(vm, Value::null());
+    }
+}
+
+/// Synchronously read bytes back from a buffer. Maps the buffer
+/// for read, blocks via `device.poll(Maintain::Wait)` until the GPU
+/// catches up, copies the mapped range into a Wren `List<Num>` (one
+/// number per byte), then unmaps. Used by the headless render specs
+/// that copy a texture into a readback buffer + verify pixel values.
+#[no_mangle]
+pub extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut VM) {
+    unsafe {
+        let buffer_id = match id_of(ctx(vm), slot(vm, 1), "Buffer.readBytes") {
+            Some(i) => i,
+            None => return,
+        };
+
+        // Hold the registry locks while reading so the buffer +
+        // device don't get destroyed mid-map.
+        let buf_reg = buffers().lock().unwrap();
+        let buf = match buf_reg.buffers.get(&buffer_id) {
+            Some(b) => b,
+            None => {
+                drop(buf_reg);
+                ctx(vm).runtime_error("Buffer.readBytes: unknown buffer id.".to_string());
+                return;
+            }
+        };
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&buf.device_id) {
+            Some(d) => d,
+            None => {
+                drop(dev_reg);
+                drop(buf_reg);
+                ctx(vm).runtime_error("Buffer.readBytes: device dropped.".to_string());
+                return;
+            }
+        };
+
+        let slice = buf.buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+        slice.map_async(wgpu::MapMode::Read, move |res| {
+            let _ = sender.send(res);
+        });
+        // Block until the GPU finishes pending work and the map
+        // completes. Maintain::Wait is the right knob here — phase
+        // 1 specs are deterministic micro-renders, no concern about
+        // stalling user fibers.
+        dev.device.poll(wgpu::Maintain::Wait);
+        match receiver.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                drop(dev_reg);
+                drop(buf_reg);
+                ctx(vm).runtime_error(format!("Buffer.readBytes: map failed: {}", e));
+                return;
+            }
+            Err(e) => {
+                drop(dev_reg);
+                drop(buf_reg);
+                ctx(vm).runtime_error(format!("Buffer.readBytes: channel: {}", e));
+                return;
+            }
+        }
+        let data = slice.get_mapped_range();
+        let bytes: Vec<u8> = data.to_vec();
+        drop(data);
+        buf.buffer.unmap();
+        drop(dev_reg);
+        drop(buf_reg);
+
+        // Build the result list. Each byte → one Wren Num.
+        let context = ctx(vm);
+        let elements: Vec<Value> = bytes.into_iter().map(|b| Value::num(b as f64)).collect();
+        let list = context.alloc_list(elements);
+        set_return(vm, list);
     }
 }
