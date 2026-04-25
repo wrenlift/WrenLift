@@ -24,12 +24,17 @@ struct Cli {
 enum Command {
     /// Scaffold a new wrenlift workspace at the given path.
     ///
-    /// Creates the directory (if missing), writes a `hatchfile` with
-    /// reasonable defaults, and drops a `main.wren` stub. The result
-    /// is a project `hatch build` can pack without further setup.
+    /// Pick a template via `--template`:
+    ///   bare — empty hello-world (default)
+    ///   web  — @hatch:web app (router, Css, htmx-ready route)
     ///
-    /// Use `--template web` for a starter @hatch:web app (router,
-    /// session, htmx-ready landing page) instead of a bare hello-world.
+    /// Other names (`game`, `cli`, ...) fall back to `bare` with a
+    /// warning, so you always get a working hatchfile + entry to
+    /// build on. Dedicated scaffolds for those land later.
+    ///
+    /// Examples:
+    ///   hatch init mysite --template web
+    ///   hatch init mylib            # → bare
     Init {
         /// Directory to scaffold. Defaults to the current directory.
         #[arg(value_name = "DIR", default_value = ".")]
@@ -38,27 +43,24 @@ enum Command {
         /// the directory's basename.
         #[arg(long)]
         name: Option<String>,
-        /// Starter template — `bare` (default) for a hello-world,
-        /// `web` for an @hatch:web app.
+        /// Starter template. Unknown values fall back to `bare`.
         #[arg(long, value_name = "KIND", default_value = "bare")]
         template: String,
-    },
-    /// Watch the workspace and re-run the entry on every save.
-    ///
-    /// Spawns `wlift --mode interpreter --step-limit 0 <entry>.wren`
-    /// as a subprocess; polls *.wren mtimes every 500ms and SIGTERMs
-    /// + restarts the subprocess when anything changes. Cheap and
-    /// good enough for the iteration loop. Ctrl-C exits.
-    Dev {
-        /// Workspace root. Defaults to the current directory.
-        #[arg(value_name = "DIR", default_value = ".")]
-        dir: PathBuf,
     },
     /// Run every *.spec.wren in the workspace and aggregate results.
     Test {
         /// Workspace root. Defaults to the current directory.
         #[arg(value_name = "DIR", default_value = ".")]
         dir: PathBuf,
+    },
+    /// @hatch:web framework commands — serve, generate, etc.
+    ///
+    /// Scaffold a new web app via `hatch init <dir> --template web`;
+    /// these subcommands operate on an existing one. Future framework
+    /// verbs (auth, migrate, deploy) land here too.
+    Web {
+        #[command(subcommand)]
+        command: WebCommand,
     },
     /// Build the current workspace into a `.hatch` artifact.
     ///
@@ -156,6 +158,34 @@ enum Command {
     Logout,
 }
 
+#[derive(Subcommand)]
+enum WebCommand {
+    /// Watch the workspace and re-run the entry on every save.
+    ///
+    /// Spawns `wlift --mode interpreter --step-limit 0 <entry>.wren`,
+    /// polls *.wren mtimes every 500ms, and respawns on any change.
+    /// Survives a child crash by waiting for the next save. Ctrl-C
+    /// kills both via the foreground process group.
+    Serve {
+        /// Workspace root. Defaults to the current directory.
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Generate a new route / form / template stub inside an
+    /// existing @hatch:web workspace.
+    Generate {
+        /// What to generate. One of: `route`, `form`, `template`.
+        #[arg(value_name = "KIND")]
+        kind: String,
+        /// Name of the new artifact (e.g. `posts`).
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Workspace root. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -164,8 +194,11 @@ fn main() {
             name,
             template,
         } => cmd_init(&dir, name.as_deref(), &template),
-        Command::Dev { dir } => cmd_dev(&dir),
         Command::Test { dir } => cmd_test(&dir),
+        Command::Web { command } => match command {
+            WebCommand::Serve { dir } => cmd_dev(&dir),
+            WebCommand::Generate { kind, name, dir } => cmd_web_generate(&kind, &name, &dir),
+        },
         Command::Build { dir, out } => cmd_build(&dir, out.as_deref()),
         Command::Inspect { path } => cmd_inspect(&path),
         Command::Run { target, withs } => cmd_run(&target, &withs),
@@ -220,29 +253,184 @@ fn cmd_init(dir: &Path, name_override: Option<&str>, template: &str) {
         .map(str::to_string)
         .unwrap_or_else(|| default_package_name(dir));
 
-    match template {
-        "bare" => scaffold_bare(dir, &name),
-        "web" => scaffold_web(dir, &name),
+    // Any template we don't have a dedicated scaffold for falls
+    // back to the bare hatchfile + main.wren — the user still gets
+    // a working workspace they can iterate from. We just warn so
+    // they know there's no framework wiring in this slot yet.
+    let effective_template = match template {
+        "bare" => {
+            scaffold_bare(dir, &name);
+            "bare"
+        }
+        "web" => {
+            scaffold_web(dir, &name);
+            "web"
+        }
         other => {
             eprintln!(
-                "error: unknown template '{}'. expected one of: bare, web",
+                "warning: template '{}' has no dedicated scaffold yet — using `bare`. \
+                 Run `hatch init --template web` for the @hatch:web starter.",
+                other
+            );
+            scaffold_bare(dir, &name);
+            "bare"
+        }
+    };
+
+    let canonical = dir
+        .canonicalize()
+        .unwrap_or_else(|_| dir.to_path_buf());
+    eprintln!(
+        "initialised workspace '{}' ({}) in {}",
+        name, effective_template, canonical.display()
+    );
+    if effective_template == "web" {
+        eprintln!("  next: cd {} && hatch web serve", dir.display());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// web — framework-specific commands
+// ---------------------------------------------------------------------------
+
+fn cmd_web_generate(kind: &str, name: &str, dir: &Path) {
+    if !dir.is_dir() || !dir.join(HATCHFILE).is_file() {
+        eprintln!(
+            "error: '{}' is not a hatch workspace (no hatchfile)",
+            dir.display()
+        );
+        process::exit(1);
+    }
+    match kind {
+        "route" => generate_route(dir, name),
+        "form" => generate_form(dir, name),
+        "template" => generate_template(dir, name),
+        other => {
+            eprintln!(
+                "error: unknown kind '{}'. expected one of: route, form, template",
                 other
             );
             process::exit(1);
         }
     }
+}
 
-    eprintln!(
-        "initialised workspace '{}' ({}) in {}",
-        name,
-        template,
-        dir.canonicalize()
-            .unwrap_or_else(|_| dir.to_path_buf())
-            .display()
-    );
-    if template == "web" {
-        eprintln!("  next: cd {} && wlift --mode interpreter --step-limit 0 main.wren", dir.display());
+fn generate_route(dir: &Path, name: &str) {
+    let routes_dir = dir.join("routes");
+    if !routes_dir.exists() {
+        let _ = std::fs::create_dir_all(&routes_dir);
     }
+    let path = routes_dir.join(format!("{}.wren", name));
+    if path.exists() {
+        eprintln!("error: '{}' already exists", path.display());
+        process::exit(1);
+    }
+    let class_name = pascal_case(name);
+    let stub = format!(
+        r#"// Routes for {name}. Wire into main.wren via:
+//
+//   import "./routes/{name}" for {class_name}Routes
+//   {class_name}Routes.mount(app)
+
+import "@hatch:web" for Response
+
+class {class_name}Routes {{
+  static mount(app) {{
+    app.get("/{name}") {{|req|
+      "<h1>{class_name}</h1>"
+    }}
+
+    app.get("/{name}/:id") {{|req|
+      "<h1>{class_name} %(req.param("id"))</h1>"
+    }}
+
+    app.post("/{name}") {{|req|
+      // var data = req.form
+      Response.redirect("/{name}")
+    }}
+  }}
+}}
+"#
+    );
+    write_or_die(&path, &stub);
+    eprintln!("created {}", path.display());
+    eprintln!("  next: import in main.wren and call {}Routes.mount(app)", class_name);
+}
+
+fn generate_form(dir: &Path, name: &str) {
+    let forms_dir = dir.join("forms");
+    if !forms_dir.exists() {
+        let _ = std::fs::create_dir_all(&forms_dir);
+    }
+    let path = forms_dir.join(format!("{}.wren", name));
+    if path.exists() {
+        eprintln!("error: '{}' already exists", path.display());
+        process::exit(1);
+    }
+    let const_name = name.to_uppercase();
+    let stub = format!(
+        r#"// {name} form schema — fill in your fields and validators.
+
+import "@hatch:web" for Form, Field
+
+var {const_name}_FORM = Form.new([
+  Field.new("email").trim.lowercase
+                    .required("Email is required")
+                    .email("Looks invalid"),
+  Field.new("name").trim
+                   .required("Name is required")
+                   .maxLength(80, "Too long")
+])
+"#
+    );
+    write_or_die(&path, &stub);
+    eprintln!("created {}", path.display());
+    eprintln!("  use: import \"./forms/{}\" for {}_FORM", name, const_name);
+}
+
+fn generate_template(dir: &Path, name: &str) {
+    let templates_dir = dir.join("templates");
+    if !templates_dir.exists() {
+        let _ = std::fs::create_dir_all(&templates_dir);
+    }
+    let path = templates_dir.join(format!("{}.wren", name));
+    if path.exists() {
+        eprintln!("error: '{}' already exists", path.display());
+        process::exit(1);
+    }
+    let const_name = name.to_uppercase();
+    let stub = format!(
+        r#"// {name} — render via @hatch:template.
+//
+//   import "./templates/{name}" for {const_name}_TPL
+//   {const_name}_TPL.render(ctx)
+
+import "@hatch:template" for Template
+
+var {const_name}_TPL = Template.parse("
+<h1>{{{{ title }}}}</h1>
+<p>{{{{ body }}}}</p>
+")
+"#
+    );
+    write_or_die(&path, &stub);
+    eprintln!("created {}", path.display());
+}
+
+fn pascal_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = true;
+    for c in s.chars() {
+        if c == '_' || c == '-' || c == ' ' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn scaffold_bare(dir: &Path, name: &str) {
