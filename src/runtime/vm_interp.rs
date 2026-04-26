@@ -1855,53 +1855,44 @@ fn run_fiber_with_stop_depth(
                                 vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
                             if recv_class == ic.class && is_leaf {
                                 let jit_ptr = ic.jit_ptr;
-                                let recv_bits = recv_val.to_bits();
                                 ensure_ctx_reg();
-                                // Read all arg registers BEFORE publishing
-                                // values to the frame — once we move
-                                // `values` into the frame, the local Vec
-                                // is empty and subsequent get_reg lookups
-                                // would read past the end.
-                                let arg_bits: SmallVec<[u64; 4]> = match argc {
-                                    0 => SmallVec::new(),
-                                    1 => {
-                                        let a1 = read_u16_at(code, arg_regs_pc);
-                                        SmallVec::from_slice(&[get_reg(&values, a1).to_bits()])
-                                    }
-                                    2 => {
-                                        let a1 = read_u16_at(code, arg_regs_pc);
-                                        let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                        SmallVec::from_slice(&[
-                                            get_reg(&values, a1).to_bits(),
-                                            get_reg(&values, a2).to_bits(),
-                                        ])
-                                    }
-                                    _ => {
-                                        let a1 = read_u16_at(code, arg_regs_pc);
-                                        let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                        let a3 = read_u16_at(code, arg_regs_pc + 4);
-                                        SmallVec::from_slice(&[
-                                            get_reg(&values, a1).to_bits(),
-                                            get_reg(&values, a2).to_bits(),
-                                            get_reg(&values, a3).to_bits(),
-                                        ])
-                                    }
-                                };
-                                // Publish caller's register file to its
-                                // MirCallFrame so a GC fired by the JIT
-                                // callee (or a runtime helper it calls
-                                // through to) can update every still-live
-                                // pointer the caller will read after the
-                                // call returns. The same fix lives on the
-                                // slow-path inline JIT dispatch below;
-                                // both spots used to leak the local
-                                // `values` Vec out of the GC's root set.
+                                // Read recv + arg values, then push them
+                                // as JIT roots so a GC inside the callee
+                                // updates these pointers before the JIT'd
+                                // body dereferences them. Without this,
+                                // a generational promote during the
+                                // callee leaves the u64 args pointing at
+                                // freed memory; the JIT callee reads
+                                // garbage and the caller's `values`
+                                // entries (now updated via frame.values
+                                // tracing) disagree with the args the
+                                // callee was invoked with.
+                                let arg_count = argc;
+                                let mut arg_regs: SmallVec<[u16; 4]> = SmallVec::new();
+                                for i in 0..arg_count {
+                                    arg_regs.push(read_u16_at(code, arg_regs_pc + (i as u32) * 2));
+                                }
+                                let root_base =
+                                    crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                                crate::codegen::runtime_fns::push_jit_root(recv_val);
+                                for &reg in &arg_regs {
+                                    crate::codegen::runtime_fns::push_jit_root(get_reg(
+                                        &values, reg,
+                                    ));
+                                }
+                                // Publish caller's register file before
+                                // the JIT call so its remaining live
+                                // pointers also get traced through
+                                // mir_frames.
                                 unsafe {
                                     let frame = (*fiber).mir_frames.last_mut().unwrap();
                                     frame.pc = pc;
                                     frame.values = std::mem::take(&mut values);
                                 }
                                 let result_bits = unsafe {
+                                    let recv_bits =
+                                        crate::codegen::runtime_fns::jit_root_at(root_base)
+                                            .to_bits();
                                     match argc {
                                         0 => {
                                             let f: extern "C" fn(u64) -> u64 =
@@ -1909,27 +1900,47 @@ fn run_fiber_with_stop_depth(
                                             f(recv_bits)
                                         }
                                         1 => {
+                                            let a1 = crate::codegen::runtime_fns::jit_root_at(
+                                                root_base + 1,
+                                            )
+                                            .to_bits();
                                             let f: extern "C" fn(u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
-                                            f(recv_bits, arg_bits[0])
+                                            f(recv_bits, a1)
                                         }
                                         2 => {
+                                            let a1 = crate::codegen::runtime_fns::jit_root_at(
+                                                root_base + 1,
+                                            )
+                                            .to_bits();
+                                            let a2 = crate::codegen::runtime_fns::jit_root_at(
+                                                root_base + 2,
+                                            )
+                                            .to_bits();
                                             let f: extern "C" fn(u64, u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
-                                            f(recv_bits, arg_bits[0], arg_bits[1])
+                                            f(recv_bits, a1, a2)
                                         }
                                         _ => {
+                                            let a1 = crate::codegen::runtime_fns::jit_root_at(
+                                                root_base + 1,
+                                            )
+                                            .to_bits();
+                                            let a2 = crate::codegen::runtime_fns::jit_root_at(
+                                                root_base + 2,
+                                            )
+                                            .to_bits();
+                                            let a3 = crate::codegen::runtime_fns::jit_root_at(
+                                                root_base + 3,
+                                            )
+                                            .to_bits();
                                             let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
-                                            f(
-                                                recv_bits,
-                                                arg_bits[0],
-                                                arg_bits[1],
-                                                arg_bits[2],
-                                            )
+                                            f(recv_bits, a1, a2, a3)
                                         }
                                     }
                                 };
+                                crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
                                 // Reload the (possibly GC-updated)
                                 // register file from the frame.
                                 unsafe {
@@ -2176,65 +2187,85 @@ fn run_fiber_with_stop_depth(
                                         }
                                     });
                                     ensure_ctx_reg();
-                                    let recv_bits = recv_val.to_bits();
-                                    // Publish the caller's register file to
-                                    // its frame BEFORE the JIT call so
-                                    // GC running mid-callee (allocations
-                                    // inside the JIT'd code, runtime
-                                    // helpers that allocate, etc.) can see
-                                    // every Value still live in the caller
-                                    // and update its pointers if objects
-                                    // move. Without this, a generational
-                                    // GC promote moved a List behind the
-                                    // caller's local `values` Vec while
-                                    // the JIT callee was running — every
-                                    // subsequent op against that register
-                                    // dereferenced freed memory and
-                                    // surfaced as misdispatched ops
-                                    // ("subscript get with arity 1" on
-                                    // what should have been a method
-                                    // call, "Null does not implement X"
-                                    // on a still-live wrapper). PC is
-                                    // also written so a fiber suspend
-                                    // mid-call resumes correctly.
+                                    // Push args as JIT roots BEFORE the
+                                    // call so a GC fired by the callee
+                                    // updates these pointers before the
+                                    // callee dereferences them. The
+                                    // u64-bit-cast snapshots in the
+                                    // function-call register slots are
+                                    // invisible to the GC otherwise —
+                                    // generational promote then leaves
+                                    // them pointing at freed memory and
+                                    // the callee reads garbage.
+                                    let root_base =
+                                        crate::codegen::runtime_fns::jit_roots_snapshot_len();
+                                    for v in arg_vals.iter() {
+                                        crate::codegen::runtime_fns::push_jit_root(*v);
+                                    }
+                                    // Publish the caller's register file
+                                    // to its frame BEFORE the JIT call
+                                    // so GC running mid-callee can see
+                                    // every Value still live in the
+                                    // caller and update its pointers if
+                                    // objects move.
                                     unsafe {
                                         let frame = (*fiber).mir_frames.last_mut().unwrap();
                                         frame.pc = pc;
                                         frame.values = std::mem::take(&mut values);
                                     }
                                     let result_bits = unsafe {
+                                        let r0 = crate::codegen::runtime_fns::jit_root_at(
+                                            root_base,
+                                        )
+                                        .to_bits();
                                         match argc {
                                             0 => {
                                                 let f: extern "C" fn(u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
-                                                f(recv_bits)
+                                                f(r0)
                                             }
                                             1 => {
+                                                let r1 = crate::codegen::runtime_fns::jit_root_at(
+                                                    root_base + 1,
+                                                )
+                                                .to_bits();
                                                 let f: extern "C" fn(u64, u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
-                                                f(arg_vals[0].to_bits(), arg_vals[1].to_bits())
+                                                f(r0, r1)
                                             }
                                             2 => {
+                                                let r1 = crate::codegen::runtime_fns::jit_root_at(
+                                                    root_base + 1,
+                                                )
+                                                .to_bits();
+                                                let r2 = crate::codegen::runtime_fns::jit_root_at(
+                                                    root_base + 2,
+                                                )
+                                                .to_bits();
                                                 let f: extern "C" fn(u64, u64, u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
-                                                f(
-                                                    arg_vals[0].to_bits(),
-                                                    arg_vals[1].to_bits(),
-                                                    arg_vals[2].to_bits(),
-                                                )
+                                                f(r0, r1, r2)
                                             }
                                             _ => {
+                                                let r1 = crate::codegen::runtime_fns::jit_root_at(
+                                                    root_base + 1,
+                                                )
+                                                .to_bits();
+                                                let r2 = crate::codegen::runtime_fns::jit_root_at(
+                                                    root_base + 2,
+                                                )
+                                                .to_bits();
+                                                let r3 = crate::codegen::runtime_fns::jit_root_at(
+                                                    root_base + 3,
+                                                )
+                                                .to_bits();
                                                 let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
                                                     std::mem::transmute(jit_ptr);
-                                                f(
-                                                    arg_vals[0].to_bits(),
-                                                    arg_vals[1].to_bits(),
-                                                    arg_vals[2].to_bits(),
-                                                    arg_vals[3].to_bits(),
-                                                )
+                                                f(r0, r1, r2, r3)
                                             }
                                         }
                                     };
+                                    crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
                                     // Reload the caller's register file —
                                     // GC during the call may have updated
                                     // entries through the frame.values
