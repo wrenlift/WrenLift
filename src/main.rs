@@ -628,7 +628,7 @@ fn run_manual_pipeline(
 fn run_opt_pipeline(mir: &mut wren_lift::mir::MirFunction, interner: &wren_lift::intern::Interner) {
     let constfold = ConstFold;
     let dce = Dce;
-    let cse = Cse;
+    let cse = Cse::default();
     let type_spec = TypeSpecialize::with_math(interner);
     let licm = Licm;
     let sra = Sra;

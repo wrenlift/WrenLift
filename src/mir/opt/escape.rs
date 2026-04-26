@@ -270,8 +270,8 @@ mod tests {
                     receiver: v_recv,
                     method: SymbolId::from_raw(0),
                     args: vec![v1],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::ReturnNull;
         }

@@ -833,8 +833,8 @@ impl<'a> MirWasmEmitter<'a> {
                 receiver,
                 method,
                 args,
-            pure_call: _,
-} => {
+                pure_call: _,
+            } => {
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 func.instruction(&WasmInst::I64Const(method.index() as i64));
                 for a in args {

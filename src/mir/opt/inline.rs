@@ -484,8 +484,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v_result);
         }
@@ -514,8 +514,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![v1],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v_result);
         }
@@ -614,8 +614,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v_result);
         }
@@ -646,8 +646,8 @@ mod tests {
                     receiver: v0,
                     method: abs_sym,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.instructions.push((
                 v_sqrt,
@@ -655,8 +655,8 @@ mod tests {
                     receiver: v_abs,
                     method: sqrt_sym,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v_sqrt);
         }

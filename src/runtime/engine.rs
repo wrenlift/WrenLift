@@ -226,7 +226,7 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     let range_loop = RangeLoop { interner };
     let constfold = ConstFold;
     let dce = Dce;
-    let cse = Cse;
+    let cse = Cse::default();
     let type_spec = TypeSpecialize::with_math(interner);
     let licm = Licm;
     let sra = Sra;
@@ -823,6 +823,28 @@ impl ExecutionEngine {
                 hint
             })
             .collect()
+    }
+
+    /// Compute a per-function "no observable side effects" map keyed
+    /// by `FuncId.0`. Used by the post-devirt CSE pass in codegen so
+    /// `CallKnownFunc { func_id }` calls into pure user methods don't
+    /// flush the memory-read cache.
+    ///
+    /// Naive implementation: rebuilds the map from the full function
+    /// table on every JIT submission. Safe because purity is a
+    /// monotone property — adding a new function can only relax
+    /// existing purity (introducing a new impure callee), and the
+    /// fixed-point handles that. Cache invalidation here is "always
+    /// recompute", traded against the simplicity of avoiding stale
+    /// entries on hot reload.
+    pub fn compute_callee_purity_map(&self) -> Arc<std::collections::HashMap<u32, bool>> {
+        let funcs: Vec<(u32, &crate::mir::MirFunction)> = self
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(idx, body)| (idx as u32, body.mir().as_ref()))
+            .collect();
+        Arc::new(crate::mir::opt::purity::compute_purity_map(funcs))
     }
 
     /// A "pure leaf" function has no internal method calls — Cranelift
@@ -1549,6 +1571,7 @@ impl ExecutionEngine {
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
         let jit_code_base = Some(self.jit_code.as_ptr());
+        let callee_purity = Some(self.compute_callee_purity_map());
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
@@ -1564,6 +1587,7 @@ impl ExecutionEngine {
                 callsite_ic_live_ptrs,
                 devirt_hints,
                 jit_code_base,
+                callee_purity,
             ) {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
@@ -1660,6 +1684,7 @@ impl ExecutionEngine {
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
+        let callee_purity = self.compute_callee_purity_map();
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -1701,6 +1726,7 @@ impl ExecutionEngine {
                 callsite_ic_live_ptrs,
                 devirt_hints,
                 Some(jit_code_base_raw as *const *const u8),
+                Some(callee_purity.clone()),
             )
             .map_err(|e| {
                 if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {

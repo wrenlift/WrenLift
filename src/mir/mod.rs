@@ -1395,8 +1395,8 @@ mod tests {
             receiver: ValueId(0),
             method: SymbolId::from_raw(0),
             args: vec![],
-        pure_call: false,
-}
+            pure_call: false,
+        }
         .has_side_effects());
         assert!(Instruction::SetField(ValueId(0), 0, ValueId(1)).has_side_effects());
         assert!(Instruction::SetModuleVar(0, ValueId(0)).has_side_effects());
@@ -1415,8 +1415,8 @@ mod tests {
                 receiver: ValueId(0),
                 method: SymbolId::from_raw(1),
                 args: vec![ValueId(2), ValueId(3)],
-            pure_call: false,
-}
+                pure_call: false,
+            }
             .operands(),
             vec![ValueId(0), ValueId(2), ValueId(3)]
         );

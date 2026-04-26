@@ -964,7 +964,76 @@ System.print(sum)
             output
         );
         // Sum 0..1999 = 1999 * 2000 / 2 = 1999000
-        assert_eq!(output.trim(), "1999000", "{:?} ctor-gc-pressure mismatch", mode);
+        assert_eq!(
+            output.trim(),
+            "1999000",
+            "{:?} ctor-gc-pressure mismatch",
+            mode
+        );
+    }
+}
+
+/// Verifies pure-user-method CSE survives across a hot loop in
+/// tiered mode. `Helper.add(a, b)` is a pure user method (only
+/// arithmetic + return). A naive CSE pass would flush its memory
+/// cache on every dispatch; with the codegen-time purity-aware
+/// CSE, the call doesn't invalidate the cache. We check
+/// behavioural correctness (the answer matches the interpreter
+/// reference) — performance is the side-effect, not the contract.
+#[test]
+fn e2e_pure_user_method_cse_through_call() {
+    use crate::{ExecutionMode, InterpretResult, VMConfig, VM};
+    let source = r#"
+class Helper {
+    static add(a, b) { a + b }
+}
+
+class Box {
+    construct new(v) { _v = v }
+    v { _v }
+    v=(x) { _v = x }
+}
+
+var b = Box.new(42)
+var sum = 0
+var i = 0
+while (i < 50000) {
+    // Two reads of b.v straddle a pure user-defined call —
+    // CSE must keep the second read merged with the first
+    // when the callee is recognised as pure. We don't observe
+    // the optimisation directly; the test just locks in that
+    // the resulting program still computes correctly.
+    sum = sum + b.v + Helper.add(b.v, i)
+    i = i + 1
+}
+System.print(sum)
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            jit_threshold: 5,
+            ..Default::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", source);
+        let output = vm.take_output();
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}\n{}",
+            mode,
+            result,
+            output
+        );
+        // sum = sum_{i=0..49999} (b.v + (b.v + i))
+        //     = 50000*(2*42) + sum_{i=0..49999} i
+        //     = 4_200_000 + 1_249_975_000
+        //     = 1_254_175_000
+        assert_eq!(
+            output.trim(),
+            "1254175000",
+            "{:?} pure-user-cse mismatch",
+            mode
+        );
     }
 }
 

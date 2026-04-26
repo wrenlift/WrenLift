@@ -2030,6 +2030,7 @@ pub fn compile_function_artifact_with_interner(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -2138,6 +2139,9 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] jit_code_base: Option<
         *const *const u8,
     >,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] callee_purity: Option<
+        std::sync::Arc<std::collections::HashMap<u32, bool>>,
+    >,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
@@ -2155,9 +2159,19 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
         Target::X86_64 | Target::Aarch64 => {
             // Speculative devirtualization: transform Call → CallKnownFunc
             // for monomorphic call sites using IC snapshot data.
-            let devirt_mir;
+            let mut devirt_mir;
             let mir_ref = if let Some(ref ic_snapshot) = callsite_ic_ptrs {
                 devirt_mir = devirt_calls_with_ic(mir, ic_snapshot, devirt_hints.as_deref());
+                // Post-devirt CSE: with `CallKnownFunc { func_id }`
+                // instances now resolved, the per-callee purity map
+                // can let memory-read merges survive across user-
+                // defined pure helpers (Phase 6 step 2).
+                if let Some(purity) = callee_purity.clone() {
+                    use crate::mir::opt::cse::Cse;
+                    use crate::mir::opt::MirPass;
+                    let cse = Cse::with_callee_purity(purity);
+                    cse.run(&mut devirt_mir);
+                }
                 &devirt_mir
             } else {
                 mir
@@ -3397,8 +3411,8 @@ impl<'a> LowerCtx<'a> {
                 receiver,
                 method,
                 args,
-            pure_call: _,
-} => {
+                pure_call: _,
+            } => {
                 use crate::mir::bytecode::{
                     CALLSITE_IC_CLASS, CALLSITE_IC_FUNC_ID, CALLSITE_IC_JIT_PTR, CALLSITE_IC_KIND,
                 };

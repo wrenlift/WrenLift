@@ -9,6 +9,7 @@ pub mod devirt;
 pub mod escape;
 pub mod inline;
 pub mod licm;
+pub mod purity;
 pub mod range_loop;
 pub mod sra;
 pub mod tree_shake;

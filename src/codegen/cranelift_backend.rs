@@ -1377,8 +1377,8 @@ pub mod cl {
                 receiver,
                 method,
                 args,
-            pure_call: _,
-} => {
+                pure_call: _,
+            } => {
                 // wren_call_N helpers only exist up to arity 4. Calls with
                 // more than 4 args silently truncated on the JIT path,
                 // which corrupts callee parameters (e.g. Render_.new with

@@ -4,11 +4,46 @@
 /// replace all uses of the new result with the earlier one. The redundant
 /// instruction becomes dead and is cleaned up by DCE.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{replace_uses_in_func, MirPass};
 use crate::mir::{Instruction, MirFunction, ValueId};
 
-pub struct Cse;
+/// CSE pass.
+///
+/// Default form is a unit-equivalent struct: the optimizer pipeline
+/// runs CSE before any inter-procedural information is available
+/// (no `CallKnownFunc` exists yet — devirt runs at codegen time),
+/// so the default doesn't try to look across calls beyond the
+/// builtin `pure_call` flag and the `is_pure_self_recursive` check
+/// for `CallStaticSelf`.
+///
+/// `with_callee_purity` produces a CSE instance that consults a
+/// per-callee purity map for `CallKnownFunc { func_id }` lookups.
+/// The codegen pipeline runs this variant *after* devirt to
+/// recover memory-cache survival across pure user-defined calls.
+#[derive(Default, Clone)]
+pub struct Cse {
+    /// `func_id` → "callee body has no observable side effects".
+    /// `None` means "I don't know about this callee" — treated
+    /// conservatively as impure.
+    callee_purity: Option<Arc<HashMap<u32, bool>>>,
+}
+
+impl Cse {
+    pub fn with_callee_purity(map: Arc<HashMap<u32, bool>>) -> Self {
+        Self {
+            callee_purity: Some(map),
+        }
+    }
+
+    fn callee_is_pure(&self, func_id: u32) -> bool {
+        self.callee_purity
+            .as_ref()
+            .and_then(|m| m.get(&func_id).copied())
+            .unwrap_or(false)
+    }
+}
 
 impl MirPass for Cse {
     fn name(&self) -> &str {
@@ -47,7 +82,7 @@ impl MirPass for Cse {
                 // Side-effecting instructions invalidate every cached
                 // memory-dependent read. Pure cache survives.
                 if inst.has_side_effects() {
-                    if inst_may_write_memory(inst, self_pure) {
+                    if inst_may_write_memory(inst, self_pure, self) {
                         memory.clear();
                     }
                     continue;
@@ -116,16 +151,15 @@ fn inst_reads_memory(inst: &Instruction) -> bool {
 /// helper that's all arithmetic + recursion keeps the memory cache
 /// live across the recursive tail.
 ///
-/// `CallKnownFunc` is conservatively impure here — it only appears
-/// after JIT-time devirtualization, by which point the optimizer
-/// pipeline has already finished. Future work plumbs a per-callee
-/// purity table into a codegen-time CSE pass to handle it.
-fn inst_may_write_memory(inst: &Instruction, self_pure: bool) -> bool {
+/// `CallKnownFunc` checks the CSE pass's per-callee purity map
+/// (populated by codegen after devirt). When the map is absent or
+/// the callee isn't listed, the call is conservatively impure.
+fn inst_may_write_memory(inst: &Instruction, self_pure: bool, cse: &Cse) -> bool {
     match inst {
         Instruction::Call { pure_call, .. } => !*pure_call,
         Instruction::CallStaticSelf { .. } => !self_pure,
-        Instruction::CallKnownFunc { .. }
-        | Instruction::SuperCall { .. }
+        Instruction::CallKnownFunc { func_id, .. } => !cse.callee_is_pure(*func_id),
+        Instruction::SuperCall { .. }
         | Instruction::SetField(..)
         | Instruction::SetUpvalue(..)
         | Instruction::SubscriptSet { .. }
@@ -288,7 +322,7 @@ mod tests {
         }
 
         let before = eval(&f).unwrap();
-        assert!(Cse.run(&mut f));
+        assert!(Cse::default().run(&mut f));
         let after = eval(&f).unwrap();
         assert_eq!(before, after);
         // v4 should use v2 twice
@@ -314,7 +348,7 @@ mod tests {
             b.terminator = Terminator::Return(v2);
         }
 
-        assert!(!Cse.run(&mut f));
+        assert!(!Cse::default().run(&mut f));
     }
 
     #[test]
@@ -335,8 +369,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.instructions.push((
                 v2,
@@ -344,13 +378,13 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v1);
         }
 
-        assert!(!Cse.run(&mut f));
+        assert!(!Cse::default().run(&mut f));
     }
 
     #[test]
@@ -370,7 +404,7 @@ mod tests {
         }
 
         let before = eval(&f).unwrap();
-        assert!(Cse.run(&mut f));
+        assert!(Cse::default().run(&mut f));
         let after = eval(&f).unwrap();
         assert_eq!(before, after);
         let (_, ref inst) = f.block(bb).instructions[2];
@@ -420,7 +454,7 @@ mod tests {
         }
 
         assert!(f.is_pure_self_recursive());
-        assert!(Cse.run(&mut f));
+        assert!(Cse::default().run(&mut f));
         // The second SubscriptGet should have been redirected to the first.
         let r3_inst = f
             .block(bb)
@@ -461,7 +495,8 @@ mod tests {
                     args: vec![idx],
                 },
             ));
-            b.instructions.push((_set, Instruction::SetField(recv, 0, idx)));
+            b.instructions
+                .push((_set, Instruction::SetField(recv, 0, idx)));
             b.instructions
                 .push((rec_call, Instruction::CallStaticSelf { args: vec![recv] }));
             b.instructions.push((
@@ -477,7 +512,7 @@ mod tests {
 
         assert!(!f.is_pure_self_recursive());
         // With an impure body, the second SubscriptGet must NOT merge.
-        Cse.run(&mut f);
+        Cse::default().run(&mut f);
         let r2_inst = f
             .block(bb)
             .instructions
@@ -512,7 +547,7 @@ mod tests {
         }
 
         let before = eval(&f).unwrap();
-        Cse.run(&mut f);
+        Cse::default().run(&mut f);
         let after = eval(&f).unwrap();
         assert_eq!(before, after);
         assert_eq!(after, InterpValue::Boxed(Value::num(900.0)));

@@ -555,7 +555,7 @@ impl VM {
         // 4. Optimize top-level + method + closure bodies
         let constfold = ConstFold;
         let dce = Dce;
-        let cse = Cse;
+        let cse = Cse::default();
         let type_spec = TypeSpecialize::with_math(&interner);
         let licm = Licm;
         let sra = Sra;
@@ -1018,7 +1018,7 @@ impl VM {
         // 5. Optimize top-level function
         let constfold = ConstFold;
         let dce = Dce;
-        let cse = Cse;
+        let cse = Cse::default();
         let type_spec = TypeSpecialize::with_math(&interner);
         let licm = Licm;
         let sra = Sra;
@@ -1252,10 +1252,8 @@ impl VM {
                     .call_closure_sync(closure, &[path_value], None)
                     .is_none()
                 {
-                    crate::diagnostics::Diagnostic::warning(
-                        "reload callback returned an error",
-                    )
-                    .eprint_no_source();
+                    crate::diagnostics::Diagnostic::warning("reload callback returned an error")
+                        .eprint_no_source();
                 }
             }
         }
@@ -1733,8 +1731,7 @@ impl VM {
                         self.native_libs.push(lib);
                     }
                     Err(err) => {
-                        crate::diagnostics::Diagnostic::error(err.to_string())
-                            .eprint_no_source();
+                        crate::diagnostics::Diagnostic::error(err.to_string()).eprint_no_source();
                     }
                 }
             } else if !class_mir.foreign_methods.is_empty() {
@@ -3434,7 +3431,7 @@ impl VM {
         }
         let constfold = ConstFold;
         let dce = Dce;
-        let cse = Cse;
+        let cse = Cse::default();
         let type_spec = TypeSpecialize::with_math(&interner);
         let licm = Licm;
         let sra = Sra;
@@ -3641,7 +3638,7 @@ impl VM {
         }
         let constfold = ConstFold;
         let dce = Dce;
-        let cse = Cse;
+        let cse = Cse::default();
         let type_spec = TypeSpecialize::with_math(&interner);
         let licm = Licm;
         let sra = Sra;
@@ -4041,9 +4038,7 @@ impl VM {
             let mut jit_args = [Value::null(); 4];
             jit_args[0] = live_instance;
             for i in 0..ctor_args.len() {
-                jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(
-                    root_len_before + 1 + i,
-                );
+                jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1 + i);
             }
             let n = ctor_args.len() + 1;
             let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();

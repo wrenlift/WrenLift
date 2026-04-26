@@ -2254,10 +2254,9 @@ fn run_fiber_with_stop_depth(
                                         frame.values = std::mem::take(&mut values);
                                     }
                                     let result_bits = unsafe {
-                                        let r0 = crate::codegen::runtime_fns::jit_root_at(
-                                            root_base,
-                                        )
-                                        .to_bits();
+                                        let r0 =
+                                            crate::codegen::runtime_fns::jit_root_at(root_base)
+                                                .to_bits();
                                         match argc {
                                             0 => {
                                                 let f: extern "C" fn(u64) -> u64 =
@@ -2902,9 +2901,8 @@ fn run_fiber_with_stop_depth(
                     }
                     let result = vm.new_list(elements);
                     unsafe {
-                        values = std::mem::take(
-                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
-                        );
+                        values =
+                            std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values);
                     }
                     set_reg(&mut values, dst, result);
                 }
@@ -2951,9 +2949,8 @@ fn run_fiber_with_stop_depth(
                     );
                     crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                     unsafe {
-                        values = std::mem::take(
-                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
-                        );
+                        values =
+                            std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values);
                     }
                     set_reg(&mut values, dst, map_val);
                 }
@@ -2973,9 +2970,8 @@ fn run_fiber_with_stop_depth(
                     }
                     let result_val = vm.new_string(result);
                     unsafe {
-                        values = std::mem::take(
-                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
-                        );
+                        values =
+                            std::mem::take(&mut (*fiber).mir_frames.last_mut().unwrap().values);
                     }
                     set_reg(&mut values, dst, result_val);
                 }
@@ -4412,8 +4408,8 @@ mod tests {
                     receiver: v0,
                     method: abs_sym,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v1);
         }
@@ -4443,8 +4439,8 @@ mod tests {
                     receiver: v0,
                     method: add_sym,
                     args: vec![v1],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v2);
         }
@@ -4668,8 +4664,8 @@ mod tests {
                     receiver: v0,
                     method: bogus,
                     args: vec![],
-                pure_call: false,
-},
+                    pure_call: false,
+                },
             ));
             b.terminator = Terminator::Return(v1);
         }
