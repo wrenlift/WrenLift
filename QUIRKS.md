@@ -41,25 +41,12 @@ fiber scheduler.
 
 ### `JSON.parse` fails on second HTTP response body in tiered mode
 
-Status: **open**
+Status: **not currently reproducing (likely fixed downstream of
+Phase 0 / 1 / 4 — `@hatch:http http.spec.wren --mode tiered` runs
+25/25 clean as of 2026-04-26, was 6/9 previously)**
 
-Two `Http.get`/`Http.post` calls in sequence, where the second's
-body is parsed as JSON, reproduce:
-
-```
-p1 ok                                 // first parse fine
-Runtime error: JSON: expected string key at offset 1
-```
-
-Minimal repro requires a real network call; `JSON.parse` on the
-same body string typed inline passes. Smells like a JIT state
-leak around `String` operations that follow a large native-side
-allocation (ureq's response body). `--opt-threshold 100000`
-doesn't clear it, so it's not purely opt-tier.
-
-Workaround: run affected scripts with `--mode interpreter`. All
-@hatch:http spec cases pass cleanly there; tiered mode exposes
-3 of 9 failures (all on the "second request" shape).
+Re-validate with the original repro if it surfaces again on real
+network code.
 
 ### `Fiber.try` doesn't catch "does not implement" method-dispatch errors
 

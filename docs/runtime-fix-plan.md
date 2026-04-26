@@ -278,7 +278,21 @@ Two bugs whose symptoms diverge but share the dispatch path:
 
 ## Phase 5 — Niche / single-site regressions
 
-Status: **open**
+Status: **fixed**
+
+* **Diamond-dependency false-positive cycle** — fixed in commit
+  `d466c6b`. `build_recursive` now splits the visited set into
+  `active` (true cycle detection) and `cache` (diamond dedupe), and
+  `merge_path_dependencies` accepts byte-identical sections from
+  multiple paths without erroring. Test:
+  `build_accepts_diamond_dependencies`.
+* **`JSON.parse` on second HTTP response body in tiered mode** —
+  no longer reproducing. `@hatch:http http.spec.wren --mode tiered`
+  runs 25/25 clean as of 2026-04-26 (was 6/9 previously). Most
+  likely fixed downstream of the CSE memory-cache fix in Phase 0
+  and the `for-in` lowering in Phase 1; the network-dependent
+  repro doesn't have a checked-in regression test, but the spec
+  suite stands in as one.
 
 Lower-priority because each affects one library and has a narrow
 trigger surface:
