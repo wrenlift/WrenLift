@@ -7,6 +7,64 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### `wren_call_N` arg rooting SIGSEGVs on Linux x86_64
+
+Status: **mitigated by reverting the rooting (commit 874b81a,
+2026-04-26); proper fix requires understanding the x86_64
+divergence**
+
+`wren_call_N_inner` was patched in commit a646e82 to push its
+receiver + args as JIT roots before dispatch, so a GC fired
+inside the callee (allocator, foreign call, nested helper)
+could update the pointers through the shared roots Vec instead
+of leaving the callee's register-bound u64 args pointing at
+freed memory.
+
+The rooting works on macOS aarch64 and macOS x86_64 (Rosetta) —
+50 parallel runs of `delta_blue` and the full e2e suite stay
+clean. On Linux x86_64 (CI runner) the same code consistently
+SIGSEGVs (signal 11, "invalid memory reference") within ~1
+second of `delta_blue` and during the e2e suite. The crash is
+not intermittent on the CI runner — it reproduces every push.
+
+What we know:
+
+- The crash signature is SIGSEGV inside the JIT runtime path,
+  not SIGABRT. So it's a memory access, not a panic / assertion.
+- The constructor JIT root push (a1412e7) is sound — disabling
+  it broke `binary_trees` correctness on x86_64 too. So the
+  rooting itself isn't categorically broken; the wren_call_N
+  variant has something specific.
+- Reverting just `runtime_fns.rs` to the pre-a646e82 state
+  (commit 874b81a) restored CI green. Bench numbers also
+  recovered to historical:
+
+  | Bench         | With rooting | Without rooting | Target |
+  |---------------|--------------|-----------------|--------|
+  | fib           | 0.0080s      | 0.0078s         | 0x     |
+  | method_call   | 0.0972s      | 0.0883s         | 1.0x   |
+  | binary_trees  | 0.9431s      | 0.8471s         | 0.8x   |
+  | delta_blue    | 0.1992s      | 0.1738s         | 1.8x   |
+
+  So the rooting was costing ~5–15% per benchmark on top of
+  whatever it was triggering on Linux.
+
+Suspected causes (none confirmed):
+
+- TLS `%fs` access pattern through naked `wren_call_0` →
+  `wren_call_0_inner` tail-jump. Linux x86_64 TLS is via
+  segment registers; macOS uses a different layout.
+- Stack alignment regression at the naked-asm boundary.
+- Vec realloc-during-push moves the Roots buffer to an address
+  that interacts badly with Linux ASLR vs macOS.
+
+Without rooting, the residual tiered register-corruption family
+(sprite-grid `Null does not implement 'view'`, bouncing-ball
+`subscript get with arity 1`, etc.) returns. Those games were
+already only working on macOS, so the priority is keeping CI
+green; re-introduce rooting once the Linux x86_64 divergence
+is understood.
+
 ### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
 
 Status: **fixed by gating the IC kind=1 inline JIT fast path off by
