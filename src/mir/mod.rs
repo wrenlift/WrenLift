@@ -818,6 +818,38 @@ impl MirFunction {
         BlockId(0)
     }
 
+    /// True if every non-`CallStaticSelf` instruction in this function is
+    /// non-side-effecting, treating recursive self-calls as an unknown
+    /// that resolves to "pure" when the rest of the body is pure.
+    ///
+    /// Used by CSE to decide whether `CallStaticSelf` invalidates the
+    /// memory-read cache: a recursive numeric helper (`fact`, `fib`,
+    /// etc.) made entirely of arithmetic + builtin pure calls + a
+    /// recursive tail can keep the cache live across the recursion.
+    ///
+    /// Sound because `CallStaticSelf` always dispatches to *this*
+    /// function — the only way the call could be impure is if the
+    /// function itself has another impure instruction, in which case
+    /// this check returns false.
+    ///
+    /// Allocation instructions (`MakeList`, `MakeMap`, etc.) count as
+    /// side-effecting because each call must produce a distinct
+    /// identity; ditto `StringConcat` / `ToString`. A "purely
+    /// arithmetic" function with one of those is not eligible.
+    pub fn is_pure_self_recursive(&self) -> bool {
+        for block in &self.blocks {
+            for (_, inst) in &block.instructions {
+                match inst {
+                    Instruction::CallStaticSelf { .. } => {}
+                    Instruction::Call { pure_call, .. } if *pure_call => {}
+                    other if other.has_side_effects() => return false,
+                    _ => {}
+                }
+            }
+        }
+        true
+    }
+
     /// Dump a human-readable text representation of this function.
     pub fn dump(&self) -> String {
         let mut out = String::new();

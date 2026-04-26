@@ -18,6 +18,13 @@ impl MirPass for Cse {
     fn run(&self, func: &mut MirFunction) -> bool {
         let mut replacements: HashMap<ValueId, ValueId> = HashMap::new();
 
+        // Self-recursion purity: when the surrounding function makes only
+        // pure ops + builtin-pure calls, every `CallStaticSelf` dispatches
+        // back into a pure body and so itself is pure. Compute once per
+        // function — checking each `CallStaticSelf` separately would be
+        // a nop because they all resolve to the same target.
+        let self_pure = func.is_pure_self_recursive();
+
         // CSE within each block only — merging across blocks requires
         // dominance analysis to avoid referencing values from non-dominating
         // blocks (e.g. merging constants between then/else branches).
@@ -40,7 +47,7 @@ impl MirPass for Cse {
                 // Side-effecting instructions invalidate every cached
                 // memory-dependent read. Pure cache survives.
                 if inst.has_side_effects() {
-                    if inst_may_write_memory(inst) {
+                    if inst_may_write_memory(inst, self_pure) {
                         memory.clear();
                     }
                     continue;
@@ -103,15 +110,21 @@ fn inst_reads_memory(inst: &Instruction) -> bool {
 /// arithmetic, comparisons, Math intrinsics) so a `subscript_get`
 /// before a `+` and another after the `+` can still merge.
 ///
-/// This is the seed of the per-function effect-summary system in the
-/// Phase 6 roadmap. Real call-graph propagation would let CSE keep
-/// the cache across user-defined leaf methods too; for now we lean on
-/// builtin-method names.
-fn inst_may_write_memory(inst: &Instruction) -> bool {
+/// `self_pure` extends the same logic to `CallStaticSelf` when the
+/// surrounding function's body is itself pure-modulo-self-recursion
+/// (see `MirFunction::is_pure_self_recursive`). A recursive numeric
+/// helper that's all arithmetic + recursion keeps the memory cache
+/// live across the recursive tail.
+///
+/// `CallKnownFunc` is conservatively impure here — it only appears
+/// after JIT-time devirtualization, by which point the optimizer
+/// pipeline has already finished. Future work plumbs a per-callee
+/// purity table into a codegen-time CSE pass to handle it.
+fn inst_may_write_memory(inst: &Instruction, self_pure: bool) -> bool {
     match inst {
         Instruction::Call { pure_call, .. } => !*pure_call,
+        Instruction::CallStaticSelf { .. } => !self_pure,
         Instruction::CallKnownFunc { .. }
-        | Instruction::CallStaticSelf { .. }
         | Instruction::SuperCall { .. }
         | Instruction::SetField(..)
         | Instruction::SetUpvalue(..)
@@ -362,6 +375,120 @@ mod tests {
         assert_eq!(before, after);
         let (_, ref inst) = f.block(bb).instructions[2];
         assert!(matches!(inst, Instruction::Add(a, b) if *a == v0 && *b == v0));
+    }
+
+    #[test]
+    fn test_pure_self_recursion_keeps_memory_cache() {
+        // SubscriptGet, CallStaticSelf, SubscriptGet on the same receiver:
+        // with the surrounding function classified pure-self-recursive,
+        // the second read merges with the first.
+        let mut interner = Interner::new();
+        let mut f = make_func(&mut interner);
+        let bb = f.new_block();
+        let recv = f.new_value();
+        let idx = f.new_value();
+        let r1 = f.new_value();
+        let r2 = f.new_value();
+        let rec_call = f.new_value();
+        let r3 = f.new_value();
+        let sum = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((recv, Instruction::BlockParam(0)));
+            b.instructions.push((idx, Instruction::ConstNum(0.0)));
+            b.instructions.push((
+                r1,
+                Instruction::SubscriptGet {
+                    receiver: recv,
+                    args: vec![idx],
+                },
+            ));
+            b.instructions
+                .push((r2, Instruction::CallStaticSelf { args: vec![recv] }));
+            // After a pure self-call, the memory cache should still be
+            // valid so this second SubscriptGet collapses to r1.
+            b.instructions.push((
+                rec_call,
+                Instruction::SubscriptGet {
+                    receiver: recv,
+                    args: vec![idx],
+                },
+            ));
+            b.instructions.push((r3, Instruction::Add(r1, rec_call)));
+            b.instructions.push((sum, Instruction::Add(r3, r2)));
+            b.terminator = Terminator::Return(sum);
+        }
+
+        assert!(f.is_pure_self_recursive());
+        assert!(Cse.run(&mut f));
+        // The second SubscriptGet should have been redirected to the first.
+        let r3_inst = f
+            .block(bb)
+            .instructions
+            .iter()
+            .find_map(|(v, i)| (*v == r3).then(|| i.clone()))
+            .unwrap();
+        assert!(
+            matches!(r3_inst, Instruction::Add(a, b) if a == r1 && b == r1),
+            "expected r3 = Add(r1, r1), got {:?}",
+            r3_inst
+        );
+    }
+
+    #[test]
+    fn test_impure_self_recursion_flushes_memory_cache() {
+        // Same shape, but with a SetField in the body — the function is
+        // no longer pure-self-recursive, so the second SubscriptGet
+        // can't merge with the first.
+        let mut interner = Interner::new();
+        let mut f = make_func(&mut interner);
+        let bb = f.new_block();
+        let recv = f.new_value();
+        let idx = f.new_value();
+        let r1 = f.new_value();
+        let _set = f.new_value();
+        let rec_call = f.new_value();
+        let r2 = f.new_value();
+        let r3 = f.new_value();
+        {
+            let b = f.block_mut(bb);
+            b.instructions.push((recv, Instruction::BlockParam(0)));
+            b.instructions.push((idx, Instruction::ConstNum(0.0)));
+            b.instructions.push((
+                r1,
+                Instruction::SubscriptGet {
+                    receiver: recv,
+                    args: vec![idx],
+                },
+            ));
+            b.instructions.push((_set, Instruction::SetField(recv, 0, idx)));
+            b.instructions
+                .push((rec_call, Instruction::CallStaticSelf { args: vec![recv] }));
+            b.instructions.push((
+                r2,
+                Instruction::SubscriptGet {
+                    receiver: recv,
+                    args: vec![idx],
+                },
+            ));
+            b.instructions.push((r3, Instruction::Add(r1, r2)));
+            b.terminator = Terminator::Return(r3);
+        }
+
+        assert!(!f.is_pure_self_recursive());
+        // With an impure body, the second SubscriptGet must NOT merge.
+        Cse.run(&mut f);
+        let r2_inst = f
+            .block(bb)
+            .instructions
+            .iter()
+            .find_map(|(v, i)| (*v == r2).then(|| i.clone()))
+            .unwrap();
+        assert!(
+            matches!(r2_inst, Instruction::SubscriptGet { .. }),
+            "r2 should still be a SubscriptGet, got {:?}",
+            r2_inst
+        );
     }
 
     #[test]
