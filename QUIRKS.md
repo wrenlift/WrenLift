@@ -7,6 +7,56 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
+
+Status: **open (workaround: `--mode interpreter`)**
+
+Three game examples reach a runtime error in `--mode tiered` after
+several frames. Each surfaces inside `@hatch:game`'s render-pass
+construction at:
+
+```
+var frame = surface.acquire()
+var encoder = device.createCommandEncoder()
+var passDesc = {
+  "colorAttachments": [{
+    "view": frame.view,    // ← Null does not implement 'view'
+    ...
+```
+
+`frame` was a valid `SurfaceFrame` two lines earlier (a Wren-level
+`System.print("DBG ... frame=%(frame)")` between the assignment and
+the Map literal makes the bug *disappear* — adding a probe forces an
+extra register usage that prevents whatever miscompile is happening).
+Reproduces under `--opt-threshold 999999999` so JIT'd code is not
+involved; the bug is in the tiered-mode interpreter path itself.
+
+Bouncing-ball trips a sibling form: `_world.position(b.body)` raises
+"unsupported: subscript get with arity 1" — the receiver register has
+been replaced by something the wlift_physics native dispatcher doesn't
+recognize as a `World2D` instance.
+
+Both shapes:
+
+* Foreign-method call returns a Wren-level wrapper object.
+* Surrounding Wren code does another foreign call (createCommandEncoder
+  / step).
+* Subsequent member access on the original wrapper sees null /
+  wrong-type.
+
+Adding any read of the wrapper between the foreign calls papers over
+the bug, suggesting a register / SSA value-tracking issue specific to
+the tiered-interpreter dispatch where the result slot for one Op::Call
+or the bound-receiver slot of another gets mis-routed when the call
+chain looks "foreign → Wren method → foreign". 5+ iterations always
+succeed; failure fires after that, indicating tier-up profiling state
+matters even when no JIT compile actually happens.
+
+`@hatch:web App.listen` hang (entry below) is likely the same root
+cause — different surface symptom because there's no synchronous
+return chain to surface the corrupted register, the loop just stops
+making progress.
+
 ### `@hatch:web` `App.listen` hangs in tiered mode
 
 Status: **open (workaround: `--mode interpreter`)**
