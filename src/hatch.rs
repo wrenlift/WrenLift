@@ -1870,7 +1870,10 @@ ghost = "9.9.9"
         // `c` should appear once, regardless of arriving via `b` and
         // directly from `a`.
         let c_module_count = hatch.manifest.modules.iter().filter(|m| *m == "c").count();
-        assert_eq!(c_module_count, 1, "c should be deduplicated, not duplicated");
+        assert_eq!(
+            c_module_count, 1,
+            "c should be deduplicated, not duplicated"
+        );
     }
 
     #[test]
