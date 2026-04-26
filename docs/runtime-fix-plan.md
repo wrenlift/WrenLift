@@ -326,14 +326,22 @@ trigger surface:
 
 ---
 
-## Phase 6 — Optimizer infrastructure (deferred)
+## Phase 6 — Optimizer infrastructure (seed landed)
 
-Status: **roadmap only** — see [QUIRKS.md → Roadmap](../QUIRKS.md#roadmap).
+Status: **seed shipped (commit `ad6b4ed`)** — see
+[QUIRKS.md → Roadmap](../QUIRKS.md#roadmap) for follow-ups.
 
-Per-function memory-effect summaries, propagated through the call
-graph, would let CSE / LICM / DCE keep more loads hoisted past
-known-pure callees. Significant pass; defer until a benchmark
-surfaces real cost from the conservative bucket-flush we ship today.
+`Instruction::Call` now carries a `pure_call: bool` flag set by the
+MIR builder when the method symbol matches a hardcoded list of
+known-pure builtins (Num arithmetic, comparisons, bitwise, Math
+intrinsics). CSE consults the flag in `inst_may_write_memory` and
+keeps the memory-read cache valid across pure calls — `xs[0] + 1`
+followed by `xs[0] + 2` no longer re-emits the second `xs[0]`.
+
+Follow-up (deferred until a benchmark shows real cost): full
+call-graph effect propagation that infers per-MirFunction
+reads / writes / unknown summaries and lets CSE / LICM / DCE keep
+state across user-defined leaf methods, not just builtins.
 
 ---
 

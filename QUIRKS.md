@@ -9,7 +9,33 @@ rationale for anyone who reads just this file.
 
 ### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
 
-Status: **open (workaround: `--mode interpreter`)**
+Status: **partially fixed (commit 518e4a7) — root cause confirmed,
+one more unsafely-rooted-locals path still surfaces**
+
+Two JIT-leaf inline dispatch paths in `vm_interp` (slow-path
+Op::Call after IC miss; IC fast path on subsequent hits) used to
+invoke a JIT'd callee while the caller's register file lived only
+in the local Rust `values: Vec<Value>` — never published to
+`frame.values`. A GC fired by the callee (or by a runtime helper
+the callee dispatches through) traced the fiber's `mir_frames`
+and missed every still-live pointer in the local Vec; generational
+promote moved those objects without updating the caller's view.
+Subsequent ops dereferenced freed memory and surfaced as either
+misdispatched ops ("subscript get with arity 1" on what should
+have been a method call) or "Null does not implement X" on a
+wrapper that's still allocated elsewhere on the heap.
+
+The fix saves `values` into `frame.values` before each JIT-leaf
+inline call and reloads after. Bouncing-ball's failure shifts
+from line 127 to line 128 (one op later); sprite-grid /
+cube-3d / ecs still fail at the same line. At least one more
+unsafely-rooted-locals path remains — likely involving the
+`@hatch:gpu` `Surface.acquire` foreign-method chain (where a Wren
+method wraps a foreign call and constructs a wrapper object).
+
+Reproduces under `--opt-threshold 999999999`, so the residual
+divergence is in the tiered-mode interpreter path itself, not in
+JIT'd code. Workaround: `--mode interpreter`.
 
 Three game examples reach a runtime error in `--mode tiered` after
 several frames. Each surfaces inside `@hatch:game`'s render-pass
@@ -431,25 +457,22 @@ code.
 
 ### Per-function memory-effect summaries for CSE / LICM / DCE
 
-Today the optimizer's memory model is binary: a `Call` instruction
-clears the memory-read cache (currently `SubscriptGet`), forcing every
-field/element read after a call to be re-issued. That's sound for
-arbitrary code but wastes optimization opportunities for calls that
-demonstrably can't write to the receiver in question — `Math.sin`,
-`Num.+`, leaf accessor methods on immutable types, etc.
+Status: **seed landed** (commit ad6b4ed) — `pure_call: bool` flag
+on `Instruction::Call`, set at MIR-build time for known-pure
+builtins (Num arithmetic + comparisons, Math intrinsics, bitwise).
+CSE keeps its memory-read cache valid across pure calls, so `xs[0]
++ 1` followed by `xs[0] + 2` no longer re-emits the second read.
 
-A real call-effect analysis would attach a per-function summary
-(reads / writes / unknown) to each MIR function, propagate through
-call edges, and use the summary at `Call` sites to invalidate only
-the memory regions that callee can actually touch. The same
-infrastructure unblocks tighter LICM (hoist a load across a call we
-can prove is loop-invariant) and tighter DCE (a call whose summary
-is "no observable effect" + unused result becomes dead).
+The full version walks the call graph, propagates a per-function
+effect summary (reads / writes / unknown) through call edges, and
+lets CSE keep the cache across user-defined leaf methods,
+LICM hoist a load past a provably-pure call, DCE drop a call whose
+summary is "no observable effect" with unused result.
 
-Cost vs. payoff: significant — needs an effect lattice on MIR, a
+Cost vs. payoff: substantive — needs an effect lattice on MIR, a
 worklist propagation pass over the call graph (with conservative
 defaults at unknown call edges), and care around foreign / native
-methods (which we have to assume `unknown` until annotated). Worth
-doing once a benchmark surfaces a CSE flush that's clearly costing
-us on a known-pure call; until then the bucket-flush captures the
-correctness story without the bookkeeping.
+methods (assume `unknown` until annotated). The current `pure_call`
+seed gets us the highest-frequency pure call sites (operators) for
+free; expand the analysis when a benchmark shows CSE losing on a
+specific user-defined leaf.
