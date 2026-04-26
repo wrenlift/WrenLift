@@ -2070,17 +2070,29 @@ pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
 }
 extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
     note_wren_call_entry();
-    let recv = Value::from_bits(receiver);
-    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &[recv]) {
-        return result;
-    }
-    push_jit_frame(
-        jit_fp as usize,
-        read_jit_ctx().current_func_id as u32,
-        ret_addr as usize,
-    );
-    let result = dispatch_call(recv, method, &[recv]);
-    pop_jit_frame();
+    // Push the receiver as a JIT root before dispatch so a GC fired
+    // by the callee's allocator (or any nested helper) can update
+    // the pointer through the shared roots Vec — register-passed
+    // u64 args are otherwise invisible to the collector and decay
+    // to freed memory the moment generational promote runs.
+    let root_base = jit_roots_snapshot_len();
+    push_jit_root(Value::from_bits(receiver));
+    let result = (|| {
+        let recv = jit_root_at(root_base);
+        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &[recv]) {
+            return result;
+        }
+        push_jit_frame(
+            jit_fp as usize,
+            read_jit_ctx().current_func_id as u32,
+            ret_addr as usize,
+        );
+        let recv = jit_root_at(root_base);
+        let result = dispatch_call(recv, method, &[recv]);
+        pop_jit_frame();
+        result
+    })();
+    jit_roots_restore_len(root_base);
     result
 }
 
@@ -2119,18 +2131,28 @@ extern "C" fn wren_call_1_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let recv = Value::from_bits(receiver);
-    let args = [recv, Value::from_bits(a0)];
-    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-        return result;
-    }
-    push_jit_frame(
-        jit_fp as usize,
-        read_jit_ctx().current_func_id as u32,
-        ret_addr as usize,
-    );
-    let result = dispatch_call(recv, method, &args);
-    pop_jit_frame();
+    // Root recv + a0 — see wren_call_0_inner for the rationale.
+    let root_base = jit_roots_snapshot_len();
+    push_jit_root(Value::from_bits(receiver));
+    push_jit_root(Value::from_bits(a0));
+    let result = (|| {
+        let recv = jit_root_at(root_base);
+        let args = [recv, jit_root_at(root_base + 1)];
+        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+            return result;
+        }
+        push_jit_frame(
+            jit_fp as usize,
+            read_jit_ctx().current_func_id as u32,
+            ret_addr as usize,
+        );
+        let recv = jit_root_at(root_base);
+        let args = [recv, jit_root_at(root_base + 1)];
+        let result = dispatch_call(recv, method, &args);
+        pop_jit_frame();
+        result
+    })();
+    jit_roots_restore_len(root_base);
     result
 }
 
@@ -2170,18 +2192,28 @@ extern "C" fn wren_call_2_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let recv = Value::from_bits(receiver);
-    let args = [recv, Value::from_bits(a0), Value::from_bits(a1)];
-    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-        return result;
-    }
-    push_jit_frame(
-        jit_fp as usize,
-        read_jit_ctx().current_func_id as u32,
-        ret_addr as usize,
-    );
-    let result = dispatch_call(recv, method, &args);
-    pop_jit_frame();
+    let root_base = jit_roots_snapshot_len();
+    push_jit_root(Value::from_bits(receiver));
+    push_jit_root(Value::from_bits(a0));
+    push_jit_root(Value::from_bits(a1));
+    let result = (|| {
+        let recv = jit_root_at(root_base);
+        let args = [recv, jit_root_at(root_base + 1), jit_root_at(root_base + 2)];
+        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+            return result;
+        }
+        push_jit_frame(
+            jit_fp as usize,
+            read_jit_ctx().current_func_id as u32,
+            ret_addr as usize,
+        );
+        let recv = jit_root_at(root_base);
+        let args = [recv, jit_root_at(root_base + 1), jit_root_at(root_base + 2)];
+        let result = dispatch_call(recv, method, &args);
+        pop_jit_frame();
+        result
+    })();
+    jit_roots_restore_len(root_base);
     result
 }
 
@@ -2204,22 +2236,45 @@ pub unsafe extern "C" fn wren_call_3(
     );
 }
 #[cfg(target_arch = "x86_64")]
-pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    // Can't use #[naked] for 7 args (exceeds 6 SysV register args).
-    // Read the caller's frame pointer from the stack frame chain instead.
-    // After this function's prologue: [rbp] = saved caller RBP, [rbp+8] = ret addr.
-    // The JIT function's FP is the saved caller RBP: [rbp] points to the JIT frame.
-    let jit_fp: u64;
-    let ret_addr: u64;
-    unsafe {
-        core::arch::asm!(
-            "mov {fp}, [rbp]",      // caller's RBP = JIT frame pointer
-            "mov {ra}, [rbp+8]",    // this function's return address
-            fp = out(reg) jit_fp,
-            ra = out(reg) ret_addr,
-        );
-    }
-    wren_call_3_inner(receiver, method, a0, a1, a2, jit_fp, ret_addr)
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_3(
+    _receiver: u64,
+    _method: u64,
+    _a0: u64,
+    _a1: u64,
+    _a2: u64,
+) -> u64 {
+    // SysV: rdi=recv, rsi=method, rdx=a0, rcx=a1, r8=a2. The inner
+    // also wants jit_fp (arg 6) and ret_addr (arg 7); we place them
+    // in r9 and on the stack respectively.
+    //
+    // Naked is required: a regular Rust wrapper that reads `[rbp]`
+    // via inline asm is unsafe under `preserve_frame_pointers=false`
+    // Cranelift codegen — the compiler doesn't know the asm needs
+    // rbp to hold the caller's frame value, so it uses rbp as a
+    // general-purpose register to spill an arg, and the asm reads
+    // garbage. The result on Linux x86_64 is a SIGSEGV inside
+    // wren_call_3 the first time JIT'd code dispatches a 3-arg
+    // method whose receiver register happened to be a NaN-boxed
+    // Value (a high-bit address that's kernel-only on Linux).
+    //
+    // Stack on entry: [rsp]=original ret_addr, rsp is 8-aligned
+    // (16-aligned just before JIT's `call wren_call_3`, then
+    // `call` pushed 8 bytes).
+    //
+    // Layout after `push rax` + `call inner`:
+    //   [rsp+0]  = post_call_ret_addr (auto-pushed by `call`)
+    //   [rsp+8]  = original ret_addr (arg 7, from our push)
+    // — matches SysV stack-arg conventions for a 7-arg fn.
+    core::arch::naked_asm!(
+        "mov r9, rbp",          // arg 6: jit_fp = caller's rbp
+        "mov rax, [rsp]",       // rax = original ret addr
+        "push rax",             // arg 7 on stack; also aligns rsp 8 → 16
+        "call {inner}",
+        "add rsp, 8",           // pop the pushed ret_addr
+        "ret",                  // return using original ret_addr at [rsp]
+        inner = sym wren_call_3_inner,
+    );
 }
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
@@ -2235,23 +2290,39 @@ extern "C" fn wren_call_3_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let recv = Value::from_bits(receiver);
-    let args = [
-        recv,
-        Value::from_bits(a0),
-        Value::from_bits(a1),
-        Value::from_bits(a2),
-    ];
-    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-        return result;
-    }
-    push_jit_frame(
-        jit_fp as usize,
-        read_jit_ctx().current_func_id as u32,
-        ret_addr as usize,
-    );
-    let result = dispatch_call(recv, method, &args);
-    pop_jit_frame();
+    let root_base = jit_roots_snapshot_len();
+    push_jit_root(Value::from_bits(receiver));
+    push_jit_root(Value::from_bits(a0));
+    push_jit_root(Value::from_bits(a1));
+    push_jit_root(Value::from_bits(a2));
+    let result = (|| {
+        let recv = jit_root_at(root_base);
+        let args = [
+            recv,
+            jit_root_at(root_base + 1),
+            jit_root_at(root_base + 2),
+            jit_root_at(root_base + 3),
+        ];
+        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+            return result;
+        }
+        push_jit_frame(
+            jit_fp as usize,
+            read_jit_ctx().current_func_id as u32,
+            ret_addr as usize,
+        );
+        let recv = jit_root_at(root_base);
+        let args = [
+            recv,
+            jit_root_at(root_base + 1),
+            jit_root_at(root_base + 2),
+            jit_root_at(root_base + 3),
+        ];
+        let result = dispatch_call(recv, method, &args);
+        pop_jit_frame();
+        result
+    })();
+    jit_roots_restore_len(root_base);
     result
 }
 
@@ -2274,7 +2345,40 @@ pub unsafe extern "C" fn wren_call_4(
         inner = sym wren_call_4_inner,
     );
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+pub unsafe extern "C" fn wren_call_4(
+    _receiver: u64,
+    _method: u64,
+    _a0: u64,
+    _a1: u64,
+    _a2: u64,
+    _a3: u64,
+) -> u64 {
+    // Same naked-asm fix as wren_call_3 — see that function for
+    // the rationale. Here all 6 SysV register slots are used by
+    // (recv, method, a0, a1, a2, a3), so jit_fp and ret_addr both
+    // go on the stack as args 7 and 8.
+    //
+    // Stack-arg ordering: caller pushes higher-index args first.
+    // Layout post-`call inner`:
+    //   [rsp+0]  = post_call_ret_addr
+    //   [rsp+8]  = arg 7 = jit_fp
+    //   [rsp+16] = arg 8 = ret_addr
+    //   [rsp+24] = padding (preserves 16-byte alignment)
+    core::arch::naked_asm!(
+        "mov r10, rbp",         // r10 = jit_fp (will become arg 7)
+        "mov rax, [rsp]",       // rax = original ret addr (arg 8)
+        "sub rsp, 8",           // align: 8-aligned → 0-aligned, 2 pushes will land 0-aligned
+        "push rax",             // arg 8 (ret_addr)
+        "push r10",             // arg 7 (jit_fp)
+        "call {inner}",
+        "add rsp, 24",          // 8 pad + 8 + 8 args
+        "ret",
+        inner = sym wren_call_4_inner,
+    );
+}
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub extern "C" fn wren_call_4(
     receiver: u64,
     method: u64,
@@ -2296,24 +2400,42 @@ extern "C" fn wren_call_4_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let recv = Value::from_bits(receiver);
-    let args = [
-        recv,
-        Value::from_bits(a0),
-        Value::from_bits(a1),
-        Value::from_bits(a2),
-        Value::from_bits(a3),
-    ];
-    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-        return result;
-    }
-    push_jit_frame(
-        jit_fp as usize,
-        read_jit_ctx().current_func_id as u32,
-        ret_addr as usize,
-    );
-    let result = dispatch_call(recv, method, &args);
-    pop_jit_frame();
+    let root_base = jit_roots_snapshot_len();
+    push_jit_root(Value::from_bits(receiver));
+    push_jit_root(Value::from_bits(a0));
+    push_jit_root(Value::from_bits(a1));
+    push_jit_root(Value::from_bits(a2));
+    push_jit_root(Value::from_bits(a3));
+    let result = (|| {
+        let recv = jit_root_at(root_base);
+        let args = [
+            recv,
+            jit_root_at(root_base + 1),
+            jit_root_at(root_base + 2),
+            jit_root_at(root_base + 3),
+            jit_root_at(root_base + 4),
+        ];
+        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+            return result;
+        }
+        push_jit_frame(
+            jit_fp as usize,
+            read_jit_ctx().current_func_id as u32,
+            ret_addr as usize,
+        );
+        let recv = jit_root_at(root_base);
+        let args = [
+            recv,
+            jit_root_at(root_base + 1),
+            jit_root_at(root_base + 2),
+            jit_root_at(root_base + 3),
+            jit_root_at(root_base + 4),
+        ];
+        let result = dispatch_call(recv, method, &args);
+        pop_jit_frame();
+        result
+    })();
+    jit_roots_restore_len(root_base);
     result
 }
 
