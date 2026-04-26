@@ -63,8 +63,22 @@ beat their historical targets:
 
 ### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
 
-Status: **fixed by gating the IC kind=1 inline JIT fast path off by
-default (commit a646e82); proper fix needs JIT stack maps**
+Status: **not currently reproducing as of 2026-04-26 — sprite-grid /
+cube-3d / ecs / bouncing-ball each run 10s+ cleanly in tiered mode
+after rebuilding the plugin dylibs against the current VM struct
+layout. A SIGSEGV at `wlift_window_create` / `wlift_gpu_request_device`
+that surfaced in a recent run turned out to be the packaged dylibs
+in `hatch/packages/<name>/libs/` being stale (built before recent
+`api_stack` field shifts in `runtime/vm.rs`), not a runtime bug.
+`cargo build --release -p wlift_window -p wlift_gpu -p wlift_image
+-p wlift_audio -p wlift_physics -p wlift_sqlite` plus copying the
+fresh `target/release/lib*.dylib` over the in-tree copies clears
+all four examples.**
+
+Below is the prior history kept for context; revisit if the
+register-corruption symptoms ("Null does not implement 'view'",
+`subscript get with arity 1`) reappear after the dylibs are
+guaranteed-fresh.
 
 The IC inline JIT-leaf dispatch passes recv + args to the compiled
 callee in registers. Even after pushing them as JIT roots before
