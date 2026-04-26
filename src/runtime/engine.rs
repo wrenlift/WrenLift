@@ -475,6 +475,14 @@ pub struct ExecutionEngine {
     /// ticks on every recorded call but doesn't yet drive any tier
     /// decision. Later phases will retire the legacy path in its favour.
     pub tier: super::tier::TierManager,
+    /// Cached per-callee purity map. Recomputed only when the
+    /// function table changes — JIT submissions can fire 70+ times
+    /// for a single benchmark, so eagerly walking every body on
+    /// every submit was an O(N²) hot spot.
+    cached_purity_map: Option<Arc<std::collections::HashMap<u32, bool>>>,
+    /// `functions.len()` snapshot at the point `cached_purity_map`
+    /// was built. The map invalidates when the function table grows.
+    cached_purity_map_len: usize,
 }
 
 /// Address range of a compiled function's native code.
@@ -548,6 +556,8 @@ impl ExecutionEngine {
                 super::tier::BASELINE_THRESHOLD,
                 super::tier::OPTIMIZED_THRESHOLD,
             ),
+            cached_purity_map: None,
+            cached_purity_map_len: 0,
         }
     }
 
@@ -830,21 +840,34 @@ impl ExecutionEngine {
     /// `CallKnownFunc { func_id }` calls into pure user methods don't
     /// flush the memory-read cache.
     ///
-    /// Naive implementation: rebuilds the map from the full function
-    /// table on every JIT submission. Safe because purity is a
-    /// monotone property — adding a new function can only relax
-    /// existing purity (introducing a new impure callee), and the
-    /// fixed-point handles that. Cache invalidation here is "always
-    /// recompute", traded against the simplicity of avoiding stale
-    /// entries on hot reload.
-    pub fn compute_callee_purity_map(&self) -> Arc<std::collections::HashMap<u32, bool>> {
+    /// Cached on the engine — `delta_blue` submits 70+ JIT compiles
+    /// during a run, and recomputing the map for every submission is
+    /// O(N²). Invalidates when the function table grows; new
+    /// installations (hot reload, late-bound classes) bump
+    /// `functions.len()` so `cached_purity_map_len != self.functions.len()`
+    /// triggers a refresh.
+    ///
+    /// In-place MIR rewrites for already-installed functions do *not*
+    /// invalidate the cache. That's safe so far because the only
+    /// post-install rewrite — JIT-time devirt — runs on a *clone* of
+    /// the MIR; the engine's authoritative copy is unchanged.
+    pub fn compute_callee_purity_map(&mut self) -> Arc<std::collections::HashMap<u32, bool>> {
+        if self.cached_purity_map_len != self.functions.len() {
+            self.cached_purity_map = None;
+        }
+        if let Some(map) = &self.cached_purity_map {
+            return Arc::clone(map);
+        }
         let funcs: Vec<(u32, &crate::mir::MirFunction)> = self
             .functions
             .iter()
             .enumerate()
             .map(|(idx, body)| (idx as u32, body.mir().as_ref()))
             .collect();
-        Arc::new(crate::mir::opt::purity::compute_purity_map(funcs))
+        let map = Arc::new(crate::mir::opt::purity::compute_purity_map(funcs));
+        self.cached_purity_map = Some(Arc::clone(&map));
+        self.cached_purity_map_len = self.functions.len();
+        map
     }
 
     /// A "pure leaf" function has no internal method calls — Cranelift
