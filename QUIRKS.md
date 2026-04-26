@@ -61,24 +61,122 @@ beat their historical targets:
 | binary_trees  | 0.6613s  | 0.9426s  | 0.70x |
 | delta_blue    | 0.1578s  | 0.0992s  | 1.59x |
 
-### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
+### Tiered JIT-to-JIT method dispatch corrupts receiver in hot loops
 
-Status: **not currently reproducing as of 2026-04-26 — sprite-grid /
-cube-3d / ecs / bouncing-ball each run 10s+ cleanly in tiered mode
-after rebuilding the plugin dylibs against the current VM struct
-layout. A SIGSEGV at `wlift_window_create` / `wlift_gpu_request_device`
-that surfaced in a recent run turned out to be the packaged dylibs
-in `hatch/packages/<name>/libs/` being stale (built before recent
-`api_stack` field shifts in `runtime/vm.rs`), not a runtime bug.
-`cargo build --release -p wlift_window -p wlift_gpu -p wlift_image
--p wlift_audio -p wlift_physics -p wlift_sqlite` plus copying the
-fresh `target/release/lib*.dylib` over the in-tree copies clears
-all four examples.**
+Status: **open — pre-existing, reproduced on clean main 2026-04-26;
+proper fix needs JIT-frame stack maps**
 
-Below is the prior history kept for context; revisit if the
-register-corruption symptoms ("Null does not implement 'view'",
-`subscript get with arity 1`) reappear after the dylibs are
-guaranteed-fresh.
+Smallest reproducer (no plugin / no GPU / no game machinery):
+
+```wren
+class Mat4 {
+  construct new() { _m = List.filled(16, 0) }
+  static identity {
+    var m = Mat4.new()
+    m.set(0, 0, 1)
+    m.set(1, 1, 1)
+    m.set(2, 2, 1)
+    m.set(3, 3, 1)
+    return m
+  }
+  static rotationY(angle) {
+    var c = angle.cos
+    var s = angle.sin
+    var m = Mat4.identity
+    m.set(0, 0, c)
+    m.set(0, 2, s)
+    m.set(2, 0, -s)
+    m.set(2, 2, c)
+    return m
+  }
+  static translation(x, y, z) {
+    var m = Mat4.identity
+    m.set(0, 3, x)
+    m.set(1, 3, y)
+    m.set(2, 3, z)
+    return m
+  }
+  set(r, c, v) { _m[r * 4 + c] = v }
+  at(r, c) { _m[r * 4 + c] }
+  *(o) {
+    var r = Mat4.new()
+    var i = 0
+    while (i < 4) {
+      var j = 0
+      while (j < 4) {
+        var s = 0
+        var k = 0
+        while (k < 4) {
+          s = s + at(i, k) * o.at(k, j)
+          k = k + 1
+        }
+        r.set(i, j, s)
+        j = j + 1
+      }
+      i = i + 1
+    }
+    return r
+  }
+}
+
+var spin = Mat4.rotationY(3.808)
+var bob  = Mat4.translation(0, 0.5, 0)
+var i = 0
+while (i < 500) {
+  var m = bob * spin
+  if ((m.at(0,0) - 3.808.cos).abs > 0.01) {
+    System.print("DIVERGE i=%(i) m[0,0]=%(m.at(0,0))")
+    break
+  }
+  i = i + 1
+}
+```
+
+`bob` and `spin` are pinned outside the loop; they NEVER change.
+After ~250 iterations under `--mode tiered`, `bob * spin` returns
+the identity matrix instead of the correct product (m[0,0] = 1
+instead of cos(3.808) ≈ -0.78). Same shape under generational
+and mark-sweep GC; `--gc arena` (no collection) and
+`--mode interpreter` both run clean to 500 iterations.
+
+What we know:
+
+- JIT-only: `WLIFT_SKIP_JIT='*'` keeps the loop correct for 500+
+  iterations.
+- Pinpointed to the `*(_) ↔ at(_,_)` JIT-to-JIT dispatch:
+  skipping JIT for *either* `*(_)` or `at(_,_)` alone clears it.
+  Both must be JIT-compiled for the corruption to surface.
+- Bytecode interpreter is fine: `--mode interpreter` runs the
+  full 500.
+- Optimized tier is not the trigger:
+  `--opt-threshold 999999999` (baseline-only) still reproduces.
+- IC fast path is not the trigger: `WLIFT_DISABLE_IC_JIT=1`
+  still reproduces; the path through `wren_call_2` is enough.
+- Threaded interpreter is not the trigger:
+  `WLIFT_DISABLE_THREADED=1` still reproduces.
+
+Surface symptoms in real apps: cube-3d's spinning cube collapses
+to a flat polygon after a few seconds (`bob * spin` model matrix
+goes to identity-shaped garbage); web chat's HTTP `tryAccept`
+loop stops processing requests once the inner dispatch is
+JIT-compiled.
+
+Suspected root cause: register-held receiver / arg pointers in
+the JIT'd caller go stale across an internal allocator
+(`Mat4.new()` at the top of `*(_)`). The `wren_call_N` rooting
+in c11c3ff covers the dispatch boundary but doesn't help the
+JIT'd body itself, which loads `this` / `o` into a register
+once and uses the register copy on every iteration of the
+inner loops. Mark-sweep also reproduces because object
+identity is preserved but the JIT register's pointer is
+suspect for an unrelated reason — perhaps the dispatch result
+slot. Needs deeper investigation.
+
+Workarounds:
+- `WLIFT_SKIP_JIT='*(_),at(_,_)'` (or any one of them).
+- `--mode interpreter` for game / web examples until fixed.
+- Hot-shape rewrites that move the inner dispatch out of the
+  JIT'd body (defeats the purpose, but unblocks specific apps).
 
 The IC inline JIT-leaf dispatch passes recv + args to the compiled
 callee in registers. Even after pushing them as JIT roots before
