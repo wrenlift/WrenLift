@@ -239,6 +239,37 @@ impl<'a> MirBuilder<'a> {
         self.current_block = block;
     }
 
+    /// True for methods the MIR builder knows can never write the
+    /// heap. Used to set `pure_call: true` on the emitted
+    /// Instruction::Call so CSE can keep its memory-read cache valid
+    /// across the call instead of flushing on every dispatch.
+    ///
+    /// Conservative seed list — Num arithmetic + comparisons,
+    /// builtin String accessors, and Math intrinsics. Anything that
+    /// allocates (List/Map constructors, `+` on String) or might
+    /// dispatch through user-overridden code stays out of the set;
+    /// when in doubt, return false.
+    fn is_pure_method_sig(&self, sym: SymbolId) -> bool {
+        matches!(
+            self.interner.resolve(sym),
+            // Boxed arithmetic operators.
+            "+(_)" | "-(_)" | "*(_)" | "/(_)" | "%(_)"
+            // Comparisons.
+            | "<(_)" | ">(_)" | "<=(_)" | ">=(_)" | "==(_)" | "!=(_)"
+            // Unary.
+            | "-" | "!"
+            // Num intrinsics.
+            | "abs" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+            | "atan(_)" | "atan2(_,_)" | "sqrt" | "cbrt" | "ln" | "log"
+            | "log2" | "exp" | "floor" | "ceil" | "round" | "truncate"
+            | "fraction" | "sign" | "min(_)" | "max(_)" | "pow(_)"
+            // Property predicates.
+            | "isInfinity" | "isNan" | "isInteger"
+            // Bitwise.
+            | "&(_)" | "|(_)" | "^(_)" | "<<(_)" | ">>(_)" | "~"
+        )
+    }
+
     fn intern(&mut self, s: &str) -> SymbolId {
         self.interner.intern(s)
     }
@@ -643,7 +674,8 @@ impl<'a> MirBuilder<'a> {
             receiver: iter_obj,
             method: iterate_sig,
             args: vec![null_val],
-        });
+        pure_call: false,
+});
 
         let cond_bb = self.new_block();
         let body_bb = self.new_block();
@@ -747,7 +779,8 @@ impl<'a> MirBuilder<'a> {
             receiver: iter_obj,
             method: iter_value_sig,
             args: vec![iter_param],
-        });
+        pure_call: false,
+});
         self.variables.insert(variable.0, elem_val);
 
         self.break_targets.push((exit_bb, tracked_names.clone()));
@@ -773,7 +806,8 @@ impl<'a> MirBuilder<'a> {
                 receiver: iter_obj,
                 method: iterate_sig,
                 args: vec![iter_param],
-            });
+            pure_call: false,
+});
             let mut backedge_args = vec![next_iter];
             for &name in &tracked_names {
                 backedge_args.push(self.variables[&name]);
@@ -792,7 +826,8 @@ impl<'a> MirBuilder<'a> {
             receiver: iter_obj,
             method: iterate_sig,
             args: vec![latch_iter_phi],
-        });
+        pure_call: false,
+});
         let mut latch_backedge_args = vec![next_iter_latch];
         for &(_, lphi) in &latch_phi_map {
             latch_backedge_args.push(lphi);
@@ -898,7 +933,8 @@ impl<'a> MirBuilder<'a> {
                                 receiver: recv,
                                 method: *method_name,
                                 args: vec![],
-                            })
+                            pure_call: false,
+})
                         }
                         ResolvedName::Local(_) => {
                             // Local should have been in variables map; fallback
@@ -1065,7 +1101,8 @@ impl<'a> MirBuilder<'a> {
                     receiver: val,
                     method: sig,
                     args: vec![class_val],
-                })
+                pure_call: false,
+})
             }
 
             Expr::Assign { target, value } => {
@@ -1124,10 +1161,12 @@ impl<'a> MirBuilder<'a> {
                         .copied()
                         .unwrap_or_else(|| self.emit(Instruction::ConstNull))
                 };
+                let pure_call = self.is_pure_method_sig(sig);
                 self.emit(Instruction::Call {
                     receiver: recv,
                     method: sig,
                     args: arg_vals,
+                    pure_call,
                 })
             }
 
@@ -1399,7 +1438,8 @@ impl<'a> MirBuilder<'a> {
                                 receiver: recv,
                                 method: setter_sym,
                                 args: vec![value],
-                            });
+                            pure_call: false,
+});
                         }
                         _ => {
                             self.variables.insert(*name, value);
@@ -1449,7 +1489,8 @@ impl<'a> MirBuilder<'a> {
                     receiver: recv,
                     method: setter_sym,
                     args: vec![value],
-                });
+                pure_call: false,
+});
             }
             _ => {}
         }

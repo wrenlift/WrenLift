@@ -2092,6 +2092,7 @@ fn devirt_calls_with_ic(
                 receiver,
                 method,
                 args,
+                pure_call: _,
             } = inst
             {
                 if ic_idx < ic_snapshot.len() {
@@ -3396,7 +3397,8 @@ impl<'a> LowerCtx<'a> {
                 receiver,
                 method,
                 args,
-            } => {
+            pure_call: _,
+} => {
                 use crate::mir::bytecode::{
                     CALLSITE_IC_CLASS, CALLSITE_IC_FUNC_ID, CALLSITE_IC_JIT_PTR, CALLSITE_IC_KIND,
                 };

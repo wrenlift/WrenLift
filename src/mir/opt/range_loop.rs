@@ -109,6 +109,7 @@ impl<'a> RangeLoop<'a> {
                     receiver,
                     method,
                     args,
+                    pure_call: _,
                 } = inst
                 {
                     if *receiver != range_vid {

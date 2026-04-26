@@ -194,6 +194,7 @@ impl MirPass for TypeSpecialize {
                         receiver,
                         method,
                         args,
+                        pure_call: _,
                     } if args.is_empty()
                         && known_nums.contains(receiver)
                         && self.math_unary.contains_key(method) =>
@@ -213,6 +214,7 @@ impl MirPass for TypeSpecialize {
                         receiver,
                         method,
                         args,
+                        pure_call: _,
                     } if args.len() == 1
                         && known_nums.contains(receiver)
                         && known_nums.contains(&args[0])
@@ -482,7 +484,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v_result);
         }
@@ -511,7 +514,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![v1],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v_result);
         }
@@ -610,7 +614,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v_result);
         }
@@ -641,7 +646,8 @@ mod tests {
                     receiver: v0,
                     method: abs_sym,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.instructions.push((
                 v_sqrt,
@@ -649,7 +655,8 @@ mod tests {
                     receiver: v_abs,
                     method: sqrt_sym,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v_sqrt);
         }

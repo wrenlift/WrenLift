@@ -571,7 +571,8 @@ impl<'a> Encoder<'a> {
                 receiver,
                 method,
                 args,
-            } => {
+            pure_call: _,
+} => {
                 self.emit_op(Op::Call);
                 self.emit_reg(dst);
                 self.emit_reg(*receiver);
@@ -1336,7 +1337,8 @@ mod tests {
                 receiver: v_recv,
                 method,
                 args: vec![v_arg],
-            },
+            pure_call: false,
+},
         ));
         f.block_mut(bb).terminator = Terminator::Return(v_result);
 
@@ -1426,7 +1428,8 @@ mod tests {
                 receiver: vals[0],
                 method: sym,
                 args: vec![vals[1]],
-            },
+            pure_call: false,
+},
             Instruction::BlockParam(0),
             Instruction::StringConcat(vec![vals[0]]),
         ];

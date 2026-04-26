@@ -4295,7 +4295,8 @@ mod tests {
                     receiver: v0,
                     method: abs_sym,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v1);
         }
@@ -4325,7 +4326,8 @@ mod tests {
                     receiver: v0,
                     method: add_sym,
                     args: vec![v1],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v2);
         }
@@ -4549,7 +4551,8 @@ mod tests {
                     receiver: v0,
                     method: bogus,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v1);
         }

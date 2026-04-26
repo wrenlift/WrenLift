@@ -1510,7 +1510,8 @@ mod tests {
                 receiver: v0,
                 method: SymbolId::from_raw(0),
                 args: vec![],
-            },
+            pure_call: false,
+},
         ));
         f.block_mut(bb).terminator = Terminator::Return(v1);
 

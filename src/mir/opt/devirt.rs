@@ -101,7 +101,8 @@ impl<'a> MirPass for Devirt<'a> {
                         receiver,
                         method,
                         args,
-                    } => {
+                    pure_call: _,
+} => {
                         let method_name = self.interner.resolve(*method);
 
                         if let Some(known) = known_types.get(receiver) {
@@ -492,7 +493,8 @@ mod tests {
                 receiver: v0,
                 method: add_sym,
                 args: vec![v1],
-            },
+            pure_call: false,
+},
         ));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
@@ -533,7 +535,8 @@ mod tests {
                 receiver: v0,
                 method: lt_sym,
                 args: vec![v1],
-            },
+            pure_call: false,
+},
         ));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
@@ -575,7 +578,8 @@ mod tests {
                 receiver: v0,
                 method: add_sym,
                 args: vec![v1],
-            },
+            pure_call: false,
+},
         ));
         f.block_mut(bb).terminator = Terminator::Return(v2);
 
@@ -618,7 +622,8 @@ mod tests {
                 receiver: v0,
                 method: add_sym,
                 args: vec![v2],
-            },
+            pure_call: false,
+},
         ));
         f.block_mut(bb).terminator = Terminator::Return(v3);
 

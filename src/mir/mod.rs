@@ -320,6 +320,19 @@ pub enum Instruction {
         receiver: ValueId,
         method: SymbolId,
         args: Vec<ValueId>,
+        /// MIR-builder annotation: this call dispatches to a method
+        /// known not to mutate observable heap state (Num/String
+        /// arithmetic + comparisons, Math, etc.). Used by CSE to keep
+        /// its memory-read cache valid across the call instead of
+        /// flushing on every method dispatch. Defaults to false; the
+        /// MIR builder sets it at lowering time when the method
+        /// symbol matches a built-in pure operator.
+        ///
+        /// This is the seed of the per-function effect-summary
+        /// system documented in the Phase 6 roadmap — start with
+        /// builtins that are demonstrably side-effect-free, grow the
+        /// set as the call-graph analysis matures.
+        pure_call: bool,
     },
     /// Direct call to a known function by FuncId. Emitted by speculative
     /// devirtualization when the receiver class is known from IC data.
@@ -1161,8 +1174,10 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
             receiver,
             method,
             args,
+            pure_call,
         } => format!(
-            "call {}.%{}({})",
+            "call{} {}.%{}({})",
+            if *pure_call { "[pure]" } else { "" },
             receiver,
             interner.resolve(*method),
             fmt_val_list(args)
@@ -1348,7 +1363,8 @@ mod tests {
             receiver: ValueId(0),
             method: SymbolId::from_raw(0),
             args: vec![],
-        }
+        pure_call: false,
+}
         .has_side_effects());
         assert!(Instruction::SetField(ValueId(0), 0, ValueId(1)).has_side_effects());
         assert!(Instruction::SetModuleVar(0, ValueId(0)).has_side_effects());
@@ -1367,7 +1383,8 @@ mod tests {
                 receiver: ValueId(0),
                 method: SymbolId::from_raw(1),
                 args: vec![ValueId(2), ValueId(3)],
-            }
+            pure_call: false,
+}
             .operands(),
             vec![ValueId(0), ValueId(2), ValueId(3)]
         );

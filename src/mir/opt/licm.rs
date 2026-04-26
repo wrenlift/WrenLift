@@ -650,7 +650,8 @@ mod tests {
                     receiver: v_i,
                     method,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.instructions.push((v_new_i, Instruction::Add(v_i, v_one)));
             b.terminator = Terminator::Branch {

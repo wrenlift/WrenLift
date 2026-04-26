@@ -876,7 +876,8 @@ pub fn lower_mir_to_threaded(
                     receiver,
                     method,
                     args,
-                } => {
+                pure_call: _,
+} => {
                     let cur_ic = ic_idx;
                     ic_idx += 1;
                     ic_entries.push(CallSiteIC::default());

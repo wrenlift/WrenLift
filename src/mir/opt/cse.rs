@@ -97,22 +97,29 @@ fn inst_reads_memory(inst: &Instruction) -> bool {
 }
 
 /// True for instructions that can mutate observable heap state — anything
-/// else cached as a memory read may now return a stale value. `Call` is
-/// the conservative choice (we don't have call-graph effects), but we can
-/// still keep pure caches alive across them.
+/// else cached as a memory read may now return a stale value. Calls
+/// flagged `pure_call` (see `Instruction::Call::pure_call`) are exempt:
+/// the MIR builder marks them based on a known-pure-methods list (Num
+/// arithmetic, comparisons, Math intrinsics) so a `subscript_get`
+/// before a `+` and another after the `+` can still merge.
+///
+/// This is the seed of the per-function effect-summary system in the
+/// Phase 6 roadmap. Real call-graph propagation would let CSE keep
+/// the cache across user-defined leaf methods too; for now we lean on
+/// builtin-method names.
 fn inst_may_write_memory(inst: &Instruction) -> bool {
-    matches!(
-        inst,
-        Instruction::Call { .. }
-            | Instruction::CallKnownFunc { .. }
-            | Instruction::CallStaticSelf { .. }
-            | Instruction::SuperCall { .. }
-            | Instruction::SetField(..)
-            | Instruction::SetUpvalue(..)
-            | Instruction::SubscriptSet { .. }
-            | Instruction::SetStaticField(..)
-            | Instruction::SetModuleVar(..)
-    )
+    match inst {
+        Instruction::Call { pure_call, .. } => !*pure_call,
+        Instruction::CallKnownFunc { .. }
+        | Instruction::CallStaticSelf { .. }
+        | Instruction::SuperCall { .. }
+        | Instruction::SetField(..)
+        | Instruction::SetUpvalue(..)
+        | Instruction::SubscriptSet { .. }
+        | Instruction::SetStaticField(..)
+        | Instruction::SetModuleVar(..) => true,
+        _ => false,
+    }
 }
 
 fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Option<CseKey> {
@@ -315,7 +322,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.instructions.push((
                 v2,
@@ -323,7 +331,8 @@ mod tests {
                     receiver: v0,
                     method,
                     args: vec![],
-                },
+                pure_call: false,
+},
             ));
             b.terminator = Terminator::Return(v1);
         }
