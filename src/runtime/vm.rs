@@ -4019,12 +4019,31 @@ impl VM {
             std::ptr::null()
         };
         if !jit_ptr.is_null() && ctor_args.len() <= 3 {
+            // Push every ctor arg as a JIT root so a GC fired during
+            // the constructor body (allocations, foreign calls, etc.)
+            // updates each pointer through the shared roots Vec
+            // before the body dereferences it. The instance itself
+            // was already rooted at root_len_before by
+            // `call_constructor_sync`. Without this, any pointer arg
+            // staled to freed memory while the JIT'd ctor ran with
+            // the args already loaded into registers — which is the
+            // class of "Constructor JIT SIGSEGV under GC pressure"
+            // bug logged in CLAUDE.md / project_cranelift_fixes.
+            for arg in ctor_args.iter() {
+                crate::codegen::runtime_fns::push_jit_root(*arg);
+            }
+            // Re-read the instance + args from roots after the
+            // pushes (the Vec may have grown / moved its backing
+            // buffer; the underlying Value bits are stable, but
+            // reading via `jit_root_at` keeps every value in
+            // lockstep with the GC's view).
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
-            // JIT expects: [this, arg0, arg1, ...]
             let mut jit_args = [Value::null(); 4];
             jit_args[0] = live_instance;
-            for (i, arg) in ctor_args.iter().enumerate() {
-                jit_args[i + 1] = *arg;
+            for i in 0..ctor_args.len() {
+                jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(
+                    root_len_before + 1 + i,
+                );
             }
             let n = ctor_args.len() + 1;
             let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
@@ -4039,7 +4058,8 @@ impl VM {
             // which registers the JIT frame for GC via #[naked] wrappers.
             let _ = unsafe { super::vm_interp::call_jit_fn_pub(jit_ptr, &jit_args[..n]) };
             crate::codegen::runtime_fns::set_jit_context(saved_ctx);
-            // Constructor returns the instance (possibly GC-forwarded)
+            // Constructor returns the instance (possibly GC-forwarded
+            // — read from the root slot, not the result register).
             let result = crate::codegen::runtime_fns::jit_root_at(root_len_before);
 
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);

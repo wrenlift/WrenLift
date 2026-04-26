@@ -216,6 +216,39 @@ the `toJson()` hook alone for v0.1.
 
 ## Fixed
 
+### Constructor JIT SIGSEGV under GC pressure
+
+Status: **fixed (2026-04-26)**
+
+`call_constructor_sync_impl` invokes the JIT'd constructor body
+with `(instance, ...ctor_args)` loaded directly into argument
+registers. The instance was being rooted before dispatch, but
+the user-supplied args were not — so any GC fired inside the
+constructor body (allocations, foreign calls, member assignment
+that grows a class shape table, etc.) staled the register-bound
+arg pointers without updating them.
+
+```wren
+class Pair {
+  construct new(left, right) {
+    _left = left            // ← any allocation here can promote
+    _right = right          //   `left` / `right`; register copies
+  }                         //   stay pointing to old addresses
+}
+var prev = null
+for (i in 0...2000) prev = Pair.new(prev, i)
+```
+
+Fix: push every ctor arg as a JIT root before dispatching the
+JIT'd body, then re-read each arg from the roots Vec into the
+`jit_args[..]` array. The instance was already rooted by
+`call_constructor_sync`; this extends the same shape to the
+remaining args. Locked in by
+`e2e_gc_pressure_constructor_with_object_args` which chains
+`Pair.new(prev, i)` for 2000 iterations under both Interpreter
+and Tiered modes and walks the chain back to dereference every
+still-live pointer the constructor stashed.
+
 ### `for-in` + `continue` infinite-looped / corrupted next binding / failed Cranelift verifier
 
 Status: **fixed (commit 1441d38, 2026-04-26)**

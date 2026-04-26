@@ -911,6 +911,63 @@ System.print(last.value)
     );
 }
 
+/// Constructor JIT dispatch under GC pressure with object-typed
+/// args. The historic "Constructor JIT SIGSEGV under GC pressure"
+/// shape: the JIT'd ctor body runs with arg pointers in registers,
+/// and an allocator fired during the body moves the underlying
+/// objects without updating the register-bound copies. This test
+/// exercises the path by chaining `Pair.new(prev, i)` so each
+/// ctor invocation receives a still-live pointer arg that's a
+/// candidate for GC-promote during the body.
+#[test]
+fn e2e_gc_pressure_constructor_with_object_args() {
+    let source = r#"
+class Pair {
+    construct new(left, right) {
+        _left = left
+        _right = right
+    }
+    left  { _left }
+    right { _right }
+}
+
+var prev = null
+var i = 0
+while (i < 2000) {
+    prev = Pair.new(prev, i)
+    i = i + 1
+}
+// Walk back through the chain to dereference every still-live
+// pointer the constructor stashed — proves none staled out.
+var node = prev
+var sum = 0
+while (node != null) {
+    sum = sum + node.right
+    node = node.left
+}
+System.print(sum)
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let mut vm = VM::new(VMConfig {
+            execution_mode: mode,
+            jit_threshold: 5,
+            ..Default::default()
+        });
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret("main", source);
+        let output = vm.take_output();
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}\n{}",
+            mode,
+            result,
+            output
+        );
+        // Sum 0..1999 = 1999 * 2000 / 2 = 1999000
+        assert_eq!(output.trim(), "1999000", "{:?} ctor-gc-pressure mismatch", mode);
+    }
+}
+
 #[test]
 fn e2e_gc_pressure_string_concat() {
     assert_output(
