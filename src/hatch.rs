@@ -665,26 +665,44 @@ pub fn build_from_source_tree_with_cache(
     root: &Path,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
-    let mut visited: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-    build_recursive(root, &mut visited, cache_dir)
+    let mut state = BuildState::default();
+    build_recursive(root, &mut state, cache_dir)
 }
 
-/// Internal recursive variant. `visited` holds canonicalized directory
-/// paths to short-circuit dependency cycles — otherwise a loop like
-/// `a → b → a` would recurse forever.
+/// Per-recursion build state. `active` is the in-progress recursion
+/// path — a revisit indicates a true cycle and errors. `cache` holds
+/// the encoded bytes of every workspace we've already built; a hit
+/// means we're seeing the same dep through a diamond path and can
+/// reuse the bytes verbatim instead of rebuilding (and hitting a
+/// false-positive cycle error).
+#[derive(Default)]
+struct BuildState {
+    active: std::collections::HashSet<std::path::PathBuf>,
+    cache: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+}
+
+/// Internal recursive variant. Distinguishes a true cycle (`a → b →
+/// a`, where `a` is *currently being built* on the recursion path)
+/// from a diamond dep (`a → b → c` plus `a → c`, where `c` is
+/// already-built and just needs to be re-folded). The former errors
+/// loudly; the latter returns the cached bytes so the second arm of
+/// the diamond doesn't trip the cycle detector.
 fn build_recursive(
     root: &Path,
-    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    state: &mut BuildState,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    if !visited.insert(canonical) {
+    if state.active.contains(&canonical) {
         return Err(HatchError::Encode(format!(
             "dependency cycle detected at {}",
             root.display()
         )));
     }
+    if let Some(cached) = state.cache.get(&canonical) {
+        return Ok(cached.clone());
+    }
+    state.active.insert(canonical.clone());
 
     let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     collect_wren_files(root, root, &mut wren_files)?;
@@ -744,10 +762,16 @@ fn build_recursive(
 
     rename_entry_to_manifest_name(&mut manifest, &mut sections)?;
     pack_bundled_native_libs(root, &mut manifest, &mut sections)?;
-    merge_path_dependencies(root, &mut manifest, &mut sections, visited, cache_dir)?;
+    merge_path_dependencies(root, &mut manifest, &mut sections, state, cache_dir)?;
 
     let hatch = Hatch { manifest, sections };
-    emit(&hatch)
+    let bytes = emit(&hatch)?;
+    // Pop from the active recursion stack and cache the encoded
+    // bytes so a diamond revisit (`a → b → c` plus `a → c`) returns
+    // these same bytes without rebuilding.
+    state.active.remove(&canonical);
+    state.cache.insert(canonical, bytes.clone());
+    Ok(bytes)
 }
 
 /// When `manifest.name` differs from the entry file's module name,
@@ -837,22 +861,21 @@ pub fn resolve_dependency_bytes(
     dep: &Dependency,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
-    let mut visited: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-    resolve_dep_bytes_inner(root, dep_name, dep, &mut visited, cache_dir)
+    let mut state = BuildState::default();
+    resolve_dep_bytes_inner(root, dep_name, dep, &mut state, cache_dir)
 }
 
 fn resolve_dep_bytes_inner(
     root: &Path,
     dep_name: &str,
     dep: &Dependency,
-    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    state: &mut BuildState,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
     match dep {
         Dependency::Path { path, .. } => {
             let dep_root = root.join(path);
-            build_recursive(&dep_root, visited, cache_dir).map_err(|e| {
+            build_recursive(&dep_root, state, cache_dir).map_err(|e| {
                 HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
             })
         }
@@ -893,7 +916,7 @@ fn resolve_dep_bytes_inner(
                     dep_name
                 )));
             }
-            build_recursive(&checkout, visited, cache_dir).map_err(|e| {
+            build_recursive(&checkout, state, cache_dir).map_err(|e| {
                 HatchError::Encode(format!(
                     "failed to build git dependency '{}': {}",
                     dep_name, e
@@ -907,7 +930,7 @@ fn merge_path_dependencies(
     root: &Path,
     manifest: &mut Manifest,
     sections: &mut Vec<Section>,
-    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    state: &mut BuildState,
     cache_dir: Option<&Path>,
 ) -> Result<(), HatchError> {
     // Collect into an owned list so we can mutate `manifest.dependencies`
@@ -922,7 +945,7 @@ fn merge_path_dependencies(
         let dep_bytes = match &dep {
             Dependency::Path { path, .. } => {
                 let dep_root = root.join(path);
-                build_recursive(&dep_root, visited, cache_dir).map_err(|e| {
+                build_recursive(&dep_root, state, cache_dir).map_err(|e| {
                     HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
                 })?
             }
@@ -970,7 +993,7 @@ fn merge_path_dependencies(
                 }
                 // Treat the cached checkout like any path dep:
                 // recursively build so transitive deps resolve too.
-                build_recursive(&checkout, visited, cache_dir).map_err(|e| {
+                build_recursive(&checkout, state, cache_dir).map_err(|e| {
                     HatchError::Encode(format!(
                         "failed to build git dependency '{}': {}",
                         dep_name, e
@@ -980,28 +1003,55 @@ fn merge_path_dependencies(
         };
         let dep_hatch = load(&dep_bytes)?;
 
-        // Prepend dep modules so they install before ours. Collisions
-        // would create ambiguous imports — reject loudly.
+        // Prepend dep modules so they install before ours. A name
+        // collision means EITHER a true collision (two unrelated
+        // packages chose the same module name — must error) OR a
+        // diamond dep where the same package appears via two paths
+        // and contributes byte-identical sections (silently dedupe).
+        // We tell them apart by checking the section bytes against
+        // what's already in `sections`.
+        let mut new_modules: Vec<String> = Vec::new();
         for mod_name in &dep_hatch.manifest.modules {
             if manifest.modules.contains(mod_name) {
-                return Err(HatchError::Encode(format!(
-                    "dependency '{}' carries module '{}' that collides with the enclosing hatch",
-                    dep_name, mod_name
-                )));
+                let dep_section = dep_hatch.sections.iter().find(|s| {
+                    matches!(s.kind, SectionKind::Wlbc | SectionKind::NativeLib)
+                        && &s.name == mod_name
+                });
+                let existing = sections.iter().find(|s| {
+                    matches!(s.kind, SectionKind::Wlbc | SectionKind::NativeLib)
+                        && &s.name == mod_name
+                });
+                match (dep_section, existing) {
+                    (Some(d), Some(e)) if d.kind == e.kind && d.data == e.data => {
+                        // Diamond — already bundled identically, skip.
+                        continue;
+                    }
+                    _ => {
+                        return Err(HatchError::Encode(format!(
+                            "dependency '{}' carries module '{}' that collides with the enclosing hatch",
+                            dep_name, mod_name
+                        )));
+                    }
+                }
             }
+            new_modules.push(mod_name.clone());
         }
-        let mut merged_modules = dep_hatch.manifest.modules.clone();
+        let mut merged_modules = new_modules;
         merged_modules.extend(std::mem::take(&mut manifest.modules));
         manifest.modules = merged_modules;
 
-        // Carry over any NativeLib sections the dep bundled for itself
-        // and any absolute-path system refs it declared.
+        // Carry over Wlbc / NativeLib sections the dep bundled.
+        // Diamond-dep sections (same name+kind+bytes) silently dedupe;
+        // genuine collisions still error.
         for section in dep_hatch.sections {
             if matches!(section.kind, SectionKind::Wlbc | SectionKind::NativeLib) {
-                if sections
+                if let Some(existing) = sections
                     .iter()
-                    .any(|s| s.name == section.name && s.kind == section.kind)
+                    .find(|s| s.name == section.name && s.kind == section.kind)
                 {
+                    if existing.data == section.data {
+                        continue; // diamond dedupe
+                    }
                     return Err(HatchError::Encode(format!(
                         "dependency '{}' carries section '{:?}/{}' that collides with the enclosing hatch",
                         dep_name, section.kind, section.name
@@ -1779,6 +1829,48 @@ ghost = "9.9.9"
 
         let result = build_from_source_tree(&a);
         assert!(matches!(result, Err(HatchError::Encode(msg)) if msg.contains("cycle")));
+    }
+
+    /// `a` depends on both `b` and `c`; `b` depends on `c`. The same
+    /// path-dep `c` appears twice in the recursion — once via `b`,
+    /// once direct from `a`. Used to error with "dependency cycle
+    /// detected at .../c" because the visited HashSet didn't
+    /// distinguish "currently in progress" from "already built". Now
+    /// the second visit hits the build cache and reuses the bytes.
+    #[test]
+    fn build_accepts_diamond_dependencies() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let c = tmp.path().join("c");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::create_dir_all(&c).unwrap();
+        std::fs::write(a.join("a.wren"), "1").unwrap();
+        std::fs::write(b.join("b.wren"), "1").unwrap();
+        std::fs::write(c.join("c.wren"), "1").unwrap();
+        std::fs::write(
+            a.join("hatchfile"),
+            "name = \"a\"\nversion = \"0\"\nentry = \"a\"\n[dependencies]\nb = { path = \"../b\" }\nc = { path = \"../c\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            b.join("hatchfile"),
+            "name = \"b\"\nversion = \"0\"\nentry = \"b\"\n[dependencies]\nc = { path = \"../c\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            c.join("hatchfile"),
+            "name = \"c\"\nversion = \"0\"\nentry = \"c\"\n",
+        )
+        .unwrap();
+
+        let bytes = build_from_source_tree(&a).expect("diamond dep should build cleanly");
+        let hatch = load(&bytes).expect("load");
+        // `c` should appear once, regardless of arriving via `b` and
+        // directly from `a`.
+        let c_module_count = hatch.manifest.modules.iter().filter(|m| *m == "c").count();
+        assert_eq!(c_module_count, 1, "c should be deduplicated, not duplicated");
     }
 
     #[test]
