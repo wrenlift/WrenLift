@@ -2432,13 +2432,11 @@ fn run_fiber_with_stop_depth(
                             // Honour `Fiber.try` for method-not-found
                             // errors the same way the native-error path
                             // already does.
-                            let msg = format!(
-                                "{} does not implement '{}'",
-                                class_name, method_name
-                            );
-                            if let Some(err_val) = unsafe {
-                                route_method_error_through_fiber_try(vm, fiber, msg)
-                            } {
+                            let msg =
+                                format!("{} does not implement '{}'", class_name, method_name);
+                            if let Some(err_val) =
+                                unsafe { route_method_error_through_fiber_try(vm, fiber, msg) }
+                            {
                                 let caller_resumed = vm.fiber != fiber;
                                 if caller_resumed {
                                     continue 'fiber_loop;
@@ -2583,13 +2581,11 @@ fn run_fiber_with_stop_depth(
                                 let method_name = vm.interner.resolve(method).to_string();
                                 let class_name =
                                     unsafe { vm.interner.resolve((*super_cls).name).to_string() };
-                                let msg = format!(
-                                    "{} does not implement '{}'",
-                                    class_name, method_name
-                                );
-                                if let Some(err_val) = unsafe {
-                                    route_method_error_through_fiber_try(vm, fiber, msg)
-                                } {
+                                let msg =
+                                    format!("{} does not implement '{}'", class_name, method_name);
+                                if let Some(err_val) =
+                                    unsafe { route_method_error_through_fiber_try(vm, fiber, msg) }
+                                {
                                     let caller_resumed = vm.fiber != fiber;
                                     if caller_resumed {
                                         continue 'fiber_loop;
