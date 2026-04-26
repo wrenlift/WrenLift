@@ -63,8 +63,32 @@ beat their historical targets:
 
 ### Tiered JIT-to-JIT method dispatch corrupts receiver in hot loops
 
-Status: **open — pre-existing, reproduced on clean main 2026-04-26;
-proper fix needs JIT-frame stack maps**
+Status: **fixed (commit e869735, 2026-04-26)**
+
+Root cause: the JIT slow paths for `Mul` / `Sub` / `Div` / `Mod`
+/ `<` / `>` / `<=` / `>=` were not dispatching to user-defined
+operator overloads when the receiver was a non-Num heap object.
+`wren_num_add` had the dispatch (`if !va.is_num()` → look up
+`+(_)` and `dispatch_method`); the others bare-cast NaN-box bits
+to f64 and ran `unbox(a) ⊕ unbox(b)`. For two object operands
+the result was an implementation-defined NaN — on aarch64 the
+hardware preserves the first operand's payload, so `bob * spin`
+silently returned the bit pattern of `bob`. The downstream code
+then "succeeded" with `bob.at(0,0) = 1` (translation matrix's
+identity diagonal), making the cube collapse to a flat polygon
+"after a few seconds" once the hot draw loop JIT-compiled.
+
+Fix: factor the dispatch pattern into `wren_arith_dispatch` and
+`wren_cmp_dispatch`, and route every helper through it.
+
+Local repro keeps the prior 60-line Mat4 test as the lock-in
+case; full-stack `cube-3d` runs cleanly for 20s+ in tiered mode
+post-fix.
+
+Below is the original bisect notes — the previous "JIT-frame
+stack maps required" hypothesis turned out to be wrong; the
+real bug was a missing dispatch path, not a register-staling
+issue.
 
 Smallest reproducer (no plugin / no GPU / no game machinery):
 
