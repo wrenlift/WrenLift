@@ -3595,17 +3595,55 @@ fn box_num(n: f64) -> u64 {
 }
 
 pub extern "C" fn wren_num_add(a: u64, b: u64) -> u64 {
+    wren_arith_dispatch(a, b, "+(_)", "+", |x, y| x + y)
+}
+
+pub extern "C" fn wren_num_sub(a: u64, b: u64) -> u64 {
+    wren_arith_dispatch(a, b, "-(_)", "-", |x, y| x - y)
+}
+
+pub extern "C" fn wren_num_mul(a: u64, b: u64) -> u64 {
+    wren_arith_dispatch(a, b, "*(_)", "*", |x, y| x * y)
+}
+
+pub extern "C" fn wren_num_div(a: u64, b: u64) -> u64 {
+    wren_arith_dispatch(a, b, "/(_)", "/", |x, y| x / y)
+}
+
+pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
+    wren_arith_dispatch(a, b, "%(_)", "%", |x, y| x % y)
+}
+
+/// Common path for arithmetic-operator slow paths: if the receiver
+/// is a Num, run the f64 op; otherwise dispatch the user-defined
+/// operator method (e.g. `Mat4 * Mat4` → `Mat4.* (o)`).
+///
+/// This is what `Op::Mul` / `Op::Sub` / etc. do in the bytecode
+/// interpreter via `bc_boxed_binop!` + `try_operator_dispatch`.
+/// Before this helper landed, the JIT slow paths ignored
+/// non-Num receivers and reinterpreted the NaN-box bits as f64,
+/// returning NaN garbage that on aarch64 silently fell through
+/// as the first operand's bits — i.e. `bob * spin` quietly
+/// returned `bob`, and the cube-3d model matrix collapsed to
+/// `bob`'s identity-shaped contents after JIT compile fired.
+#[inline]
+fn wren_arith_dispatch(
+    a: u64,
+    b: u64,
+    method_with_paren: &str,
+    method_bare: &str,
+    fast: impl FnOnce(f64, f64) -> f64,
+) -> u64 {
     let va = Value::from_bits(a);
     if va.is_num() {
-        return box_num(unbox_num(a) + unbox_num(b));
+        return box_num(fast(unbox_num(a), unbox_num(b)));
     }
-    // Non-numeric receiver: dispatch as method call (string concat, operator overload)
     match unsafe { vm_ref() } {
         Some(vm) => {
             let sym = vm
                 .interner
-                .lookup("+(_)")
-                .or_else(|| vm.interner.lookup("+"));
+                .lookup(method_with_paren)
+                .or_else(|| vm.interner.lookup(method_bare));
             if let Some(sym) = sym {
                 let class = vm.class_of(va);
                 if let Some((method, _dc)) = unsafe { find_method_with_class(class, sym) } {
@@ -3616,22 +3654,6 @@ pub extern "C" fn wren_num_add(a: u64, b: u64) -> u64 {
         }
         None => Value::null().to_bits(),
     }
-}
-
-pub extern "C" fn wren_num_sub(a: u64, b: u64) -> u64 {
-    box_num(unbox_num(a) - unbox_num(b))
-}
-
-pub extern "C" fn wren_num_mul(a: u64, b: u64) -> u64 {
-    box_num(unbox_num(a) * unbox_num(b))
-}
-
-pub extern "C" fn wren_num_div(a: u64, b: u64) -> u64 {
-    box_num(unbox_num(a) / unbox_num(b))
-}
-
-pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
-    box_num(unbox_num(a) % unbox_num(b))
 }
 
 pub extern "C" fn wren_num_neg(a: u64) -> u64 {
@@ -3663,19 +3685,54 @@ pub extern "C" fn wren_num_neg(a: u64) -> u64 {
 // ---------------------------------------------------------------------------
 
 pub extern "C" fn wren_cmp_lt(a: u64, b: u64) -> u64 {
-    Value::bool(unbox_num(a) < unbox_num(b)).to_bits()
+    wren_cmp_dispatch(a, b, "<(_)", "<", |x, y| x < y)
 }
 
 pub extern "C" fn wren_cmp_gt(a: u64, b: u64) -> u64 {
-    Value::bool(unbox_num(a) > unbox_num(b)).to_bits()
+    wren_cmp_dispatch(a, b, ">(_)", ">", |x, y| x > y)
 }
 
 pub extern "C" fn wren_cmp_le(a: u64, b: u64) -> u64 {
-    Value::bool(unbox_num(a) <= unbox_num(b)).to_bits()
+    wren_cmp_dispatch(a, b, "<=(_)", "<=", |x, y| x <= y)
 }
 
 pub extern "C" fn wren_cmp_ge(a: u64, b: u64) -> u64 {
-    Value::bool(unbox_num(a) >= unbox_num(b)).to_bits()
+    wren_cmp_dispatch(a, b, ">=(_)", ">=", |x, y| x >= y)
+}
+
+/// Same dispatch pattern as `wren_arith_dispatch`, but for ordering
+/// comparisons. User-defined `<(_)`, `>(_)`, `<=(_)`, `>=(_)` need
+/// to be honoured for non-Num receivers; the bare-fast-path version
+/// silently returned `Bool(NaN < NaN) == false` for any object pair,
+/// which silently broke `Comparable.compareTo`-style protocols.
+#[inline]
+fn wren_cmp_dispatch(
+    a: u64,
+    b: u64,
+    method_with_paren: &str,
+    method_bare: &str,
+    fast: impl FnOnce(f64, f64) -> bool,
+) -> u64 {
+    let va = Value::from_bits(a);
+    if va.is_num() {
+        return Value::bool(fast(unbox_num(a), unbox_num(b))).to_bits();
+    }
+    match unsafe { vm_ref() } {
+        Some(vm) => {
+            let sym = vm
+                .interner
+                .lookup(method_with_paren)
+                .or_else(|| vm.interner.lookup(method_bare));
+            if let Some(sym) = sym {
+                let class = vm.class_of(va);
+                if let Some((method, _dc)) = unsafe { find_method_with_class(class, sym) } {
+                    return dispatch_method(vm, method, &[va, Value::from_bits(b)], None);
+                }
+            }
+            Value::bool(false).to_bits()
+        }
+        None => Value::bool(false).to_bits(),
+    }
 }
 
 pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
