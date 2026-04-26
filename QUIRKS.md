@@ -9,61 +9,57 @@ rationale for anyone who reads just this file.
 
 ### `wren_call_N` arg rooting SIGSEGVs on Linux x86_64
 
-Status: **mitigated by reverting the rooting (commit 874b81a,
-2026-04-26); proper fix requires understanding the x86_64
-divergence**
+Status: **fixed (commit c11c3ff, 2026-04-26)**
 
-`wren_call_N_inner` was patched in commit a646e82 to push its
-receiver + args as JIT roots before dispatch, so a GC fired
-inside the callee (allocator, foreign call, nested helper)
-could update the pointers through the shared roots Vec instead
-of leaving the callee's register-bound u64 args pointing at
-freed memory.
+Root cause: the `wren_call_3` and `wren_call_4` x86_64 wrappers
+were regular Rust functions that read `[rbp]` and `[rbp+8]` via
+inline asm to pull `jit_fp` (caller's frame pointer) and
+`ret_addr` from the stack. The asm didn't declare rbp as an
+input, so Rust's release optimiser treated rbp as a free
+general-purpose register and clobbered it with a function arg
+*before* the asm executed:
 
-The rooting works on macOS aarch64 and macOS x86_64 (Rosetta) —
-50 parallel runs of `delta_blue` and the full e2e suite stay
-clean. On Linux x86_64 (CI runner) the same code consistently
-SIGSEGVs (signal 11, "invalid memory reference") within ~1
-second of `delta_blue` and during the e2e suite. The crash is
-not intermittent on the CI runner — it reproduces every push.
+```
+8374e0:  push   %rbp                  ; save caller's rbp (callee-saved)
+...
+8374f3:  mov    %rcx,%rbp             ; rbp = a1 (function arg)  ← clobber
+...
+837501:  mov    0x0(%rbp),%rcx        ; mov rcx, [rbp]           ← reads [a1]
+```
 
-What we know:
+`mov 0x0(%rbp), %rcx` then dereferences whatever Rust spilled
+into rbp — in delta_blue, that's a NaN-boxed Value (e.g.
+`0xfffc7fffd7c187a8`), a high-bit address. On Linux x86_64
+user space ends at `0x7fff_ffff_ffff`, so reading from a 0xfffc
+address faults — kernel-only memory. macOS (aarch64 native or
+Rosetta x86_64) maps that range differently and the read
+silently succeeds with garbage that doesn't crash.
 
-- The crash signature is SIGSEGV inside the JIT runtime path,
-  not SIGABRT. So it's a memory access, not a panic / assertion.
-- The constructor JIT root push (a1412e7) is sound — disabling
-  it broke `binary_trees` correctness on x86_64 too. So the
-  rooting itself isn't categorically broken; the wren_call_N
-  variant has something specific.
-- Reverting just `runtime_fns.rs` to the pre-a646e82 state
-  (commit 874b81a) restored CI green. Bench numbers also
-  recovered to historical:
+The bug had been latent since the `wren_call_3/4` x86_64
+wrappers were written; what changed in `a646e82` was the size
+and shape of `wren_call_N_inner`, which made LLVM's register
+allocator more likely to pick rbp for a spill in the wrapper.
 
-  | Bench         | With rooting | Without rooting | Target |
-  |---------------|--------------|-----------------|--------|
-  | fib           | 0.0080s      | 0.0078s         | 0x     |
-  | method_call   | 0.0972s      | 0.0883s         | 1.0x   |
-  | binary_trees  | 0.9431s      | 0.8471s         | 0.8x   |
-  | delta_blue    | 0.1992s      | 0.1738s         | 1.8x   |
+Fix: rewrite `wren_call_3` and `wren_call_4` as
+`#[unsafe(naked)]` (matching `wren_call_0/1/2`). Naked asm has
+no Rust prologue, so `rbp` at function entry IS the caller's
+value. The 7th and 8th args (jit_fp, ret_addr) are placed in
+register r9 (wren_call_3) or pushed onto the stack (wren_call_4)
+— SysV's 16-byte alignment is preserved with explicit `sub
+rsp, 8` padding before the pair of pushes in wren_call_4.
 
-  So the rooting was costing ~5–15% per benchmark on top of
-  whatever it was triggering on Linux.
+Verified by reproducing the crash on Lima Ubuntu 24.04 x86_64
+VM, applying the fix, and watching 50 stress runs of
+`delta_blue` produce 14065400 with no SIGSEGV. CI bench (Linux
+x86_64) green again with rooting in place; all four benchmarks
+beat their historical targets:
 
-Suspected causes (none confirmed):
-
-- TLS `%fs` access pattern through naked `wren_call_0` →
-  `wren_call_0_inner` tail-jump. Linux x86_64 TLS is via
-  segment registers; macOS uses a different layout.
-- Stack alignment regression at the naked-asm boundary.
-- Vec realloc-during-push moves the Roots buffer to an address
-  that interacts badly with Linux ASLR vs macOS.
-
-Without rooting, the residual tiered register-corruption family
-(sprite-grid `Null does not implement 'view'`, bouncing-ball
-`subscript get with arity 1`, etc.) returns. Those games were
-already only working on macOS, so the priority is keeping CI
-green; re-introduce rooting once the Linux x86_64 divergence
-is understood.
+| Bench         | WrenLift | Std Wren | Ratio |
+|---------------|----------|----------|-------|
+| fib           | 0.0122s  | 0.1774s  | 0.07x |
+| method_call   | 0.0537s  | 0.0841s  | 0.64x |
+| binary_trees  | 0.6613s  | 0.9426s  | 0.70x |
+| delta_blue    | 0.1578s  | 0.0992s  | 1.59x |
 
 ### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
 
