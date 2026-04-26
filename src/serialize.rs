@@ -33,12 +33,26 @@ use crate::mir::ModuleMir;
 /// wren_lift bytecode cache.
 pub const MAGIC: [u8; 4] = *b"WLBC";
 
-/// Current format revision. Bump when `ModuleBlob`'s shape changes in a
-/// way a previous-version loader can't handle (new Instruction variants
-/// are additive from bincode's perspective as long as we never reorder
-/// existing variants, so most upgrades won't need a version bump — but
-/// reshuffling a struct field or swapping enum variant order will).
-pub const VERSION: u32 = 4;
+/// Current format revision. **Bump this whenever any
+/// wlbc-serialized type changes shape**: a new field on a struct
+/// variant of an enum, a new variant in the middle of an enum,
+/// reordered fields — anything that changes the bincode layout.
+/// A missed bump produces silent decoder confusion ("decode:
+/// InvalidBooleanValue(5)" or similar) on every stale `.hatch`
+/// artifact a developer hasn't rebuilt yet, instead of a clean
+/// `VersionMismatch` error pointing at the exact remediation.
+///
+/// Adding a new (last) variant to an enum is the only safe edit
+/// without bumping — bincode encodes variants by index, and a
+/// new tail variant is encode-only until the first program
+/// produces one in serialized output.
+///
+/// History:
+/// - v5 (2026-04-26): `Instruction::Call::pure_call` field added
+///   for the Phase 6 effect-summary seed.
+/// - v4: prior; first version this constant gained a written-down
+///   bump policy.
+pub const VERSION: u32 = 5;
 
 /// Combined payload: everything a fresh `VM` needs to materialise the
 /// module without touching the parser, resolver, MIR builder, or the
@@ -82,7 +96,8 @@ impl std::fmt::Display for SerializeError {
             SerializeError::BadMagic => write!(f, "not a wlift bytecode cache (missing WLBC magic)"),
             SerializeError::VersionMismatch { expected, found } => write!(
                 f,
-                "wlift bytecode cache version mismatch: expected {expected}, found {found}"
+                "wlift bytecode cache version mismatch: expected v{expected}, found v{found}; \
+                 rebuild the artifact with `hatch build` against the current wren_lift sources"
             ),
             SerializeError::TruncatedPayload { declared, available } => write!(
                 f,
@@ -210,6 +225,37 @@ mod tests {
             load(&buf),
             Err(SerializeError::VersionMismatch { .. })
         ));
+    }
+
+    /// Stale artifacts carrying a *lower* version number should
+    /// also fail at the version check rather than tumble down into
+    /// bincode and surface as misleading "InvalidBooleanValue"-style
+    /// decoder errors. Locks the rebuild-guidance message format too
+    /// — every developer pulling a wlbc-format change benefits from
+    /// the user-visible "rebuild with hatch build" hint instead of
+    /// having to grep the error.
+    #[test]
+    fn load_rejects_older_version_with_rebuild_hint() {
+        if VERSION == 0 {
+            return; // can't synthesise a lower version
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        buf.extend_from_slice(&(VERSION - 1).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let err = match load(&buf) {
+            Err(e) => e,
+            Ok(_) => panic!("stale version should reject"),
+        };
+        assert!(matches!(err, SerializeError::VersionMismatch { .. }));
+        let msg = format!("{}", err);
+        assert!(msg.contains(&format!("v{}", VERSION)));
+        assert!(msg.contains(&format!("v{}", VERSION - 1)));
+        assert!(
+            msg.contains("hatch build"),
+            "expected rebuild guidance, got: {}",
+            msg
+        );
     }
 
     #[test]

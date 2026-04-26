@@ -801,10 +801,22 @@ impl VM {
                     blob.var_names,
                 ),
                 Err(e) => {
-                    eprintln!(
+                    // A `decode:` failure here usually means the
+                    // artifact was built against an older wren_lift
+                    // whose VERSION constant didn't get bumped before
+                    // the format drifted. Surface a hint pointing at
+                    // the rebuild remediation alongside the raw error.
+                    let mut diag = crate::diagnostics::Diagnostic::error(format!(
                         "hatch module '{}' failed to load its wlbc payload: {}",
                         module_name, e
-                    );
+                    ));
+                    if matches!(e, crate::serialize::SerializeError::Decode(_)) {
+                        diag = diag.with_note(
+                            "this is usually a stale artifact — rebuild it with `hatch build` \
+                             against the current wren_lift sources",
+                        );
+                    }
+                    diag.eprint_no_source();
                     return InterpretResult::CompileError;
                 }
             };
