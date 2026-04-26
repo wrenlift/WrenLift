@@ -76,6 +76,12 @@ pub enum SectionKind {
     /// rejected by the loader today so forward-compat hatches don't
     /// silently run on a build that can't honor them.
     NativeLib = 3,
+    /// UTF-8 source text for a Wren module. Section name matches the
+    /// module's compiled Wlbc name. Carried so runtime errors that
+    /// originate inside a hatch-bundled module can render through the
+    /// same ariadne label / span path the on-disk module loader uses;
+    /// without source the loader falls back to bare prose.
+    Source = 4,
 }
 
 impl SectionKind {
@@ -85,6 +91,7 @@ impl SectionKind {
             1 => Some(SectionKind::Wlbc),
             2 => Some(SectionKind::Resource),
             3 => Some(SectionKind::NativeLib),
+            4 => Some(SectionKind::Source),
             _ => None,
         }
     }
@@ -729,6 +736,18 @@ fn build_recursive(
             name: module_name.clone(),
             data: blob,
         });
+        // Bundle the original source text alongside the compiled
+        // bytecode so runtime errors raised inside the module can
+        // render through ariadne labels at install time. Adds the
+        // source bytes to the artifact (typically <10% of the total
+        // — wlbc + native libs dominate) but turns a "Class does
+        // not implement 'create(_)'" runtime error into a labelled
+        // span pointing at the actual call site.
+        sections.push(Section {
+            kind: SectionKind::Source,
+            name: module_name.clone(),
+            data: source.into_bytes(),
+        });
         module_names.push(module_name.clone());
     }
 
@@ -819,6 +838,14 @@ fn rename_entry_to_manifest_name(
         )));
     };
     section.name = new.clone();
+    // Rename the matching Source section too so error reporting can
+    // still find the source by module name.
+    if let Some(src_section) = sections
+        .iter_mut()
+        .find(|s| matches!(s.kind, SectionKind::Source) && s.name == old)
+    {
+        src_section.name = new.clone();
+    }
 
     // Mirror the rename in the module list so the install loop
     // asks for the new name when it iterates manifest.modules.
@@ -1040,11 +1067,14 @@ fn merge_path_dependencies(
         merged_modules.extend(std::mem::take(&mut manifest.modules));
         manifest.modules = merged_modules;
 
-        // Carry over Wlbc / NativeLib sections the dep bundled.
-        // Diamond-dep sections (same name+kind+bytes) silently dedupe;
-        // genuine collisions still error.
+        // Carry over Wlbc / NativeLib / Source sections the dep
+        // bundled. Diamond-dep sections (same name+kind+bytes) silently
+        // dedupe; genuine collisions still error.
         for section in dep_hatch.sections {
-            if matches!(section.kind, SectionKind::Wlbc | SectionKind::NativeLib) {
+            if matches!(
+                section.kind,
+                SectionKind::Wlbc | SectionKind::NativeLib | SectionKind::Source
+            ) {
                 if let Some(existing) = sections
                     .iter()
                     .find(|s| s.name == section.name && s.kind == section.kind)

@@ -581,7 +581,8 @@ impl VM {
 
         // 6. Serialize.
         crate::serialize::emit(&interner, &module_mir, &var_names).map_err(|e| {
-            eprintln!("failed to emit .wlbc: {}", e);
+            crate::diagnostics::Diagnostic::error(format!("failed to emit .wlbc: {}", e))
+                .eprint_no_source();
             InterpretResult::CompileError
         })
     }
@@ -756,6 +757,19 @@ impl VM {
         let result = self.extract_hatch_native_sections(hatch);
         if !matches!(result, InterpretResult::Success) {
             return result;
+        }
+
+        // Source sections carry the original .wren text alongside the
+        // compiled wlbc. Stash each into `module_sources` so a runtime
+        // error raised inside this module renders through ariadne's
+        // labelled-span path rather than the bare-prose fallback.
+        for section in &hatch.sections {
+            if matches!(section.kind, crate::hatch::SectionKind::Source) {
+                if let Ok(text) = std::str::from_utf8(&section.data) {
+                    self.module_sources
+                        .insert(section.name.clone(), text.to_string());
+                }
+            }
         }
 
         for module_name in &hatch.manifest.modules {
@@ -1176,7 +1190,8 @@ impl VM {
                 Some(prev) if mtime > prev + 0.0001 => {
                     eprintln!("wlift: reloading {}", name);
                     if let Err(e) = self.reload_module(&name) {
-                        eprintln!("wlift: reload failed: {}", e);
+                        crate::diagnostics::Diagnostic::error(format!("reload failed: {}", e))
+                            .eprint_no_source();
                     } else {
                         reloaded.push(name);
                     }
@@ -1225,7 +1240,10 @@ impl VM {
                     .call_closure_sync(closure, &[path_value], None)
                     .is_none()
                 {
-                    eprintln!("wlift: reload callback returned an error");
+                    crate::diagnostics::Diagnostic::warning(
+                        "reload callback returned an error",
+                    )
+                    .eprint_no_source();
                 }
             }
         }
@@ -1263,7 +1281,10 @@ impl VM {
                     .call_closure_sync(closure, &[path_value], None)
                     .is_none()
                 {
-                    eprintln!("wlift: file-watch callback returned an error");
+                    crate::diagnostics::Diagnostic::warning(
+                        "file-watch callback returned an error",
+                    )
+                    .eprint_no_source();
                 }
             }
         }
@@ -1282,7 +1303,10 @@ impl VM {
                     .call_closure_sync(closure, &[path_value], None)
                     .is_none()
                 {
-                    eprintln!("wlift: before-reload callback returned an error");
+                    crate::diagnostics::Diagnostic::warning(
+                        "before-reload callback returned an error",
+                    )
+                    .eprint_no_source();
                 }
             }
         }
@@ -1648,7 +1672,11 @@ impl VM {
                 ) {
                     Ok(lib) => {
                         if trace {
-                            eprintln!("wrenlift: loaded native library '{}'", lib_name);
+                            crate::diagnostics::Diagnostic::info(format!(
+                                "loaded native library '{}'",
+                                lib_name
+                            ))
+                            .eprint_no_source();
                         }
                         unsafe {
                             (*class_ptr).is_foreign = true;
@@ -1672,26 +1700,29 @@ impl VM {
                                         sig_sym
                                     };
                                     if trace {
-                                        eprintln!(
-                                            "wrenlift: bound '{}' → {} (sym={})",
+                                        crate::diagnostics::Diagnostic::info(format!(
+                                            "bound '{}' → {} (sym={})",
                                             fm.signature,
                                             symbol_name,
                                             bind_sym.index(),
-                                        );
+                                        ))
+                                        .eprint_no_source();
                                     }
                                     unsafe {
                                         (*class_ptr).bind_foreign_c(bind_sym, func);
                                     }
                                 }
                                 Err(err) => {
-                                    eprintln!("wrenlift: {}", err);
+                                    crate::diagnostics::Diagnostic::error(err.to_string())
+                                        .eprint_no_source();
                                 }
                             }
                         }
                         self.native_libs.push(lib);
                     }
                     Err(err) => {
-                        eprintln!("wrenlift: {}", err);
+                        crate::diagnostics::Diagnostic::error(err.to_string())
+                            .eprint_no_source();
                     }
                 }
             } else if !class_mir.foreign_methods.is_empty() {
@@ -1699,10 +1730,11 @@ impl VM {
                 // when #!native is absent. Surface a diagnostic so silent
                 // "method not found" errors aren't mysterious.
                 let class_name = self.interner.resolve(class_mir.name).to_string();
-                eprintln!(
-                    "wrenlift: class '{}' has foreign methods but no #!native directive",
+                crate::diagnostics::Diagnostic::warning(format!(
+                    "class '{}' has foreign methods but no #!native directive",
                     class_name
-                );
+                ))
+                .eprint_no_source();
             }
 
             // Store class in module vars
@@ -1987,14 +2019,27 @@ impl VM {
                 return;
             }
         }
-        // Fallback: no source location available
-        let msg = format!("{}", error);
+        // Fallback: no source location available (e.g. error
+        // raised inside a hatch-bundled module that didn't ship
+        // its source section). Still go through the Diagnostic
+        // formatter so the output matches the labelled-span path
+        // visually — same colored "Error:" header, same Note rows
+        // for context + stack trace.
+        let mut diag = crate::diagnostics::Diagnostic::error(error.to_string());
+        if let Some(help) = Self::error_help(error) {
+            diag = diag.with_note(help);
+        }
         let trace = self.build_full_fiber_trace(fiber);
         if !trace.is_empty() {
-            let full = format!("{}\n{}", msg, trace.join("\n"));
-            self.report_error(&full);
+            let trace_str = format!("stack trace:\n{}", trace.join("\n"));
+            diag = diag.with_note(trace_str);
+        }
+        if self.output_buffer.is_some() {
+            // Test harness — render to string so error_fn captures it.
+            let rendered = diag.render_to_string("");
+            self.report_error(&rendered);
         } else {
-            self.report_error(&msg);
+            diag.eprint_no_source();
         }
     }
 
@@ -2260,11 +2305,32 @@ impl VM {
     }
 
     /// Report a runtime error.
+    ///
+    /// Two callers:
+    /// - the normal path through `report_runtime_error` which has
+    ///   already pre-rendered a Diagnostic to a String (via
+    ///   `render_to_string`) and just needs the host to surface it
+    ///   verbatim — the message starts with the ariadne ANSI
+    ///   "Error:" header in that case;
+    /// - direct callers that pass raw error prose (e.g. "Could not
+    ///   load module 'X'"), which we wrap in a Diagnostic so every
+    ///   error reaching the user goes through the same formatter.
+    ///
+    /// Test mode (`config.error_fn` set) forwards the message
+    /// verbatim so the test harness can pattern-match on it.
     pub fn report_error(&self, msg: &str) {
         if let Some(ref f) = self.config.error_fn {
             f(ErrorKind::Runtime, "", 0, msg);
+            return;
+        }
+        // If the msg already starts with the rendered ariadne header
+        // (it begins with the colored "Error" sequence), pass it
+        // through as-is. Otherwise wrap raw text in a Diagnostic so
+        // it looks like every other error.
+        if msg.contains("Error]") || msg.starts_with("\x1b[") {
+            eprintln!("{}", msg.trim_end_matches('\n'));
         } else {
-            eprintln!("Runtime error: {}", msg);
+            crate::diagnostics::Diagnostic::error(msg.to_string()).eprint_no_source();
         }
     }
 
