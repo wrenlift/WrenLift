@@ -61,18 +61,17 @@ pub fn function_body_is_pure(
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
-                Instruction::Call { pure_call, .. }
-                    if !*pure_call => {
-                        return false;
-                    }
+                Instruction::Call { pure_call, .. } if !*pure_call => {
+                    return false;
+                }
                 Instruction::CallKnownFunc { func_id, .. }
-                    if oracle.is_pure(*func_id) != Some(true) => {
-                        return false;
-                    }
-                Instruction::CallStaticSelf { .. }
-                    if !assume_self_pure => {
-                        return false;
-                    }
+                    if oracle.is_pure(*func_id) != Some(true) =>
+                {
+                    return false;
+                }
+                Instruction::CallStaticSelf { .. } if !assume_self_pure => {
+                    return false;
+                }
                 Instruction::SuperCall { .. } => return false,
                 // Stores / mutations.
                 Instruction::SetField(..)
@@ -163,18 +162,17 @@ pub fn function_body_is_alloc_free(
                 // Calls — only safe when the target is known and
                 // also alloc-free (oracle map is shared with the
                 // purity run, where alloc-free sits below pure).
-                Instruction::Call { pure_call, .. }
-                    if !*pure_call => {
-                        return false;
-                    }
+                Instruction::Call { pure_call, .. } if !*pure_call => {
+                    return false;
+                }
                 Instruction::CallKnownFunc { func_id, .. }
-                    if oracle.is_pure(*func_id) != Some(true) => {
-                        return false;
-                    }
-                Instruction::CallStaticSelf { .. }
-                    if !assume_self_alloc_free => {
-                        return false;
-                    }
+                    if oracle.is_pure(*func_id) != Some(true) =>
+                {
+                    return false;
+                }
+                Instruction::CallStaticSelf { .. } if !assume_self_alloc_free => {
+                    return false;
+                }
                 Instruction::SuperCall { .. } => return false,
                 // SetField / SetUpvalue / SubscriptSet / module
                 // var stores: writes only, no allocation. Don't

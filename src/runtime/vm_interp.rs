@@ -1879,8 +1879,7 @@ fn run_fiber_with_stop_depth(
                             // submissions, and a stale read could
                             // route a not-actually-alloc-free callee
                             // into the IC fast path.
-                            let force_on =
-                                std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some();
+                            let force_on = std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some();
                             if recv_class == ic.class && is_leaf && force_on {
                                 if std::env::var_os("WLIFT_TRACE_IC_JIT").is_some() {
                                     let fn_idx_ic = ic.func_id as usize;

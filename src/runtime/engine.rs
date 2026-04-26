@@ -894,7 +894,9 @@ impl ExecutionEngine {
             .enumerate()
             .map(|(idx, body)| (idx as u32, body.mir().as_ref()))
             .collect();
-        let purity = Arc::new(crate::mir::opt::purity::compute_purity_map(funcs.iter().copied()));
+        let purity = Arc::new(crate::mir::opt::purity::compute_purity_map(
+            funcs.iter().copied(),
+        ));
         let alloc_free = Arc::new(crate::mir::opt::purity::compute_alloc_free_map(
             funcs.iter().copied(),
         ));
