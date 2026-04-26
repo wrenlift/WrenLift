@@ -1869,17 +1869,19 @@ fn run_fiber_with_stop_depth(
                             // the alloc-free gate for benchmarks /
                             // diagnosis. `WLIFT_DISABLE_IC_JIT=1` turns
                             // the fast path off entirely.
-                            let alloc_free =
-                                vm.engine.func_is_alloc_free(ic.func_id as u32);
+                            // BISECT: temporarily revert the alloc-free
+                            // gate to the previous behavior (env-var
+                            // opt-in only). The Linux x86_64 CI bench
+                            // is dumping core on delta_blue and the
+                            // alloc-free auto-enable is the most
+                            // likely culprit — the analysis runs over
+                            // engine MIR concurrently with JIT
+                            // submissions, and a stale read could
+                            // route a not-actually-alloc-free callee
+                            // into the IC fast path.
                             let force_on =
                                 std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some();
-                            let force_off =
-                                std::env::var_os("WLIFT_DISABLE_IC_JIT").is_some();
-                            if recv_class == ic.class
-                                && is_leaf
-                                && (alloc_free || force_on)
-                                && !force_off
-                            {
+                            if recv_class == ic.class && is_leaf && force_on {
                                 if std::env::var_os("WLIFT_TRACE_IC_JIT").is_some() {
                                     let fn_idx_ic = ic.func_id as usize;
                                     let name = vm
