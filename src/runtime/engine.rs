@@ -483,6 +483,15 @@ pub struct ExecutionEngine {
     /// `functions.len()` snapshot at the point `cached_purity_map`
     /// was built. The map invalidates when the function table grows.
     cached_purity_map_len: usize,
+    /// Cached "this function transitively doesn't allocate" map. Used
+    /// by the IC kind=1 inline JIT-leaf fast path to guarantee that
+    /// the callee can't fire a GC, so register-passed args stay
+    /// valid without JIT-frame stack maps.
+    cached_alloc_free_map: Option<Arc<std::collections::HashMap<u32, bool>>>,
+    /// Vec form of `cached_alloc_free_map` indexed by `FuncId.0` for
+    /// O(1) lookup on the IC hot path. Both share the same
+    /// invalidation key (`functions.len()`).
+    cached_alloc_free_vec: Vec<bool>,
 }
 
 /// Address range of a compiled function's native code.
@@ -558,6 +567,8 @@ impl ExecutionEngine {
             ),
             cached_purity_map: None,
             cached_purity_map_len: 0,
+            cached_alloc_free_map: None,
+            cached_alloc_free_vec: Vec::new(),
         }
     }
 
@@ -852,11 +863,30 @@ impl ExecutionEngine {
     /// post-install rewrite — JIT-time devirt — runs on a *clone* of
     /// the MIR; the engine's authoritative copy is unchanged.
     pub fn compute_callee_purity_map(&mut self) -> Arc<std::collections::HashMap<u32, bool>> {
-        if self.cached_purity_map_len != self.functions.len() {
-            self.cached_purity_map = None;
-        }
-        if let Some(map) = &self.cached_purity_map {
-            return Arc::clone(map);
+        self.refresh_purity_caches();
+        Arc::clone(self.cached_purity_map.as_ref().expect("just refreshed"))
+    }
+
+    /// O(1) lookup: "the function with this id can't fire a GC during
+    /// its body". Used by the IC kind=1 inline JIT-leaf fast path so
+    /// register-passed args stay valid without JIT-frame stack maps.
+    /// Returns false (conservative) for ids past the cached vec.
+    pub fn func_is_alloc_free(&self, func_id: u32) -> bool {
+        self.cached_alloc_free_vec
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Refresh the purity / alloc-free caches if the function table
+    /// has grown since the last build. Both caches share the same
+    /// invalidation key (`functions.len()`) so a single check covers
+    /// both. In-place MIR rewrites for already-installed functions
+    /// don't invalidate; the engine's authoritative copy stays
+    /// unchanged because JIT-time devirt operates on a clone.
+    pub fn refresh_purity_caches(&mut self) {
+        if self.cached_purity_map_len == self.functions.len() && self.cached_purity_map.is_some() {
+            return;
         }
         let funcs: Vec<(u32, &crate::mir::MirFunction)> = self
             .functions
@@ -864,10 +894,20 @@ impl ExecutionEngine {
             .enumerate()
             .map(|(idx, body)| (idx as u32, body.mir().as_ref()))
             .collect();
-        let map = Arc::new(crate::mir::opt::purity::compute_purity_map(funcs));
-        self.cached_purity_map = Some(Arc::clone(&map));
-        self.cached_purity_map_len = self.functions.len();
-        map
+        let purity = Arc::new(crate::mir::opt::purity::compute_purity_map(funcs.iter().copied()));
+        let alloc_free = Arc::new(crate::mir::opt::purity::compute_alloc_free_map(
+            funcs.iter().copied(),
+        ));
+        let n = self.functions.len();
+        self.cached_alloc_free_vec.clear();
+        self.cached_alloc_free_vec.reserve(n);
+        for i in 0..n {
+            self.cached_alloc_free_vec
+                .push(alloc_free.get(&(i as u32)).copied().unwrap_or(false));
+        }
+        self.cached_purity_map = Some(purity);
+        self.cached_alloc_free_map = Some(alloc_free);
+        self.cached_purity_map_len = n;
     }
 
     /// A "pure leaf" function has no internal method calls — Cranelift

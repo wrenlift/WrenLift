@@ -138,6 +138,89 @@ where
     map
 }
 
+/// True if every instruction in `mir` is alloc-free given the
+/// callee oracle. Stricter than "no GC" only in that it also
+/// considers `SuperCall` / `Call { method }` impure (their target
+/// is unknown and might allocate).
+///
+/// Used by the IC fast path: a callee that's transitively
+/// alloc-free can't fire a GC during its body, so register-passed
+/// args stay valid even without JIT-frame stack maps. Impure
+/// stores (`SetField`, etc.) are *fine* here — they don't move
+/// anything in memory; they just write a slot.
+pub fn function_body_is_alloc_free(
+    mir: &MirFunction,
+    oracle: &dyn CalleePurity,
+    assume_self_alloc_free: bool,
+) -> bool {
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            match inst {
+                // Allocations / GC triggers.
+                Instruction::MakeList(..)
+                | Instruction::MakeMap(..)
+                | Instruction::MakeRange(..)
+                | Instruction::MakeClosure { .. }
+                | Instruction::StringConcat(..)
+                | Instruction::ToString(..) => return false,
+                // Calls — only safe when the target is known and
+                // also alloc-free (oracle map is shared with the
+                // purity run, where alloc-free sits below pure).
+                Instruction::Call { pure_call, .. } => {
+                    if !*pure_call {
+                        return false;
+                    }
+                }
+                Instruction::CallKnownFunc { func_id, .. } => {
+                    if oracle.is_pure(*func_id) != Some(true) {
+                        return false;
+                    }
+                }
+                Instruction::CallStaticSelf { .. } => {
+                    if !assume_self_alloc_free {
+                        return false;
+                    }
+                }
+                Instruction::SuperCall { .. } => return false,
+                // SetField / SetUpvalue / SubscriptSet / module
+                // var stores: writes only, no allocation. Don't
+                // bail.
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// Same fixed-point shape as `compute_purity_map` but uses
+/// `function_body_is_alloc_free`. Returned bits are: "this
+/// function (transitively) doesn't trigger a GC."
+pub fn compute_alloc_free_map<'a, I>(funcs: I) -> HashMap<u32, bool>
+where
+    I: IntoIterator<Item = (u32, &'a MirFunction)>,
+{
+    let funcs: Vec<(u32, &MirFunction)> = funcs.into_iter().collect();
+    let mut map: HashMap<u32, bool> = funcs.iter().map(|(id, _)| (*id, true)).collect();
+    for _ in 0..funcs.len().saturating_add(1) {
+        let mut changed = false;
+        for (id, mir) in &funcs {
+            let prev = map.get(id).copied().unwrap_or(true);
+            if !prev {
+                continue;
+            }
+            let alloc_free = function_body_is_alloc_free(mir, &map, true);
+            if !alloc_free {
+                map.insert(*id, false);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

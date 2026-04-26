@@ -1853,34 +1853,32 @@ fn run_fiber_with_stop_depth(
                             let fn_idx_ic = ic.func_id as usize;
                             let is_leaf =
                                 vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
-                            // The IC kind=1 inline JIT-leaf dispatch is
-                            // GC-unsafe by default: the receiver and args
-                            // are passed to the compiled callee in
-                            // registers, and any GC fired *anywhere* in
-                            // the surrounding interpreter loop after this
-                            // path completes (next op's MakeList /
-                            // MakeMap / native helper / etc.) ages those
-                            // register-bound pointers out of any GC root
-                            // set. Even when the JIT'd callee itself is
-                            // alloc-free, the result and other live
-                            // values in `values` straddle the boundary —
-                            // and a chain of fast IC dispatches with one
-                            // intervening allocator triggers the residual
-                            // tiered register-corruption family logged in
-                            // QUIRKS (sprite-grid `Null does not
-                            // implement 'view'`, bouncing-ball
-                            // `subscript get with arity 1`).
+                            // The IC kind=1 inline JIT-leaf dispatch
+                            // passes recv + args in registers, which the
+                            // GC root scanner can't see (no JIT-frame
+                            // stack maps). To stay sound we restrict the
+                            // fast path to callees that transitively
+                            // can't fire a GC: no allocations in the
+                            // body, and no calls that allocate either.
+                            // `func_is_alloc_free` is computed by the
+                            // module-level purity / alloc-free pass and
+                            // lives as a Vec<bool> indexed by FuncId for
+                            // O(1) lookup on this hot path.
                             //
-                            // Set `WLIFT_ENABLE_IC_JIT=1` to opt back in
-                            // for benchmarks like `method_call` that
-                            // depend on this path for ~15× speedup. The
-                            // proper fix needs JIT-frame stack maps OR a
-                            // codegen change that pushes incoming args
-                            // as JIT roots and re-reads them across
-                            // every safepoint inside the function body.
+                            // Setting `WLIFT_ENABLE_IC_JIT=1` overrides
+                            // the alloc-free gate for benchmarks /
+                            // diagnosis. `WLIFT_DISABLE_IC_JIT=1` turns
+                            // the fast path off entirely.
+                            let alloc_free =
+                                vm.engine.func_is_alloc_free(ic.func_id as u32);
+                            let force_on =
+                                std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some();
+                            let force_off =
+                                std::env::var_os("WLIFT_DISABLE_IC_JIT").is_some();
                             if recv_class == ic.class
                                 && is_leaf
-                                && std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some()
+                                && (alloc_free || force_on)
+                                && !force_off
                             {
                                 if std::env::var_os("WLIFT_TRACE_IC_JIT").is_some() {
                                     let fn_idx_ic = ic.func_id as usize;
