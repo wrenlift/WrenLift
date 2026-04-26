@@ -4015,16 +4015,6 @@ impl VM {
         } else {
             std::ptr::null()
         };
-        // BISECT: temporarily default the JIT constructor dispatch
-        // OFF to isolate the intermittent Linux x86_64 delta_blue
-        // core-dump in CI. Set WLIFT_ENABLE_CTOR_JIT=1 to opt back
-        // in. Falls back to the interpreter-driven body further
-        // down (pre-dates the rooting change in a1412e7).
-        let jit_ptr = if std::env::var_os("WLIFT_ENABLE_CTOR_JIT").is_some() {
-            jit_ptr
-        } else {
-            std::ptr::null()
-        };
         if !jit_ptr.is_null() && ctor_args.len() <= 3 {
             // Push every ctor arg as a JIT root so a GC fired during
             // the constructor body (allocations, foreign calls, etc.)
