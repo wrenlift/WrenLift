@@ -1857,6 +1857,50 @@ fn run_fiber_with_stop_depth(
                                 let jit_ptr = ic.jit_ptr;
                                 let recv_bits = recv_val.to_bits();
                                 ensure_ctx_reg();
+                                // Read all arg registers BEFORE publishing
+                                // values to the frame — once we move
+                                // `values` into the frame, the local Vec
+                                // is empty and subsequent get_reg lookups
+                                // would read past the end.
+                                let arg_bits: SmallVec<[u64; 4]> = match argc {
+                                    0 => SmallVec::new(),
+                                    1 => {
+                                        let a1 = read_u16_at(code, arg_regs_pc);
+                                        SmallVec::from_slice(&[get_reg(&values, a1).to_bits()])
+                                    }
+                                    2 => {
+                                        let a1 = read_u16_at(code, arg_regs_pc);
+                                        let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                        SmallVec::from_slice(&[
+                                            get_reg(&values, a1).to_bits(),
+                                            get_reg(&values, a2).to_bits(),
+                                        ])
+                                    }
+                                    _ => {
+                                        let a1 = read_u16_at(code, arg_regs_pc);
+                                        let a2 = read_u16_at(code, arg_regs_pc + 2);
+                                        let a3 = read_u16_at(code, arg_regs_pc + 4);
+                                        SmallVec::from_slice(&[
+                                            get_reg(&values, a1).to_bits(),
+                                            get_reg(&values, a2).to_bits(),
+                                            get_reg(&values, a3).to_bits(),
+                                        ])
+                                    }
+                                };
+                                // Publish caller's register file to its
+                                // MirCallFrame so a GC fired by the JIT
+                                // callee (or a runtime helper it calls
+                                // through to) can update every still-live
+                                // pointer the caller will read after the
+                                // call returns. The same fix lives on the
+                                // slow-path inline JIT dispatch below;
+                                // both spots used to leak the local
+                                // `values` Vec out of the GC's root set.
+                                unsafe {
+                                    let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                    frame.pc = pc;
+                                    frame.values = std::mem::take(&mut values);
+                                }
                                 let result_bits = unsafe {
                                     match argc {
                                         0 => {
@@ -1865,37 +1909,34 @@ fn run_fiber_with_stop_depth(
                                             f(recv_bits)
                                         }
                                         1 => {
-                                            let a1 = read_u16_at(code, arg_regs_pc);
                                             let f: extern "C" fn(u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
-                                            f(recv_bits, get_reg(&values, a1).to_bits())
+                                            f(recv_bits, arg_bits[0])
                                         }
                                         2 => {
-                                            let a1 = read_u16_at(code, arg_regs_pc);
-                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
                                             let f: extern "C" fn(u64, u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
-                                            f(
-                                                recv_bits,
-                                                get_reg(&values, a1).to_bits(),
-                                                get_reg(&values, a2).to_bits(),
-                                            )
+                                            f(recv_bits, arg_bits[0], arg_bits[1])
                                         }
                                         _ => {
-                                            let a1 = read_u16_at(code, arg_regs_pc);
-                                            let a2 = read_u16_at(code, arg_regs_pc + 2);
-                                            let a3 = read_u16_at(code, arg_regs_pc + 4);
                                             let f: extern "C" fn(u64, u64, u64, u64) -> u64 =
                                                 std::mem::transmute(jit_ptr);
                                             f(
                                                 recv_bits,
-                                                get_reg(&values, a1).to_bits(),
-                                                get_reg(&values, a2).to_bits(),
-                                                get_reg(&values, a3).to_bits(),
+                                                arg_bits[0],
+                                                arg_bits[1],
+                                                arg_bits[2],
                                             )
                                         }
                                     }
                                 };
+                                // Reload the (possibly GC-updated)
+                                // register file from the frame.
+                                unsafe {
+                                    values = std::mem::take(
+                                        &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                                    );
+                                }
                                 set_reg(&mut values, dst, Value::from_bits(result_bits));
                                 steps += 1;
                                 continue;
@@ -2136,6 +2177,31 @@ fn run_fiber_with_stop_depth(
                                     });
                                     ensure_ctx_reg();
                                     let recv_bits = recv_val.to_bits();
+                                    // Publish the caller's register file to
+                                    // its frame BEFORE the JIT call so
+                                    // GC running mid-callee (allocations
+                                    // inside the JIT'd code, runtime
+                                    // helpers that allocate, etc.) can see
+                                    // every Value still live in the caller
+                                    // and update its pointers if objects
+                                    // move. Without this, a generational
+                                    // GC promote moved a List behind the
+                                    // caller's local `values` Vec while
+                                    // the JIT callee was running — every
+                                    // subsequent op against that register
+                                    // dereferenced freed memory and
+                                    // surfaced as misdispatched ops
+                                    // ("subscript get with arity 1" on
+                                    // what should have been a method
+                                    // call, "Null does not implement X"
+                                    // on a still-live wrapper). PC is
+                                    // also written so a fiber suspend
+                                    // mid-call resumes correctly.
+                                    unsafe {
+                                        let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                        frame.pc = pc;
+                                        frame.values = std::mem::take(&mut values);
+                                    }
                                     let result_bits = unsafe {
                                         match argc {
                                             0 => {
@@ -2169,6 +2235,15 @@ fn run_fiber_with_stop_depth(
                                             }
                                         }
                                     };
+                                    // Reload the caller's register file —
+                                    // GC during the call may have updated
+                                    // entries through the frame.values
+                                    // root we published above.
+                                    unsafe {
+                                        values = std::mem::take(
+                                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                                        );
+                                    }
                                     // Restore the caller's module context so
                                     // the next interpreter ops read from the
                                     // right module_vars.
