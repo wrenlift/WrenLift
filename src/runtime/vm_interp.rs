@@ -1853,7 +1853,47 @@ fn run_fiber_with_stop_depth(
                             let fn_idx_ic = ic.func_id as usize;
                             let is_leaf =
                                 vm.engine.jit_leaf.get(fn_idx_ic).copied().unwrap_or(false);
-                            if recv_class == ic.class && is_leaf {
+                            // The IC kind=1 inline JIT-leaf dispatch is
+                            // GC-unsafe by default: the receiver and args
+                            // are passed to the compiled callee in
+                            // registers, and any GC fired *anywhere* in
+                            // the surrounding interpreter loop after this
+                            // path completes (next op's MakeList /
+                            // MakeMap / native helper / etc.) ages those
+                            // register-bound pointers out of any GC root
+                            // set. Even when the JIT'd callee itself is
+                            // alloc-free, the result and other live
+                            // values in `values` straddle the boundary —
+                            // and a chain of fast IC dispatches with one
+                            // intervening allocator triggers the residual
+                            // tiered register-corruption family logged in
+                            // QUIRKS (sprite-grid `Null does not
+                            // implement 'view'`, bouncing-ball
+                            // `subscript get with arity 1`).
+                            //
+                            // Set `WLIFT_ENABLE_IC_JIT=1` to opt back in
+                            // for benchmarks like `method_call` that
+                            // depend on this path for ~15× speedup. The
+                            // proper fix needs JIT-frame stack maps OR a
+                            // codegen change that pushes incoming args
+                            // as JIT roots and re-reads them across
+                            // every safepoint inside the function body.
+                            if recv_class == ic.class
+                                && is_leaf
+                                && std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some()
+                            {
+                                if std::env::var_os("WLIFT_TRACE_IC_JIT").is_some() {
+                                    let fn_idx_ic = ic.func_id as usize;
+                                    let name = vm
+                                        .engine
+                                        .get_mir(FuncId(fn_idx_ic as u32))
+                                        .map(|m| vm.interner.resolve(m.name).to_string())
+                                        .unwrap_or_else(|| "<unknown>".into());
+                                    eprintln!(
+                                        "ic-jit: dispatch fn_idx={} name='{}' argc={}",
+                                        fn_idx_ic, name, argc
+                                    );
+                                }
                                 let jit_ptr = ic.jit_ptr;
                                 ensure_ctx_reg();
                                 // Read recv + arg values, then push them
@@ -2846,7 +2886,27 @@ fn run_fiber_with_stop_depth(
                         let reg = read_u16(code, &mut pc);
                         elements.push(get_reg(&values, reg));
                     }
-                    set_reg(&mut values, dst, vm.new_list(elements));
+                    // `vm.new_list` allocates and may trigger GC.
+                    // Publish the caller's register file to its frame
+                    // so every still-live pointer in `values` gets
+                    // traced through `mir_frames`. Without this,
+                    // generational promote moves objects behind the
+                    // local Vec — the next op then dereferences a
+                    // stale pointer and surfaces as "Null does not
+                    // implement X" on a wrapper that's actually
+                    // still alive at its post-promote address.
+                    unsafe {
+                        let frame = (*fiber).mir_frames.last_mut().unwrap();
+                        frame.pc = pc;
+                        frame.values = std::mem::take(&mut values);
+                    }
+                    let result = vm.new_list(elements);
+                    unsafe {
+                        values = std::mem::take(
+                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                        );
+                    }
+                    set_reg(&mut values, dst, result);
                 }
                 Op::MakeMap => {
                     let dst = read_u16(code, &mut pc);
@@ -2862,7 +2922,16 @@ fn run_fiber_with_stop_depth(
                         crate::codegen::runtime_fns::push_jit_root(val);
                         entries.push(());
                     }
-
+                    // Publish the caller's register file before any
+                    // allocator path runs — see Op::MakeList. The
+                    // key/value JIT-roots above protect the new
+                    // map's own contents; only the surrounding
+                    // local Vec needs the frame.values dance.
+                    unsafe {
+                        let frame = (*fiber).mir_frames.last_mut().unwrap();
+                        frame.pc = pc;
+                        frame.values = std::mem::take(&mut values);
+                    }
                     let map_val = vm.new_map();
                     crate::codegen::runtime_fns::push_jit_root(map_val);
                     if count > 0 {
@@ -2881,6 +2950,11 @@ fn run_fiber_with_stop_depth(
                         root_len_before + entries.len() * 2,
                     );
                     crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                    unsafe {
+                        values = std::mem::take(
+                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                        );
+                    }
                     set_reg(&mut values, dst, map_val);
                 }
                 Op::StringConcat => {
@@ -2891,7 +2965,19 @@ fn run_fiber_with_stop_depth(
                         let reg = read_u16(code, &mut pc);
                         result.push_str(&value_to_string(vm, get_reg(&values, reg)));
                     }
-                    set_reg(&mut values, dst, vm.new_string(result));
+                    // Same rationale as MakeList — `vm.new_string` allocates.
+                    unsafe {
+                        let frame = (*fiber).mir_frames.last_mut().unwrap();
+                        frame.pc = pc;
+                        frame.values = std::mem::take(&mut values);
+                    }
+                    let result_val = vm.new_string(result);
+                    unsafe {
+                        values = std::mem::take(
+                            &mut (*fiber).mir_frames.last_mut().unwrap().values,
+                        );
+                    }
+                    set_reg(&mut values, dst, result_val);
                 }
 
                 // =============================================================
