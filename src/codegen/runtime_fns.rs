@@ -2070,32 +2070,17 @@ pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
 }
 extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_addr: u64) -> u64 {
     note_wren_call_entry();
-    // Push the receiver as a JIT root before dispatch so a GC fired
-    // by the callee's allocator (or any nested helper) can update
-    // the pointer through the shared roots Vec — register-passed
-    // u64 args are otherwise invisible to the collector and decay
-    // to freed memory the moment generational promote runs.
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &[recv]) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        // Re-read recv from the roots after push_jit_frame in case
-        // it allocates — keeps the dispatch in lockstep with the
-        // GC's view.
-        let recv = jit_root_at(root_base);
-        let result = dispatch_call(recv, method, &[recv]);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+    let recv = Value::from_bits(receiver);
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &[recv]) {
+        return result;
+    }
+    push_jit_frame(
+        jit_fp as usize,
+        read_jit_ctx().current_func_id as u32,
+        ret_addr as usize,
+    );
+    let result = dispatch_call(recv, method, &[recv]);
+    pop_jit_frame();
     result
 }
 
@@ -2134,28 +2119,18 @@ extern "C" fn wren_call_1_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    // Root recv + a0 — see wren_call_0_inner for the rationale.
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1)];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1)];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+    let recv = Value::from_bits(receiver);
+    let args = [recv, Value::from_bits(a0)];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
+    push_jit_frame(
+        jit_fp as usize,
+        read_jit_ctx().current_func_id as u32,
+        ret_addr as usize,
+    );
+    let result = dispatch_call(recv, method, &args);
+    pop_jit_frame();
     result
 }
 
@@ -2195,28 +2170,18 @@ extern "C" fn wren_call_2_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    push_jit_root(Value::from_bits(a1));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1), jit_root_at(root_base + 2)];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [recv, jit_root_at(root_base + 1), jit_root_at(root_base + 2)];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+    let recv = Value::from_bits(receiver);
+    let args = [recv, Value::from_bits(a0), Value::from_bits(a1)];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
+    push_jit_frame(
+        jit_fp as usize,
+        read_jit_ctx().current_func_id as u32,
+        ret_addr as usize,
+    );
+    let result = dispatch_call(recv, method, &args);
+    pop_jit_frame();
     result
 }
 
@@ -2270,39 +2235,23 @@ extern "C" fn wren_call_3_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    push_jit_root(Value::from_bits(a1));
-    push_jit_root(Value::from_bits(a2));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-        ];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-        ];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+    let recv = Value::from_bits(receiver);
+    let args = [
+        recv,
+        Value::from_bits(a0),
+        Value::from_bits(a1),
+        Value::from_bits(a2),
+    ];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
+    push_jit_frame(
+        jit_fp as usize,
+        read_jit_ctx().current_func_id as u32,
+        ret_addr as usize,
+    );
+    let result = dispatch_call(recv, method, &args);
+    pop_jit_frame();
     result
 }
 
@@ -2347,42 +2296,24 @@ extern "C" fn wren_call_4_inner(
     ret_addr: u64,
 ) -> u64 {
     note_wren_call_entry();
-    let root_base = jit_roots_snapshot_len();
-    push_jit_root(Value::from_bits(receiver));
-    push_jit_root(Value::from_bits(a0));
-    push_jit_root(Value::from_bits(a1));
-    push_jit_root(Value::from_bits(a2));
-    push_jit_root(Value::from_bits(a3));
-    let result = (|| {
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-            jit_root_at(root_base + 4),
-        ];
-        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
-            return result;
-        }
-        push_jit_frame(
-            jit_fp as usize,
-            read_jit_ctx().current_func_id as u32,
-            ret_addr as usize,
-        );
-        let recv = jit_root_at(root_base);
-        let args = [
-            recv,
-            jit_root_at(root_base + 1),
-            jit_root_at(root_base + 2),
-            jit_root_at(root_base + 3),
-            jit_root_at(root_base + 4),
-        ];
-        let result = dispatch_call(recv, method, &args);
-        pop_jit_frame();
-        result
-    })();
-    jit_roots_restore_len(root_base);
+    let recv = Value::from_bits(receiver);
+    let args = [
+        recv,
+        Value::from_bits(a0),
+        Value::from_bits(a1),
+        Value::from_bits(a2),
+        Value::from_bits(a3),
+    ];
+    if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+        return result;
+    }
+    push_jit_frame(
+        jit_fp as usize,
+        read_jit_ctx().current_func_id as u32,
+        ret_addr as usize,
+    );
+    let result = dispatch_call(recv, method, &args);
+    pop_jit_frame();
     result
 }
 
