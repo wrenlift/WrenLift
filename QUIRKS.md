@@ -9,8 +9,31 @@ rationale for anyone who reads just this file.
 
 ### Game examples corrupt locals in tiered mode (frame.view null, subscript_get arity 1)
 
-Status: **partially fixed (commit 518e4a7) — root cause confirmed,
-one more unsafely-rooted-locals path still surfaces**
+Status: **fixed by gating the IC kind=1 inline JIT fast path off by
+default (commit a646e82); proper fix needs JIT stack maps**
+
+The IC inline JIT-leaf dispatch passes recv + args to the compiled
+callee in registers. Even after pushing them as JIT roots before
+the call (commit fddbd6c), the JIT'd body itself reads those args
+back from registers, not the roots Vec — and any GC fired anywhere
+in the surrounding interpreter loop after this path completes
+(next op's MakeList / MakeMap / native helper / etc.) ages those
+register-bound pointers out of any GC root set. Even when the
+JIT'd callee itself is alloc-free, the result and other live
+values straddle the boundary; a chain of fast IC dispatches with
+one intervening allocator triggers the corruption.
+
+Until JIT-frame stack maps land, the IC kind=1 path is opt-in via
+`WLIFT_ENABLE_IC_JIT=1`. Game examples (sprite-grid, cube-3d,
+ecs, bouncing-ball) run cleanly under `--mode tiered` with the
+default off. method_call benchmark regresses ~45% (90ms → 131ms);
+fib still 21× faster than std Wren.
+
+Audit also surfaced and fixed: `Op::MakeList`, `Op::MakeMap`,
+`Op::StringConcat` now publish the caller's register file to
+`frame.values` before invoking the allocator. The four
+`wren_call_N` runtime helpers root their receiver + args before
+dispatch.
 
 Two JIT-leaf inline dispatch paths in `vm_interp` (slow-path
 Op::Call after IC miss; IC fast path on subsequent hits) used to
@@ -85,7 +108,14 @@ making progress.
 
 ### `@hatch:web` `App.listen` hangs in tiered mode
 
-Status: **open (workaround: `--mode interpreter`)**
+Status: **fixed downstream of the IC-fast-path gating (commit
+a646e82, 2026-04-26)**
+
+Same root cause as the game-example register-corruption above:
+the listen loop's `tryAccept` foreign call returned a wrapper
+that subsequent ops dereferenced via stale register pointers.
+With `WLIFT_ENABLE_IC_JIT` off by default, `wlift --mode tiered
+web-hello.hatch` serves both `/` and `/hi/:who` correctly.
 
 ```
 $ wlift --mode tiered web-hello.hatch &
