@@ -2166,11 +2166,23 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 // instances now resolved, the per-callee purity map
                 // can let memory-read merges survive across user-
                 // defined pure helpers (Phase 6 step 2).
-                if let Some(purity) = callee_purity.clone() {
-                    use crate::mir::opt::cse::Cse;
-                    use crate::mir::opt::MirPass;
-                    let cse = Cse::with_callee_purity(purity);
-                    cse.run(&mut devirt_mir);
+                // Post-devirt CSE is opt-in via WLIFT_ENABLE_POSTDEVIRT_CSE.
+                // Default off until the intermittent CI delta_blue
+                // core-dump on Linux x86_64 is root-caused — local
+                // macOS aarch64 runs are clean but the Linux runner
+                // hits a SIGSEGV/SIGABRT after ~1s consistently.
+                // The kill switch lets bench / production runs use
+                // the safer (non-CSE) post-devirt path while we
+                // bisect; setting WLIFT_ENABLE_POSTDEVIRT_CSE=1
+                // re-enables it for benchmarks where the win is
+                // measurable and the inputs are known-safe.
+                if std::env::var_os("WLIFT_ENABLE_POSTDEVIRT_CSE").is_some() {
+                    if let Some(purity) = callee_purity.clone() {
+                        use crate::mir::opt::cse::Cse;
+                        use crate::mir::opt::MirPass;
+                        let cse = Cse::with_callee_purity(purity);
+                        cse.run(&mut devirt_mir);
+                    }
                 }
                 &devirt_mir
             } else {
