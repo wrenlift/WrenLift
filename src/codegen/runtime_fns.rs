@@ -1832,6 +1832,21 @@ fn handle_jit_fiber_action(
     // Determine Call vs Transfer before destructuring moves the enum.
     let is_call = matches!(&action, FiberAction::Call { .. });
 
+    // Save the caller's JIT context — `run_fiber` below drives the
+    // bytecode interpreter on the target fiber, which resets the
+    // JitContext on every loop iteration to point at the active
+    // frame's module. When the child eventually yields/completes
+    // and we return to the caller's JIT'd code, that JIT'd code
+    // expects its own module's `module_vars` / `module_name` /
+    // `closure` / `defining_class` / `current_func_id` —
+    // otherwise downstream `wren_get_module_var` reads the wrong
+    // slot table (e.g. an `@hatch:web` closure dispatched
+    // mid-listen would inherit the SSE writer's module after a
+    // yield, and `listener.tryAccept` would resolve `listener`
+    // against the wrong module).
+    let saved_jit_ctx = read_jit_ctx();
+    let saved_jit_depth = jit_depth();
+
     match action {
         FiberAction::Call { target, value } | FiberAction::Transfer { target, value } => {
             let caller = vm.fiber;
@@ -1889,9 +1904,14 @@ fn handle_jit_fiber_action(
                     (*caller).state = FiberState::Running;
                 }
                 vm.fiber = caller;
+                set_jit_context(saved_jit_ctx);
+                set_jit_depth(saved_jit_depth);
                 if let Some(v) = yield_val {
                     return v.to_bits();
                 }
+            } else {
+                set_jit_context(saved_jit_ctx);
+                set_jit_depth(saved_jit_depth);
             }
             match result {
                 Ok(v) => v.to_bits(),
