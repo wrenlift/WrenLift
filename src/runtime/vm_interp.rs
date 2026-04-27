@@ -3767,10 +3767,26 @@ fn dispatch_closure_bc_inner(
             .and_then(|t| t.as_ref())
             .is_some();
         if has_tc {
+            // Resolve module_vars against the *callee's* defining
+            // module, not the caller's. Without this, a route handler
+            // closure registered in `main.wren` and dispatched via the
+            // threaded path from `@hatch:web`'s listen loop would see
+            // `@hatch:web`'s module-var slots — every `GetModuleVar @N`
+            // inside the closure would resolve to whatever class
+            // happens to live at slot N in @hatch:web (e.g. `page`
+            // would silently rewrite to the `HxResponse` class), and
+            // anything that did `arg is String` would die with
+            // "Right operand must be a class" because String is at
+            // a different slot in main vs @hatch:web.
+            let callee_module_name = vm
+                .engine
+                .func_module(target_func_id)
+                .cloned()
+                .unwrap_or_else(|| Rc::clone(module_name));
             let (mv_ptr, mv_count) = vm
                 .engine
                 .modules
-                .get(module_name.as_str())
+                .get(callee_module_name.as_str())
                 .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
                 .unwrap_or((std::ptr::null_mut(), 0));
             let vm_ptr = vm as *mut VM as *mut u8;
@@ -3785,7 +3801,7 @@ fn dispatch_closure_bc_inner(
                     bc.ic_table.get()
                 });
             // Set JIT context so wren_call_N slow path works.
-            let mod_name_bytes = module_name.as_bytes();
+            let mod_name_bytes = callee_module_name.as_bytes();
             crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                 ctx.vm = vm_ptr;
                 ctx.module_vars = mv_ptr;

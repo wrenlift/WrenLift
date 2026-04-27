@@ -9,7 +9,36 @@ rationale for anyone who reads just this file.
 
 ### `@hatch:web` request handler returns null in tiered mode (counter / chat)
 
-Status: **open, repro narrowed but not root-caused**
+Status: **fixed (commit pending, 2026-04-27)**
+
+Root cause: `dispatch_closure_bc`'s **threaded interpreter
+fast path** built its `JitContext` with the *caller's* module
+storage instead of the *callee's*. When `@hatch:web`'s listen
+loop dispatched a user-registered route handler closure, the
+closure's body inherited `@hatch:web`'s `module_vars`, so every
+`GetModuleVar @N` resolved against the wrong slot table.
+
+Concretely, `var page = Css.tw("...")` in `main.wren` would
+read back as the `HxResponse` class object from inside the
+handler closure (because slot N in `@hatch:web` happens to
+hold `HxResponse`), and any `arg is String` / `value is
+Response` check downstream raised "Right operand must be a
+class" because the loaded "class" was a Style instance, a
+Map, etc.
+
+Fix: in the `has_tc` (threaded code installed) branch of
+`dispatch_closure_bc_inner`, look up `module_vars` against
+`vm.engine.func_module(target_func_id)` instead of the caller's
+`module_name` parameter. Mirrors what the JIT-dispatch branch
+above already does and what `dispatch_closure_bc`'s callee
+context section does for the JitContext setup.
+
+The non-threaded JIT branch and the bytecode-fallback branch
+were already correct; this was a single missed swap on the
+threaded path. Counter / chat / hello all serve the right HTML
+in tiered mode after the fix; 845 lib + 108 e2e green.
+
+Original investigation notes preserved:
 
 `hatch run hatch/examples/web/counter` returns `204 No Content`
 for `GET /` in tiered mode but the correct HTML in
