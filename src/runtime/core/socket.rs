@@ -144,39 +144,48 @@ fn tcp_try_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(id) = resolve_id(ctx, args[1], "Tcp.tryAccept") else {
         return Value::null();
     };
-    let listener = {
-        let reg = tcp_listeners().lock().unwrap();
-        match reg.get(&id) {
-            Some(l) => match l.try_clone() {
-                Ok(c) => c,
-                Err(e) => {
-                    ctx.runtime_error(format!("Tcp.tryAccept: {}: {}", id, e));
-                    return Value::null();
-                }
-            },
-            None => {
-                ctx.runtime_error(format!("Tcp.tryAccept: listener {} not found.", id));
-                return Value::null();
-            }
+    // Hold the registry mutex over the `accept()` syscall instead of
+    // dup'ing the listener fd per call. `try_clone()` is `dup(2)`;
+    // on macOS a tight tryAccept polling loop that calls
+    // `set_nonblocking()` on the dup'd fd and lets it `close()` on
+    // drop leaves the listener fd's accept queue in a state where
+    // pending connections never get reported, even though `netstat`
+    // shows them as ESTABLISHED. Reproduces every time on
+    // @hatch:web's SSE chat in tiered mode: the SSE serve fiber
+    // parks on `Subscription_.receive`'s `Fiber.yield`, the accept
+    // loop hammers tryAccept, and every subsequent POST connection
+    // sits queued forever.
+    //
+    // Holding the mutex across the syscall is fine here — Wren is
+    // single-threaded, the accept loop runs on one fiber per
+    // listener, and each iteration yields, so this never contends.
+    let reg = tcp_listeners().lock().unwrap();
+    let listener = match reg.get(&id) {
+        Some(l) => l,
+        None => {
+            drop(reg);
+            ctx.runtime_error(format!("Tcp.tryAccept: listener {} not found.", id));
+            return Value::null();
         }
     };
-    if let Err(e) = listener.set_nonblocking(true) {
-        ctx.runtime_error(format!("Tcp.tryAccept: {}: {}", id, e));
-        return Value::null();
-    }
-    match listener.accept() {
+    let _ = listener.set_nonblocking(true);
+    let result = listener.accept();
+    match result {
         Ok((stream, _peer)) => {
             // Hand the stream back in blocking mode regardless of
             // the listener's flag — callers expect `read`/`write`
             // on the returned id to be synchronous by default.
             let _ = stream.set_nonblocking(false);
             let sid = next_id();
+            drop(reg);
             tcp_streams().lock().unwrap().insert(sid, stream);
             Value::num(sid as f64)
         }
         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Value::null(),
         Err(e) => {
-            ctx.runtime_error(format!("Tcp.tryAccept: {}: {}", id, e));
+            let msg = format!("Tcp.tryAccept: {}: {}", id, e);
+            drop(reg);
+            ctx.runtime_error(msg);
             Value::null()
         }
     }
