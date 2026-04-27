@@ -7,6 +7,57 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### `@hatch:web` request handler returns null in tiered mode (counter / chat)
+
+Status: **open, repro narrowed but not root-caused**
+
+`hatch run hatch/examples/web/counter` returns `204 No Content`
+for `GET /` in tiered mode but the correct HTML in
+`--mode interpreter`. Same shape on the chat example
+(messages don't send). `web/hello` works in both modes.
+
+Repro narrows to: when a user-defined closure
+(`{|req| ...}`) registered via `app.get("/")` is called from
+`@hatch:web`'s dispatch loop, instructions inside the closure
+that touch a built-in class via `is` (e.g. `arg is String` in
+css.wren's `applyToken_`, `value is Response` in web.wren's
+`Response.coerce`) raise
+
+```
+Error: Right operand must be a class.
+```
+
+The error fires from `Object.is`'s native (`obj.rs:19`),
+which checks `args[1].is_object()`. So `String` / `Response` /
+`Style` etc. are loading as a non-object value. Most likely
+the JIT's `wren_get_module_var` is reading from the wrong
+module's variable storage — i.e. a missed cross-module
+context swap somewhere in the dispatch chain that ends in the
+user closure.
+
+`call_jit_with_shadow` already does swap module_vars on
+cross-module dispatch (see `runtime_fns.rs::call_jit_with_shadow`),
+so the leak point is most likely either:
+- closures dispatched via `wren_call_N` going through a path
+  that bypasses the swap, or
+- bytecode-interpreted paths with stale `JitContext` from a
+  prior JIT call.
+
+Local minimal repro:
+
+```wren
+import "@hatch:web" for App
+var app = App.new()
+app.get("/") {|req|
+  var s = "hello"
+  System.print(s is String)   // <-- in tiered: "Right operand must be a class"
+  return "ok"
+}
+app.listen("127.0.0.1:3000")
+```
+
+Workaround: `wlift --mode interpreter <app.hatch>` until fixed.
+
 ### `wren_call_N` arg rooting SIGSEGVs on Linux x86_64
 
 Status: **fixed (commit c11c3ff, 2026-04-26)**
