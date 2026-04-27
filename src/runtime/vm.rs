@@ -1838,9 +1838,19 @@ impl VM {
         }
         let frame = unsafe { (*fiber).mir_frames.last()? };
 
-        // Try bytecode source map first (pc-based lookup)
+        // Try bytecode source map first (pc-based lookup).
+        // `frame.pc` is saved by Op handlers AFTER they've finished
+        // reading their operands — so on a failed call, pc points
+        // at the START of the *next* instruction, not the failing
+        // one. `lookup_span` does a binary search by `offset <= pc`,
+        // which on an exact match against a `record_span` boundary
+        // returns the next instruction's span (e.g. the wrapping
+        // `System.print(...)` call instead of the inner failing
+        // `x.tryAccept`). Use `pc.saturating_sub(1)` so the lookup
+        // lands inside the instruction that actually errored.
         if let Some(bc) = self.engine.peek_bytecode(frame.func_id) {
-            if let Some(span) = bc.lookup_span(frame.pc) {
+            let lookup_pc = frame.pc.saturating_sub(1);
+            if let Some(span) = bc.lookup_span(lookup_pc) {
                 return Some(super::vm_interp::SourceLoc {
                     span: span.clone(),
                     module: frame.module_name.clone(),
