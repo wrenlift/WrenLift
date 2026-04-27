@@ -326,6 +326,61 @@ fn tier_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
 }
 
+/// Returns true if `mir` directly invokes a method that drives a
+/// fiber switch — `Fiber.yield` / `Fiber.suspend`, or one of the
+/// instance-side fiber controls (`fiber.try / call / transfer /
+/// transferError`). The JIT's `handle_jit_fiber_action` keeps a
+/// caller-side stub for `Yield`/`Suspend` (it just returns the
+/// yielded value to the caller without actually suspending the
+/// fiber), and even the `Call`/`Transfer` cases reach into the
+/// caller's `mir_frames` and re-enter the bytecode interpreter
+/// — both routes assume the JIT'd caller has not stowed any live
+/// state in CPU registers across the dispatch. In practice that
+/// assumption breaks on `Subscription_.receive` (busy-spins on
+/// yield) and `Scheduler_.tick`'s `f.try()` loop (segfaults
+/// during the cross-fiber switch when the inner fiber yields back
+/// past a JIT'd `tick`). The bytecode interpreter handles all of
+/// these correctly via `handle_fiber_action_bc`, so we keep any
+/// function that *directly* dispatches a fiber control method off
+/// the JIT until the native unwinder grows proper yield-safepoint
+/// support.
+///
+/// `call()` / `call(_)` is intentionally NOT in this list:
+/// `Fn.call` shares the same method name and is one of the most
+/// common methods in user code (every closure invocation, every
+/// `iter.each {|x| ...}.call(x)`). Excluding it would prevent
+/// most hot loops from JIT'ing. Functions that genuinely call
+/// `someFiber.call(_)` instead of `someFn.call(_)` are rare; if
+/// they show up, we'll need a receiver-class check at compile
+/// time rather than this name-based filter.
+fn mir_calls_jit_unsafe_fiber_method(
+    mir: &MirFunction,
+    interner: &crate::intern::Interner,
+) -> bool {
+    use crate::mir::Instruction;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            if let Instruction::Call { method, .. } = inst {
+                let name = interner.resolve(*method);
+                if matches!(
+                    name,
+                    "yield()"
+                        | "yield(_)"
+                        | "suspend()"
+                        | "try()"
+                        | "try(_)"
+                        | "transfer()"
+                        | "transfer(_)"
+                        | "transferError(_)"
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Determine leaf status from compiled code metadata. A function is leaf if
 /// its only safepoints are self-calls (CallLocal or wren_call_static_self_*).
 /// This replaces MIR-level analysis which can't predict conditional CallRuntime
@@ -691,7 +746,7 @@ impl ExecutionEngine {
         }
         if self.threaded_code[idx].is_none() {
             let mir = self.get_mir(id)?;
-            if !crate::mir::threaded::can_use_threaded(&mir) {
+            if !crate::mir::threaded::can_use_threaded(&mir, Some(interner)) {
                 // Cache negative result so we don't re-check.
                 self.threaded_code[idx] = Some(None);
                 return None;
@@ -1606,6 +1661,21 @@ impl ExecutionEngine {
         let Some(body) = self.functions.get(idx) else {
             return false;
         };
+        // Skip JIT for functions that directly call `Fiber.yield()` /
+        // `Fiber.suspend()`. The JIT's `handle_jit_fiber_action`
+        // Yield/Suspend branches are stubs that simply return the
+        // yielded value — the compiled function keeps running as if
+        // yield were a regular call, so the fiber never suspends.
+        // Cooperative loops like `Subscription_.receive` (which polls
+        // `Fiber.yield()` until a message arrives) busy-spin forever
+        // once tiered, starving every other fiber on the scheduler.
+        // Until JIT can unwind out of native code at a yield, refuse
+        // to compile yielding functions and let the bytecode
+        // interpreter (whose `handle_fiber_action_bc` does suspend
+        // properly) handle them.
+        if mir_calls_jit_unsafe_fiber_method(body.mir(), interner) {
+            return false;
+        }
         // Skip JIT compilation for functions named in WLIFT_SKIP_JIT env var
         if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
             let name = interner.resolve(body.mir().name);
@@ -1690,6 +1760,11 @@ impl ExecutionEngine {
         let Some(tier) = self.next_compile_tier(idx) else {
             return;
         };
+        if let Some(body) = self.functions.get(idx) {
+            if mir_calls_jit_unsafe_fiber_method(body.mir(), interner) {
+                return;
+            }
+        }
         // Skip JIT for functions named in WLIFT_SKIP_JIT env var
         if let Ok(skip) = std::env::var("WLIFT_SKIP_JIT") {
             if let Some(body) = self.functions.get(idx) {

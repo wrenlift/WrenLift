@@ -566,9 +566,48 @@ fn op_unreachable(_state: &mut ThreadedState, _op: &ThreadedOp) -> usize {
 // MIR → ThreadedCode lowering
 // ---------------------------------------------------------------------------
 
+/// Method names that, when invoked, set a `pending_fiber_action` on the
+/// VM (yield / suspend / fiber switch). The threaded interpreter has no
+/// way to honour these mid-execution: it doesn't push a frame onto the
+/// fiber's `mir_frames`, so a yield from inside a threaded body would
+/// be silently dropped — the `op_call` handler stores the return value,
+/// bumps `pc`, and keeps running. Any caller that polled
+/// `Fiber.yield()` in a loop (`Subscription_.receive`,
+/// `Channel.broadcast` waiting on a sub) would busy-spin forever
+/// instead of yielding control to the scheduler.
+///
+/// Until threaded execution can either save its state across a fiber
+/// switch or transfer the rest of the function back to the bytecode
+/// interpreter, the cheapest fix is to refuse to threadify any
+/// function whose MIR directly calls one of these. Handler chains
+/// that go *through* this function on their way to the actual yield
+/// are still safe — only the *innermost* frame sees the fiber action,
+/// so the bytecode interpreter that sits above the threaded frame
+/// will pick it up on return.
+///
+/// Mirrors `mir_calls_jit_unsafe_fiber_method` in `engine.rs` (same
+/// reasoning, same list — kept in sync). `call()`/`call(_)` are
+/// deliberately *not* in this list because they're shared with
+/// `Fn.call`, which is harmless and ubiquitous; only the receiver
+/// being a Fiber matters, and that distinction needs a class-level
+/// check we don't have at compile time.
+fn is_fiber_action_method(name: &str) -> bool {
+    matches!(
+        name,
+        "yield()"
+            | "yield(_)"
+            | "suspend()"
+            | "transfer()"
+            | "transfer(_)"
+            | "transferError(_)"
+            | "try()"
+            | "try(_)"
+    )
+}
+
 /// Check if a MIR function can be executed via the threaded interpreter.
 /// Returns false if any instruction isn't supported (mapped to op_noop).
-pub fn can_use_threaded(mir: &MirFunction) -> bool {
+pub fn can_use_threaded(mir: &MirFunction, interner: Option<&crate::intern::Interner>) -> bool {
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
@@ -604,7 +643,6 @@ pub fn can_use_threaded(mir: &MirFunction) -> bool {
                 | Instruction::SetField(_, _, _)
                 | Instruction::GetModuleVar(_)
                 | Instruction::SetModuleVar(_, _)
-                | Instruction::Call { .. }
                 | Instruction::CallKnownFunc { .. }
                 | Instruction::MakeRange { .. }
                 | Instruction::StringConcat(_)
@@ -612,6 +650,13 @@ pub fn can_use_threaded(mir: &MirFunction) -> bool {
                 | Instruction::ConstString(_)
                 | Instruction::GuardNum(_)
                 | Instruction::GuardBool(_) => {}
+                Instruction::Call { method, .. } => {
+                    if let Some(intr) = interner {
+                        if is_fiber_action_method(intr.resolve(*method)) {
+                            return false;
+                        }
+                    }
+                }
                 _ => return false,
             }
         }
