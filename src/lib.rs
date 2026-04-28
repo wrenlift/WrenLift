@@ -33,7 +33,10 @@ pub mod serialize;
 // whole layer; the wasm interpreter consumes wlbc bytes directly via
 // `vm.compile_source_to_blob` / `vm.interpret_hatch` (the runtime
 // itself is portable).
-#[cfg(feature = "host")]
+// `hatch` itself is target-agnostic — the load/emit/manifest
+// types compile everywhere. Build paths
+// (`build_from_source_tree*`, the registry/runner crates) stay
+// host-gated since they pull in `std::fs`, `git`, `curl`, etc.
 pub mod hatch;
 #[cfg(feature = "host")]
 pub mod hatch_registry;

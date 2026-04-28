@@ -54,6 +54,7 @@ const {
   default: init,
   version,
   run,
+  run_hatch,
   resolve_future,
   reject_future,
   ws_open,
@@ -269,7 +270,35 @@ self.postMessage({ cmd: "ready", version: version() });
 
 self.addEventListener("message", (e) => {
   const msg = e.data;
-  if (msg.cmd === "run") {
+  if (msg.cmd === "run-hatch") {
+    const { id, bytes } = msg;
+    // Same shape as `run`: drive `run_hatch` through the
+    // scheduler. Async-bridge support inside hatch-bundled
+    // modules works the same way as in plain source mode.
+    const t0 = performance.now();
+    run_hatch(bytes).then(
+      (result) => {
+        self.postMessage({
+          cmd: "result",
+          id,
+          output: result.output,
+          ok: result.ok,
+          errorKind: result.errorKind,
+          elapsedMs: performance.now() - t0,
+        });
+      },
+      (err) => {
+        self.postMessage({
+          cmd: "result",
+          id,
+          output: String(err),
+          ok: false,
+          errorKind: -1,
+          elapsedMs: performance.now() - t0,
+        });
+      },
+    );
+  } else if (msg.cmd === "run") {
     const { id, source } = msg;
     // `run` is async — it returns a Promise that resolves
     // once the scheduler loop has drained any parked fibers

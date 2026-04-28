@@ -147,6 +147,25 @@ class WorkerWlift {
     });
   }
 
+  // Run a `.hatch` byte stream — multi-module bundle produced by
+  // `wlift src/ --bundle out.hatch --bundle-target wasm32-unknown-unknown`.
+  // The bundle's `target` manifest field is checked against the
+  // wasm runtime's family marker; cross-family bundles fail
+  // load with a `WrongTarget` message in the result.
+  runHatch(bytes) {
+    return new Promise((resolve) => {
+      const id = this.nextId++;
+      this.pending.set(id, resolve);
+      // Transfer the underlying buffer so we don't pay a copy on
+      // postMessage. `bytes` should be a Uint8Array.
+      const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      this.worker.postMessage(
+        { cmd: "run-hatch", id, bytes: buf },
+        [buf.buffer],
+      );
+    });
+  }
+
   // SAB-mode: the page can read worker-side wasm bytes directly
   // through `memory.buffer`. Plain worker mode: returns null
   // (the boundary is the point). Feature-probe with `if (wlift.memory)`.
@@ -384,6 +403,34 @@ class MainWlift {
     };
 
     return this;
+  }
+
+  async runHatch(bytes) {
+    // Same shape as `run`, but the user code is a `.hatch`
+    // bundle. `_mod.run_hatch` is the wasm-bindgen export added
+    // alongside `run` — both go through the same VM-setup +
+    // scheduler-loop machinery in `wlift_wasm::lib::run_inner`.
+    const t0 = performance.now();
+    let result;
+    try {
+      const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      result = await this._mod.run_hatch(buf);
+    } catch (err) {
+      return {
+        cmd: "result",
+        output: String(err),
+        ok: false,
+        errorKind: -1,
+        elapsedMs: performance.now() - t0,
+      };
+    }
+    return {
+      cmd: "result",
+      output: result.output,
+      ok: result.ok,
+      errorKind: result.errorKind,
+      elapsedMs: performance.now() - t0,
+    };
   }
 
   async run(source) {

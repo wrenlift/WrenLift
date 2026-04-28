@@ -922,8 +922,43 @@ fn perf_log(label: &str, start: f64) {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn perf_log(_label: &str, _start: f64) {}
 
+/// What to feed into the VM after the prelude is in place. The
+/// `Source` arm runs through the parser + sema + lower path the
+/// playground has always used; the `Hatch` arm bypasses that
+/// pipeline by installing a pre-compiled `.hatch` bundle —
+/// multiple modules at once, plus the `target` compatibility
+/// check (cf. `crate::hatch::check_target_compat`).
+enum RunInput<'a> {
+    Source(&'a str),
+    Hatch(&'a [u8]),
+}
+
+/// Run a `.hatch` bundle in the playground. Same setup as `run`
+/// (fresh VM, prelude install, scheduler loop) but feeds the
+/// user-code phase a hatch byte stream instead of source. Modules
+/// inside the hatch install in their declared order — so a hatch
+/// produced via `wlift src/ --bundle out.hatch --bundle-target
+/// wasm32-unknown-unknown` runs end-to-end here, including any
+/// in-bundle `import` between modules (cross-module resolution
+/// in wasm).
+///
+/// `@hatch:*` external package resolution is *not* implemented
+/// here — the wasm runtime can't synchronously fetch packages
+/// during compilation. Use the host's `hatch` CLI (or a
+/// JS-side prefetch + multiple `install_hatch` calls, when that
+/// API lands) to assemble the closure of needed packages, then
+/// pass the result here as a single bundle.
+#[wasm_bindgen]
+pub async fn run_hatch(bytes: &[u8]) -> RunResult {
+    run_inner(RunInput::Hatch(bytes)).await
+}
+
 #[wasm_bindgen]
 pub async fn run(source: &str) -> RunResult {
+    run_inner(RunInput::Source(source)).await
+}
+
+async fn run_inner(input: RunInput<'_>) -> RunResult {
     use std::sync::{Arc, Mutex as StdMutex};
 
     let t_total = perf_mark();
@@ -994,9 +1029,22 @@ pub async fn run(source: &str) -> RunResult {
             error_kind: ErrorKind::CompileError,
         };
     }
-    let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
     let t_user = perf_mark();
-    let result = vm.interpret("main", &combined);
+    let result = match input {
+        RunInput::Source(source) => {
+            let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
+            vm.interpret("main", &combined)
+        }
+        RunInput::Hatch(bytes) => {
+            // `interpret_hatch` runs the manifest's check_target_compat
+            // gate first, then installs every Wlbc / Source section
+            // in declared order. Cross-module imports inside the
+            // bundle resolve against already-installed peers — the
+            // same path the host CLI uses, just without
+            // native-lib extraction (gated to `feature = "host"`).
+            vm.interpret_hatch(bytes)
+        }
+    };
     perf_log("user_compile_and_run", t_user);
 
     // Scheduler loop. Drives parked fibers across JS event-loop

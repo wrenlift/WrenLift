@@ -502,7 +502,39 @@ impl From<std::io::Error> for HatchError {
 /// caller-supplied sections in the order given. The payload is always
 /// zstd-compressed in this build; loaders that see the flag clear on a
 /// future hatch get an uncompressed payload instead.
+/// Encode a `Hatch` into the on-disk byte stream. Compresses
+/// the payload with zstd when the `host` feature is enabled
+/// (the only build that links zstd); on `feature = "host"` off
+/// builds (i.e. wasm), falls back to an uncompressed payload
+/// with `FLAG_ZSTD` cleared. `load()` handles both shapes, so a
+/// host-built hatch round-trips through a wasm runtime as long
+/// as it was built uncompressed (use `--bundle-target wasm32`).
 pub fn emit(hatch: &Hatch) -> Result<Vec<u8>, HatchError> {
+    emit_with_options(hatch, EmitOptions::default())
+}
+
+/// Knobs that affect `emit()`. Exposed because the builder has
+/// to override the default for wasm targets — wasm runtimes
+/// can't decompress zstd today (the dep is host-feature gated).
+#[derive(Debug, Clone, Copy)]
+pub struct EmitOptions {
+    /// Compress the payload with zstd. Requires the host build
+    /// (zstd is gated). `false` always works.
+    pub compress: bool,
+}
+
+impl Default for EmitOptions {
+    fn default() -> Self {
+        // Compress by default on host; on non-host builds (wasm)
+        // the zstd dep isn't linked, so the compressed branch
+        // wouldn't compile — flip the default off there.
+        Self {
+            compress: cfg!(feature = "host"),
+        }
+    }
+}
+
+pub fn emit_with_options(hatch: &Hatch, opts: EmitOptions) -> Result<Vec<u8>, HatchError> {
     // --- Build payload in-memory first so we know its post-
     //     compression length for the header. ---
     let manifest_toml = toml::to_string_pretty(&hatch.manifest)
@@ -523,16 +555,30 @@ pub fn emit(hatch: &Hatch) -> Result<Vec<u8>, HatchError> {
     }
 
     // --- Wrap payload + header. ---
-    let compressed = zstd::encode_all(std::io::Cursor::new(&payload), ZSTD_LEVEL)
-        .map_err(|e| HatchError::Encode(format!("zstd encode: {e}")))?;
+    let (body, flags): (Vec<u8>, u8) = if opts.compress {
+        #[cfg(feature = "host")]
+        {
+            let compressed = zstd::encode_all(std::io::Cursor::new(&payload), ZSTD_LEVEL)
+                .map_err(|e| HatchError::Encode(format!("zstd encode: {e}")))?;
+            (compressed, FLAG_ZSTD)
+        }
+        #[cfg(not(feature = "host"))]
+        {
+            return Err(HatchError::Encode(
+                "compression requested but this build has no zstd (wasm/no-host)".to_string(),
+            ));
+        }
+    } else {
+        (payload, 0)
+    };
 
-    let mut out = Vec::with_capacity(16 + compressed.len());
+    let mut out = Vec::with_capacity(16 + body.len());
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.push(FLAG_ZSTD); // flags
+    out.push(flags); // flags
     out.extend_from_slice(&[0u8; 3]); // reserved
-    out.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
-    out.extend_from_slice(&compressed);
+    out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    out.extend_from_slice(&body);
     Ok(out)
 }
 
@@ -590,8 +636,24 @@ pub fn load(bytes: &[u8]) -> Result<Hatch, HatchError> {
     let raw_payload = &bytes[header_len..header_len + payload_len as usize];
 
     let payload = if flags & FLAG_ZSTD != 0 {
-        zstd::decode_all(std::io::Cursor::new(raw_payload))
-            .map_err(|e| HatchError::Decompress(e.to_string()))?
+        #[cfg(feature = "host")]
+        {
+            zstd::decode_all(std::io::Cursor::new(raw_payload))
+                .map_err(|e| HatchError::Decompress(e.to_string()))?
+        }
+        #[cfg(not(feature = "host"))]
+        {
+            // Compressed payload but this build has no zstd
+            // (wasm/no-host). Producers targeting wasm should
+            // build with `--bundle-target wasm32-*`, which sets
+            // `EmitOptions::compress = false` and clears
+            // FLAG_ZSTD on the hatch.
+            return Err(HatchError::Decompress(
+                "compressed hatch can't be loaded — runtime has no zstd; \
+                 rebuild with `--bundle-target wasm32-*` for an uncompressed payload"
+                    .to_string(),
+            ));
+        }
     } else {
         raw_payload.to_vec()
     };
@@ -692,6 +754,7 @@ pub const HATCHFILE: &str = "hatchfile";
 /// The module ordering in the emitted manifest is alphabetical by
 /// module name. Callers that need a specific dependency order should
 /// supply a `hatchfile` with `modules` set explicitly.
+#[cfg(feature = "host")]
 pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
     build_from_source_tree_with_cache(root, None)
 }
@@ -701,6 +764,7 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
 /// `None` falls back to the ambient `cache_root()` — `HATCH_CACHE_DIR`
 /// or `$HOME/.hatch/cache`. Tests pass an explicit path to avoid
 /// process-wide env var coupling.
+#[cfg(feature = "host")]
 pub fn build_from_source_tree_with_cache(
     root: &Path,
     cache_dir: Option<&Path>,
@@ -716,6 +780,7 @@ pub fn build_from_source_tree_with_cache(
 /// because wasm runtimes don't dlopen anything; the manifest's
 /// `[native_libs]` declarations stay as a *requirement list* the
 /// receiving runtime must satisfy via statically-linked plugins.
+#[cfg(feature = "host")]
 pub fn build_from_source_tree_for_target(
     root: &Path,
     cache_dir: Option<&Path>,
@@ -735,12 +800,18 @@ pub fn build_from_source_tree_for_target(
         // knew the target. The wasm runtime ignores them anyway,
         // and shipping x86_64 dylibs in a wasm hatch wastes
         // bytes + confuses `--inspect`.
-        if is_wasm_target(target) {
+        // Wasm targets get an uncompressed payload — the wasm
+        // runtime doesn't link zstd, so a compressed bundle
+        // would refuse to load there with a decode error.
+        let opts = if is_wasm_target(target) {
             hatch
                 .sections
                 .retain(|s| !matches!(s.kind, SectionKind::NativeLib));
-        }
-        bytes = emit(&hatch)?;
+            EmitOptions { compress: false }
+        } else {
+            EmitOptions::default()
+        };
+        bytes = emit_with_options(&hatch, opts)?;
     }
     Ok(bytes)
 }
@@ -825,6 +896,7 @@ pub fn current_runtime_target() -> &'static str {
 /// means we're seeing the same dep through a diamond path and can
 /// reuse the bytes verbatim instead of rebuilding (and hitting a
 /// false-positive cycle error).
+#[cfg(feature = "host")]
 #[derive(Default)]
 struct BuildState {
     active: std::collections::HashSet<std::path::PathBuf>,
@@ -837,6 +909,7 @@ struct BuildState {
 /// already-built and just needs to be re-folded). The former errors
 /// loudly; the latter returns the cached bytes so the second arm of
 /// the diamond doesn't trip the cycle detector.
+#[cfg(feature = "host")]
 fn build_recursive(
     root: &Path,
     state: &mut BuildState,
@@ -950,6 +1023,7 @@ fn build_recursive(
 /// named `@hatch:fs` with `fs.wren` + `fs/stat.wren` would install
 /// modules `@hatch:fs` and `fs/stat` (or `fs.stat` — whatever the
 /// file layout produces).
+#[cfg(feature = "host")]
 fn rename_entry_to_manifest_name(
     manifest: &mut Manifest,
     sections: &mut [Section],
@@ -1026,6 +1100,7 @@ fn rename_entry_to_manifest_name(
 /// dep; used to resolve relative `path = "..."` deps. `cache_dir` lets
 /// callers pin the registry cache root (tests pass an explicit path;
 /// production passes `None` → `$HOME/.hatch/cache`).
+#[cfg(feature = "host")]
 pub fn resolve_dependency_bytes(
     root: &Path,
     dep_name: &str,
@@ -1036,6 +1111,7 @@ pub fn resolve_dependency_bytes(
     resolve_dep_bytes_inner(root, dep_name, dep, &mut state, cache_dir)
 }
 
+#[cfg(feature = "host")]
 fn resolve_dep_bytes_inner(
     root: &Path,
     dep_name: &str,
@@ -1097,6 +1173,7 @@ fn resolve_dep_bytes_inner(
     }
 }
 
+#[cfg(feature = "host")]
 fn merge_path_dependencies(
     root: &Path,
     manifest: &mut Manifest,
@@ -1263,6 +1340,7 @@ fn merge_path_dependencies(
 /// This is host-platform-only for now: the resolver picks the current
 /// platform's entry and bundles that one. Cross-platform packaging
 /// (multi-platform sections side-by-side) is a follow-up.
+#[cfg(feature = "host")]
 fn pack_bundled_native_libs(
     root: &Path,
     manifest: &mut Manifest,
@@ -1299,6 +1377,7 @@ fn pack_bundled_native_libs(
     Ok(())
 }
 
+#[cfg(feature = "host")]
 fn collect_wren_files(
     root: &Path,
     dir: &Path,
@@ -1334,6 +1413,7 @@ fn collect_wren_files(
     Ok(())
 }
 
+#[cfg(feature = "host")]
 fn pick_default_entry(modules: &[String]) -> String {
     // Prefer `main` if present; otherwise the first module alphabetically.
     if modules.iter().any(|m| m == "main") {
@@ -2162,6 +2242,101 @@ openssl = "libs/openssl.dylib"
         assert!(
             !has_native,
             "wasm target should not pack host-native dylib bytes"
+        );
+    }
+
+    #[test]
+    fn wasm_target_uses_uncompressed_payload_so_no_zstd_needed_at_load() {
+        // The whole point of `EmitOptions::compress = false` for
+        // wasm targets is that the wasm runtime (built without
+        // `feature = "host"`) doesn't link zstd — `load()` would
+        // otherwise hit the not-host branch and refuse to decode.
+        // Verify the bundled bytes are uncompressed by checking
+        // the FLAG_ZSTD bit at offset 9 in the header.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("hatchfile"),
+            "name = \"u\"\nversion = \"0.1.0\"\nentry = \"main\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("main.wren"), "System.print(\"hi\")").unwrap();
+
+        let bytes =
+            build_from_source_tree_for_target(root, None, Some("wasm32-unknown-unknown"))
+                .expect("build wasm-targeted");
+        // Header layout (cf. format docs at top of file):
+        //   bytes[0..5]  = MAGIC ("HATCH")
+        //   bytes[5..9]  = VERSION (u32 LE)
+        //   bytes[9]     = flags
+        assert!(bytes.len() >= 16);
+        let flags = bytes[9];
+        assert_eq!(
+            flags & FLAG_ZSTD,
+            0,
+            "wasm-targeted hatch must clear FLAG_ZSTD; got flags=0b{:08b}",
+            flags
+        );
+
+        // Round-trip: load the bytes back and confirm the
+        // manifest + Wlbc section made it through.
+        let h = load(&bytes).expect("load uncompressed");
+        assert_eq!(h.manifest.name, "u");
+        assert_eq!(h.manifest.target.as_deref(), Some("wasm32-unknown-unknown"));
+        assert!(h.sections.iter().any(|s| matches!(s.kind, SectionKind::Wlbc)));
+    }
+
+    #[test]
+    fn cross_module_import_resolves_inside_a_hatch() {
+        // Two-module hatch where `main` imports a class declared in
+        // a sibling `util` module. install_hatch_sections has to
+        // honour `manifest.modules` order so `util` is in
+        // `engine.modules` by the time `main`'s top-level runs.
+        // Same code path the wasm playground exercises through
+        // `wlift_wasm::run_hatch`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(
+            root.join("hatchfile"),
+            r#"
+name = "two-module"
+version = "0.1.0"
+entry = "main"
+modules = ["util", "main"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("util.wren"),
+            "class Util { static greet(name) { return \"hi, %(name)\" } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("main.wren"),
+            r#"
+import "util" for Util
+System.print(Util.greet("hatch"))
+"#,
+        )
+        .unwrap();
+
+        let bytes = build_from_source_tree(root).expect("build");
+        // Use the public VM install-and-run path so this test
+        // exercises the same loader the playground / CLI hit.
+        let mut vm = crate::runtime::vm::VM::new(crate::runtime::vm::VMConfig::default());
+        vm.output_buffer = Some(String::new());
+        let result = vm.interpret_hatch(&bytes);
+        let out = vm.output_buffer.clone().unwrap_or_default();
+        assert_eq!(
+            result,
+            crate::runtime::engine::InterpretResult::Success,
+            "interpret_hatch should succeed: output={:?}",
+            out
+        );
+        assert!(
+            out.contains("hi, hatch"),
+            "expected cross-module Util.greet output; got {:?}",
+            out
         );
     }
 

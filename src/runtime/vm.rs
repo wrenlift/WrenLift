@@ -646,7 +646,6 @@ impl VM {
     /// Each installed module's top-level runs, the same way a source-
     /// path `import` does. Returns `RuntimeError` if any module's
     /// top-level raises.
-    #[cfg(feature = "host")]
     pub fn install_hatch_modules(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
         let hatch = match crate::hatch::load(hatch_bytes) {
             Ok(h) => h,
@@ -789,12 +788,19 @@ impl VM {
     /// and extracts any bundled `NativeLib` sections to a temp
     /// directory so `#!native` directives inside the hatch resolve
     /// against both sources at class install time.
-    #[cfg(feature = "host")]
     fn install_hatch_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
-        self.apply_hatch_native_manifest(&hatch.manifest);
-        let result = self.extract_hatch_native_sections(hatch);
-        if !matches!(result, InterpretResult::Success) {
-            return result;
+        // Native-lib registration + extraction is host-only: wasm
+        // runtimes don't dlopen, so `[native_libs]` and any
+        // bundled `NativeLib` sections become a no-op there.
+        // Pure-Wren modules (Wlbc + Source) install identically
+        // on both targets.
+        #[cfg(feature = "host")]
+        {
+            self.apply_hatch_native_manifest(&hatch.manifest);
+            let result = self.extract_hatch_native_sections(hatch);
+            if !matches!(result, InterpretResult::Success) {
+                return result;
+            }
         }
 
         // Source sections carry the original .wren text alongside the
@@ -875,7 +881,6 @@ impl VM {
     /// today — those land in commit 3b. Resource sections are ignored
     /// by this loader; a future `wlift.resource(...)` API will surface
     /// them.
-    #[cfg(feature = "host")]
     pub fn interpret_hatch(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
         let hatch = match crate::hatch::load(hatch_bytes) {
             Ok(h) => h,
