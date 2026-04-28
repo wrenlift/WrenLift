@@ -634,11 +634,7 @@ pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn wren_call_1_inner(
-    vm: &mut wren_lift::runtime::vm::VM,
-    root_base: usize,
-    method_id: u64,
-) -> u64 {
+fn wren_call_1_inner(vm: &mut wren_lift::runtime::vm::VM, root_base: usize, method_id: u64) -> u64 {
     use wren_lift::codegen::runtime_fns::jit_root_at;
     // Re-read receiver / arg through the root store so a GC
     // mid-call sees forwarded pointers reflected in the locals
@@ -850,8 +846,7 @@ pub fn wren_jit_slot_for_module_var(slot_idx: u64) -> u32 {
     }
     let ptr = receiver.as_object().unwrap();
     let header = ptr as *const wren_lift::runtime::object::ObjHeader;
-    let is_closure =
-        unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
+    let is_closure = unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
     if !is_closure {
         return 0;
     }
