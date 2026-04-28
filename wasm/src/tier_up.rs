@@ -37,6 +37,7 @@
 //! place rather than getting renamed.
 
 use wasm_bindgen::prelude::*;
+use wren_lift::runtime::value::Value;
 
 /// Phase 1 smoke test — emit a hand-built MIR function that
 /// returns `42` as a NaN-boxed `Value` and hand back the wasm
@@ -115,4 +116,110 @@ pub fn jit_emit_from_source(source: &str) -> Vec<u8> {
         }
     }
     Vec::new()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2a — runtime helpers that compiled wasm modules import.
+// ---------------------------------------------------------------------------
+//
+// `emit_mir` produces wasm modules that import a `wren` namespace
+// — `wren_num_add(i64, i64) -> i64`, `wren_cmp_lt`, etc. To
+// instantiate one of those modules, the JS shim needs concrete
+// implementations to bind. We export them here, wired to the
+// existing `Value` semantics. Each takes/returns a NaN-boxed
+// `u64` (which wasm marshals as i64 — same bit pattern).
+//
+// The implementations match Wren's core arithmetic / comparison
+// behaviour: type-check operands, fall back to a safe default
+// (currently `null`) on mismatch. Phase 4 (inter-fn calls + GC
+// integration) replaces the fallbacks with proper runtime errors
+// once the dispatch path is wired.
+//
+// `wren_call` (general method dispatch) is **not** here — that
+// needs access to the live VM and lands in Phase 4 alongside the
+// dispatch hook. Compiled functions that only do arithmetic +
+// comparisons (the most fib-shaped workloads) work with just
+// these helpers.
+
+fn binop_num<F: Fn(f64, f64) -> f64>(a: u64, b: u64, op: F) -> u64 {
+    let av = Value::from_bits(a);
+    let bv = Value::from_bits(b);
+    match (av.as_num(), bv.as_num()) {
+        (Some(an), Some(bn)) => Value::num(op(an, bn)).to_bits(),
+        _ => Value::null().to_bits(),
+    }
+}
+
+fn cmp_num<F: Fn(f64, f64) -> bool>(a: u64, b: u64, op: F) -> u64 {
+    let av = Value::from_bits(a);
+    let bv = Value::from_bits(b);
+    match (av.as_num(), bv.as_num()) {
+        (Some(an), Some(bn)) => Value::bool(op(an, bn)).to_bits(),
+        _ => Value::null().to_bits(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn wren_num_add(a: u64, b: u64) -> u64 {
+    binop_num(a, b, |x, y| x + y)
+}
+#[wasm_bindgen]
+pub fn wren_num_sub(a: u64, b: u64) -> u64 {
+    binop_num(a, b, |x, y| x - y)
+}
+#[wasm_bindgen]
+pub fn wren_num_mul(a: u64, b: u64) -> u64 {
+    binop_num(a, b, |x, y| x * y)
+}
+#[wasm_bindgen]
+pub fn wren_num_div(a: u64, b: u64) -> u64 {
+    binop_num(a, b, |x, y| x / y)
+}
+#[wasm_bindgen]
+pub fn wren_num_mod(a: u64, b: u64) -> u64 {
+    binop_num(a, b, |x, y| x % y)
+}
+#[wasm_bindgen]
+pub fn wren_num_neg(a: u64) -> u64 {
+    let av = Value::from_bits(a);
+    match av.as_num() {
+        Some(n) => Value::num(-n).to_bits(),
+        None => Value::null().to_bits(),
+    }
+}
+
+#[wasm_bindgen]
+pub fn wren_cmp_lt(a: u64, b: u64) -> u64 {
+    cmp_num(a, b, |x, y| x < y)
+}
+#[wasm_bindgen]
+pub fn wren_cmp_gt(a: u64, b: u64) -> u64 {
+    cmp_num(a, b, |x, y| x > y)
+}
+#[wasm_bindgen]
+pub fn wren_cmp_le(a: u64, b: u64) -> u64 {
+    cmp_num(a, b, |x, y| x <= y)
+}
+#[wasm_bindgen]
+pub fn wren_cmp_ge(a: u64, b: u64) -> u64 {
+    cmp_num(a, b, |x, y| x >= y)
+}
+
+#[wasm_bindgen]
+pub fn wren_cmp_eq(a: u64, b: u64) -> u64 {
+    let av = Value::from_bits(a);
+    let bv = Value::from_bits(b);
+    Value::bool(av.equals(bv)).to_bits()
+}
+#[wasm_bindgen]
+pub fn wren_cmp_ne(a: u64, b: u64) -> u64 {
+    let av = Value::from_bits(a);
+    let bv = Value::from_bits(b);
+    Value::bool(!av.equals(bv)).to_bits()
+}
+
+#[wasm_bindgen]
+pub fn wren_not(a: u64) -> u64 {
+    let av = Value::from_bits(a);
+    Value::bool(!av.is_truthy_wren()).to_bits()
 }
