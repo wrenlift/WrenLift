@@ -12,6 +12,18 @@ description = "Image encode / decode / resize / convert for WrenLift. Backed by 
 # runtime crate links in directly.
 crate-type = ["cdylib", "rlib"]
 
+# Plugins must compile against the SAME `wren_lift` feature set the
+# host binary uses, otherwise host-gated fields in `VM` /
+# `NativeContext` shift offsets and the cdylib's `&mut VM` decode
+# is wrong → silent SIGSEGV on the first foreign-method call. The
+# `host` feature here flips `wren_lift/host` so the plugin's view
+# of those structs matches the binary's. The cdylib build keeps
+# `host` on by default; the wasm static-link path in `wlift_wasm`
+# explicitly disables it via `default-features = false`.
+[features]
+default = ["host"]
+host = ["wren_lift/host"]
+
 [dependencies]
 wren_lift = { path = "../..", default-features = false }
 # Game-asset codecs only — TIFF/EXR/HDR aren't worth the binary

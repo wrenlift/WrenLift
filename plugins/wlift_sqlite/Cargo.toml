@@ -8,10 +8,13 @@ description = "SQLite plugin for the WrenLift runtime — distributed as a dylib
 crate-type = ["cdylib"]
 
 [dependencies]
-# Skip cranelift: the plugin doesn't emit JIT code, it just uses
-# the Value / VM / NativeContext types. Pulling in cranelift-jit
-# bloats the dylib by ~10 MB and drags cranelift-native into
+# `features = ["host"]` matches the binary's view of `wren_lift`,
+# so host-gated fields in `VM` / `NativeContext` line up. Without
+# it the plugin's `&mut VM` decode is offset → silent SIGSEGV on
+# the first foreign-method dispatch. We still skip `cranelift`:
+# the plugin doesn't emit JIT code, and pulling cranelift-jit in
+# bloats the dylib by ~10 MB while dragging cranelift-native into
 # cross-compile paths where it fails to detect the target CPU
 # (notably linux-arm64 under `cross`).
-wren_lift = { path = "../..", default-features = false }
+wren_lift = { path = "../..", default-features = false, features = ["host"] }
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -8,6 +8,11 @@ description = "Audio playback for the WrenLift game framework. cpal-backed outpu
 crate-type = ["cdylib"]
 
 [dependencies]
-wren_lift = { path = "../..", default-features = false }
+# `features = ["host"]` matches the binary's view of `wren_lift`,
+# so host-gated fields in `VM` / `NativeContext` line up. Without
+# it the plugin's `&mut VM` decode is offset → silent SIGSEGV on
+# the first foreign-method dispatch. `default-features = false`
+# still keeps `cranelift` out — the JIT bloat doesn't belong here.
+wren_lift = { path = "../..", default-features = false, features = ["host"] }
 cpal  = "0.17"
 hound = "3.5"

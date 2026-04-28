@@ -8,9 +8,12 @@ description = "GPU plugin for the WrenLift runtime — wgpu-backed primitives bu
 crate-type = ["cdylib"]
 
 [dependencies]
-# Skip cranelift for the same reason as wlift_sqlite — the plugin
-# only needs the Value / VM / NativeContext types, not the JIT.
-wren_lift = { path = "../..", default-features = false }
+# `features = ["host"]` matches the binary's view of `wren_lift`,
+# so host-gated fields in `VM` / `NativeContext` line up. Without
+# it the plugin's `&mut VM` decode is offset → silent SIGSEGV on
+# the first foreign-method dispatch. We still skip `cranelift`
+# (default-features = false) — the JIT bloat doesn't belong here.
+wren_lift = { path = "../..", default-features = false, features = ["host"] }
 
 # wgpu pulls in naga (shader compiler), wgpu-core, wgpu-hal, plus
 # platform backends (Metal/Vulkan/DX12). We disable winit support
