@@ -3866,6 +3866,7 @@ fn abi_regs(target: super::Target) -> (&'static [u32], u32, u32, u32) {
 
 /// Resolve a runtime function name to its address.
 /// Returns `None` if the name is unknown.
+#[cfg(feature = "host")]
 pub fn resolve(name: &str) -> Option<usize> {
     match name {
         "wren_get_module_var" => Some(wren_get_module_var as *const () as usize),
@@ -4027,6 +4028,12 @@ pub extern "C" fn wren_jit_frame_pop() {
 /// Thin wrapper for native method dispatch from inline IC.
 /// Takes (native_fn_ptr, receiver, args..., jit_fp) — the jit_fp is captured
 /// by #[naked] wrappers to register the JIT frame for GC.
+// IC native trampolines transmute a `u64` carried in the IC entry
+// to a `NativeFn` pointer — only sound on host targets where fn
+// pointers are 64-bit. wasm32 has 32-bit fn pointers, and there's
+// no JIT to populate the IC slot anyway, so the whole helper is
+// host-only.
+#[cfg(feature = "host")]
 macro_rules! ic_native_inner {
     ($name:ident, $($arg:ident),*) => {
         extern "C" fn $name(native_fn: u64, recv: u64, $($arg: u64,)* jit_fp: u64) -> u64 {
@@ -4048,9 +4055,13 @@ macro_rules! ic_native_inner {
     };
 }
 
+#[cfg(feature = "host")]
 ic_native_inner!(wren_ic_native_0_inner,);
+#[cfg(feature = "host")]
 ic_native_inner!(wren_ic_native_1_inner, a0);
+#[cfg(feature = "host")]
 ic_native_inner!(wren_ic_native_2_inner, a0, a1);
+#[cfg(feature = "host")]
 ic_native_inner!(wren_ic_native_3_inner, a0, a1, a2);
 
 // #[naked] wrappers capture x29 (JIT FP) as the last argument.
@@ -4061,7 +4072,7 @@ ic_native_inner!(wren_ic_native_3_inner, a0, a1, a2);
 pub unsafe extern "C" fn wren_ic_native_0(_nfn: u64, _recv: u64) -> u64 {
     core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_native_0_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_native_0(nfn: u64, recv: u64) -> u64 {
     wren_ic_native_0_inner(nfn, recv, 0)
 }
@@ -4073,7 +4084,7 @@ pub extern "C" fn wren_ic_native_0(nfn: u64, recv: u64) -> u64 {
 pub unsafe extern "C" fn wren_ic_native_1(_nfn: u64, _recv: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_native_1_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_native_1(nfn: u64, recv: u64, a0: u64) -> u64 {
     wren_ic_native_1_inner(nfn, recv, a0, 0)
 }
@@ -4085,7 +4096,7 @@ pub extern "C" fn wren_ic_native_1(nfn: u64, recv: u64, a0: u64) -> u64 {
 pub unsafe extern "C" fn wren_ic_native_2(_nfn: u64, _recv: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_native_2_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_native_2(nfn: u64, recv: u64, a0: u64, a1: u64) -> u64 {
     wren_ic_native_2_inner(nfn, recv, a0, a1, 0)
 }
@@ -4103,7 +4114,7 @@ pub unsafe extern "C" fn wren_ic_native_3(
 ) -> u64 {
     core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_native_3_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_native_3(nfn: u64, recv: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_ic_native_3_inner(nfn, recv, a0, a1, a2, 0)
 }
@@ -4406,6 +4417,7 @@ use crate::codegen::{Label, MachFunc, MachInst, Mem, VReg};
 /// Register-sourced arguments are scheduled with a physical-register parallel
 /// copy resolver, while spilled arguments are loaded directly from their stack
 /// slots into ABI argument registers after any clobber-sensitive register moves.
+#[cfg(feature = "host")]
 pub fn link_runtime_calls(
     mf: &mut MachFunc,
     target: super::Target,
@@ -4545,6 +4557,7 @@ enum LinkedCallTarget {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "host")]
 fn lower_linked_call(
     args: &[VReg],
     ret: Option<VReg>,
@@ -4661,6 +4674,7 @@ fn lower_linked_call(
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "host")]
 fn target_data_addr(name: &'static str) -> u64 {
     resolve(name).unwrap_or(0) as u64
 }

@@ -11,20 +11,58 @@ edition = "2021"
 [lib]
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# The binary is host-only — clap, file I/O, plugin loading. The
+# wasm build skips it (cargo silently drops bins whose required
+# features don't resolve on the target).
 [[bin]]
 name = "wlift"
 path = "src/main.rs"
+required-features = ["host"]
 
 [features]
-default = ["cranelift"]
-cranelift = ["dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-module", "dep:cranelift-jit", "dep:cranelift-native"]
+# `host` gathers every dep that doesn't compile to wasm32 (host JIT,
+# plugin dlopen, sync HTTP / process / fs primitives, threaded
+# tier-up broker). It's on by default so existing native builds are
+# unchanged. Wasm builds pass `--no-default-features` and pick up
+# only the portable parser + interpreter.
+default = ["host", "cranelift"]
+host = [
+    "dep:dynasmrt",
+    "dep:dynasm",
+    "dep:libloading",
+    "dep:tempfile",
+    "dep:ureq",
+    "dep:beadie",
+    "dep:zstd",
+    "dep:zip",
+    "dep:sha2",
+    "dep:sha1",
+    "dep:md-5",
+    "dep:hmac",
+    "dep:aes-gcm",
+    "dep:ed25519-dalek",
+    "dep:argon2",
+    "dep:password-hash",
+    "dep:libc",
+    "dep:rand",
+    "dep:rand_core",
+]
+cranelift = [
+    "host",
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-module",
+    "dep:cranelift-jit",
+    "dep:cranelift-native",
+]
 
 [dependencies]
+# Pure-Rust deps that compile on every target wasm32-unknown-unknown
+# included. Anything that drags in syscalls, threads, dlopen, or
+# native FFI lives behind `host`.
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.5"
 logos = "0.15"
-dynasmrt = "2"
-dynasm = "2"
 wasm-encoder = "0.245"
 smallvec = "1"
 serde = { version = "1", features = ["derive"] }
@@ -32,25 +70,34 @@ serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 toml = "0.8"
 toml_edit = "0.22"
-zstd = "0.13"
-libloading = "0.8"
-libc = "0.2"
-tempfile = "3"
-sha2 = "0.10"
-sha1 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
 base64 = "0.22"
-rand = "0.9"
+
+# Host-only — see the `host` feature definition above.
+dynasmrt = { version = "2", optional = true }
+dynasm = { version = "2", optional = true }
+libloading = { version = "0.8", optional = true }
+libc = { version = "0.2", optional = true }
+tempfile = { version = "3", optional = true }
+sha2 = { version = "0.10", optional = true }
+sha1 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 regex = "1"
-uuid = { version = "1", features = ["v4", "v5", "v7"] }
-aes-gcm = "0.10"
-ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"] }
-rand_core = { version = "0.6", features = ["std"] }
-argon2 = { version = "0.5", features = ["std", "password-hash"] }
-password-hash = { version = "0.5", features = ["std", "alloc"] }
-zip = { version = "2", default-features = false, features = ["deflate", "zstd"] }
-ureq = { version = "2", features = ["tls"] }
+# `uuid` v4 and v5 are portable; v7 reads `SystemTime::now()` which
+# panics on `wasm32-unknown-unknown`. We keep all three features
+# enabled — calling `Uuid.v7` on wasm will surface as a runtime
+# error rather than blocking the whole build. A wasm-specific shim
+# that swaps the time source via `web-time` lands in Phase 1.1.
+uuid = { version = "1", features = ["v4", "v5", "v7", "js"] }
+aes-gcm = { version = "0.10", optional = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core", "std"], optional = true }
+argon2 = { version = "0.5", features = ["std", "password-hash"], optional = true }
+password-hash = { version = "0.5", features = ["std", "alloc"], optional = true }
+zip = { version = "2", default-features = false, features = ["deflate", "zstd"], optional = true }
+zstd = { version = "0.13", optional = true }
+rand = { version = "0.9", optional = true }
+rand_core = { version = "0.6", features = ["std"], optional = true }
+ureq = { version = "2", features = ["tls"], optional = true }
 cranelift-codegen = { version = "0.130", optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }
@@ -58,8 +105,22 @@ cranelift-jit = { version = "0.130", optional = true }
 cranelift-native = { version = "0.130", optional = true }
 # Tier-up / promotion broker. Pinned to 0.3 — version 0.3 brought in
 # the OsrEntry / swap_compiled_with_osr APIs that `src/runtime/tier.rs`
-# relies on for OSR-aware installs.
-beadie = "0.3"
+# relies on for OSR-aware installs. Pulls in `std::thread` so it sits
+# under `host` even though the crate itself is pure Rust.
+beadie = { version = "0.3", optional = true }
+
+# Wasm-specific: getrandom needs the `js` feature on wasm32-unknown-
+# unknown so `rand` can pull entropy from `crypto.getRandomValues`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `getrandom` 0.3's `wasm_js` feature pulls entropy from
+# `crypto.getRandomValues` so `rand` works in browsers / Node.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+# `std::time::Instant::now` compiles on wasm32-unknown-unknown but
+# panics at runtime. `web-time` re-exports the same `Instant` /
+# `SystemTime` API backed by `performance.now()` / `Date.now()`,
+# so portable runtime code that needs monotonic time can swap it
+# in via `use web_time as time` under `cfg(target_arch = "wasm32")`.
+web-time = "1"
 
 [dev-dependencies]
 capstone = "0.12"

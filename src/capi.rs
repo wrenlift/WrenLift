@@ -896,20 +896,29 @@ pub extern "C" fn wrenSetUserData(vm: *mut WrenVM, user_data: *mut c_void) {
 
 /// Install a pre-loaded `.hatch` byte buffer into the VM. Returns
 /// 0 on success, 1 on compile error, 2 on runtime error, -1 on
-/// null-pointer inputs. Useful for embedders that ship packages
-/// baked into the binary via `include_bytes!` / a resource file.
+/// null-pointer inputs, -2 on builds without hatch packaging
+/// (wasm). Useful for embedders that ship packages baked into the
+/// binary via `include_bytes!` / a resource file.
 #[no_mangle]
 pub extern "C" fn wrenInstallHatchBytes(vm: *mut WrenVM, bytes: *const u8, len: usize) -> c_int {
     if vm.is_null() || bytes.is_null() {
         return -1;
     }
-    let vm_ref = unsafe { &mut *vm };
-    let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
-    use crate::runtime::engine::InterpretResult;
-    match vm_ref.install_hatch_modules(slice) {
-        InterpretResult::Success => 0,
-        InterpretResult::CompileError => 1,
-        InterpretResult::RuntimeError => 2,
+    #[cfg(feature = "host")]
+    {
+        let vm_ref = unsafe { &mut *vm };
+        let slice = unsafe { std::slice::from_raw_parts(bytes, len) };
+        use crate::runtime::engine::InterpretResult;
+        match vm_ref.install_hatch_modules(slice) {
+            InterpretResult::Success => 0,
+            InterpretResult::CompileError => 1,
+            InterpretResult::RuntimeError => 2,
+        }
+    }
+    #[cfg(not(feature = "host"))]
+    {
+        let _ = (vm, bytes, len);
+        -2
     }
 }
 

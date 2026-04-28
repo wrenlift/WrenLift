@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// [`VM::check_pending_reload`].
 static RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "host")]
 extern "C" fn reload_signal_handler(_sig: libc::c_int) {
     // Async-signal-safe: AtomicBool::store with Release ordering is
     // documented to be lock-free on every platform we run on, so
@@ -31,6 +32,7 @@ extern "C" fn reload_signal_handler(_sig: libc::c_int) {
 /// Intended to be invoked by the `wlift` binary when a `--watch`
 /// flag (or `WLIFT_WATCH=1` env var) is present, so the parent
 /// `hatch` CLI can drive in-process reload via `kill(pid, SIGUSR1)`.
+#[cfg(feature = "host")]
 pub fn install_reload_signal_handler() {
     unsafe {
         libc::signal(
@@ -39,6 +41,11 @@ pub fn install_reload_signal_handler() {
         );
     }
 }
+
+/// Wasm builds have no signal infrastructure; reload is driven
+/// by an explicit `Hatch.reload(...)` call from JS host glue.
+#[cfg(not(feature = "host"))]
+pub fn install_reload_signal_handler() {}
 
 /// True when the signal handler has flagged a pending reload pass.
 /// Used by integration tests / the CLI to assert delivery.
@@ -290,7 +297,7 @@ pub struct VM {
     /// Dynamic libraries opened on behalf of `foreign` classes via
     /// `#!native`. Kept alive for the VM's lifetime so the function
     /// pointers bound into method tables remain valid.
-    pub native_libs: Vec<libloading::Library>,
+    pub native_libs: Vec<crate::runtime::foreign::Library>,
 
     /// Extra filesystem directories to search when resolving a
     /// `#!native = "..."` library reference, tried ahead of the OS
@@ -309,6 +316,8 @@ pub struct VM {
     /// `.hatch` `NativeLib` sections. Held so the directories (and the
     /// `.dylib` / `.so` files inside) survive as long as the VM does.
     /// Dropped automatically at VM teardown, which reclaims disk.
+    /// Wasm has no fs / dlopen, so the field disappears entirely.
+    #[cfg(feature = "host")]
     native_temp_dirs: Vec<tempfile::TempDir>,
 
     /// Per-class field layouts, keyed by class name. Value is the
@@ -441,6 +450,7 @@ impl VM {
             native_libs: Vec::new(),
             native_search_paths: Vec::new(),
             native_lib_paths: HashMap::new(),
+            #[cfg(feature = "host")]
             native_temp_dirs: Vec::new(),
             field_layouts: HashMap::new(),
             reload_class_table: None,
@@ -626,6 +636,7 @@ impl VM {
     /// Each installed module's top-level runs, the same way a source-
     /// path `import` does. Returns `RuntimeError` if any module's
     /// top-level raises.
+    #[cfg(feature = "host")]
     pub fn install_hatch_modules(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
         let hatch = match crate::hatch::load(hatch_bytes) {
             Ok(h) => h,
@@ -642,6 +653,7 @@ impl VM {
     /// hatches; explicit `[native_libs]` entries with the same key
     /// overwrite (last writer wins) so a consuming hatch can override
     /// a dependency's defaults.
+    #[cfg(feature = "host")]
     fn apply_hatch_native_manifest(&mut self, manifest: &crate::hatch::Manifest) {
         for raw in &manifest.native_search_paths {
             let path = std::path::PathBuf::from(raw);
@@ -662,6 +674,7 @@ impl VM {
     /// Used by spec runs where the file layout on disk — not the
     /// already-extracted temp dir from a `.hatch` bundle — is the
     /// source of truth for native libraries.
+    #[cfg(feature = "host")]
     pub fn apply_hatch_native_manifest_rooted(
         &mut self,
         manifest: &crate::hatch::Manifest,
@@ -696,6 +709,7 @@ impl VM {
     /// bundled library. Returns `CompileError` on any I/O failure —
     /// partial extraction would leave the hatch in an inconsistent
     /// state.
+    #[cfg(feature = "host")]
     fn extract_hatch_native_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
         let has_native = hatch
             .sections
@@ -752,6 +766,7 @@ impl VM {
     /// and extracts any bundled `NativeLib` sections to a temp
     /// directory so `#!native` directives inside the hatch resolve
     /// against both sources at class install time.
+    #[cfg(feature = "host")]
     fn install_hatch_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
         self.apply_hatch_native_manifest(&hatch.manifest);
         let result = self.extract_hatch_native_sections(hatch);
@@ -837,6 +852,7 @@ impl VM {
     /// today — those land in commit 3b. Resource sections are ignored
     /// by this loader; a future `wlift.resource(...)` API will surface
     /// them.
+    #[cfg(feature = "host")]
     pub fn interpret_hatch(&mut self, hatch_bytes: &[u8]) -> InterpretResult {
         let hatch = match crate::hatch::load(hatch_bytes) {
             Ok(h) => h,
@@ -2383,6 +2399,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "fs" => {
                 let class = super::core::fs::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2396,6 +2413,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "os" => {
                 let class = super::core::os::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2422,6 +2440,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "hash" => {
                 let class = super::core::hash::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2435,6 +2454,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "crypto" => {
                 let class = super::core::crypto::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2448,6 +2468,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "zip" => {
                 let class = super::core::zip::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2461,6 +2482,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "socket" => {
                 let class = super::core::socket::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2487,6 +2509,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "http" => {
                 let class = super::core::http::register(self);
                 let class_value = Value::object(class as *mut u8);
@@ -2500,6 +2523,7 @@ impl VM {
                 );
                 true
             }
+            #[cfg(feature = "host")]
             "proc" => {
                 let class = super::core::proc::register(self);
                 let class_value = Value::object(class as *mut u8);

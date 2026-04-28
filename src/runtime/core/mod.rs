@@ -2,15 +2,12 @@
 ///
 /// Implements all built-in classes and their native methods, following
 /// the standard Wren specification from wren-lang/wren.
+// Pure-Rust core modules — always available, wasm and native alike.
 mod bool;
 mod cls;
-pub mod crypto;
 mod fiber;
 mod fn_obj;
-pub mod fs;
-pub mod hash;
 pub mod hatch;
-pub mod http;
 pub mod io;
 mod list;
 mod map;
@@ -18,19 +15,38 @@ pub mod meta;
 mod null;
 mod num;
 mod obj;
-pub mod os;
-pub mod proc;
 pub mod random;
 mod range;
 pub mod regex;
 mod sequence;
-pub mod socket;
 mod string;
 mod system;
 pub mod time;
 pub mod toml;
 mod typed_array;
 pub mod uuid;
+
+// Host-only core modules. Each reaches for syscalls / dynamic
+// linking / heavyweight crypto deps that don't compile (or panic
+// at runtime) on `wasm32-unknown-unknown`. Skipped from the wasm
+// build so the interpreter is portable; user code that does
+// `import "fs"` etc. on wasm sees a clean "module not found"
+// instead of a foreign linker error.
+#[cfg(feature = "host")]
+pub mod crypto;
+#[cfg(feature = "host")]
+pub mod fs;
+#[cfg(feature = "host")]
+pub mod hash;
+#[cfg(feature = "host")]
+pub mod http;
+#[cfg(feature = "host")]
+pub mod os;
+#[cfg(feature = "host")]
+pub mod proc;
+#[cfg(feature = "host")]
+pub mod socket;
+#[cfg(feature = "host")]
 pub mod zip;
 
 use super::vm::VM;

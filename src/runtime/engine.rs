@@ -310,6 +310,7 @@ fn insert_speculative_guards(mir: &mut MirFunction, profile: Option<&TypeProfile
 /// Translate WrenLift's per-function `NativeOsrEntry` list into the
 /// beadie `OsrEntry` vec that gets installed on the bead. Skips
 /// entries with null pointers (non-native / WASM fallback tiers).
+#[cfg(feature = "host")]
 fn encode_osr_entries(entries: &[NativeOsrEntry]) -> Vec<beadie::OsrEntry> {
     entries
         .iter()
@@ -1112,6 +1113,7 @@ impl ExecutionEngine {
         }
     }
 
+    #[cfg(feature = "host")]
     fn sync_active_tier_cache(&mut self, idx: usize) {
         let state = self
             .tier_states
@@ -1249,6 +1251,7 @@ impl ExecutionEngine {
         } else {
             TierState::BaselineNative
         };
+        #[cfg(feature = "host")]
         self.sync_active_tier_cache(idx);
         if !self.collect_tier_stats {
             return;
@@ -1413,6 +1416,7 @@ impl ExecutionEngine {
         );
     }
 
+    #[cfg(feature = "host")]
     fn install_compiled_tier(
         &mut self,
         idx: usize,
@@ -1509,6 +1513,7 @@ impl ExecutionEngine {
         if let Some(bytecode) = self.peek_bytecode(FuncId(idx as u32)) {
             self.bc_cache[idx] = Arc::as_ptr(&bytecode);
         }
+        #[cfg(feature = "host")]
         self.sync_active_tier_cache(idx);
         if std::env::var_os("WLIFT_TRACE_INSTALL").is_some() {
             let jit_ptr = self.jit_code.get(idx).copied().unwrap_or(std::ptr::null());
@@ -1653,6 +1658,17 @@ impl ExecutionEngine {
     }
 
     /// Compile the next tier synchronously and install it.
+    /// Wasm builds run BC-only — there is no native code to compile,
+    /// no broker thread to drive, and `tier_up` on the host pulls in
+    /// `compile_function_artifact_*` which is itself host-only. The
+    /// wasm stub returns `false` so any caller that opportunistically
+    /// asked "did this function get promoted?" sees the same shape.
+    #[cfg(not(feature = "host"))]
+    pub fn tier_up(&mut self, _id: FuncId, _interner: &crate::intern::Interner) -> bool {
+        false
+    }
+
+    #[cfg(feature = "host")]
     pub fn tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) -> bool {
         let idx = id.0 as usize;
         let Some(tier) = self.next_compile_tier(idx) else {
@@ -1747,6 +1763,10 @@ impl ExecutionEngine {
     /// Submit the next tier for background compilation.
     /// The interpreter keeps running bytecode; the compiled result is installed
     /// when `poll_compilations` is called at the next safepoint.
+    #[cfg(not(feature = "host"))]
+    pub fn request_tier_up(&mut self, _id: FuncId, _interner: &crate::intern::Interner) {}
+
+    #[cfg(feature = "host")]
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         if self.mode != ExecutionMode::Tiered {
             return;
@@ -1946,6 +1966,10 @@ impl ExecutionEngine {
 
     /// Install any completed background compilations.
     #[inline]
+    #[cfg(not(feature = "host"))]
+    pub fn poll_compilations(&mut self) {}
+
+    #[cfg(feature = "host")]
     pub fn poll_compilations(&mut self) {
         if self.pending_count == 0 {
             return;

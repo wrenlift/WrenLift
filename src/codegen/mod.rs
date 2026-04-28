@@ -9,15 +9,27 @@
 /// - Explicit results from comparisons via `CSet` (no implicit flag registers)
 /// - Load/store architecture: memory only via `Ldr`/`Str`
 /// - Virtual registers resolved by linear-scan register allocator before emission
-#[cfg(target_arch = "aarch64")]
+// dynasmrt-backed per-arch encoders + the optional Cranelift
+// backend are host-only — neither dep compiles to wasm32 and the
+// emitters target host machine code anyway. The `wasm` codegen
+// module stays unconditional so the same crate still emits
+// Wren-to-wasm from any build (including a wasm-hosted compiler
+// for track 2).
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 pub mod aarch64;
 pub mod cfg;
 #[cfg(feature = "cranelift")]
 pub mod cranelift_backend;
 pub mod native_meta;
 pub mod regalloc;
+// `runtime_fns` is mostly small TLS / context shims that the BC
+// interpreter calls into too; the JIT-only entry points (naked
+// asm wrappers, alloc helpers) are individually cfg-gated inside
+// the file. So the module compiles on wasm even though large
+// chunks of it sit behind `#[cfg(feature = "host")]`.
 pub mod runtime_fns;
 pub mod wasm;
+#[cfg(feature = "host")]
 pub mod x86_64;
 
 use std::fmt;
@@ -1782,6 +1794,7 @@ fn needs_native_shadow_stack(mach: &MachFunc) -> bool {
 }
 
 #[allow(dead_code)]
+#[cfg(feature = "host")]
 fn instrument_native_shadow_stores(mach: &mut MachFunc) {
     let boxed_slots: HashMap<VReg, u16> = mach
         .boxed_gp_vregs()
@@ -1869,9 +1882,10 @@ pub fn lower_mir_with_interner_and_callsite_ics(
 #[allow(clippy::large_enum_variant)]
 pub enum CompiledFunction {
     /// x86_64 machine code bytes.
+    #[cfg(feature = "host")]
     X86_64(x86_64::EmittedCode),
     /// aarch64 executable buffer.
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "host"))]
     Aarch64(aarch64::CompiledCode),
     /// Cranelift-compiled code (owns the JIT module memory).
     #[cfg(feature = "cranelift")]
@@ -1911,11 +1925,12 @@ impl CompiledFunction {
     /// WASM modules cannot be made directly executable (use a WASM runtime).
     pub fn into_executable(self) -> Result<ExecutableFunction, String> {
         match self {
+            #[cfg(feature = "host")]
             CompiledFunction::X86_64(code) => {
                 let exec = code.make_executable()?;
                 Ok(ExecutableFunction::X86_64(exec))
             }
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "host"))]
             CompiledFunction::Aarch64(code) => Ok(ExecutableFunction::Aarch64(code)),
             #[cfg(feature = "cranelift")]
             CompiledFunction::CraneliftOwned(cl) => Ok(ExecutableFunction::Cranelift(cl)),
@@ -1941,8 +1956,9 @@ impl CompiledFunction {
 /// space on the variants that matter.
 #[allow(clippy::large_enum_variant)]
 pub enum ExecutableFunction {
+    #[cfg(feature = "host")]
     X86_64(x86_64::ExecutableCode),
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "host"))]
     Aarch64(aarch64::CompiledCode),
     #[cfg(feature = "cranelift")]
     Cranelift(cranelift_backend::cl::CraneliftCompiledCode),
@@ -1956,11 +1972,14 @@ impl ExecutableFunction {
     /// the target architecture matches the host.
     pub unsafe fn as_fn<F: Copy>(&self) -> F {
         match self {
+            #[cfg(feature = "host")]
             ExecutableFunction::X86_64(code) => code.as_fn(),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "host"))]
             ExecutableFunction::Aarch64(code) => code.as_fn(),
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(cl) => std::mem::transmute_copy(&cl.fn_ptr),
+            #[allow(unreachable_patterns)]
+            _ => panic!("ExecutableFunction::as_fn called on a wasm-only build"),
         }
     }
 
@@ -1985,22 +2004,28 @@ impl ExecutableFunction {
     /// Whether this function can be called on the current host.
     pub fn is_native(&self) -> bool {
         match self {
+            #[cfg(feature = "host")]
             ExecutableFunction::X86_64(_) => cfg!(target_arch = "x86_64"),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "host"))]
             ExecutableFunction::Aarch64(_) => true,
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
         }
     }
 
     /// Size of the native code in bytes.
     pub fn code_size(&self) -> usize {
         match self {
+            #[cfg(feature = "host")]
             ExecutableFunction::X86_64(code) => code.len(),
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "host"))]
             ExecutableFunction::Aarch64(code) => code.code_size(),
             #[cfg(feature = "cranelift")]
             ExecutableFunction::Cranelift(cl) => cl.code_size,
+            #[allow(unreachable_patterns)]
+            _ => 0,
         }
     }
 }
@@ -2009,12 +2034,14 @@ impl ExecutableFunction {
 ///
 /// Native pipeline: MIR → lower → regalloc → sentinel fixup → emit.
 /// WASM pipeline: MIR → emit_mir (bypasses MachInst entirely).
+#[cfg(feature = "host")]
 pub fn compile_function(mir: &MirFunction, target: Target) -> Result<CompiledFunction, String> {
     let interner = crate::intern::Interner::new();
     compile_function_with_interner(mir, target, &interner)
 }
 
 /// Compile with access to the VM's interner and preserve native metadata.
+#[cfg(feature = "host")]
 pub fn compile_function_artifact_with_interner(
     mir: &MirFunction,
     target: Target,
@@ -2124,6 +2151,7 @@ fn devirt_calls_with_ic(
 }
 
 #[allow(clippy::too_many_arguments)] // Single call site; plumbs IC snapshot, devirt hints and jit_code_base into the backend.
+#[cfg(feature = "host")]
 pub fn compile_function_artifact_with_interner_and_callsite_ics(
     mir: &MirFunction,
     target: Target,
@@ -2340,6 +2368,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
 }
 
 /// Compile with access to the VM's interner for symbol resolution.
+#[cfg(feature = "host")]
 pub fn compile_function_with_interner(
     mir: &MirFunction,
     target: Target,
@@ -2614,6 +2643,7 @@ fn fixup_vreg_sentinels(
 ///   movz x16, pop_addr
 ///   blr  x16              (call wren_jit_frame_pop)
 #[allow(dead_code)] // Legacy backend helper; cranelift handles this via its own runtime entries.
+#[cfg(feature = "host")]
 fn instrument_jit_frame_registration(mach: &mut MachFunc, func_id: u32) {
     let push_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_push").unwrap_or(0) as u64;
     let pop_addr = crate::codegen::runtime_fns::resolve("wren_jit_frame_pop").unwrap_or(0) as u64;

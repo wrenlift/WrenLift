@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use libloading::Library;
+pub use libloading::Library;
 
 use crate::runtime::object::ForeignCFn;
 use crate::runtime::value::Value;
