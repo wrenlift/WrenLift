@@ -298,6 +298,12 @@ pub fn create_pending_future() -> u32 {
 // single-threaded — the `Mutex` exists for `OnceLock` interior
 // mutability, not actual cross-thread synchronisation.
 
+// Fields are only read inside the scheduler loop, which is
+// gated to `wasm32 + unknown`. The host build still pushes
+// entries (via `park_fiber`) so the type stays present, but
+// clippy flags the fields as dead — silence it instead of
+// gating the whole module surface on wasm32.
+#[allow(dead_code)]
 struct ParkedFiber {
     fiber: *mut ObjFiber,
     handle: u32,
@@ -996,6 +1002,12 @@ pub async fn run(source: &str) -> RunResult {
     // ≈ 10 s wall clock — covers a reasonable awaited timer
     // chain and bails on actually-stuck programs.
     let t_sched = perf_mark();
+    // Scheduler loop is wasm-only — the host build (clippy /
+    // unit tests) has no JS event loop, so any parked fiber is
+    // definitionally unreachable. Gating the whole block keeps
+    // host clippy clean (no unreachable_code / never_loop /
+    // unused_assignments lints to silence one by one).
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     if matches!(result, InterpretResult::Success) {
         let mut tick_budget: u32 = 2_500;
         loop {
@@ -1024,38 +1036,28 @@ pub async fn run(source: &str) -> RunResult {
             // setTimeout backstop is there for cases where the
             // first tick has nothing parked yet, or a future
             // settled while no waker was armed (rare race).
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            {
-                let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-                    *scheduler_waker().lock().expect("scheduler waker poisoned") =
-                        Some(SchedulerWaker(resolve));
-                });
-                // Race the wake against a setTimeout backstop so
-                // we can't deadlock if no future settles. The
-                // backstop fires every ~4 ms (browser clamp),
-                // which is the worst-case latency on a future
-                // that settled without arming the waker.
-                let backstop = js::wlift_yield_to_event_loop();
-                let race = js_sys::Promise::race(&js_sys::Array::of2(&promise, &backstop));
-                let _ = wasm_bindgen_futures::JsFuture::from(race).await;
-                // Drop any waker we left armed — `Promise::race`
-                // resolved through the backstop side, so the
-                // waker won't be called. Leaving it set would
-                // make the next tick fire immediately on the
-                // next `resolve_future` call regardless of which
-                // tick that future was actually parked from.
-                scheduler_waker()
-                    .lock()
-                    .expect("scheduler waker poisoned")
-                    .take();
-            }
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            {
-                // Non-wasm host build (clippy / unit tests) has no
-                // event loop. Anything still parked is by
-                // definition unreachable here.
-                break;
-            }
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                *scheduler_waker().lock().expect("scheduler waker poisoned") =
+                    Some(SchedulerWaker(resolve));
+            });
+            // Race the wake against a setTimeout backstop so
+            // we can't deadlock if no future settles. The
+            // backstop fires every ~4 ms (browser clamp),
+            // which is the worst-case latency on a future
+            // that settled without arming the waker.
+            let backstop = js::wlift_yield_to_event_loop();
+            let race = js_sys::Promise::race(&js_sys::Array::of2(&promise, &backstop));
+            let _ = wasm_bindgen_futures::JsFuture::from(race).await;
+            // Drop any waker we left armed — `Promise::race`
+            // resolved through the backstop side, so the
+            // waker won't be called. Leaving it set would
+            // make the next tick fire immediately on the
+            // next `resolve_future` call regardless of which
+            // tick that future was actually parked from.
+            scheduler_waker()
+                .lock()
+                .expect("scheduler waker poisoned")
+                .take();
 
             // Snapshot the parked list, partition into ready vs.
             // still-pending, and resume the ready ones. New

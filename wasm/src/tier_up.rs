@@ -186,6 +186,7 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
 /// ReturnNull. Anything that would require a `wren_call`,
 /// `wren_make_*`, GC alloc, or upvalue access gets rejected so
 /// instantiation never trips LinkError.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn mir_needs_unsupported_helpers(mir: &wren_lift::mir::MirFunction) -> bool {
     use wren_lift::mir::Instruction;
     for block in &mir.blocks {
@@ -541,11 +542,13 @@ pub fn wren_jit_slot_plus_one(receiver_bits: u64) -> u32 {
 /// (this) without name collision. JIT'd code with `wren_call_1`
 /// imports still works — it's an alias for the slow path so
 /// pre-Phase-5 modules continue dispatching correctly.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn wren_call_1_slow(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
     wren_call_1(receiver_bits, method_id, arg_bits)
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
     let vm_ptr = wren_lift::runtime::tier::current_vm();

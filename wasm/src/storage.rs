@@ -169,10 +169,16 @@ pub unsafe extern "C" fn storage_clear(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 /// Publish Storage foreign methods under library name `"storage"`.
+/// No-op on the workspace's host build (clippy / unit tests) —
+/// the foreign registry only exists when wren_lift is built
+/// without the `host` feature, i.e. on `wasm32-*` targets.
 pub fn register_static_symbols() {
-    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
-    register_plugin_symbol_unsafe("storage", "storage_get", storage_get);
-    register_plugin_symbol_unsafe("storage", "storage_set", storage_set);
-    register_plugin_symbol_unsafe("storage", "storage_remove", storage_remove);
-    register_plugin_symbol_unsafe("storage", "storage_clear", storage_clear);
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
+        register_plugin_symbol_unsafe("storage", "storage_get", storage_get);
+        register_plugin_symbol_unsafe("storage", "storage_set", storage_set);
+        register_plugin_symbol_unsafe("storage", "storage_remove", storage_remove);
+        register_plugin_symbol_unsafe("storage", "storage_clear", storage_clear);
+    }
 }

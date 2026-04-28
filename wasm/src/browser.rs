@@ -441,17 +441,22 @@ pub unsafe extern "C" fn browser_ws_close(vm: *mut VM) {
 
 /// Publish the `Browser.*` foreign methods to the runtime
 /// registry. Called from `register_static_plugins` in `lib.rs`.
+/// No-op on the workspace's host build (clippy / unit tests) —
+/// see the matching note in `storage::register_static_symbols`.
 pub fn register_static_symbols() {
-    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
-    register_plugin_symbol_unsafe("browser", "browser_set_timeout", browser_set_timeout);
-    register_plugin_symbol_unsafe("browser", "browser_fetch", browser_fetch);
-    register_plugin_symbol_unsafe("browser", "browser_ws_open", browser_ws_open);
-    register_plugin_symbol_unsafe("browser", "browser_ws_send", browser_ws_send);
-    register_plugin_symbol_unsafe("browser", "browser_ws_recv", browser_ws_recv);
-    register_plugin_symbol_unsafe("browser", "browser_ws_close", browser_ws_close);
-    register_plugin_symbol_unsafe("browser", "browser_peek_state", browser_peek_state);
-    register_plugin_symbol_unsafe("browser", "browser_take_value", browser_take_value);
-    register_plugin_symbol_unsafe("browser", "browser_park_self", browser_park_self);
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
+        register_plugin_symbol_unsafe("browser", "browser_set_timeout", browser_set_timeout);
+        register_plugin_symbol_unsafe("browser", "browser_fetch", browser_fetch);
+        register_plugin_symbol_unsafe("browser", "browser_ws_open", browser_ws_open);
+        register_plugin_symbol_unsafe("browser", "browser_ws_send", browser_ws_send);
+        register_plugin_symbol_unsafe("browser", "browser_ws_recv", browser_ws_recv);
+        register_plugin_symbol_unsafe("browser", "browser_ws_close", browser_ws_close);
+        register_plugin_symbol_unsafe("browser", "browser_peek_state", browser_peek_state);
+        register_plugin_symbol_unsafe("browser", "browser_take_value", browser_take_value);
+        register_plugin_symbol_unsafe("browser", "browser_park_self", browser_park_self);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -288,15 +288,20 @@ pub unsafe extern "C" fn dom_query_all(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 /// Publish DOM foreign methods under library name `"dom"`.
+/// No-op on the workspace's host build — see the matching note
+/// in `storage::register_static_symbols`.
 pub fn register_static_symbols() {
-    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
-    register_plugin_symbol_unsafe("dom", "dom_text", dom_text);
-    register_plugin_symbol_unsafe("dom", "dom_set_text", dom_set_text);
-    register_plugin_symbol_unsafe("dom", "dom_get_attribute", dom_get_attribute);
-    register_plugin_symbol_unsafe("dom", "dom_set_attribute", dom_set_attribute);
-    register_plugin_symbol_unsafe("dom", "dom_add_class", dom_add_class);
-    register_plugin_symbol_unsafe("dom", "dom_remove_class", dom_remove_class);
-    register_plugin_symbol_unsafe("dom", "dom_query_all", dom_query_all);
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
+        register_plugin_symbol_unsafe("dom", "dom_text", dom_text);
+        register_plugin_symbol_unsafe("dom", "dom_set_text", dom_set_text);
+        register_plugin_symbol_unsafe("dom", "dom_get_attribute", dom_get_attribute);
+        register_plugin_symbol_unsafe("dom", "dom_set_attribute", dom_set_attribute);
+        register_plugin_symbol_unsafe("dom", "dom_add_class", dom_add_class);
+        register_plugin_symbol_unsafe("dom", "dom_remove_class", dom_remove_class);
+        register_plugin_symbol_unsafe("dom", "dom_query_all", dom_query_all);
+    }
 }
 
 // ---------------------------------------------------------------------------

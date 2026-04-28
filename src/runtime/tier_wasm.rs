@@ -50,6 +50,7 @@ use crate::runtime::engine::FuncId;
 
 /// Compile a MIR function to wasm bytecode + instantiate it
 /// + return the slot index in the host's JIT instance table.
+///
 /// `None` signals compile / instantiate failure (the dispatch
 /// path then falls through to the BC interpreter as if no JIT
 /// had been registered).
