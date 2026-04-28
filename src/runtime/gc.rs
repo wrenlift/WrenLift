@@ -682,7 +682,7 @@ impl Gc {
 
     /// Auto-select minor or major GC based on interval.
     pub fn collect(&mut self, roots: &mut [Value]) {
-        let start = std::time::Instant::now();
+        let start = crate::portable_time::Instant::now();
         if self.minor_since_major >= self.config.major_gc_interval {
             self.collect_major(roots);
         } else {

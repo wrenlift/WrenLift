@@ -112,6 +112,16 @@ fn smoke_runs_under_wasmtime() {
         "missing list ops; captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("time ok: mono delta >= 0 = true"),
+        "monotonic Instant didn't survive in wasm; captured:\n{}",
+        captured
+    );
+    assert!(
+        captured.contains("unix ok: nonzero = true"),
+        "SystemTime returned 0/epoch on wasm; captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

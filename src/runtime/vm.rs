@@ -57,12 +57,22 @@ pub fn reload_pending() -> bool {
 /// Unix epoch. Returns `None` for missing files or non-Unix-epoch
 /// stat results. Used to baseline modules at install time and decide
 /// which ones to reload on a SIGUSR1 pass.
+#[cfg(feature = "host")]
 fn file_mtime_secs(path: &str) -> Option<f64> {
     let m = std::fs::metadata(path).ok()?;
     let mt = m.modified().ok()?;
-    mt.duration_since(std::time::UNIX_EPOCH)
+    mt.duration_since(crate::portable_time::UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs_f64())
+}
+
+/// Wasm has no file system — every "did the file change" check
+/// reports `None` so callers fall back to "module up to date".
+/// Hot reload on wasm is driven by an explicit `Hatch.reload(...)`
+/// call from JS host glue, not stat-polling.
+#[cfg(not(feature = "host"))]
+fn file_mtime_secs(_path: &str) -> Option<f64> {
+    None
 }
 
 use super::engine::{ExecutionEngine, ExecutionMode, InterpretResult};

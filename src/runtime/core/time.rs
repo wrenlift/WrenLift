@@ -7,7 +7,7 @@
 //! own. UTC covers logs and unix-epoch math, which is 95% of what
 //! libraries actually want.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::portable_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::object::NativeContext;
 use crate::runtime::value::Value;
@@ -52,7 +52,16 @@ fn time_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         ctx.runtime_error("Time.sleep: seconds must be a non-negative finite number.".to_string());
         return Value::null();
     }
+    // `std::thread::sleep` doesn't exist on `wasm32-unknown-unknown`
+    // (no thread to put to sleep). The browser host can't block
+    // anyway — long sleeps would freeze the page. Wasm callers are
+    // expected to drive a cooperative scheduler that translates
+    // sleep into a `setTimeout` + `Fiber.yield`; the runtime itself
+    // just no-ops the request.
+    #[cfg(feature = "host")]
     std::thread::sleep(Duration::from_secs_f64(secs));
+    #[cfg(not(feature = "host"))]
+    let _ = secs;
     Value::null()
 }
 

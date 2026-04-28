@@ -16,8 +16,9 @@ use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::vm::{VM, VMConfig};
 
 const SOURCE: &str = r#"
+import "time" for TimeCore
+
 System.print("hello from wasm!")
-var fib = Fn.new {|n| n < 2 ? n : Fiber.current && (n - 1) + 1 } // placeholder
 var i = 0
 var sum = 0
 while (i < 10) {
@@ -29,6 +30,13 @@ System.print("List ops:")
 var nums = [1, 2, 3, 4, 5]
 var doubled = nums.map {|x| x * 2}.toList
 System.print(doubled)
+// Probe `web-time`-backed clocks: confirm Instant + SystemTime
+// don't panic at runtime under wasm32-unknown-unknown / wasi.
+var t0 = TimeCore.mono
+var t1 = TimeCore.mono
+System.print("time ok: mono delta >= 0 = %((t1 - t0) >= 0)")
+var unix = TimeCore.unix
+System.print("unix ok: nonzero = %(unix > 0)")
 "#;
 
 fn main() -> std::process::ExitCode {

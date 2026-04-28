@@ -120,7 +120,7 @@ fn save_prng(args: &[Value], prng: &Well512) {
 
 /// Random.new() — seed from current time
 fn random_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::portable_time::{SystemTime, UNIX_EPOCH};
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

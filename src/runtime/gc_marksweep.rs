@@ -378,7 +378,7 @@ impl GcAllocator for MarkSweepGc {
     }
 
     fn collect(&mut self, roots: &mut [Value]) {
-        let start = std::time::Instant::now();
+        let start = crate::portable_time::Instant::now();
 
         // Mark phase.
         let mut gray_stack: Vec<*mut ObjHeader> = Vec::new();

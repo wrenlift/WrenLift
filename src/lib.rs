@@ -4,6 +4,7 @@ pub mod codegen;
 pub mod diagnostics;
 pub mod intern;
 pub mod mir;
+pub mod portable_time;
 pub mod parse;
 pub mod runtime;
 pub mod sema;

@@ -32,15 +32,21 @@ fn hatch_module_mtime(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = super::validate_string(ctx, args[1], "Path") else {
         return Value::null();
     };
+    #[cfg(feature = "host")]
     match std::fs::metadata(&path).and_then(|m| m.modified()) {
         Ok(mtime) => {
             let secs = mtime
-                .duration_since(std::time::UNIX_EPOCH)
+                .duration_since(crate::portable_time::UNIX_EPOCH)
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.0);
             Value::num(secs)
         }
         Err(_) => Value::null(),
+    }
+    #[cfg(not(feature = "host"))]
+    {
+        let _ = path;
+        Value::null()
     }
 }
 
