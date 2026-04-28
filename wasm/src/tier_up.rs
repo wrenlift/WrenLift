@@ -84,12 +84,26 @@ pub fn jit_dispatch_fast_path_count() -> u64 {
 }
 
 /// Reset all counters — handy for per-run measurements.
+/// Doesn't touch the runtime's `dispatch_hook_hits` counter
+/// (it's `pub fn` in tier_wasm.rs without a reset hook); read
+/// the delta yourself if you need a per-run number.
 #[wasm_bindgen]
 pub fn jit_counters_reset() {
     COMPILE_COUNT.store(0, Ordering::Relaxed);
     COMPILE_REJECT_COUNT.store(0, Ordering::Relaxed);
     DISPATCH_FROM_BC_COUNT.store(0, Ordering::Relaxed);
     DISPATCH_FAST_PATH_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Total times the BC interpreter's wasm dispatch hook ran —
+/// i.e. how many Wren closure-method calls reached
+/// `dispatch_closure_bc_inner`'s wasm-only block. If this stays
+/// 0 while a script runs, closure dispatch is going through a
+/// path that bypasses the hook (rare but possible — e.g. if a
+/// call is intercepted by an earlier match arm in `Op::Call`).
+#[wasm_bindgen]
+pub fn jit_dispatch_hook_hits() -> u64 {
+    wren_lift::runtime::tier::dispatch_hook_hits()
 }
 
 // Phase 2b — extern bindings for the JS-side instantiate + call

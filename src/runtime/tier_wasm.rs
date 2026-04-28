@@ -189,6 +189,35 @@ pub fn exit_vm(prev: *mut crate::runtime::vm::VM) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Raw dispatch-hook counter
+// ---------------------------------------------------------------------------
+//
+// Bumped on every call into `dispatch_closure_bc_inner`'s wasm
+// hook, **before** any slot lookup or tier-up trigger. Lets the
+// host distinguish "hook never runs" from "hook runs but
+// `try_compile` silently fails." If this counter stays 0 while
+// fib(20) executes, the BC interpreter is dispatching closure
+// calls through a path that bypasses the hook entirely.
+//
+// Cost: one relaxed atomic increment per Wren method call. <1 ns
+// on wasm32. Negligible vs. dispatch overhead.
+
+static DISPATCH_HOOK_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increment the hook-hit counter. Called from the wasm
+/// dispatch hook in `vm_interp.rs::dispatch_closure_bc_inner`.
+#[inline(always)]
+pub fn bump_dispatch_hook_hits() {
+    DISPATCH_HOOK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the total number of dispatch-hook entries. Exposed via
+/// `wlift_wasm::tier_up::jit_dispatch_hook_hits()`.
+pub fn dispatch_hook_hits() -> u64 {
+    DISPATCH_HOOK_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const BASELINE_THRESHOLD: u32 = 100;
 pub const OPTIMIZED_THRESHOLD: u32 = 1_000;
 pub const DEFAULT_DEOPT_LIMIT: u32 = 3;

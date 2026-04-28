@@ -3569,6 +3569,7 @@ fn dispatch_closure_bc_inner(
     // JS-roundtrip cost on inter-fn calls.
     #[cfg(target_arch = "wasm32")]
     if arg_vals.len() <= 3 {
+        crate::runtime::tier::bump_dispatch_hook_hits();
         if let Some(slot) = vm.engine.wasm_jit_slot(target_func_id) {
             // Receiver is `arg_vals[0]`; JIT'd functions take
             // only positional args today (Phase 4 threads the
