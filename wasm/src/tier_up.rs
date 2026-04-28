@@ -82,10 +82,17 @@ extern "C" {
 
 /// Compile a MIR function via `emit_mir` and instantiate via the
 /// JS shim. Returns the slot index in the page's JIT instance
-/// table. `None` on emit / instantiate failure (the runtime
-/// then falls back to BC interp dispatch).
+/// table. `None` on emit / instantiate failure or if the MIR
+/// uses instructions whose runtime helpers we haven't bound yet
+/// (would LinkError at instantiation).
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
+    if mir_needs_unsupported_helpers(mir) {
+        // Phase 4 lifts this — wires `wren_call`, `wren_make_*`,
+        // `wren_to_string`, etc. through a thread-local VM
+        // pointer so JIT'd code can call back into the runtime.
+        return None;
+    }
     let module = wren_lift::codegen::wasm::emit_mir(mir).ok()?;
     let bytes = module.bytes;
     if bytes.is_empty() {
@@ -93,6 +100,46 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
     }
     let slot = js_jit_instantiate(&bytes);
     Some(slot)
+}
+
+/// Walk MIR for any instruction whose `wren_*` runtime helper
+/// isn't bound yet. Phase 3 supports the leaf-arithmetic subset:
+/// ConstNum / Box / Unbox / Add / Sub / Mul / Div / Mod / Neg /
+/// Cmp* / Not / IsTruthy / Branch / CondBranch / Return /
+/// ReturnNull. Anything that would require a `wren_call`,
+/// `wren_make_*`, GC alloc, or upvalue access gets rejected so
+/// instantiation never trips LinkError.
+fn mir_needs_unsupported_helpers(mir: &wren_lift::mir::MirFunction) -> bool {
+    use wren_lift::mir::Instruction;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            match inst {
+                Instruction::Call { .. }
+                | Instruction::CallStaticSelf { .. }
+                | Instruction::SuperCall { .. }
+                | Instruction::MakeClosure { .. }
+                | Instruction::GetUpvalue(_)
+                | Instruction::SetUpvalue(..)
+                | Instruction::MakeList(_)
+                | Instruction::MakeMap(_)
+                | Instruction::MakeRange(..)
+                | Instruction::StringConcat(_)
+                | Instruction::ToString(_)
+                | Instruction::SubscriptGet { .. }
+                | Instruction::SubscriptSet { .. }
+                | Instruction::GetField(..)
+                | Instruction::SetField(..)
+                | Instruction::GetStaticField(..)
+                | Instruction::SetStaticField(..)
+                | Instruction::GetModuleVar(_)
+                | Instruction::SetModuleVar(..)
+                | Instruction::IsType(..)
+                | Instruction::GuardClass(..) => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Invoke a JIT'd slot via the JS shim. Args are NaN-boxed
@@ -317,6 +364,21 @@ pub fn wren_cmp_ne(a: u64, b: u64) -> u64 {
 pub fn wren_not(a: u64) -> u64 {
     let av = Value::from_bits(a);
     Value::bool(!av.is_truthy_wren()).to_bits()
+}
+
+/// Truthiness probe — emit_mir uses this for `if`/`while` tests
+/// on boxed values. Returns `1` for truthy, `0` for falsy. Note
+/// the result type is i32 (a wasm bool) not i64 — the codegen
+/// wires it directly into a `br_if` so an i64 boxed bool would
+/// need an extra unboxing step.
+#[wasm_bindgen]
+pub fn wren_is_truthy(a: u64) -> u32 {
+    let av = Value::from_bits(a);
+    if av.is_truthy_wren() {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
