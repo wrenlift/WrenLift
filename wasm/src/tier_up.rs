@@ -135,6 +135,17 @@ extern "C" {
     fn js_jit_call_1(slot: u32, a: u64) -> u64;
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_2)]
     fn js_jit_call_2(slot: u32, a: u64, b: u64) -> u64;
+    /// JS-provided shim that resets the host's JIT-instance
+    /// pool (the array `__wliftJitInstances` and the funcref
+    /// table `__wliftJitTable`). Called from
+    /// `reset_jit_runtime_caches` at the start of each `run()`
+    /// so accumulated entries from previous VMs don't leak as
+    /// the page is held open. Safe because each `run()`
+    /// instantiates a fresh VM whose `wasm_jit_slots` is empty
+    /// — no in-flight reference to a prior slot can survive
+    /// across the boundary.
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_reset)]
+    fn js_jit_reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +740,28 @@ mod main_module_cache {
         module: UnsafeCell::new(std::ptr::null()),
     };
 }
+
+/// Invalidate per-run JIT caches. Called at the start of every
+/// `run()` because the VM is freshly `Box`-allocated and the
+/// allocator may reuse a prior run's address — without this
+/// reset the next prologue would deref a freed `ModuleEntry`
+/// and trap. Also clears the JS-side `__wliftJitInstances` and
+/// `__wliftJitTable` so accumulated wasm modules from previous
+/// runs become garbage-collectable; otherwise the page would
+/// grow without bound on every Run-button click.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn reset_jit_runtime_caches() {
+    unsafe {
+        *main_module_cache::CACHE.vm.get() = std::ptr::null_mut();
+        *main_module_cache::CACHE.module.get() = std::ptr::null();
+    }
+    js_jit_reset();
+}
+
+/// Stub for non-wasm builds so `lib.rs::run` can call it
+/// unconditionally.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn reset_jit_runtime_caches() {}
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn cached_main_module(

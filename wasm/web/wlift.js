@@ -330,6 +330,19 @@ class MainWlift {
     globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
     globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
 
+    // Per-run reset — wlift_wasm calls this at the top of each
+    // `run()` so JIT'd modules from prior VMs become
+    // garbage-collectable. We can't shrink the funcref Table
+    // (no API), so we null-out every entry and reset the
+    // companion array. The JIT'd wasm modules themselves drop
+    // out of scope once the table releases its references.
+    globalThis._wlift_jit_reset = () => {
+      for (let i = 0; i < __wliftJitInstances.length; i++) {
+        try { __wliftJitTable.set(i, null); } catch (_) { /* table ref types vary by browser */ }
+      }
+      __wliftJitInstances.length = 0;
+    };
+
     return this;
   }
 

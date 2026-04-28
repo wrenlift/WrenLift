@@ -223,6 +223,15 @@ globalThis._wlift_jit_call_0 = (slot)       => __wliftSafeCall(slot, (fn) => fn(
 globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
 globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
 
+// Per-run reset — see wlift.js for rationale. Worker-mode
+// install lives here.
+globalThis._wlift_jit_reset = () => {
+  for (let i = 0; i < __wliftJitInstances.length; i++) {
+    try { __wliftJitTable.set(i, null); } catch (_) { /* table ref types vary by browser */ }
+  }
+  __wliftJitInstances.length = 0;
+};
+
 // `init()` returns the raw wasm exports object. Use those
 // (NOT the wasm-bindgen JS wrappers from the namespace import)
 // for the JIT-side imports — the wrappers do BigInt↔i64

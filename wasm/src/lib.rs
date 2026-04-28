@@ -948,6 +948,16 @@ pub async fn run(source: &str) -> RunResult {
         }
     }));
 
+    // Wipe per-run JIT caches (main-module pointer etc.) before
+    // the new VM is allocated. The allocator may hand the new VM
+    // the same address as the previous one, which would make the
+    // cached `vm_ptr` check pass but the cached `module_ptr`
+    // dangling — the prologue would deref freed memory and trap
+    // ("memory access out of bounds" inside
+    // `wren_jit_slot_for_module_var`). Running the reset *before*
+    // VM::new is the simplest insurance.
+    tier_up::reset_jit_runtime_caches();
+
     let t_vm_new = perf_mark();
     let mut vm = VM::new(config);
     vm.output_buffer = Some(String::new());
