@@ -1,21 +1,143 @@
 //! wasm-bindgen entry shim for the WrenLift interpreter.
 //!
-//! Two functions exposed to JS / wasi hosts so far:
+//! Three things exported to JS / wasi hosts:
 //!
 //!   * `version()` — returns a `&str` describing the wlift build,
 //!     useful as a smoke test that the wasm module loaded at all.
 //!   * `run(source: &str) -> RunResult` — compiles the source as a
 //!     `<wasm>` module, drives the BC interpreter, and returns the
 //!     captured `System.print` output plus an `ok` flag.
+//!   * `resolve_future` / `reject_future` — host-side handle store
+//!     for the Promise ↔ `Fiber.yield` bridge. JS Promise callbacks
+//!     flip a handle's state; the awaiting fiber wakes on its next
+//!     yield-loop iteration. See
+//!     `project_wasm_promise_fiber_bridge.md` for the full design.
 //!
 //! No JIT, no plugin loading, no fs / sockets. Future phases grow
 //! the surface (incremental compile, multi-module install,
 //! browser-API foreign classes); this is the minimal demo.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use wasm_bindgen::prelude::*;
 
-use wren_lift::runtime::engine::{InterpretResult, ExecutionMode};
+use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::vm::{VM, VMConfig};
+
+// ---------------------------------------------------------------------------
+// Promise ↔ Fiber.yield handle store (Phase 1.1 scaffolding)
+// ---------------------------------------------------------------------------
+//
+// Foreign methods that call browser async APIs (`fetch`,
+// `setTimeout`, `WebSocket.send`, ...) mint a handle here, kick
+// off the JS Promise, and return the handle to Wren wrapped in a
+// `Future` instance. JS resolves/rejects via the
+// `resolve_future` / `reject_future` exports below; the Wren
+// `Future.await` method polls `peek_state` in a `Fiber.yield`
+// loop until the handle flips out of `Pending`.
+//
+// The store is a global Mutex<HashMap> for now. Multi-VM hosts
+// (server-side wasi running multiple wlift instances) eventually
+// want a per-VM store, but that's a refactor with no consumers
+// in Phase 1.1 — defer until at least one host ships multiple
+// concurrent VMs.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[wasm_bindgen]
+pub enum FutureState {
+    Pending = 0,
+    Resolved = 1,
+    Rejected = 2,
+}
+
+#[derive(Debug)]
+struct FutureSlot {
+    state: FutureState,
+    /// Resolved value, currently encoded as a UTF-8 string (JSON
+    /// for fetch payloads, plain text for echo APIs). Switching
+    /// to a richer encoding (e.g. wasm-bindgen `JsValue` round-
+    /// trip via the wlift heap) lands when there's a second
+    /// consumer that actually needs it.
+    value: Option<String>,
+    /// Error message on `Rejected`. Surfaced to Wren via
+    /// `Fiber.abort` inside `Future.await`.
+    error: Option<String>,
+}
+
+fn future_store() -> &'static Mutex<HashMap<u32, FutureSlot>> {
+    static STORE: std::sync::OnceLock<Mutex<HashMap<u32, FutureSlot>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_future_handle() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Internal — Phase 1.1+ foreign methods call this to mint a
+/// handle and pre-stash a `Pending` slot. Public so the future
+/// `core::browser` foreign-method registry (lives in this crate
+/// for now) can call it directly without going through the JS
+/// host.
+pub fn create_pending_future() -> u32 {
+    let handle = next_future_handle();
+    let mut store = future_store().lock().expect("future store poisoned");
+    store.insert(
+        handle,
+        FutureSlot {
+            state: FutureState::Pending,
+            value: None,
+            error: None,
+        },
+    );
+    handle
+}
+
+/// JS-callable: flip a handle to `Resolved` and stash the value.
+/// Idempotent — resolving an already-resolved/rejected handle is
+/// a no-op (matches Promise semantics; the first settlement wins).
+#[wasm_bindgen]
+pub fn resolve_future(handle: u32, value: String) {
+    let mut store = future_store().lock().expect("future store poisoned");
+    if let Some(slot) = store.get_mut(&handle) {
+        if slot.state == FutureState::Pending {
+            slot.state = FutureState::Resolved;
+            slot.value = Some(value);
+        }
+    }
+}
+
+/// JS-callable: flip a handle to `Rejected` with an error message.
+#[wasm_bindgen]
+pub fn reject_future(handle: u32, error: String) {
+    let mut store = future_store().lock().expect("future store poisoned");
+    if let Some(slot) = store.get_mut(&handle) {
+        if slot.state == FutureState::Pending {
+            slot.state = FutureState::Rejected;
+            slot.error = Some(error);
+        }
+    }
+}
+
+/// JS-callable: read the current state of a handle. Used by
+/// JS-side debugging / introspection tooling. Wren's
+/// `Future.await` doesn't go through wasm-bindgen — it dispatches
+/// through the `peek_state` foreign method registered with the VM
+/// (Phase 1.1+ work).
+#[wasm_bindgen]
+pub fn future_state(handle: u32) -> FutureState {
+    let store = future_store().lock().expect("future store poisoned");
+    store
+        .get(&handle)
+        .map(|s| s.state)
+        .unwrap_or(FutureState::Rejected)
+}
+
+// ---------------------------------------------------------------------------
+// Init + version
+// ---------------------------------------------------------------------------
 
 /// Optional one-time setup. Browser callers should invoke this
 /// from JS before the first `run` so that any panic deeper in
