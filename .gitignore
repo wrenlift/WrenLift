@@ -7,3 +7,6 @@ profile.json.gz
 # `wasm/src/lib.rs` + the runtime source on every build; we
 # track the recipe, not the bytes.
 wasm/pkg/
+
+# Local-only state from /loop's wakeup scheduler — never tracked.
+.claude/
