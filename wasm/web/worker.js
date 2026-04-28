@@ -216,6 +216,11 @@ globalThis._wlift_jit_call_1 = (slot, a)    => __wliftJitInstances[slot](a);
 globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftJitInstances[slot](a, b);
 
 await init();
+// Stash the namespace on the worker's globalThis so the worker-
+// side `_wlift_jit_*` shims and JIT counters can be poked at
+// during debugging. Main-thread console can't reach this one
+// (different scope) — see `wlift.js` for the page-side mirror.
+globalThis.wlift_wasm = wlift_wasm;
 self.postMessage({ cmd: "ready", version: version() });
 
 self.addEventListener("message", (e) => {

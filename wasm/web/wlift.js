@@ -235,6 +235,15 @@ class MainWlift {
     this._memory = wasm.memory;
     this.version = mod.version();
 
+    // Expose the module namespace to `globalThis` so the dev
+    // console can poke at JIT counters / debug exports in main
+    // mode without an extra `import` step. Worker mode stashes
+    // its own copy on the worker's globalThis (see worker.js)
+    // — the page-side `wlift_wasm` only reflects main-mode
+    // state. Two separate instances; that's working as
+    // designed.
+    globalThis.wlift_wasm = mod;
+
     // Tier-up Phase 2b — JIT instantiate + call shims. The Rust
     // side calls `wlift_wasm::tier_up::emit_*` to produce wasm
     // bytes; these shims compile + instantiate them with the
