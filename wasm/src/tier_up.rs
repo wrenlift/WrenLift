@@ -101,6 +101,7 @@ pub fn jit_counters_reset() {
 /// 0 while a script runs, closure dispatch is going through a
 /// path that bypasses the hook (rare but possible — e.g. if a
 /// call is intercepted by an earlier match arm in `Op::Call`).
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn jit_dispatch_hook_hits() -> u64 {
     wren_lift::runtime::tier::dispatch_hook_hits()
@@ -504,6 +505,7 @@ pub fn wren_is_truthy(a: u64) -> u32 {
 /// The `+ 1` encoding lets the caller emit a single
 /// `i32.eqz`-based branch rather than a sentinel comparison
 /// against `-1` or similar.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn wren_jit_slot_plus_one(receiver_bits: u64) -> u32 {
     let vm_ptr = wren_lift::runtime::tier::current_vm();
@@ -627,6 +629,7 @@ pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
 /// Phase 4 step 5+ would generalise this by embedding the
 /// declaring module's identifier in the JIT'd module at
 /// compile time and threading it through each call.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn wren_get_module_var(slot_idx: u64) -> u64 {
     let vm_ptr = wren_lift::runtime::tier::current_vm();

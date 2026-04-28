@@ -114,6 +114,18 @@ struct MirWasmEmitter<'a> {
     /// up-front (in `scan_locals`) so the per-instruction emitter
     /// can stay `&self`.
     call_slot_local: Option<u32>,
+    /// Phase 5b: module-var idx → cached `slot + 1` i32 local.
+    /// For Call sites whose receiver is the result of
+    /// `GetModuleVar(idx)`, the function prologue computes the
+    /// JIT slot once at entry and stores it here; the Call site
+    /// then skips `wren_jit_slot_plus_one` entirely. Eliminates
+    /// the per-recursion cross-instance hop on the hot path
+    /// (fib(20): ~22k slot lookups → 1).
+    module_var_slot_locals: HashMap<u16, u32>,
+    /// Phase 5b: ValueId → defining `GetModuleVar(idx)`. Used at
+    /// Call lowering time to decide whether the cached slot in
+    /// `module_var_slot_locals` applies.
+    value_to_module_var: HashMap<ValueId, u16>,
 }
 
 impl<'a> MirWasmEmitter<'a> {
@@ -126,6 +138,8 @@ impl<'a> MirWasmEmitter<'a> {
             runtime_imports: HashMap::new(),
             import_list: Vec::new(),
             call_slot_local: None,
+            module_var_slot_locals: HashMap::new(),
+            value_to_module_var: HashMap::new(),
         }
     }
 
@@ -241,6 +255,41 @@ impl<'a> MirWasmEmitter<'a> {
             self.num_locals += 1;
             self.local_types.push(ValType::I32);
             self.call_slot_local = Some(idx);
+        }
+
+        // Phase 5b — hoist slot lookups for module-var receivers.
+        // Build a `ValueId → idx` map for `GetModuleVar` results,
+        // then for every Call whose receiver was defined that way,
+        // reserve a cached-slot local keyed on the idx. The
+        // function prologue (in `emit_function`) populates each
+        // local once per outer call; the Call lowering reuses it
+        // and skips the per-Call `wren_jit_slot_plus_one` hop.
+        for block in &self.mir.blocks {
+            for (val, inst) in &block.instructions {
+                if let Instruction::GetModuleVar(idx) = inst {
+                    self.value_to_module_var.insert(*val, *idx);
+                }
+            }
+        }
+        let mut idxs_to_cache: Vec<u16> = Vec::new();
+        for block in &self.mir.blocks {
+            for (_, inst) in &block.instructions {
+                if let Instruction::Call { receiver, .. } = inst {
+                    if let Some(&mv_idx) = self.value_to_module_var.get(receiver) {
+                        if !self.module_var_slot_locals.contains_key(&mv_idx)
+                            && !idxs_to_cache.contains(&mv_idx)
+                        {
+                            idxs_to_cache.push(mv_idx);
+                        }
+                    }
+                }
+            }
+        }
+        for mv_idx in idxs_to_cache {
+            let local = self.num_locals;
+            self.num_locals += 1;
+            self.local_types.push(ValType::I32);
+            self.module_var_slot_locals.insert(mv_idx, local);
         }
     }
 
@@ -506,6 +555,31 @@ impl<'a> MirWasmEmitter<'a> {
             .map(|t| (1, *t))
             .collect();
         let mut func = Function::new(body_locals);
+
+        // Phase 5b prologue — for each module-var idx that's used
+        // as a Call receiver, look up the JIT slot once at entry
+        // and stash it in the cached local. The Call lowering
+        // then reads from this local directly, skipping the
+        // `wren_jit_slot_plus_one` cross-instance hop on the hot
+        // path. fib(20)'s ~22k recursive Calls go from one slot
+        // lookup per Call to one per outer call (a 22k → 1 drop
+        // since the module var doesn't change between iterations).
+        // Iterate in idx order so the wasm output is deterministic
+        // regardless of HashMap iteration order.
+        let mut prologue_pairs: Vec<(u16, u32)> = self
+            .module_var_slot_locals
+            .iter()
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        prologue_pairs.sort_by_key(|(k, _)| *k);
+        for (mv_idx, slot_local) in prologue_pairs {
+            func.instruction(&WasmInst::I64Const(mv_idx as i64));
+            func.instruction(&WasmInst::Call(self.runtime_imports["wren_get_module_var"]));
+            func.instruction(&WasmInst::Call(
+                self.runtime_imports["wren_jit_slot_plus_one"],
+            ));
+            func.instruction(&WasmInst::LocalSet(slot_local));
+        }
 
         // Emit structured control flow from MIR blocks.
         self.emit_blocks(&mut func)?;
@@ -957,21 +1031,37 @@ impl<'a> MirWasmEmitter<'a> {
                     1 => "wren_call_1_slow",
                     _ => "wren_call_n_slow",
                 };
-                let slot_local = self
+                let scratch_slot_local = self
                     .call_slot_local
                     .expect("scan_locals should have reserved a call_slot_local");
-                // -- Slot lookup (once per Call) --
-                // `local.tee` stores the result in `slot_local`
-                // *and* leaves it on the stack so the following
-                // `i32.eqz` can branch on it. Avoids a second
-                // wasm-to-wasm hop into wren_jit_slot_plus_one in
-                // the fast path — fib(20) makes ~22k recursive
-                // calls and was paying for that round-trip twice.
-                func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
-                func.instruction(&WasmInst::Call(
-                    self.runtime_imports["wren_jit_slot_plus_one"],
-                ));
-                func.instruction(&WasmInst::LocalTee(slot_local));
+                // Phase 5b — if the receiver came from a hoisted
+                // `GetModuleVar(idx)`, use the cached slot local
+                // computed in the function prologue. Skips the
+                // per-Call `wren_jit_slot_plus_one` cross-instance
+                // hop entirely on the hot path.
+                let cached_slot = self
+                    .value_to_module_var
+                    .get(receiver)
+                    .and_then(|mv| self.module_var_slot_locals.get(mv))
+                    .copied();
+                let slot_local = cached_slot.unwrap_or(scratch_slot_local);
+                if cached_slot.is_some() {
+                    // Cached path: prologue already computed the
+                    // slot, just load it for the eqz test.
+                    func.instruction(&WasmInst::LocalGet(slot_local));
+                } else {
+                    // Inline lookup — `local.tee` stores the
+                    // result in the scratch slot local *and*
+                    // leaves it on the stack for the following
+                    // `i32.eqz`. Avoids a second wasm-to-wasm hop
+                    // into wren_jit_slot_plus_one in the fast
+                    // path.
+                    func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
+                    func.instruction(&WasmInst::Call(
+                        self.runtime_imports["wren_jit_slot_plus_one"],
+                    ));
+                    func.instruction(&WasmInst::LocalTee(slot_local));
+                }
                 // Stack: [slot_plus_one]
                 // Test (slot == 0):
                 func.instruction(&WasmInst::I32Eqz);
