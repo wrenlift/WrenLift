@@ -2,169 +2,274 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>wlift — Wren in your browser</title>
+  <title>wlift playground — Wren in your browser</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
       --bg: #0f1115;
       --panel: #161922;
+      --panel-2: #1c2030;
       --text: #e6e6ea;
       --muted: #7d8aa0;
+      --rule: #232631;
       --accent: #ffb454;
       --good: #84e188;
       --bad:  #ff8585;
+      --link: #74b6ff;
     }
+    *, *::before, *::after { box-sizing: border-box; }
     html, body {
       margin: 0; padding: 0;
       background: var(--bg);
       color: var(--text);
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 14px;
+      font-size: 13px;
       line-height: 1.5;
       height: 100%;
+      overflow: hidden;
     }
+
+    /* Page is one big grid: header / panes / footer. */
     .layout {
       display: grid;
       grid-template-rows: auto 1fr auto;
-      height: 100%;
+      height: 100vh;
     }
+
     header, footer {
-      padding: 12px 20px;
-      border-bottom: 1px solid #232631;
+      padding: 10px 16px;
       display: flex; align-items: center; gap: 12px;
-    }
-    footer {
-      border-top: 1px solid #232631;
-      border-bottom: 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    h1 { font-size: 14px; margin: 0; color: var(--accent); }
-    button {
-      background: var(--accent); color: #0f1115;
-      border: 0; padding: 6px 14px;
-      font: inherit; font-weight: 600;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    button:disabled { opacity: 0.4; cursor: wait; }
-    main {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1px;
-      background: #232631;
-      overflow: hidden;
-    }
-    section {
       background: var(--panel);
-      display: flex; flex-direction: column;
     }
-    .label {
-      padding: 8px 16px;
-      color: var(--muted);
-      font-size: 11px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      border-bottom: 1px solid #232631;
+    header { border-bottom: 1px solid var(--rule); }
+    footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
+
+    h1 { font-size: 13px; margin: 0; color: var(--accent); letter-spacing: 0.04em; }
+
+    button, select {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--rule); padding: 5px 12px;
+      font: inherit; font-size: 12px;
+      border-radius: 4px; cursor: pointer;
     }
-    textarea, pre {
-      flex: 1;
-      margin: 0;
-      padding: 16px;
-      background: transparent;
-      color: inherit;
-      font: inherit;
-      border: 0;
-      resize: none;
-      white-space: pre-wrap;
-      tab-size: 2;
-      outline: none;
-    }
-    pre.ok    { color: var(--good); }
-    pre.error { color: var(--bad); }
+    button.primary { background: var(--accent); color: #0f1115; font-weight: 600; border-color: transparent; }
+    button:disabled { opacity: 0.4; cursor: wait; }
+    label.field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+
     .pill {
       display: inline-block;
       padding: 2px 8px;
       border-radius: 999px;
       font-size: 11px;
-      background: #232631;
+      background: var(--panel-2);
       color: var(--muted);
     }
     .pill.ok    { color: var(--good); }
     .pill.error { color: var(--bad); }
+
+    /* jsbin-style 3-column grid: HTML | Wren | Output (stage + console). */
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1.2fr 1fr;
+      gap: 1px;
+      background: var(--rule);
+      overflow: hidden;
+      min-height: 0;
+    }
+    section {
+      background: var(--panel);
+      display: flex; flex-direction: column;
+      min-height: 0;
+      min-width: 0;
+    }
+    .pane-header {
+      padding: 8px 14px;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--rule);
+      display: flex; align-items: center; gap: 8px;
+    }
+    .pane-header .badge {
+      margin-left: auto;
+      color: var(--accent);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+      text-transform: none;
+    }
+
+    textarea {
+      flex: 1;
+      margin: 0;
+      padding: 14px;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      border: 0;
+      resize: none;
+      white-space: pre;
+      tab-size: 2;
+      outline: none;
+    }
+
+    /* Output column: stage on top (renders the HTML), console below. */
+    .output-col { display: grid; grid-template-rows: 1fr 1fr; min-height: 0; }
+    .output-col .pane { display: flex; flex-direction: column; min-height: 0; }
+    .output-col .pane + .pane { border-top: 1px solid var(--rule); }
+
+    .stage {
+      flex: 1;
+      margin: 0;
+      padding: 14px;
+      background: #fff;
+      color: #111;
+      overflow: auto;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    pre.console {
+      flex: 1;
+      margin: 0;
+      padding: 14px;
+      background: #0a0c12;
+      color: var(--text);
+      font: inherit;
+      white-space: pre-wrap;
+      overflow: auto;
+    }
+    pre.console.ok    { color: var(--good); }
+    pre.console.error { color: var(--bad); }
+
+    .banner {
+      padding: 8px 16px;
+      background: #2a221a;
+      color: var(--accent);
+      font-size: 12px;
+      border-bottom: 1px solid var(--rule);
+    }
+    .banner.hidden { display: none; }
+
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
   <div class="layout">
     <header>
-      <h1>wlift</h1>
+      <h1>wlift playground</h1>
       <span id="status" class="pill">loading…</span>
       <span style="margin-left: auto"></span>
-      <label style="color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px;">
+      <label class="field">
         mode
-        <select id="mode-select" style="background: #232631; color: var(--text); border: 0; padding: 4px 8px; font: inherit; border-radius: 4px;">
-          <option value="worker" selected>worker (default)</option>
-          <option value="main">main thread (direct memory)</option>
+        <select id="mode-select">
+          <option value="main" selected>main thread</option>
+          <option value="worker">worker</option>
         </select>
       </label>
-      <button id="run-btn" disabled>Run (⌘↵)</button>
+      <label class="field">
+        <input type="checkbox" id="autorun-toggle" checked>
+        auto-run
+      </label>
+      <button id="run-btn" class="primary" disabled>Run (⌘↵)</button>
     </header>
+
+    <div id="banner" class="banner hidden">
+      worker mode: async bridges (<code>Browser.fetch</code>,
+      <code>Browser.setTimeout</code>, <code>Browser.connect</code>,
+      <code>Dom.*</code>) won't resume after their first
+      <code>Fiber.yield</code> — top-level await scheduler isn't
+      wired yet. Switch to <strong>main thread</strong> for the DOM
+      demo. Worker mode still runs sync compute fine.
+    </div>
+
     <main>
       <section>
-        <div class="label">main.wren</div>
-        <textarea id="src" spellcheck="false">// Hello from Wren in your browser.
-// Edit and press ⌘↵ (or click Run) to interpret.
+        <div class="pane-header">html<span class="badge">stage markup</span></div>
+        <textarea id="html-src" spellcheck="false"><h1 id="title">hello, wren</h1>
+<p id="msg">edit me from Wren via <code>Dom.setText</code>.</p>
+<button id="ping" onclick="alert('clicked')">ping</button>
+</textarea>
+      </section>
 
-System.print("hello from wasm-bindgen!")
+      <section>
+        <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
+        <textarea id="src" spellcheck="false">// `Future`, `Browser`, `WebSocket`, `Dom` are loaded by the
+// runtime — no boilerplate needed. Read & write the stage's
+// DOM directly:
 
+var fiber = Fiber.new {
+  var before = Dom.text("#title").await
+  Dom.setText("#title", "rewritten by wren").await
+  Dom.setText("#msg", "before was: %(before)").await
+  return "ok"
+}
+System.print("dom roundtrip: %(fiber.try())")
+
+// Compute is fine on the worker — UI doesn't freeze.
 var fib
 fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
 System.print("fib(20) = %(fib.call(20))")
-
-var nums = [1, 2, 3, 4, 5]
-var sum = nums.reduce {|acc, x| acc + x }
-System.print("sum %(nums) = %(sum)")
 </textarea>
       </section>
-      <section>
-        <div class="label">output</div>
-        <pre id="out"></pre>
+
+      <section class="output-col">
+        <div class="pane">
+          <div class="pane-header">stage<span class="badge">live preview</span></div>
+          <div id="stage" class="stage"></div>
+        </div>
+        <div class="pane">
+          <div class="pane-header">console<span class="badge">System.print</span></div>
+          <pre id="out" class="console"></pre>
+        </div>
       </section>
     </main>
+
     <footer>
       <span id="version">…</span>
-      <span style="margin-left: auto"
-        >static REPL · interpreter only · no JIT, no plugins (Phase 1.1)</span>
+      <span style="margin-left: auto">
+        <a href="https://github.com/wrenlift/WrenLift" target="_blank" rel="noopener">wrenlift on github</a>
+      </span>
     </footer>
   </div>
 
   <script type="module">
-    // Façade in `wlift.js` picks worker (default) vs main-thread
-    // (opt-in). Worker mode keeps the UI responsive during heavy
-    // compute or pending awaits but hides the wasm linear memory
-    // behind structured-clone postMessage. Main-thread mode
-    // exposes `wlift.memory` for direct buffer access at the
-    // cost of UI freezes during long runs. See `wlift.js` for
-    // the full tradeoff write-up.
+    // The page is a thin client over the `createWlift` façade in
+    // `wlift.js`. Worker mode is the default; the mode picker
+    // tears down and respawns when toggled. The stage <div> is
+    // *the* DOM the Wren program manipulates — `Dom.text("#x")`
+    // hits real `document.querySelector` either inline (main
+    // mode) or via the worker→main postMessage round-trip.
     import { createWlift } from "./wlift.js";
     import { ErrorKind } from "../pkg/wlift_wasm.js";
 
     const statusEl  = document.getElementById("status");
     const versionEl = document.getElementById("version");
+    const htmlEl    = document.getElementById("html-src");
     const srcEl     = document.getElementById("src");
+    const stageEl   = document.getElementById("stage");
     const outEl     = document.getElementById("out");
     const runBtn    = document.getElementById("run-btn");
     const modeSel   = document.getElementById("mode-select");
+    const autoChk   = document.getElementById("autorun-toggle");
+    const bannerEl  = document.getElementById("banner");
 
     let wlift = null;
 
+    function renderStage() {
+      // Just `innerHTML` — this is a local playground, the user
+      // is typing their own markup. No sanitisation needed.
+      stageEl.innerHTML = htmlEl.value;
+    }
+
     async function bootMode(mode) {
+      bannerEl.classList.toggle("hidden", mode !== "worker");
       runBtn.disabled = true;
       statusEl.classList.remove("ok", "error");
       statusEl.textContent = `loading (${mode})…`;
       if (wlift) {
-        // Switching modes — terminate the previous one so we don't
-        // leak workers / dangling listeners across rebuilds.
         wlift.terminate();
         wlift = null;
       }
@@ -175,11 +280,11 @@ System.print("sum %(nums) = %(sum)")
         statusEl.classList.add("error");
         return;
       }
-      statusEl.textContent = `ready (${mode})`;
+      statusEl.textContent = `ready · ${mode}`;
       statusEl.classList.add("ok");
       versionEl.textContent = wlift.memory
-        ? `${wlift.version} · memory: ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB`
-        : wlift.version;
+        ? `${wlift.version} · linear memory ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB (direct)`
+        : `${wlift.version} · linear memory hidden behind worker boundary`;
       runBtn.disabled = false;
       execute();
     }
@@ -189,14 +294,15 @@ System.print("sum %(nums) = %(sum)")
       runBtn.disabled = true;
       outEl.classList.remove("ok", "error");
       outEl.textContent = "running…";
+      // Render the markup first so DOM ops have something to
+      // hit. The Wren source then runs against the live stage.
+      renderStage();
       const result = await wlift.run(srcEl.value);
       outEl.textContent = result.output || "(no output)";
       outEl.classList.add(result.ok ? "ok" : "error");
       outEl.textContent +=
         `\n--- ${result.ok ? "ok" : "error"} (${result.elapsedMs.toFixed(1)} ms) ---`;
       if (!result.ok) {
-        // `errorKind === -1` is the façade's "unhandled JS
-        // exception" path; the message already lives in `output`.
         const kind = result.errorKind === -1
           ? "JsException"
           : (ErrorKind[result.errorKind] ?? result.errorKind);
@@ -205,12 +311,26 @@ System.print("sum %(nums) = %(sum)")
       runBtn.disabled = false;
     }
 
+    // Re-run on every keystroke when auto-run is on, debounced
+    // so we don't fire on every keypress in the middle of a
+    // word. 350ms feels close to live without being thrashy.
+    let debounceTimer = null;
+    function maybeAutorun() {
+      if (!autoChk.checked || !wlift || runBtn.disabled) return;
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(execute, 350);
+    }
+    htmlEl.addEventListener("input", maybeAutorun);
+    srcEl.addEventListener("input", maybeAutorun);
+
     runBtn.addEventListener("click", execute);
-    srcEl.addEventListener("keydown", (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-        e.preventDefault();
-        execute();
-      }
+    [htmlEl, srcEl].forEach((el) => {
+      el.addEventListener("keydown", (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+          e.preventDefault();
+          execute();
+        }
+      });
     });
     modeSel.addEventListener("change", () => bootMode(modeSel.value));
 

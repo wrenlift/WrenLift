@@ -143,6 +143,12 @@ fn smoke_runs_under_wasmtime() {
          captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("dom: ok"),
+        "Dom.text + Dom.setText didn't resolve through the \
+         DOM bridge mock under wasi. captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

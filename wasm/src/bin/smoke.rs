@@ -15,7 +15,10 @@
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::vm::{VMConfig, VM};
 
-const SOURCE: &str = r#"
+// `r##"..."##` (rather than the usual `r#"..."#`) because the
+// Wren source includes selectors like `"#title"` whose `"#`
+// would otherwise terminate the raw string early.
+const SOURCE: &str = r##"
 import "time" for TimeCore
 
 System.print("hello from wasm!")
@@ -157,7 +160,35 @@ if (wsResult == "hello world") {
 } else {
     System.print("ws: BAD (%(wsResult))")
 }
-"#;
+
+// DOM bridge probe. There's no DOM under wasi — `dom_*` foreign
+// methods resolve synchronously with `MOCK_DOM_*:<selector>`, so
+// the smoke test verifies symbol resolution + the read/write
+// future shape without needing a browser. Browser hosts route
+// the same call through the page's `dispatchDomOp` table.
+#!native = "dom"
+foreign class DomCore {
+    #!symbol = "dom_text"
+    foreign static textHandle(selector)
+    #!symbol = "dom_set_text"
+    foreign static setTextHandle(selector, value)
+}
+class Dom {
+    static text(selector)              { Future.new_(DomCore.textHandle(selector)) }
+    static setText(selector, value)    { Future.new_(DomCore.setTextHandle(selector, value)) }
+}
+var domFiber = Fiber.new {
+    var read    = Dom.text("#title").await
+    var written = Dom.setText("#title", "hello dom").await
+    return read + "|" + written
+}
+var domResult = domFiber.try()
+if (domResult == "MOCK_DOM_TEXT:#title|MOCK_DOM_SET_TEXT:#title") {
+    System.print("dom: ok")
+} else {
+    System.print("dom: BAD (%(domResult))")
+}
+"##;
 
 fn main() -> std::process::ExitCode {
     // Static plugin registration. On `wasm32-*` targets this

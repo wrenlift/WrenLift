@@ -26,6 +26,7 @@ use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::vm::{VMConfig, VM};
 
 pub mod browser;
+pub mod dom;
 
 // `js` carries the `extern "C"` block that imports browser-side
 // shims (today: `_wlift_set_timeout`). Compiled only on the
@@ -106,6 +107,31 @@ pub mod js {
         ///   };
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_ws_close)]
         pub fn wlift_ws_close(handle: u32);
+
+        // ---------- DOM bridge ------------------------------------------
+        // Main-thread page or `WorkerWlift` adapter installs these.
+        // Worker-mode shims `postMessage` to the main thread; main-mode
+        // shims call `document.*` directly. See `wlift.js` and the
+        // `dom` Rust module for the full story.
+
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_dom_text = (handle, selector) => {
+        ///       const el = document.querySelector(selector);
+        ///       resolve_future(handle, el ? el.textContent : "");
+        ///   };
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_text)]
+        pub fn wlift_dom_text(handle: u32, selector: &str);
+
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_dom_set_text = (handle, selector, value) => {
+        ///       const el = document.querySelector(selector);
+        ///       if (el) el.textContent = value;
+        ///       resolve_future(handle, "");
+        ///   };
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_set_text)]
+        pub fn wlift_dom_set_text(handle: u32, selector: &str, value: &str);
     }
 }
 
@@ -445,6 +471,7 @@ pub fn _wasm_init() {
 pub fn register_static_plugins() {
     wlift_image::register_static_symbols();
     browser::register_static_symbols();
+    dom::register_static_symbols();
 }
 
 /// Host-side stub so non-wasm callers (the smoke `_start` binary
@@ -501,24 +528,138 @@ impl RunResult {
     }
 }
 
+/// Wren-side prelude prepended to every `run()` call. Defines the
+/// `Future`, `Browser`, `WebSocket`, and `Dom` classes that wrap
+/// the foreign-method handles into a pleasant Wren API. Without
+/// this, every page would have to inline ~40 lines of Wren shim
+/// boilerplate before getting to its own code.
+///
+/// One source of truth — both worker and main-thread modes pick
+/// it up via `run()`. Trade-off: error line numbers shift by the
+/// prelude's height. We reserve the first chunk of lines and
+/// offer a `prelude_line_count()` export so tooling can subtract
+/// it back out when reporting positions.
+const BROWSER_PRELUDE: &str = r##"
+#!native = "browser"
+foreign class BrowserCore {
+    #!symbol = "browser_set_timeout"
+    foreign static setTimeoutHandle(ms)
+    #!symbol = "browser_fetch"
+    foreign static fetchHandle(url)
+    #!symbol = "browser_ws_open"
+    foreign static wsOpen(url)
+    #!symbol = "browser_ws_send"
+    foreign static wsSend(handle, text)
+    #!symbol = "browser_ws_recv"
+    foreign static wsRecv(handle)
+    #!symbol = "browser_ws_close"
+    foreign static wsClose(handle)
+    #!symbol = "browser_peek_state"
+    foreign static peekState(handle)
+    #!symbol = "browser_take_value"
+    foreign static takeValue(handle)
+}
+#!native = "dom"
+foreign class DomCore {
+    #!symbol = "dom_text"
+    foreign static textHandle(selector)
+    #!symbol = "dom_set_text"
+    foreign static setTextHandle(selector, value)
+}
+class Future {
+    construct new_(handle) { _h = handle }
+    handle { _h }
+    state  { BrowserCore.peekState(_h) }
+    await {
+        // 0 = pending, 1 = resolved, 2 = rejected. Cache the
+        // settled state BEFORE `takeValue` removes the slot —
+        // a subsequent `peekState` on a missing handle reports
+        // Rejected, which would mis-fire `Fiber.abort` on a
+        // resolved Future.
+        while (state == 0) Fiber.yield()
+        var settled = state
+        var v = BrowserCore.takeValue(_h)
+        if (settled == 2) Fiber.abort(v == null ? "Future rejected" : v)
+        return v
+    }
+}
+class WebSocket {
+    construct new_(handle) { _h = handle }
+    handle      { _h }
+    send(text)  { BrowserCore.wsSend(_h, text) }
+    recv        { Future.new_(BrowserCore.wsRecv(_h)) }
+    close       { BrowserCore.wsClose(_h) }
+}
+class Browser {
+    static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
+    static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
+    static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
+}
+class Dom {
+    static text(selector)              { Future.new_(DomCore.textHandle(selector)) }
+    static setText(selector, value)    { Future.new_(DomCore.setTextHandle(selector, value)) }
+}
+"##;
+
+/// Number of newlines in `BROWSER_PRELUDE`. Exposed so the host
+/// can shift error spans back into user-source line numbers.
+#[wasm_bindgen]
+pub fn prelude_line_count() -> u32 {
+    BROWSER_PRELUDE.matches('\n').count() as u32
+}
+
 /// Compile + interpret a Wren source string. Output captured into
 /// the returned `RunResult`. The VM lives only for the duration
 /// of this call — every `run` is a fresh interpreter, no shared
 /// state across calls. (A multi-call API that holds onto a `VM`
 /// instance lands in Phase 1.1.)
+///
+/// The browser prelude (`Future` / `Browser` / `WebSocket` /
+/// `Dom`) is prepended to every source so callers don't have to
+/// inline the shim boilerplate. See `BROWSER_PRELUDE` above.
 #[wasm_bindgen]
 pub fn run(source: &str) -> RunResult {
-    let mut vm = VM::new(VMConfig {
-        // No JIT on wasm — gated out at compile time, but the mode
-        // gate also short-circuits all the tier-up bookkeeping the
-        // BC interpreter would otherwise pay per call.
+    use std::sync::{Arc, Mutex};
+
+    // Capture compile + runtime diagnostics into the same stream
+    // we hand back as `output`. Without this, errors land on the
+    // wasm `eprintln!` path — which in a browser is the devtools
+    // console, *not* the page's output pane. Caller couldn't see
+    // why a script failed.
+    let diagnostics = Arc::new(Mutex::new(String::new()));
+    let diag_capture = diagnostics.clone();
+
+    let mut config = VMConfig {
         execution_mode: ExecutionMode::Interpreter,
         ..VMConfig::default()
-    });
+    };
+    config.error_fn = Some(Box::new(move |_kind, _module, _line, msg| {
+        let mut buf = diag_capture.lock().expect("diagnostic buffer poisoned");
+        buf.push_str(msg);
+        if !msg.ends_with('\n') {
+            buf.push('\n');
+        }
+    }));
+
+    let mut vm = VM::new(config);
     vm.output_buffer = Some(String::new());
 
-    let result = vm.interpret("main", source);
-    let output = vm.take_output();
+    let combined = format!("{}\n{}", BROWSER_PRELUDE, source);
+    let result = vm.interpret("main", &combined);
+    let mut output = vm.take_output();
+
+    // Drain the diagnostic stream, strip ANSI colour codes, and
+    // append it to whatever `System.print` already wrote. The
+    // page renders plain text in a `<pre>`; ANSI escapes would
+    // show up literally as `^[[31m…`.
+    let diag = diagnostics.lock().expect("diagnostic buffer poisoned");
+    if !diag.is_empty() {
+        let plain = strip_ansi(&diag);
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&plain);
+    }
 
     let (ok, error_kind) = match result {
         InterpretResult::Success => (true, ErrorKind::None),
@@ -531,4 +672,36 @@ pub fn run(source: &str) -> RunResult {
         ok,
         error_kind,
     }
+}
+
+/// Strip ANSI escape sequences from a diagnostic string. Handles
+/// the CSI form (`ESC [ ... letter`) and the simpler reset (`ESC
+/// [ m`) used by ariadne. Good enough for the colour codes the
+/// runtime emits — not a general ANSI parser.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // Walk to the terminating letter (ASCII 0x40..=0x7E).
+            i += 2;
+            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                i += 1;
+            }
+            // Skip the terminator itself.
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        // Append the next char without splitting UTF-8 code points.
+        let next = s[i..]
+            .chars()
+            .next()
+            .expect("char boundary preserved by parser");
+        out.push(next);
+        i += next.len_utf8();
+    }
+    out
 }

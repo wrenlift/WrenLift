@@ -88,34 +88,55 @@ globalThis._wlift_ws_close = (handle) => {
   }
 };
 
+// DOM bridges round-trip through the main thread — workers have
+// no `document`. Each foreign method posts a `dom-op` describing
+// the call; the page's `WorkerWlift` adapter executes it and
+// posts back a `dom-result`/`dom-error` carrying the same handle.
+// Adding a new DOM op here means: (a) a new `_wlift_dom_*` shim
+// in this file that posts the op, (b) a matching `case` in
+// `wlift.js`'s main-thread dispatcher.
+globalThis._wlift_dom_text = (handle, selector) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "text", args: [selector] });
+};
+globalThis._wlift_dom_set_text = (handle, selector, value) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "setText", args: [selector, value] });
+};
+
 await init();
 self.postMessage({ cmd: "ready", version: version() });
 
 self.addEventListener("message", (e) => {
-  const { cmd, id, source } = e.data;
-  if (cmd !== "run") return;
-
-  const t0 = performance.now();
-  let result;
-  try {
-    result = run(source);
-  } catch (err) {
+  const msg = e.data;
+  if (msg.cmd === "run") {
+    const { id, source } = msg;
+    const t0 = performance.now();
+    let result;
+    try {
+      result = run(source);
+    } catch (err) {
+      self.postMessage({
+        cmd: "result",
+        id,
+        output: String(err),
+        ok: false,
+        errorKind: -1,
+        elapsedMs: performance.now() - t0,
+      });
+      return;
+    }
     self.postMessage({
       cmd: "result",
       id,
-      output: String(err),
-      ok: false,
-      errorKind: -1,
+      output: result.output,
+      ok: result.ok,
+      errorKind: result.errorKind,
       elapsedMs: performance.now() - t0,
     });
-    return;
+  } else if (msg.cmd === "dom-result") {
+    // Main thread completed a `dom-op`; settle the future from
+    // here so the awaiting Wren fiber wakes on its next yield.
+    resolve_future(msg.handle, msg.value ?? "");
+  } else if (msg.cmd === "dom-error") {
+    reject_future(msg.handle, msg.error ?? "DOM op failed");
   }
-  self.postMessage({
-    cmd: "result",
-    id,
-    output: result.output,
-    ok: result.ok,
-    errorKind: result.errorKind,
-    elapsedMs: performance.now() - t0,
-  });
 });

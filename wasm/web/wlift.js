@@ -11,10 +11,24 @@
 //   wlift.memory            // WebAssembly.Memory | null
 //   wlift.terminate()
 //
-// `mode: "worker"` (default) — wlift_wasm runs inside `worker.js`.
-// The page never sees the wasm linear memory directly; everything
-// crosses the boundary as structured-cloned messages. UI thread
-// stays responsive during heavy compute or pending awaits.
+// `mode: "worker"` (default for compute-only workloads) —
+// wlift_wasm runs inside `worker.js`. The page never sees the
+// wasm linear memory directly; everything crosses the boundary
+// as structured-cloned messages. UI thread stays responsive
+// during heavy compute.
+//
+// **Async-bridge caveat:** today's worker mode does NOT have a
+// top-level await scheduler. Foreign methods that resolve
+// asynchronously — `Browser.fetch`, `Browser.setTimeout`,
+// `Browser.connect`, and worker-mode `Dom.*` — settle their
+// future *after* the awaiting fiber's `Fiber.yield` returned to
+// the script's outer fiber, and nothing wakes that outer fiber
+// back up. The first `await` returns `null`. Sync compute, plus
+// any foreign method whose JS shim resolves its future inline,
+// still works fine. For now: pick `mode: "main"` to demo the
+// async bridges (the JS shims are inline-resolving in main mode
+// for sync ops; truly-async ones still need the scheduler).
+// The scheduler lands in a future phase.
 //
 // `mode: "main"` (opt-in) — wlift_wasm runs inline on the same
 // thread as the page. `wlift.memory` returns the live
@@ -65,6 +79,16 @@ class WorkerWlift {
         if (resolve) {
           this.pending.delete(m.id);
           resolve(m);
+        }
+      } else if (m.cmd === "dom-op") {
+        // Worker can't reach `document`; we run the op on the
+        // page's behalf and post the answer back. Each `op` is
+        // matched by a `_wlift_dom_*` shim in `worker.js`.
+        try {
+          const value = dispatchDomOp(m.op, m.args);
+          this.worker.postMessage({ cmd: "dom-result", handle: m.handle, value });
+        } catch (err) {
+          this.worker.postMessage({ cmd: "dom-error", handle: m.handle, error: String(err) });
         }
       }
     });
@@ -139,6 +163,25 @@ class MainWlift {
       }
     };
 
+    // DOM shims — main mode runs `document.*` directly (we're on
+    // the page thread; no postMessage hop). The worker mode's
+    // round-trip uses the same `dispatchDomOp` table below, so
+    // both paths share the implementation of each op.
+    globalThis._wlift_dom_text = (handle, selector) => {
+      try {
+        mod.resolve_future(handle, dispatchDomOp("text", [selector]));
+      } catch (err) {
+        mod.reject_future(handle, String(err));
+      }
+    };
+    globalThis._wlift_dom_set_text = (handle, selector, value) => {
+      try {
+        mod.resolve_future(handle, dispatchDomOp("setText", [selector, value]));
+      } catch (err) {
+        mod.reject_future(handle, String(err));
+      }
+    };
+
     // wasm-bindgen `--target web` returns the wasm exports object
     // from the default `init()`. `exports.memory` is the live
     // `WebAssembly.Memory` instance — that's what main-mode
@@ -179,5 +222,39 @@ class MainWlift {
 
   terminate() {
     // No worker to kill; nothing to do. Provided for API parity.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DOM op dispatch table — shared by worker mode (main runs the
+// op on the worker's behalf) and main mode (we run inline).
+// Each entry returns a String (or throws). Adding a DOM op needs
+// three pieces:
+//
+//   1. A `dom_*` foreign method in `wasm/src/dom.rs`.
+//   2. A `_wlift_dom_*` shim in `worker.js` (posts a `dom-op`)
+//      and another in `MainWlift.init()` (calls dispatch directly).
+//   3. A `case` here.
+//
+// Returning a string keeps the protocol JSON-serialisable
+// without bringing in a richer wire format yet — the existing
+// future store flows everything as `String`s anyway.
+// ---------------------------------------------------------------------------
+
+function dispatchDomOp(op, args) {
+  switch (op) {
+    case "text": {
+      const [selector] = args;
+      const el = document.querySelector(selector);
+      return el ? el.textContent ?? "" : "";
+    }
+    case "setText": {
+      const [selector, value] = args;
+      const el = document.querySelector(selector);
+      if (el) el.textContent = value;
+      return "";
+    }
+    default:
+      throw new Error(`unknown DOM op '${op}'`);
   }
 }
