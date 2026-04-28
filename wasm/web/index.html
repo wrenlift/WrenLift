@@ -224,18 +224,22 @@
 
 var fiber = Fiber.new {
   System.print("before: %(Dom.text("#title").await)")
-  Browser.setTimeout(150).await
+  Browser.setTimeout(0).await
   Dom.setText("#title", "rewritten by wren").await
-  Dom.setText("#msg", "scheduler resumed me after 150ms").await
+  Dom.setText("#msg", "scheduler resumed me after 0ms").await
   Dom.addClass("#title", "dim").await
   System.print("done")
 }
 fiber.try()
 
-// Compute too — runs straight through, no async needed.
-var fib
-fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
-System.print("fib(20) = %(fib.call(20))")
+// Heavy compute under the BC interp is slow on wasm — each
+// `Fn.call` dispatch is ~2 µs. JIT-on-wasm (Phase 2) erases it.
+// Try `fib(15)` if you want a fast loop demo, `fib(28)` if you
+// want to see the interpreter floor.
+//
+// var fib
+// fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
+// System.print("fib(15) = %(fib.call(15))")
 </textarea>
       </section>
 
