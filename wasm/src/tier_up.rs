@@ -39,6 +39,28 @@
 use wasm_bindgen::prelude::*;
 use wren_lift::runtime::value::Value;
 
+// Phase 2b — extern bindings for the JS-side instantiate + call
+// shims. Installed by `wlift.js` (main mode) and `worker.js`
+// (worker mode) right after `await init()`. The shim takes wasm
+// bytes, builds a `WebAssembly.Module` + `Instance` with the
+// `wren_*` runtime helpers as imports, stores the instance in a
+// per-page table, and returns a slot index. Subsequent
+// `jit_call_N(slot, fn_idx, args...)` calls dispatch through
+// the slot.
+//
+// Future-proof signatures: the Phase 4 inter-fn-call work
+// replaces these per-arity exports with `call_indirect` through
+// a shared funcref table; the per-arity shims here are
+// transitional.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_instantiate)]
+    fn js_jit_instantiate(bytes: &[u8]) -> u32;
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_0)]
+    fn js_jit_call_0(slot: u32, fn_idx: u32) -> u64;
+}
+
 /// Phase 1 smoke test — emit a hand-built MIR function that
 /// returns `42` as a NaN-boxed `Value` and hand back the wasm
 /// bytes. JS-side test:
@@ -222,4 +244,37 @@ pub fn wren_cmp_ne(a: u64, b: u64) -> u64 {
 pub fn wren_not(a: u64) -> u64 {
     let av = Value::from_bits(a);
     Value::bool(!av.is_truthy_wren()).to_bits()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b — end-to-end smoke test
+// ---------------------------------------------------------------------------
+//
+// Drives `emit_mir` → `js_jit_instantiate` → `js_jit_call_0` so
+// callers can verify the full tier-up round-trip works without
+// hand-marshalling bytes from JS. Returns the raw u64 the
+// compiled function produced — for `jit_test_emit` this is the
+// NaN-boxed bits of `42.0` (= `0x4045_0000_0000_0000`).
+//
+// JS-side check after init():
+//
+//   const r = wlift_wasm.jit_smoke_run_const();
+//   console.log(r === 0x4045000000000000n); // true → end-to-end works
+
+/// Phase 2b smoke — emit the const-42 module, hand bytes to the
+/// JS instantiate shim, call the resulting function via the
+/// JS call-0 shim, return the raw u64. Returns `0` on any
+/// failure (cleanest signal for the JS test code).
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn jit_smoke_run_const() -> u64 {
+    let bytes = jit_test_emit();
+    if bytes.is_empty() {
+        return 0;
+    }
+    let slot = js_jit_instantiate(&bytes);
+    // The MirFunction's name was interned at index 0 (only name
+    // in the throwaway interner), so `emit_mir` exports it as
+    // `fn_0`.
+    js_jit_call_0(slot, 0)
 }

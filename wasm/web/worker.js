@@ -45,7 +45,13 @@
 // rendering surface to the worker, which can then draw without
 // touching the DOM.
 
-import init, {
+// Use a namespace import so the JIT shim below can reach the
+// `wren_*` runtime helpers without enumerating each name in the
+// `import` list. The wlift_wasm wasm exports are returned by
+// `init()` and stashed below for use as JIT-module imports.
+import * as wlift_wasm from "../pkg/wlift_wasm.js";
+const {
+  default: init,
   version,
   run,
   resolve_future,
@@ -53,7 +59,7 @@ import init, {
   ws_open,
   ws_message,
   ws_close,
-} from "../pkg/wlift_wasm.js";
+} = wlift_wasm;
 
 // Async-bridge shims, identical surface to the inline page setup.
 // The worker has its own `globalThis`, so we install a fresh copy
@@ -166,6 +172,45 @@ globalThis._wlift_perf_log = (label, ms) => {
   if (globalThis.__wlift_perf_enabled) {
     console.log(`[wlift perf] ${label}: ${ms.toFixed(2)} ms`);
   }
+};
+
+// Tier-up Phase 2b — JIT instantiate + call shims. Mirror of
+// `wlift.js`'s install for worker mode, since the worker has its
+// own `globalThis`. We reach for the wlift_wasm namespace's
+// `wren_*` JS wrappers as imports for the JIT'd module. Phase 5
+// can switch to raw wasm exports for ~zero-overhead inter-module
+// calls.
+const __wliftJitInstances = [];
+const __wliftWrenImports = {
+  wren_num_add: wlift_wasm.wren_num_add,
+  wren_num_sub: wlift_wasm.wren_num_sub,
+  wren_num_mul: wlift_wasm.wren_num_mul,
+  wren_num_div: wlift_wasm.wren_num_div,
+  wren_num_mod: wlift_wasm.wren_num_mod,
+  wren_num_neg: wlift_wasm.wren_num_neg,
+  wren_cmp_lt: wlift_wasm.wren_cmp_lt,
+  wren_cmp_gt: wlift_wasm.wren_cmp_gt,
+  wren_cmp_le: wlift_wasm.wren_cmp_le,
+  wren_cmp_ge: wlift_wasm.wren_cmp_ge,
+  wren_cmp_eq: wlift_wasm.wren_cmp_eq,
+  wren_cmp_ne: wlift_wasm.wren_cmp_ne,
+  wren_not:    wlift_wasm.wren_not,
+};
+globalThis._wlift_jit_instantiate = (bytes) => {
+  const module = new WebAssembly.Module(bytes);
+  const instance = new WebAssembly.Instance(module, { wren: __wliftWrenImports });
+  const slot = __wliftJitInstances.length;
+  __wliftJitInstances.push(instance);
+  return slot;
+};
+globalThis._wlift_jit_call_0 = (slot, fnIdx) => {
+  return __wliftJitInstances[slot].exports[`fn_${fnIdx}`]();
+};
+globalThis._wlift_jit_call_1 = (slot, fnIdx, a) => {
+  return __wliftJitInstances[slot].exports[`fn_${fnIdx}`](a);
+};
+globalThis._wlift_jit_call_2 = (slot, fnIdx, a, b) => {
+  return __wliftJitInstances[slot].exports[`fn_${fnIdx}`](a, b);
 };
 
 await init();

@@ -234,6 +234,54 @@ class MainWlift {
     this._mod    = mod;
     this._memory = wasm.memory;
     this.version = mod.version();
+
+    // Tier-up Phase 2b — JIT instantiate + call shims. The Rust
+    // side calls `wlift_wasm::tier_up::emit_*` to produce wasm
+    // bytes; these shims compile + instantiate them with the
+    // `wren_*` runtime helpers as imports, store the instance
+    // in a per-page table, and expose `call_0` / `call_1` /
+    // `call_2` arities for invocation. Must run AFTER
+    // `await mod.default()` so the `wasm` exports object is
+    // populated for the import bindings. Phase 4 generalises
+    // the call shape; for now arity caps at 2 (fib's signature).
+    const __wliftJitInstances = [];
+    const __wliftWrenImports = {
+      wren_num_add: wasm.wren_num_add,
+      wren_num_sub: wasm.wren_num_sub,
+      wren_num_mul: wasm.wren_num_mul,
+      wren_num_div: wasm.wren_num_div,
+      wren_num_mod: wasm.wren_num_mod,
+      wren_num_neg: wasm.wren_num_neg,
+      wren_cmp_lt: wasm.wren_cmp_lt,
+      wren_cmp_gt: wasm.wren_cmp_gt,
+      wren_cmp_le: wasm.wren_cmp_le,
+      wren_cmp_ge: wasm.wren_cmp_ge,
+      wren_cmp_eq: wasm.wren_cmp_eq,
+      wren_cmp_ne: wasm.wren_cmp_ne,
+      wren_not:    wasm.wren_not,
+    };
+    globalThis._wlift_jit_instantiate = (bytes) => {
+      const module = new WebAssembly.Module(bytes);
+      const instance = new WebAssembly.Instance(module, {
+        wren: __wliftWrenImports,
+      });
+      const slot = __wliftJitInstances.length;
+      __wliftJitInstances.push(instance);
+      return slot;
+    };
+    globalThis._wlift_jit_call_0 = (slot, fnIdx) => {
+      const fn = __wliftJitInstances[slot].exports[`fn_${fnIdx}`];
+      return fn();
+    };
+    globalThis._wlift_jit_call_1 = (slot, fnIdx, a) => {
+      const fn = __wliftJitInstances[slot].exports[`fn_${fnIdx}`];
+      return fn(a);
+    };
+    globalThis._wlift_jit_call_2 = (slot, fnIdx, a, b) => {
+      const fn = __wliftJitInstances[slot].exports[`fn_${fnIdx}`];
+      return fn(a, b);
+    };
+
     return this;
   }
 
