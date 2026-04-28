@@ -197,6 +197,7 @@ const __wliftWrenImports = {
   wren_not:       wlift_wasm.wren_not,
   wren_is_truthy: wlift_wasm.wren_is_truthy,
   wren_call_1:    wlift_wasm.wren_call_1,
+  wren_get_module_var: wlift_wasm.wren_get_module_var,
 };
 globalThis._wlift_jit_instantiate = (bytes) => {
   const module = new WebAssembly.Module(bytes);

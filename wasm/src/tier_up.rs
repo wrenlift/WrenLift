@@ -210,10 +210,13 @@ fn mir_needs_unsupported_helpers(mir: &wren_lift::mir::MirFunction) -> bool {
                 | Instruction::SetField(..)
                 | Instruction::GetStaticField(..)
                 | Instruction::SetStaticField(..)
-                | Instruction::GetModuleVar(_)
                 | Instruction::SetModuleVar(..)
                 | Instruction::IsType(..)
                 | Instruction::GuardClass(..) => return true,
+                // GetModuleVar accepted (Phase 4 step 5 binds
+                // `wren_get_module_var` against the user-source
+                // module). SetModuleVar still rejects since
+                // there's no symmetric helper yet.
                 _ => {}
             }
         }
@@ -553,6 +556,41 @@ pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
     use wren_lift::runtime::object::NativeContext;
     match vm.call_method_on(receiver, &method_name, &[arg]) {
         Some(v) => v.to_bits(),
+        None => Value::null().to_bits(),
+    }
+}
+
+/// `wren_get_module_var(slot_idx)` — read a module-level
+/// variable. The JIT'd code emits this for any reference to a
+/// `var name = …` declared at module scope (closure-recursive
+/// `fib` → `fib.call(n-1)` lowers to `GetModuleVar(fib_slot)`).
+///
+/// **Hardcoded module: `"main"`.** Phase 4 minimum supports
+/// only user-source vars; the prelude module's vars aren't
+/// reachable. That's acceptable because the prelude classes
+/// always reject for other reasons (Call arity > 1, MakeList,
+/// etc.) so their MIR never compiles to wasm in the first
+/// place. The user-source MIR is always in module `"main"`
+/// (see `vm.interpret("main", &combined)` in `lib.rs::run`).
+///
+/// Phase 4 step 5+ would generalise this by embedding the
+/// declaring module's identifier in the JIT'd module at
+/// compile time and threading it through each call.
+#[wasm_bindgen]
+pub fn wren_get_module_var(slot_idx: u64) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let idx = slot_idx as usize;
+    match vm.engine.modules.get("main") {
+        Some(module) => module
+            .vars
+            .get(idx)
+            .copied()
+            .unwrap_or(Value::null())
+            .to_bits(),
         None => Value::null().to_bits(),
     }
 }

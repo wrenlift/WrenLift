@@ -270,6 +270,7 @@ class MainWlift {
       wren_not:      wasm.wren_not,
       wren_is_truthy:wasm.wren_is_truthy,
       wren_call_1:   wasm.wren_call_1,
+      wren_get_module_var: wasm.wren_get_module_var,
     };
     globalThis._wlift_jit_instantiate = (bytes) => {
       const module = new WebAssembly.Module(bytes);
