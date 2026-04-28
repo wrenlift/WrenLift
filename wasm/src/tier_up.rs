@@ -58,8 +58,77 @@ extern "C" {
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_instantiate)]
     fn js_jit_instantiate(bytes: &[u8]) -> u32;
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_0)]
-    fn js_jit_call_0(slot: u32, fn_idx: u32) -> u64;
+    fn js_jit_call_0(slot: u32, fn_export_idx: u32) -> u64;
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_1)]
+    fn js_jit_call_1(slot: u32, fn_export_idx: u32, a: u64) -> u64;
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_2)]
+    fn js_jit_call_2(slot: u32, fn_export_idx: u32, a: u64, b: u64) -> u64;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3a — runtime callback bridge
+// ---------------------------------------------------------------------------
+//
+// The runtime crate (`wren_lift`) decides *when* to tier up;
+// this crate (`wlift_wasm`) handles *how* via wasm-bindgen +
+// JS instantiation. The bridge: at module init,
+// `register_tier_up_callbacks()` plugs Rust function pointers
+// into `wren_lift::runtime::tier::set_*_callback`. The runtime
+// crate stays wasm-bindgen-free.
+
+/// Compile a MIR function via `emit_mir` and instantiate via the
+/// JS shim. Returns the slot index in the page's JIT instance
+/// table. `None` on emit / instantiate failure (the runtime
+/// then falls back to BC interp dispatch).
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
+    let module = wren_lift::codegen::wasm::emit_mir(mir).ok()?;
+    let bytes = module.bytes;
+    if bytes.is_empty() {
+        return None;
+    }
+    let slot = js_jit_instantiate(&bytes);
+    Some(slot)
+}
+
+/// Invoke a JIT'd slot via the JS shim. Args are NaN-boxed
+/// `u64`s (passing through wasm-bindgen as BigInt). The export
+/// name carries the function's symbol-index — `emit_mir`
+/// formats it as `fn_<symbol_index>`. We only need the integer
+/// after the prefix, so the JS side reconstructs the full name.
+///
+/// Currently capped at 2 args (fib's signature). Phase 4 swaps
+/// per-arity shims for `call_indirect` through a shared funcref
+/// table.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn dispatch_callback(slot: u32, fn_export_name: &str, args: &[u64]) -> u64 {
+    // `fn_<digits>` → strip the prefix and parse the integer.
+    let fn_idx: u32 = fn_export_name
+        .strip_prefix("fn_")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    match args.len() {
+        0 => js_jit_call_0(slot, fn_idx),
+        1 => js_jit_call_1(slot, fn_idx, args[0]),
+        2 => js_jit_call_2(slot, fn_idx, args[0], args[1]),
+        // Phase 4 generalises this — return 0 (null bits) so the
+        // caller can detect the dispatch failed and fall back.
+        _ => 0,
+    }
+}
+
+/// Plug the compile + dispatch hooks into the runtime's
+/// tier-up broker. Called from `_wasm_init` so callbacks are
+/// armed before any user code runs.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn register_tier_up_callbacks() {
+    wren_lift::runtime::tier::set_compile_callback(compile_callback);
+    wren_lift::runtime::tier::set_dispatch_callback(dispatch_callback);
+}
+
+/// Host stub so non-wasm builds still link cleanly.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn register_tier_up_callbacks() {}
 
 /// Phase 1 smoke test — emit a hand-built MIR function that
 /// returns `42` as a NaN-boxed `Value` and hand back the wasm

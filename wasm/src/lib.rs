@@ -637,6 +637,11 @@ pub fn _wasm_init() {
     {
         console_error_panic_hook::set_once();
         register_static_plugins();
+        // Plug the wasm-tier-up compile + dispatch hooks into
+        // the runtime's broker. Has to happen before any
+        // `record_call` that might trigger tier-up — i.e.
+        // before any user code runs.
+        tier_up::register_tier_up_callbacks();
         // Warm the prelude bytecode cache so the *first* user
         // `run()` doesn't pay ~30 ms of parse / sema / MIR build
         // for `BROWSER_PRELUDE`. Subsequent runs already hit the

@@ -1,29 +1,99 @@
-//! Wasm-side stub for the tier-up broker.
+//! Wasm-side tier-up broker.
 //!
 //! `tier.rs` (the host build) wraps `beadie`, which spawns a
 //! background promoter thread to drive tier-up. Neither beadie
-//! nor `std::thread::spawn` works on `wasm32-unknown-unknown` —
-//! and the Phase 1.0 wasm runtime defaults to
-//! `ExecutionMode::Interpreter` anyway, so tier-up is
-//! conceptually a no-op for the first cut.
+//! nor `std::thread::spawn` works on `wasm32-unknown-unknown`,
+//! so the wasm path runs the broker inline.
 //!
-//! Phase 2 will swap this stub for a real wasm-aware tier
-//! manager: hot Wren functions get lowered through the existing
-//! `codegen::wasm::emit_mir` path, the resulting bytes get fed
-//! to `WebAssembly.compile()` (browser host) or
-//! `wasmtime::Module::new` (wasi host), and the broker installs
-//! the returned function reference / table index in place of
-//! the BC interpreter dispatch — same shape as the native JIT
-//! path, different backend. The single-threaded story (no
-//! `std::thread`) means the broker has to run inline, which
-//! beadie 0.4+ already supports via its sync-policy variant.
+//! ## Tier-up to wasm (Phase 3+)
 //!
-//! Until that lands, the methods here are no-ops; tier-up
-//! callers (`request_tier_up`, `tier_up`, `submit_compile`)
-//! live behind `#[cfg(feature = "host")]` so they never see
-//! this module.
+//! Hot Wren methods get lowered to wasm via
+//! `codegen::wasm::emit_mir`, instantiated by the JS host
+//! (`wlift_wasm` crate, `tier_up.rs`), and dispatched through a
+//! per-function slot table — same shape as the native JIT path,
+//! different backend.
+//!
+//! The runtime crate stays wasm-bindgen-agnostic by exposing
+//! **callback hooks**:
+//!
+//!   * [`set_compile_callback`] — wlift_wasm registers a
+//!     function that takes a `&MirFunction` and returns
+//!     `Option<u32>` (a slot index in the JIT instance table,
+//!     or `None` if compilation failed).
+//!
+//!   * [`set_dispatch_callback`] — wlift_wasm registers a
+//!     function that takes `(slot, fn_export_name, args)` and
+//!     returns the i64 result of invoking the slot's function.
+//!
+//! Plain Rust function pointers — no `wasm-bindgen` types
+//! crossing into the runtime crate. The wasm-bindgen-side glue
+//! lives in `wlift_wasm::tier_up`.
+//!
+//! Most of the `TierManager` methods stay no-ops because wasm
+//! tier-up tracking happens via `engine.wasm_jit_slots` (parallel
+//! to the host's `jit_code`), not through beadie's per-bead
+//! state. The `TierManager` shape is preserved purely so the
+//! engine compiles cleanly under either build.
 
+use std::sync::OnceLock;
+
+use crate::mir::MirFunction;
 use crate::runtime::engine::FuncId;
+
+// ---------------------------------------------------------------------------
+// Callback hooks (Phase 3a)
+// ---------------------------------------------------------------------------
+//
+// `OnceLock` lets the host register exactly once at module init.
+// `Send + Sync` is required by the lock; our function pointers
+// are zero-state so it's automatic.
+
+/// Compile a MIR function to wasm bytecode + instantiate it
+/// + return the slot index in the host's JIT instance table.
+/// `None` signals compile / instantiate failure (the dispatch
+/// path then falls through to the BC interpreter as if no JIT
+/// had been registered).
+pub type CompileCallback = fn(&MirFunction) -> Option<u32>;
+
+/// Invoke a previously-compiled JIT slot with the given args.
+/// `args` is the NaN-boxed `u64` representation of each
+/// argument. `fn_export_name` is the wasm export name the
+/// emitted module uses (`emit_mir` formats it as
+/// `fn_<symbol_index>`).
+pub type DispatchCallback = fn(slot: u32, fn_export_name: &str, args: &[u64]) -> u64;
+
+static COMPILE_CALLBACK: OnceLock<CompileCallback> = OnceLock::new();
+static DISPATCH_CALLBACK: OnceLock<DispatchCallback> = OnceLock::new();
+
+/// Register the host-provided compile hook. Called once from
+/// `wlift_wasm::tier_up` at module init. Subsequent calls are
+/// silently dropped.
+pub fn set_compile_callback(cb: CompileCallback) {
+    let _ = COMPILE_CALLBACK.set(cb);
+}
+
+/// Register the host-provided dispatch hook. See [`set_compile_callback`].
+pub fn set_dispatch_callback(cb: DispatchCallback) {
+    let _ = DISPATCH_CALLBACK.set(cb);
+}
+
+/// Compile `mir` via the registered host callback. Returns
+/// `None` if no host has registered yet (e.g. wasi smoke
+/// binary) or if compilation failed.
+pub fn try_compile(mir: &MirFunction) -> Option<u32> {
+    COMPILE_CALLBACK.get().and_then(|cb| cb(mir))
+}
+
+/// Dispatch through a previously-compiled slot. Caller must
+/// have registered a dispatch callback first (verified by the
+/// debug assertion); production paths only reach here after
+/// `try_compile` succeeded, which implies registration.
+pub fn dispatch(slot: u32, fn_export_name: &str, args: &[u64]) -> u64 {
+    DISPATCH_CALLBACK
+        .get()
+        .map(|cb| cb(slot, fn_export_name, args))
+        .unwrap_or(0)
+}
 
 pub const BASELINE_THRESHOLD: u32 = 100;
 pub const OPTIMIZED_THRESHOLD: u32 = 1_000;
