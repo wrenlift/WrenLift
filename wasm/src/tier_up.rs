@@ -386,6 +386,47 @@ fn cmp_num<F: Fn(f64, f64) -> bool>(a: u64, b: u64, op: F) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// JIT root tracking (Phase 4 step 4)
+// ---------------------------------------------------------------------------
+//
+// JIT'd wasm code holds NaN-boxed `Value`s in wasm locals. Those
+// locals aren't visible to the GC's normal root scan — if a slow
+// path crosses back into the runtime and triggers GC mid-call,
+// any object Value still in flight would be reclaimed.
+//
+// The runtime crate already maintains a process-wide
+// `JIT_ROOTS_STORE: Vec<Value>` for the Cranelift JIT (see
+// `codegen::runtime_fns::push_jit_root` etc.); the GC drains it
+// in `take_jit_roots` and reinstalls forwarded entries via
+// `set_jit_roots`. We just expose the same surface to the wasm
+// JIT'd module via three thin shims, and emit_mir wraps each
+// Call site with snapshot / push args / restore_len so live
+// values survive a runtime entry.
+//
+// `snapshot_len` returns the current depth as `u32`; `push`
+// appends a NaN-boxed value; `restore_len` truncates back to a
+// snapshot. Single-threaded wasm so no atomic — the runtime's
+// `UnsafeCell` does the heavy lifting.
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_jit_root_push(bits: u64) {
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(bits));
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_jit_roots_snapshot_len() -> u32 {
+    wren_lift::codegen::runtime_fns::jit_roots_snapshot_len() as u32
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_jit_roots_restore_len(len: u32) {
+    wren_lift::codegen::runtime_fns::jit_roots_restore_len(len as usize);
+}
+
 #[wasm_bindgen]
 pub fn wren_num_add(a: u64, b: u64) -> u64 {
     binop_num(a, b, |x, y| x + y)
@@ -560,8 +601,39 @@ pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
         return Value::null().to_bits();
     }
     let vm = unsafe { &mut *vm_ptr };
-    let receiver = Value::from_bits(receiver_bits);
-    let arg = Value::from_bits(arg_bits);
+    // Phase 4 step 4 — push receiver + arg as JIT roots before
+    // any path that might trigger GC. Mirrors the Cranelift
+    // `wren_call_1` runtime helper (`runtime_fns.rs` ~2150).
+    // The wasm JIT'd caller's `receiver_bits` / `arg_bits` are
+    // primitive u64s on the wasm stack — invisible to the GC's
+    // root scan. By copying them into `JIT_ROOTS_STORE`, any
+    // GC that fires inside `call_method_on` walks them, and we
+    // re-read post-GC via `jit_root_at` so a moved object's
+    // updated bits propagate back. The fast path doesn't need
+    // this — `js_jit_call_1` is wasm-to-wasm with no Rust
+    // re-entry — but rooting up-front keeps the bookkeeping
+    // simple and is cheap on the hot path (just two Vec
+    // pushes + a truncate at the end).
+    let root_base = wren_lift::codegen::runtime_fns::jit_roots_snapshot_len();
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(receiver_bits));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(arg_bits));
+    let result = wren_call_1_inner(vm, root_base, method_id);
+    wren_lift::codegen::runtime_fns::jit_roots_restore_len(root_base);
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wren_call_1_inner(
+    vm: &mut wren_lift::runtime::vm::VM,
+    root_base: usize,
+    method_id: u64,
+) -> u64 {
+    use wren_lift::codegen::runtime_fns::jit_root_at;
+    // Re-read receiver / arg through the root store so a GC
+    // mid-call sees forwarded pointers reflected in the locals
+    // we use here.
+    let receiver = jit_root_at(root_base);
+    let arg = jit_root_at(root_base + 1);
 
     // FAST PATH — receiver is a Closure whose function already
     // has a wasm JIT slot installed. Dispatch directly through
@@ -594,7 +666,7 @@ pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
             let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
             if let Some(slot) = vm.engine.wasm_jit_slot(target_fn) {
                 DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
-                return js_jit_call_1(slot, arg_bits);
+                return js_jit_call_1(slot, arg.to_bits());
             }
         }
     }
