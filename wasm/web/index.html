@@ -100,6 +100,13 @@
       <h1>wlift</h1>
       <span id="status" class="pill">loading…</span>
       <span style="margin-left: auto"></span>
+      <label style="color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px;">
+        mode
+        <select id="mode-select" style="background: #232631; color: var(--text); border: 0; padding: 4px 8px; font: inherit; border-radius: 4px;">
+          <option value="worker" selected>worker (default)</option>
+          <option value="main">main thread (direct memory)</option>
+        </select>
+      </label>
       <button id="run-btn" disabled>Run (⌘↵)</button>
     </header>
     <main>
@@ -132,16 +139,14 @@ System.print("sum %(nums) = %(sum)")
   </div>
 
   <script type="module">
-    // The wlift interpreter runs in `worker.js`. The page is a
-    // thin client that posts `run` requests and renders the
-    // `result` reply. Keeping the heavy work off the UI thread
-    // means the page stays responsive while a Wren program is
-    // computing or awaiting a fetch / WebSocket message — see
-    // worker.js for the full rationale + bridge shim install.
-    //
-    // We pull `ErrorKind` from the wasm-pack output for label
-    // rendering; it's a frozen JS object literal, so it's just a
-    // tiny module load on the main thread.
+    // Façade in `wlift.js` picks worker (default) vs main-thread
+    // (opt-in). Worker mode keeps the UI responsive during heavy
+    // compute or pending awaits but hides the wasm linear memory
+    // behind structured-clone postMessage. Main-thread mode
+    // exposes `wlift.memory` for direct buffer access at the
+    // cost of UI freezes during long runs. See `wlift.js` for
+    // the full tradeoff write-up.
+    import { createWlift } from "./wlift.js";
     import { ErrorKind } from "../pkg/wlift_wasm.js";
 
     const statusEl  = document.getElementById("status");
@@ -149,59 +154,49 @@ System.print("sum %(nums) = %(sum)")
     const srcEl     = document.getElementById("src");
     const outEl     = document.getElementById("out");
     const runBtn    = document.getElementById("run-btn");
+    const modeSel   = document.getElementById("mode-select");
 
-    statusEl.textContent = "loading…";
-    const worker = new Worker(new URL("./worker.js", import.meta.url), {
-      type: "module",
-    });
+    let wlift = null;
 
-    // `run()` dispatches by id so multiple in-flight requests
-    // don't tangle. Today the UI runs at most one at a time
-    // (button is disabled while a run is outstanding), but the
-    // worker doesn't enforce that — leaving room for a future
-    // "queue another script" affordance without protocol churn.
-    let nextId = 1;
-    const pending = new Map();
-
-    function runInWorker(source) {
-      return new Promise((resolve) => {
-        const id = nextId++;
-        pending.set(id, resolve);
-        worker.postMessage({ cmd: "run", id, source });
-      });
+    async function bootMode(mode) {
+      runBtn.disabled = true;
+      statusEl.classList.remove("ok", "error");
+      statusEl.textContent = `loading (${mode})…`;
+      if (wlift) {
+        // Switching modes — terminate the previous one so we don't
+        // leak workers / dangling listeners across rebuilds.
+        wlift.terminate();
+        wlift = null;
+      }
+      try {
+        wlift = await createWlift({ mode });
+      } catch (e) {
+        statusEl.textContent = `failed: ${e}`;
+        statusEl.classList.add("error");
+        return;
+      }
+      statusEl.textContent = `ready (${mode})`;
+      statusEl.classList.add("ok");
+      versionEl.textContent = wlift.memory
+        ? `${wlift.version} · memory: ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB`
+        : wlift.version;
+      runBtn.disabled = false;
+      execute();
     }
 
-    worker.addEventListener("message", (e) => {
-      const msg = e.data;
-      if (msg.cmd === "ready") {
-        statusEl.textContent = "ready";
-        statusEl.classList.add("ok");
-        versionEl.textContent = msg.version;
-        runBtn.disabled = false;
-        // Auto-run once the worker is up so the page is useful
-        // immediately on load.
-        execute();
-      } else if (msg.cmd === "result") {
-        const resolve = pending.get(msg.id);
-        if (resolve) {
-          pending.delete(msg.id);
-          resolve(msg);
-        }
-      }
-    });
-
     async function execute() {
+      if (!wlift) return;
       runBtn.disabled = true;
       outEl.classList.remove("ok", "error");
       outEl.textContent = "running…";
-      const result = await runInWorker(srcEl.value);
+      const result = await wlift.run(srcEl.value);
       outEl.textContent = result.output || "(no output)";
       outEl.classList.add(result.ok ? "ok" : "error");
       outEl.textContent +=
         `\n--- ${result.ok ? "ok" : "error"} (${result.elapsedMs.toFixed(1)} ms) ---`;
       if (!result.ok) {
-        // `errorKind = -1` is the worker's "unhandled JS
-        // exception" path; the message is already in `output`.
+        // `errorKind === -1` is the façade's "unhandled JS
+        // exception" path; the message already lives in `output`.
         const kind = result.errorKind === -1
           ? "JsException"
           : (ErrorKind[result.errorKind] ?? result.errorKind);
@@ -217,6 +212,9 @@ System.print("sum %(nums) = %(sum)")
         execute();
       }
     });
+    modeSel.addEventListener("change", () => bootMode(modeSel.value));
+
+    bootMode(modeSel.value);
   </script>
 </body>
 </html>
