@@ -138,6 +138,9 @@ System.print("sum %(nums) = %(sum)")
       ErrorKind,
       resolve_future,
       reject_future,
+      ws_open,
+      ws_message,
+      ws_close,
     } from "../pkg/wlift_wasm.js";
 
     // Browser-async shims for the Promise ↔ Fiber.yield bridge.
@@ -155,6 +158,32 @@ System.print("sum %(nums) = %(sum)")
         .then((r) => r.text())
         .then((t) => resolve_future(handle, t))
         .catch((e) => reject_future(handle, String(e)));
+    };
+
+    // WebSocket bridge. Wren `Browser.connect(url)` mints a
+    // handle and asks us to attach a `WebSocket`; the wasm side
+    // owns the inbox queue + `recv()` future plumbing, we just
+    // forward open/message/close events back into it. The page
+    // keeps a `Map<handle, WebSocket>` so subsequent `send` /
+    // `close` calls can find their socket.
+    globalThis.__wlift_sockets ??= new Map();
+    globalThis._wlift_ws_open = (handle, url) => {
+      const ws = new WebSocket(url);
+      ws.addEventListener("open",    () => ws_open(handle));
+      ws.addEventListener("message", (e) => ws_message(handle, String(e.data)));
+      ws.addEventListener("close",   () => ws_close(handle));
+      ws.addEventListener("error",   () => ws_close(handle));
+      globalThis.__wlift_sockets.set(handle, ws);
+    };
+    globalThis._wlift_ws_send = (handle, text) => {
+      globalThis.__wlift_sockets.get(handle)?.send(text);
+    };
+    globalThis._wlift_ws_close = (handle) => {
+      const ws = globalThis.__wlift_sockets.get(handle);
+      if (ws) {
+        ws.close();
+        globalThis.__wlift_sockets.delete(handle);
+      }
     };
 
     const statusEl  = document.getElementById("status");

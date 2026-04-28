@@ -136,6 +136,13 @@ fn smoke_runs_under_wasmtime() {
          through the bridge. captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("ws: ok"),
+        "Browser.connect(url) → send + recv loopback didn't \
+         round-trip messages through the WebSocket bridge. \
+         captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

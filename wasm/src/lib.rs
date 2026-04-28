@@ -17,7 +17,7 @@
 //! the surface (incremental compile, multi-module install,
 //! browser-API foreign classes); this is the minimal demo.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use wasm_bindgen::prelude::*;
@@ -71,6 +71,41 @@ pub mod js {
         /// Same wiring as `_wlift_set_timeout`.
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_fetch)]
         pub fn wlift_fetch(handle: u32, url: &str);
+
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_ws_open = (handle, url) => {
+        ///       const ws = new WebSocket(url);
+        ///       ws.addEventListener("open",    () => ws_open(handle));
+        ///       ws.addEventListener("message", (e) => ws_message(handle, String(e.data)));
+        ///       ws.addEventListener("close",   () => ws_close(handle));
+        ///       ws.addEventListener("error",   () => ws_close(handle));
+        ///       globalThis.__wlift_sockets ??= new Map();
+        ///       globalThis.__wlift_sockets.set(handle, ws);
+        ///   };
+        ///
+        /// The page keeps a `Map<handle, WebSocket>` so subsequent
+        /// `_wlift_ws_send` / `_wlift_ws_close` calls can find the
+        /// underlying socket.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_ws_open)]
+        pub fn wlift_ws_open(handle: u32, url: &str);
+
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_ws_send = (handle, text) => {
+        ///       globalThis.__wlift_sockets?.get(handle)?.send(text);
+        ///   };
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_ws_send)]
+        pub fn wlift_ws_send(handle: u32, text: &str);
+
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_ws_close = (handle) => {
+        ///       const ws = globalThis.__wlift_sockets?.get(handle);
+        ///       if (ws) { ws.close(); globalThis.__wlift_sockets.delete(handle); }
+        ///   };
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_ws_close)]
+        pub fn wlift_ws_close(handle: u32);
     }
 }
 
@@ -198,6 +233,181 @@ pub fn future_store_take_value(handle: u32) -> Option<String> {
         FutureState::Resolved => slot.value,
         FutureState::Rejected => slot.error,
     }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket handle store (Phase 1.2)
+// ---------------------------------------------------------------------------
+//
+// `Browser.connect(url)` mints a *connection* handle here (not a
+// future), then returns it wrapped in a Wren `WebSocket` instance.
+// Subsequent `send` / `recv` / `close` foreign methods drive the
+// connection through this store.
+//
+// The contract differs from `FutureSlot` because a socket is
+// multi-shot — many messages flow over one handle, each delivered
+// to the next pending `recv()` future or buffered for a later
+// caller. The store therefore holds:
+//
+//   * `state` — Connecting → Open → Closed lifecycle.
+//   * `inbox` — messages that arrived with no waiter ready.
+//   * `waiters` — future handles parked by `recv()`. The next
+//                 inbound message wakes the head waiter.
+//
+// Browser-host JS wires its `WebSocket` listeners to call
+// `ws_open` / `ws_message` / `ws_close` below. Wasi has no real
+// socket; the wasi smoke runs a loopback (send → inbox) so the
+// bridge can be exercised without a network stack.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[wasm_bindgen]
+pub enum WebSocketState {
+    Connecting = 0,
+    Open = 1,
+    Closed = 2,
+}
+
+#[derive(Debug)]
+struct WebSocketSlot {
+    state: WebSocketState,
+    inbox: VecDeque<String>,
+    waiters: VecDeque<u32>,
+}
+
+fn websocket_store() -> &'static Mutex<HashMap<u32, WebSocketSlot>> {
+    static STORE: std::sync::OnceLock<Mutex<HashMap<u32, WebSocketSlot>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_websocket_handle() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mint a fresh socket handle in `Connecting` state. Foreign
+/// methods call this before kicking off the JS-side `WebSocket`
+/// constructor (browser) or flipping the state synchronously
+/// (wasi loopback).
+pub fn create_websocket() -> u32 {
+    let handle = next_websocket_handle();
+    let mut store = websocket_store().lock().expect("websocket store poisoned");
+    store.insert(
+        handle,
+        WebSocketSlot {
+            state: WebSocketState::Connecting,
+            inbox: VecDeque::new(),
+            waiters: VecDeque::new(),
+        },
+    );
+    handle
+}
+
+/// JS-callable: flip a socket to `Open`. Browser hosts call this
+/// from the `WebSocket`'s `open` listener so subsequent `send`
+/// calls aren't queued in JS-land for nothing.
+#[wasm_bindgen]
+pub fn ws_open(handle: u32) {
+    let mut store = websocket_store().lock().expect("websocket store poisoned");
+    if let Some(slot) = store.get_mut(&handle) {
+        if slot.state == WebSocketState::Connecting {
+            slot.state = WebSocketState::Open;
+        }
+    }
+}
+
+/// JS-callable: deliver an incoming message. Wakes the head
+/// `recv()` future if one is parked; otherwise buffers the
+/// message for a later caller. Drops the message silently if the
+/// handle is unknown — late arrivals on a closed/torn-down socket
+/// shouldn't crash the page.
+#[wasm_bindgen]
+pub fn ws_message(handle: u32, msg: String) {
+    let waiter = {
+        let mut store = websocket_store().lock().expect("websocket store poisoned");
+        let Some(slot) = store.get_mut(&handle) else {
+            return;
+        };
+        if let Some(w) = slot.waiters.pop_front() {
+            Some(w)
+        } else {
+            slot.inbox.push_back(msg.clone());
+            None
+        }
+    };
+    if let Some(w) = waiter {
+        resolve_future(w, msg);
+    }
+}
+
+/// JS-callable: flip a socket to `Closed` and reject any parked
+/// `recv()` futures. Idempotent — closing twice is a no-op.
+#[wasm_bindgen]
+pub fn ws_close(handle: u32) {
+    // Drain the waiter list under the store lock, then settle the
+    // futures outside it — `reject_future` reaches into the future
+    // store, and re-entering the websocket lock isn't necessary.
+    let waiters: Vec<u32> = {
+        let mut store = websocket_store().lock().expect("websocket store poisoned");
+        match store.get_mut(&handle) {
+            Some(slot) if slot.state != WebSocketState::Closed => {
+                slot.state = WebSocketState::Closed;
+                slot.waiters.drain(..).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    for w in waiters {
+        reject_future(w, "WebSocket closed".to_string());
+    }
+}
+
+/// JS-callable: read the current state of a socket. Used by JS
+/// debug tooling and by `browser::browser_ws_state` if a Wren-
+/// side state probe ends up wanted.
+#[wasm_bindgen]
+pub fn websocket_state(handle: u32) -> WebSocketState {
+    let store = websocket_store().lock().expect("websocket store poisoned");
+    store
+        .get(&handle)
+        .map(|s| s.state)
+        .unwrap_or(WebSocketState::Closed)
+}
+
+/// Internal: enqueue a message into a socket's inbox without going
+/// through the JS event path. The wasi mock uses this to loopback
+/// `send()` straight back to `recv()` — there's no real socket on
+/// wasi, but the bridge wiring (handle → future → fiber resume)
+/// still gets exercised end-to-end.
+pub fn websocket_inbox_push(handle: u32, msg: String) {
+    ws_message(handle, msg);
+}
+
+/// Internal: park a future handle on a socket's waiter queue, or
+/// resolve it immediately if the inbox already has a message.
+/// Returns the future handle; callers wrap it in a Wren `Future`.
+pub fn websocket_recv(handle: u32) -> u32 {
+    let future = create_pending_future();
+    let immediate = {
+        let mut store = websocket_store().lock().expect("websocket store poisoned");
+        match store.get_mut(&handle) {
+            Some(slot) if slot.state == WebSocketState::Closed => Some(Err(())),
+            Some(slot) => match slot.inbox.pop_front() {
+                Some(msg) => Some(Ok(msg)),
+                None => {
+                    slot.waiters.push_back(future);
+                    None
+                }
+            },
+            None => Some(Err(())),
+        }
+    };
+    match immediate {
+        Some(Ok(msg)) => resolve_future(future, msg),
+        Some(Err(())) => reject_future(future, "WebSocket closed".to_string()),
+        None => {}
+    }
+    future
 }
 
 // ---------------------------------------------------------------------------

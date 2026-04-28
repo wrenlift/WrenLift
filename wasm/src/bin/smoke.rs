@@ -69,6 +69,14 @@ foreign class BrowserCore {
     foreign static setTimeoutHandle(ms)
     #!symbol = "browser_fetch"
     foreign static fetchHandle(url)
+    #!symbol = "browser_ws_open"
+    foreign static wsOpen(url)
+    #!symbol = "browser_ws_send"
+    foreign static wsSend(handle, text)
+    #!symbol = "browser_ws_recv"
+    foreign static wsRecv(handle)
+    #!symbol = "browser_ws_close"
+    foreign static wsClose(handle)
     #!symbol = "browser_peek_state"
     foreign static peekState(handle)
     #!symbol = "browser_take_value"
@@ -90,9 +98,16 @@ class Future {
         return v
     }
 }
+class WebSocket {
+    construct new_(handle) { _h = handle }
+    send(text)  { BrowserCore.wsSend(_h, text) }
+    recv        { Future.new_(BrowserCore.wsRecv(_h)) }
+    close       { BrowserCore.wsClose(_h) }
+}
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
     static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
+    static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }
 
 var awaitFiber = Fiber.new {
@@ -120,6 +135,27 @@ if (fetchResult == "MOCK:https://example.invalid/api") {
     System.print("fetch: ok")
 } else {
     System.print("fetch: BAD (%(fetchResult))")
+}
+
+// WebSocket bridge probe. Under wasi the connect/send/recv
+// loopback through a single handle's inbox queue — no real
+// network. A two-message round trip exercises both the immediate-
+// inbox path (recv finds a buffered message) and the parked-
+// waiter path (recv blocks, send wakes the waiter).
+var wsFiber = Fiber.new {
+    var ws = Browser.connect("ws://localhost/echo")
+    ws.send("hello")
+    ws.send("world")
+    var first  = ws.recv.await
+    var second = ws.recv.await
+    ws.close
+    return first + " " + second
+}
+var wsResult = wsFiber.try()
+if (wsResult == "hello world") {
+    System.print("ws: ok")
+} else {
+    System.print("ws: BAD (%(wsResult))")
 }
 "#;
 

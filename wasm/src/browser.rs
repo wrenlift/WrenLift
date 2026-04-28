@@ -34,12 +34,17 @@ use wren_lift::runtime::object::{NativeContext, ObjString};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
-use crate::{create_pending_future, future_state, future_store_take_value, FutureState};
-// `resolve_future` is only used on the wasi/native fallback path
+use crate::{
+    create_pending_future, create_websocket, future_state, future_store_take_value, websocket_recv,
+    FutureState,
+};
+// These helpers are only used on the wasi/native fallback path
 // where there's no event loop to wait on. The browser path goes
 // through the `_wlift_*` JS shims instead.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-use crate::resolve_future;
+use crate::{
+    resolve_future, websocket_inbox_push, ws_close as ws_close_impl, ws_open as ws_open_impl,
+};
 
 // ---------------------------------------------------------------------------
 // Foreign-method shims
@@ -225,6 +230,165 @@ pub unsafe extern "C" fn browser_take_value(vm: *mut VM) {
     }
 }
 
+/// `Browser.connect(url)` (via `BrowserCore.wsOpen`) — mints a
+/// fresh WebSocket handle, kicks off the JS-side `WebSocket`
+/// constructor (browser) or flips the socket to `Open`
+/// synchronously (wasi loopback), and returns the handle.
+///
+/// # Safety
+///
+/// Reads `url` (String) from slot 1; writes the socket handle
+/// (Num) to slot 0.
+pub unsafe extern "C" fn browser_ws_open(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let url: String = if arg.is_string_object() {
+            let ptr = arg.as_object().expect("string object pointer");
+            (*(ptr as *const ObjString)).as_str().to_string()
+        } else {
+            vm_ref.runtime_error("Browser.connect: url must be a String.".to_string());
+            return;
+        };
+        let handle = create_websocket();
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::js::wlift_ws_open(handle, &url);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            // Wasi loopback: no real socket. Flip to Open straight
+            // away so `send`/`recv` round-trip locally.
+            let _ = url;
+            ws_open_impl(handle);
+        }
+
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::num(handle as f64));
+        } else {
+            vm_ref.api_stack[0] = Value::num(handle as f64);
+        }
+    }
+}
+
+/// `WebSocket.send(text)` (via `BrowserCore.wsSend`) — push a
+/// message out the socket. Browser dispatches to the JS
+/// `WebSocket.send`; wasi pushes the message straight onto the
+/// socket's own inbox so the next `recv()` returns it (loopback).
+///
+/// # Safety
+///
+/// Reads `handle` (Num) from slot 1, `text` (String) from slot 2;
+/// writes `null` to slot 0.
+pub unsafe extern "C" fn browser_ws_send(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let handle_arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let text_arg = vm_ref.api_stack.get(2).copied().unwrap_or(Value::null());
+        let handle = match handle_arg.as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 => n as u32,
+            _ => {
+                vm_ref.runtime_error(
+                    "WebSocket.send: handle must be a non-negative integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let text: String = if text_arg.is_string_object() {
+            let ptr = text_arg.as_object().expect("string object pointer");
+            (*(ptr as *const ObjString)).as_str().to_string()
+        } else {
+            vm_ref.runtime_error("WebSocket.send: text must be a String.".to_string());
+            return;
+        };
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::js::wlift_ws_send(handle, &text);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            websocket_inbox_push(handle, text);
+        }
+
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::null());
+        } else {
+            vm_ref.api_stack[0] = Value::null();
+        }
+    }
+}
+
+/// `WebSocket.recv()` (via `BrowserCore.wsRecv`) — returns a
+/// future handle that resolves with the next inbound message, or
+/// rejects if the socket closes first. Doesn't depend on the host
+/// path: the underlying queue/waiter logic is identical on
+/// browser and wasi.
+///
+/// # Safety
+///
+/// Reads `handle` (Num) from slot 1; writes the future handle
+/// (Num) to slot 0.
+pub unsafe extern "C" fn browser_ws_recv(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let handle = match arg.as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 => n as u32,
+            _ => {
+                vm_ref.runtime_error(
+                    "WebSocket.recv: handle must be a non-negative integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let future = websocket_recv(handle);
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::num(future as f64));
+        } else {
+            vm_ref.api_stack[0] = Value::num(future as f64);
+        }
+    }
+}
+
+/// `WebSocket.close()` (via `BrowserCore.wsClose`) — close the
+/// socket and reject any parked `recv()` futures.
+///
+/// # Safety
+///
+/// Reads `handle` (Num) from slot 1; writes `null` to slot 0.
+pub unsafe extern "C" fn browser_ws_close(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let handle = match arg.as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 => n as u32,
+            _ => {
+                vm_ref.runtime_error(
+                    "WebSocket.close: handle must be a non-negative integer.".to_string(),
+                );
+                return;
+            }
+        };
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::js::wlift_ws_close(handle);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            ws_close_impl(handle);
+        }
+
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::null());
+        } else {
+            vm_ref.api_stack[0] = Value::null();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -235,6 +399,10 @@ pub fn register_static_symbols() {
     use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
     register_plugin_symbol_unsafe("browser", "browser_set_timeout", browser_set_timeout);
     register_plugin_symbol_unsafe("browser", "browser_fetch", browser_fetch);
+    register_plugin_symbol_unsafe("browser", "browser_ws_open", browser_ws_open);
+    register_plugin_symbol_unsafe("browser", "browser_ws_send", browser_ws_send);
+    register_plugin_symbol_unsafe("browser", "browser_ws_recv", browser_ws_recv);
+    register_plugin_symbol_unsafe("browser", "browser_ws_close", browser_ws_close);
     register_plugin_symbol_unsafe("browser", "browser_peek_state", browser_peek_state);
     register_plugin_symbol_unsafe("browser", "browser_take_value", browser_take_value);
 }
@@ -261,6 +429,14 @@ foreign class BrowserCore {
     foreign static setTimeoutHandle(ms)
     #!symbol = "browser_fetch"
     foreign static fetchHandle(url)
+    #!symbol = "browser_ws_open"
+    foreign static wsOpen(url)
+    #!symbol = "browser_ws_send"
+    foreign static wsSend(handle, text)
+    #!symbol = "browser_ws_recv"
+    foreign static wsRecv(handle)
+    #!symbol = "browser_ws_close"
+    foreign static wsClose(handle)
     #!symbol = "browser_peek_state"
     foreign static peekState(handle)
     #!symbol = "browser_take_value"
@@ -285,8 +461,17 @@ class Future {
     }
 }
 
+class WebSocket {
+    construct new_(handle) { _h = handle }
+    handle      { _h }
+    send(text)  { BrowserCore.wsSend(_h, text) }
+    recv        { Future.new_(BrowserCore.wsRecv(_h)) }
+    close       { BrowserCore.wsClose(_h) }
+}
+
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
     static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
+    static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }
 "#;
