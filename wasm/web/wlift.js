@@ -288,9 +288,28 @@ class MainWlift {
       __wliftJitInstances.push(fn);
       return slot;
     };
-    globalThis._wlift_jit_call_0 = (slot)       => __wliftJitInstances[slot]();
-    globalThis._wlift_jit_call_1 = (slot, a)    => __wliftJitInstances[slot](a);
-    globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftJitInstances[slot](a, b);
+    // Defensive shim — if the wasm function returns undefined
+    // (mismatched signature, unbound import filled with stub,
+    // wrong slot), surface the failure as `null`-bits rather
+    // than letting wasm-bindgen throw "Cannot convert undefined
+    // to BigInt" deep in the dispatch path. The console.warn
+    // makes the misuse visible without crashing the whole run.
+    const __wliftSafeCall = (slot, fn, label) => {
+      const target = __wliftJitInstances[slot];
+      if (typeof target !== "function") {
+        console.warn(`[wlift jit] ${label}: slot ${slot} is not a function (${typeof target})`);
+        return 0x7FFC000000000000n; // Value::null() — TAG_NULL = QNAN
+      }
+      const r = fn(target);
+      if (typeof r !== "bigint") {
+        console.warn(`[wlift jit] ${label}: slot ${slot} returned non-BigInt (${typeof r}, ${r}); falling back to null`);
+        return 0x7FFC000000000000n;
+      }
+      return r;
+    };
+    globalThis._wlift_jit_call_0 = (slot)       => __wliftSafeCall(slot, (fn) => fn(),   "call_0");
+    globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
+    globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
 
     return this;
   }

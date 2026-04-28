@@ -212,9 +212,23 @@ globalThis._wlift_jit_instantiate = (bytes) => {
   __wliftJitInstances.push(fn);
   return slot;
 };
-globalThis._wlift_jit_call_0 = (slot)       => __wliftJitInstances[slot]();
-globalThis._wlift_jit_call_1 = (slot, a)    => __wliftJitInstances[slot](a);
-globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftJitInstances[slot](a, b);
+// Defensive call shims — see `wlift.js` for the rationale.
+const __wliftSafeCall = (slot, invoke, label) => {
+  const target = __wliftJitInstances[slot];
+  if (typeof target !== "function") {
+    console.warn(`[wlift jit] ${label}: slot ${slot} is not a function (${typeof target})`);
+    return 0x7FFC000000000000n;
+  }
+  const r = invoke(target);
+  if (typeof r !== "bigint") {
+    console.warn(`[wlift jit] ${label}: slot ${slot} returned non-BigInt (${typeof r}, ${r})`);
+    return 0x7FFC000000000000n;
+  }
+  return r;
+};
+globalThis._wlift_jit_call_0 = (slot)       => __wliftSafeCall(slot, (fn) => fn(),   "call_0");
+globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
+globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
 
 await init();
 // Stash the namespace on the worker's globalThis so the worker-
