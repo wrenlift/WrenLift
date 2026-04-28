@@ -57,12 +57,16 @@ use wren_lift::runtime::value::Value;
 extern "C" {
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_instantiate)]
     fn js_jit_instantiate(bytes: &[u8]) -> u32;
+    /// Each slot holds a direct reference to the module's
+    /// `fn_*` export — the JS shim resolves it once at
+    /// instantiate time, so the per-arity call shims don't pay
+    /// name-lookup cost on the dispatch hot path.
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_0)]
-    fn js_jit_call_0(slot: u32, fn_export_idx: u32) -> u64;
+    fn js_jit_call_0(slot: u32) -> u64;
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_1)]
-    fn js_jit_call_1(slot: u32, fn_export_idx: u32, a: u64) -> u64;
+    fn js_jit_call_1(slot: u32, a: u64) -> u64;
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_2)]
-    fn js_jit_call_2(slot: u32, fn_export_idx: u32, a: u64, b: u64) -> u64;
+    fn js_jit_call_2(slot: u32, a: u64, b: u64) -> u64;
 }
 
 // ---------------------------------------------------------------------------
@@ -92,25 +96,25 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
 }
 
 /// Invoke a JIT'd slot via the JS shim. Args are NaN-boxed
-/// `u64`s (passing through wasm-bindgen as BigInt). The export
-/// name carries the function's symbol-index — `emit_mir`
-/// formats it as `fn_<symbol_index>`. We only need the integer
-/// after the prefix, so the JS side reconstructs the full name.
+/// `u64`s (wasm-bindgen marshals as BigInt). The slot already
+/// holds a direct function reference, so this is a single
+/// JS hop into a wasm-to-wasm cross-module call.
+///
+/// `_fn_export_name` is unused — the JS shim resolved the
+/// `fn_*` export once at instantiate time. Kept in the signature
+/// because the runtime crate's `DispatchCallback` type carries
+/// it for future expansion (e.g. tables exporting multiple
+/// functions per module in Phase 4).
 ///
 /// Currently capped at 2 args (fib's signature). Phase 4 swaps
 /// per-arity shims for `call_indirect` through a shared funcref
 /// table.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn dispatch_callback(slot: u32, fn_export_name: &str, args: &[u64]) -> u64 {
-    // `fn_<digits>` → strip the prefix and parse the integer.
-    let fn_idx: u32 = fn_export_name
-        .strip_prefix("fn_")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+fn dispatch_callback(slot: u32, _fn_export_name: &str, args: &[u64]) -> u64 {
     match args.len() {
-        0 => js_jit_call_0(slot, fn_idx),
-        1 => js_jit_call_1(slot, fn_idx, args[0]),
-        2 => js_jit_call_2(slot, fn_idx, args[0], args[1]),
+        0 => js_jit_call_0(slot),
+        1 => js_jit_call_1(slot, args[0]),
+        2 => js_jit_call_2(slot, args[0], args[1]),
         // Phase 4 generalises this — return 0 (null bits) so the
         // caller can detect the dispatch failed and fall back.
         _ => 0,
@@ -342,8 +346,5 @@ pub fn jit_smoke_run_const() -> u64 {
         return 0;
     }
     let slot = js_jit_instantiate(&bytes);
-    // The MirFunction's name was interned at index 0 (only name
-    // in the throwaway interner), so `emit_mir` exports it as
-    // `fn_0`.
-    js_jit_call_0(slot, 0)
+    js_jit_call_0(slot)
 }

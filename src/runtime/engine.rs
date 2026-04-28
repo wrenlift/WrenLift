@@ -475,6 +475,23 @@ pub struct ExecutionEngine {
     /// JIT native code pointers indexed by FuncId. O(1) lookup for fast dispatch.
     /// null_ptr entries mean the function is not yet compiled.
     pub jit_code: Vec<*const u8>,
+    /// Wasm-tier-up dispatch slots indexed by `FuncId`. `0` = not
+    /// compiled; otherwise the value is `slot + 1` (the actual
+    /// slot index is `value - 1`). Lives parallel to `jit_code`
+    /// because wasm doesn't deal in raw native function pointers
+    /// — slots index into the host's `WebAssembly.Instance` table
+    /// (see `wlift_wasm::tier_up`). Always empty on host builds;
+    /// the BC interpreter's wasm dispatch hook reads it under
+    /// `cfg(target_arch = "wasm32")` only.
+    pub wasm_jit_slots: Vec<u32>,
+    /// Wasm-tier-up call counters indexed by `FuncId`. Bumped on
+    /// each invocation under `cfg(target_arch = "wasm32")` only;
+    /// when a counter crosses `WASM_JIT_THRESHOLD` the dispatch
+    /// hook calls `runtime::tier::try_compile` and stashes the
+    /// returned slot in `wasm_jit_slots`. Separate from
+    /// `tier_stats` so a tier-up event in one path doesn't
+    /// confuse the other.
+    pub wasm_call_counts: Vec<u32>,
     /// Whether the currently active native tier can use the direct fast path.
     pub jit_leaf: Vec<bool>,
     /// Preserved native-frame metadata for compiled functions.
@@ -595,6 +612,8 @@ impl ExecutionEngine {
             pending_count: 0,
             pending_callee_precompile: Vec::new(),
             jit_code: Vec::new(),
+            wasm_jit_slots: Vec::new(),
+            wasm_call_counts: Vec::new(),
             jit_leaf: Vec::new(),
             jit_metadata: Vec::new(),
             tier_states: Vec::new(),
@@ -649,6 +668,8 @@ impl ExecutionEngine {
         });
         self.compiling_tier.push(None);
         self.jit_code.push(std::ptr::null());
+        self.wasm_jit_slots.push(0);
+        self.wasm_call_counts.push(0);
         self.jit_leaf.push(false);
         self.jit_metadata.push(None);
         self.tier_states.push(TierState::Interpreted);
@@ -687,6 +708,52 @@ impl ExecutionEngine {
             .and_then(|m| m.as_ref())
     }
 
+    /// Install a wasm-tier-up dispatch slot for `id`. Stored as
+    /// `slot + 1` internally so `0` means "not compiled" and we
+    /// can use a plain `Vec<u32>` instead of `Vec<Option<u32>>`.
+    /// See `runtime::tier::set_compile_callback`.
+    pub fn install_wasm_jit_slot(&mut self, id: FuncId, slot: u32) {
+        let idx = id.0 as usize;
+        if idx >= self.wasm_jit_slots.len() {
+            self.wasm_jit_slots.resize(idx + 1, 0);
+        }
+        self.wasm_jit_slots[idx] = slot.saturating_add(1);
+    }
+
+    /// Look up the wasm-tier-up slot for `id`. `None` if the
+    /// function hasn't been JIT-compiled to wasm yet. Always
+    /// returns `None` on host builds.
+    pub fn wasm_jit_slot(&self, id: FuncId) -> Option<u32> {
+        let raw = *self.wasm_jit_slots.get(id.0 as usize)?;
+        if raw == 0 {
+            None
+        } else {
+            Some(raw - 1)
+        }
+    }
+
+    /// Bump the wasm-tier-up call count for `id` and return the
+    /// new value. The dispatch hook uses this on every invocation
+    /// of an interpreted function to decide when to tier up.
+    pub fn bump_wasm_call_count(&mut self, id: FuncId) -> u32 {
+        let idx = id.0 as usize;
+        if idx >= self.wasm_call_counts.len() {
+            self.wasm_call_counts.resize(idx + 1, 0);
+        }
+        self.wasm_call_counts[idx] = self.wasm_call_counts[idx].saturating_add(1);
+        self.wasm_call_counts[idx]
+    }
+}
+
+/// Threshold at which a Wren function gets compiled to wasm.
+/// Aggressive (low) on purpose — wasm-AOT compilation is cheap
+/// per-function (a few KB of bytes via `emit_mir` + a sync
+/// `WebAssembly.Module` constructor) and the interpreter floor
+/// is high enough that even a few-thousand-call function
+/// benefits.
+pub const WASM_JIT_THRESHOLD: u32 = 50;
+
+impl ExecutionEngine {
     /// Register a compiled function's code range for GC stack walking.
     pub fn register_code_range(
         &mut self,

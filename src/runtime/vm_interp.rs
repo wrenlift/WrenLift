@@ -3535,6 +3535,61 @@ fn dispatch_closure_bc_inner(
     let target_func_id = FuncId(unsafe { (*fn_ptr).fn_id });
     let fn_idx = target_func_id.0 as usize;
 
+    // Wasm tier-up dispatch + trigger. On wasm builds, hot Wren
+    // methods get compiled to a per-function wasm module
+    // (see `wlift_wasm::tier_up`); the resulting `WebAssembly`
+    // function reference lives in the `wasm_jit_slots` table.
+    //
+    //   1. If a slot's already set, dispatch via the host's JS
+    //      shim instead of running bytecode.
+    //   2. Otherwise, bump the call counter; on threshold, ask
+    //      the runtime's tier broker (`runtime::tier::try_compile`)
+    //      to compile + install. The very next call hits path 1.
+    //
+    // Capped at args.len() <= 3 (receiver + 2 positional) today
+    // because the JS call shims only support up to 2 args.
+    // Phase 4 swaps `tier::dispatch` for a shared funcref table
+    // + `call_indirect`, eliminating the per-arity cap and the
+    // JS-roundtrip cost on inter-fn calls.
+    #[cfg(target_arch = "wasm32")]
+    if arg_vals.len() <= 3 {
+        if let Some(slot) = vm.engine.wasm_jit_slot(target_func_id) {
+            // Receiver is `arg_vals[0]`; JIT'd functions take
+            // only positional args today (Phase 4 threads the
+            // receiver through too).
+            let args_bits: Vec<u64> = arg_vals[1..].iter().map(|v| v.to_bits()).collect();
+            // Export name only matters for Phase 4's table
+            // multiplexing; per-instance dispatch ignores it.
+            let result_bits = crate::runtime::tier::dispatch(slot, "", &args_bits);
+            let result_val = Value::from_bits(result_bits);
+            set_reg(&mut values, return_dst.0 as u16, result_val);
+            unsafe {
+                if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                    frame.pc = pc;
+                    frame.values = values;
+                }
+            }
+            return Ok(());
+        }
+        // Not yet JIT'd — bump counter and try compile on
+        // threshold crossing. We only do this on the *crossing*
+        // (count == THRESHOLD) so a function that fails to
+        // compile doesn't retry-spam every subsequent call.
+        let count = vm.engine.bump_wasm_call_count(target_func_id);
+        if count == crate::runtime::engine::WASM_JIT_THRESHOLD {
+            if let Some(mir_arc) = vm.engine.get_mir(target_func_id) {
+                if let Some(slot) = crate::runtime::tier::try_compile(&mir_arc) {
+                    vm.engine.install_wasm_jit_slot(target_func_id, slot);
+                    // Don't dispatch this call through the JIT —
+                    // the BC interpreter has already set up
+                    // partial state. Fall through to the BC path
+                    // and let the *next* invocation of this
+                    // function take the JIT path.
+                }
+            }
+        }
+    }
+
     // Fast JIT dispatch: check the Vec-indexed jit_code array (O(1) lookup).
     // Skip tier-up profiling entirely for already-compiled functions.
     if vm.engine.mode != ExecutionMode::Interpreter

@@ -265,22 +265,20 @@ class MainWlift {
       const instance = new WebAssembly.Instance(module, {
         wren: __wliftWrenImports,
       });
+      // `emit_mir` exports exactly one `fn_<symbol_index>` per
+      // module — find it once and stash the function reference
+      // directly so subsequent calls don't pay name-lookup cost.
+      let fn = null;
+      for (const key of Object.keys(instance.exports)) {
+        if (key.startsWith("fn_")) { fn = instance.exports[key]; break; }
+      }
       const slot = __wliftJitInstances.length;
-      __wliftJitInstances.push(instance);
+      __wliftJitInstances.push(fn);
       return slot;
     };
-    globalThis._wlift_jit_call_0 = (slot, fnIdx) => {
-      const fn = __wliftJitInstances[slot].exports[`fn_${fnIdx}`];
-      return fn();
-    };
-    globalThis._wlift_jit_call_1 = (slot, fnIdx, a) => {
-      const fn = __wliftJitInstances[slot].exports[`fn_${fnIdx}`];
-      return fn(a);
-    };
-    globalThis._wlift_jit_call_2 = (slot, fnIdx, a, b) => {
-      const fn = __wliftJitInstances[slot].exports[`fn_${fnIdx}`];
-      return fn(a, b);
-    };
+    globalThis._wlift_jit_call_0 = (slot)       => __wliftJitInstances[slot]();
+    globalThis._wlift_jit_call_1 = (slot, a)    => __wliftJitInstances[slot](a);
+    globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftJitInstances[slot](a, b);
 
     return this;
   }
