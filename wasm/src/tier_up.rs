@@ -173,9 +173,31 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
         COMPILE_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    // Diagnostic: log the arity of every compiled function so we
+    // can see what's tier-up'ing. Spot-checks `js_jit_call_0`
+    // mismatches — if a function compiles with arity > 0, the
+    // BC dispatch hook must call it with that many args.
+    web_sys_console_log(&format!(
+        "[wlift jit] compile: arity={} block0_params={} bytes={}",
+        mir.arity,
+        mir.blocks.first().map(|b| b.params.len()).unwrap_or(0),
+        bytes.len(),
+    ));
     let slot = js_jit_instantiate(&bytes);
     COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
     Some(slot)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn web_sys_console_log(s: &str) {
+    js_console_log(s);
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = log)]
+    fn js_console_log(s: &str);
 }
 
 /// Walk MIR for any instruction whose `wren_*` runtime helper
