@@ -158,6 +158,16 @@ globalThis._wlift_storage_clear = (handle, scope) => {
 globalThis._wlift_yield_to_event_loop = () =>
   new Promise((resolve) => setTimeout(resolve, 0));
 
+// Perf logger — `run()` brackets each phase and calls this so
+// we can see where wall time goes. Gated by a global flag so the
+// console isn't spammed by default; flip on via the page or
+// devtools: `globalThis.__wlift_perf_enabled = true`.
+globalThis._wlift_perf_log = (label, ms) => {
+  if (globalThis.__wlift_perf_enabled) {
+    console.log(`[wlift perf] ${label}: ${ms.toFixed(2)} ms`);
+  }
+};
+
 await init();
 self.postMessage({ cmd: "ready", version: version() });
 

@@ -168,6 +168,20 @@ pub mod js {
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_yield_to_event_loop)]
         pub fn wlift_yield_to_event_loop() -> js_sys::Promise;
 
+        /// Perf logger — host installs as a `console.log`-style
+        /// shim. `_wlift_perf_log("phase", ms)` is called at each
+        /// phase boundary inside `run()` so we can see where the
+        /// time actually goes. Hosts that don't care can install
+        /// a no-op.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_perf_log)]
+        pub fn wlift_perf_log(label: &str, ms: f64);
+
+        /// `performance.now()` in milliseconds (high-resolution
+        /// monotonic clock). Available on both Window and
+        /// WorkerGlobalScope. Used by the perf logger.
+        #[wasm_bindgen(js_namespace = ["performance"], js_name = now)]
+        pub fn perf_now() -> f64;
+
         // ---------- Storage bridge --------------------------------------
         // localStorage / sessionStorage exist in both Window and
         // WorkerGlobalScope, so the JS shim can hit them inline in
@@ -870,9 +884,30 @@ fn prelude_blob() -> &'static Vec<u8> {
 /// `Dom` / `LocalStorage` / …) is prepended to every source so
 /// callers don't have to inline the shim boilerplate. See
 /// `BROWSER_PRELUDE` above.
+/// Wall-clock milliseconds since module load, via JS
+/// `performance.now()`. Wraps the import so the rest of `run()`
+/// can use `let t = perf_mark();` without a cfg every time.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn perf_mark() -> f64 {
+    js::perf_now()
+}
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn perf_mark() -> f64 {
+    0.0
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn perf_log(label: &str, start: f64) {
+    js::wlift_perf_log(label, js::perf_now() - start);
+}
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn perf_log(_label: &str, _start: f64) {}
+
 #[wasm_bindgen]
 pub async fn run(source: &str) -> RunResult {
     use std::sync::{Arc, Mutex as StdMutex};
+
+    let t_total = perf_mark();
 
     // Capture compile + runtime diagnostics into the same stream
     // we hand back as `output`. Without this, errors land on the
@@ -894,8 +929,10 @@ pub async fn run(source: &str) -> RunResult {
         }
     }));
 
+    let t_vm_new = perf_mark();
     let mut vm = VM::new(config);
     vm.output_buffer = Some(String::new());
+    perf_log("vm_new", t_vm_new);
 
     // Wipe any leftover parked fibers from a prior `run()` —
     // those fibers belong to a now-dropped VM and the pointers
@@ -910,7 +947,13 @@ pub async fn run(source: &str) -> RunResult {
     // sema / codegen. The user source then `import`s those
     // names, and the import path short-circuits because the
     // module's already loaded.
+    let t_blob = perf_mark();
+    let _ = prelude_blob(); // ensure cache populated; first run pays the compile
+    perf_log("prelude_compile_or_cache_hit", t_blob);
+
+    let t_prelude_load = perf_mark();
     let prelude_load = vm.interpret_bytecode("wlift_prelude", prelude_blob());
+    perf_log("prelude_bytecode_install", t_prelude_load);
     if !matches!(prelude_load, InterpretResult::Success) {
         // Cached blob failed to load — should never happen since
         // the const is fixed at build time. Fall back to a clean
@@ -923,7 +966,9 @@ pub async fn run(source: &str) -> RunResult {
         };
     }
     let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
+    let t_user = perf_mark();
     let result = vm.interpret("main", &combined);
+    perf_log("user_compile_and_run", t_user);
 
     // Scheduler loop. Drives parked fibers across JS event-loop
     // turns until either nothing's parked or the tick budget
@@ -937,6 +982,7 @@ pub async fn run(source: &str) -> RunResult {
     // clamp nested `setTimeout(_, 0)` to ~4 ms, so 2500 ticks
     // ≈ 10 s wall clock — covers a reasonable awaited timer
     // chain and bails on actually-stuck programs.
+    let t_sched = perf_mark();
     if matches!(result, InterpretResult::Success) {
         let mut tick_budget: u32 = 2_500;
         loop {
@@ -1035,7 +1081,9 @@ pub async fn run(source: &str) -> RunResult {
                 .extend(still_parked);
         }
     }
+    perf_log("scheduler_loop", t_sched);
 
+    let t_output = perf_mark();
     let mut output = vm.take_output();
 
     // Drain the diagnostic stream, strip ANSI colour codes, and
@@ -1056,6 +1104,8 @@ pub async fn run(source: &str) -> RunResult {
         InterpretResult::CompileError => (false, ErrorKind::CompileError),
         InterpretResult::RuntimeError => (false, ErrorKind::RuntimeError),
     };
+    perf_log("output_capture", t_output);
+    perf_log("run_total", t_total);
 
     RunResult {
         output,

@@ -217,6 +217,15 @@ class MainWlift {
     globalThis._wlift_yield_to_event_loop = () =>
       new Promise((resolve) => setTimeout(resolve, 0));
 
+    // Perf logger — gated by `globalThis.__wlift_perf_enabled`.
+    // Same install in worker.js so worker-mode runs are
+    // diagnosable too.
+    globalThis._wlift_perf_log = (label, ms) => {
+      if (globalThis.__wlift_perf_enabled) {
+        console.log(`[wlift perf] ${label}: ${ms.toFixed(2)} ms`);
+      }
+    };
+
     // wasm-bindgen `--target web` returns the wasm exports object
     // from the default `init()`. `exports.memory` is the live
     // `WebAssembly.Memory` instance — that's what main-mode
