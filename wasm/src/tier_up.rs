@@ -36,8 +36,61 @@
 //! Each phase is a single focused commit; this file grows in
 //! place rather than getting renamed.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use wasm_bindgen::prelude::*;
 use wren_lift::runtime::value::Value;
+
+// ---------------------------------------------------------------------------
+// Diagnostic counters
+// ---------------------------------------------------------------------------
+//
+// Lets the host page check whether tier-up is actually firing.
+// All four are bumped on the dispatch hot path; cost is one
+// relaxed atomic per event, negligible vs. the call itself.
+
+static COMPILE_COUNT: AtomicU32 = AtomicU32::new(0);
+static COMPILE_REJECT_COUNT: AtomicU32 = AtomicU32::new(0);
+static DISPATCH_FROM_BC_COUNT: AtomicU64 = AtomicU64::new(0);
+static DISPATCH_FAST_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of MIR functions successfully compiled to wasm.
+#[wasm_bindgen]
+pub fn jit_compile_count() -> u32 {
+    COMPILE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Number of MIR functions rejected by the helper-set gate.
+#[wasm_bindgen]
+pub fn jit_compile_reject_count() -> u32 {
+    COMPILE_REJECT_COUNT.load(Ordering::Relaxed)
+}
+
+/// Number of dispatches via the BC interp's hook (a normal
+/// `Op::Call` in interpreted code that found a JIT'd slot).
+#[wasm_bindgen]
+pub fn jit_dispatch_from_bc_count() -> u64 {
+    DISPATCH_FROM_BC_COUNT.load(Ordering::Relaxed)
+}
+
+/// Number of dispatches via `wren_call_1`'s short-circuit
+/// (JIT'd code calling another JIT'd function directly,
+/// without re-entering the BC interp). High value = recursion
+/// stays in JIT; low value with high BC count = the alternating
+/// JIT/BC pattern we're trying to avoid.
+#[wasm_bindgen]
+pub fn jit_dispatch_fast_path_count() -> u64 {
+    DISPATCH_FAST_PATH_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset all counters — handy for per-run measurements.
+#[wasm_bindgen]
+pub fn jit_counters_reset() {
+    COMPILE_COUNT.store(0, Ordering::Relaxed);
+    COMPILE_REJECT_COUNT.store(0, Ordering::Relaxed);
+    DISPATCH_FROM_BC_COUNT.store(0, Ordering::Relaxed);
+    DISPATCH_FAST_PATH_COUNT.store(0, Ordering::Relaxed);
+}
 
 // Phase 2b — extern bindings for the JS-side instantiate + call
 // shims. Installed by `wlift.js` (main mode) and `worker.js`
@@ -91,14 +144,23 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
         // Phase 4 lifts this — wires `wren_call`, `wren_make_*`,
         // `wren_to_string`, etc. through a thread-local VM
         // pointer so JIT'd code can call back into the runtime.
+        COMPILE_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let module = wren_lift::codegen::wasm::emit_mir(mir).ok()?;
+    let module = match wren_lift::codegen::wasm::emit_mir(mir) {
+        Ok(m) => m,
+        Err(_) => {
+            COMPILE_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
     let bytes = module.bytes;
     if bytes.is_empty() {
+        COMPILE_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let slot = js_jit_instantiate(&bytes);
+    COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
     Some(slot)
 }
 
@@ -161,6 +223,7 @@ fn mir_needs_unsupported_helpers(mir: &wren_lift::mir::MirFunction) -> bool {
 /// table.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn dispatch_callback(slot: u32, _fn_export_name: &str, args: &[u64]) -> u64 {
+    DISPATCH_FROM_BC_COUNT.fetch_add(1, Ordering::Relaxed);
     match args.len() {
         0 => js_jit_call_0(slot),
         1 => js_jit_call_1(slot, args[0]),
@@ -427,11 +490,49 @@ pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
     let receiver = Value::from_bits(receiver_bits);
     let arg = Value::from_bits(arg_bits);
 
-    // `method.index()` was baked in at compile time. Resolve
-    // back to the method name string. Cloning the &str is
-    // necessary because `call_method_on` borrows `&mut self`
-    // (which would conflict with the &str borrow against the
-    // interner held by `vm`).
+    // FAST PATH — receiver is a Closure whose function already
+    // has a wasm JIT slot installed. Dispatch directly through
+    // the slot, skipping `call_method_on` →
+    // `call_closure_sync` → BC frame setup. Without this,
+    // recursion alternates JIT→BC→JIT→BC every level (each
+    // BC frame setup costs more than the BC interp saved by
+    // tier-up), making JIT'd self-recursive code *slower* than
+    // pure BC.
+    //
+    // Eligibility: receiver must be a Closure object whose
+    // FuncId has a slot in `wasm_jit_slots`. Skips for non-
+    // closure receivers, generic method dispatch, or
+    // un-tier-up'd functions.
+    //
+    // Gated to `target_os = "unknown"` (the browser-bindgen
+    // target) because `js_jit_call_1` is a wasm-bindgen
+    // import that only exists there. The wasi smoke build
+    // (`wasm32-wasip1`) doesn't have JIT'd modules to dispatch
+    // to and falls through to the slow path below.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    if receiver.is_object() {
+        let ptr = receiver.as_object().unwrap();
+        let header = ptr as *const wren_lift::runtime::object::ObjHeader;
+        let is_closure =
+            unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
+        if is_closure {
+            let closure_ptr = ptr as *const wren_lift::runtime::object::ObjClosure;
+            let fn_ptr = unsafe { (*closure_ptr).function };
+            let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+            if let Some(slot) = vm.engine.wasm_jit_slot(target_fn) {
+                DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
+                return js_jit_call_1(slot, arg_bits);
+            }
+        }
+    }
+
+    // SLOW PATH — full method dispatch. `method_id` was baked
+    // in at compile time as a `SymbolId` index. Resolve back
+    // to a method-name string and let the runtime's existing
+    // closure-fast-path / find_method machinery handle it.
+    // Cloning the &str because `call_method_on` borrows
+    // `&mut self`, conflicting with the &str borrow against
+    // `vm.interner`.
     let sym = wren_lift::intern::SymbolId::from_raw(method_id as u32);
     let method_name = vm.interner.resolve(sym).to_string();
 
