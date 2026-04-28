@@ -29,6 +29,7 @@ use wren_lift::runtime::vm::{VMConfig, VM};
 pub mod browser;
 pub mod dom;
 pub mod storage;
+pub mod tier_up;
 
 // `js` carries the `extern "C"` block that imports browser-side
 // shims (today: `_wlift_set_timeout`). Compiled only on the
