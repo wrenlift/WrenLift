@@ -149,6 +149,15 @@ globalThis._wlift_storage_clear = (handle, scope) => {
   } catch (e) { reject_future(handle, String(e)); }
 };
 
+// Scheduler yield helper. The Rust `run()` async fn awaits this
+// each tick to give the JS event loop a chance to drain BOTH
+// microtasks (resolved Promises) AND macrotasks (setTimeout
+// callbacks, fetch responses, message events). `setTimeout(0)`
+// is the cheapest way to hop a macrotask boundary; clamped to
+// ~4 ms by browsers under nested calls.
+globalThis._wlift_yield_to_event_loop = () =>
+  new Promise((resolve) => setTimeout(resolve, 0));
+
 await init();
 self.postMessage({ cmd: "ready", version: version() });
 

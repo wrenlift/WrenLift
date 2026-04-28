@@ -154,6 +154,20 @@ pub mod js {
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_query_all)]
         pub fn wlift_dom_query_all(handle: u32, selector: &str);
 
+        /// JS-provided yield helper used by the scheduler loop.
+        /// Returns a Promise that resolves on `setTimeout(0)` so
+        /// the JS event loop drains BOTH microtasks AND
+        /// macrotasks (including `setTimeout` callbacks). A
+        /// `Promise.resolve()` await would only flush microtasks
+        /// and leave `setTimeout(150).await` permanently
+        /// pending. The page wires this in `worker.js` and
+        /// `MainWlift.init` next to the other shims:
+        ///
+        ///   globalThis._wlift_yield_to_event_loop =
+        ///     () => new Promise(r => setTimeout(r, 0));
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_yield_to_event_loop)]
+        pub fn wlift_yield_to_event_loop() -> js_sys::Promise;
+
         // ---------- Storage bridge --------------------------------------
         // localStorage / sessionStorage exist in both Window and
         // WorkerGlobalScope, so the JS shim can hit them inline in
@@ -804,29 +818,51 @@ pub async fn run(source: &str) -> RunResult {
     let result = vm.interpret("main", &combined);
 
     // Scheduler loop. Drives parked fibers across JS event-loop
-    // turns until either the parked list is empty or no fiber
-    // makes progress in a tick (which would mean every still-
-    // parked future is permanently pending — likely a logic bug
-    // in user code, but better to bail than spin forever).
+    // turns until either nothing's parked or the tick budget
+    // runs out.
     //
-    // Budget caps total ticks so a runaway loop can't lock the
-    // page. Reasonable user programs settle in single-digit
-    // iterations; the cap is generous so heavily-async programs
-    // (e.g. a chat that awaits many WebSocket messages) still
-    // complete.
+    // Each tick yields via `setTimeout(0)` rather than
+    // `Promise.resolve()` — that's the critical detail. A
+    // microtask-only await would never give
+    // `Browser.setTimeout(150).await` a chance to fire, since
+    // `setTimeout` callbacks ride the macrotask queue. Browsers
+    // clamp nested `setTimeout(_, 0)` to ~4 ms, so 2500 ticks
+    // ≈ 10 s wall clock — covers a reasonable awaited timer
+    // chain and bails on actually-stuck programs.
     if matches!(result, InterpretResult::Success) {
-        let mut tick_budget: u32 = 10_000;
+        let mut tick_budget: u32 = 2_500;
         loop {
             if tick_budget == 0 {
                 break;
             }
             tick_budget -= 1;
 
-            // Yield to the JS event loop so any pending Promises
-            // can fire their resolve/reject callbacks. After this
-            // `await`, parked fibers' futures may have settled.
-            let p = js_sys::Promise::resolve(&JsValue::UNDEFINED);
-            let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+            // If nothing's parked, the user code already finished
+            // synchronously — no scheduler work to do.
+            if parked_fibers()
+                .lock()
+                .expect("parked fiber list poisoned")
+                .is_empty()
+            {
+                break;
+            }
+
+            // Yield to the JS event loop. `setTimeout(0)` ensures
+            // both the microtask queue (resolved Promises) AND
+            // the macrotask queue (setTimeout / fetch / WebSocket
+            // events) get a chance to run before we re-check.
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                let p = js::wlift_yield_to_event_loop();
+                let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            {
+                // Non-wasm host build (clippy / unit tests) has no
+                // event loop. Anything still parked is by
+                // definition unreachable here.
+                break;
+            }
 
             // Snapshot the parked list, partition into ready vs.
             // still-pending, and resume the ready ones. New
@@ -834,12 +870,8 @@ pub async fn run(source: &str) -> RunResult {
             // again) accumulate into the live list.
             let parked =
                 std::mem::take(&mut *parked_fibers().lock().expect("parked fiber list poisoned"));
-            if parked.is_empty() {
-                break;
-            }
 
             let mut still_parked = Vec::new();
-            let mut resumed_any = false;
             for entry in parked {
                 let state = future_store()
                     .lock()
@@ -858,7 +890,6 @@ pub async fn run(source: &str) -> RunResult {
                 // `vm.fiber` until it yields or returns.
                 vm.fiber = entry.fiber;
                 let _ = wren_lift::runtime::vm_interp::run_fiber(&mut vm);
-                resumed_any = true;
             }
 
             // Re-park anything still pending. New fibers pushed
@@ -868,25 +899,6 @@ pub async fn run(source: &str) -> RunResult {
                 .lock()
                 .expect("parked fiber list poisoned")
                 .extend(still_parked);
-
-            if !resumed_any
-                && parked_fibers()
-                    .lock()
-                    .expect("parked fiber list poisoned")
-                    .iter()
-                    .all(|e| {
-                        future_store()
-                            .lock()
-                            .expect("future store poisoned")
-                            .get(&e.handle)
-                            .is_none_or(|s| s.state == FutureState::Pending)
-                    })
-            {
-                // Deadlock-style: all remaining parked fibers
-                // are waiting on futures nothing's going to
-                // settle. Bail rather than spin.
-                break;
-            }
         }
     }
 

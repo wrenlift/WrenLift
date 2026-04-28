@@ -213,6 +213,10 @@ class MainWlift {
       } catch (e) { mod.reject_future(handle, String(e)); }
     };
 
+    // Scheduler yield helper — see `worker.js` for rationale.
+    globalThis._wlift_yield_to_event_loop = () =>
+      new Promise((resolve) => setTimeout(resolve, 0));
+
     // wasm-bindgen `--target web` returns the wasm exports object
     // from the default `init()`. `exports.memory` is the live
     // `WebAssembly.Memory` instance — that's what main-mode
