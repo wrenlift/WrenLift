@@ -380,6 +380,19 @@ impl<'a> MirWasmEmitter<'a> {
                             &[ValType::I64],
                             &[ValType::I32],
                         );
+                        // Phase 4 step 4b future hook — when the
+                        // `mir_needs_unsupported_helpers` filter
+                        // is relaxed to admit heap-touching MIR,
+                        // this is where to register
+                        // `wren_jit_roots_snapshot_len` /
+                        // `wren_jit_root_push` /
+                        // `wren_jit_roots_restore_len`. The
+                        // wasm-bindgen exports already exist
+                        // (Phase 4 step 4a); only the
+                        // import-registration + Call-body emit
+                        // are missing. See
+                        // `project_wasm_jit_root_emit_followup.md`
+                        // for the design.
                         let slow_name = match args.len() {
                             1 => "wren_call_1_slow",
                             // Higher arities don't have slow-path

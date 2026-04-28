@@ -304,5 +304,15 @@ self.addEventListener("message", (e) => {
     resolve_future(msg.handle, msg.value ?? "");
   } else if (msg.cmd === "dom-error") {
     reject_future(msg.handle, msg.error ?? "DOM op failed");
+  } else if (msg.cmd === "memory") {
+    // Page asked for our wasm Memory. Only structurally
+    // cloneable across the worker boundary when the buffer is
+    // a SharedArrayBuffer — i.e. the wasm module was built with
+    // threading. Without that, post `null` so the page falls
+    // back to the plain worker boundary semantics.
+    const isShared =
+      typeof SharedArrayBuffer !== "undefined" &&
+      wasm.memory?.buffer instanceof SharedArrayBuffer;
+    self.postMessage({ cmd: "memory", memory: isShared ? wasm.memory : null });
   }
 });

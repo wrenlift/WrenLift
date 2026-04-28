@@ -40,20 +40,40 @@
 // streaming many KB/frame to a canvas, or a debugger that
 // inspects Wren strings without copying them out.
 //
-// A future `mode: "worker", shared: true` opt-in would back the
-// wasm `WebAssembly.Memory` with a `SharedArrayBuffer` so the
-// page can read worker-side memory without postMessage. That
-// requires wasm-pack rebuilt with threads + the page served with
-// `Cross-Origin-Opener-Policy: same-origin` and
-// `Cross-Origin-Embedder-Policy: require-corp`. Out of scope
-// today; the API surface above is designed to add it without
-// breaking either existing mode.
+// `mode: "worker", shared: true` (opt-in, gated on environment) —
+// when `crossOriginIsolated` is true and SAB is available, asks
+// the worker to expose its `WebAssembly.Memory` (now backed by
+// `SharedArrayBuffer`) to the page via a one-shot
+// `postMessage({cmd: "memory"})`. The page can then read worker-
+// side wasm bytes directly with no marshal cost — useful for
+// streaming large outputs. Falls back to plain worker mode if
+// the page isn't crossOriginIsolated. Page must be served with
+// COOP/COEP headers; `serve.js` next to this file sets both.
+//
+// Threaded wasm-pack build (required for true SAB-backed wasm):
+//   RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals' \
+//     wasm-pack build wasm --target web --release \
+//                          --no-default-features -- -Z build-std=std,panic_abort
+// Needs nightly Rust. Without the threaded build, the wasm
+// module's memory isn't shared even if SAB is allowed; the
+// `shared: true` flag falls through to plain worker mode.
 
 export async function createWlift(opts = {}) {
-  const { mode = "worker" } = opts;
-  if (mode === "worker") return new WorkerWlift().init();
+  const { mode = "worker", shared = false } = opts;
+  if (mode === "worker") return new WorkerWlift({ shared }).init();
   if (mode === "main")   return new MainWlift().init();
   throw new Error(`createWlift: unknown mode '${mode}', expected 'worker' or 'main'`);
+}
+
+// Returns true iff SAB is available *and* the page is
+// crossOriginIsolated (i.e. served with COOP/COEP). The wasm
+// module still needs to be built with threading for the wasm
+// memory itself to be SAB-backed; `shared: true` opts the page
+// in to *requesting* it from the worker.
+export function sharedMemorySupported() {
+  return typeof SharedArrayBuffer !== "undefined"
+      && typeof crossOriginIsolated !== "undefined"
+      && crossOriginIsolated === true;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,9 +81,17 @@ export async function createWlift(opts = {}) {
 // ---------------------------------------------------------------------------
 
 class WorkerWlift {
-  constructor() {
+  constructor({ shared = false } = {}) {
     this.mode    = "worker";
     this.version = null;
+    // SAB requires both crossOriginIsolated AND a SAB-aware
+    // wasm build. We probe the page side (cheap); the worker
+    // side resolves on `cmd: "memory"` reply — if the wasm
+    // module isn't SAB-built, the memory comes back as a
+    // regular ArrayBuffer-backed `WebAssembly.Memory` which
+    // can't cross worker → page, so the request is a no-op.
+    this._sharedRequested = shared && sharedMemorySupported();
+    this._memory = null;
     this.worker  = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     this.pending = new Map();
     this.nextId  = 1;
@@ -73,6 +101,18 @@ class WorkerWlift {
       const m = e.data;
       if (m.cmd === "ready") {
         this.version = m.version;
+        if (this._sharedRequested) {
+          this.worker.postMessage({ cmd: "memory" });
+        } else {
+          this._resolveReady();
+        }
+      } else if (m.cmd === "memory") {
+        // Worker handed back its `WebAssembly.Memory` (only
+        // structurally cloneable when its buffer is a SAB).
+        // If the worker's wasm isn't SAB-built we get null
+        // here; surface as `wlift.memory === null` (same as
+        // plain worker mode).
+        this._memory = m.memory ?? null;
         this._resolveReady();
       } else if (m.cmd === "result") {
         const resolve = this.pending.get(m.id);
@@ -107,10 +147,10 @@ class WorkerWlift {
     });
   }
 
-  // No direct memory access in worker mode — that's the point of
-  // the boundary. Returning `null` (vs throwing) so feature-
-  // probing code can `if (wlift.memory) { ... }` safely.
-  get memory() { return null; }
+  // SAB-mode: the page can read worker-side wasm bytes directly
+  // through `memory.buffer`. Plain worker mode: returns null
+  // (the boundary is the point). Feature-probe with `if (wlift.memory)`.
+  get memory() { return this._memory; }
 
   terminate() { this.worker.terminate(); }
 }
