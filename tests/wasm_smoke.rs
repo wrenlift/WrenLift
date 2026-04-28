@@ -149,6 +149,12 @@ fn smoke_runs_under_wasmtime() {
          DOM bridge mock under wasi. captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("dom-ext: ok"),
+        "Dom attribute/class/queryAll ops didn't all resolve \
+         through the bridge under wasi. captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

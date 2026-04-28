@@ -132,6 +132,25 @@ pub mod js {
         ///   };
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_set_text)]
         pub fn wlift_dom_set_text(handle: u32, selector: &str, value: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_get_attribute)]
+        pub fn wlift_dom_get_attribute(handle: u32, selector: &str, name: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_set_attribute)]
+        pub fn wlift_dom_set_attribute(handle: u32, selector: &str, name: &str, value: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_add_class)]
+        pub fn wlift_dom_add_class(handle: u32, selector: &str, name: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_remove_class)]
+        pub fn wlift_dom_remove_class(handle: u32, selector: &str, name: &str);
+
+        /// `Dom.queryAll(selector)` — resolves to the count of
+        /// matching elements as a decimal string (e.g. `"3"`).
+        /// Single result type (String) keeps it on the existing
+        /// `Future<String>` transport.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_query_all)]
+        pub fn wlift_dom_query_all(handle: u32, selector: &str);
     }
 }
 
@@ -565,6 +584,16 @@ foreign class DomCore {
     foreign static textHandle(selector)
     #!symbol = "dom_set_text"
     foreign static setTextHandle(selector, value)
+    #!symbol = "dom_get_attribute"
+    foreign static getAttributeHandle(selector, name)
+    #!symbol = "dom_set_attribute"
+    foreign static setAttributeHandle(selector, name, value)
+    #!symbol = "dom_add_class"
+    foreign static addClassHandle(selector, name)
+    #!symbol = "dom_remove_class"
+    foreign static removeClassHandle(selector, name)
+    #!symbol = "dom_query_all"
+    foreign static queryAllHandle(selector)
 }
 class Future {
     construct new_(handle) { _h = handle }
@@ -596,8 +625,13 @@ class Browser {
     static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }
 class Dom {
-    static text(selector)              { Future.new_(DomCore.textHandle(selector)) }
-    static setText(selector, value)    { Future.new_(DomCore.setTextHandle(selector, value)) }
+    static text(selector)                  { Future.new_(DomCore.textHandle(selector)) }
+    static setText(selector, value)        { Future.new_(DomCore.setTextHandle(selector, value)) }
+    static getAttribute(selector, name)    { Future.new_(DomCore.getAttributeHandle(selector, name)) }
+    static setAttribute(selector, n, v)    { Future.new_(DomCore.setAttributeHandle(selector, n, v)) }
+    static addClass(selector, name)        { Future.new_(DomCore.addClassHandle(selector, name)) }
+    static removeClass(selector, name)     { Future.new_(DomCore.removeClassHandle(selector, name)) }
+    static queryAll(selector)              { Future.new_(DomCore.queryAllHandle(selector)) }
 }
 "##;
 

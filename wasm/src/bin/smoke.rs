@@ -172,10 +172,25 @@ foreign class DomCore {
     foreign static textHandle(selector)
     #!symbol = "dom_set_text"
     foreign static setTextHandle(selector, value)
+    #!symbol = "dom_get_attribute"
+    foreign static getAttributeHandle(selector, name)
+    #!symbol = "dom_set_attribute"
+    foreign static setAttributeHandle(selector, name, value)
+    #!symbol = "dom_add_class"
+    foreign static addClassHandle(selector, name)
+    #!symbol = "dom_remove_class"
+    foreign static removeClassHandle(selector, name)
+    #!symbol = "dom_query_all"
+    foreign static queryAllHandle(selector)
 }
 class Dom {
-    static text(selector)              { Future.new_(DomCore.textHandle(selector)) }
-    static setText(selector, value)    { Future.new_(DomCore.setTextHandle(selector, value)) }
+    static text(selector)                  { Future.new_(DomCore.textHandle(selector)) }
+    static setText(selector, value)        { Future.new_(DomCore.setTextHandle(selector, value)) }
+    static getAttribute(selector, name)    { Future.new_(DomCore.getAttributeHandle(selector, name)) }
+    static setAttribute(selector, n, v)    { Future.new_(DomCore.setAttributeHandle(selector, n, v)) }
+    static addClass(selector, name)        { Future.new_(DomCore.addClassHandle(selector, name)) }
+    static removeClass(selector, name)     { Future.new_(DomCore.removeClassHandle(selector, name)) }
+    static queryAll(selector)              { Future.new_(DomCore.queryAllHandle(selector)) }
 }
 var domFiber = Fiber.new {
     var read    = Dom.text("#title").await
@@ -187,6 +202,23 @@ if (domResult == "MOCK_DOM_TEXT:#title|MOCK_DOM_SET_TEXT:#title") {
     System.print("dom: ok")
 } else {
     System.print("dom: BAD (%(domResult))")
+}
+
+// New Dom ops — attributes, classes, queryAll.
+var domExtFiber = Fiber.new {
+    var attrSet  = Dom.setAttribute("#x", "data-id", "42").await
+    var attrGet  = Dom.getAttribute("#x", "data-id").await
+    var addCls   = Dom.addClass("#x", "active").await
+    var rmCls    = Dom.removeClass("#x", "active").await
+    var qAll     = Dom.queryAll(".item").await
+    return [attrSet, attrGet, addCls, rmCls, qAll].join(",")
+}
+var domExtResult = domExtFiber.try()
+var expected = "MOCK_DOM_SET_ATTR:#x,MOCK_DOM_GET_ATTR:#x,MOCK_DOM_ADD_CLASS:#x,MOCK_DOM_REMOVE_CLASS:#x,MOCK_DOM_QUERY_ALL:.item"
+if (domExtResult == expected) {
+    System.print("dom-ext: ok")
+} else {
+    System.print("dom-ext: BAD (%(domExtResult))")
 }
 "##;
 

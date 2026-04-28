@@ -167,20 +167,23 @@ class MainWlift {
     // the page thread; no postMessage hop). The worker mode's
     // round-trip uses the same `dispatchDomOp` table below, so
     // both paths share the implementation of each op.
-    globalThis._wlift_dom_text = (handle, selector) => {
+    // Each main-mode shim is a thin wrapper around the same
+    // `dispatchDomOp` table the worker mode uses on the page
+    // side. One implementation, two callers.
+    const settleSync = (handle, op, args) => {
       try {
-        mod.resolve_future(handle, dispatchDomOp("text", [selector]));
+        mod.resolve_future(handle, dispatchDomOp(op, args));
       } catch (err) {
         mod.reject_future(handle, String(err));
       }
     };
-    globalThis._wlift_dom_set_text = (handle, selector, value) => {
-      try {
-        mod.resolve_future(handle, dispatchDomOp("setText", [selector, value]));
-      } catch (err) {
-        mod.reject_future(handle, String(err));
-      }
-    };
+    globalThis._wlift_dom_text          = (h, s)        => settleSync(h, "text", [s]);
+    globalThis._wlift_dom_set_text      = (h, s, v)     => settleSync(h, "setText", [s, v]);
+    globalThis._wlift_dom_get_attribute = (h, s, n)     => settleSync(h, "getAttribute", [s, n]);
+    globalThis._wlift_dom_set_attribute = (h, s, n, v)  => settleSync(h, "setAttribute", [s, n, v]);
+    globalThis._wlift_dom_add_class     = (h, s, n)     => settleSync(h, "addClass", [s, n]);
+    globalThis._wlift_dom_remove_class  = (h, s, n)     => settleSync(h, "removeClass", [s, n]);
+    globalThis._wlift_dom_query_all     = (h, s)        => settleSync(h, "queryAll", [s]);
 
     // wasm-bindgen `--target web` returns the wasm exports object
     // from the default `init()`. `exports.memory` is the live
@@ -253,6 +256,36 @@ function dispatchDomOp(op, args) {
       const el = document.querySelector(selector);
       if (el) el.textContent = value;
       return "";
+    }
+    case "getAttribute": {
+      const [selector, name] = args;
+      const el = document.querySelector(selector);
+      return el ? (el.getAttribute(name) ?? "") : "";
+    }
+    case "setAttribute": {
+      const [selector, name, value] = args;
+      const el = document.querySelector(selector);
+      if (el) el.setAttribute(name, value);
+      return "";
+    }
+    case "addClass": {
+      const [selector, name] = args;
+      const el = document.querySelector(selector);
+      if (el) el.classList.add(name);
+      return "";
+    }
+    case "removeClass": {
+      const [selector, name] = args;
+      const el = document.querySelector(selector);
+      if (el) el.classList.remove(name);
+      return "";
+    }
+    case "queryAll": {
+      const [selector] = args;
+      // Encode count as a decimal string so it rides the
+      // `Future<String>` transport. Future variant: return a
+      // JSON-encoded list of element ids/handles.
+      return String(document.querySelectorAll(selector).length);
     }
     default:
       throw new Error(`unknown DOM op '${op}'`);

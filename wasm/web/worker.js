@@ -101,6 +101,21 @@ globalThis._wlift_dom_text = (handle, selector) => {
 globalThis._wlift_dom_set_text = (handle, selector, value) => {
   self.postMessage({ cmd: "dom-op", handle, op: "setText", args: [selector, value] });
 };
+globalThis._wlift_dom_get_attribute = (handle, selector, name) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "getAttribute", args: [selector, name] });
+};
+globalThis._wlift_dom_set_attribute = (handle, selector, name, value) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "setAttribute", args: [selector, name, value] });
+};
+globalThis._wlift_dom_add_class = (handle, selector, name) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "addClass", args: [selector, name] });
+};
+globalThis._wlift_dom_remove_class = (handle, selector, name) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "removeClass", args: [selector, name] });
+};
+globalThis._wlift_dom_query_all = (handle, selector) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "queryAll", args: [selector] });
+};
 
 await init();
 self.postMessage({ cmd: "ready", version: version() });
