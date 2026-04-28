@@ -2063,7 +2063,7 @@ fn dispatch_method(
 /// # Safety
 /// Called only from JIT-compiled code via `CallRuntime`. The receiver and
 /// method arguments are NaN-boxed values produced by the JIT.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
     core::arch::naked_asm!(
@@ -2118,7 +2118,7 @@ extern "C" fn wren_call_0_inner(receiver: u64, method: u64, jit_fp: u64, ret_add
 
 /// # Safety
 /// Called only from JIT-compiled code via `CallRuntime`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!(
@@ -2178,7 +2178,7 @@ extern "C" fn wren_call_1_inner(
 
 /// # Safety
 /// Called only from JIT-compiled code via `CallRuntime`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!(
@@ -2239,7 +2239,7 @@ extern "C" fn wren_call_2_inner(
 
 /// # Safety
 /// Called only from JIT-compiled code via `CallRuntime`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_call_3(
     _receiver: u64,
@@ -2348,7 +2348,7 @@ extern "C" fn wren_call_3_inner(
 
 /// # Safety
 /// Called only from JIT-compiled code via `CallRuntime`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_call_4(
     _receiver: u64,
@@ -4067,7 +4067,7 @@ ic_native_inner!(wren_ic_native_3_inner, a0, a1, a2);
 // #[naked] wrappers capture x29 (JIT FP) as the last argument.
 /// # Safety
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_native_0(_nfn: u64, _recv: u64) -> u64 {
     core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_native_0_inner);
@@ -4079,7 +4079,7 @@ pub extern "C" fn wren_ic_native_0(nfn: u64, recv: u64) -> u64 {
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_native_1(_nfn: u64, _recv: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_native_1_inner);
@@ -4091,7 +4091,7 @@ pub extern "C" fn wren_ic_native_1(nfn: u64, recv: u64, a0: u64) -> u64 {
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_native_2(_nfn: u64, _recv: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_native_2_inner);
@@ -4103,7 +4103,7 @@ pub extern "C" fn wren_ic_native_2(nfn: u64, recv: u64, a0: u64, a1: u64) -> u64
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC dispatch (kind=4).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_native_3(
     _nfn: u64,
@@ -4165,43 +4165,43 @@ ic_ctor_inner!(wren_ic_ctor_3_inner, a0, a1, a2);
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_ctor_0(_cls: u64, _closure: u64) -> u64 {
     core::arch::naked_asm!("mov x2, x29", "b {inner}", inner = sym wren_ic_ctor_0_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_ctor_0(cls: u64, closure: u64) -> u64 {
     wren_ic_ctor_0_inner(cls, closure, 0)
 }
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_ctor_1(_cls: u64, _closure: u64, _a0: u64) -> u64 {
     core::arch::naked_asm!("mov x3, x29", "b {inner}", inner = sym wren_ic_ctor_1_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_ctor_1(cls: u64, closure: u64, a0: u64) -> u64 {
     wren_ic_ctor_1_inner(cls, closure, a0, 0)
 }
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_ctor_2(_cls: u64, _closure: u64, _a0: u64, _a1: u64) -> u64 {
     core::arch::naked_asm!("mov x4, x29", "b {inner}", inner = sym wren_ic_ctor_2_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_ctor_2(cls: u64, closure: u64, a0: u64, a1: u64) -> u64 {
     wren_ic_ctor_2_inner(cls, closure, a0, a1, 0)
 }
 
 /// # Safety
 /// Called only from JIT-compiled code via inline IC constructor dispatch (kind=3).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "host"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn wren_ic_ctor_3(
     _cls: u64,
@@ -4212,7 +4212,7 @@ pub unsafe extern "C" fn wren_ic_ctor_3(
 ) -> u64 {
     core::arch::naked_asm!("mov x5, x29", "b {inner}", inner = sym wren_ic_ctor_3_inner);
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(all(not(target_arch = "aarch64"), feature = "host"))]
 pub extern "C" fn wren_ic_ctor_3(cls: u64, closure: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_ic_ctor_3_inner(cls, closure, a0, a1, a2, 0)
 }

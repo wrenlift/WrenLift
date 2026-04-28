@@ -525,6 +525,7 @@ pub struct ExecutionEngine {
     /// interpreter dispatch — faster than bytecode for hot functions.
     /// `None` = not yet checked. `Some(None)` = checked, not eligible.
     /// `Some(Some(tc))` = eligible, threaded code ready.
+    #[cfg(feature = "host")]
     pub threaded_code: Vec<Option<Option<crate::mir::threaded::ThreadedCode>>>,
     /// Tier-up promotion broker. Phase 2 wires this up in shadow mode
     /// alongside the existing call_count / compile_queue machinery — it
@@ -613,6 +614,7 @@ impl ExecutionEngine {
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
+            #[cfg(feature = "host")]
             threaded_code: Vec::new(),
             // Thresholds mirror the legacy jit_threshold / opt_threshold
             // defaults above so shadow-mode tick counts stay in step with
@@ -663,6 +665,7 @@ impl ExecutionEngine {
         self.optimized_leaf.push(false);
         self.optimized_metadata.push(None);
         self.bc_cache.push(std::ptr::null());
+        #[cfg(feature = "host")]
         self.threaded_code.push(None); // None = not yet checked
         self.type_profiles.push(None);
         // Shadow-mode registration. The core pointer stays null for now —
@@ -736,6 +739,7 @@ impl ExecutionEngine {
     /// Returns a reference to the ThreadedCode if available.
     /// Only creates threaded code for functions where ALL instructions
     /// are supported — otherwise falls through to bytecode interpreter.
+    #[cfg(feature = "host")]
     pub fn ensure_threaded_code(
         &mut self,
         id: FuncId,

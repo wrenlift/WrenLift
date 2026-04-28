@@ -961,7 +961,11 @@ fn run_fiber_with_stop_depth(
 
         // Root-frame threaded dispatch — disabled pending proper
         // frame lifecycle handling (popping root frame + fiber_loop
-        // re-entry causes infinite null output).
+        // re-entry causes infinite null output). Wasm builds gate
+        // out the threaded module entirely (it relies on the JIT
+        // runtime helpers); the `cfg` keeps the disabled-by-default
+        // block from breaking the wasm type check.
+        #[cfg(feature = "host")]
         if false {
             let fn_idx_tc = func_id.0 as usize;
             let has_jit = !vm
@@ -3748,6 +3752,7 @@ fn dispatch_closure_bc_inner(
     } else {
         false
     };
+    #[cfg(feature = "host")]
     if allow_threaded
         && !fn_has_jit
         && !is_constructor

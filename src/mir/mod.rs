@@ -11,6 +11,12 @@ pub mod bytecode;
 pub mod interp;
 pub mod opt;
 pub mod ssa;
+// Threaded dispatch piggybacks on the host JIT runtime helpers
+// (`wren_call_N` for indirect method calls). Wasm builds run BC-
+// only and never see threaded code, so the whole module is host-
+// gated; the BC interpreter's `threaded_*` references are gated
+// to `host` too (see vm_interp.rs / engine.rs).
+#[cfg(feature = "host")]
 pub mod threaded;
 
 use std::{

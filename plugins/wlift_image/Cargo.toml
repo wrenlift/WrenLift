@@ -5,7 +5,12 @@ edition = "2021"
 description = "Image encode / decode / resize / convert for WrenLift. Backed by the `image` crate; bundled into @hatch:image as a cdylib so games + tools share the same RGBA8 pipeline."
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` for the host plugin loader (libloading dlopens the
+# `.dylib`/`.so`/`.dll`). `rlib` for the wasm build path that
+# statically links the plugin into `wlift_wasm` — wasm has no
+# dynamic-library loader, so plugins ship as Rust crates the
+# runtime crate links in directly.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 wren_lift = { path = "../..", default-features = false }
