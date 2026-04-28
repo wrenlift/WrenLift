@@ -27,6 +27,7 @@ use wren_lift::runtime::vm::{VMConfig, VM};
 
 pub mod browser;
 pub mod dom;
+pub mod storage;
 
 // `js` carries the `extern "C"` block that imports browser-side
 // shims (today: `_wlift_set_timeout`). Compiled only on the
@@ -151,6 +152,25 @@ pub mod js {
         /// `Future<String>` transport.
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_query_all)]
         pub fn wlift_dom_query_all(handle: u32, selector: &str);
+
+        // ---------- Storage bridge --------------------------------------
+        // localStorage / sessionStorage exist in both Window and
+        // WorkerGlobalScope, so the JS shim can hit them inline in
+        // either mode — no postMessage round-trip needed. Foreign
+        // methods take a `scope` arg ("local" | "session") so we
+        // share one method table between the two backing stores.
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_storage_get)]
+        pub fn wlift_storage_get(handle: u32, scope: &str, key: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_storage_set)]
+        pub fn wlift_storage_set(handle: u32, scope: &str, key: &str, value: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_storage_remove)]
+        pub fn wlift_storage_remove(handle: u32, scope: &str, key: &str);
+
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_storage_clear)]
+        pub fn wlift_storage_clear(handle: u32, scope: &str);
     }
 }
 
@@ -491,6 +511,7 @@ pub fn register_static_plugins() {
     wlift_image::register_static_symbols();
     browser::register_static_symbols();
     dom::register_static_symbols();
+    storage::register_static_symbols();
 }
 
 /// Host-side stub so non-wasm callers (the smoke `_start` binary
@@ -632,6 +653,29 @@ class Dom {
     static addClass(selector, name)        { Future.new_(DomCore.addClassHandle(selector, name)) }
     static removeClass(selector, name)     { Future.new_(DomCore.removeClassHandle(selector, name)) }
     static queryAll(selector)              { Future.new_(DomCore.queryAllHandle(selector)) }
+}
+#!native = "storage"
+foreign class StorageCore {
+    #!symbol = "storage_get"
+    foreign static getHandle(scope, key)
+    #!symbol = "storage_set"
+    foreign static setHandle(scope, key, value)
+    #!symbol = "storage_remove"
+    foreign static removeHandle(scope, key)
+    #!symbol = "storage_clear"
+    foreign static clearHandle(scope)
+}
+class LocalStorage {
+    static get(key)         { Future.new_(StorageCore.getHandle("local", key)) }
+    static set(key, value)  { Future.new_(StorageCore.setHandle("local", key, value)) }
+    static remove(key)      { Future.new_(StorageCore.removeHandle("local", key)) }
+    static clear            { Future.new_(StorageCore.clearHandle("local")) }
+}
+class SessionStorage {
+    static get(key)         { Future.new_(StorageCore.getHandle("session", key)) }
+    static set(key, value)  { Future.new_(StorageCore.setHandle("session", key, value)) }
+    static remove(key)      { Future.new_(StorageCore.removeHandle("session", key)) }
+    static clear            { Future.new_(StorageCore.clearHandle("session")) }
 }
 "##;
 

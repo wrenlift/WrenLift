@@ -220,6 +220,42 @@ if (domExtResult == expected) {
 } else {
     System.print("dom-ext: BAD (%(domExtResult))")
 }
+
+// Storage bridge — sync in both modes (localStorage/
+// sessionStorage exist on WorkerGlobalScope), so the wasi mock
+// just verifies symbol resolution via the same MOCK_* payload
+// pattern the DOM ops use.
+#!native = "storage"
+foreign class StorageCore {
+    #!symbol = "storage_get"
+    foreign static getHandle(scope, key)
+    #!symbol = "storage_set"
+    foreign static setHandle(scope, key, value)
+    #!symbol = "storage_remove"
+    foreign static removeHandle(scope, key)
+    #!symbol = "storage_clear"
+    foreign static clearHandle(scope)
+}
+class LocalStorage {
+    static get(key)         { Future.new_(StorageCore.getHandle("local", key)) }
+    static set(key, value)  { Future.new_(StorageCore.setHandle("local", key, value)) }
+    static remove(key)      { Future.new_(StorageCore.removeHandle("local", key)) }
+    static clear            { Future.new_(StorageCore.clearHandle("local")) }
+}
+var storageFiber = Fiber.new {
+    var setR    = LocalStorage.set("k", "v").await
+    var getR    = LocalStorage.get("k").await
+    var removeR = LocalStorage.remove("k").await
+    var clearR  = LocalStorage.clear.await
+    return [setR, getR, removeR, clearR].join(",")
+}
+var storageResult = storageFiber.try()
+var storageExpect = "MOCK_STORAGE_SET:local:k,MOCK_STORAGE_GET:local:k,MOCK_STORAGE_REMOVE:local:k,MOCK_STORAGE_CLEAR:local"
+if (storageResult == storageExpect) {
+    System.print("storage: ok")
+} else {
+    System.print("storage: BAD (%(storageResult))")
+}
 "##;
 
 fn main() -> std::process::ExitCode {

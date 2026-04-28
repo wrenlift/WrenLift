@@ -185,6 +185,34 @@ class MainWlift {
     globalThis._wlift_dom_remove_class  = (h, s, n)     => settleSync(h, "removeClass", [s, n]);
     globalThis._wlift_dom_query_all     = (h, s)        => settleSync(h, "queryAll", [s]);
 
+    // Storage shims — same install in both modes since
+    // localStorage/sessionStorage are sync and worker-safe.
+    const pickStorage = (scope) => (scope === "session" ? sessionStorage : localStorage);
+    globalThis._wlift_storage_get = (handle, scope, key) => {
+      try {
+        const v = pickStorage(scope).getItem(key);
+        mod.resolve_future(handle, v ?? "");
+      } catch (e) { mod.reject_future(handle, String(e)); }
+    };
+    globalThis._wlift_storage_set = (handle, scope, key, value) => {
+      try {
+        pickStorage(scope).setItem(key, value);
+        mod.resolve_future(handle, "");
+      } catch (e) { mod.reject_future(handle, String(e)); }
+    };
+    globalThis._wlift_storage_remove = (handle, scope, key) => {
+      try {
+        pickStorage(scope).removeItem(key);
+        mod.resolve_future(handle, "");
+      } catch (e) { mod.reject_future(handle, String(e)); }
+    };
+    globalThis._wlift_storage_clear = (handle, scope) => {
+      try {
+        pickStorage(scope).clear();
+        mod.resolve_future(handle, "");
+      } catch (e) { mod.reject_future(handle, String(e)); }
+    };
+
     // wasm-bindgen `--target web` returns the wasm exports object
     // from the default `init()`. `exports.memory` is the live
     // `WebAssembly.Memory` instance — that's what main-mode

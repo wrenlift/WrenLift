@@ -117,6 +117,38 @@ globalThis._wlift_dom_query_all = (handle, selector) => {
   self.postMessage({ cmd: "dom-op", handle, op: "queryAll", args: [selector] });
 };
 
+// Storage shims — `localStorage` / `sessionStorage` exist on
+// `WorkerGlobalScope`, so unlike DOM we can call them inline and
+// resolve the future synchronously. No `dom-op` round-trip
+// needed; main mode uses an identical install via wlift.js.
+function pickStorage(scope) {
+  return scope === "session" ? sessionStorage : localStorage;
+}
+globalThis._wlift_storage_get = (handle, scope, key) => {
+  try {
+    const v = pickStorage(scope).getItem(key);
+    resolve_future(handle, v ?? "");
+  } catch (e) { reject_future(handle, String(e)); }
+};
+globalThis._wlift_storage_set = (handle, scope, key, value) => {
+  try {
+    pickStorage(scope).setItem(key, value);
+    resolve_future(handle, "");
+  } catch (e) { reject_future(handle, String(e)); }
+};
+globalThis._wlift_storage_remove = (handle, scope, key) => {
+  try {
+    pickStorage(scope).removeItem(key);
+    resolve_future(handle, "");
+  } catch (e) { reject_future(handle, String(e)); }
+};
+globalThis._wlift_storage_clear = (handle, scope) => {
+  try {
+    pickStorage(scope).clear();
+    resolve_future(handle, "");
+  } catch (e) { reject_future(handle, String(e)); }
+};
+
 await init();
 self.postMessage({ cmd: "ready", version: version() });
 

@@ -155,6 +155,12 @@ fn smoke_runs_under_wasmtime() {
          through the bridge under wasi. captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("storage: ok"),
+        "Storage bridge didn't resolve through the wasi mocks. \
+         captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a
