@@ -114,8 +114,11 @@ fn mir_needs_unsupported_helpers(mir: &wren_lift::mir::MirFunction) -> bool {
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
-                Instruction::Call { .. }
-                | Instruction::CallStaticSelf { .. }
+                // `Call` is supported for arity 1 (Phase 4 step 2's
+                // `wren_call_1` helper). Other arities still reject
+                // until those helpers land.
+                Instruction::Call { args, .. } if args.len() != 1 => return true,
+                Instruction::CallStaticSelf { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::MakeClosure { .. }
                 | Instruction::GetUpvalue(_)
@@ -378,6 +381,64 @@ pub fn wren_is_truthy(a: u64) -> u32 {
         1
     } else {
         0
+    }
+}
+
+/// One-arg method call — `receiver.method(arg)`.
+///
+/// Phase 4 step 2: emit_mir lowers `Call` instructions to
+/// `wren_call_<argc>` imports. The 1-arg variant is enough to
+/// unlock self-recursive numeric code (`fib.call(n)`,
+/// `factorial.call(n)`, etc.). Higher arities follow the same
+/// template; the runtime's `call_method_on` handles any arity.
+///
+/// Method dispatch:
+///   * `method_id` is the `SymbolId` index emit_mir baked in
+///     when compiling — `mir.name.index() as i64`. Resolves
+///     against the live VM's interner (must be the same VM
+///     that compiled the MIR; we can't migrate slots across
+///     VMs).
+///   * `call_method_on` short-circuits to `call_closure_sync`
+///     when the receiver is a Closure and the method name
+///     starts with `call`. That's the hot path for
+///     `fib.call(n)`-style recursion.
+///
+/// **GC SAFETY (Phase 4 step 4 territory):** the JIT'd caller
+/// holds NaN-boxed `Value`s in wasm locals while this runs.
+/// The wlift GC has no visibility into wasm locals — if a
+/// callee allocates and triggers a GC pass, those locals can
+/// dangle. fib + similar pure-arithmetic recursive code
+/// doesn't allocate and is safe. **Do not tier up code that
+/// allocates inside its hot loop until step 4 lands.** The
+/// MIR reject list catches most allocating instructions
+/// (MakeList / MakeMap / StringConcat / ToString); the gap is
+/// callees reached via `Call` that themselves allocate.
+#[wasm_bindgen]
+pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        // No VM in scope — must be called from outside any
+        // `run_fiber` window, which shouldn't happen since
+        // JIT'd code only runs through a dispatch from
+        // `dispatch_closure_bc_inner`. Be defensive.
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let receiver = Value::from_bits(receiver_bits);
+    let arg = Value::from_bits(arg_bits);
+
+    // `method.index()` was baked in at compile time. Resolve
+    // back to the method name string. Cloning the &str is
+    // necessary because `call_method_on` borrows `&mut self`
+    // (which would conflict with the &str borrow against the
+    // interner held by `vm`).
+    let sym = wren_lift::intern::SymbolId::from_raw(method_id as u32);
+    let method_name = vm.interner.resolve(sym).to_string();
+
+    use wren_lift::runtime::object::NativeContext;
+    match vm.call_method_on(receiver, &method_name, &[arg]) {
+        Some(v) => v.to_bits(),
+        None => Value::null().to_bits(),
     }
 }
 

@@ -261,9 +261,24 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_not", &[ValType::I64], &[ValType::I64])
                     }
                     Instruction::Call { args, .. } => {
-                        // wren_call(receiver, method_id, args...) → i64
+                        // Per-arity import name so different call
+                        // sites in the same fn don't trip the
+                        // signature-mismatch trap (only the first
+                        // `register_import` per name takes hold;
+                        // a 1-arg call followed by a 2-arg call
+                        // with a single shared name would emit
+                        // wasm that fails validation).
+                        let name = match args.len() {
+                            0 => "wren_call_0",
+                            1 => "wren_call_1",
+                            2 => "wren_call_2",
+                            3 => "wren_call_3",
+                            4 => "wren_call_4",
+                            _ => "wren_call_n", // codegen rejects via mir_needs_unsupported_helpers
+                        };
+                        // wren_call_<n>(receiver, method_id, arg0, …) → i64
                         let params = vec![ValType::I64; args.len() + 2];
-                        self.register_import("wren_call", &params, &[ValType::I64]);
+                        self.register_import(name, &params, &[ValType::I64]);
                     }
                     Instruction::CallStaticSelf { args } => {
                         let name = match args.len() {
@@ -835,12 +850,20 @@ impl<'a> MirWasmEmitter<'a> {
                 args,
                 pure_call: _,
             } => {
+                let name = match args.len() {
+                    0 => "wren_call_0",
+                    1 => "wren_call_1",
+                    2 => "wren_call_2",
+                    3 => "wren_call_3",
+                    4 => "wren_call_4",
+                    _ => "wren_call_n",
+                };
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 func.instruction(&WasmInst::I64Const(method.index() as i64));
                 for a in args {
                     func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_call"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::CallStaticSelf { args } => {

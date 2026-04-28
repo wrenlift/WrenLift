@@ -182,19 +182,21 @@ globalThis._wlift_perf_log = (label, ms) => {
 // calls.
 const __wliftJitInstances = [];
 const __wliftWrenImports = {
-  wren_num_add: wlift_wasm.wren_num_add,
-  wren_num_sub: wlift_wasm.wren_num_sub,
-  wren_num_mul: wlift_wasm.wren_num_mul,
-  wren_num_div: wlift_wasm.wren_num_div,
-  wren_num_mod: wlift_wasm.wren_num_mod,
-  wren_num_neg: wlift_wasm.wren_num_neg,
-  wren_cmp_lt: wlift_wasm.wren_cmp_lt,
-  wren_cmp_gt: wlift_wasm.wren_cmp_gt,
-  wren_cmp_le: wlift_wasm.wren_cmp_le,
-  wren_cmp_ge: wlift_wasm.wren_cmp_ge,
-  wren_cmp_eq: wlift_wasm.wren_cmp_eq,
-  wren_cmp_ne: wlift_wasm.wren_cmp_ne,
-  wren_not:    wlift_wasm.wren_not,
+  wren_num_add:   wlift_wasm.wren_num_add,
+  wren_num_sub:   wlift_wasm.wren_num_sub,
+  wren_num_mul:   wlift_wasm.wren_num_mul,
+  wren_num_div:   wlift_wasm.wren_num_div,
+  wren_num_mod:   wlift_wasm.wren_num_mod,
+  wren_num_neg:   wlift_wasm.wren_num_neg,
+  wren_cmp_lt:    wlift_wasm.wren_cmp_lt,
+  wren_cmp_gt:    wlift_wasm.wren_cmp_gt,
+  wren_cmp_le:    wlift_wasm.wren_cmp_le,
+  wren_cmp_ge:    wlift_wasm.wren_cmp_ge,
+  wren_cmp_eq:    wlift_wasm.wren_cmp_eq,
+  wren_cmp_ne:    wlift_wasm.wren_cmp_ne,
+  wren_not:       wlift_wasm.wren_not,
+  wren_is_truthy: wlift_wasm.wren_is_truthy,
+  wren_call_1:    wlift_wasm.wren_call_1,
 };
 globalThis._wlift_jit_instantiate = (bytes) => {
   const module = new WebAssembly.Module(bytes);
