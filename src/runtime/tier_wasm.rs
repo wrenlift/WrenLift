@@ -95,6 +95,100 @@ pub fn dispatch(slot: u32, fn_export_name: &str, args: &[u64]) -> u64 {
         .unwrap_or(0)
 }
 
+// ---------------------------------------------------------------------------
+// Thread-local current VM (Phase 4 foundation)
+// ---------------------------------------------------------------------------
+//
+// JIT'd wasm functions need to call back into the runtime —
+// `wren_call` for closure dispatch, `wren_make_list` for GC
+// allocation, etc. — but they don't have a VM pointer in scope.
+// We can't pass it through every wasm import (each helper
+// would need an extra arg, ballooning the wasm size), and we
+// can't store it on the JIT module's memory because that's
+// instance-scoped.
+//
+// On wasm32 there's only one thread. A `static` cell works as
+// a thread-local: `vm.interpret` and `vm_interp::run_fiber`
+// set it on entry, restore the prior value on exit. Re-entrant
+// `run_fiber` calls (e.g. the scheduler resuming a parked
+// fiber) save/restore the cell so nested calls all see the
+// right VM.
+//
+// `current_vm()` returns a raw pointer rather than a reference
+// because callers operate inside FFI boundaries where reference
+// lifetimes can't be expressed. Discipline: only deref while
+// the host thread is inside `vm.interpret` or a re-entrant
+// helper called *from* `vm.interpret`. After interpret returns
+// the cell is null and deref is UB — which is fine because
+// the `static mut`'s only legitimate writers are the entry/exit
+// pairs that wlift_wasm controls.
+
+#[cfg(target_arch = "wasm32")]
+mod current_vm_cell {
+    use crate::runtime::vm::VM;
+    use std::cell::UnsafeCell;
+
+    /// Single-threaded wasm cell — `Sync` is purely cosmetic,
+    /// the runtime never runs from more than one thread.
+    pub(super) struct VmCell(UnsafeCell<*mut VM>);
+    unsafe impl Sync for VmCell {}
+
+    pub(super) static CURRENT: VmCell = VmCell(UnsafeCell::new(std::ptr::null_mut()));
+
+    impl VmCell {
+        pub(super) fn get(&self) -> *mut VM {
+            unsafe { *self.0.get() }
+        }
+        pub(super) fn set(&self, v: *mut VM) {
+            unsafe { *self.0.get() = v }
+        }
+    }
+}
+
+/// Read the current VM pointer. Returns null on host builds and
+/// outside any `interpret` / `run_fiber` window. JIT'd helpers
+/// like `wren_call` rely on this to find the live runtime
+/// without taking a VM ref through the wasm ABI.
+pub fn current_vm() -> *mut crate::runtime::vm::VM {
+    #[cfg(target_arch = "wasm32")]
+    {
+        current_vm_cell::CURRENT.get()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
+/// Save the current value, install `vm`, return the saved ptr
+/// for the caller to restore on exit. RAII would be cleaner
+/// but the borrow against `vm: &mut VM` makes it awkward — the
+/// scope guard would need a `'_` lifetime tied to the VM ref,
+/// which then collides with `interpret`'s mutable borrow. Plain
+/// save / restore keeps the type plumbing simple.
+#[allow(unused_variables)]
+pub fn enter_vm(vm: *mut crate::runtime::vm::VM) -> *mut crate::runtime::vm::VM {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prev = current_vm_cell::CURRENT.get();
+        current_vm_cell::CURRENT.set(vm);
+        prev
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
+/// Restore a previously-saved VM pointer. Pair with [`enter_vm`].
+#[allow(unused_variables)]
+pub fn exit_vm(prev: *mut crate::runtime::vm::VM) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        current_vm_cell::CURRENT.set(prev);
+    }
+}
+
 pub const BASELINE_THRESHOLD: u32 = 100;
 pub const OPTIMIZED_THRESHOLD: u32 = 1_000;
 pub const DEFAULT_DEOPT_LIMIT: u32 = 3;

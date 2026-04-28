@@ -3474,7 +3474,23 @@ fn new_values_fill_undef(values: &mut [Value], count: usize) {
 /// The fiber must have at least one MirCallFrame pushed before calling this.
 /// Uses flat bytecode dispatch for efficient interpretation.
 pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
-    run_fiber_with_stop_depth(vm, None)
+    // On wasm32, install the VM as the current thread-local so
+    // JIT'd helper calls (`wren_call`, `wren_make_*`, etc.) can
+    // find it without a VM ref through the wasm ABI. Save/
+    // restore handles re-entrance — the scheduler can resume a
+    // parked fiber via `run_fiber` while another `run_fiber` is
+    // already on the call stack, and each level needs to see
+    // the right VM (always the same one in single-threaded
+    // wasm, but the discipline keeps the contract clear).
+    //
+    // Host has Cranelift-driven calling convention that threads
+    // VM through stack args; no thread-local needed.
+    #[cfg(target_arch = "wasm32")]
+    let prev_vm = crate::runtime::tier::enter_vm(vm as *mut VM);
+    let result = run_fiber_with_stop_depth(vm, None);
+    #[cfg(target_arch = "wasm32")]
+    crate::runtime::tier::exit_vm(prev_vm);
+    result
 }
 
 /// Run the active fiber until its frame stack shrinks back to `stop_depth`.
