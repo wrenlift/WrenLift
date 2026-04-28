@@ -636,6 +636,13 @@ pub fn _wasm_init() {
     {
         console_error_panic_hook::set_once();
         register_static_plugins();
+        // Warm the prelude bytecode cache so the *first* user
+        // `run()` doesn't pay ~30 ms of parse / sema / MIR build
+        // for `BROWSER_PRELUDE`. Subsequent runs already hit the
+        // cache; this just shifts the work from "first user click"
+        // to module instantiation, where it overlaps with the
+        // page's `await init()` and is invisible.
+        let _ = prelude_blob();
     }
 }
 
