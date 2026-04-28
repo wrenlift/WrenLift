@@ -642,11 +642,22 @@ pub unsafe extern "C" fn wlift_gpu_request_device(vm: *mut VM) {
                 }
             };
 
+        // Use the adapter's full capabilities instead of
+        // `downlevel_defaults()`. The downlevel preset caps
+        // `max_texture_dimension_2d` at 2048 (the GLES / WebGL2
+        // floor), so a HiDPI desktop window wider than 2048
+        // physical pixels gets clamped — visible as an unwritten
+        // strip on the right edge of the swap chain. Native
+        // desktop adapters (Metal / Vulkan / DX12 / GL on a real
+        // GPU) routinely support 8192 or 16384, well past any
+        // reasonable window size. Asking for the adapter's full
+        // limits here means a Macbook Pro retina at 3024×1964
+        // physical configures cleanly.
         let (device, queue) = match pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: label.as_deref(),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
