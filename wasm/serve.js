@@ -10,17 +10,22 @@
 // and SAB is undefined on `window`. Plain `python -m http.server`
 // won't set them either.
 //
-// Usage:
+// Usage (from `wasm/`):
+//
 //   node serve.js [port]
 //
-// Default port: 8080. Hit Ctrl-C to stop.
+// Default port: 8080. Hit Ctrl-C to stop. Serves the
+// playground at `/` (which redirects to `web/index.html`),
+// the wasm-pack output under `/pkg/`, and arbitrary files
+// under `/web/`.
 
 import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { stat, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
-const ROOT = resolve(fileURLToPath(import.meta.url), "..", "..");
+// Script lives at `wasm/serve.js`, so ROOT *is* `wasm/`.
+const ROOT = resolve(fileURLToPath(import.meta.url), "..");
 const PORT = Number(process.argv[2] ?? 8080);
 
 const MIME = {
@@ -46,22 +51,37 @@ function setSecurityHeaders(res) {
   res.setHeader("Cache-Control", "no-store");
 }
 
+function resolveRequest(urlPath) {
+  // `/` and `/index.html` map to `web/index.html`. Everything
+  // else routes by prefix: `/pkg/...` → `wasm/pkg/...`,
+  // anything else → `wasm/web/...`. The `..` traversal guard
+  // is the prefix check after `normalize`.
+  if (urlPath === "/" || urlPath === "/index.html") {
+    return join(ROOT, "web", "index.html");
+  }
+  if (urlPath.startsWith("/pkg/")) {
+    return normalize(join(ROOT, urlPath.slice(1)));
+  }
+  if (urlPath.startsWith("/web/")) {
+    return normalize(join(ROOT, urlPath.slice(1)));
+  }
+  // Default: treat as relative to `web/` so `<script src="worker.js">`
+  // and `<link href="style.css">` work without a leading `/web/`.
+  return normalize(join(ROOT, "web", urlPath));
+}
+
 const server = createServer(async (req, res) => {
   setSecurityHeaders(res);
 
-  // Strip query string and decode percent-encoded segments.
   const urlPath = decodeURIComponent((req.url ?? "/").split("?")[0]);
+  let requested = resolveRequest(urlPath);
 
-  // `..` traversal guard via `normalize` and the prefix check.
-  let requested = normalize(join(ROOT, "web", urlPath));
-  if (urlPath === "/" || urlPath.endsWith("/")) {
-    requested = join(requested, "index.html");
-  }
-  // The wasm-pack output sits a level up (`wasm/pkg`); the
-  // `wlift.js` import path uses `../pkg/...`. Allow access to
-  // either `wasm/web/...` or `wasm/pkg/...`.
-  if (!requested.startsWith(ROOT + "/web") && !requested.startsWith(ROOT + "/pkg")) {
-    requested = join(ROOT, "web", urlPath);
+  // Sanity: ensure the resolved path is still under ROOT.
+  if (!requested.startsWith(ROOT + "/")) {
+    res.statusCode = 403;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end(`403 Forbidden\n${requested}\n`);
+    return;
   }
 
   try {
