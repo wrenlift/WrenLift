@@ -1,0 +1,27 @@
+[package]
+name = "wlift_wasm"
+version = "0.1.0"
+edition = "2021"
+description = "wasm-bindgen entry shim for the WrenLift runtime — compile + run Wren code in browser / wasi hosts."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The runtime itself, with host-only deps gated out. We keep the
+# `wasm-encoder` dep enabled so a future track-2 wasm-AOT pipeline
+# can still emit modules from inside this build.
+wren_lift = { path = "..", default-features = false }
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Browser-side panic visibility: any unhandled panic surfaces as a
+# `console.error` with a stack trace instead of `unreachable
+# executed`. Cheap, ergonomic, no runtime cost in non-panicking
+# paths.
+console_error_panic_hook = "0.1"
+# A `js_sys::Date::now()`-backed monotonic clock that swaps in for
+# `std::time::Instant::now()` (which panics on wasm32-unknown-
+# unknown). Pulled in transitively by `wren_lift`'s wasm cfg too —
+# explicit here so the rlib link order stays sane.
+web-time = "1"
