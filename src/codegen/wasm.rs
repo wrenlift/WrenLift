@@ -957,11 +957,21 @@ impl<'a> MirWasmEmitter<'a> {
                     1 => "wren_call_1_slow",
                     _ => "wren_call_n_slow",
                 };
-                // -- Slot lookup ----
+                let slot_local = self
+                    .call_slot_local
+                    .expect("scan_locals should have reserved a call_slot_local");
+                // -- Slot lookup (once per Call) --
+                // `local.tee` stores the result in `slot_local`
+                // *and* leaves it on the stack so the following
+                // `i32.eqz` can branch on it. Avoids a second
+                // wasm-to-wasm hop into wren_jit_slot_plus_one in
+                // the fast path — fib(20) makes ~22k recursive
+                // calls and was paying for that round-trip twice.
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 func.instruction(&WasmInst::Call(
                     self.runtime_imports["wren_jit_slot_plus_one"],
                 ));
+                func.instruction(&WasmInst::LocalTee(slot_local));
                 // Stack: [slot_plus_one]
                 // Test (slot == 0):
                 func.instruction(&WasmInst::I32Eqz);
@@ -982,29 +992,15 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::Else);
                 {
                     // -- Fast path: call_indirect via table --
-                    // Re-look-up slot (we lost the value when we
-                    // entered the `if` after `i32.eqz` consumed
-                    // it). Cheap — wasm-internal cross-module
-                    // call, ~20 ns; far less than the wasm-to-JS
-                    // hop we're avoiding.
-                    func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
-                    func.instruction(&WasmInst::Call(
-                        self.runtime_imports["wren_jit_slot_plus_one"],
-                    ));
-                    func.instruction(&WasmInst::I32Const(1));
-                    func.instruction(&WasmInst::I32Sub);
-                    // Stack: [slot]
-                    // Push args before slot for call_indirect's
-                    // calling convention. The scratch local was
-                    // reserved up-front in scan_locals.
-                    let slot_local = self
-                        .call_slot_local
-                        .expect("scan_locals should have reserved a call_slot_local");
-                    func.instruction(&WasmInst::LocalSet(slot_local));
+                    // `slot_local` holds slot_plus_one from the
+                    // tee above; subtract 1 to get the actual
+                    // table index.
                     for a in args {
                         func.instruction(&WasmInst::LocalGet(self.local(*a)));
                     }
                     func.instruction(&WasmInst::LocalGet(slot_local));
+                    func.instruction(&WasmInst::I32Const(1));
+                    func.instruction(&WasmInst::I32Sub);
                     // The call_indirect type is the compiled
                     // function's type (`(i64*arity) -> i64`),
                     // located at `func_type_idx` in the type
