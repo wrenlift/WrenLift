@@ -254,6 +254,15 @@ class MainWlift {
     // populated for the import bindings. Phase 4 generalises
     // the call shape; for now arity caps at 2 (fib's signature).
     const __wliftJitInstances = [];
+    // Phase 5 — shared funcref table. Each JIT'd module imports
+    // `wren.__wlift_jit_table` and emits `call_indirect` through
+    // it for inter-fn calls (skipping the JS hop). We grow the
+    // table by one entry per `_wlift_jit_instantiate` and
+    // `set(slot, fn)` so all modules see every JIT'd function at
+    // its host-side slot. No upper bound declared on the table
+    // type, so growth is unbounded by the wasm spec — the runtime
+    // caps via `wasm_jit_slot()` lookup, not the table.
+    const __wliftJitTable = new WebAssembly.Table({ initial: 0, element: "anyfunc" });
     const __wliftWrenImports = {
       wren_num_add:  wasm.wren_num_add,
       wren_num_sub:  wasm.wren_num_sub,
@@ -269,8 +278,10 @@ class MainWlift {
       wren_cmp_ne:   wasm.wren_cmp_ne,
       wren_not:      wasm.wren_not,
       wren_is_truthy:wasm.wren_is_truthy,
-      wren_call_1:   wasm.wren_call_1,
+      wren_call_1_slow: wasm.wren_call_1,
+      wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
       wren_get_module_var: wasm.wren_get_module_var,
+      __wlift_jit_table: __wliftJitTable,
     };
     globalThis._wlift_jit_instantiate = (bytes) => {
       const module = new WebAssembly.Module(bytes);
@@ -286,6 +297,13 @@ class MainWlift {
       }
       const slot = __wliftJitInstances.length;
       __wliftJitInstances.push(fn);
+      // Phase 5 — publish the funcref so other JIT'd modules can
+      // `call_indirect` to us. Order matters: the slot returned
+      // here must match `wasm_jit_slot()` on the Rust side, since
+      // `wren_jit_slot_plus_one` resolves callees against that
+      // index.
+      __wliftJitTable.grow(1);
+      __wliftJitTable.set(slot, fn);
       return slot;
     };
     // Defensive shim — if the wasm function returns undefined

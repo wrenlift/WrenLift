@@ -109,6 +109,11 @@ struct MirWasmEmitter<'a> {
     runtime_imports: HashMap<&'static str, u32>,
     /// Ordered import list: (name, param types, result types).
     import_list: Vec<(&'static str, Vec<ValType>, Vec<ValType>)>,
+    /// Phase 5: shared scratch i32 local used by Call sites to
+    /// hold the table slot during `call_indirect` setup. Allocated
+    /// up-front (in `scan_locals`) so the per-instruction emitter
+    /// can stay `&self`.
+    call_slot_local: Option<u32>,
 }
 
 impl<'a> MirWasmEmitter<'a> {
@@ -120,6 +125,7 @@ impl<'a> MirWasmEmitter<'a> {
             local_types: Vec::new(),
             runtime_imports: HashMap::new(),
             import_list: Vec::new(),
+            call_slot_local: None,
         }
     }
 
@@ -154,6 +160,25 @@ impl<'a> MirWasmEmitter<'a> {
         let mut imports = ImportSection::new();
         for (i, (name, _, _)) in self.import_list.iter().enumerate() {
             imports.import("wren", name, EntityType::Function(i as u32));
+        }
+        // Phase 5 — shared funcref table for inter-fn JIT
+        // dispatch. Imported only when the function emits a Call
+        // (i.e. needs `call_indirect`); otherwise we leave the
+        // table out so leaf-only modules instantiate cleanly in
+        // hosts that don't provide one (the wasmtime test harness
+        // passes no imports).
+        if self.call_slot_local.is_some() {
+            imports.import(
+                "wren",
+                "__wlift_jit_table",
+                EntityType::Table(wasm_encoder::TableType {
+                    element_type: wasm_encoder::RefType::FUNCREF,
+                    minimum: 0,
+                    maximum: None,
+                    table64: false,
+                    shared: false,
+                }),
+            );
         }
         module.section(&imports);
 
@@ -200,6 +225,22 @@ impl<'a> MirWasmEmitter<'a> {
                 let wasm_ty = self.infer_wasm_type(inst);
                 self.ensure_local(*val, wasm_ty);
             }
+        }
+        // Phase 5: if the function has any Call sites, reserve a
+        // single shared i32 scratch local for the call_indirect
+        // slot. Each Call site overwrites it ephemerally so one
+        // local is enough — keeping `emit_instruction` `&self`.
+        let has_call = self
+            .mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .any(|(_, inst)| matches!(inst, Instruction::Call { .. }));
+        if has_call {
+            let idx = self.num_locals;
+            self.num_locals += 1;
+            self.local_types.push(ValType::I32);
+            self.call_slot_local = Some(idx);
         }
     }
 
@@ -269,24 +310,40 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_not", &[ValType::I64], &[ValType::I64])
                     }
                     Instruction::Call { args, .. } => {
-                        // Per-arity import name so different call
-                        // sites in the same fn don't trip the
-                        // signature-mismatch trap (only the first
-                        // `register_import` per name takes hold;
-                        // a 1-arg call followed by a 2-arg call
-                        // with a single shared name would emit
-                        // wasm that fails validation).
-                        let name = match args.len() {
-                            0 => "wren_call_0",
-                            1 => "wren_call_1",
-                            2 => "wren_call_2",
-                            3 => "wren_call_3",
-                            4 => "wren_call_4",
-                            _ => "wren_call_n", // codegen rejects via mir_needs_unsupported_helpers
+                        // Phase 5 — JIT-to-JIT inter-fn calls go
+                        // through a slot lookup + call_indirect on
+                        // a shared funcref table. The lookup
+                        // returns `slot + 1` (so 0 means "no JIT,
+                        // take the slow path"), and the slow-path
+                        // helper handles non-JIT'd targets +
+                        // generic method dispatch. Single
+                        // wasm-to-wasm call per Call site for the
+                        // hot path (no JS hop), versus the old
+                        // `wren_call_N` design which routed every
+                        // call through JS.
+                        //
+                        // Both helpers stay arity-specific because
+                        // the slow-path helper takes the args
+                        // unboxed and the runtime dispatch needs
+                        // arity to format the method name.
+                        self.register_import(
+                            "wren_jit_slot_plus_one",
+                            &[ValType::I64],
+                            &[ValType::I32],
+                        );
+                        let slow_name = match args.len() {
+                            1 => "wren_call_1_slow",
+                            // Higher arities don't have slow-path
+                            // helpers yet — `mir_needs_unsupported_helpers`
+                            // rejects them. Reserve names so emit
+                            // compiles even if a stale module
+                            // sneaks through; the JIT'd module
+                            // would just LinkError at instantiate
+                            // time, surfacing the gap clearly.
+                            _ => "wren_call_n_slow",
                         };
-                        // wren_call_<n>(receiver, method_id, arg0, …) → i64
-                        let params = vec![ValType::I64; args.len() + 2];
-                        self.register_import(name, &params, &[ValType::I64]);
+                        let slow_params = vec![ValType::I64; args.len() + 2];
+                        self.register_import(slow_name, &slow_params, &[ValType::I64]);
                     }
                     Instruction::CallStaticSelf { args } => {
                         let name = match args.len() {
@@ -871,20 +928,95 @@ impl<'a> MirWasmEmitter<'a> {
                 args,
                 pure_call: _,
             } => {
-                let name = match args.len() {
-                    0 => "wren_call_0",
-                    1 => "wren_call_1",
-                    2 => "wren_call_2",
-                    3 => "wren_call_3",
-                    4 => "wren_call_4",
-                    _ => "wren_call_n",
+                // Phase 5 lowering — slot lookup → branch →
+                // call_indirect (fast) | wren_call_<n>_slow (slow).
+                //
+                // Wasm pseudocode:
+                //
+                //   let slot = wren_jit_slot_plus_one(receiver);
+                //   if (slot == 0) {
+                //     // slow path: full method dispatch
+                //     dst = wren_call_<n>_slow(receiver, method_id, args...);
+                //   } else {
+                //     // fast path: indirect call through table
+                //     dst = call_indirect (param i64) (result i64)
+                //             args... (slot - 1);
+                //   }
+                //
+                // Both branches leave one i64 on the stack for
+                // `LocalSet(dst)`. The `(if … else …)` block is
+                // typed `(result i64)`; wasm validates that both
+                // arms produce one i64.
+                //
+                // The `call_indirect` reuses the type at index
+                // `func_type_idx` (the compiled function's
+                // signature, `(i64*arity) -> i64`) — same shape
+                // as any tier-up'd target since they're all
+                // arity-`args.len()` closures.
+                let slow_name = match args.len() {
+                    1 => "wren_call_1_slow",
+                    _ => "wren_call_n_slow",
                 };
+                // -- Slot lookup ----
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
-                func.instruction(&WasmInst::I64Const(method.index() as i64));
-                for a in args {
-                    func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                func.instruction(&WasmInst::Call(
+                    self.runtime_imports["wren_jit_slot_plus_one"],
+                ));
+                // Stack: [slot_plus_one]
+                // Test (slot == 0):
+                func.instruction(&WasmInst::I32Eqz);
+                // Branch typed `(result i64)` so both arms must
+                // leave an i64 on the stack.
+                func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(
+                    ValType::I64,
+                )));
+                {
+                    // -- Slow path: call wren_call_<n>_slow(receiver, method_id, args...) --
+                    func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
+                    func.instruction(&WasmInst::I64Const(method.index() as i64));
+                    for a in args {
+                        func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                    }
+                    func.instruction(&WasmInst::Call(self.runtime_imports[slow_name]));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
+                func.instruction(&WasmInst::Else);
+                {
+                    // -- Fast path: call_indirect via table --
+                    // Re-look-up slot (we lost the value when we
+                    // entered the `if` after `i32.eqz` consumed
+                    // it). Cheap — wasm-internal cross-module
+                    // call, ~20 ns; far less than the wasm-to-JS
+                    // hop we're avoiding.
+                    func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
+                    func.instruction(&WasmInst::Call(
+                        self.runtime_imports["wren_jit_slot_plus_one"],
+                    ));
+                    func.instruction(&WasmInst::I32Const(1));
+                    func.instruction(&WasmInst::I32Sub);
+                    // Stack: [slot]
+                    // Push args before slot for call_indirect's
+                    // calling convention. The scratch local was
+                    // reserved up-front in scan_locals.
+                    let slot_local = self
+                        .call_slot_local
+                        .expect("scan_locals should have reserved a call_slot_local");
+                    func.instruction(&WasmInst::LocalSet(slot_local));
+                    for a in args {
+                        func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                    }
+                    func.instruction(&WasmInst::LocalGet(slot_local));
+                    // The call_indirect type is the compiled
+                    // function's type (`(i64*arity) -> i64`),
+                    // located at `func_type_idx` in the type
+                    // section. Table 0 = the imported
+                    // `__wlift_jit_table`.
+                    func.instruction(&WasmInst::CallIndirect {
+                        type_index: self.import_list.len() as u32,
+                        table_index: 0,
+                    });
+                }
+                func.instruction(&WasmInst::End);
+                // Stack now has the result on top.
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::CallStaticSelf { args } => {

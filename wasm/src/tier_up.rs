@@ -515,6 +515,59 @@ pub fn wren_is_truthy(a: u64) -> u32 {
 /// MIR reject list catches most allocating instructions
 /// (MakeList / MakeMap / StringConcat / ToString); the gap is
 /// callees reached via `Call` that themselves allocate.
+/// `wren_jit_slot_plus_one(receiver) -> i32` — Phase 5 helper.
+///
+/// Look up the JIT slot for a closure receiver, returning
+/// `slot + 1` (so `0` means "no JIT, take the slow path"). Used
+/// by emit_mir's `Call` lowering to decide between
+/// `call_indirect` (fast) and `wren_call_1_slow` (slow). Single
+/// wasm-to-wasm cross-module call per Call site — no JS hop.
+///
+/// The `+ 1` encoding lets the caller emit a single
+/// `i32.eqz`-based branch rather than a sentinel comparison
+/// against `-1` or similar.
+#[wasm_bindgen]
+pub fn wren_jit_slot_plus_one(receiver_bits: u64) -> u32 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return 0;
+    }
+    let vm = unsafe { &*vm_ptr };
+    let receiver = Value::from_bits(receiver_bits);
+    if !receiver.is_object() {
+        return 0;
+    }
+    let ptr = receiver.as_object().unwrap();
+    let header = ptr as *const wren_lift::runtime::object::ObjHeader;
+    let is_closure = unsafe {
+        (*header).obj_type == wren_lift::runtime::object::ObjType::Closure
+    };
+    if !is_closure {
+        return 0;
+    }
+    let closure_ptr = ptr as *const wren_lift::runtime::object::ObjClosure;
+    let fn_ptr = unsafe { (*closure_ptr).function };
+    let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+    match vm.engine.wasm_jit_slot(target_fn) {
+        Some(slot) => {
+            DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
+            slot.saturating_add(1)
+        }
+        None => 0,
+    }
+}
+
+/// `wren_call_1_slow` — fallback for `wren_jit_slot_plus_one`'s
+/// `0` case. Same body as the original `wren_call_1`, just renamed
+/// so emit_mir can pick between fast (call_indirect) and slow
+/// (this) without name collision. JIT'd code with `wren_call_1`
+/// imports still works — it's an alias for the slow path so
+/// pre-Phase-5 modules continue dispatching correctly.
+#[wasm_bindgen]
+pub fn wren_call_1_slow(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
+    wren_call_1(receiver_bits, method_id, arg_bits)
+}
+
 #[wasm_bindgen]
 pub fn wren_call_1(receiver_bits: u64, method_id: u64, arg_bits: u64) -> u64 {
     let vm_ptr = wren_lift::runtime::tier::current_vm();

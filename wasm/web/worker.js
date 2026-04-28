@@ -181,6 +181,10 @@ globalThis._wlift_perf_log = (label, ms) => {
 // can switch to raw wasm exports for ~zero-overhead inter-module
 // calls.
 const __wliftJitInstances = [];
+// Phase 5 — see `wlift.js` for the design notes; this is the
+// worker-side mirror. Each JIT'd module imports the table and
+// `call_indirect`s through it for inter-fn calls.
+const __wliftJitTable = new WebAssembly.Table({ initial: 0, element: "anyfunc" });
 const __wliftWrenImports = {
   wren_num_add:   wlift_wasm.wren_num_add,
   wren_num_sub:   wlift_wasm.wren_num_sub,
@@ -196,8 +200,10 @@ const __wliftWrenImports = {
   wren_cmp_ne:    wlift_wasm.wren_cmp_ne,
   wren_not:       wlift_wasm.wren_not,
   wren_is_truthy: wlift_wasm.wren_is_truthy,
-  wren_call_1:    wlift_wasm.wren_call_1,
+  wren_call_1_slow: wlift_wasm.wren_call_1,
+  wren_jit_slot_plus_one: wlift_wasm.wren_jit_slot_plus_one,
   wren_get_module_var: wlift_wasm.wren_get_module_var,
+  __wlift_jit_table: __wliftJitTable,
 };
 globalThis._wlift_jit_instantiate = (bytes) => {
   const module = new WebAssembly.Module(bytes);
@@ -210,6 +216,9 @@ globalThis._wlift_jit_instantiate = (bytes) => {
   }
   const slot = __wliftJitInstances.length;
   __wliftJitInstances.push(fn);
+  // Phase 5 — publish for inter-module `call_indirect`.
+  __wliftJitTable.grow(1);
+  __wliftJitTable.set(slot, fn);
   return slot;
 };
 // Defensive call shims — see `wlift.js` for the rationale.
