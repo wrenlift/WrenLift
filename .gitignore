@@ -3,3 +3,7 @@ bench/site/results.json
 profile.json.gz
 /hatch/
 .DS_Store
+# `wasm-pack build wasm --target web` output. Regenerated from
+# `wasm/src/lib.rs` + the runtime source on every build; we
+# track the recipe, not the bytes.
+wasm/pkg/

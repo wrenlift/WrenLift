@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wlift — Wren in your browser</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #161922;
+      --text: #e6e6ea;
+      --muted: #7d8aa0;
+      --accent: #ffb454;
+      --good: #84e188;
+      --bad:  #ff8585;
+    }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      height: 100%;
+    }
+    .layout {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      height: 100%;
+    }
+    header, footer {
+      padding: 12px 20px;
+      border-bottom: 1px solid #232631;
+      display: flex; align-items: center; gap: 12px;
+    }
+    footer {
+      border-top: 1px solid #232631;
+      border-bottom: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    h1 { font-size: 14px; margin: 0; color: var(--accent); }
+    button {
+      background: var(--accent); color: #0f1115;
+      border: 0; padding: 6px 14px;
+      font: inherit; font-weight: 600;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: wait; }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1px;
+      background: #232631;
+      overflow: hidden;
+    }
+    section {
+      background: var(--panel);
+      display: flex; flex-direction: column;
+    }
+    .label {
+      padding: 8px 16px;
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      border-bottom: 1px solid #232631;
+    }
+    textarea, pre {
+      flex: 1;
+      margin: 0;
+      padding: 16px;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      border: 0;
+      resize: none;
+      white-space: pre-wrap;
+      tab-size: 2;
+      outline: none;
+    }
+    pre.ok    { color: var(--good); }
+    pre.error { color: var(--bad); }
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      background: #232631;
+      color: var(--muted);
+    }
+    .pill.ok    { color: var(--good); }
+    .pill.error { color: var(--bad); }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <header>
+      <h1>wlift</h1>
+      <span id="status" class="pill">loading…</span>
+      <span style="margin-left: auto"></span>
+      <button id="run-btn" disabled>Run (⌘↵)</button>
+    </header>
+    <main>
+      <section>
+        <div class="label">main.wren</div>
+        <textarea id="src" spellcheck="false">// Hello from Wren in your browser.
+// Edit and press ⌘↵ (or click Run) to interpret.
+
+System.print("hello from wasm-bindgen!")
+
+var fib
+fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
+System.print("fib(20) = %(fib.call(20))")
+
+var nums = [1, 2, 3, 4, 5]
+var sum = nums.reduce {|acc, x| acc + x }
+System.print("sum %(nums) = %(sum)")
+</textarea>
+      </section>
+      <section>
+        <div class="label">output</div>
+        <pre id="out"></pre>
+      </section>
+    </main>
+    <footer>
+      <span id="version">…</span>
+      <span style="margin-left: auto"
+        >static REPL · interpreter only · no JIT, no plugins (Phase 1.1)</span>
+    </footer>
+  </div>
+
+  <script type="module">
+    import init, { version, run, ErrorKind } from "../pkg/wlift_wasm.js";
+
+    const statusEl  = document.getElementById("status");
+    const versionEl = document.getElementById("version");
+    const srcEl     = document.getElementById("src");
+    const outEl     = document.getElementById("out");
+    const runBtn    = document.getElementById("run-btn");
+
+    statusEl.textContent = "loading…";
+    await init();
+    statusEl.textContent = "ready";
+    statusEl.classList.add("ok");
+    versionEl.textContent = version();
+    runBtn.disabled = false;
+
+    function execute() {
+      runBtn.disabled = true;
+      outEl.classList.remove("ok", "error");
+      outEl.textContent = "";
+      const t0 = performance.now();
+      let result;
+      try {
+        result = run(srcEl.value);
+      } catch (e) {
+        outEl.textContent = String(e);
+        outEl.classList.add("error");
+        runBtn.disabled = false;
+        return;
+      }
+      const elapsed = (performance.now() - t0).toFixed(1);
+      outEl.textContent = result.output || "(no output)";
+      outEl.classList.add(result.ok ? "ok" : "error");
+      outEl.textContent +=
+        `\n--- ${result.ok ? "ok" : "error"} (${elapsed} ms) ---`;
+      if (!result.ok) {
+        const kind = ErrorKind[result.errorKind] ?? result.errorKind;
+        outEl.textContent += ` [${kind}]`;
+      }
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener("click", execute);
+    srcEl.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        execute();
+      }
+    });
+
+    // Auto-run on load so the page is useful immediately.
+    execute();
+  </script>
+</body>
+</html>
