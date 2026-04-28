@@ -138,15 +138,45 @@ pub fn future_state(handle: u32) -> FutureState {
 // Init + version
 // ---------------------------------------------------------------------------
 
-/// Optional one-time setup. Browser callers should invoke this
-/// from JS before the first `run` so that any panic deeper in
-/// the runtime surfaces as a console error rather than the
-/// generic `unreachable executed` string.
+/// One-time setup. The wasm-bindgen `start` attribute makes this
+/// run on module instantiation, before any JS-side `run()` /
+/// `version()` call.
+///
+/// Two jobs:
+///
+///   * Install `console_error_panic_hook` so panics surface as a
+///     readable JS `console.error` instead of the bare
+///     "unreachable executed" trap.
+///
+///   * Publish every statically-linked plugin's foreign-method
+///     symbols to the runtime's foreign-method registry. This is
+///     the wasm replacement for the host's `libloading::dlsym`
+///     pass — Wren `foreign class` declarations annotated with
+///     `#!native = "wlift_image"` look up here at install time.
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
     #[cfg(target_arch = "wasm32")]
-    console_error_panic_hook::set_once();
+    {
+        console_error_panic_hook::set_once();
+        register_static_plugins();
+    }
 }
+
+/// Static-link plugin registry. Wasi smoke binaries call this from
+/// `main` before they spin up a VM. Browser builds get it via the
+/// `_wasm_init` shim above.
+#[cfg(target_arch = "wasm32")]
+pub fn register_static_plugins() {
+    wlift_image::register_static_symbols();
+}
+
+/// Host-side stub so non-wasm callers (the smoke `_start` binary
+/// running on a native target via `cargo run -p wlift_wasm --bin
+/// smoke` for local debugging — outside the wasi target) still
+/// compile. The host wlift loads `libwlift_image.dylib` /
+/// `.so` / `.dll` via dlsym; this no-ops there.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn register_static_plugins() {}
 
 /// Build identifier — hard-coded for the moment so JS can sanity-
 /// check the loaded wasm matches what its bundler thought it was

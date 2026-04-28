@@ -118,6 +118,12 @@ fn smoke_runs_under_wasmtime() {
         "SystemTime returned 0/epoch on wasm; captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("foreign: ok"),
+        "wlift_image foreign method didn't dispatch through the static \
+         registry — symbol probably wasn't registered. captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

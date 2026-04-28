@@ -14,6 +14,14 @@ crate-type = ["cdylib", "rlib"]
 wren_lift = { path = "..", default-features = false }
 wasm-bindgen = "0.2"
 
+# Plugins statically linked into the wasm runtime. Each one
+# exposes a `register_static_symbols()` that publishes its
+# `#[no_mangle] wlift_*` exports to the foreign-method registry
+# on `wasm32-*` targets. Adding a plugin here is the wasm
+# equivalent of dropping `lib<crate>.so` into a host package's
+# `libs/` directory.
+wlift_image = { path = "../plugins/wlift_image", default-features = false }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browser-side panic visibility: any unhandled panic surfaces as a
 # `console.error` with a stack trace instead of `unreachable

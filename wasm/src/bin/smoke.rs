@@ -37,9 +37,40 @@ var t1 = TimeCore.mono
 System.print("time ok: mono delta >= 0 = %((t1 - t0) >= 0)")
 var unix = TimeCore.unix
 System.print("unix ok: nonzero = %(unix > 0)")
+
+// Foreign-method registry probe: dispatch into the statically-
+// linked `wlift_image` plugin. We don't ship a real PNG in the
+// smoke binary — calling decode with garbage bytes is enough to
+// confirm the symbol resolved (the plugin's own runtime_error
+// path runs instead of "Class does not implement 'decode_(_)'",
+// which is what we'd see if the foreign loader returned an
+// error).
+#!native = "wlift_image"
+foreign class ImageCore {
+    #!symbol = "wlift_image_decode"
+    foreign static decode(bytes)
+}
+var probe = Fiber.new { ImageCore.decode([1, 2, 3]) }
+var err = probe.try()
+// Either path means the foreign method got dispatched: an error
+// raised by `wlift_image_decode` itself (good), or the plugin
+// returned null (also good — symbol resolved). The bad case is
+// "Class ... does not implement" which means the registry never
+// bound the symbol.
+if (err is String && err.contains("does not implement")) {
+    System.print("foreign: BAD (%(err))")
+} else {
+    System.print("foreign: ok (decode dispatched; err=%(err))")
+}
 "#;
 
 fn main() -> std::process::ExitCode {
+    // Static plugin registration. On `wasm32-*` targets this
+    // populates `runtime::foreign`'s registry with every linked
+    // plugin's `wlift_*` exports; on a non-wasm host it's a
+    // no-op (the host loader uses dlsym instead).
+    wlift_wasm::register_static_plugins();
+
     let mut vm = VM::new(VMConfig {
         execution_mode: ExecutionMode::Interpreter,
         ..VMConfig::default()

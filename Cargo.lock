@@ -6307,6 +6307,7 @@ dependencies = [
  "console_error_panic_hook",
  "wasm-bindgen",
  "web-time",
+ "wlift_image",
  "wren_lift",
 ]
 

@@ -260,3 +260,35 @@ pub unsafe extern "C" fn wlift_image_encode(vm: *mut VM) {
         set_return(vm, arr);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Static plugin registration (wasm path)
+// ---------------------------------------------------------------------------
+//
+// On `wasm32-unknown-unknown` the runtime can't `dlopen` a cdylib;
+// plugins ship as Rust crates that the runtime statically links
+// in, then call this function once at host-init time to publish
+// their symbols to the foreign-method registry. The host build
+// uses `dlsym` instead, so this entire block is a no-op there.
+//
+// Hosts that include this crate (today: `wlift_wasm`) call
+// `wlift_image::register_static_symbols()` from their `_wasm_init`
+// shim — same place `console_error_panic_hook::set_once()` lives.
+
+/// Register every `#[no_mangle] wlift_image_*` foreign-method
+/// export under the library name `"wlift_image"`. Idempotent —
+/// re-calling overwrites the same `(library, symbol)` keys.
+///
+/// Only exists on `wasm32-*` targets, where `wren_lift`'s
+/// `foreign` module routes to the static registry. Host builds
+/// resolve these symbols via `dlsym` and never call this; the
+/// function isn't compiled there at all.
+#[cfg(target_arch = "wasm32")]
+pub fn register_static_symbols() {
+    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
+    // SAFETY: each export is `unsafe extern "C" fn(*mut VM)` with
+    // the same ABI the host build dispatches via `dlsym`; see the
+    // safety contract on `register_plugin_symbol_unsafe`.
+    register_plugin_symbol_unsafe("wlift_image", "wlift_image_decode", wlift_image_decode);
+    register_plugin_symbol_unsafe("wlift_image", "wlift_image_encode", wlift_image_encode);
+}
