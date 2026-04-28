@@ -307,29 +307,87 @@ pub fn park_fiber(fiber: *mut ObjFiber, handle: u32) {
         .push(ParkedFiber { fiber, handle });
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler wake hook
+// ---------------------------------------------------------------------------
+//
+// Without this, the scheduler's `await` loop could only poll —
+// `setTimeout(0)` between iterations to give JS a chance to run.
+// Each poll costs ~4 ms (browser nested-setTimeout clamp) plus
+// the postMessage round-trip in worker mode, so a fiber awaiting
+// many DOM ops paid 50–60 ms latency *per op*.
+//
+// Reactive wakeup: `resolve_future` / `reject_future` settle a
+// handle, then immediately call the JS resolver stashed here.
+// That resolves the Promise the scheduler is awaiting, which
+// re-enters the scheduler in the next microtask — no polling
+// cost. The `setTimeout(0)` path still exists as a fallback
+// when no resolver has been registered (e.g. the very first
+// scheduler tick before parking any fiber).
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+struct SchedulerWaker(js_sys::Function);
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+// SAFETY: wasm32 is single-threaded.
+unsafe impl Send for SchedulerWaker {}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn scheduler_waker() -> &'static Mutex<Option<SchedulerWaker>> {
+    static W: std::sync::OnceLock<Mutex<Option<SchedulerWaker>>> = std::sync::OnceLock::new();
+    W.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn wake_scheduler_if_armed() {
+    let waker = scheduler_waker()
+        .lock()
+        .expect("scheduler waker poisoned")
+        .take();
+    if let Some(SchedulerWaker(fun)) = waker {
+        let _ = fun.call0(&JsValue::UNDEFINED);
+    }
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn wake_scheduler_if_armed() {}
+
 /// JS-callable: flip a handle to `Resolved` and stash the value.
 /// Idempotent — resolving an already-resolved/rejected handle is
 /// a no-op (matches Promise semantics; the first settlement wins).
 #[wasm_bindgen]
 pub fn resolve_future(handle: u32, value: String) {
-    let mut store = future_store().lock().expect("future store poisoned");
-    if let Some(slot) = store.get_mut(&handle) {
-        if slot.state == FutureState::Pending {
-            slot.state = FutureState::Resolved;
-            slot.value = Some(value);
+    let settled = {
+        let mut store = future_store().lock().expect("future store poisoned");
+        match store.get_mut(&handle) {
+            Some(slot) if slot.state == FutureState::Pending => {
+                slot.state = FutureState::Resolved;
+                slot.value = Some(value);
+                true
+            }
+            _ => false,
         }
+    };
+    if settled {
+        wake_scheduler_if_armed();
     }
 }
 
 /// JS-callable: flip a handle to `Rejected` with an error message.
 #[wasm_bindgen]
 pub fn reject_future(handle: u32, error: String) {
-    let mut store = future_store().lock().expect("future store poisoned");
-    if let Some(slot) = store.get_mut(&handle) {
-        if slot.state == FutureState::Pending {
-            slot.state = FutureState::Rejected;
-            slot.error = Some(error);
+    let settled = {
+        let mut store = future_store().lock().expect("future store poisoned");
+        match store.get_mut(&handle) {
+            Some(slot) if slot.state == FutureState::Pending => {
+                slot.state = FutureState::Rejected;
+                slot.error = Some(error);
+                true
+            }
+            _ => false,
         }
+    };
+    if settled {
+        wake_scheduler_if_armed();
     }
 }
 
@@ -847,14 +905,40 @@ pub async fn run(source: &str) -> RunResult {
                 break;
             }
 
-            // Yield to the JS event loop. `setTimeout(0)` ensures
-            // both the microtask queue (resolved Promises) AND
-            // the macrotask queue (setTimeout / fetch / WebSocket
-            // events) get a chance to run before we re-check.
+            // Sleep until *either* (a) a future settles and
+            // calls `wake_scheduler_if_armed`, or (b) the
+            // `setTimeout(0)` macrotask backstop fires. The
+            // wake path is what eliminates polling latency: the
+            // moment `resolve_future` runs from a JS callback,
+            // it triggers our resolver and the scheduler is
+            // back in business one microtask later. The
+            // setTimeout backstop is there for cases where the
+            // first tick has nothing parked yet, or a future
+            // settled while no waker was armed (rare race).
             #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
             {
-                let p = js::wlift_yield_to_event_loop();
-                let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+                let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                    *scheduler_waker().lock().expect("scheduler waker poisoned") =
+                        Some(SchedulerWaker(resolve));
+                });
+                // Race the wake against a setTimeout backstop so
+                // we can't deadlock if no future settles. The
+                // backstop fires every ~4 ms (browser clamp),
+                // which is the worst-case latency on a future
+                // that settled without arming the waker.
+                let backstop = js::wlift_yield_to_event_loop();
+                let race = js_sys::Promise::race(&js_sys::Array::of2(&promise, &backstop));
+                let _ = wasm_bindgen_futures::JsFuture::from(race).await;
+                // Drop any waker we left armed — `Promise::race`
+                // resolved through the backstop side, so the
+                // waker won't be called. Leaving it set would
+                // make the next tick fire immediately on the
+                // next `resolve_future` call regardless of which
+                // tick that future was actually parked from.
+                scheduler_waker()
+                    .lock()
+                    .expect("scheduler waker poisoned")
+                    .take();
             }
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
