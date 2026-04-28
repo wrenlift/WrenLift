@@ -124,6 +124,12 @@ fn smoke_runs_under_wasmtime() {
          registry — symbol probably wasn't registered. captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("future: ok"),
+        "Browser.setTimeout(0).await didn't round-trip through the \
+         Promise/Fiber.yield bridge. captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

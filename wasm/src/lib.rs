@@ -25,6 +25,28 @@ use wasm_bindgen::prelude::*;
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
 use wren_lift::runtime::vm::{VMConfig, VM};
 
+pub mod browser;
+
+// `js` carries the `extern "C"` block that imports browser-side
+// shims (today: `_wlift_set_timeout`). Compiled only on the
+// `wasm32-unknown-unknown` target, which is the only one where
+// wasm-bindgen's JS interop applies. Wasi (the smoke target)
+// short-circuits the same paths to a synchronous resolution.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub mod js {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        /// JS-provided shim: `setTimeout(() =>
+        /// wlift_resolve_future(handle, ""), ms)`. Lives in the
+        /// page's bootstrapping script; the wasm-pack template
+        /// adds it next to the standard `init()` glue.
+        #[wasm_bindgen(js_name = _wlift_set_timeout)]
+        pub fn wlift_set_timeout(handle: u32, ms: f64);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Promise ↔ Fiber.yield handle store (Phase 1.1 scaffolding)
 // ---------------------------------------------------------------------------
@@ -121,10 +143,9 @@ pub fn reject_future(handle: u32, error: String) {
 }
 
 /// JS-callable: read the current state of a handle. Used by
-/// JS-side debugging / introspection tooling. Wren's
-/// `Future.await` doesn't go through wasm-bindgen — it dispatches
-/// through the `peek_state` foreign method registered with the VM
-/// (Phase 1.1+ work).
+/// JS-side debugging / introspection tooling AND by the
+/// `browser::browser_peek_state` foreign method that Wren's
+/// `Future.await` polls in its yield loop.
 #[wasm_bindgen]
 pub fn future_state(handle: u32) -> FutureState {
     let store = future_store().lock().expect("future store poisoned");
@@ -132,6 +153,24 @@ pub fn future_state(handle: u32) -> FutureState {
         .get(&handle)
         .map(|s| s.state)
         .unwrap_or(FutureState::Rejected)
+}
+
+/// Take the resolved value (or rejection error) out of a slot
+/// and drop the slot. Called from `browser::browser_take_value`
+/// after `peekState` reports non-pending — the slot is one-shot
+/// from the Wren side, matching Promise's "settled once" rule.
+///
+/// Returns `None` if the handle was never registered, was
+/// already taken, or hasn't settled yet (the await loop should
+/// only call this after `peekState != 0`).
+pub fn future_store_take_value(handle: u32) -> Option<String> {
+    let mut store = future_store().lock().expect("future store poisoned");
+    let slot = store.remove(&handle)?;
+    match slot.state {
+        FutureState::Pending => None,
+        FutureState::Resolved => slot.value,
+        FutureState::Rejected => slot.error,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +207,7 @@ pub fn _wasm_init() {
 #[cfg(target_arch = "wasm32")]
 pub fn register_static_plugins() {
     wlift_image::register_static_symbols();
+    browser::register_static_symbols();
 }
 
 /// Host-side stub so non-wasm callers (the smoke `_start` binary

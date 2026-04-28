@@ -52,15 +52,56 @@ foreign class ImageCore {
 }
 var probe = Fiber.new { ImageCore.decode([1, 2, 3]) }
 var err = probe.try()
-// Either path means the foreign method got dispatched: an error
-// raised by `wlift_image_decode` itself (good), or the plugin
-// returned null (also good — symbol resolved). The bad case is
-// "Class ... does not implement" which means the registry never
-// bound the symbol.
 if (err is String && err.contains("does not implement")) {
     System.print("foreign: BAD (%(err))")
 } else {
     System.print("foreign: ok (decode dispatched; err=%(err))")
+}
+
+// Promise ↔ Fiber.yield bridge probe. `Browser.setTimeout(0)`
+// returns a Future; under wasi this resolves synchronously, so
+// `await`'s yield loop sees `state == 1` on the very next
+// iteration and the fiber returns. The browser host wires the
+// same path to `setTimeout` via wasm-bindgen.
+#!native = "browser"
+foreign class BrowserCore {
+    #!symbol = "browser_set_timeout"
+    foreign static setTimeoutHandle(ms)
+    #!symbol = "browser_peek_state"
+    foreign static peekState(handle)
+    #!symbol = "browser_take_value"
+    foreign static takeValue(handle)
+}
+class Future {
+    construct new_(handle) { _h = handle }
+    state { BrowserCore.peekState(_h) }
+    await {
+        // 0 = pending, 1 = resolved, 2 = rejected. Cache the
+        // settled state BEFORE `takeValue` removes the slot —
+        // a subsequent `peekState` on a missing handle reports
+        // Rejected, which would mis-fire `Fiber.abort` on a
+        // resolved Future.
+        while (state == 0) Fiber.yield()
+        var settled = state
+        var v = BrowserCore.takeValue(_h)
+        if (settled == 2) Fiber.abort(v == null ? "Future rejected" : v)
+        return v
+    }
+}
+class Browser {
+    static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
+}
+
+var awaitFiber = Fiber.new {
+    Browser.setTimeout(0).await
+    System.print("future: awaited a 0ms timeout")
+    return "awaited"
+}
+var awaitResult = awaitFiber.try()
+if (awaitResult == "awaited") {
+    System.print("future: ok")
+} else {
+    System.print("future: BAD (%(awaitResult))")
 }
 "#;
 
