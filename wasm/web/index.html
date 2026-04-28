@@ -29,10 +29,13 @@
       overflow: hidden;
     }
 
-    /* Page is one big grid: header / panes / footer. */
+    /* Page is one big grid: header / banner / panes / footer.
+       The banner row is `auto`, so when its child is hidden
+       (`display: none`) it collapses to zero — main keeps the
+       full `1fr`. */
     .layout {
       display: grid;
-      grid-template-rows: auto 1fr auto;
+      grid-template-rows: auto auto 1fr auto;
       height: 100vh;
     }
 
@@ -148,6 +151,7 @@
       background: #2a221a;
       color: var(--accent);
       font-size: 12px;
+      height: fit-content;
       border-bottom: 1px solid var(--rule);
     }
     .banner.hidden { display: none; }
