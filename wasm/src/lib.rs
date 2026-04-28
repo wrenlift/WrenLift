@@ -812,11 +812,44 @@ class SessionStorage {
 }
 "##;
 
-/// Number of newlines in `BROWSER_PRELUDE`. Exposed so the host
-/// can shift error spans back into user-source line numbers.
+/// Number of lines `run()` prepends to the user source. Today
+/// it's just the one-line `PRELUDE_IMPORT`. Exposed so callers
+/// can shift error spans back to user-source line numbers — the
+/// big `BROWSER_PRELUDE` is loaded as a separate module and no
+/// longer inflates the user module's line count.
 #[wasm_bindgen]
 pub fn prelude_line_count() -> u32 {
-    BROWSER_PRELUDE.matches('\n').count() as u32
+    // `format!("{}\n{}", PRELUDE_IMPORT, source)` — one prefix
+    // line + the newline separator.
+    1
+}
+
+/// One-line `import` that pulls every prelude class into the
+/// user's module. With the prelude moved out of the per-`run()`
+/// compile path (cached as a wlbc blob — see `prelude_blob`),
+/// this is what the user code pays parse / sema / codegen cost
+/// for instead of the full ~100 lines.
+const PRELUDE_IMPORT: &str =
+    r#"import "wlift_prelude" for Future, Browser, WebSocket, Dom, LocalStorage, SessionStorage"#;
+
+/// Compile `BROWSER_PRELUDE` to a `.wlbc`-style bytecode blob the
+/// first time it's needed, then cache it forever. Each `run()`
+/// loads this blob via `vm.interpret_bytecode` rather than
+/// re-parsing + re-semating + re-codegenning ~100 lines of
+/// foreign-class declarations on every invocation. The first
+/// call still pays the compile cost (one-time, on a throwaway
+/// VM); subsequent calls just deserialize the blob, which is
+/// roughly an order of magnitude cheaper.
+fn prelude_blob() -> &'static Vec<u8> {
+    static B: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let mut tmp = VM::new(VMConfig {
+            execution_mode: ExecutionMode::Interpreter,
+            ..VMConfig::default()
+        });
+        tmp.compile_source_to_blob(BROWSER_PRELUDE)
+            .expect("BROWSER_PRELUDE must compile — check the const for a typo")
+    })
 }
 
 /// Compile + interpret a Wren source string. Output captured into
@@ -872,7 +905,24 @@ pub async fn run(source: &str) -> RunResult {
         .expect("parked fiber list poisoned")
         .clear();
 
-    let combined = format!("{}\n{}", BROWSER_PRELUDE, source);
+    // Install the precompiled prelude into module
+    // `wlift_prelude`. Cheap: bytecode deserialise, no parse /
+    // sema / codegen. The user source then `import`s those
+    // names, and the import path short-circuits because the
+    // module's already loaded.
+    let prelude_load = vm.interpret_bytecode("wlift_prelude", prelude_blob());
+    if !matches!(prelude_load, InterpretResult::Success) {
+        // Cached blob failed to load — should never happen since
+        // the const is fixed at build time. Fall back to a clean
+        // error so the page surfaces it instead of silently
+        // running without a prelude.
+        return RunResult {
+            output: "wlift internal error: prelude bytecode failed to load".to_string(),
+            ok: false,
+            error_kind: ErrorKind::CompileError,
+        };
+    }
+    let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
     let result = vm.interpret("main", &combined);
 
     // Scheduler loop. Drives parked fibers across JS event-loop
