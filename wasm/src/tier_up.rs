@@ -704,6 +704,58 @@ fn wren_call_1_inner(
 /// Phase 4 step 5+ would generalise this by embedding the
 /// declaring module's identifier in the JIT'd module at
 /// compile time and threading it through each call.
+// Cache of the "main" module pointer keyed by VM pointer so the
+// per-call HashMap<String,_>::get fallback falls away. Each
+// `run()` instantiates a fresh VM, so we key on `vm_ptr` and
+// refresh on mismatch — once per run, not per recursion. Only
+// the wasm tier hits this hot loop (BC interp resolves module
+// vars through different paths), so the cache is gated to
+// wasm32-unknown. Single-threaded wasm makes the `Sync` newtype
+// pattern (cf. `tier_wasm::current_vm_cell::VmCell`) safe.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod main_module_cache {
+    use std::cell::UnsafeCell;
+    use wren_lift::runtime::engine::ModuleEntry;
+    use wren_lift::runtime::vm::VM;
+
+    pub(super) struct Cell {
+        pub(super) vm: UnsafeCell<*mut VM>,
+        pub(super) module: UnsafeCell<*const ModuleEntry>,
+    }
+    unsafe impl Sync for Cell {}
+
+    pub(super) static CACHE: Cell = Cell {
+        vm: UnsafeCell::new(std::ptr::null_mut()),
+        module: UnsafeCell::new(std::ptr::null()),
+    };
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn cached_main_module(
+    vm: &wren_lift::runtime::vm::VM,
+    vm_ptr: *mut wren_lift::runtime::vm::VM,
+) -> *const wren_lift::runtime::engine::ModuleEntry {
+    // SAFETY: wasm32 single-threaded; UnsafeCell access is the
+    // standard pattern for these runtime caches.
+    let cached_vm = unsafe { *main_module_cache::CACHE.vm.get() };
+    if cached_vm == vm_ptr {
+        let cached_module = unsafe { *main_module_cache::CACHE.module.get() };
+        if !cached_module.is_null() {
+            return cached_module;
+        }
+    }
+    let module_ptr: *const wren_lift::runtime::engine::ModuleEntry = vm
+        .engine
+        .modules
+        .get("main")
+        .map_or(std::ptr::null(), |m| m);
+    unsafe {
+        *main_module_cache::CACHE.vm.get() = vm_ptr;
+        *main_module_cache::CACHE.module.get() = module_ptr;
+    }
+    module_ptr
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn wren_get_module_var(slot_idx: u64) -> u64 {
@@ -711,16 +763,74 @@ pub fn wren_get_module_var(slot_idx: u64) -> u64 {
     if vm_ptr.is_null() {
         return Value::null().to_bits();
     }
-    let vm = unsafe { &mut *vm_ptr };
+    let vm = unsafe { &*vm_ptr };
+    let module_ptr = cached_main_module(vm, vm_ptr);
+    if module_ptr.is_null() {
+        return Value::null().to_bits();
+    }
     let idx = slot_idx as usize;
-    match vm.engine.modules.get("main") {
-        Some(module) => module
-            .vars
-            .get(idx)
-            .copied()
-            .unwrap_or(Value::null())
-            .to_bits(),
-        None => Value::null().to_bits(),
+    // SAFETY: module_ptr is a non-null pointer into
+    // `vm.engine.modules` whose backing storage is owned by `vm`
+    // for the duration of `run()`. The Vec's stable address is
+    // implied by the fact that we don't mutate
+    // `vm.engine.modules` between fetches in normal scripts.
+    let module = unsafe { &*module_ptr };
+    module
+        .vars
+        .get(idx)
+        .copied()
+        .unwrap_or(Value::null())
+        .to_bits()
+}
+
+/// Phase 5d combined helper — load the closure stored in
+/// `module_vars["main"][idx]` *and* return its JIT slot+1 in a
+/// single cross-instance call. The function-prologue lookup
+/// emitted by `codegen::wasm::emit_function` was previously
+/// two hops (`wren_get_module_var` then `wren_jit_slot_plus_one`);
+/// merging them halves the prologue's cross-instance overhead,
+/// which matters because the prologue runs once per outer call
+/// (fib(20) → ~22k invocations).
+///
+/// Returns 0 if the module / var / closure isn't JIT'd, mirroring
+/// the `slot + 1` encoding of `wren_jit_slot_plus_one`.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_jit_slot_for_module_var(slot_idx: u64) -> u32 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return 0;
+    }
+    let vm = unsafe { &*vm_ptr };
+    let module_ptr = cached_main_module(vm, vm_ptr);
+    if module_ptr.is_null() {
+        return 0;
+    }
+    let module = unsafe { &*module_ptr };
+    let idx = slot_idx as usize;
+    let receiver = match module.vars.get(idx).copied() {
+        Some(v) => v,
+        None => return 0,
+    };
+    if !receiver.is_object() {
+        return 0;
+    }
+    let ptr = receiver.as_object().unwrap();
+    let header = ptr as *const wren_lift::runtime::object::ObjHeader;
+    let is_closure =
+        unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
+    if !is_closure {
+        return 0;
+    }
+    let closure_ptr = ptr as *const wren_lift::runtime::object::ObjClosure;
+    let fn_ptr = unsafe { (*closure_ptr).function };
+    let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+    match vm.engine.wasm_jit_slot(target_fn) {
+        Some(slot) => {
+            DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
+            slot.saturating_add(1)
+        }
+        None => 0,
     }
 }
 

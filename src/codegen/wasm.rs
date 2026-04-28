@@ -518,6 +518,18 @@ impl<'a> MirWasmEmitter<'a> {
                 self.register_import("wren_is_truthy", &[ValType::I64], &[ValType::I32]);
             }
         }
+        // Phase 5d prologue — if any module-var slot locals were
+        // reserved in `scan_locals`, the prologue calls
+        // `wren_jit_slot_for_module_var(idx) -> i32` once per
+        // unique idx. Single combined helper to keep the
+        // prologue's cross-instance count low.
+        if !self.module_var_slot_locals.is_empty() {
+            self.register_import(
+                "wren_jit_slot_for_module_var",
+                &[ValType::I64],
+                &[ValType::I32],
+            );
+        }
     }
 
     fn register_import_binop(&mut self, name: &'static str) {
@@ -573,10 +585,15 @@ impl<'a> MirWasmEmitter<'a> {
             .collect();
         prologue_pairs.sort_by_key(|(k, _)| *k);
         for (mv_idx, slot_local) in prologue_pairs {
+            // One cross-instance call instead of two — the
+            // `wren_jit_slot_for_module_var` helper does the
+            // module-var load + closure deref + slot lookup in
+            // one Rust function. fib(20) runs the prologue ~22k
+            // times; halving the per-prologue cross-instance
+            // count saves ~1–2 ms.
             func.instruction(&WasmInst::I64Const(mv_idx as i64));
-            func.instruction(&WasmInst::Call(self.runtime_imports["wren_get_module_var"]));
             func.instruction(&WasmInst::Call(
-                self.runtime_imports["wren_jit_slot_plus_one"],
+                self.runtime_imports["wren_jit_slot_for_module_var"],
             ));
             func.instruction(&WasmInst::LocalSet(slot_local));
         }

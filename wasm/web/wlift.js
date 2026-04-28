@@ -280,6 +280,7 @@ class MainWlift {
       wren_is_truthy:wasm.wren_is_truthy,
       wren_call_1_slow: wasm.wren_call_1,
       wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
+      wren_jit_slot_for_module_var: wasm.wren_jit_slot_for_module_var,
       wren_get_module_var: wasm.wren_get_module_var,
       __wlift_jit_table: __wliftJitTable,
     };
