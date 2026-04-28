@@ -83,11 +83,7 @@ fn smoke_runs_under_wasmtime() {
     // trap) is a failure.
     if let Err(err) = start.call(&mut store, ()) {
         if let Some(exit) = err.downcast_ref::<wasmtime_wasi::I32Exit>() {
-            assert_eq!(
-                exit.0, 0,
-                "smoke.wasm exited with non-zero code {}",
-                exit.0
-            );
+            assert_eq!(exit.0, 0, "smoke.wasm exited with non-zero code {}", exit.0);
         } else {
             panic!("smoke.wasm trapped: {:?}", err);
         }

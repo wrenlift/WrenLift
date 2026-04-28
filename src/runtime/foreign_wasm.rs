@@ -30,9 +30,19 @@ pub struct Library;
 
 #[derive(Debug)]
 pub enum ForeignLoadError {
-    LibraryNotFound { name: String, tried: Vec<String> },
-    SymbolNotFound { library: String, symbol: String },
-    AbiMismatch { library: String, expected: u32, found: u32 },
+    LibraryNotFound {
+        name: String,
+        tried: Vec<String>,
+    },
+    SymbolNotFound {
+        library: String,
+        symbol: String,
+    },
+    AbiMismatch {
+        library: String,
+        expected: u32,
+        found: u32,
+    },
     Unsupported,
 }
 
@@ -40,12 +50,24 @@ impl std::fmt::Display for ForeignLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ForeignLoadError::LibraryNotFound { name, .. } => {
-                write!(f, "native library '{}' is not available in the wasm build.", name)
+                write!(
+                    f,
+                    "native library '{}' is not available in the wasm build.",
+                    name
+                )
             }
             ForeignLoadError::SymbolNotFound { library, symbol } => {
-                write!(f, "symbol '{}' not found in '{}' (wasm build).", symbol, library)
+                write!(
+                    f,
+                    "symbol '{}' not found in '{}' (wasm build).",
+                    symbol, library
+                )
             }
-            ForeignLoadError::AbiMismatch { library, expected, found } => {
+            ForeignLoadError::AbiMismatch {
+                library,
+                expected,
+                found,
+            } => {
                 write!(
                     f,
                     "plugin '{}' ABI version {} does not match host expected {}.",

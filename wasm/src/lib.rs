@@ -23,7 +23,7 @@ use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
-use wren_lift::runtime::vm::{VM, VMConfig};
+use wren_lift::runtime::vm::{VMConfig, VM};
 
 // ---------------------------------------------------------------------------
 // Promise ↔ Fiber.yield handle store (Phase 1.1 scaffolding)
@@ -66,8 +66,7 @@ struct FutureSlot {
 }
 
 fn future_store() -> &'static Mutex<HashMap<u32, FutureSlot>> {
-    static STORE: std::sync::OnceLock<Mutex<HashMap<u32, FutureSlot>>> =
-        std::sync::OnceLock::new();
+    static STORE: std::sync::OnceLock<Mutex<HashMap<u32, FutureSlot>>> = std::sync::OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

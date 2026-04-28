@@ -92,11 +92,7 @@ impl TierManager {
         Self
     }
 
-    pub fn register(
-        &mut self,
-        _id: FuncId,
-        _core: *mut (),
-    ) -> std::sync::Arc<Bead> {
+    pub fn register(&mut self, _id: FuncId, _core: *mut ()) -> std::sync::Arc<Bead> {
         std::sync::Arc::new(Bead)
     }
 
@@ -114,12 +110,7 @@ impl TierManager {
         false
     }
 
-    pub fn install_or_swap_osr(
-        &self,
-        _id: FuncId,
-        _code: *mut (),
-        _osr: Vec<OsrEntry>,
-    ) -> bool {
+    pub fn install_or_swap_osr(&self, _id: FuncId, _code: *mut (), _osr: Vec<OsrEntry>) -> bool {
         false
     }
 

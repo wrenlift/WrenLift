@@ -1,7 +1,7 @@
+use crate::portable_time::{SystemTime, UNIX_EPOCH};
 use crate::runtime::object::NativeContext;
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
-use crate::portable_time::{SystemTime, UNIX_EPOCH};
 
 fn system_clock(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     let duration = SystemTime::now()

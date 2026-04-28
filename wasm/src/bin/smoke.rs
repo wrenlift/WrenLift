@@ -13,7 +13,7 @@
 //!     wasmtime target/wasm32-wasip1/release/smoke.wasm
 
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
-use wren_lift::runtime::vm::{VM, VMConfig};
+use wren_lift::runtime::vm::{VMConfig, VM};
 
 const SOURCE: &str = r#"
 import "time" for TimeCore
