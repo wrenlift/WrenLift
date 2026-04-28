@@ -36,14 +36,41 @@ pub mod browser;
 pub mod js {
     use wasm_bindgen::prelude::*;
 
+    // Shims live on `globalThis` so the embedding page (or worker)
+    // provides them by simple assignment, e.g.
+    //
+    //   globalThis._wlift_fetch = (h, url) => { fetch(url)... };
+    //
+    // before `init()`. No `module = "..."` means we don't have to
+    // ship a separate JS file alongside `pkg/`; the host wires
+    // these up however it likes (inline `<script>`, an external
+    // module, etc.).
     #[wasm_bindgen]
     extern "C" {
-        /// JS-provided shim: `setTimeout(() =>
-        /// wlift_resolve_future(handle, ""), ms)`. Lives in the
-        /// page's bootstrapping script; the wasm-pack template
-        /// adds it next to the standard `init()` glue.
-        #[wasm_bindgen(js_name = _wlift_set_timeout)]
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_set_timeout = (handle, ms) => {
+        ///       setTimeout(() => resolve_future(handle, ""), ms);
+        ///   };
+        ///
+        /// `resolve_future` is exported from this same wasm module
+        /// (`pkg/wlift_wasm.js`); the host imports it and closes
+        /// over it before installing the shim.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_set_timeout)]
         pub fn wlift_set_timeout(handle: u32, ms: f64);
+
+        /// JS-provided shim:
+        ///
+        ///   globalThis._wlift_fetch = (handle, url) => {
+        ///       fetch(url)
+        ///         .then(r => r.text())
+        ///         .then(t => resolve_future(handle, t))
+        ///         .catch(e => reject_future(handle, String(e)));
+        ///   };
+        ///
+        /// Same wiring as `_wlift_set_timeout`.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_fetch)]
+        pub fn wlift_fetch(handle: u32, url: &str);
     }
 }
 

@@ -132,7 +132,30 @@ System.print("sum %(nums) = %(sum)")
   </div>
 
   <script type="module">
-    import init, { version, run, ErrorKind } from "../pkg/wlift_wasm.js";
+    import init, {
+      version,
+      run,
+      ErrorKind,
+      resolve_future,
+      reject_future,
+    } from "../pkg/wlift_wasm.js";
+
+    // Browser-async shims for the Promise ↔ Fiber.yield bridge.
+    // `Browser.setTimeout(ms)` and `Browser.fetch(url)` in Wren
+    // mint a handle on the wasm side, then call into these
+    // functions; we settle the handle with `resolve_future` /
+    // `reject_future` once the underlying Promise settles. The
+    // awaiting Wren fiber's `Fiber.yield` loop notices on its
+    // next tick and resumes.
+    globalThis._wlift_set_timeout = (handle, ms) => {
+      setTimeout(() => resolve_future(handle, ""), ms);
+    };
+    globalThis._wlift_fetch = (handle, url) => {
+      fetch(url)
+        .then((r) => r.text())
+        .then((t) => resolve_future(handle, t))
+        .catch((e) => reject_future(handle, String(e)));
+    };
 
     const statusEl  = document.getElementById("status");
     const versionEl = document.getElementById("version");

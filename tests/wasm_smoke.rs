@@ -130,6 +130,12 @@ fn smoke_runs_under_wasmtime() {
          Promise/Fiber.yield bridge. captured:\n{}",
         captured
     );
+    assert!(
+        captured.contains("fetch: ok"),
+        "Browser.fetch(url).await didn't round-trip a string body \
+         through the bridge. captured:\n{}",
+        captured
+    );
 
     // Quiet `unused` warning on the `Read` import — kept around
     // because earlier iterations of this test piped through a

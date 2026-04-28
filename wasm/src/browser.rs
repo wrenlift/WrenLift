@@ -30,11 +30,16 @@
 //! `Browser` Wren foreign class declared at the bottom of this
 //! file's accompanying Wren source (see `BROWSER_WREN`).
 
-use wren_lift::runtime::object::NativeContext;
+use wren_lift::runtime::object::{NativeContext, ObjString};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
 use crate::{create_pending_future, future_state, future_store_take_value, FutureState};
+// `resolve_future` is only used on the wasi/native fallback path
+// where there's no event loop to wait on. The browser path goes
+// through the `_wlift_*` JS shims instead.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use crate::resolve_future;
 
 // ---------------------------------------------------------------------------
 // Foreign-method shims
@@ -88,6 +93,60 @@ pub unsafe extern "C" fn browser_set_timeout(vm: *mut VM) {
             // is already in place.
             let _ = ms;
             crate::resolve_future(handle, String::new());
+        }
+
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::num(handle as f64));
+        } else {
+            vm_ref.api_stack[0] = Value::num(handle as f64);
+        }
+    }
+}
+
+/// `Browser.fetch(url)` — returns a future handle (Num) that
+/// resolves to the response body (String). Browser path drives a
+/// JS `fetch(url).then(r => r.text())`; wasi path resolves
+/// synchronously with a mock payload so the bridge round-trip can
+/// be exercised end-to-end without a network stack.
+///
+/// # Safety
+///
+/// Foreign-method ABI: reads `url` (String) from slot 1, writes
+/// the handle (or null on bad args) to slot 0.
+pub unsafe extern "C" fn browser_fetch(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let url: String = if arg.is_string_object() {
+            let ptr = arg.as_object().expect("string object pointer");
+            (*(ptr as *const ObjString)).as_str().to_string()
+        } else {
+            vm_ref.runtime_error("Browser.fetch: url must be a String.".to_string());
+            return;
+        };
+        let handle = create_pending_future();
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            // Browser host. The JS shim:
+            //
+            //   export function _wlift_fetch(handle, url) {
+            //       fetch(url)
+            //         .then(r => r.text())
+            //         .then(t => wlift_resolve_future(handle, t))
+            //         .catch(e => wlift_reject_future(handle, String(e)));
+            //   }
+            //
+            // bound via wasm-bindgen `extern "C"` block in lib.rs.
+            crate::js::wlift_fetch(handle, &url);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            // Wasi / native. No fetch implementation — resolve with
+            // a deterministic mock so tests can verify the bridge.
+            // Real HTTP under wasi would need a wasi-http binding;
+            // out of scope for the bridge smoke test.
+            resolve_future(handle, format!("MOCK:{}", url));
         }
 
         if vm_ref.api_stack.is_empty() {
@@ -175,6 +234,7 @@ pub unsafe extern "C" fn browser_take_value(vm: *mut VM) {
 pub fn register_static_symbols() {
     use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
     register_plugin_symbol_unsafe("browser", "browser_set_timeout", browser_set_timeout);
+    register_plugin_symbol_unsafe("browser", "browser_fetch", browser_fetch);
     register_plugin_symbol_unsafe("browser", "browser_peek_state", browser_peek_state);
     register_plugin_symbol_unsafe("browser", "browser_take_value", browser_take_value);
 }
@@ -199,6 +259,8 @@ pub const BROWSER_WREN: &str = r#"
 foreign class BrowserCore {
     #!symbol = "browser_set_timeout"
     foreign static setTimeoutHandle(ms)
+    #!symbol = "browser_fetch"
+    foreign static fetchHandle(url)
     #!symbol = "browser_peek_state"
     foreign static peekState(handle)
     #!symbol = "browser_take_value"
@@ -225,5 +287,6 @@ class Future {
 
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
+    static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
 }
 "#;

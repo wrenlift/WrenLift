@@ -67,6 +67,8 @@ if (err is String && err.contains("does not implement")) {
 foreign class BrowserCore {
     #!symbol = "browser_set_timeout"
     foreign static setTimeoutHandle(ms)
+    #!symbol = "browser_fetch"
+    foreign static fetchHandle(url)
     #!symbol = "browser_peek_state"
     foreign static peekState(handle)
     #!symbol = "browser_take_value"
@@ -90,6 +92,7 @@ class Future {
 }
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
+    static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
 }
 
 var awaitFiber = Fiber.new {
@@ -102,6 +105,21 @@ if (awaitResult == "awaited") {
     System.print("future: ok")
 } else {
     System.print("future: BAD (%(awaitResult))")
+}
+
+// fetch bridge probe. Under wasi the foreign method resolves
+// synchronously with `MOCK:<url>`; under a real browser host the
+// JS `_wlift_fetch` shim does an actual `fetch(url)` and feeds
+// the response body back through the same handle store. The Wren
+// code is identical either way.
+var fetchFiber = Fiber.new {
+    return Browser.fetch("https://example.invalid/api").await
+}
+var fetchResult = fetchFiber.try()
+if (fetchResult == "MOCK:https://example.invalid/api") {
+    System.print("fetch: ok")
+} else {
+    System.print("fetch: BAD (%(fetchResult))")
 }
 "#;
 
