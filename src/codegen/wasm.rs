@@ -139,7 +139,15 @@ impl<'a> MirWasmEmitter<'a> {
                 .function(params.iter().copied(), results.iter().copied());
         }
         let func_type_idx = self.import_list.len() as u32;
-        types.ty().function([], [ValType::I64]); // () -> i64 (NaN-boxed Value)
+        // Compiled function takes one i64 per MIR parameter
+        // (NaN-boxed `Value`s) and returns one i64. Without this
+        // the wasm signature was always `() -> i64`, so block 0's
+        // param locals stayed zero-initialised (default for body
+        // locals) and the JIT'd function effectively saw all
+        // arguments as `Value::from_bits(0)`. Caused wrong-result
+        // bugs once a function with non-zero arity got tier-up'd.
+        let params: Vec<ValType> = (0..self.mir.arity as usize).map(|_| ValType::I64).collect();
+        types.ty().function(params, [ValType::I64]);
         module.section(&types);
 
         // Import section.
@@ -425,9 +433,22 @@ impl<'a> MirWasmEmitter<'a> {
     // -----------------------------------------------------------------------
 
     fn emit_function(&self) -> Result<Function, String> {
-        // Declare locals.
-        let locals: Vec<(u32, ValType)> = self.local_types.iter().map(|t| (1, *t)).collect();
-        let mut func = Function::new(locals);
+        // The first `mir.arity` locals correspond to block 0's
+        // parameters — i.e. the function's wasm parameters.
+        // wasm-encoder's `Function::new` only takes the *body*
+        // locals (everything past the params); the params come
+        // from the type-section signature. Slipping the params
+        // into `Function::new` here would shift all the body
+        // local indices and silently mis-route every MIR
+        // ValueId scan_locals assigned.
+        let arity = self.mir.arity as usize;
+        let body_locals: Vec<(u32, ValType)> = self
+            .local_types
+            .iter()
+            .skip(arity)
+            .map(|t| (1, *t))
+            .collect();
+        let mut func = Function::new(body_locals);
 
         // Emit structured control flow from MIR blocks.
         self.emit_blocks(&mut func)?;
