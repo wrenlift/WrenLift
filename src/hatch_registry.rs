@@ -423,6 +423,7 @@ mod tests {
                 native_libs: std::collections::BTreeMap::new(),
                 native_search_paths: Vec::new(),
                 plugin_source: None,
+                target: None,
             },
             sections: Vec::new(),
         };

@@ -655,6 +655,19 @@ impl VM {
                 return InterpretResult::CompileError;
             }
         };
+        // Refuse cross-family bundles up front — running a wasm-
+        // built hatch on a host runtime (or vice versa) would
+        // succeed for pure-Wren modules but silently break any
+        // `#!native` reference, which is a worse failure mode
+        // than an early reject.
+        let runtime = crate::hatch::current_runtime_target();
+        if let Err(e) = crate::hatch::check_target_compat(
+            hatch.manifest.target.as_deref(),
+            runtime,
+        ) {
+            eprintln!("failed to load hatch: {}", e);
+            return InterpretResult::CompileError;
+        }
         self.install_hatch_sections(&hatch)
     }
 
@@ -871,6 +884,19 @@ impl VM {
                 return InterpretResult::CompileError;
             }
         };
+
+        // Refuse cross-family bundles. Same gate as
+        // `install_hatch_modules` — keep both call sites in lock
+        // step so users see a consistent reject regardless of
+        // whether the CLI or library API loaded the hatch.
+        let runtime = crate::hatch::current_runtime_target();
+        if let Err(e) = crate::hatch::check_target_compat(
+            hatch.manifest.target.as_deref(),
+            runtime,
+        ) {
+            eprintln!("failed to load hatch: {}", e);
+            return InterpretResult::CompileError;
+        }
 
         // Entry module gets no second run; its top-level executes as
         // part of the install loop. `manifest.entry` is effectively an

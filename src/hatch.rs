@@ -161,6 +161,27 @@ pub struct Manifest {
     /// upstream SHA — re-runs reproduce the same bytes.
     #[serde(default, rename = "plugin_source")]
     pub plugin_source: Option<PluginSource>,
+    /// Target triple this hatch was built for. `None` (the default
+    /// for older hatches) means "host target" — preserves the
+    /// pre-target-aware behavior. When set, the loader checks the
+    /// triple matches its own runtime; mismatched bundles refuse
+    /// to load with `HatchError::WrongTarget`.
+    ///
+    /// Recognised values:
+    ///   * Any concrete triple (`x86_64-apple-darwin`,
+    ///     `wasm32-unknown-unknown`, `wasm32-wasip1`, etc.).
+    ///   * `wasm32` — a family marker that matches any
+    ///     `wasm32-*` runtime (so a single bundle works on both
+    ///     `unknown-unknown` and `wasi`).
+    ///
+    /// For `wasm32-*` targets, `pack_bundled_native_libs` skips
+    /// shipping `.dylib`/`.so` bytes — wasm runtimes use
+    /// statically-linked plugins (cf. `wlift_wasm`'s
+    /// `register_static_plugins`), and a wasm hatch's native_libs
+    /// list is treated as a *required* set the runtime must
+    /// already carry, not a build-time bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// Tells CI how to build this package's native library from an
@@ -422,6 +443,13 @@ pub enum HatchError {
     /// Loader refused to run the hatch (e.g. it carried a `NativeLib`
     /// section and this build didn't enable native-lib support yet).
     Unsupported(String),
+    /// Hatch was built for a different target than the runtime
+    /// loading it. Carries the bundle's declared target and the
+    /// runtime's expected target so the message is actionable.
+    WrongTarget {
+        bundle: String,
+        runtime: String,
+    },
     Io(std::io::Error),
     Encode(String),
 }
@@ -446,6 +474,11 @@ impl std::fmt::Display for HatchError {
             HatchError::ManifestMissing => write!(f, "hatch has no manifest section"),
             HatchError::ManifestParse(e) => write!(f, "hatch.toml parse failed: {e}"),
             HatchError::Unsupported(s) => write!(f, "unsupported: {s}"),
+            HatchError::WrongTarget { bundle, runtime } => write!(
+                f,
+                "hatch built for target '{bundle}' but this runtime is '{runtime}' — \
+                 rebuild with `--target {runtime}` (or matching family)"
+            ),
             HatchError::Io(e) => write!(f, "io: {e}"),
             HatchError::Encode(e) => write!(f, "encode: {e}"),
         }
@@ -672,8 +705,118 @@ pub fn build_from_source_tree_with_cache(
     root: &Path,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
+    build_from_source_tree_for_target(root, cache_dir, None)
+}
+
+/// Most-flexible builder entry point — same as
+/// `build_from_source_tree_with_cache`, plus an optional target
+/// triple to stamp into the manifest. `None` means "host target"
+/// (legacy behaviour). For `wasm32-*` triples,
+/// `pack_bundled_native_libs` skips packing `.dylib`/`.so` bytes
+/// because wasm runtimes don't dlopen anything; the manifest's
+/// `[native_libs]` declarations stay as a *requirement list* the
+/// receiving runtime must satisfy via statically-linked plugins.
+pub fn build_from_source_tree_for_target(
+    root: &Path,
+    cache_dir: Option<&Path>,
+    target: Option<&str>,
+) -> Result<Vec<u8>, HatchError> {
     let mut state = BuildState::default();
-    build_recursive(root, &mut state, cache_dir)
+    let mut bytes = build_recursive(root, &mut state, cache_dir)?;
+    if target.is_some() {
+        // Re-stamp the manifest's `target` field. Cheaper to
+        // decode/re-encode the whole hatch than to thread `target`
+        // through every layer of `build_recursive` — this only
+        // runs once per top-level build, not per dependency.
+        let mut hatch = load(&bytes)?;
+        hatch.manifest.target = target.map(|s| s.to_string());
+        // For wasm targets, drop any NativeLib sections that
+        // `pack_bundled_native_libs` may have packed before we
+        // knew the target. The wasm runtime ignores them anyway,
+        // and shipping x86_64 dylibs in a wasm hatch wastes
+        // bytes + confuses `--inspect`.
+        if is_wasm_target(target) {
+            hatch
+                .sections
+                .retain(|s| !matches!(s.kind, SectionKind::NativeLib));
+        }
+        bytes = emit(&hatch)?;
+    }
+    Ok(bytes)
+}
+
+/// True iff `target` is a wasm32 family triple. `wasm32` (bare)
+/// is the family marker; `wasm32-unknown-unknown` /
+/// `wasm32-wasip1` etc. are concrete triples within it. Matched
+/// by prefix so future wasm32 sub-triples don't need a code
+/// change.
+pub fn is_wasm_target(target: Option<&str>) -> bool {
+    matches!(target, Some(t) if t == "wasm32" || t.starts_with("wasm32-"))
+}
+
+/// Family bucket a target triple falls into. Hatches are
+/// loadable on any runtime within the same family — a
+/// `wasm32-unknown-unknown` build runs on a `wasm32-wasip1`
+/// runtime (same wlbc, same statically-linked plugin set), and a
+/// `x86_64-apple-darwin` build runs on `aarch64-apple-darwin`
+/// (same wlbc, same dlopen path). Cross-family mismatch is the
+/// only thing that errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFamily {
+    /// `wasm32` (family marker) and any `wasm32-*` concrete triple.
+    Wasm32,
+    /// Any host-native triple — `x86_64-*`, `aarch64-*`, etc.
+    Native,
+}
+
+/// Bucket a triple into a [`TargetFamily`]. `wasm32` and
+/// `wasm32-*` map to `Wasm32`; everything else maps to `Native`.
+pub fn target_family(target: &str) -> TargetFamily {
+    if target == "wasm32" || target.starts_with("wasm32-") {
+        TargetFamily::Wasm32
+    } else {
+        TargetFamily::Native
+    }
+}
+
+/// True iff the `bundle` target is loadable on a runtime built
+/// for `runtime`. Compatibility rules:
+///
+///   * `bundle == None` (target-agnostic / legacy hatches) — accepted everywhere.
+///   * Same family — accepted (see `target_family`).
+///   * Different family — `WrongTarget` error.
+pub fn check_target_compat(
+    bundle: Option<&str>,
+    runtime: &str,
+) -> Result<(), HatchError> {
+    let Some(bundle) = bundle else {
+        return Ok(());
+    };
+    if target_family(bundle) == target_family(runtime) {
+        return Ok(());
+    }
+    Err(HatchError::WrongTarget {
+        bundle: bundle.to_string(),
+        runtime: runtime.to_string(),
+    })
+}
+
+/// The target the current binary is running under. Family
+/// markers (`"wasm32"`, `"native"`) rather than full triples —
+/// the family is what compat checks against, and we don't have
+/// a build.rs to capture the concrete triple. Concrete triples
+/// can still be *stamped into bundles* via `--target`; the
+/// loader's `check_target_compat` family-matches them against
+/// this string at install time.
+pub fn current_runtime_target() -> &'static str {
+    #[cfg(target_arch = "wasm32")]
+    {
+        "wasm32"
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        "native"
+    }
 }
 
 /// Per-recursion build state. `active` is the in-progress recursion
@@ -776,6 +919,7 @@ fn build_recursive(
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
     };
 
@@ -1219,6 +1363,7 @@ mod tests {
                 native_libs: BTreeMap::new(),
                 native_search_paths: Vec::new(),
                 plugin_source: None,
+                target: None,
             },
             sections: vec![
                 Section {
@@ -1941,5 +2086,102 @@ notes = "hello"
         ))
         .expect("parse");
         assert_eq!(m.native_libs["mystery"].resolve_for("macos", "arm64"), None);
+    }
+
+    #[test]
+    fn target_family_buckets_correctly() {
+        assert_eq!(target_family("wasm32"), TargetFamily::Wasm32);
+        assert_eq!(target_family("wasm32-unknown-unknown"), TargetFamily::Wasm32);
+        assert_eq!(target_family("wasm32-wasip1"), TargetFamily::Wasm32);
+        assert_eq!(target_family("x86_64-apple-darwin"), TargetFamily::Native);
+        assert_eq!(target_family("aarch64-unknown-linux-gnu"), TargetFamily::Native);
+        assert_eq!(target_family("native"), TargetFamily::Native);
+    }
+
+    #[test]
+    fn check_target_compat_accepts_legacy_and_same_family() {
+        // Legacy bundle (no target stamp) — accepted everywhere.
+        assert!(check_target_compat(None, "native").is_ok());
+        assert!(check_target_compat(None, "wasm32").is_ok());
+
+        // Same family — concrete triple loadable on the family marker.
+        assert!(check_target_compat(Some("wasm32-unknown-unknown"), "wasm32").is_ok());
+        assert!(check_target_compat(Some("wasm32"), "wasm32-wasip1").is_ok());
+        assert!(check_target_compat(Some("x86_64-apple-darwin"), "native").is_ok());
+
+        // Cross-family — rejected.
+        let err = check_target_compat(Some("wasm32-unknown-unknown"), "native")
+            .expect_err("wasm bundle on native runtime should reject");
+        assert!(matches!(err, HatchError::WrongTarget { .. }));
+        let err = check_target_compat(Some("x86_64-apple-darwin"), "wasm32")
+            .expect_err("native bundle on wasm runtime should reject");
+        assert!(matches!(err, HatchError::WrongTarget { .. }));
+    }
+
+    #[test]
+    fn build_for_wasm_target_strips_native_lib_sections_and_stamps_manifest() {
+        // Reuse `build_packs_relative_native_libs_and_strips_manifest_entry`'s
+        // setup but call the target-aware builder. The wasm path
+        // should drop the NativeLib section that the host pack pass
+        // would have produced.
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let lib_dir = root.join("libs");
+        std::fs::create_dir(&lib_dir).expect("libs/");
+        let mut f = std::fs::File::create(lib_dir.join("openssl.dylib")).expect("create dylib");
+        f.write_all(b"FAKE_DYLIB").expect("write dylib");
+        std::fs::write(
+            root.join("hatchfile"),
+            r#"
+name = "wasm-target-test"
+version = "0.1.0"
+entry = "main"
+
+[native_libs]
+openssl = "libs/openssl.dylib"
+"#,
+        )
+        .expect("hatchfile");
+        std::fs::write(root.join("main.wren"), "System.print(\"hi\")").expect("main.wren");
+
+        let bytes = build_from_source_tree_for_target(root, None, Some("wasm32-unknown-unknown"))
+            .expect("build wasm-targeted hatch");
+        let hatch = load(&bytes).expect("decode wasm hatch");
+
+        assert_eq!(
+            hatch.manifest.target.as_deref(),
+            Some("wasm32-unknown-unknown"),
+            "manifest should record the build target"
+        );
+        let has_native = hatch
+            .sections
+            .iter()
+            .any(|s| matches!(s.kind, SectionKind::NativeLib));
+        assert!(
+            !has_native,
+            "wasm target should not pack host-native dylib bytes"
+        );
+    }
+
+    #[test]
+    fn install_target_mismatch_returns_wrong_target() {
+        // A manifest stamped with a wasm target should be rejected
+        // by `check_target_compat` against a "native" runtime.
+        let mut hatch = sample();
+        hatch.manifest.target = Some("wasm32-unknown-unknown".to_string());
+        let bytes = emit(&hatch).expect("encode");
+        let decoded = load(&bytes).expect("decode");
+        assert_eq!(decoded.manifest.target.as_deref(), Some("wasm32-unknown-unknown"));
+        let err = check_target_compat(decoded.manifest.target.as_deref(), "native")
+            .expect_err("cross-family should reject");
+        match err {
+            HatchError::WrongTarget { bundle, runtime } => {
+                assert_eq!(bundle, "wasm32-unknown-unknown");
+                assert_eq!(runtime, "native");
+            }
+            e => panic!("unexpected error: {:?}", e),
+        }
     }
 }

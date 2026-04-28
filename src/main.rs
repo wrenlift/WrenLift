@@ -89,6 +89,19 @@ struct Cli {
     #[arg(long, value_name = "OUT_PATH")]
     bundle: Option<String>,
 
+    /// Target triple for `--bundle`. Defaults to host-family
+    /// (recorded as `target = "native"` in the manifest). Pass
+    /// `wasm32` (family marker) or a concrete `wasm32-*` triple
+    /// (e.g. `wasm32-unknown-unknown`, `wasm32-wasip1`) to
+    /// produce a hatch loadable by the wasm runtime; the builder
+    /// skips packing host `.dylib`/`.so` bytes for those targets
+    /// since wasm runtimes use statically-linked plugins.
+    /// Loader-side `check_target_compat` rejects cross-family
+    /// mismatches at install time. Distinct from `--target`
+    /// (which selects the codegen backend for direct execution).
+    #[arg(long, value_name = "TRIPLE", requires = "bundle")]
+    bundle_target: Option<String>,
+
     /// Print the manifest + section listing of a `.hatch` package and
     /// exit without running. Accepts the positional `file` argument
     /// as the hatch path.
@@ -727,7 +740,11 @@ fn build_bytecode_cache(source: &str, filename: &str, out_path: &str, cli: &Cli)
 
 /// Walk a source tree, compile every `.wren` file, write the result
 /// as a `.hatch` package. `root` is the positional `file` argument.
-fn build_hatch_package(root: &str, out_path: &str) {
+/// `target` (when `Some`) is stamped into the manifest's `target`
+/// field and gates wasm-specific build behavior (skip packing
+/// host `.dylib`/`.so` bytes); `None` preserves legacy behavior
+/// (target-agnostic bundle).
+fn build_hatch_package(root: &str, out_path: &str, target: Option<&str>) {
     let root_path = std::path::PathBuf::from(root);
     if !root_path.is_dir() {
         eprintln!(
@@ -736,7 +753,11 @@ fn build_hatch_package(root: &str, out_path: &str) {
         );
         process::exit(1);
     }
-    let bytes = match wren_lift::hatch::build_from_source_tree(&root_path) {
+    let bytes = match wren_lift::hatch::build_from_source_tree_for_target(
+        &root_path,
+        None,
+        target,
+    ) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -747,7 +768,14 @@ fn build_hatch_package(root: &str, out_path: &str) {
         eprintln!("error: cannot write '{}': {}", out_path, e);
         process::exit(1);
     }
-    eprintln!("bundled {} bytes from {} → {}", bytes.len(), root, out_path);
+    let target_note = target.map(|t| format!(" [target={}]", t)).unwrap_or_default();
+    eprintln!(
+        "bundled {} bytes from {} → {}{}",
+        bytes.len(),
+        root,
+        out_path,
+        target_note
+    );
 }
 
 /// Parse a `.hatch` byte stream and print its manifest + section
@@ -860,7 +888,7 @@ fn main() {
             // tree root rather than a file — resolve it before the
             // file-read path below.
             if let Some(out_path) = &cli.bundle {
-                build_hatch_package(filename, out_path);
+                build_hatch_package(filename, out_path, cli.bundle_target.as_deref());
                 return;
             }
 

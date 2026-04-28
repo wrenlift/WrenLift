@@ -3556,6 +3556,7 @@ System.print("main says %(c.count)")
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
@@ -3608,6 +3609,7 @@ fn e2e_hatch_rejects_missing_entry_module() {
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
         sections: vec![],
     };
@@ -3663,6 +3665,7 @@ System.print(g.hello)
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
         sections: vec![
             Section {
@@ -3737,6 +3740,7 @@ System.print(c.value)
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
@@ -3765,6 +3769,7 @@ System.print(c.value)
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
@@ -3824,6 +3829,7 @@ fn e2e_hatch_extracts_native_lib_sections_to_disk() {
             native_libs: BTreeMap::new(),
             native_search_paths: Vec::new(),
             plugin_source: None,
+            target: None,
         },
         sections: vec![
             Section {
@@ -4028,6 +4034,7 @@ fn e2e_hatch_manifest_applies_native_search_paths_and_overrides() {
             native_libs,
             native_search_paths: vec!["/opt/homebrew/lib".to_string()],
             plugin_source: None,
+            target: None,
         },
         sections: vec![Section {
             kind: SectionKind::Wlbc,
