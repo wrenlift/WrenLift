@@ -30,19 +30,31 @@
     }
 
     /* Page is one big grid: header / banner / panes / footer.
-       The banner row is `auto`, so when its child is hidden
-       (`display: none`) it collapses to zero — main keeps the
-       full `1fr`. */
+       Areas are pinned by name so `display: none` on the banner
+       doesn't trigger CSS Grid auto-placement reflow — without
+       this, hiding the banner pushes `main` into the `auto`
+       row and footer takes the `1fr`, leaving a huge empty gap
+       above the footer. */
     .layout {
       display: grid;
       grid-template-rows: auto auto 1fr auto;
+      grid-template-areas:
+        "header"
+        "banner"
+        "main"
+        "footer";
       height: 100vh;
     }
+    header  { grid-area: header; }
+    .banner { grid-area: banner; }
+    main    { grid-area: main; }
+    footer  { grid-area: footer; }
 
     header, footer {
       padding: 10px 16px;
       display: flex; align-items: center; gap: 12px;
       background: var(--panel);
+      height: fit-content;
     }
     header { border-bottom: 1px solid var(--rule); }
     footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
@@ -70,10 +82,16 @@
     .pill.ok    { color: var(--good); }
     .pill.error { color: var(--bad); }
 
-    /* jsbin-style 3-column grid: HTML | Wren | Output (stage + console). */
+    /* jsbin-style 3-column grid: HTML | Wren | Output (stage + console).
+       Explicit single 1fr row so the sections stretch to fill
+       main's height. Without this, the implicit auto row sized
+       to its content (≈ pane-header), and the textareas/console
+       got `flex: 1` of zero. Result: tiny panes + huge empty
+       space above footer. */
     main {
       display: grid;
       grid-template-columns: 1fr 1.2fr 1fr;
+      grid-template-rows: minmax(0, 1fr);
       gap: 1px;
       background: var(--rule);
       overflow: hidden;
