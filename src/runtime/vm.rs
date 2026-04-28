@@ -4052,10 +4052,49 @@ impl VM {
             }
             let n = ctor_args.len() + 1;
             let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+            // Swap JitContext.module_vars to the callee's defining
+            // module before entering its JIT'd body. The body's
+            // `GetModuleVar @N` ops resolve against whatever
+            // `module_vars` is currently published — without this
+            // swap they hit the *caller's* slot table, which is a
+            // different module's variables. Concretely: a `main`
+            // function calling `Camera2D.new(...)` (in
+            // `@hatch:gpu`) leaves the constructor body reading
+            // `Vec3` from main's slot N — main doesn't import
+            // `Vec3`, so the slot is undefined and the JIT'd body
+            // produces `_origin = null` even though the BC version
+            // works fine. The other JIT entry points
+            // (`call_jit_with_shadow`, the BC interpreter's
+            // `Method::Closure` JIT-leaf path) already do this
+            // swap; the constructor path was missing it.
+            let callee_module = self.engine.func_module(func_id);
+            let (callee_mv_ptr, callee_mv_count, callee_name_ptr, callee_name_len) =
+                match callee_module {
+                    Some(mn) => {
+                        let bytes = mn.as_bytes();
+                        let (mv_ptr, mv_count) = self
+                            .engine
+                            .modules
+                            .get(mn.as_str())
+                            .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
+                            .unwrap_or((std::ptr::null_mut(), 0));
+                        (mv_ptr, mv_count, bytes.as_ptr(), bytes.len() as u32)
+                    }
+                    None => (
+                        saved_ctx.module_vars,
+                        saved_ctx.module_var_count,
+                        saved_ctx.module_name,
+                        saved_ctx.module_name_len,
+                    ),
+                };
             crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                 ctx.current_func_id = func_id.0 as u64;
                 ctx.closure = closure_ptr as *mut u8;
                 ctx.defining_class = class_ptr as *mut u8;
+                ctx.module_vars = callee_mv_ptr;
+                ctx.module_var_count = callee_mv_count;
+                ctx.module_name = callee_name_ptr;
+                ctx.module_name_len = callee_name_len;
             });
             self.engine.note_native_entry(func_id);
             // Use call_jit_fn which sets x20 (JitContext pointer).
