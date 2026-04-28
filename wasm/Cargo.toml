@@ -13,6 +13,13 @@ crate-type = ["cdylib", "rlib"]
 # can still emit modules from inside this build.
 wren_lift = { path = "..", default-features = false }
 wasm-bindgen = "0.2"
+# Async wasm-bindgen exports — `pub async fn` becomes a JS
+# Promise-returning function. The scheduler in `lib.rs::run`
+# uses this to yield to the JS event loop between draining
+# parked Wren fibers, so async bridges (Browser.fetch /
+# setTimeout / WebSocket) actually settle their futures.
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 
 # Plugins statically linked into the wasm runtime. Each one
 # exposes a `register_static_symbols()` that publishes its

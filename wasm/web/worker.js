@@ -156,29 +156,33 @@ self.addEventListener("message", (e) => {
   const msg = e.data;
   if (msg.cmd === "run") {
     const { id, source } = msg;
+    // `run` is async — it returns a Promise that resolves
+    // once the scheduler loop has drained any parked fibers
+    // (i.e. once Browser.fetch / setTimeout / WebSocket / etc.
+    // have had a chance to settle).
     const t0 = performance.now();
-    let result;
-    try {
-      result = run(source);
-    } catch (err) {
-      self.postMessage({
-        cmd: "result",
-        id,
-        output: String(err),
-        ok: false,
-        errorKind: -1,
-        elapsedMs: performance.now() - t0,
-      });
-      return;
-    }
-    self.postMessage({
-      cmd: "result",
-      id,
-      output: result.output,
-      ok: result.ok,
-      errorKind: result.errorKind,
-      elapsedMs: performance.now() - t0,
-    });
+    run(source).then(
+      (result) => {
+        self.postMessage({
+          cmd: "result",
+          id,
+          output: result.output,
+          ok: result.ok,
+          errorKind: result.errorKind,
+          elapsedMs: performance.now() - t0,
+        });
+      },
+      (err) => {
+        self.postMessage({
+          cmd: "result",
+          id,
+          output: String(err),
+          ok: false,
+          errorKind: -1,
+          elapsedMs: performance.now() - t0,
+        });
+      },
+    );
   } else if (msg.cmd === "dom-result") {
     // Main thread completed a `dom-op`; settle the future from
     // here so the awaiting Wren fiber wakes on its next yield.

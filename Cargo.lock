@@ -6305,7 +6305,9 @@ name = "wlift_wasm"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "js-sys",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-time",
  "wlift_image",
  "wren_lift",

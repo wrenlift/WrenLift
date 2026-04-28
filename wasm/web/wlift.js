@@ -224,29 +224,34 @@ class MainWlift {
     return this;
   }
 
-  run(source) {
+  async run(source) {
+    // `_mod.run` is `pub async fn` on the Rust side, so it
+    // returns a Promise. `await` it so the scheduler loop
+    // (which drains parked fibers across `await` points) gets
+    // to drive async bridges to completion before we hand back
+    // a result.
     const t0 = performance.now();
     let result;
     try {
-      result = this._mod.run(source);
+      result = await this._mod.run(source);
     } catch (err) {
-      return Promise.resolve({
+      return {
         cmd: "result",
         output: String(err),
         ok: false,
         errorKind: -1,
         elapsedMs: performance.now() - t0,
-      });
+      };
     }
     // Same shape as the worker reply so the UI doesn't have to
     // care which mode it's talking to.
-    return Promise.resolve({
+    return {
       cmd: "result",
       output: result.output,
       ok: result.ok,
       errorKind: result.errorKind,
       elapsedMs: performance.now() - t0,
-    });
+    };
   }
 
   get memory() { return this._memory; }

@@ -162,6 +162,52 @@ pub unsafe extern "C" fn browser_fetch(vm: *mut VM) {
     }
 }
 
+/// `Future.await`'s scheduler hook — captures the currently-
+/// executing fiber so the host-side scheduler can resume it
+/// once the awaited future settles. Called from Wren just
+/// before each `Fiber.yield` in the `await` loop:
+///
+///   await {
+///       while (state == 0) {
+///           BrowserCore.parkSelf(_h)
+///           Fiber.yield()
+///       }
+///       ...
+///   }
+///
+/// The fiber must stay GC-rooted by Wren-side code (typically
+/// the `var f = Fiber.new {…}` reference the user holds).
+/// The scheduler only stores a raw pointer; it doesn't add a
+/// new GC root.
+///
+/// # Safety
+///
+/// Reads `handle` (Num) from slot 1; writes `null` to slot 0.
+pub unsafe extern "C" fn browser_park_self(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let handle = match arg.as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 => n as u32,
+            _ => {
+                vm_ref.runtime_error(
+                    "Browser.parkSelf: handle must be a non-negative integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let fiber = vm_ref.fiber;
+        if !fiber.is_null() {
+            crate::park_fiber(fiber, handle);
+        }
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::null());
+        } else {
+            vm_ref.api_stack[0] = Value::null();
+        }
+    }
+}
+
 /// `Browser.peekState(handle)` — returns the future's current
 /// state as a Num: 0 pending / 1 resolved / 2 rejected. Used by
 /// `Future.await`'s `Fiber.yield` loop.
@@ -405,6 +451,7 @@ pub fn register_static_symbols() {
     register_plugin_symbol_unsafe("browser", "browser_ws_close", browser_ws_close);
     register_plugin_symbol_unsafe("browser", "browser_peek_state", browser_peek_state);
     register_plugin_symbol_unsafe("browser", "browser_take_value", browser_take_value);
+    register_plugin_symbol_unsafe("browser", "browser_park_self", browser_park_self);
 }
 
 // ---------------------------------------------------------------------------

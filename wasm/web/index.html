@@ -199,12 +199,11 @@
     </header>
 
     <div id="banner" class="banner hidden">
-      worker mode: async bridges (<code>Browser.fetch</code>,
+      worker mode: scheduler drives parked fibers across event-
+      loop turns, so async bridges (<code>Browser.fetch</code>,
       <code>Browser.setTimeout</code>, <code>Browser.connect</code>,
-      <code>Dom.*</code>) won't resume after their first
-      <code>Fiber.yield</code> — top-level await scheduler isn't
-      wired yet. Switch to <strong>main thread</strong> for the DOM
-      demo. Worker mode still runs sync compute fine.
+      <code>Dom.*</code>) now resume to completion. UI stays
+      responsive on long compute / awaits.
     </div>
 
     <main>
@@ -218,19 +217,22 @@
 
       <section>
         <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
-        <textarea id="src" spellcheck="false">// `Future`, `Browser`, `WebSocket`, `Dom` are loaded by the
-// runtime — no boilerplate needed. Read & write the stage's
-// DOM directly:
+        <textarea id="src" spellcheck="false">// `Future`, `Browser`, `WebSocket`, `Dom`, `LocalStorage` are
+// loaded by the runtime — no boilerplate needed. Async bridges
+// resume through the scheduler in both modes; print *inside*
+// the fiber so results land in the output pane.
 
 var fiber = Fiber.new {
-  var before = Dom.text("#title").await
+  System.print("before: %(Dom.text("#title").await)")
+  Browser.setTimeout(150).await
   Dom.setText("#title", "rewritten by wren").await
-  Dom.setText("#msg", "before was: %(before)").await
-  return "ok"
+  Dom.setText("#msg", "scheduler resumed me after 150ms").await
+  Dom.addClass("#title", "dim").await
+  System.print("done")
 }
-System.print("dom roundtrip: %(fiber.try())")
+fiber.try()
 
-// Compute is fine on the worker — UI doesn't freeze.
+// Compute too — runs straight through, no async needed.
 var fib
 fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
 System.print("fib(20) = %(fib.call(20))")

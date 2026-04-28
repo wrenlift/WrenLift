@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 use wren_lift::runtime::engine::{ExecutionMode, InterpretResult};
+use wren_lift::runtime::object::ObjFiber;
 use wren_lift::runtime::vm::{VMConfig, VM};
 
 pub mod browser;
@@ -241,6 +242,55 @@ pub fn create_pending_future() -> u32 {
         },
     );
     handle
+}
+
+// ---------------------------------------------------------------------------
+// Parked fiber store (Phase 1.3 — top-level await scheduler)
+// ---------------------------------------------------------------------------
+//
+// `Future.await` calls `BrowserCore.parkSelf(handle)` before each
+// `Fiber.yield`. The foreign method captures `vm.fiber` and
+// pushes `(fiber_ptr, handle)` here. After `vm.interpret`
+// returns, the async `run()` loop snapshots this list, picks the
+// entries whose handles have settled, and resumes them via
+// `vm_interp::run_fiber`. Between drains it `await`s a microtask
+// so the JS event loop can fire pending Promise callbacks.
+//
+// **GC rooting:** the raw `*mut ObjFiber` here is *not* a GC
+// root. Callers rely on the Wren-side `var` reference the user
+// holds (`var f = Fiber.new {…}`) keeping the fiber alive across
+// the parked window. If a fiber drops out of all Wren scopes
+// while still parked the resume is undefined behaviour. In
+// practice, fibers ARE held by `var` declarations because the
+// host needs the handle to call `.try()` in the first place.
+//
+// `*mut ObjFiber` isn't `Send` by default; we wrap it in a
+// `ParkedFiber` and add an `unsafe impl Send` since wasm32 is
+// single-threaded — the `Mutex` exists for `OnceLock` interior
+// mutability, not actual cross-thread synchronisation.
+
+struct ParkedFiber {
+    fiber: *mut ObjFiber,
+    handle: u32,
+}
+// SAFETY: wasm32 is single-threaded. The pointer is dereferenced
+// only on the same thread that pushed it, inside the
+// scheduler's resume call. Real cross-thread Send would need GC
+// rooting + atomic state.
+unsafe impl Send for ParkedFiber {}
+
+fn parked_fibers() -> &'static Mutex<Vec<ParkedFiber>> {
+    static PARKED: std::sync::OnceLock<Mutex<Vec<ParkedFiber>>> = std::sync::OnceLock::new();
+    PARKED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Internal — `browser_park_self` calls this. Pushes the current
+/// fiber + the handle it's awaiting onto the parked list.
+pub fn park_fiber(fiber: *mut ObjFiber, handle: u32) {
+    parked_fibers()
+        .lock()
+        .expect("parked fiber list poisoned")
+        .push(ParkedFiber { fiber, handle });
 }
 
 /// JS-callable: flip a handle to `Resolved` and stash the value.
@@ -598,6 +648,8 @@ foreign class BrowserCore {
     foreign static peekState(handle)
     #!symbol = "browser_take_value"
     foreign static takeValue(handle)
+    #!symbol = "browser_park_self"
+    foreign static parkSelf(handle)
 }
 #!native = "dom"
 foreign class DomCore {
@@ -626,7 +678,16 @@ class Future {
         // a subsequent `peekState` on a missing handle reports
         // Rejected, which would mis-fire `Fiber.abort` on a
         // resolved Future.
-        while (state == 0) Fiber.yield()
+        //
+        // `parkSelf` registers the current fiber + handle with
+        // the host's scheduler so it can resume us once the
+        // future settles. Has to come BEFORE `Fiber.yield` —
+        // after the yield, control's already with the host and
+        // we'd never get a chance to register.
+        while (state == 0) {
+            BrowserCore.parkSelf(_h)
+            Fiber.yield()
+        }
         var settled = state
         var v = BrowserCore.takeValue(_h)
         if (settled == 2) Fiber.abort(v == null ? "Future rejected" : v)
@@ -689,22 +750,31 @@ pub fn prelude_line_count() -> u32 {
 /// Compile + interpret a Wren source string. Output captured into
 /// the returned `RunResult`. The VM lives only for the duration
 /// of this call — every `run` is a fresh interpreter, no shared
-/// state across calls. (A multi-call API that holds onto a `VM`
-/// instance lands in Phase 1.1.)
+/// state across calls.
+///
+/// `run` is **async** so async foreign methods (`Browser.fetch`,
+/// `Browser.setTimeout`, `Browser.connect`, cross-thread `Dom.*`)
+/// actually settle their futures: after the user's source runs
+/// once, any fiber parked on a still-pending future gets
+/// resumed by the scheduler loop below. Each loop iteration
+/// `await`s a JS microtask so pending Promises can fire their
+/// `.then` callbacks (which call `resolve_future` / `reject_future`),
+/// then resumes every parked fiber whose handle has settled.
 ///
 /// The browser prelude (`Future` / `Browser` / `WebSocket` /
-/// `Dom`) is prepended to every source so callers don't have to
-/// inline the shim boilerplate. See `BROWSER_PRELUDE` above.
+/// `Dom` / `LocalStorage` / …) is prepended to every source so
+/// callers don't have to inline the shim boilerplate. See
+/// `BROWSER_PRELUDE` above.
 #[wasm_bindgen]
-pub fn run(source: &str) -> RunResult {
-    use std::sync::{Arc, Mutex};
+pub async fn run(source: &str) -> RunResult {
+    use std::sync::{Arc, Mutex as StdMutex};
 
     // Capture compile + runtime diagnostics into the same stream
     // we hand back as `output`. Without this, errors land on the
     // wasm `eprintln!` path — which in a browser is the devtools
     // console, *not* the page's output pane. Caller couldn't see
     // why a script failed.
-    let diagnostics = Arc::new(Mutex::new(String::new()));
+    let diagnostics = Arc::new(StdMutex::new(String::new()));
     let diag_capture = diagnostics.clone();
 
     let mut config = VMConfig {
@@ -722,8 +792,104 @@ pub fn run(source: &str) -> RunResult {
     let mut vm = VM::new(config);
     vm.output_buffer = Some(String::new());
 
+    // Wipe any leftover parked fibers from a prior `run()` —
+    // those fibers belong to a now-dropped VM and the pointers
+    // are invalid.
+    parked_fibers()
+        .lock()
+        .expect("parked fiber list poisoned")
+        .clear();
+
     let combined = format!("{}\n{}", BROWSER_PRELUDE, source);
     let result = vm.interpret("main", &combined);
+
+    // Scheduler loop. Drives parked fibers across JS event-loop
+    // turns until either the parked list is empty or no fiber
+    // makes progress in a tick (which would mean every still-
+    // parked future is permanently pending — likely a logic bug
+    // in user code, but better to bail than spin forever).
+    //
+    // Budget caps total ticks so a runaway loop can't lock the
+    // page. Reasonable user programs settle in single-digit
+    // iterations; the cap is generous so heavily-async programs
+    // (e.g. a chat that awaits many WebSocket messages) still
+    // complete.
+    if matches!(result, InterpretResult::Success) {
+        let mut tick_budget: u32 = 10_000;
+        loop {
+            if tick_budget == 0 {
+                break;
+            }
+            tick_budget -= 1;
+
+            // Yield to the JS event loop so any pending Promises
+            // can fire their resolve/reject callbacks. After this
+            // `await`, parked fibers' futures may have settled.
+            let p = js_sys::Promise::resolve(&JsValue::UNDEFINED);
+            let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+
+            // Snapshot the parked list, partition into ready vs.
+            // still-pending, and resume the ready ones. New
+            // entries pushed during resume (a fiber that awaits
+            // again) accumulate into the live list.
+            let parked =
+                std::mem::take(&mut *parked_fibers().lock().expect("parked fiber list poisoned"));
+            if parked.is_empty() {
+                break;
+            }
+
+            let mut still_parked = Vec::new();
+            let mut resumed_any = false;
+            for entry in parked {
+                let state = future_store()
+                    .lock()
+                    .expect("future store poisoned")
+                    .get(&entry.handle)
+                    .map(|s| s.state)
+                    .unwrap_or(FutureState::Rejected);
+
+                if state == FutureState::Pending {
+                    still_parked.push(entry);
+                    continue;
+                }
+
+                // Resume the parked fiber. `vm_interp::run_fiber`
+                // executes whatever fiber is currently in
+                // `vm.fiber` until it yields or returns.
+                vm.fiber = entry.fiber;
+                let _ = wren_lift::runtime::vm_interp::run_fiber(&mut vm);
+                resumed_any = true;
+            }
+
+            // Re-park anything still pending. New fibers pushed
+            // by the resumes above (re-await on a different
+            // handle) are already in the live list.
+            parked_fibers()
+                .lock()
+                .expect("parked fiber list poisoned")
+                .extend(still_parked);
+
+            if !resumed_any
+                && parked_fibers()
+                    .lock()
+                    .expect("parked fiber list poisoned")
+                    .iter()
+                    .all(|e| {
+                        future_store()
+                            .lock()
+                            .expect("future store poisoned")
+                            .get(&e.handle)
+                            .is_none_or(|s| s.state == FutureState::Pending)
+                    })
+            {
+                // Deadlock-style: all remaining parked fibers
+                // are waiting on futures nothing's going to
+                // settle. Bail rather than spin.
+                break;
+            }
+        }
+    }
+
     let mut output = vm.take_output();
 
     // Drain the diagnostic stream, strip ANSI colour codes, and
