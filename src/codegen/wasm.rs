@@ -977,9 +977,7 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::I32Eqz);
                 // Branch typed `(result i64)` so both arms must
                 // leave an i64 on the stack.
-                func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(
-                    ValType::I64,
-                )));
+                func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(ValType::I64)));
                 {
                     // -- Slow path: call wren_call_<n>_slow(receiver, method_id, args...) --
                     func.instruction(&WasmInst::LocalGet(self.local(*receiver)));

@@ -517,9 +517,7 @@ pub fn wren_jit_slot_plus_one(receiver_bits: u64) -> u32 {
     }
     let ptr = receiver.as_object().unwrap();
     let header = ptr as *const wren_lift::runtime::object::ObjHeader;
-    let is_closure = unsafe {
-        (*header).obj_type == wren_lift::runtime::object::ObjType::Closure
-    };
+    let is_closure = unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
     if !is_closure {
         return 0;
     }
