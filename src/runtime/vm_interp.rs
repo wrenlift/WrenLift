@@ -3568,13 +3568,15 @@ fn dispatch_closure_bc_inner(
     // + `call_indirect`, eliminating the per-arity cap and the
     // JS-roundtrip cost on inter-fn calls.
     #[cfg(target_arch = "wasm32")]
-    if arg_vals.len() <= 3 {
+    if arg_vals.len() <= 2 {
         crate::runtime::tier::bump_dispatch_hook_hits();
         if let Some(slot) = vm.engine.wasm_jit_slot(target_func_id) {
-            // Receiver is `arg_vals[0]`; JIT'd functions take
-            // only positional args today (Phase 4 threads the
-            // receiver through too).
-            let args_bits: Vec<u64> = arg_vals[1..].iter().map(|v| v.to_bits()).collect();
+            // `arg_vals` in this function is the caller's
+            // `&caller_arg_vals[1..]` — receiver already
+            // stripped at the call site (line ~2021 in
+            // `Op::Call`). So `arg_vals` is exactly the
+            // positional args; pass through as-is.
+            let args_bits: Vec<u64> = arg_vals.iter().map(|v| v.to_bits()).collect();
             // Export name only matters for Phase 4's table
             // multiplexing; per-instance dispatch ignores it.
             let result_bits = crate::runtime::tier::dispatch(slot, "", &args_bits);
