@@ -130,6 +130,18 @@ pub fn cached_artifact_path_in(cache_dir: &std::path::Path, name: &str, version:
     cache_dir.join(artifact_filename(name, version))
 }
 
+/// [`cached_artifact_path_in`] with target awareness. Wasm-targeted
+/// builds get a `-wasm32`-suffixed cache filename so wasm and host
+/// copies of the same `name@version` don't clobber each other.
+pub fn cached_artifact_path_in_for_target(
+    cache_dir: &std::path::Path,
+    name: &str,
+    version: &str,
+    target: Option<&str>,
+) -> PathBuf {
+    cache_dir.join(artifact_filename_for_target(name, version, target))
+}
+
 fn artifact_filename(name: &str, version: &str) -> String {
     // Use the dir-flattened form so the cache filename matches the
     // remote asset basename and stays portable on filesystems that
@@ -137,19 +149,55 @@ fn artifact_filename(name: &str, version: &str) -> String {
     format!("{}-{}.hatch", scoped_name_to_dir(name), version)
 }
 
+/// Same shape as [`artifact_filename`] but for wasm-target variants.
+/// `publish-pkg.yml` ships `<dir>-<ver>.hatch` (host) and
+/// `<dir>-<ver>-wasm32.hatch` (wasm) side by side; we mirror the
+/// suffix locally so the cache can hold both variants without
+/// collision.
+fn artifact_filename_for_target(name: &str, version: &str, target: Option<&str>) -> String {
+    if is_wasm_target(target) {
+        format!("{}-{}-wasm32.hatch", scoped_name_to_dir(name), version)
+    } else {
+        artifact_filename(name, version)
+    }
+}
+
+fn is_wasm_target(target: Option<&str>) -> bool {
+    matches!(target, Some(t) if t == "wasm32" || t.starts_with("wasm32-"))
+}
+
 /// Construct the release URL a `hatch install name@version` will hit.
 /// Kept public so the CLI can print a human-readable hint when a
 /// download fails. Mirrors the asset layout `publish-pkg.yml`
 /// produces — see the module docstring.
 pub fn release_url(registry_base: &str, name: &str, version: &str) -> String {
+    release_url_for_target(registry_base, name, version, None)
+}
+
+/// Variant of [`release_url`] that fetches the wasm-target asset
+/// (`<dir>-<ver>-wasm32.hatch`) when the bundle is being built for
+/// `wasm32-*`. Without this, a host-mode build of a wasm bundle would
+/// pull host-target deps and re-bundle them — including the deps'
+/// pre-compiled wlbc, which already had `#!native` resolved at the
+/// dep's publish time. Symptom: `import "@hatch:window"` in a wasm
+/// runtime resolves to the dispatcher's `window_native` arm because
+/// the wlbc was filtered for native at publish.
+pub fn release_url_for_target(
+    registry_base: &str,
+    name: &str,
+    version: &str,
+    target: Option<&str>,
+) -> String {
     let dir = scoped_name_to_dir(name);
+    let suffix = if is_wasm_target(target) { "-wasm32" } else { "" };
     format!(
-        "{}/releases/download/publish/{}%40{}/{}-{}.hatch",
+        "{}/releases/download/publish/{}%40{}/{}-{}{}.hatch",
         registry_base.trim_end_matches('/'),
         dir,
         version,
         dir,
         version,
+        suffix,
     )
 }
 
@@ -172,8 +220,20 @@ pub fn ensure_in_cache(
     name: &str,
     version: &str,
 ) -> Result<PathBuf, RegistryError> {
+    ensure_in_cache_for_target(registry_base, name, version, None)
+}
+
+/// [`ensure_in_cache`] with target awareness. When `target` selects a
+/// wasm32 family, the wasm32-suffixed asset is fetched and cached
+/// under a target-specific filename so host + wasm copies coexist.
+pub fn ensure_in_cache_for_target(
+    registry_base: &str,
+    name: &str,
+    version: &str,
+    target: Option<&str>,
+) -> Result<PathBuf, RegistryError> {
     let cache = cache_root()?;
-    ensure_in_cache_dir(&cache, registry_base, name, version)
+    ensure_in_cache_dir_for_target(&cache, registry_base, name, version, target)
 }
 
 /// Ensure `name@version` is present in the given cache directory.
@@ -185,7 +245,18 @@ pub fn ensure_in_cache_dir(
     name: &str,
     version: &str,
 ) -> Result<PathBuf, RegistryError> {
-    let dest = cached_artifact_path_in(cache_dir, name, version);
+    ensure_in_cache_dir_for_target(cache_dir, registry_base, name, version, None)
+}
+
+/// [`ensure_in_cache_dir`] with target awareness.
+pub fn ensure_in_cache_dir_for_target(
+    cache_dir: &std::path::Path,
+    registry_base: &str,
+    name: &str,
+    version: &str,
+    target: Option<&str>,
+) -> Result<PathBuf, RegistryError> {
+    let dest = cache_dir.join(artifact_filename_for_target(name, version, target));
     if dest.exists() {
         validate_hatch_magic(&dest)?;
         return Ok(dest);
@@ -193,7 +264,7 @@ pub fn ensure_in_cache_dir(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let url = release_url(registry_base, name, version);
+    let url = release_url_for_target(registry_base, name, version, target);
     download(&url, &dest)?;
     validate_hatch_magic(&dest)?;
     Ok(dest)

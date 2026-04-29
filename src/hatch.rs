@@ -1182,27 +1182,40 @@ fn resolve_version_cached_or_fetch(
     dep_name: &str,
     version: &str,
     cache_dir: Option<&Path>,
+    target: Option<&str>,
 ) -> Result<Vec<u8>, HatchError> {
     let registry = crate::hatch_registry::registry_url();
     let offline = std::env::var_os("HATCH_OFFLINE").is_some();
 
     // Compute the cache path up-front for both branches so the
-    // miss logic is symmetric.
+    // miss logic is symmetric. When `target` selects wasm32 we
+    // pull the `-wasm32` asset variant — its dispatcher modules
+    // were filtered through `cfg::apply` for wasm at the
+    // dep's *publish* time, so re-bundling here keeps the
+    // import-resolution graph correct (`#!wasm` arms win).
     let cached_path = match cache_dir {
-        Some(dir) => crate::hatch_registry::cached_artifact_path_in(dir, dep_name, version),
-        None => crate::hatch_registry::cached_artifact_path(dep_name, version)
-            .map_err(|e| HatchError::Encode(e.to_string()))?,
+        Some(dir) => crate::hatch_registry::cached_artifact_path_in_for_target(
+            dir, dep_name, version, target,
+        ),
+        None => {
+            let root = crate::hatch_registry::cache_root()
+                .map_err(|e| HatchError::Encode(e.to_string()))?;
+            crate::hatch_registry::cached_artifact_path_in_for_target(
+                &root, dep_name, version, target,
+            )
+        }
     };
 
     let path = if cached_path.exists() {
         // Cache hit — silent. Validate magic so a corrupt
         // cache entry doesn't surface as a confusing parse
         // error inside `load()`.
-        crate::hatch_registry::ensure_in_cache_dir(
+        crate::hatch_registry::ensure_in_cache_dir_for_target(
             cached_path.parent().unwrap_or_else(|| Path::new(".")),
             &registry,
             dep_name,
             version,
+            target,
         )
         .map_err(|e| {
             HatchError::Encode(format!(
@@ -1220,13 +1233,17 @@ fn resolve_version_cached_or_fetch(
         // Cache miss — fetch + populate. Surface the install
         // so a `hatch build` that walks 20 deps reads as
         // progress instead of silent stalls during downloads.
-        let url = crate::hatch_registry::release_url(&registry, dep_name, version);
+        let url = crate::hatch_registry::release_url_for_target(
+            &registry, dep_name, version, target,
+        );
         eprintln!("hatch: installing {}@{} from {}", dep_name, version, url);
         let dest = match cache_dir {
-            Some(dir) => {
-                crate::hatch_registry::ensure_in_cache_dir(dir, &registry, dep_name, version)
-            }
-            None => crate::hatch_registry::ensure_in_cache(&registry, dep_name, version),
+            Some(dir) => crate::hatch_registry::ensure_in_cache_dir_for_target(
+                dir, &registry, dep_name, version, target,
+            ),
+            None => crate::hatch_registry::ensure_in_cache_for_target(
+                &registry, dep_name, version, target,
+            ),
         };
         dest.map_err(|e| {
             HatchError::Encode(format!(
@@ -1274,7 +1291,7 @@ fn resolve_dep_bytes_inner(
             })
         }
         Dependency::Version(version) => {
-            resolve_version_cached_or_fetch(dep_name, version, cache_dir)
+            resolve_version_cached_or_fetch(dep_name, version, cache_dir, target)
         }
         Dependency::Url { url } => {
             // Direct-URL deps are wasm-runtime-only; the host
@@ -1354,7 +1371,7 @@ fn merge_path_dependencies(
                 // pull on demand too — set `HATCH_OFFLINE=1` to
                 // restore strict offline behaviour for hermetic
                 // CI / network-egress-blocked environments.
-                resolve_version_cached_or_fetch(&dep_name, version, cache_dir)?
+                resolve_version_cached_or_fetch(&dep_name, version, cache_dir, target)?
             }
             Dependency::Git { git, .. } => {
                 let git_ref = dep.git_ref().ok_or_else(|| {
