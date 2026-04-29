@@ -122,7 +122,12 @@ class SpriteGrid is Game {
   }
   resize(g, w, h) { _camera.fitContain(w, h) }
   update(g) {
-    if (g.tick > 60) g.requestQuit
+    // Run long enough to clear the old 2500-tick scheduler cap
+    // (~10 s wall clock on the prior code). Anything over that
+    // proves the new idle-tick budget doesn't bail on productive
+    // long runs — the loop has to actually finish at our quit
+    // boundary, not at the scheduler's.
+    if (g.tick > 1500) g.requestQuit
   }
   draw(g) {
     _renderer.beginFrame(_camera)
@@ -152,7 +157,14 @@ Game.run(SpriteGrid)
       log(`  ok=${probe2.ok}  ${probe2.elapsedMs.toFixed(1)} ms`, probe2.ok ? "ok" : "err");
       log(probe2.output || "(no output)");
       const expectedTicks = Math.floor(runMs / 50);
-      const msPerFrame = runMs / 60;  // 60 frames in this probe
+      const FRAMES = 1500;
+      const msPerFrame = runMs / FRAMES;
+      // If the scheduler bailed on the old 2500-tick cap, the run
+      // would complete *before* g.requestQuit at frame 1500 fires.
+      // Wall-clock would be ~10 s instead of the ~12.5–25 s we
+      // expect (depending on display refresh rate). Surface that.
+      const minExpectedMs = FRAMES * 6;   // assumes >=6 ms/frame
+      const finishedAtCap = runMs < minExpectedMs;
       log(`freeze detector: mainTicks=${mainTicks}  expected≈${expectedTicks}  (run wall=${runMs.toFixed(1)} ms)`);
       log(`per-frame pacing: ${msPerFrame.toFixed(2)} ms/frame  (rAF target ≈16.7 ms @ 60 Hz)`);
       const freezeOk = mainTicks > 0;
@@ -160,7 +172,9 @@ Game.run(SpriteGrid)
       // would land near 0–5 ms/frame (drains macrotasks at full
       // speed). 8–25 ms/frame range = rAF working.
       const pacingOk = msPerFrame >= 8 && msPerFrame <= 25;
-      if (probe2.ok && freezeOk && pacingOk) {
+      if (probe2.ok && finishedAtCap) {
+        log(`✗ FAIL — run ended at ${runMs.toFixed(0)} ms (< ${minExpectedMs} ms minimum). Scheduler bailed before g.requestQuit at frame 1500 — old 2500-tick cap likely still in effect.`, "err");
+      } else if (probe2.ok && freezeOk && pacingOk) {
         log("✓ PASS — Sprite Grid ran end-to-end, main thread unfrozen, vsync-paced.", "ok");
       } else if (probe2.ok && freezeOk) {
         log(`⚠ Probe ok, freeze ok, but pacing is ${msPerFrame.toFixed(2)} ms/frame — outside expected 8–25 ms rAF window. setTimeout-based yield instead of rAF?`, "err");

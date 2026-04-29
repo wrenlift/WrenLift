@@ -1333,13 +1333,19 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
     // unused_assignments lints to silence one by one).
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     if matches!(result, InterpretResult::Success) {
-        let mut tick_budget: u32 = 2_500;
+        // Idle-budget instead of total-tick budget — the previous
+        // 2500-tick cap killed productive long-running programs
+        // (game loop awaiting `Browser.nextFrame` once per frame
+        // hit the cap at ~2500 frames ≈ 10 s wall clock and the
+        // run silently completed mid-flight). Now: we only
+        // decrement the budget when a tick wakes up to find
+        // nothing settled. Each frame the game advances counts
+        // as progress and resets the budget; the bail still
+        // triggers if the program is *actually* stuck (every
+        // parked fiber awaiting a handle that nobody resolves).
+        const IDLE_TICK_BUDGET: u32 = 250; // ~1 s of pure idle
+        let mut idle_budget: u32 = IDLE_TICK_BUDGET;
         loop {
-            if tick_budget == 0 {
-                break;
-            }
-            tick_budget -= 1;
-
             // If nothing's parked, the user code already finished
             // synchronously — no scheduler work to do.
             if parked_fibers()
@@ -1347,6 +1353,10 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                 .expect("parked fiber list poisoned")
                 .is_empty()
             {
+                break;
+            }
+
+            if idle_budget == 0 {
                 break;
             }
 
@@ -1391,6 +1401,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                 std::mem::take(&mut *parked_fibers().lock().expect("parked fiber list poisoned"));
 
             let mut still_parked = Vec::new();
+            let mut resumed_this_tick = 0u32;
             for entry in parked {
                 let state = future_store()
                     .lock()
@@ -1403,6 +1414,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                     still_parked.push(entry);
                     continue;
                 }
+                resumed_this_tick += 1;
 
                 // Resume the parked fiber. `vm_interp::run_fiber`
                 // executes whatever fiber is currently in
@@ -1454,6 +1466,19 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                 .lock()
                 .expect("parked fiber list poisoned")
                 .extend(still_parked);
+
+            // Reset the idle budget on any progress; otherwise
+            // count this tick against it. Productive game loops
+            // (rAF tick → resume → re-park → wait) reset the
+            // budget every frame and run forever; truly stuck
+            // programs (every parked fiber awaits a handle no
+            // one will resolve) tick the budget down and bail
+            // after IDLE_TICK_BUDGET wakes (~1 s).
+            if resumed_this_tick > 0 {
+                idle_budget = IDLE_TICK_BUDGET;
+            } else {
+                idle_budget = idle_budget.saturating_sub(1);
+            }
         }
     }
     perf_log("scheduler_loop", t_sched);

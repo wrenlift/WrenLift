@@ -1464,14 +1464,17 @@ entry   = "main"
       // the picker + reboot.
       if (ex.mode && modeSel.value !== ex.mode) {
         modeSel.value = ex.mode;
-        bootMode(ex.mode);
+        // Forced mode switch on a pinned example. Honour the
+        // autorun toggle: switching examples with autorun off
+        // shouldn't auto-start a long-running game loop.
+        bootMode(ex.mode, autoChk.checked);
         return;
       }
       // If wlift is already up, restart it so any in-flight
       // long-running fiber (e.g. a game loop) is killed before
       // we re-run with the new source. Skipped on first boot —
       // `wlift` is null until the initial `bootMode` resolves.
-      if (wlift) bootMode(modeSel.value);
+      if (wlift) bootMode(modeSel.value, autoChk.checked);
     }
 
     // Populate the dropdown from EXAMPLES.
@@ -1573,7 +1576,7 @@ entry   = "main"
       stageEl.innerHTML = htmlEl.value;
     }
 
-    async function bootMode(mode) {
+    async function bootMode(mode, runAfter = true) {
       bannerEl.classList.toggle("hidden", mode !== "worker");
       runBtn.disabled = true;
       statusEl.classList.remove("ok", "error");
@@ -1595,7 +1598,11 @@ entry   = "main"
         ? `${wlift.version} · linear memory ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB (direct)`
         : `${wlift.version} · linear memory hidden behind worker boundary`;
       runBtn.disabled = false;
-      execute();
+      // Initial boot + mode-switch: run by default. Example
+      // dropdown switches respect the autorun toggle and pass
+      // `runAfter: autoChk.checked` so flipping examples with
+      // autorun off doesn't kick off a render loop unprompted.
+      if (runAfter) execute();
     }
 
     function renderResult(result) {
