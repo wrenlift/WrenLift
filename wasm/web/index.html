@@ -462,7 +462,7 @@ var elapsed = (System.clock - start) * 1000
 // `@hatch:assert` is fetched on demand from the dev server
 Expect.that(result).toBe(6765)
 Expect.that(elapsed).not.toBeNull()
-System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
+System.print("fib(20) = %(result)  (%(elapsed) ms")
 </textarea>
         </div>
         <div class="splitter h" id="split-wren-hatch" data-resize="wren"></div>
@@ -495,7 +495,7 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
       </section>
       <div class="splitter v" id="split-wren-out" data-resize="main"></div>
 
-      <section class="output-col">
+      <section class="output-col show-console">
         <div class="pane">
           <div class="pane-header">stage<span class="badge">live preview</span></div>
           <div id="stage" class="stage"></div>
@@ -843,6 +843,12 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     consoleToggleBtn.addEventListener("click", () => {
       setConsoleVisible(!outputColEl.classList.contains("show-console"));
     });
+    // Match the markup's default (`show-console` set on output-col)
+    // so the toggle starts in its active state.
+    consoleToggleBtn.classList.toggle(
+      "seg-active",
+      outputColEl.classList.contains("show-console"),
+    );
 
     // Click the runtime pill to jump to the console — that's
     // where the actual output / stack trace / print stream
