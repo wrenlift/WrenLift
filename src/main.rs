@@ -808,6 +808,7 @@ fn inspect_hatch(bytes: &[u8]) {
                     tag,
                     rev,
                     branch,
+                    url,
                 } => {
                     let r = tag
                         .as_deref()
@@ -815,7 +816,14 @@ fn inspect_hatch(bytes: &[u8]) {
                         .or_else(|| rev.as_deref().map(|r| format!("rev = \"{}\"", r)))
                         .or_else(|| branch.as_deref().map(|b| format!("branch = \"{}\"", b)))
                         .unwrap_or_else(|| "ref = <none>".to_string());
-                    println!("    {} = {{ git = \"{}\", {} }}", name, git, r);
+                    let url_extra = url
+                        .as_deref()
+                        .map(|u| format!(", url = \"{}\"", u))
+                        .unwrap_or_default();
+                    println!("    {} = {{ git = \"{}\", {}{} }}", name, git, r, url_extra);
+                }
+                wren_lift::hatch::Dependency::Url { url } => {
+                    println!("    {} = {{ url = \"{}\" }}", name, url);
                 }
             }
         }

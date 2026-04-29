@@ -204,18 +204,38 @@ pub struct Manifest {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginSource {
     /// Git URL — https, ssh, or file:// for local checkouts.
-    pub repo: String,
+    /// Optional when `url` is set (direct artifact fetch, no
+    /// repo-clone needed).
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Pinned commit SHA (short or long form).
     #[serde(default)]
     pub rev: Option<String>,
     /// Alternative to `rev`: pin by git tag. One of `rev` / `tag`
-    /// should be set; CI errors out if both are absent.
+    /// should be set when `repo` is used; CI errors otherwise.
     #[serde(default)]
     pub tag: Option<String>,
-    /// Cargo package name to build from within the repo (the one
-    /// that produces the cdylib we bundle).
-    #[serde(rename = "crate")]
-    pub crate_name: String,
+    /// Library name within the source tree — the build artifact
+    /// CI compiles + bundles. For Rust projects this is a Cargo
+    /// package name; for other build systems it identifies the
+    /// equivalent target. Field name kept Wren-developer-
+    /// friendly (no implementation-tool jargon); the older
+    /// `crate = "..."` spelling stays accepted via serde alias
+    /// so existing hatchfiles round-trip.
+    #[serde(rename = "library", alias = "crate")]
+    pub library: String,
+    /// Optional direct download URL for a pre-built plugin
+    /// artifact. When set, CI / runtimes that can fetch HTTP
+    /// pull the bytes verbatim instead of cloning `repo` and
+    /// building. Useful for self-hosted forges (Gitea,
+    /// Forgejo, custom CDN) where the GitHub/GitLab release-
+    /// asset URL pattern doesn't apply, and for publishers who
+    /// pre-build the dylib and ship it directly. The host CLI
+    /// honors this on platforms it can fetch from; the wasm
+    /// runtime ignores `[plugin_source]` entirely (plugins are
+    /// statically linked there).
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// Shape of a `[dependencies.<name>]` entry. Four shapes, in rising
@@ -254,6 +274,14 @@ pub enum Dependency {
     /// package. `hatch install` shallow-clones the repo at the given
     /// ref into the git cache; `hatch build` reads the checkout like
     /// a path dep.
+    ///
+    /// Optional `url` overrides the browser-side resolver's
+    /// guess at the release-asset path. The host CLI ignores
+    /// this field — it always uses git operations. Use it to
+    /// declare a direct `.hatch` download URL the wasm runtime
+    /// can `fetch()` for self-hosted forges (Gitea, Forgejo,
+    /// custom git+CDN setups) where the GitHub/GitLab default
+    /// patterns don't apply.
     Git {
         git: String,
         #[serde(default)]
@@ -262,7 +290,16 @@ pub enum Dependency {
         rev: Option<String>,
         #[serde(default)]
         branch: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
     },
+    /// `name = { url = "https://..." }` — direct download URL
+    /// for publishers that ship from a CDN / S3 / arbitrary
+    /// HTTP host without a git remote in the metadata. Browser
+    /// resolver `fetch()`s this verbatim; host CLI treats it as
+    /// a build-time error since there's no git context to
+    /// recursively walk.
+    Url { url: String },
 }
 
 impl Dependency {
@@ -1144,6 +1181,20 @@ fn resolve_dep_bytes_inner(
             }
             Ok(std::fs::read(&cached)?)
         }
+        Dependency::Url { url } => {
+            // Direct-URL deps are wasm-runtime-only; the host
+            // CLI has no `git` context to recursively walk and
+            // can't fetch arbitrary HTTP without changing its
+            // offline-build invariants. Surface a clear error
+            // rather than silently producing an incomplete
+            // bundle.
+            Err(HatchError::Encode(format!(
+                "dependency '{}' is declared with `url = \"{}\"` — that form is only honored by \
+                 the wasm-runtime resolver. Use `path = \"...\"` (workspace), `version = \"...\"` \
+                 (registry), or `git = \"...\"` (forge) for `hatch build`.",
+                dep_name, url
+            )))
+        }
         Dependency::Git { git, .. } => {
             let git_ref = dep.git_ref().ok_or_else(|| {
                 HatchError::Encode(format!(
@@ -1251,6 +1302,18 @@ fn merge_path_dependencies(
                         dep_name, e
                     ))
                 })?
+            }
+            Dependency::Url { url } => {
+                // Same reasoning as `resolve_dep_bytes_inner`'s
+                // Url arm — host build doesn't fetch arbitrary
+                // URLs. Surface so the publisher knows their
+                // dep entry is wasm-only.
+                return Err(HatchError::Encode(format!(
+                    "dependency '{}' is declared with `url = \"{}\"` — that form is only honored \
+                     by the wasm-runtime resolver. Use `path = \"...\"`, `version = \"...\"`, or \
+                     `git = \"...\"` for host builds.",
+                    dep_name, url
+                )));
             }
         };
         let dep_hatch = load(&dep_bytes)?;
@@ -2414,6 +2477,117 @@ System.print(Foo.greet())
             "expected '@hatch:foo' import to resolve and run; got {:?}",
             out
         );
+    }
+
+    #[test]
+    fn dependency_parses_url_variant() {
+        // `name = { url = "https://..." }` — direct download URL,
+        // wasm-runtime only. Parses into `Dependency::Url`.
+        let m: Manifest = toml::from_str(
+            r#"
+name = "consumer"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+"@user:lib" = { url = "https://cdn.example.com/lib-1.0.hatch" }
+"#,
+        )
+        .expect("parse");
+        match &m.dependencies["@user:lib"] {
+            Dependency::Url { url } => assert_eq!(url, "https://cdn.example.com/lib-1.0.hatch"),
+            other => panic!("expected Dependency::Url, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dependency_git_accepts_url_override() {
+        // Git dep with an explicit `url` override — exercised
+        // by self-hosted forges (Forgejo, Gitea installs, etc.)
+        // where the GitHub release-asset path doesn't apply.
+        let m: Manifest = toml::from_str(
+            r#"
+name = "consumer"
+version = "0.1.0"
+entry = "main"
+
+[dependencies]
+"@user:lib" = { git = "https://forgejo.example.com/u/r", rev = "v1.0", url = "https://forgejo.example.com/u/r/archive/v1.0.hatch" }
+"#,
+        )
+        .expect("parse");
+        match &m.dependencies["@user:lib"] {
+            Dependency::Git { git, rev, url, .. } => {
+                assert_eq!(git, "https://forgejo.example.com/u/r");
+                assert_eq!(rev.as_deref(), Some("v1.0"));
+                assert_eq!(
+                    url.as_deref(),
+                    Some("https://forgejo.example.com/u/r/archive/v1.0.hatch")
+                );
+            }
+            other => panic!("expected Dependency::Git with url, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn plugin_source_accepts_library_or_legacy_crate_alias() {
+        // New `library = "..."` field is the canonical name.
+        let m_new: Manifest = toml::from_str(
+            r#"
+name = "p"
+version = "0.1.0"
+entry = "main"
+
+[plugin_source]
+repo    = "https://github.com/u/r"
+rev     = "abc"
+library = "wlift_sqlite"
+"#,
+        )
+        .expect("parse new");
+        assert_eq!(m_new.plugin_source.as_ref().unwrap().library, "wlift_sqlite");
+
+        // Legacy `crate = "..."` — accepted via serde alias so
+        // existing hatchfiles in the wild keep working without a
+        // migration step.
+        let m_old: Manifest = toml::from_str(
+            r#"
+name = "p"
+version = "0.1.0"
+entry = "main"
+
+[plugin_source]
+repo  = "https://github.com/u/r"
+rev   = "abc"
+crate = "wlift_sqlite"
+"#,
+        )
+        .expect("parse legacy");
+        assert_eq!(m_old.plugin_source.as_ref().unwrap().library, "wlift_sqlite");
+    }
+
+    #[test]
+    fn plugin_source_accepts_url_for_prebuilt_artifact() {
+        // Direct-download URL on PluginSource — same idea as the
+        // Dependency::Url variant: lets publishers ship pre-built
+        // dylib bytes from a CDN/S3 instead of CI building from
+        // git. `repo` becomes optional in this case.
+        let m: Manifest = toml::from_str(
+            r#"
+name = "p"
+version = "0.1.0"
+entry = "main"
+
+[plugin_source]
+url     = "https://cdn.example.com/wlift_sqlite-aarch64-darwin.dylib"
+library = "wlift_sqlite"
+"#,
+        )
+        .expect("parse");
+        let ps = m.plugin_source.unwrap();
+        assert_eq!(ps.url.as_deref(), Some("https://cdn.example.com/wlift_sqlite-aarch64-darwin.dylib"));
+        assert!(ps.repo.is_none());
+        assert_eq!(ps.library, "wlift_sqlite");
     }
 
     #[test]

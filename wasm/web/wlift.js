@@ -152,25 +152,58 @@ export async function peekManifest(bytes) {
   return m.peek_manifest(buf);
 }
 
+// Map a parsed git remote URL to the host's release-asset URL
+// pattern. Each forge has its own; this is intentionally a
+// short list — anything self-hosted should use an explicit
+// `url = "..."` override on the dep entry instead of relying
+// on us guessing.
+//
+// Returns `null` on unrecognised hosts; the caller turns that
+// into an actionable error pointing at the override.
+function gitForgeReleaseUrl(gitUrl, rev, name) {
+  // Strip `.git` suffix and any trailing slash so `${base}/...`
+  // composes cleanly regardless of how the publisher wrote it.
+  const base = gitUrl.replace(/\.git\/?$/, "").replace(/\/$/, "");
+  // GitHub: `<repo>/releases/download/<tag>/<asset>`.
+  if (/(^|\/\/)([^/]+\.)?github\.com\//.test(base)) {
+    return `${base}/releases/download/${rev}/${name}.hatch`;
+  }
+  // GitLab (and self-managed CE/EE installs sharing the same
+  // route): `<repo>/-/releases/<tag>/downloads/<asset>`.
+  if (/(^|\/\/)([^/]+\.)?gitlab(\.[^/]+)?\//.test(base)) {
+    return `${base}/-/releases/${rev}/downloads/${name}.hatch`;
+  }
+  // Codeberg / Gitea: `<repo>/releases/download/<tag>/<asset>`
+  // (same shape as GitHub since Gitea modeled its API after
+  // it). Match codeberg.org by name; other Gitea installs
+  // should set `url` explicitly.
+  if (/(^|\/\/)codeberg\.org\//.test(base)) {
+    return `${base}/releases/download/${rev}/${name}.hatch`;
+  }
+  return null;
+}
+
 // Resolve a single `[dependencies]` entry into a fetch URL.
 // Mirrors the host's `Dependency` enum:
 //
 //   "@hatch:assert" = "0.2.0"             // version (registry CDN)
 //   "@user:lib"     = { git = "...", rev = "abc" }
 //   "@user:lib"     = { git = "...", tag = "v1" }
+//   "@user:lib"     = { git = "...", rev = "abc", url = "https://..." }   // explicit override
+//   "@user:lib"     = { url = "https://..." }                             // direct, no git
 //   "local"         = { path = "../local" }
 //
 // Browser limitations:
 //
 //   * Path deps fail with a clear error — they're build-time
 //     references on the host CLI; nothing to fetch.
-//   * Git deps require a public release artifact at
-//     `<git>/releases/download/<rev|tag>/<name>.hatch`. There's
-//     no general "git clone" in the browser, so we assume the
-//     publisher cut a release matching the rev/tag.
+//   * Git deps without an explicit `url` need a known forge
+//     (github / gitlab / codeberg). Self-hosted forges
+//     (Forgejo, Gitea installs, custom CDN routes) should set
+//     `url = "..."` on the dep entry, which wins over the
+//     forge-pattern guess.
 //
-// Returns `{ url }` on success; throws on unsupported entries
-// so the caller can surface a precise reason.
+// Returns `{ url }` on success; throws on unsupported entries.
 export function depEntryToUrl(name, dep, registryBase = DEFAULT_HATCH_REGISTRY) {
   if (typeof dep === "string") {
     return {
@@ -181,17 +214,33 @@ export function depEntryToUrl(name, dep, registryBase = DEFAULT_HATCH_REGISTRY) 
     if (typeof dep.path === "string") {
       throw new Error(
         `dep '${name}' is a path reference (${dep.path}); path deps only resolve at build time. ` +
-        `Build the parent project on host with \`wlift project/ --bundle out.hatch --bundle-target wasm32-*\` and load the bundle directly.`
+        `Build the parent project on host with \`wlift project/ --bundle out.hatch --bundle-target wasm32-*\` and load the bundle directly.`,
       );
+    }
+    // Direct-URL entry (`{ url = "..." }` with no git) — wasm-
+    // runtime-only, fetched verbatim. Host CLI rejects this
+    // shape since it has no rev / version to lock against.
+    if (typeof dep.url === "string" && typeof dep.git !== "string") {
+      return { url: dep.url };
     }
     if (typeof dep.git === "string") {
       const rev = dep.rev ?? dep.tag;
       if (!rev) {
         throw new Error(`dep '${name}' has 'git' but no 'rev' or 'tag' — can't pin a specific release.`);
       }
-      // Conventional release-asset path; publisher must have
-      // tagged a release with `<name>.hatch` attached.
-      return { url: `${dep.git}/releases/download/${rev}/${name}.hatch` };
+      // Explicit `url` overrides any forge-pattern guess so
+      // self-hosted installs (Forgejo, custom CDN, etc.) work
+      // without us hardcoding their route shape.
+      if (typeof dep.url === "string") {
+        return { url: dep.url };
+      }
+      const forgeUrl = gitForgeReleaseUrl(dep.git, rev, name);
+      if (forgeUrl) return { url: forgeUrl };
+      throw new Error(
+        `dep '${name}' is hosted at '${dep.git}' — that forge isn't in the known release-URL list ` +
+        `(github / gitlab / codeberg). Add an explicit \`url = "..."\` to the dep entry pointing at ` +
+        `the .hatch download URL on this host.`,
+      );
     }
     // Bare table — try a `version` key as a fallback so
     // `{ version = "1.0.0" }` works the same as the bare
