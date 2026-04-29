@@ -105,6 +105,7 @@ unsafe extern "C" {
     /// the byte-packing dance Wren would otherwise need.
     fn host_gpu_create_buffer_from_f32(vm: *mut c_void, slot: i32, usage_bits: u32) -> u32;
     fn host_gpu_buffer_write_f32(vm: *mut c_void, buffer_handle: u32, offset: u32, slot: i32);
+    fn host_gpu_buffer_write_u32(vm: *mut c_void, buffer_handle: u32, offset: u32, slot: i32);
 
     // ---- Shaders ----------------------------------------------
     /// WGSL source comes from the slot — same slot-based pattern
@@ -275,6 +276,17 @@ pub unsafe extern "C" fn wlift_gpu_create_buffer_from_floats(vm: *mut c_void) {
     let h = unsafe { host_gpu_create_buffer_from_f32(vm, 1, usage) };
     let result = if h == 0 { -1.0 } else { h as f64 };
     unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.bufferWriteUints_(buffer, offset, uints)` — writes a
+/// Wren `List<Num>` to an existing buffer as u32 bytes (each
+/// value truncates to 32 bits). Returns null.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut c_void) {
+    let handle = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let offset = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    unsafe { host_gpu_buffer_write_u32(vm, handle, offset, 3) };
+    unsafe { wrenSetSlotNull(vm, 0) };
 }
 
 /// `Gpu.bufferWriteFloats_(buffer, offset, floats)` — writes a

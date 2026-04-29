@@ -509,7 +509,7 @@ impl VM {
             .any(|d| d.severity == Severity::Error)
         {
             for err in &parse_result.errors {
-                err.eprint(source);
+                self.report_diagnostic(err, source);
             }
             return Err(InterpretResult::CompileError);
         }
@@ -545,7 +545,7 @@ impl VM {
             .any(|d| d.severity == Severity::Error)
         {
             for err in &resolve_result.errors {
-                err.eprint(source);
+                self.report_diagnostic(err, source);
             }
             return Err(InterpretResult::CompileError);
         }
@@ -981,7 +981,7 @@ impl VM {
             .any(|d| d.severity == Severity::Error)
         {
             for err in &parse_result.errors {
-                err.eprint(source);
+                self.report_diagnostic(err, source);
             }
             self.loading_modules.remove(&module_key);
             return InterpretResult::CompileError;
@@ -1019,7 +1019,7 @@ impl VM {
             .any(|d| d.severity == Severity::Error)
         {
             for err in &resolve_result.errors {
-                err.eprint(source);
+                self.report_diagnostic(err, source);
             }
             self.loading_modules.remove(&module_key);
             return InterpretResult::CompileError;
@@ -2438,6 +2438,27 @@ impl VM {
         }
     }
 
+    /// Route a parse / sema diagnostic through the same channel
+    /// runtime errors use. Without this, compile-time errors call
+    /// `Diagnostic::eprint(source)` directly — which writes to
+    /// stderr, fine on the host CLI but invisible on wasm where the
+    /// page UI only sees what `error_fn` captures. Embedders that
+    /// configured `error_fn` (the wasm playground, the test
+    /// harness) get the rendered ariadne header in the same buffer
+    /// as `System.print` output; the host CLI keeps its colourful
+    /// stderr render.
+    pub(crate) fn report_diagnostic(
+        &self,
+        diag: &crate::diagnostics::Diagnostic,
+        source: &str,
+    ) {
+        if self.config.error_fn.is_some() {
+            self.report_error(&diag.render_to_string(source));
+        } else {
+            diag.eprint(source);
+        }
+    }
+
     /// Try to load a built-in optional module ("meta" or "random").
     /// Returns true if the module was recognized and registered.
     fn try_load_builtin_module(&mut self, name: &str) -> bool {
@@ -3475,7 +3496,7 @@ impl VM {
             .any(|d| d.severity == Severity::Error)
         {
             for err in &parse_result.errors {
-                err.eprint(source);
+                self.report_diagnostic(err, source);
             }
             return false;
         }
@@ -3518,7 +3539,7 @@ impl VM {
             .any(|d| d.severity == Severity::Error)
         {
             for err in &resolve_result.errors {
-                err.eprint(source);
+                self.report_diagnostic(err, source);
             }
             return false;
         }

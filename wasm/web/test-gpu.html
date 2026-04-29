@@ -98,77 +98,77 @@ fn fs_main() -> @location(0) vec4f {
 import "@hatch:window" for Window
 import "@hatch:gpu" for Gpu
 
-var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "phase 3 smoke"})
+var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "triangle smoke"})
 if (canvas < 0) Fiber.abort("Window.create_ failed")
-System.print("canvas handle: %(canvas)")
 
-if (!Gpu.init_()) Fiber.abort("WebGPU not available")
-System.print("Gpu.init_: ok")
+var device = Gpu.requestDevice({})
+var surface = device.createSurface(canvas)
 
-var surface = Gpu.attachCanvas_(canvas)
-if (surface < 0) Fiber.abort("Gpu.attachCanvas_ failed")
-System.print("surface: %(surface)")
+var shader = device.createShaderModule({
+  "code": ${JSON.stringify(wgsl)}
+})
 
-var shader = Gpu.createShader_(${JSON.stringify(wgsl)})
-if (shader < 0) Fiber.abort("createShader_ failed")
-System.print("shader: %(shader)")
+// Vertex buffer (positions only)
+var vbo = device.createBuffer({
+  "size":  ${triangle.length * 4},
+  "usage": ["vertex", "copy-dst"]
+})
+vbo.writeFloats(0, ${JSON.stringify(triangle)})
 
-// vertex buffer (positions) — VERTEX|COPY_DST = 32|8 = 40
-var vb = Gpu.createBufferFromFloats_(${JSON.stringify(triangle)}, 40)
-if (vb < 0) Fiber.abort("vertex buffer failed")
-System.print("vb: %(vb)")
+// Uniform buffer for the rotation matrix.
+var ubo = device.createBuffer({
+  "size":  64,
+  "usage": ["uniform", "copy-dst"]
+})
+ubo.writeFloats(0, ${JSON.stringify(identityMat4)})
 
-// uniform buffer for the rotation matrix — UNIFORM|COPY_DST = 64|8 = 72
-var ub = Gpu.createBufferFromFloats_(${JSON.stringify(identityMat4)}, 72)
-if (ub < 0) Fiber.abort("uniform buffer failed")
-System.print("ub: %(ub)")
+var bgl = device.createBindGroupLayout({
+  "entries": [
+    { "binding": 0, "visibility": ["vertex"], "kind": "uniform" }
+  ]
+})
+var pipelineLayout = device.createPipelineLayout({"bindGroupLayouts": [bgl]})
+var bg = device.createBindGroup({
+  "layout":  bgl,
+  "entries": [{ "binding": 0, "buffer": ubo }]
+})
 
-// bind group layout: one uniform binding visible to the vertex stage.
-var bgl = Gpu.createBindGroupLayout_(
-  "{\\"entries\\":[{\\"binding\\":0,\\"visibility\\":\\"vertex\\",\\"buffer\\":{\\"type\\":\\"uniform\\"}}]}"
-)
-if (bgl < 0) Fiber.abort("bind group layout failed")
-System.print("bgl: %(bgl)")
+var pipeline = device.createRenderPipeline({
+  "layout": pipelineLayout,
+  "vertex": {
+    "module": shader, "entryPoint": "vs_main",
+    "buffers": [{
+      "arrayStride": 12,
+      "attributes": [
+        { "shaderLocation": 0, "offset": 0, "format": "float32x3" }
+      ]
+    }]
+  },
+  "fragment": {
+    "module": shader, "entryPoint": "fs_main",
+    "targets": [{ "format": "preferred" }]
+  },
+  "primitive": { "topology": "triangle-list" }
+})
 
-var bg = Gpu.createBindGroup_(
-  "{\\"layout\\":%(bgl),\\"entries\\":[{\\"binding\\":0,\\"resource\\":{\\"kind\\":\\"buffer\\",\\"buffer\\":%(ub)}}]}"
-)
-if (bg < 0) Fiber.abort("bind group failed")
-System.print("bg: %(bg)")
-
-var pipelineDesc =
-  "{" +
-    "\\"layouts\\":[%(bgl)]," +
-    "\\"vertex\\":{" +
-      "\\"shader\\":%(shader),\\"entry\\":\\"vs_main\\"," +
-      "\\"buffers\\":[{\\"arrayStride\\":12,\\"attributes\\":[{\\"shaderLocation\\":0,\\"offset\\":0,\\"format\\":\\"float32x3\\"}]}]" +
-    "}," +
-    "\\"fragment\\":{" +
-      "\\"shader\\":%(shader),\\"entry\\":\\"fs_main\\"," +
-      "\\"targets\\":[{\\"format\\":\\"preferred\\"}]" +
-    "}," +
-    "\\"primitive\\":{\\"topology\\":\\"triangle-list\\"}" +
-  "}"
-var pipeline = Gpu.createPipeline_(pipelineDesc)
-if (pipeline < 0) Fiber.abort("pipeline failed")
-System.print("pipeline: %(pipeline)")
-
-var frame = Gpu.beginFrame_(surface)
-if (frame < 0) Fiber.abort("beginFrame failed")
-System.print("frame: %(frame)")
-
-var pass = Gpu.renderPassBegin_(frame,
-  "{\\"colorAttachments\\":[{\\"clearValue\\":{\\"r\\":0.06,\\"g\\":0.05,\\"b\\":0.04,\\"a\\":1.0},\\"loadOp\\":\\"clear\\",\\"storeOp\\":\\"store\\"}]}"
-)
-if (pass < 0) Fiber.abort("renderPassBegin failed")
-System.print("pass: %(pass)")
-
-Gpu.renderPassSetPipeline_(pass, pipeline)
-Gpu.renderPassSetBindGroup_(pass, 0, bg)
-Gpu.renderPassSetVertexBuffer_(pass, 0, vb)
-Gpu.renderPassDraw_(pass, 3, 1, 0, 0)
-Gpu.renderPassEnd_(pass)
-Gpu.endFrame_(frame)
+var frame = surface.acquire()
+var enc = device.createCommandEncoder()
+var pass = enc.beginRenderPass({
+  "colorAttachments": [{
+    "view":       frame.view,
+    "loadOp":     "clear",
+    "clearValue": { "r": 0.06, "g": 0.05, "b": 0.04, "a": 1.0 },
+    "storeOp":    "store"
+  }]
+})
+pass.setPipeline(pipeline)
+pass.setBindGroup(0, bg)
+pass.setVertexBuffer(0, vbo)
+pass.draw(3)
+pass.end
+enc.finish
+device.submit([enc])
+frame.present
 System.print("rendered ✓")
 `.trim();
 

@@ -1111,6 +1111,25 @@ class MainWlift {
           gpuDevice.queue.writeBuffer(obj.buffer, offset, floats);
         },
 
+        host_gpu_buffer_write_u32: (vm, buffer_handle, offset, list_slot) => {
+          if (!gpuDevice) return;
+          const obj = gpuObjects.get(buffer_handle);
+          if (!obj || obj.kind !== "buffer") return;
+          const count = wasm.wrenGetListCount(vm, list_slot);
+          if (count <= 0) return;
+          const uints = new Uint32Array(count);
+          wasm.wrenEnsureSlots(vm, list_slot + 2);
+          const dest = list_slot + 1;
+          for (let i = 0; i < count; i++) {
+            wasm.wrenGetListElement(vm, list_slot, i, dest);
+            // wrenGetSlotDouble's result truncates to u32 by the
+            // typed-array store. Negative or fractional inputs
+            // wrap; that mirrors Wren's existing host-side packer.
+            uints[i] = wasm.wrenGetSlotDouble(vm, dest);
+          }
+          gpuDevice.queue.writeBuffer(obj.buffer, offset, uints);
+        },
+
         // ----- Shaders ------------------------------------------
 
         host_gpu_create_shader: (vm, slot) => {
@@ -1634,6 +1653,24 @@ class MainWlift {
     return this;
   }
 
+  // Mirror compiler / runtime errors to the JS console so the
+  // browser devtools surface them alongside the page UI's error
+  // pane. `result.output` already carries the rendered ariadne
+  // diagnostic; re-emit it via `console.error` (or `console.log`
+  // for the trailing parser-recover noise) so a developer who
+  // glanced past the page text still sees what failed. Returns
+  // the original `result` unchanged.
+  _mirrorErrorToConsole(result) {
+    if (!result) return result;
+    if (!result.ok && result.output) {
+      // Use console.error so devtools highlight + filter it; the
+      // [wlift] tag makes it easy to grep / filter out when it's
+      // expected (running tests that probe error paths).
+      console.error("[wlift] run failed:\n" + result.output);
+    }
+    return result;
+  }
+
   async runHatch(bytes) {
     // Same shape as `run`, but the user code is a `.hatch`
     // bundle. `_mod.run_hatch` is the wasm-bindgen export added
@@ -1645,21 +1682,21 @@ class MainWlift {
       const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
       result = await this._mod.run_hatch(buf);
     } catch (err) {
-      return {
+      return this._mirrorErrorToConsole({
         cmd: "result",
         output: String(err),
         ok: false,
         errorKind: -1,
         elapsedMs: performance.now() - t0,
-      };
+      });
     }
-    return {
+    return this._mirrorErrorToConsole({
       cmd: "result",
       output: result.output,
       ok: result.ok,
       errorKind: result.errorKind,
       elapsedMs: performance.now() - t0,
-    };
+    });
   }
 
   async runWithHatches(source, deps) {
@@ -1693,21 +1730,21 @@ class MainWlift {
       }
       result = await this._mod.run_with_hatches(source, bufs);
     } catch (err) {
-      return {
+      return this._mirrorErrorToConsole({
         cmd: "result",
         output: String(err),
         ok: false,
         errorKind: -1,
         elapsedMs: performance.now() - t0,
-      };
+      });
     }
-    return {
+    return this._mirrorErrorToConsole({
       cmd: "result",
       output: result.output,
       ok: result.ok,
       errorKind: result.errorKind,
       elapsedMs: performance.now() - t0,
-    };
+    });
   }
 
   async run(source) {
@@ -1721,23 +1758,23 @@ class MainWlift {
     try {
       result = await this._mod.run(source);
     } catch (err) {
-      return {
+      return this._mirrorErrorToConsole({
         cmd: "result",
         output: String(err),
         ok: false,
         errorKind: -1,
         elapsedMs: performance.now() - t0,
-      };
+      });
     }
     // Same shape as the worker reply so the UI doesn't have to
     // care which mode it's talking to.
-    return {
+    return this._mirrorErrorToConsole({
       cmd: "result",
       output: result.output,
       ok: result.ok,
       errorKind: result.errorKind,
       elapsedMs: performance.now() - t0,
-    };
+    });
   }
 
   get memory() { return this._memory; }

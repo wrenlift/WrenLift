@@ -115,91 +115,87 @@ import "@hatch:gpu" for Gpu
 var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "textured quad smoke"})
 if (canvas < 0) Fiber.abort("Window.create_ failed")
 
-if (!Gpu.init_()) Fiber.abort("WebGPU not available")
+var device = Gpu.requestDevice({})
+var surface = device.createSurface(canvas)
 
-var surface = Gpu.attachCanvas_(canvas)
-if (surface < 0) Fiber.abort("Gpu.attachCanvas_ failed")
+var shader = device.createShaderModule({"code": ${JSON.stringify(wgsl)}})
 
-var shader = Gpu.createShader_(${JSON.stringify(wgsl)})
-if (shader < 0) Fiber.abort("createShader_ failed")
+var vbo = device.createBuffer({
+  "size":  ${quad.length * 4},
+  "usage": ["vertex", "copy-dst"]
+})
+vbo.writeFloats(0, ${JSON.stringify(quad)})
 
-// vertex buffer (positions + uv) — VERTEX|COPY_DST = 32|8 = 40
-var vb = Gpu.createBufferFromFloats_(${JSON.stringify(quad)}, 40)
-if (vb < 0) Fiber.abort("vertex buffer failed")
+// 2x2 RGBA8 texture
+var tex = device.createTexture({
+  "width":  2, "height": 2,
+  "format": "rgba8unorm",
+  "usage":  ["texture-binding", "copy-dst"]
+})
+device.writeTexture(tex, ${JSON.stringify(pixelStr)}, {
+  "width": 2, "height": 2, "bytesPerRow": 8
+})
+var view = tex.createView()
 
-// 2x2 RGBA8 texture. usage = TEXTURE_BINDING|COPY_DST = 4|2 = 6
-var tex = Gpu.createTexture_(
-  "{\\"width\\":2,\\"height\\":2,\\"format\\":\\"rgba8unorm\\",\\"usage\\":6}"
-)
-if (tex < 0) Fiber.abort("texture failed")
-System.print("texture handle: %(tex)")
+var sampler = device.createSampler({
+  "magFilter":     "nearest",
+  "minFilter":     "nearest",
+  "addressModeU":  "clamp-to-edge",
+  "addressModeV":  "clamp-to-edge"
+})
 
-Gpu.queueWriteTexture_(tex, ${JSON.stringify(pixelStr)},
-  "{\\"bytesPerRow\\":8,\\"width\\":2,\\"height\\":2}"
-)
-System.print("uploaded 2x2 RGBA pixels")
+var bgl = device.createBindGroupLayout({
+  "entries": [
+    { "binding": 0, "visibility": ["fragment"], "kind": "texture" },
+    { "binding": 1, "visibility": ["fragment"], "kind": "sampler" }
+  ]
+})
+var pipelineLayout = device.createPipelineLayout({"bindGroupLayouts": [bgl]})
+var bg = device.createBindGroup({
+  "layout": bgl,
+  "entries": [
+    { "binding": 0, "view":    view },
+    { "binding": 1, "sampler": sampler }
+  ]
+})
 
-var view = Gpu.createTextureView_(tex, null)
-if (view < 0) Fiber.abort("texture view failed")
-System.print("view handle: %(view)")
+var pipeline = device.createRenderPipeline({
+  "layout": pipelineLayout,
+  "vertex": {
+    "module": shader, "entryPoint": "vs_main",
+    "buffers": [{
+      "arrayStride": 16,
+      "attributes": [
+        { "shaderLocation": 0, "offset": 0, "format": "float32x2" },
+        { "shaderLocation": 1, "offset": 8, "format": "float32x2" }
+      ]
+    }]
+  },
+  "fragment": {
+    "module": shader, "entryPoint": "fs_main",
+    "targets": [{ "format": "preferred" }]
+  },
+  "primitive": { "topology": "triangle-list" }
+})
 
-var sampler = Gpu.createSampler_(
-  "{\\"magFilter\\":\\"nearest\\",\\"minFilter\\":\\"nearest\\",\\"addressModeU\\":\\"clamp-to-edge\\",\\"addressModeV\\":\\"clamp-to-edge\\"}"
-)
-if (sampler < 0) Fiber.abort("sampler failed")
-System.print("sampler handle: %(sampler)")
-
-// bind group layout: texture at binding 0 (fragment-visible),
-// sampler at binding 1.
-var bgl = Gpu.createBindGroupLayout_(
-  "{\\"entries\\":[" +
-    "{\\"binding\\":0,\\"visibility\\":\\"fragment\\",\\"texture\\":{}}," +
-    "{\\"binding\\":1,\\"visibility\\":\\"fragment\\",\\"sampler\\":{}}" +
-  "]}"
-)
-if (bgl < 0) Fiber.abort("bgl failed")
-
-var bg = Gpu.createBindGroup_(
-  "{\\"layout\\":%(bgl),\\"entries\\":[" +
-    "{\\"binding\\":0,\\"resource\\":{\\"kind\\":\\"textureView\\",\\"view\\":%(view)}}," +
-    "{\\"binding\\":1,\\"resource\\":{\\"kind\\":\\"sampler\\",\\"sampler\\":%(sampler)}}" +
-  "]}"
-)
-if (bg < 0) Fiber.abort("bg failed")
-
-var pipeline = Gpu.createPipeline_(
-  "{" +
-    "\\"layouts\\":[%(bgl)]," +
-    "\\"vertex\\":{" +
-      "\\"shader\\":%(shader),\\"entry\\":\\"vs_main\\"," +
-      "\\"buffers\\":[{\\"arrayStride\\":16,\\"attributes\\":[" +
-        "{\\"shaderLocation\\":0,\\"offset\\":0,\\"format\\":\\"float32x2\\"}," +
-        "{\\"shaderLocation\\":1,\\"offset\\":8,\\"format\\":\\"float32x2\\"}" +
-      "]}]" +
-    "}," +
-    "\\"fragment\\":{" +
-      "\\"shader\\":%(shader),\\"entry\\":\\"fs_main\\"," +
-      "\\"targets\\":[{\\"format\\":\\"preferred\\"}]" +
-    "}," +
-    "\\"primitive\\":{\\"topology\\":\\"triangle-list\\"}" +
-  "}"
-)
-if (pipeline < 0) Fiber.abort("pipeline failed")
-
-var frame = Gpu.beginFrame_(surface)
-if (frame < 0) Fiber.abort("beginFrame failed")
-
-var pass = Gpu.renderPassBegin_(frame,
-  "{\\"colorAttachments\\":[{\\"clearValue\\":{\\"r\\":0.06,\\"g\\":0.05,\\"b\\":0.04,\\"a\\":1.0},\\"loadOp\\":\\"clear\\",\\"storeOp\\":\\"store\\"}]}"
-)
-if (pass < 0) Fiber.abort("renderPassBegin failed")
-
-Gpu.renderPassSetPipeline_(pass, pipeline)
-Gpu.renderPassSetBindGroup_(pass, 0, bg)
-Gpu.renderPassSetVertexBuffer_(pass, 0, vb)
-Gpu.renderPassDraw_(pass, 6, 1, 0, 0)
-Gpu.renderPassEnd_(pass)
-Gpu.endFrame_(frame)
+var frame = surface.acquire()
+var enc = device.createCommandEncoder()
+var pass = enc.beginRenderPass({
+  "colorAttachments": [{
+    "view":       frame.view,
+    "loadOp":     "clear",
+    "clearValue": { "r": 0.06, "g": 0.05, "b": 0.04, "a": 1.0 },
+    "storeOp":    "store"
+  }]
+})
+pass.setPipeline(pipeline)
+pass.setBindGroup(0, bg)
+pass.setVertexBuffer(0, vbo)
+pass.draw(6)
+pass.end
+enc.finish
+device.submit([enc])
+frame.present
 System.print("rendered ✓")
 `.trim();
 

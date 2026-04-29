@@ -767,6 +767,10 @@ impl Parser {
                 if !self.match_token(&Token::Comma) {
                     break;
                 }
+                self.skip_newlines();
+                if self.check(&Token::RightParen) {
+                    break;
+                }
             }
         }
         self.expect(&Token::RightParen, "expected ')'");
@@ -792,6 +796,10 @@ impl Parser {
                 params.push((sym, span));
 
                 if !self.match_token(&Token::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+                if self.check(&Token::RightBracket) {
                     break;
                 }
             }
@@ -1440,6 +1448,10 @@ impl Parser {
                         if !self.match_token(&Token::Comma) {
                             break;
                         }
+                        self.skip_newlines();
+                        if self.check(&Token::RightBracket) {
+                            break;
+                        }
                     }
                 }
                 self.skip_newlines();
@@ -1485,6 +1497,13 @@ impl Parser {
                 args.push(self.expression()?);
                 self.skip_newlines();
                 if !self.match_token(&Token::Comma) {
+                    break;
+                }
+                // Trailing comma: `f(a, b, c,)` and the multi-line
+                // variant terminate cleanly here instead of trying
+                // to parse another argument.
+                self.skip_newlines();
+                if self.check(&Token::RightParen) {
                     break;
                 }
             }
@@ -1691,6 +1710,13 @@ impl Parser {
                         elements.push(self.expression()?);
                         self.skip_newlines();
                         if !self.match_token(&Token::Comma) {
+                            break;
+                        }
+                        // Trailing comma — `[a, b, c,]` and the
+                        // multi-line variant terminate cleanly here
+                        // instead of trying to parse another element.
+                        self.skip_newlines();
+                        if self.check(&Token::RightBracket) {
                             break;
                         }
                     }
@@ -1923,6 +1949,13 @@ impl Parser {
                 entries.push((key, value));
                 self.skip_newlines();
                 if !self.match_token(&Token::Comma) {
+                    break;
+                }
+                // Trailing comma: `{a: 1, b: 2,}` and the multi-line
+                // variant terminate cleanly here instead of trying
+                // to parse another key.
+                self.skip_newlines();
+                if self.check(&Token::RightBrace) {
                     break;
                 }
             }
@@ -2252,6 +2285,38 @@ mod tests {
         match &result.module[0].0 {
             Stmt::Expr((Expr::MapLiteral(entries), _)) => assert_eq!(entries.len(), 2),
             other => panic!("expected MapLiteral, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_trailing_commas() {
+        // List literal — single line + multi-line.
+        let (expr, errors) = parse_expr("[1, 2, 3,]");
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+        if let Expr::ListLiteral(elems) = expr {
+            assert_eq!(elems.len(), 3);
+        } else {
+            panic!("expected ListLiteral");
+        }
+
+        let result = parse("var xs = [\n  1,\n  2,\n  3,\n]\n");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        // Map literal trailing comma.
+        let result = parse(r#"{"a": 1, "b": 2,}"#);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        // Call argument list trailing comma.
+        let result = parse("System.print(1, 2, 3,)");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        // Subscript-args trailing comma.
+        let (expr, errors) = parse_expr("m[1, 2,]");
+        assert!(errors.is_empty(), "errors: {:?}", errors);
+        if let Expr::Subscript { args, .. } = expr {
+            assert_eq!(args.len(), 2);
+        } else {
+            panic!("expected Subscript");
         }
     }
 
