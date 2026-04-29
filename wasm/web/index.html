@@ -16,14 +16,14 @@
       --text:     #e8dcc8; /* warm cream — main copy in dark panes */
       --muted:    #8a7e6b; /* dim cream — secondary copy */
       --rule:     #3a3024; /* dividers inside dark panes */
-      --accent:   #f5a623; /* amber — primary action / highlights */
+      --accent:   #f4c24a; /* amber — primary action / highlights */
       --run:      #a4c17c; /* sage — Run button */
       --good:     #a4c17c; /* sage — success states */
       --bad:      #d97a6c; /* warm red — error */
       --link:     #c9a878; /* gold — links on parchment */
 
       /* Syntax-highlight tokens (used by the .editor backdrop). */
-      --syn-keyword:  #f5a623;
+      --syn-keyword:  #f4c24a;
       --syn-string:   #9cb88b;
       --syn-comment:  #6d6354;
       --syn-number:   #d4a76a;
@@ -111,13 +111,20 @@
        space above footer. */
     main {
       display: grid;
-      grid-template-columns: 1fr 1.2fr 1fr;
+      /* Default: HTML pane is hidden, wren | output. Toggle the
+         `.show-html` class on `main` to reveal the html pane;
+         the grid then expands to three columns. */
+      grid-template-columns: 1.2fr 1fr;
       grid-template-rows: minmax(0, 1fr);
       gap: 1px;
       background: var(--rule);
       overflow: hidden;
       min-height: 0;
     }
+    main.show-html {
+      grid-template-columns: 1fr 1.2fr 1fr;
+    }
+    main:not(.show-html) #html-section { display: none; }
     section {
       background: var(--panel);
       display: flex; flex-direction: column;
@@ -155,12 +162,9 @@
       outline: none;
     }
 
-    /* Syntax-highlighted editor: a <pre><code> backdrop renders
-       coloured HTML; a transparent <textarea> overlays it and
-       forwards typing/scroll. Both share font metrics so the
-       caret lines up with the underlying text. The textarea's
-       text color is `transparent`; we keep the caret visible by
-       falling back to `caret-color`. */
+    /* CodeMirror mount points. The library handles its own
+       chrome (gutter, scroller, layered cursor) — we just set
+       the panel background and let it fill the container. */
     .editor {
       position: relative;
       flex: 1;
@@ -168,49 +172,30 @@
       overflow: hidden;
       background: var(--panel);
     }
-    .editor pre.editor-bg,
-    .editor textarea.editor-fg {
-      position: absolute;
-      top: 0; left: 0; right: 0; bottom: 0;
-      margin: 0;
-      padding: 14px;
-      font: inherit;
+    .editor .cm-editor {
+      height: 100%;
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 13px;
+    }
+    .editor .cm-scroller {
+      font-family: inherit;
       line-height: 1.5;
-      tab-size: 2;
-      white-space: pre;
-      word-wrap: normal;
-      overflow: auto;
     }
-    .editor pre.editor-bg {
-      color: var(--text);
-      pointer-events: none;
-      user-select: none;
+    .editor .cm-content { padding: 14px 0; }
+    .editor .cm-gutters {
+      background: var(--panel);
+      color: var(--muted);
+      border-right: 1px solid var(--rule);
     }
-    .editor textarea.editor-fg {
-      color: transparent;
-      caret-color: var(--accent);
-      background: transparent;
-      border: 0;
-      resize: none;
-      outline: none;
-    }
-    .editor textarea.editor-fg::selection {
-      background: rgba(245, 166, 35, 0.25);
-    }
-    /* Token classes — the highlighter wraps matched spans with
-       these. Names mirror typical Prism / highlight.js token
-       conventions so swapping in a richer highlighter later is
-       a one-CSS-rename swap. */
-    .tok-comment { color: var(--syn-comment); font-style: italic; }
-    .tok-keyword { color: var(--syn-keyword); }
-    .tok-string  { color: var(--syn-string); }
-    .tok-number  { color: var(--syn-number); }
-    .tok-fn      { color: var(--syn-fn); }
-    .tok-type    { color: var(--syn-type); font-weight: 600; }
-    .tok-section { color: var(--syn-keyword); font-weight: 600; }
-    .tok-key     { color: var(--syn-fn); }
+    .editor .cm-activeLineGutter,
+    .editor .cm-activeLine { background: rgba(245, 166, 35, 0.06); }
+    .editor .cm-cursor { border-left-color: var(--accent); }
+    .editor .cm-selectionBackground,
+    .editor ::selection { background: rgba(245, 166, 35, 0.25) !important; }
+    /* Hidden state-of-truth textareas — CodeMirror writes back
+       to them on every doc change so the rest of the page can
+       keep reading `srcEl.value` etc. unchanged. */
+    .editor-shadow { display: none; }
 
     /* Output column: stage on top (renders the HTML), console below. */
     .output-col { display: grid; grid-template-rows: 1fr 1fr; min-height: 0; }
@@ -334,6 +319,7 @@
         <input type="checkbox" id="autorun-toggle" checked>
         auto-run
       </label>
+      <button id="html-toggle" class="seg" title="show/hide html pane">html</button>
       <button id="hatch-toggle" class="seg" title="show/hide hatchfile pane">hatchfile</button>
       <button id="run-btn" class="primary" disabled>Run (⌘↵)</button>
     </header>
@@ -347,9 +333,10 @@
     </div>
 
     <main>
-      <section>
+      <section id="html-section">
         <div class="pane-header">html<span class="badge">stage markup</span></div>
-        <textarea id="html-src" spellcheck="false"><h1 id="title">hello, wren</h1>
+        <div class="editor" id="html-mount"></div>
+        <textarea id="html-src" class="editor-shadow" spellcheck="false"><h1 id="title">hello, wren</h1>
 <p id="msg">edit me from Wren via <code>Dom.setText</code>.</p>
 <button id="ping" onclick="alert('clicked')">ping</button>
 </textarea>
@@ -358,9 +345,8 @@
       <section class="wren-col">
         <div class="pane wren-pane">
         <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
-        <div class="editor">
-        <pre class="editor-bg" aria-hidden="true"><code id="src-bg"></code></pre>
-        <textarea id="src" class="editor-fg" spellcheck="false">import "@hatch:assert" for Expect
+        <div class="editor" id="src-mount"></div>
+        <textarea id="src" class="editor-shadow" spellcheck="false">import "@hatch:assert" for Expect
 
 // `Future`, `Browser`, `WebSocket`, `Dom`, `LocalStorage` are
 // loaded by the runtime — no boilerplate needed. Async bridges
@@ -395,7 +381,6 @@ Expect.that(elapsed).not.toBeNull()
 System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
 </textarea>
         </div>
-        </div>
         <div class="pane hatchfile-pane">
           <div class="pane-header">
             hatchfile
@@ -418,8 +403,8 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
           </div>
           <!-- Raw TOML view: same hatchfile, editable directly. -->
           <div class="editor hidden" id="hatchfile-toml-wrap">
-            <pre class="editor-bg" aria-hidden="true"><code id="hatchfile-bg"></code></pre>
-            <textarea id="hatchfile-src" class="editor-fg" spellcheck="false"></textarea>
+            <div class="editor" id="hatchfile-mount" style="height: 100%;"></div>
+            <textarea id="hatchfile-src" class="editor-shadow" spellcheck="false"></textarea>
           </div>
         </div>
       </section>
@@ -453,6 +438,22 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     // mode) or via the worker→main postMessage round-trip.
     import { createWlift, runProject } from "./wlift.js";
     import { ErrorKind } from "../pkg/wlift_wasm.js";
+    // CodeMirror 6 — modular ESM via esm.sh. The dev server's
+    // COOP/COEP headers cooperate with esm.sh's CORP responses,
+    // so cross-origin module fetch works without a build step.
+    // Pinned-version URLs would be sturdier; we float for now
+    // since the playground is internal-iteration territory.
+    import { EditorState } from "https://esm.sh/@codemirror/state@6";
+    import { EditorView, keymap, lineNumbers, highlightActiveLine,
+      drawSelection } from "https://esm.sh/@codemirror/view@6";
+    import { defaultKeymap, indentWithTab, history, historyKeymap }
+      from "https://esm.sh/@codemirror/commands@6";
+    import { StreamLanguage, syntaxHighlighting,
+      HighlightStyle, bracketMatching, indentOnInput }
+      from "https://esm.sh/@codemirror/language@6";
+    import { tags } from "https://esm.sh/@lezer/highlight@1";
+    import { toml } from "https://esm.sh/@codemirror/legacy-modes@6/mode/toml";
+    import { html } from "https://esm.sh/@codemirror/lang-html@6";
 
     const statusEl       = document.getElementById("status");
     const versionEl      = document.getElementById("version");
@@ -468,7 +469,9 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     const viewFormBtn    = document.getElementById("hatch-view-form");
     const viewTomlBtn    = document.getElementById("hatch-view-toml");
     const hatchToggleBtn = document.getElementById("hatch-toggle");
+    const htmlToggleBtn  = document.getElementById("html-toggle");
     const wrenColEl      = document.querySelector(".wren-col");
+    const mainEl         = document.querySelector("main");
     const stageEl        = document.getElementById("stage");
     const outEl          = document.getElementById("out");
     const runBtn         = document.getElementById("run-btn");
@@ -478,189 +481,143 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     const srcBgEl        = document.getElementById("src-bg");
     const hatchfileBgEl  = document.getElementById("hatchfile-bg");
 
-    // ---- Syntax highlighter -----------------------------------------
-    // Minimal regex-based highlighter — small enough to inline,
-    // fast enough for live keystrokes on a few hundred lines. The
-    // Wren tokenizer recognises comments, strings, numbers,
-    // keywords, type-cased identifiers (PascalCase → tok-type),
-    // and call-site identifiers followed by `(`. The TOML
-    // tokenizer covers section headers, key=value pairs, strings,
-    // numbers, and `#` comments — enough for hatchfile shapes.
-    //
-    // Both produce sanitised HTML (no raw user text injected),
-    // so the .editor-bg <code> can render whatever's typed.
+    // ---- Editor: CodeMirror 6 with Wren + TOML languages ---------
+    // Each visible editor is a CodeMirror view mounted inside the
+    // `.editor` wrapper, with a hidden `<textarea>` shadow that
+    // CodeMirror writes back to on every doc change. The shadow
+    // keeps the rest of the page (which talks to `srcEl.value` and
+    // the `input` event) working unchanged.
 
-    function escapeHtml(s) {
-      return s
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-    }
-
-    const WREN_KEYWORDS = new Set([
+    // Minimal Wren stream-parser. CodeMirror 5/6's StreamLanguage
+    // takes one of these and produces a parser + token classes.
+    // No first-party Wren grammar exists; this adapts the regex
+    // tokenizer we'd been running on the transparent-textarea hack.
+    const wrenKeywords = new Set([
       "as","break","class","construct","continue","else","false",
       "for","foreign","if","import","in","is","null","return",
       "static","super","this","true","var","while",
     ]);
+    const wrenStreamParser = {
+      name: "wren",
+      startState() { return { inBlockComment: false, inString: false }; },
+      token(stream, state) {
+        if (state.inBlockComment) {
+          if (stream.match(/.*?\*\//)) { state.inBlockComment = false; return "comment"; }
+          stream.skipToEnd();
+          return "comment";
+        }
+        if (stream.eatSpace()) return null;
+        if (stream.match("//")) { stream.skipToEnd(); return "lineComment"; }
+        if (stream.match("/*")) { state.inBlockComment = true; return "blockComment"; }
+        if (stream.match(/^"(?:\\.|[^"\\])*"/)) return "string";
+        if (stream.match(/^[0-9]+(?:\.[0-9]+)?/)) return "number";
+        if (stream.match(/^[A-Za-z_][A-Za-z0-9_]*/)) {
+          const word = stream.current();
+          if (wrenKeywords.has(word)) return "keyword";
+          if (/^[A-Z]/.test(word)) return "typeName";
+          if (stream.peek() === "(") return "function";
+          return "variableName";
+        }
+        if (stream.match(/^[+\-*/=<>!&|%^~?:]+/)) return "operator";
+        stream.next();
+        return null;
+      },
+      languageData: { commentTokens: { line: "//", block: { open: "/*", close: "*/" } } },
+    };
+    const wrenLanguage = StreamLanguage.define(wrenStreamParser);
 
-    function highlightWren(src) {
-      // Single pass over the source. Each iteration consumes the
-      // next token (longest-match) and emits a sanitised span.
-      const out = [];
-      let i = 0;
-      const n = src.length;
-      while (i < n) {
-        const c = src[i];
-        // Block comment /* ... */ (Wren has both)
-        if (c === "/" && src[i + 1] === "*") {
-          let j = i + 2;
-          while (j < n && !(src[j] === "*" && src[j + 1] === "/")) j++;
-          j = Math.min(n, j + 2);
-          out.push(`<span class="tok-comment">${escapeHtml(src.slice(i, j))}</span>`);
-          i = j; continue;
-        }
-        // Line comment //...
-        if (c === "/" && src[i + 1] === "/") {
-          let j = i;
-          while (j < n && src[j] !== "\n") j++;
-          out.push(`<span class="tok-comment">${escapeHtml(src.slice(i, j))}</span>`);
-          i = j; continue;
-        }
-        // String literal — Wren uses `"..."` with backslash escapes
-        // and `%(...)` interpolation. Highlight the whole thing
-        // green for now; nested expression colouring is a v2 task.
-        if (c === '"') {
-          let j = i + 1;
-          while (j < n && src[j] !== '"') {
-            if (src[j] === "\\" && j + 1 < n) j += 2;
-            else j++;
-          }
-          j = Math.min(n, j + 1);
-          out.push(`<span class="tok-string">${escapeHtml(src.slice(i, j))}</span>`);
-          i = j; continue;
-        }
-        // Number — `\d+(\.\d+)?` is enough for the playground
-        if (/[0-9]/.test(c)) {
-          let j = i;
-          while (j < n && /[0-9]/.test(src[j])) j++;
-          if (src[j] === "." && /[0-9]/.test(src[j + 1] || "")) {
-            j++;
-            while (j < n && /[0-9]/.test(src[j])) j++;
-          }
-          out.push(`<span class="tok-number">${escapeHtml(src.slice(i, j))}</span>`);
-          i = j; continue;
-        }
-        // Identifier — keyword / type / call / plain
-        if (/[A-Za-z_]/.test(c)) {
-          let j = i;
-          while (j < n && /[A-Za-z0-9_]/.test(src[j])) j++;
-          const word = src.slice(i, j);
-          let cls = null;
-          if (WREN_KEYWORDS.has(word)) cls = "tok-keyword";
-          else if (/^[A-Z]/.test(word)) cls = "tok-type";
-          else if (src[j] === "(") cls = "tok-fn";
-          out.push(cls
-            ? `<span class="${cls}">${escapeHtml(word)}</span>`
-            : escapeHtml(word));
-          i = j; continue;
-        }
-        // Anything else: emit a single escaped char and move on.
-        out.push(escapeHtml(c));
-        i += 1;
-      }
-      return out.join("");
+    // Theme — token colors from --syn-* CSS variables so the
+    // editor inherits palette swaps. `tags.*` are the standard
+    // Lezer highlighter tag names; StreamLanguage maps the
+    // string-typed token classes above onto these via the
+    // default classHighlighter.
+    const wlightTheme = HighlightStyle.define([
+      { tag: tags.comment,        color: "var(--syn-comment)", fontStyle: "italic" },
+      { tag: tags.lineComment,    color: "var(--syn-comment)", fontStyle: "italic" },
+      { tag: tags.blockComment,   color: "var(--syn-comment)", fontStyle: "italic" },
+      { tag: tags.keyword,        color: "var(--syn-keyword)" },
+      { tag: tags.string,         color: "var(--syn-string)" },
+      { tag: tags.number,         color: "var(--syn-number)" },
+      { tag: tags.bool,           color: "var(--syn-number)" },
+      { tag: tags.atom,           color: "var(--syn-number)" },
+      { tag: tags.typeName,       color: "var(--syn-type)", fontWeight: "600" },
+      { tag: tags.variableName,   color: "var(--syn-type)" },
+      { tag: tags.function(tags.variableName), color: "var(--syn-fn)" },
+      { tag: tags.propertyName,   color: "var(--syn-fn)" },
+      { tag: tags.heading,        color: "var(--syn-keyword)", fontWeight: "600" },
+      { tag: tags.operator,       color: "var(--text)" },
+    ]);
+
+    // Theme matching the playground palette. CodeMirror's `theme`
+    // helper takes a CSS-rule object keyed by selector strings.
+    const wlightEditorTheme = EditorView.theme({
+      "&": {
+        backgroundColor: "var(--panel)",
+        color: "var(--text)",
+        height: "100%",
+      },
+      ".cm-content": { caretColor: "var(--accent)" },
+      "&.cm-focused .cm-cursor": { borderLeftColor: "var(--accent)" },
+      "&.cm-focused .cm-selectionBackground, ::selection": {
+        backgroundColor: "rgba(245, 166, 35, 0.25)",
+      },
+      ".cm-gutters": {
+        backgroundColor: "var(--panel)",
+        color: "var(--muted)",
+        borderRight: "1px solid var(--rule)",
+      },
+      ".cm-activeLine, .cm-activeLineGutter": {
+        backgroundColor: "rgba(245, 166, 35, 0.06)",
+      },
+    }, { dark: true });
+
+    function buildExtensions(language) {
+      return [
+        lineNumbers(),
+        history(),
+        drawSelection(),
+        bracketMatching(),
+        indentOnInput(),
+        highlightActiveLine(),
+        // `lineWrapping` keeps long lines visible without a
+        // horizontal scrollbar — wrapping happens at word
+        // boundaries by default.
+        EditorView.lineWrapping,
+        keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
+        language,
+        syntaxHighlighting(wlightTheme),
+        wlightEditorTheme,
+      ];
     }
 
-    function highlightToml(src) {
-      // Section headers, key = value lines, strings, numbers,
-      // comments. Whitespace-preserving so the backdrop lines up
-      // with the textarea.
-      const out = [];
-      const lines = src.split("\n");
-      lines.forEach((line, idx) => {
-        let m;
-        if ((m = /^(\s*)(#.*)$/.exec(line))) {
-          out.push(escapeHtml(m[1]) + `<span class="tok-comment">${escapeHtml(m[2])}</span>`);
-        } else if ((m = /^(\s*)(\[[^\]]+\])(\s*)$/.exec(line))) {
-          out.push(
-            escapeHtml(m[1]) +
-            `<span class="tok-section">${escapeHtml(m[2])}</span>` +
-            escapeHtml(m[3]),
-          );
-        } else if ((m = /^(\s*)("?[^=#"]+"?)(\s*=\s*)(.*)$/.exec(line))) {
-          out.push(
-            escapeHtml(m[1]) +
-            `<span class="tok-key">${escapeHtml(m[2])}</span>` +
-            escapeHtml(m[3]) +
-            highlightTomlValue(m[4]),
-          );
-        } else {
-          out.push(escapeHtml(line));
-        }
-        if (idx < lines.length - 1) out.push("\n");
+    function bindEditor(textarea, mount, language) {
+      const initial = textarea.value;
+      const view = new EditorView({
+        state: EditorState.create({
+          doc: initial,
+          extensions: [
+            ...buildExtensions(language),
+            EditorView.updateListener.of((u) => {
+              if (!u.docChanged) return;
+              // Mirror CM doc back to the shadow textarea so the
+              // existing `srcEl.value` / `srcEl.addEventListener("input")`
+              // call sites keep working.
+              textarea.value = u.state.doc.toString();
+              textarea.dispatchEvent(new Event("input"));
+            }),
+          ],
+        }),
+        parent: mount,
       });
-      return out.join("");
-    }
-
-    function highlightTomlValue(v) {
-      // Strings → green; numbers → amber; everything else plain.
-      // No deep nesting / inline-table tokenisation; good enough
-      // for the hatchfile shapes the playground edits.
-      const out = [];
-      let i = 0;
-      const n = v.length;
-      while (i < n) {
-        const c = v[i];
-        if (c === "\"") {
-          let j = i + 1;
-          while (j < n && v[j] !== "\"") {
-            if (v[j] === "\\" && j + 1 < n) j += 2;
-            else j++;
-          }
-          j = Math.min(n, j + 1);
-          out.push(`<span class="tok-string">${escapeHtml(v.slice(i, j))}</span>`);
-          i = j; continue;
-        }
-        if (/[0-9]/.test(c)) {
-          let j = i;
-          while (j < n && /[0-9.]/.test(v[j])) j++;
-          out.push(`<span class="tok-number">${escapeHtml(v.slice(i, j))}</span>`);
-          i = j; continue;
-        }
-        out.push(escapeHtml(c));
-        i += 1;
-      }
-      return out.join("");
-    }
-
-    function bindEditor(textarea, bg, highlighter) {
-      function render() {
-        // Trailing newline keeps the backdrop at-least-one-line
-        // taller than the visible content so the cursor on the
-        // last line doesn't fall off the .editor-bg's bottom
-        // padding.
-        bg.innerHTML = highlighter(textarea.value + "\n");
-      }
-      function syncScroll() {
-        const pre = bg.parentElement;
-        pre.scrollTop = textarea.scrollTop;
-        pre.scrollLeft = textarea.scrollLeft;
-      }
-      textarea.addEventListener("input", () => { render(); syncScroll(); });
-      textarea.addEventListener("scroll", syncScroll);
-      // Tab key inserts two spaces instead of moving focus.
-      textarea.addEventListener("keydown", (e) => {
-        if (e.key === "Tab" && !e.shiftKey) {
-          e.preventDefault();
-          const s = textarea.selectionStart;
-          textarea.setRangeText("  ", s, textarea.selectionEnd, "end");
-          render();
-        }
-      });
-      render();
-      syncScroll();
-      // Expose so callers (form→TOML sync etc.) can re-render.
-      return render;
+      // Setter for callers that need to push state in (form →
+      // TOML sync). Replace the whole doc; callers don't care
+      // about cursor preservation here.
+      const setValue = (text) => {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: text },
+        });
+      };
+      return { view, setValue };
     }
 
     // ---- Hatchfile form ↔ TOML sync ---------------------------------
@@ -712,7 +669,13 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     }
 
     function syncFormToToml() {
-      hatchfileEl.value = buildTomlFromForm();
+      const text = buildTomlFromForm();
+      hatchfileEl.value = text;
+      // Push into the live CodeMirror editor too. The bound
+      // editor's setValue replaces the doc; without this the
+      // backdrop view stays stale until the user clicks into
+      // the TOML pane.
+      if (hatchfileEditor) hatchfileEditor.setValue(text);
     }
 
     // Try to parse a hatchfile-shaped TOML string back into the
@@ -752,8 +715,9 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
         // Coming from TOML — best-effort parse back into the form.
         syncTomlToForm();
       } else {
+        // Coming from the form — push the freshly-generated TOML
+        // into the CM editor so the user lands on current text.
         syncFormToToml();
-        renderHatchfileBg();
       }
     }
 
@@ -773,13 +737,22 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
       const showing = wrenColEl.classList.toggle("show-hatchfile");
       hatchToggleBtn.classList.toggle("seg-active", showing);
     });
+    htmlToggleBtn.addEventListener("click", () => {
+      const showing = mainEl.classList.toggle("show-html");
+      htmlToggleBtn.classList.toggle("seg-active", showing);
+    });
 
-    // Wire the syntax-highlight backdrops to their textareas.
-    // `renderHatchfileBg` is called on form→TOML sync so the
-    // backdrop reflects the freshly-generated TOML when the user
-    // toggles to that view.
-    bindEditor(srcEl, srcBgEl, highlightWren);
-    const renderHatchfileBg = bindEditor(hatchfileEl, hatchfileBgEl, highlightToml);
+    // Mount the CodeMirror editors. `bindEditor` reads each
+    // textarea's current value as the initial doc, then writes
+    // back to the textarea on every change — so the rest of
+    // the page (which still talks to `srcEl.value` etc.) keeps
+    // working unchanged.
+    const srcMount = document.getElementById("src-mount");
+    const hatchfileMount = document.getElementById("hatchfile-mount");
+    const htmlMount = document.getElementById("html-mount");
+    bindEditor(htmlEl, htmlMount, html());
+    bindEditor(srcEl, srcMount, wrenLanguage);
+    var hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
     // Local-dev fetcher for the hatchfile-driven resolver.
     // Maps `<registry>/releases/download/<name>-<ver>/<name>-<ver>.hatch`
