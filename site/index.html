@@ -704,6 +704,12 @@
     .install-grid { grid-template-columns: 1fr; gap: 28px; }
     .hatch-card { grid-template-columns: 1fr; padding: 36px 28px; }
     .term-float { left: 0; width: 280px; }
+    /* Diagnostics + Embed: side-by-side text/code layout collapses
+       to a single column. The wide error report and code panels
+       overflow their column at narrower widths, so let the panel
+       sit below the prose where it can use the full content width. */
+    .diag-grid  { grid-template-columns: 1fr; gap: 28px; }
+    .embed-grid { grid-template-columns: 1fr; gap: 28px; }
   }
   @media (max-width: 600px) {
     .nav-links a { display: none; }
