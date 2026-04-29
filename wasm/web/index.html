@@ -446,9 +446,9 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     <footer>
       <button id="html-toggle" class="seg" title="show/hide html pane">html</button>
       <button id="hatch-toggle" class="seg" title="show/hide hatchfile pane">hatchfile</button>
-      <button id="console-toggle" class="seg" title="show/hide console pane">console</button>
       <span id="version">…</span>
-      <span style="margin-left: auto">
+      <span style="margin-left: auto; display: inline-flex; align-items: center; gap: 12px">
+        <button id="console-toggle" class="seg" title="show/hide console pane">console</button>
         <a href="https://github.com/wrenlift/WrenLift" target="_blank" rel="noopener">wrenlift on github</a>
       </span>
     </footer>
@@ -772,9 +772,10 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     consoleToggleBtn.addEventListener("click", () => {
       const showing = outputColEl.classList.toggle("show-console");
       consoleToggleBtn.classList.toggle("seg-active", showing);
-      // Opening the console clears the unread-error indicator
-      // — by definition the user can now see what went wrong.
-      if (showing) consoleToggleBtn.classList.remove("has-error");
+      // Recompute from the latched error state so the dot
+      // reappears the next time the user collapses the console
+      // while an error is still the latest result.
+      updateConsoleErrorDot();
     });
 
     // Mount the CodeMirror editors. `bindEditor` reads each
@@ -811,6 +812,17 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     }
 
     let wlift = null;
+    // Latch — does the most recent run carry an error? The
+    // console-toggle's red dot is the (lastErrored AND
+    // console-hidden) intersection; without persisting the
+    // first half, toggling the console open then shut would
+    // clear the dot even though nothing changed about the run.
+    let lastErrored = false;
+
+    function updateConsoleErrorDot() {
+      const consoleHidden = !outputColEl.classList.contains("show-console");
+      consoleToggleBtn.classList.toggle("has-error", lastErrored && consoleHidden);
+    }
 
     function renderStage() {
       // Just `innerHTML` — this is a local playground, the user
@@ -868,11 +880,10 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
         runtimeEl.textContent = `${kind} · ${ms}`;
       }
 
-      // Error indicator on the console toggle: only when the run
-      // errored AND the user has the console hidden. If the
-      // console is open they're already looking at the output.
-      const consoleHidden = !outputColEl.classList.contains("show-console");
-      consoleToggleBtn.classList.toggle("has-error", !result.ok && consoleHidden);
+      // Latch the error state so the toggle's dot persists
+      // across console show/hide cycles until the *next* run.
+      lastErrored = !result.ok;
+      updateConsoleErrorDot();
     }
 
     // True if the source has at least one `import "..."` whose
