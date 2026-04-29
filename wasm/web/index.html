@@ -294,14 +294,22 @@ var fiber = Fiber.new {
 }
 fiber.try()
 
-// Heavy compute under the BC interp is slow on wasm — each
-// `Fn.call` dispatch is ~2 µs. JIT-on-wasm (Phase 2) erases it.
-// Try `fib(15)` if you want a fast loop demo, `fib(28)` if you
-// want to see the interpreter floor.
+// Recursive compute through the wasm tier-up JIT. fib(20) lands
+// at ~3 ms post-warmup on both worker and main mode (call_indirect
+// through a shared funcref table; no JS hop on the hot path).
+// Bump to fib(28) if you want to feel the runtime in earnest.
+var start = System.clock
+var fib
+fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
+System.print("fib(20) = %(fib.call(20))  (%((System.clock - start) * 1000) ms)")
+
+// `@hatch:*` package resolution. Uncomment the import below and
+// open the `hatchfile` pane (header button) — the seeded form
+// already lists `@hatch:test` and `@hatch:assert` from the
+// local /packages/ dev server, so Run just works.
 //
-// var fib
-// fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
-// System.print("fib(15) = %(fib.call(15))")
+// import "@hatch:assert" for Expect
+// System.print("got Expect from @hatch:assert: %(Expect)")
 </textarea>
         </div>
         <div class="pane hatchfile-pane">
