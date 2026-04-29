@@ -1715,6 +1715,29 @@ entry   = "main"
     htmlEl.addEventListener("input", () => { renderStage(); maybeAutorun(); });
     srcEl.addEventListener("input", maybeAutorun);
 
+    // Escape-to-cancel. Captures at window level so it wins
+    // before any keydown listener the running script's canvas
+    // bridge installed (those are bubble-phase listeners on
+    // `document` — capture fires first; stopPropagation keeps
+    // the game from seeing the keypress at all). Only acts
+    // when a run is actually in flight (`runBtn.disabled` is the
+    // proxy — both bootMode and execute flip it).
+    window.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (!runBtn.disabled || !wlift) return;
+      e.preventDefault();
+      e.stopPropagation();
+      outEl.textContent = "cancelled by Escape";
+      outEl.classList.remove("ok");
+      outEl.classList.add("error");
+      lastErrored = true;
+      updateConsoleErrorDot();
+      // Reboot terminates the in-flight wasm so any long-running
+      // fiber (game loop) goes away. `runAfter: false` keeps the
+      // fresh runtime idle — the user can Run again on demand.
+      bootMode(modeSel.value, false);
+    }, true);
+
     runBtn.addEventListener("click", execute);
     [htmlEl, srcEl].forEach((el) => {
       el.addEventListener("keydown", (e) => {
