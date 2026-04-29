@@ -108,6 +108,41 @@ pub unsafe extern "C" fn browser_set_timeout(vm: *mut VM) {
     }
 }
 
+/// `Browser.nextFrame()` — returns a future handle (Num) that
+/// resolves on the next browser paint opportunity. The JS shim
+/// uses `requestAnimationFrame` on the main thread and a
+/// `setTimeout(..., 16)` fallback inside a worker (workers can't
+/// call rAF directly). This is the right primitive for game
+/// loops: vsync-paced, tab-backgrounded-throttled, paint-aligned.
+///
+/// # Safety
+///
+/// Foreign-method ABI: takes no args; writes the handle to slot 0.
+pub unsafe extern "C" fn browser_next_frame(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let handle = create_pending_future();
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::js::wlift_next_frame(handle);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            // Wasi / native — no event loop. Resolve right away
+            // so the awaiting fiber yields once and proceeds; lets
+            // the bridge round-trip be exercised in tests.
+            crate::resolve_future(handle, String::new());
+        }
+
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::num(handle as f64));
+        } else {
+            vm_ref.api_stack[0] = Value::num(handle as f64);
+        }
+    }
+}
+
 /// `Browser.fetch(url)` — returns a future handle (Num) that
 /// resolves to the response body (String). Browser path drives a
 /// JS `fetch(url).then(r => r.text())`; wasi path resolves
@@ -448,6 +483,7 @@ pub fn register_static_symbols() {
     {
         use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
         register_plugin_symbol_unsafe("browser", "browser_set_timeout", browser_set_timeout);
+        register_plugin_symbol_unsafe("browser", "browser_next_frame", browser_next_frame);
         register_plugin_symbol_unsafe("browser", "browser_fetch", browser_fetch);
         register_plugin_symbol_unsafe("browser", "browser_ws_open", browser_ws_open);
         register_plugin_symbol_unsafe("browser", "browser_ws_send", browser_ws_send);
@@ -479,6 +515,8 @@ pub const BROWSER_WREN: &str = r#"
 foreign class BrowserCore {
     #!symbol = "browser_set_timeout"
     foreign static setTimeoutHandle(ms)
+    #!symbol = "browser_next_frame"
+    foreign static nextFrameHandle()
     #!symbol = "browser_fetch"
     foreign static fetchHandle(url)
     #!symbol = "browser_ws_open"
@@ -523,6 +561,12 @@ class WebSocket {
 
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
+    // Vsync-paced yield. Use this in render loops instead of
+    // `setTimeout(0)` — `setTimeout` runs as fast as macrotasks
+    // drain (no upper bound) and keeps firing in backgrounded
+    // tabs; rAF naturally caps at the display refresh rate and
+    // pauses when the tab is hidden.
+    static nextFrame      { Future.new_(BrowserCore.nextFrameHandle()) }
     static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
     static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }

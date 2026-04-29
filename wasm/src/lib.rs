@@ -65,6 +65,19 @@ pub mod js {
 
         /// JS-provided shim:
         ///
+        ///   globalThis._wlift_next_frame = (handle) => {
+        ///       requestAnimationFrame(() => resolve_future(handle, ""));
+        ///   };
+        ///
+        /// Worker mode falls back to `setTimeout(..., 16)` because
+        /// `requestAnimationFrame` is a main-thread API. The
+        /// fallback is roughly 60 Hz; not vsync-locked, but better
+        /// than `setTimeout(0)` (unbounded fire rate).
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_next_frame)]
+        pub fn wlift_next_frame(handle: u32);
+
+        /// JS-provided shim:
+        ///
         ///   globalThis._wlift_fetch = (handle, url) => {
         ///       fetch(url)
         ///         .then(r => r.text())
@@ -917,6 +930,8 @@ const BROWSER_PRELUDE: &str = r##"
 foreign class BrowserCore {
     #!symbol = "browser_set_timeout"
     foreign static setTimeoutHandle(ms)
+    #!symbol = "browser_next_frame"
+    foreign static nextFrameHandle()
     #!symbol = "browser_fetch"
     foreign static fetchHandle(url)
     #!symbol = "browser_ws_open"
@@ -986,6 +1001,12 @@ class WebSocket {
 }
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
+    // Vsync-paced yield. Use this in render loops instead of
+    // setTimeout(0) — setTimeout runs as fast as macrotasks drain
+    // (no upper bound) and keeps firing in backgrounded tabs;
+    // rAF naturally caps at the display refresh rate and pauses
+    // when the tab is hidden.
+    static nextFrame      { Future.new_(BrowserCore.nextFrameHandle()) }
     static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
     static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Local @hatch:game bundle smoke test</title>
+  <style>
+    body { font: 13px ui-monospace, monospace; max-width: 900px; margin: 1.5rem auto; padding: 0 1rem; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; max-height: 320px; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+    #stage { margin-top: 1rem; border: 2px solid #1d1812; border-radius: 8px; background: #0a0810; min-height: 480px; display: flex; align-items: center; justify-content: center; }
+    canvas { display: block; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+  <h2>Local @hatch:game wasm32 bundle — Sprite Grid smoke test</h2>
+  <p>Loads <code>./hatch-game-local.hatch</code> (built locally with the
+     target-aware-fetch wlift commit <code>36d392b</code>) and runs the
+     sprite-grid example via the <em>main-mode</em> wasm runtime. Pass
+     means: import resolves to <code>window_web</code>, plugins instantiate,
+     <code>Window.create({...})</code> returns a real handle.</p>
+  <pre id="out">running…</pre>
+  <div id="stage">
+    <canvas id="stage-canvas" width="640" height="480" tabindex="0"></canvas>
+  </div>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+    out.textContent = "";
+
+    try {
+      log("createWlift(main)…");
+      const wlift = await createWlift({ mode: "main" });
+      log(`  version=${wlift.version}`, "ok");
+
+      log("fetching ./hatch-game-local.hatch…");
+      const r = await fetch("./hatch-game-local.hatch");
+      if (!r.ok) throw new Error(`fetch ${r.status}`);
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      log(`  ${bytes.length} bytes`, "ok");
+
+      // Probe 1 — does `import "@hatch:window" for Window` resolve to a
+      // non-null class?  This is the focused regression check for the
+      // 36d392b fix.
+      log("probe 1 — import @hatch:window for Window…");
+      const probe1 = await wlift.runWithHatches(`
+import "@hatch:window" for Window
+if (Window == null) Fiber.abort("FAIL: Window is null")
+System.print("OK: Window class = %(Window)")
+`, [bytes]);
+      log(`  ok=${probe1.ok}  ${probe1.elapsedMs.toFixed(1)} ms`, probe1.ok ? "ok" : "err");
+      log(probe1.output || "(no output)");
+      if (!probe1.ok) {
+        log("STOP — Window null. Fix didn't take.", "err");
+        throw new Error("probe 1 failed");
+      }
+
+      // Probe 2 — actual sprite-grid run with Game.run + canvas attach.
+      // Per-frame draw loop is open-ended so we use the BYO-canvas
+      // attach path against the `<canvas id="stage-canvas">` already
+      // mounted above.
+      log("probe 2 — Game.run(SpriteGrid)…");
+      // Freeze detector. We schedule a 50ms interval *before*
+      // entering Game.run; if the main thread freezes (Wren loop
+      // doesn't yield to the JS event loop) the callback never
+      // fires and `mainTicks` stays at 0. With the wasm-only
+      // `Browser.setTimeout(0).await` at the end of each frame,
+      // the JS event loop should drain ~once per frame and
+      // mainTicks should hover near `runTimeMs / 50`.
+      let mainTicks = 0;
+      const freezeDetector = setInterval(() => mainTicks++, 50);
+      const runStart = performance.now();
+      // Wren uses newlines, not semicolons — multi-statement
+      // braces have to spread across lines.
+      const spriteSrc = `
+import "@hatch:game" for Game
+import "@hatch:gpu"  for Renderer2D, Camera2D, Sprite
+
+class SpriteGrid is Game {
+  construct new() {}
+  config { {
+    "title": "smoke", "width": 640, "height": 480,
+    "clearColor": [0.04, 0.05, 0.08, 1.0],
+    "canvas": "stage-canvas"
+  } }
+  setup(g) {
+    _renderer = Renderer2D.new(g.device, g.surfaceFormat)
+    _camera   = Camera2D.contain(640, 480, g.width, g.height)
+    var w = 4
+    var h = 4
+    var bytes = ""
+    var i = 0
+    while (i < w * h * 4) {
+      bytes = bytes + String.fromCodePoint(255)
+      i = i + 1
+    }
+    _texture = g.device.createTexture({"width": w, "height": h, "format": "rgba8unorm", "usage": ["texture-binding", "copy-dst"]})
+    g.device.writeTexture(_texture, bytes, {"width": w, "height": h, "bytesPerRow": w * 4})
+    _sprites = []
+    var r = 0
+    while (r < 4) {
+      var c = 0
+      while (c < 4) {
+        var s = Sprite.new(_texture)
+        s.width = 60
+        s.height = 60
+        s.anchor(0.5, 0.5)
+        _sprites.add(s)
+        c = c + 1
+      }
+      r = r + 1
+    }
+    System.print("setup ok")
+  }
+  resize(g, w, h) { _camera.fitContain(w, h) }
+  update(g) {
+    if (g.tick > 60) g.requestQuit
+  }
+  draw(g) {
+    _renderer.beginFrame(_camera)
+    var idx = 0
+    var r = 0
+    while (r < 4) {
+      var c = 0
+      while (c < 4) {
+        var s = _sprites[idx]
+        s.x = 100 + c * 80
+        s.y = 100 + r * 80
+        s.setTint(0.5 + 0.5 * (c / 3.0), 0.5, 0.5 + 0.5 * (r / 3.0), 1)
+        s.draw(_renderer)
+        idx = idx + 1
+        c = c + 1
+      }
+      r = r + 1
+    }
+    _renderer.flush(g.pass)
+  }
+}
+Game.run(SpriteGrid)
+`;
+      const probe2 = await wlift.runWithHatches(spriteSrc, [bytes]);
+      clearInterval(freezeDetector);
+      const runMs = performance.now() - runStart;
+      log(`  ok=${probe2.ok}  ${probe2.elapsedMs.toFixed(1)} ms`, probe2.ok ? "ok" : "err");
+      log(probe2.output || "(no output)");
+      const expectedTicks = Math.floor(runMs / 50);
+      const msPerFrame = runMs / 60;  // 60 frames in this probe
+      log(`freeze detector: mainTicks=${mainTicks}  expected≈${expectedTicks}  (run wall=${runMs.toFixed(1)} ms)`);
+      log(`per-frame pacing: ${msPerFrame.toFixed(2)} ms/frame  (rAF target ≈16.7 ms @ 60 Hz)`);
+      const freezeOk = mainTicks > 0;
+      // rAF pacing: ~16ms is the canonical 60 Hz tick. setTimeout(0)
+      // would land near 0–5 ms/frame (drains macrotasks at full
+      // speed). 8–25 ms/frame range = rAF working.
+      const pacingOk = msPerFrame >= 8 && msPerFrame <= 25;
+      if (probe2.ok && freezeOk && pacingOk) {
+        log("✓ PASS — Sprite Grid ran end-to-end, main thread unfrozen, vsync-paced.", "ok");
+      } else if (probe2.ok && freezeOk) {
+        log(`⚠ Probe ok, freeze ok, but pacing is ${msPerFrame.toFixed(2)} ms/frame — outside expected 8–25 ms rAF window. setTimeout-based yield instead of rAF?`, "err");
+      } else if (probe2.ok && !freezeOk) {
+        log("✗ FAIL — game ran, but main thread froze (mainTicks=0 → no JS event loop progress during the run).", "err");
+      } else {
+        log("✗ FAIL — Game.run errored.", "err");
+      }
+    } catch (err) {
+      log(`exception: ${err}`, "err");
+      console.error(err);
+    }
+  </script>
+</body>
+</html>

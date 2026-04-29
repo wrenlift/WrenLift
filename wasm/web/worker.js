@@ -71,6 +71,14 @@ const {
 globalThis._wlift_set_timeout = (handle, ms) => {
   setTimeout(() => resolve_future(handle, ""), ms);
 };
+// Workers can't requestAnimationFrame directly — it's a main-thread
+// API. Fall back to a 16ms timer, which approximates 60 Hz without
+// vsync alignment. Upgrade path: postMessage to main, main calls
+// rAF, postMessages back, worker resolves the future. That's a
+// follow-up tied to the OffscreenCanvas + DOM-event-shuttle work.
+globalThis._wlift_next_frame = (handle) => {
+  setTimeout(() => resolve_future(handle, ""), 16);
+};
 globalThis._wlift_fetch = (handle, url) => {
   fetch(url)
     .then((r) => r.text())

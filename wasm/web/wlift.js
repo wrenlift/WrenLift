@@ -524,6 +524,11 @@ class MainWlift {
     globalThis._wlift_set_timeout = (handle, ms) => {
       setTimeout(() => mod.resolve_future(handle, ""), ms);
     };
+    // Real rAF on the page thread — vsync-paced, paint-aligned,
+    // tab-backgrounded-throttled.
+    globalThis._wlift_next_frame = (handle) => {
+      requestAnimationFrame(() => mod.resolve_future(handle, ""));
+    };
     globalThis._wlift_fetch = (handle, url) => {
       fetch(url)
         .then((r) => r.text())
@@ -780,11 +785,15 @@ class MainWlift {
           parent.appendChild(canvas);
 
           const queue = [];
+          // Field names mirror what `@hatch:game`'s Input.applyEvent_
+          // reads — `code` is `KeyboardEvent.code` (physical key,
+          // matches `g.input.isDown("KeyA")`), and the move event
+          // is `mouseMoved` (winit's name) not the DOM `mousemove`.
           const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
           const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
-          const onMouseMove = (e) => queue.push({ type: "mouseMove", x: e.offsetX, y: e.offsetY });
-          const onKeyDown   = (e) => queue.push({ type: "keyDown", key: e.key });
-          const onKeyUp     = (e) => queue.push({ type: "keyUp",   key: e.key });
+          const onMouseMove = (e) => queue.push({ type: "mouseMoved", x: e.offsetX, y: e.offsetY });
+          const onKeyDown   = (e) => queue.push({ type: "keyDown", code: e.code, key: e.key });
+          const onKeyUp     = (e) => queue.push({ type: "keyUp",   code: e.code, key: e.key });
           canvas.addEventListener("mousedown", onMouseDown);
           canvas.addEventListener("mouseup",   onMouseUp);
           canvas.addEventListener("mousemove", onMouseMove);
@@ -822,11 +831,15 @@ class MainWlift {
           const canvas = /** @type {HTMLCanvasElement} */ (el);
 
           const queue = [];
+          // Field names mirror what `@hatch:game`'s Input.applyEvent_
+          // reads — `code` is `KeyboardEvent.code` (physical key,
+          // matches `g.input.isDown("KeyA")`), and the move event
+          // is `mouseMoved` (winit's name) not the DOM `mousemove`.
           const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
           const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
-          const onMouseMove = (e) => queue.push({ type: "mouseMove", x: e.offsetX, y: e.offsetY });
-          const onKeyDown   = (e) => queue.push({ type: "keyDown", key: e.key });
-          const onKeyUp     = (e) => queue.push({ type: "keyUp",   key: e.key });
+          const onMouseMove = (e) => queue.push({ type: "mouseMoved", x: e.offsetX, y: e.offsetY });
+          const onKeyDown   = (e) => queue.push({ type: "keyDown", code: e.code, key: e.key });
+          const onKeyUp     = (e) => queue.push({ type: "keyUp",   code: e.code, key: e.key });
           canvas.addEventListener("mousedown", onMouseDown);
           canvas.addEventListener("mouseup",   onMouseUp);
           canvas.addEventListener("mousemove", onMouseMove);
