@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Wrenlift — benchmarks</title>
+<title>Wrenlift · benchmarks</title>
 <link rel="icon" href="../assets/wrenlift-mascot.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -68,6 +68,16 @@
   }
   .nav-links a { color: var(--ink); }
   .nav-links a:hover { color: var(--toast-deep); text-decoration: none; }
+  .nav-links a.nav-cta { color: var(--cream); }
+  .nav-cta {
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+    background: var(--ink); color: var(--cream);
+    padding: 9px 14px; border-radius: 999px;
+    border: 2px solid var(--ink);
+    display: inline-flex; align-items: center; gap: 8px;
+    white-space: nowrap;
+  }
+  .nav-cta:hover, .nav-links a.nav-cta:hover { background: var(--ember); border-color: var(--ember); color: var(--cream); text-decoration: none; }
 
   /* ---------- HEADER ---------- */
   .head {
@@ -219,20 +229,27 @@
 
   /* ---------- FOOTER ---------- */
   footer {
-    margin-top: 56px;
+    margin-top: 64px;
     background: var(--cream-2);
     border-top: 2.5px solid var(--ink);
-    padding: 32px 32px 24px;
+    padding: 40px 32px 28px;
   }
   .foot-inner {
     max-width: 1180px; margin: 0 auto;
-    display: flex; justify-content: space-between; align-items: center;
-    gap: 24px; flex-wrap: wrap;
+    display: flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap;
   }
+  .foot-brand { display: flex; align-items: center; gap: 10px; }
   .foot-brand b { font-family: var(--display); font-weight: 800; font-size: 18px; color: var(--ink); }
   .foot-links { display: flex; gap: 22px; font-family: var(--mono); font-size: 12.5px; }
   .foot-links a { color: var(--ink-2); }
   .foot-links a:hover { color: var(--toast-deep); }
+  .foot-bottom {
+    max-width: 1180px; margin: 24px auto 0;
+    padding-top: 18px;
+    border-top: 1.5px dashed var(--rule);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    font-family: var(--mono); font-size: 12px; color: var(--ink-3);
+  }
 
   @media (max-width: 600px) {
     .nav-links a:not(:last-child) { display: none; }
@@ -245,13 +262,20 @@
 
 <!-- NAV -->
 <nav class="nav">
-  <a class="brand" href="../"><span class="word">wrenlift</span></a>
+  <a class="brand" href="../">
+    <span class="word">wrenlift</span>
+  </a>
   <div class="nav-links">
     <a href="../#install">Install</a>
     <a href="../#diagnostics">Diagnostics</a>
     <a href="../#embed">Embed</a>
     <a href="../#hatch">Packages</a>
-    <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    <a href="./">Benchmarks</a>
+    <a href="https://github.com/wrenlift">GitHub</a>
+    <a class="nav-cta" href="https://github.com/wrenlift/WrenLift">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-1.96c-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.15 1.18a10.95 10.95 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.58.23 2.75.11 3.04.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.27 5.69.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.8.55C20.21 21.39 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+      <span>Star on GitHub</span>
+    </a>
   </div>
 </nav>
 
@@ -261,7 +285,7 @@
   <h1>How <em>fast</em> does it lift?</h1>
   <p>
     Wrenlift compared head-to-head with standard Wren and a handful of other scripting languages on the same GitHub Actions runner.
-    Best of 10 runs, executed code only — interpreter startup is excluded.
+    Best of 10 runs, executed code only; interpreter startup is excluded.
     Source for every benchmark lives in <a href="https://github.com/wrenlift/WrenLift/tree/main/bench" target="_blank" rel="noopener">bench/</a>.
   </p>
 </header>
@@ -269,7 +293,7 @@
 <!-- METHODOLOGY -->
 <section class="method">
   <div class="method-card">
-    <span><svg class="ti" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><b>Tiered JIT</b> · interpret then Cranelift-compile</span>
+    <span><svg class="ti" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><b>Tiered JIT</b></span>
     <span><svg class="ti" viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg><b>OSR</b> · hot loops switch mid-iteration</span>
     <span><svg class="ti" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><b>Best of 10</b> · per language</span>
     <span><svg class="ti" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><b>Same runner</b> · ubuntu-latest</span>
@@ -286,21 +310,28 @@
 <div class="footnote">
   <strong>Shorter bars are better.</strong>
   Each benchmark is run 10 times and the best wall-clock time is kept.
-  Only the benchmarked code is timed — interpreter startup is excluded.
+  Only the benchmarked code is timed; interpreter startup is excluded.
   Output is correctness-checked against standard Wren before timing; any divergence fails the workflow.
 </div>
 
 <!-- FOOTER -->
 <footer>
   <div class="foot-inner">
-    <div class="foot-brand"><b>wrenlift</b></div>
+    <div class="foot-brand">
+      <b>wrenlift</b>
+    </div>
     <div class="foot-links">
-      <a href="../">Home</a>
+      <a href="https://github.com/wrenlift">GitHub</a>
       <a href="../#install">Install</a>
       <a href="../#embed">Embed</a>
+      <a href="./">Benchmarks</a>
       <a href="https://github.com/wrenlift/hatch">Hatch</a>
-      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+      <a href="https://wren.io" target="_blank" rel="noopener">Wren</a>
     </div>
+  </div>
+  <div class="foot-bottom">
+    <span>© 2026 The Wrenlift contributors · MIT licensed</span>
+    <span>built fast for portable <a href="https://wren.io" target="_blank" rel="noopener">Wren</a> scripts</span>
   </div>
 </footer>
 

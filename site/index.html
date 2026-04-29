@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Wrenlift — a tiered runtime for Wren</title>
+<title>Wrenlift · a tiered runtime for Wren</title>
 <link rel="icon" href="assets/wrenlift-mascot.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -739,7 +739,7 @@
     <h1>Wren scripts, now <span class="accent">standalone</span> and portable.</h1>
     <p class="lede">
       <a href="https://wren.io" target="_blank" rel="noopener"><code>Wren</code></a>
-      was intended to be small and embedded. Wrenlift flips that &mdash;
+      was intended to be small and embedded. Wrenlift flips that:
       it runs your <code>.wren</code> files directly as standalone, portable scripts
       and apps. One static binary, <code>wlift</code>, with zero runtime deps.
     </p>
@@ -762,7 +762,7 @@
 
     <div class="hero-meta">
       <span><svg class="ti" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg> <b>standalone</b> &middot; no host required</span>
-      <span><svg class="ti" viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg> <b>tiered JIT</b> · interpret then Cranelift</span>
+      <span><svg class="ti" viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg> <b>tiered JIT</b></span>
       <span><svg class="ti" viewBox="0 0 24 24"><path d="M12 4v12m0 0l-5-5m5 5l5-5M4 20h16"/></svg> <b>zero</b> runtime deps</span>
     </div>
   </div>
@@ -801,17 +801,17 @@
   <div class="install-grid">
     <div class="install-text">
       <h2>Quick <em>setup</em>.</h2>
-      <p>One curl gives you both binaries &mdash; <code>wlift</code> (the runtime) and <code>hatch</code> (the package + build tool) &mdash; pulled from the latest GitHub Release, SHA256-verified, dropped into <code>~/.local/bin</code>. No Node, no Python, no Docker.</p>
+      <p>One curl gives you <code>wlift</code> (the runtime) and <code>hatch</code> (the package + build tool), pulled from the latest GitHub Release, SHA256-verified, and dropped into <code>~/.local/bin</code>.</p>
       <ol>
         <li>Run the script. The default install dir is <code>~/.local/bin</code>; override with <code>INSTALL_DIR</code>.</li>
         <li>Open a new shell so <code>wlift</code> and <code>hatch</code> land on your <code>PATH</code>.</li>
-        <li>Run <code>wlift hello.wren</code> &mdash; you&rsquo;re lifting.</li>
+        <li>Run <code>wlift hello.wren</code>. You&rsquo;re lifting.</li>
       </ol>
     </div>
 
     <div>
       <pre class="codeblock"><span class="cmt"># install (macos · linux)</span>
-<span class="pr">$</span> curl -fsSL <span class="accent">https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh</span> | bash
+<span class="pr">$</span> curl -fsSL <span class="accent">wrenlift.com/install.sh</span> | sh
 
 <span class="cmt"># verify</span>
 <span class="pr">$</span> wlift --version
@@ -834,7 +834,7 @@
     <div>
       <span class="tag"><svg class="ti" viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h10"/><circle cx="19" cy="17" r="2"/></svg> packages &amp; libraries</span>
       <h2>Pair with <em>Hatch</em><br/>for libraries.</h2>
-      <p>Wrenlift powers <a href="https://github.com/wrenlift/hatch" style="color:var(--butter);">Hatch</a>, and Hatch brings the ecosystem. Add a package, lock the version, and <code style="font-family:var(--mono);font-size:13px;background:rgba(251,243,220,0.1);padding:2px 7px;border-radius:6px;color:var(--cream);">hatch run</code> takes care of the rest &mdash; same runtime under the hood.</p>
+      <p>Wrenlift powers <a href="https://github.com/wrenlift/hatch" style="color:var(--butter);">Hatch</a>, and Hatch brings the ecosystem. Add a package, lock the version, and <code style="font-family:var(--mono);font-size:13px;background:rgba(251,243,220,0.1);padding:2px 7px;border-radius:6px;color:var(--cream);">hatch run</code> takes care of the rest. Same runtime under the hood.</p>
       <div class="links">
         <a class="btn-light" href="https://github.com/wrenlift/hatch/blob/main/index.toml">
           <span>Browse hatch packages</span>
@@ -851,7 +851,7 @@
 <span class="cmt">  resolved 3 packages</span>
 
 <span class="cmt"># run with the hatch cli &mdash; it wraps wlift</span>
-<span class="pr">$</span> hatch run app.wren
+<span class="pr">$</span> hatch run path/to/myApp
 <span class="cmt">  loading </span><span class="accent">@hatch:http</span><span class="cmt">@0.3.0</span>
 <span class="cmt">  loading </span><span class="accent">@hatch:json</span><span class="cmt">@0.1.0</span>
 <span class="em">  &gt; standalone &middot; serving :8080</span></pre>
@@ -864,7 +864,7 @@
     <div class="diag-text">
       <span class="tag"><svg class="ti" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg> diagnostics</span>
       <h2>Errors that <em>read like prose</em>.</h2>
-      <p>When something goes wrong, Wrenlift doesn't just say "method not found." It points at the exact identifier, names the type involved, and &mdash; when it can &mdash; tells you what to try next.</p>
+      <p>When something goes wrong, Wrenlift doesn't just say "method not found." It points at the exact identifier, names the type involved, and tells you what to try next when it can.</p>
       <ul class="diag-points">
         <li><span class="ck">1</span><span><b>Located.</b> File, line, and column.</span></li>
         <li><span class="ck">2</span><span><b>Source-anchored.</b> Caret on the failing identifier.</span></li>
@@ -907,11 +907,11 @@
 
       <div class="embed-mode active" data-mode="c">
         <h2>Or <em>embed it</em> in your C host.</h2>
-        <p>Drop-in for the upstream Wren C API. Same <code>WrenVM</code>, same <code>WrenConfiguration</code> &mdash; grab the <a href="https://github.com/wrenlift/WrenLift/blob/main/examples/wrenlift.h" target="_blank" rel="noopener"><code>wrenlift.h</code></a> shim, link <code>libwrenlift.a</code>, and your existing host keeps working.</p>
+        <p>Drop-in for the upstream Wren C API. Same <code>WrenVM</code>, same <code>WrenConfiguration</code>. Grab the <a href="https://github.com/wrenlift/WrenLift/blob/main/examples/wrenlift.h" target="_blank" rel="noopener"><code>wrenlift.h</code></a> shim, link <code>libwrenlift.a</code>, and your existing host keeps working.</p>
         <ul class="embed-points">
           <li><span class="ck">✓</span><span><b>API-compatible.</b> <code>wrenNewVM</code>, <code>wrenInterpret</code>, <code>wrenCall</code>, foreign methods, slots: all of it.</span></li>
           <li><span class="ck">✓</span><span><b>One library, two modes.</b> Same build powers <code>wlift</code> on the CLI and embeds inside your game, editor, or daemon.</span></li>
-          <li><span class="ck">✓</span><span><b>Bring your own loader.</b> <code>WrenLoadModuleFn</code> is honoured &mdash; ship Hatch packages or your own modules.</span></li>
+          <li><span class="ck">✓</span><span><b>Bring your own loader.</b> <code>WrenLoadModuleFn</code> is honoured. Ship Hatch packages or your own modules.</span></li>
         </ul>
       </div>
 
@@ -919,9 +919,9 @@
         <h2>Or <em>embed it</em> in your Rust host.</h2>
         <p>Wrenlift ships first-class Rust bindings. Reach for <a href="https://github.com/wrenlift/WrenLift/blob/main/src/hatch_runner.rs" target="_blank" rel="noopener"><code>hatch_runner</code></a> when you want the Hatch-aware runtime in two lines, or drop down to the raw <a href="https://github.com/wrenlift/WrenLift/blob/main/src/capi.rs" target="_blank" rel="noopener"><code>capi</code></a> externs for full VM control.</p>
         <ul class="embed-points">
-          <li><span class="ck">✓</span><span><b>High level &mdash; <code>hatch_runner</code>.</b> One <code>HatchRunner::new()</code>, then <code>run_file()</code>. Resolves Hatch packages automatically.</span></li>
-          <li><span class="ck">✓</span><span><b>Low level &mdash; <code>capi</code>.</b> <code>extern "C"</code> bindings to <code>wrenNewVM</code>, <code>wrenInterpret</code>, slots, foreign methods. <code>unsafe</code> when you need it.</span></li>
-          <li><span class="ck">✓</span><span><b>Cargo-native.</b> Add <code>wren_lift</code> to your <code>Cargo.toml</code> &mdash; the build links the static lib for you.</span></li>
+          <li><span class="ck">✓</span><span><b>High level: <code>hatch_runner</code>.</b> One <code>HatchRunner::new()</code>, then <code>run_file()</code>. Resolves Hatch packages automatically.</span></li>
+          <li><span class="ck">✓</span><span><b>Low level: <code>capi</code>.</b> <code>extern "C"</code> bindings to <code>wrenNewVM</code>, <code>wrenInterpret</code>, slots, foreign methods. <code>unsafe</code> when you need it.</span></li>
+          <li><span class="ck">✓</span><span><b>Cargo-native.</b> Add <code>wren_lift</code> to your <code>Cargo.toml</code>; the build links the static lib for you.</span></li>
         </ul>
       </div>
     </div>

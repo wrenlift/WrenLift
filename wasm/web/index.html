@@ -4,6 +4,17 @@
   <meta charset="utf-8">
   <title>wlift playground — Wren in your browser</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- coi-serviceworker: registers a SW that re-emits responses
+       with COOP/COEP/CORP headers so `crossOriginIsolated` is
+       true even on hosts that can't set headers (GitHub Pages).
+       That unlocks `SharedArrayBuffer` and threaded wasm for
+       `wlift.js`'s `shared: true` opt-in mode. The SW is a
+       no-op when the page is already cross-origin-isolated by
+       the origin server (e.g. dev mode under serve.js's COOP/
+       COEP), so leaving it loaded is safe in both environments.
+       Must be the FIRST script in <head> — it controls every
+       subsequent navigation. MIT, ~3 KB. -->
+  <script src="coi-serviceworker.js"></script>
   <style>
     :root {
       /* Brand palette matching the upcoming wlift website:
@@ -932,14 +943,30 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     bindEditor(srcEl, srcMount, wrenLanguage);
     var hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
-    // Dep fetcher — routes registry URLs through this dev
-    // server's `/proxy?url=...` route so GitHub release-asset
-    // responses arrive with `Cross-Origin-Resource-Policy:
-    // cross-origin` set. Without that, the COEP-locked page
-    // drops the body. The proxy's allowlist is the real
-    // security boundary; we just rewrite the URL here.
+    // Dep fetcher — routes registry URLs through an allowlisted
+    // proxy so GitHub release-asset responses arrive with the
+    // CORS headers a sandboxed page needs. Two homes for that
+    // proxy:
+    //
+    //   * Local dev: `serve.js` exposes `/proxy?url=...` on
+    //     the same origin. The relative path below hits it.
+    //   * Production: the `hatch-bot` Supabase Edge Function
+    //     exposes `<HATCH_BOT_URL>/proxy?url=...`. Set
+    //     `window.WLIFT_PROXY_BASE` to point at it (the deploy
+    //     injects this via a small `<script>` tag — see
+    //     `site/playground/web/index.html` after the bench
+    //     workflow stages it).
+    //
+    // The `localhost` fallback keeps `python -m http.server`
+    // happy for offline preview without serve.js.
+    function resolveProxyBase() {
+      if (typeof window.WLIFT_PROXY_BASE === "string" && window.WLIFT_PROXY_BASE) {
+        return window.WLIFT_PROXY_BASE.replace(/\/$/, "") + "/proxy";
+      }
+      return "/proxy";
+    }
     async function proxiedFetcher(url, name) {
-      const proxied = `/proxy?url=${encodeURIComponent(url)}`;
+      const proxied = `${resolveProxyBase()}?url=${encodeURIComponent(url)}`;
       const r = await fetch(proxied);
       if (!r.ok) {
         throw new Error(

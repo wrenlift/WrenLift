@@ -212,10 +212,34 @@ jobs:
         # `../pkg/wlift_wasm.js`, which resolves cleanly with
         # this shape. The "Try it in your browser" CTA on the
         # landing points at `playground/web/`.
+        #
+        # `HATCH_BOT_URL` (configured as a repo variable) is
+        # injected as `window.WLIFT_PROXY_BASE` so the playground's
+        # dep fetcher routes registry calls through the Edge
+        # Function's `/proxy` endpoint instead of the local
+        # serve.js. Falls through silently if the var is unset —
+        # the playground only needs the proxy when a hatchfile
+        # declares scoped deps, and surfaces an actionable error
+        # at runtime if the fetch fails.
+        env:
+          HATCH_BOT_URL: ${{ vars.HATCH_BOT_URL }}
         run: |
+          set -eu
           mkdir -p site/playground/web site/playground/pkg
           cp -R wasm/web/. site/playground/web/
           cp -R wasm/pkg/. site/playground/pkg/
+          if [ -n "${HATCH_BOT_URL:-}" ]; then
+            # Inject `window.WLIFT_PROXY_BASE` right after <head>
+            # so the page-script picks it up before the playground
+            # boots. Escape `&`, `/`, and `$` to keep sed happy
+            # against arbitrary URL contents.
+            esc=$(printf '%s' "$HATCH_BOT_URL" | sed -e 's/[\/&$]/\\&/g')
+            sed -i'' -e "s|<head>|<head>\n  <script>window.WLIFT_PROXY_BASE=\"${esc}\";</script>|" \
+              site/playground/web/index.html
+            echo "::notice::injected WLIFT_PROXY_BASE = ${HATCH_BOT_URL}"
+          else
+            echo "::notice::HATCH_BOT_URL var unset; playground will use relative /proxy (no remote registry fetches)"
+          fi
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
