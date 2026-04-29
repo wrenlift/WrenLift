@@ -420,6 +420,47 @@ impl NativeLibEntry {
             }
         }
     }
+
+    /// Resolve against an explicit *bundle target* triple rather than
+    /// the host. `None` means "host" (current process), and behaves
+    /// like [`resolve`]. `Some("wasm32")` / `Some("wasm32-*")` selects
+    /// the wasm-targeted variant — the `wasm` / `wasm32` map keys
+    /// are tried first, falling back to `any` / `path` so a single
+    /// declared blob can serve native + wasm.
+    ///
+    /// The wasm short keys exist because `[native_libs]` already
+    /// uses friendly names (`macos`, `linux`) for the os column;
+    /// `wasm` matches that style. The longer `unknown-wasm32` form
+    /// (the `os-arch` shape) is also accepted for callers who want
+    /// to spell it out.
+    pub fn resolve_for_target(&self, target: Option<&str>) -> Option<&str> {
+        let Some(t) = target else {
+            return self.resolve();
+        };
+        if !is_wasm_target(Some(t)) {
+            return self.resolve();
+        }
+        match self {
+            // Path-only shorthand is "use this for every target".
+            // On wasm, that's only meaningful if the file is itself
+            // a wasm artefact — packing a `.dylib` / `.so` into a
+            // wasm bundle would just bloat it. Filter by extension.
+            NativeLibEntry::Path(p) => {
+                if p.ends_with(".wasm") {
+                    Some(p.as_str())
+                } else {
+                    None
+                }
+            }
+            NativeLibEntry::Map(map) => map
+                .get("wasm")
+                .or_else(|| map.get("wasm32"))
+                .or_else(|| map.get("unknown-wasm32"))
+                .or_else(|| map.get("any"))
+                .or_else(|| map.get("path"))
+                .map(String::as_str),
+        }
+    }
 }
 
 /// Map a Rust/LLVM architecture name to the short form hatchfiles use.
@@ -828,26 +869,21 @@ pub fn build_from_source_tree_for_target(
     target: Option<&str>,
 ) -> Result<Vec<u8>, HatchError> {
     let mut state = BuildState::default();
-    let mut bytes = build_recursive(root, &mut state, cache_dir)?;
+    let mut bytes = build_recursive(root, &mut state, cache_dir, target)?;
     if target.is_some() {
         // Re-stamp the manifest's `target` field. Cheaper to
-        // decode/re-encode the whole hatch than to thread `target`
-        // through every layer of `build_recursive` — this only
-        // runs once per top-level build, not per dependency.
+        // decode/re-encode the whole hatch than to thread the
+        // target into every byte-level layer below; this runs once
+        // per top-level build, not per dependency. NativeLib
+        // sections were already packed against `target` by
+        // `pack_bundled_native_libs`, so we don't need to strip
+        // them here — they're correct by construction.
         let mut hatch = load(&bytes)?;
         hatch.manifest.target = target.map(|s| s.to_string());
-        // For wasm targets, drop any NativeLib sections that
-        // `pack_bundled_native_libs` may have packed before we
-        // knew the target. The wasm runtime ignores them anyway,
-        // and shipping x86_64 dylibs in a wasm hatch wastes
-        // bytes + confuses `--inspect`.
         // Wasm targets get an uncompressed payload — the wasm
         // runtime doesn't link zstd, so a compressed bundle
         // would refuse to load there with a decode error.
         let opts = if is_wasm_target(target) {
-            hatch
-                .sections
-                .retain(|s| !matches!(s.kind, SectionKind::NativeLib));
             EmitOptions { compress: false }
         } else {
             EmitOptions::default()
@@ -952,6 +988,7 @@ fn build_recursive(
     root: &Path,
     state: &mut BuildState,
     cache_dir: Option<&Path>,
+    target: Option<&str>,
 ) -> Result<Vec<u8>, HatchError> {
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if state.active.contains(&canonical) {
@@ -1035,8 +1072,8 @@ fn build_recursive(
     };
 
     rename_entry_to_manifest_name(&mut manifest, &mut sections)?;
-    pack_bundled_native_libs(root, &mut manifest, &mut sections)?;
-    merge_path_dependencies(root, &mut manifest, &mut sections, state, cache_dir)?;
+    pack_bundled_native_libs(root, &mut manifest, &mut sections, target)?;
+    merge_path_dependencies(root, &mut manifest, &mut sections, state, cache_dir, target)?;
 
     let hatch = Hatch { manifest, sections };
     let bytes = emit(&hatch)?;
@@ -1214,7 +1251,7 @@ pub fn resolve_dependency_bytes(
     cache_dir: Option<&Path>,
 ) -> Result<Vec<u8>, HatchError> {
     let mut state = BuildState::default();
-    resolve_dep_bytes_inner(root, dep_name, dep, &mut state, cache_dir)
+    resolve_dep_bytes_inner(root, dep_name, dep, &mut state, cache_dir, None)
 }
 
 #[cfg(feature = "host")]
@@ -1224,11 +1261,12 @@ fn resolve_dep_bytes_inner(
     dep: &Dependency,
     state: &mut BuildState,
     cache_dir: Option<&Path>,
+    target: Option<&str>,
 ) -> Result<Vec<u8>, HatchError> {
     match dep {
         Dependency::Path { path, .. } => {
             let dep_root = root.join(path);
-            build_recursive(&dep_root, state, cache_dir).map_err(|e| {
+            build_recursive(&dep_root, state, cache_dir, target).map_err(|e| {
                 HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
             })
         }
@@ -1272,7 +1310,7 @@ fn resolve_dep_bytes_inner(
                     dep_name
                 )));
             }
-            build_recursive(&checkout, state, cache_dir).map_err(|e| {
+            build_recursive(&checkout, state, cache_dir, target).map_err(|e| {
                 HatchError::Encode(format!(
                     "failed to build git dependency '{}': {}",
                     dep_name, e
@@ -1289,6 +1327,7 @@ fn merge_path_dependencies(
     sections: &mut Vec<Section>,
     state: &mut BuildState,
     cache_dir: Option<&Path>,
+    target: Option<&str>,
 ) -> Result<(), HatchError> {
     // Collect into an owned list so we can mutate `manifest.dependencies`
     // while iterating.
@@ -1302,7 +1341,7 @@ fn merge_path_dependencies(
         let dep_bytes = match &dep {
             Dependency::Path { path, .. } => {
                 let dep_root = root.join(path);
-                build_recursive(&dep_root, state, cache_dir).map_err(|e| {
+                build_recursive(&dep_root, state, cache_dir, target).map_err(|e| {
                     HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
                 })?
             }
@@ -1339,7 +1378,7 @@ fn merge_path_dependencies(
                 }
                 // Treat the cached checkout like any path dep:
                 // recursively build so transitive deps resolve too.
-                build_recursive(&checkout, state, cache_dir).map_err(|e| {
+                build_recursive(&checkout, state, cache_dir, target).map_err(|e| {
                     HatchError::Encode(format!(
                         "failed to build git dependency '{}': {}",
                         dep_name, e
@@ -1455,11 +1494,12 @@ fn pack_bundled_native_libs(
     root: &Path,
     manifest: &mut Manifest,
     sections: &mut Vec<Section>,
+    target: Option<&str>,
 ) -> Result<(), HatchError> {
     let mut bundled: Vec<String> = Vec::new();
     for (name, entry) in &manifest.native_libs {
-        let Some(path_str) = entry.resolve() else {
-            continue; // nothing declared for this host platform — skip
+        let Some(path_str) = entry.resolve_for_target(target) else {
+            continue; // nothing declared for this target — skip
         };
         let path = Path::new(path_str);
         if path.is_absolute() {
@@ -2374,6 +2414,67 @@ openssl = "libs/openssl.dylib"
         assert!(
             !has_native,
             "wasm target should not pack host-native dylib bytes"
+        );
+    }
+
+    #[test]
+    fn build_for_wasm_target_packs_wasm_keyed_native_libs() {
+        // The pre-1a behaviour was "wasm targets carry no native
+        // libs". 1a flips that to "wasm targets carry libs the
+        // hatchfile flagged for wasm". The hatchfile's
+        // [native_libs] table can either set a `wasm = "..."` key
+        // or use a plain `*.wasm` Path; both should pack.
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let lib_dir = root.join("libs");
+        std::fs::create_dir(&lib_dir).expect("libs/");
+
+        // Two artefacts on disk — only the .wasm should make the
+        // wasm bundle. The native dylib must be skipped.
+        std::fs::File::create(lib_dir.join("hello.wasm"))
+            .expect("create wasm")
+            .write_all(b"\0asm\x01\0\0\0FAKE_WASM_BYTES")
+            .expect("write wasm");
+        std::fs::File::create(lib_dir.join("hello.dylib"))
+            .expect("create dylib")
+            .write_all(b"FAKE_DYLIB_BYTES")
+            .expect("write dylib");
+
+        std::fs::write(
+            root.join("hatchfile"),
+            r#"
+name = "wasm-keyed-test"
+version = "0.1.0"
+entry = "main"
+
+[native_libs]
+hello = { macos = "libs/hello.dylib", wasm = "libs/hello.wasm" }
+"#,
+        )
+        .expect("hatchfile");
+        std::fs::write(root.join("main.wren"), "System.print(\"hi\")").expect("main.wren");
+
+        let bytes = build_from_source_tree_for_target(root, None, Some("wasm32-unknown-unknown"))
+            .expect("build wasm-targeted hatch");
+        let hatch = load(&bytes).expect("decode wasm hatch");
+
+        let native_sections: Vec<&Section> = hatch
+            .sections
+            .iter()
+            .filter(|s| matches!(s.kind, SectionKind::NativeLib))
+            .collect();
+        assert_eq!(
+            native_sections.len(),
+            1,
+            "wasm bundle should carry exactly the wasm-keyed lib"
+        );
+        let sec = native_sections[0];
+        assert_eq!(sec.name, "hello");
+        assert!(
+            sec.data.starts_with(b"\0asm"),
+            "section bytes must be the wasm artefact, not the dylib"
         );
     }
 
