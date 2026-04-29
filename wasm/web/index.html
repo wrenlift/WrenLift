@@ -197,10 +197,33 @@
        keep reading `srcEl.value` etc. unchanged. */
     .editor-shadow { display: none; }
 
-    /* Output column: stage on top (renders the HTML), console below. */
-    .output-col { display: grid; grid-template-rows: 1fr 1fr; min-height: 0; }
+    /* Output column: stage on top (renders the HTML), console
+       below behind a toggle. Default: stage takes full height
+       (console row collapsed). With `.show-console` on the col,
+       the console row reveals at half height. */
+    .output-col {
+      display: grid;
+      grid-template-rows: 1fr;
+      min-height: 0;
+    }
+    .output-col.show-console { grid-template-rows: 1fr 1fr; }
     .output-col .pane { display: flex; flex-direction: column; min-height: 0; }
     .output-col .pane + .pane { border-top: 1px solid var(--rule); }
+    .output-col:not(.show-console) .console-pane { display: none; }
+
+    /* Error dot on the console-toggle button when the most
+       recent run errored AND the console is hidden — pulls
+       attention to the missing detail. Cleared when the user
+       opens the console or kicks off a new successful run. */
+    button.seg.has-error::after {
+      content: "";
+      display: inline-block;
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--bad);
+      margin-left: 6px;
+      vertical-align: middle;
+    }
 
     .stage {
       flex: 1;
@@ -307,6 +330,7 @@
     <header>
       <h1>wlift playground</h1>
       <span id="status" class="pill">loading…</span>
+      <span id="runtime" class="pill" hidden>—</span>
       <span style="margin-left: auto"></span>
       <label class="field">
         mode
@@ -412,7 +436,7 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
           <div class="pane-header">stage<span class="badge">live preview</span></div>
           <div id="stage" class="stage"></div>
         </div>
-        <div class="pane">
+        <div class="pane console-pane">
           <div class="pane-header">console<span class="badge">System.print</span></div>
           <pre id="out" class="console"></pre>
         </div>
@@ -422,6 +446,7 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     <footer>
       <button id="html-toggle" class="seg" title="show/hide html pane">html</button>
       <button id="hatch-toggle" class="seg" title="show/hide hatchfile pane">hatchfile</button>
+      <button id="console-toggle" class="seg" title="show/hide console pane">console</button>
       <span id="version">…</span>
       <span style="margin-left: auto">
         <a href="https://github.com/wrenlift/WrenLift" target="_blank" rel="noopener">wrenlift on github</a>
@@ -468,10 +493,13 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     const hfAddDepBtn    = document.getElementById("hf-add-dep");
     const viewFormBtn    = document.getElementById("hatch-view-form");
     const viewTomlBtn    = document.getElementById("hatch-view-toml");
-    const hatchToggleBtn = document.getElementById("hatch-toggle");
-    const htmlToggleBtn  = document.getElementById("html-toggle");
-    const wrenColEl      = document.querySelector(".wren-col");
-    const mainEl         = document.querySelector("main");
+    const hatchToggleBtn   = document.getElementById("hatch-toggle");
+    const htmlToggleBtn    = document.getElementById("html-toggle");
+    const consoleToggleBtn = document.getElementById("console-toggle");
+    const runtimeEl        = document.getElementById("runtime");
+    const outputColEl      = document.querySelector(".output-col");
+    const wrenColEl        = document.querySelector(".wren-col");
+    const mainEl           = document.querySelector("main");
     const stageEl        = document.getElementById("stage");
     const outEl          = document.getElementById("out");
     const runBtn         = document.getElementById("run-btn");
@@ -741,6 +769,13 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
       const showing = mainEl.classList.toggle("show-html");
       htmlToggleBtn.classList.toggle("seg-active", showing);
     });
+    consoleToggleBtn.addEventListener("click", () => {
+      const showing = outputColEl.classList.toggle("show-console");
+      consoleToggleBtn.classList.toggle("seg-active", showing);
+      // Opening the console clears the unread-error indicator
+      // — by definition the user can now see what went wrong.
+      if (showing) consoleToggleBtn.classList.remove("has-error");
+    });
 
     // Mount the CodeMirror editors. `bindEditor` reads each
     // textarea's current value as the initial doc, then writes
@@ -809,16 +844,35 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     }
 
     function renderResult(result) {
+      // Console body — just the captured output. Status / timing
+      // / error-kind moved out to the runtime pill (header) and
+      // the console-toggle's error dot (footer); duplicating them
+      // here would clutter the bare `System.print` view the user
+      // came to read.
       outEl.textContent = result.output || "(no output)";
+      outEl.classList.remove("ok", "error");
       outEl.classList.add(result.ok ? "ok" : "error");
-      outEl.textContent +=
-        `\n--- ${result.ok ? "ok" : "error"} (${result.elapsedMs.toFixed(1)} ms) ---`;
-      if (!result.ok) {
+
+      // Runtime pill in the header. Always populated; the
+      // ok/error class colours it.
+      runtimeEl.hidden = false;
+      runtimeEl.classList.remove("ok", "error");
+      runtimeEl.classList.add(result.ok ? "ok" : "error");
+      const ms = `${result.elapsedMs.toFixed(1)} ms`;
+      if (result.ok) {
+        runtimeEl.textContent = ms;
+      } else {
         const kind = result.errorKind === -1
           ? "JsException"
           : (ErrorKind[result.errorKind] ?? result.errorKind);
-        outEl.textContent += ` [${kind}]`;
+        runtimeEl.textContent = `${kind} · ${ms}`;
       }
+
+      // Error indicator on the console toggle: only when the run
+      // errored AND the user has the console hidden. If the
+      // console is open they're already looking at the output.
+      const consoleHidden = !outputColEl.classList.contains("show-console");
+      consoleToggleBtn.classList.toggle("has-error", !result.ok && consoleHidden);
     }
 
     // True if the source has at least one `import "..."` whose
