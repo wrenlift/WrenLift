@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wlift on-demand plugin loader smoke test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; font-family: ui-monospace, monospace; }
+    h1 { font-size: 1.4rem; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+    .note  { color: #888; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Phase 1e smoke — on-demand wasm plugin loader</h1>
+  <p class="note">
+    Loads <code>hatch-hello.hatch</code> from this directory, instantiates
+    <code>wlift_hello.wasm</code> as a separate WebAssembly module via the
+    new loader, then runs a Wren script that imports
+    <code>@hatch:hello</code> and calls <code>Hello.greet("phase 1e")</code>.
+    Expect <strong>"hello, phase 1e"</strong> in the output below.
+  </p>
+  <pre id="out">running…</pre>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+
+    out.textContent = "";
+
+    try {
+      // Main mode: plugin loader currently only wired here.
+      log("createWlift({ mode: 'main' })…");
+      const wlift = await createWlift({ mode: "main" });
+      log(`  ${wlift.version}`);
+
+      log("fetching hatch-hello.hatch…");
+      const r = await fetch("./hatch-hello.hatch");
+      if (!r.ok) throw new Error(`fetch ${r.status}`);
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      log(`  ${bytes.length} bytes`);
+
+      const source = `
+import "@hatch:hello" for Hello
+System.print(Hello.greet("phase 1e"))
+`.trim();
+
+      log("runWithHatches…");
+      const result = await wlift.runWithHatches(source, [bytes]);
+      log(`  ok=${result.ok}  errorKind=${result.errorKind}  ${result.elapsedMs.toFixed(2)}ms`);
+      log("--- output ---");
+      log(result.output, result.ok ? "ok" : "err");
+
+      const expected = "hello, phase 1e";
+      if (result.ok && result.output.trim() === expected) {
+        log(`✓ PASS — got expected "${expected}"`, "ok");
+      } else {
+        log(`✗ FAIL — expected "${expected}", got "${result.output.trim()}"`, "err");
+      }
+    } catch (err) {
+      log(`exception: ${err}`, "err");
+      console.error(err);
+    }
+  </script>
+</body>
+</html>
