@@ -279,7 +279,9 @@
       <section class="wren-col">
         <div class="pane wren-pane">
         <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
-        <textarea id="src" spellcheck="false">// `Future`, `Browser`, `WebSocket`, `Dom`, `LocalStorage` are
+        <textarea id="src" spellcheck="false">import "@hatch:assert" for Expect
+
+// `Future`, `Browser`, `WebSocket`, `Dom`, `LocalStorage` are
 // loaded by the runtime — no boilerplate needed. Async bridges
 // resume through the scheduler in both modes; print *inside*
 // the fiber so results land in the output pane.
@@ -301,15 +303,15 @@ fiber.try()
 var start = System.clock
 var fib
 fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
-System.print("fib(20) = %(fib.call(20))  (%((System.clock - start) * 1000) ms)")
+var result = fib.call(20)
+var elapsed = (System.clock - start) * 1000
 
-// `@hatch:*` package resolution. Uncomment the import below and
-// open the `hatchfile` pane (header button) — the seeded form
-// already lists `@hatch:test` and `@hatch:assert` from the
-// local /packages/ dev server, so Run just works.
-//
-// import "@hatch:assert" for Expect
-// System.print("got Expect from @hatch:assert: %(Expect)")
+// `@hatch:assert` is fetched on demand from the dev server's
+// /packages/ route — the hatchfile pane (header button) lists
+// the deps; runProject installs them before this source runs.
+Expect.that(result).toBe(6765)
+Expect.that(elapsed).not.toBeNull()
+System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
 </textarea>
         </div>
         <div class="pane hatchfile-pane">
