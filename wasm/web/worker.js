@@ -61,6 +61,8 @@ const {
   ws_open,
   ws_message,
   ws_close,
+  wlift_extract_wasm_plugins,
+  wlift_register_plugin_dynamic_export,
 } = wlift_wasm;
 
 // Async-bridge shims, identical surface to the inline page setup.
@@ -267,6 +269,137 @@ __wliftWrenImports = {
 // during debugging. Main-thread console can't reach this one
 // (different scope) — see `wlift.js` for the page-side mirror.
 globalThis.wlift_wasm = wlift_wasm;
+
+// ---------------------------------------------------------------
+// Plugin loader — worker mirror of the main-thread plumbing in
+// `wlift.js::MainWlift.init()`. The runtime (this worker) and
+// every cdylib plugin live in the same wasm process, so plugin
+// instances have to be created here. Symbol registration must
+// happen in the same process too — `wlift_register_plugin_dynamic_export`
+// stores a u32 index that the dispatcher then looks up to call
+// the right plugin export.
+//
+// Layers 1 + 2 (passthrough wlift_wasm exports + slot bridges)
+// are entirely worker-side and identical to the main-thread
+// version. Layers 3 + 4 (DOM + GPU bridges) need browser-API
+// state that lives on the main thread. Until a postMessage +
+// SharedArrayBuffer proxy lands, the worker stubs throw a clear
+// error if a plugin actually invokes those — pure-compute
+// plugins (image, hashing, physics-on-CPU) load and run; window
+// / GPU plugins still need `mode: "main"` for now.
+// ---------------------------------------------------------------
+const pluginInstances = new Map();
+const dispatchTable   = [];
+
+globalThis.wliftDynamicPluginDispatch = (idx, vm) => {
+  const entry = dispatchTable[idx];
+  if (!entry) {
+    console.warn(`[wlift plugin/worker] dispatch ${idx}: no entry`);
+    return;
+  }
+  try {
+    entry.instance.exports[entry.exportName](vm);
+  } catch (err) {
+    console.error(
+      `[wlift plugin/worker] ${entry.libName}.${entry.exportName} threw:`,
+      err,
+    );
+  }
+};
+
+// Stub for any browser-API bridge a plugin imports but the
+// worker can't service. The thrown message names the exact
+// bridge so the failure mode is self-explanatory ("use main
+// mode"). Pure-compute plugins import none of these and never
+// trip the throw.
+function makeBridgeStub(name) {
+  return (...args) => {
+    throw new Error(
+      `[wlift plugin/worker] '${name}' is a DOM/GPU bridge that ` +
+      `requires the main thread. Run this example in 'main' mode ` +
+      `(the playground's mode picker). Args: ${JSON.stringify(args)}`,
+    );
+  };
+}
+
+function buildPluginEnv(libName, getInstance) {
+  return {
+    // Layer 1: passthrough of every wlift_wasm export. Plugin
+    // calls into `wrenGetSlotDouble` etc. land directly in the
+    // host wasm with no JS hop.
+    ...wasm,
+    // Layer 2: slot bridges. Both the host (this worker's
+    // wlift_wasm) and the plugin live in this worker, so the
+    // memcpy is direct — no postMessage round-trip needed.
+    wlift_get_slot_str: (vm, slot, out_ptr, max) => {
+      const host_ptr = wasm.wrenGetSlotString(vm, slot);
+      if (!host_ptr) return -1;
+      const host_view = new Uint8Array(wasm.memory.buffer);
+      let len = 0;
+      while (len < max && host_view[host_ptr + len] !== 0) len++;
+      const inst = getInstance();
+      const plugin_view = new Uint8Array(inst.exports.memory.buffer, out_ptr, max);
+      plugin_view.set(host_view.subarray(host_ptr, host_ptr + len));
+      return len;
+    },
+    wlift_set_slot_str: (vm, slot, ptr, len) => {
+      const inst = getInstance();
+      const plugin_view = new Uint8Array(inst.exports.memory.buffer, ptr, len);
+      const host_ptr = wasm.wlift_host_alloc(len + 1);
+      const host_view = new Uint8Array(wasm.memory.buffer, host_ptr, len + 1);
+      host_view.set(plugin_view);
+      host_view[len] = 0;
+      wasm.wrenSetSlotString(vm, slot, host_ptr);
+      wasm.wlift_host_free(host_ptr, len + 1);
+    },
+    // Layers 3 + 4 are filled in dynamically per-plugin below
+    // so we can stub exactly the imports the plugin declares.
+  };
+}
+
+async function installWasmPlugin(libName, wasmBytes) {
+  if (pluginInstances.has(libName)) return;
+
+  // Compile first so we can read the import list and stub every
+  // missing `env.*` import dynamically. Hardcoded lists drift
+  // every time a bridge is added on main; reading the module's
+  // own imports keeps the worker side honest.
+  const module = await WebAssembly.compile(wasmBytes);
+  let instance;
+  const env = buildPluginEnv(libName, () => instance);
+  for (const desc of WebAssembly.Module.imports(module)) {
+    if (desc.module !== "env" || desc.kind !== "function") continue;
+    if (env[desc.name] !== undefined) continue;
+    env[desc.name] = makeBridgeStub(desc.name);
+  }
+
+  instance = await WebAssembly.instantiate(module, { env });
+  pluginInstances.set(libName, instance);
+
+  // Walk plugin exports → register each `wlift_*` function in the
+  // host's foreign-method registry. The host returns a u32 index
+  // per registration; the dispatcher consults it on each foreign
+  // call to route back to the right plugin instance.
+  for (const exportName of Object.keys(instance.exports)) {
+    if (!exportName.startsWith("wlift_")) continue;
+    if (typeof instance.exports[exportName] !== "function") continue;
+    const idx = wlift_register_plugin_dynamic_export(libName, exportName);
+    dispatchTable[idx] = { instance, exportName, libName };
+  }
+}
+
+// Drains every dep's `NativeLib` sections, instantiates each
+// plugin once, registers its `wlift_*` exports. Idempotent on
+// repeated bundles thanks to the `pluginInstances` guard.
+async function installPluginsForDeps(deps) {
+  for (const buf of deps) {
+    const plugins = wlift_extract_wasm_plugins(buf);
+    for (const p of plugins) {
+      await installWasmPlugin(p.lib, p.bytes);
+    }
+  }
+}
+
 self.postMessage({ cmd: "ready", version: version() });
 
 self.addEventListener("message", (e) => {
@@ -274,32 +407,35 @@ self.addEventListener("message", (e) => {
   if (msg.cmd === "run-with-hatches") {
     const { id, source, deps } = msg;
     // Pre-installs each `@hatch:*` dep, then runs user source.
-    // Same scheduler path as `run` — async bridges in either
-    // the deps' top-levels or the user source resolve through
-    // the parked-fiber loop below.
+    // Plugin extraction has to happen *before* `run_with_hatches`
+    // — `#!native` / `#!symbol` resolution at install time looks
+    // the symbols up in the foreign-method registry that the
+    // plugin's exports must already have populated.
     const t0 = performance.now();
-    run_with_hatches(source, deps).then(
-      (result) => {
-        self.postMessage({
-          cmd: "result",
-          id,
-          output: result.output,
-          ok: result.ok,
-          errorKind: result.errorKind,
-          elapsedMs: performance.now() - t0,
-        });
-      },
-      (err) => {
-        self.postMessage({
-          cmd: "result",
-          id,
-          output: String(err),
-          ok: false,
-          errorKind: -1,
-          elapsedMs: performance.now() - t0,
-        });
-      },
-    );
+    installPluginsForDeps(deps)
+      .then(() => run_with_hatches(source, deps))
+      .then(
+        (result) => {
+          self.postMessage({
+            cmd: "result",
+            id,
+            output: result.output,
+            ok: result.ok,
+            errorKind: result.errorKind,
+            elapsedMs: performance.now() - t0,
+          });
+        },
+        (err) => {
+          self.postMessage({
+            cmd: "result",
+            id,
+            output: String(err),
+            ok: false,
+            errorKind: -1,
+            elapsedMs: performance.now() - t0,
+          });
+        },
+      );
   } else if (msg.cmd === "run-hatch") {
     const { id, bytes } = msg;
     // Same shape as `run`: drive `run_hatch` through the

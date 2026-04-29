@@ -1456,12 +1456,13 @@ entry   = "main"
       syncTomlToForm();
       renderStage();
 
-      // Some examples need a specific mode. Canvas / GPU demos
-      // pin to `main` because plugin-symbol binding currently
-      // only flows through the main-thread runtime; in worker
-      // mode their foreign-method imports come back unresolved
-      // (`Class does not implement create`). When an example
-      // declares `mode`, force the picker + reboot.
+      // Some examples need a specific mode. Worker mode now
+      // loads + dispatches compute plugins (slot bridges run
+      // entirely in the worker), but DOM / GPU bridges still
+      // need a postMessage + SAB proxy to reach main-thread
+      // browser APIs — so canvas-touching plugins keep their
+      // `mode: "main"` pin until that lands. When set, force
+      // the picker + reboot.
       if (ex.mode && modeSel.value !== ex.mode) {
         modeSel.value = ex.mode;
         bootMode(ex.mode);
