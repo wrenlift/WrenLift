@@ -6,16 +6,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     :root {
-      --bg: #0f1115;
-      --panel: #161922;
-      --panel-2: #1c2030;
-      --text: #e6e6ea;
-      --muted: #7d8aa0;
-      --rule: #232631;
-      --accent: #ffb454;
-      --good: #84e188;
-      --bad:  #ff8585;
-      --link: #74b6ff;
+      /* Brand palette matching the upcoming wlift website:
+         warm parchment outer, deep brown panels, amber accent.
+         Same role-names as before so downstream rules stay
+         valid; only the hex codes change. */
+      --bg:       #f1e3cc; /* page parchment */
+      --panel:    #1d1812; /* code-pane dark brown */
+      --panel-2:  #2a2218; /* form / sub-pane fill */
+      --text:     #e8dcc8; /* warm cream — main copy in dark panes */
+      --muted:    #8a7e6b; /* dim cream — secondary copy */
+      --rule:     #3a3024; /* dividers inside dark panes */
+      --accent:   #f5a623; /* amber — primary action / highlights */
+      --run:      #a4c17c; /* sage — Run button */
+      --good:     #a4c17c; /* sage — success states */
+      --bad:      #d97a6c; /* warm red — error */
+      --link:     #c9a878; /* gold — links on parchment */
+
+      /* Syntax-highlight tokens (used by the .editor backdrop). */
+      --syn-keyword:  #f5a623;
+      --syn-string:   #9cb88b;
+      --syn-comment:  #6d6354;
+      --syn-number:   #d4a76a;
+      --syn-type:     #e8dcc8;
+      --syn-fn:       #e8c878;
     }
     *, *::before, *::after { box-sizing: border-box; }
     html, body {
@@ -63,11 +76,19 @@
 
     button, select {
       background: var(--panel-2); color: var(--text);
-      border: 1px solid var(--rule); padding: 5px 12px;
+      border: 1px solid var(--rule); padding: 6px 14px;
       font: inherit; font-size: 12px;
-      border-radius: 4px; cursor: pointer;
+      border-radius: 10px;
+      corner-shape: squircle;
+      cursor: pointer;
     }
-    button.primary { background: var(--accent); color: #0f1115; font-weight: 600; border-color: transparent; }
+    button.primary {
+      background: var(--run);
+      color: var(--panel);
+      font-weight: 600;
+      border-color: transparent;
+      padding: 6px 16px;
+    }
     button:disabled { opacity: 0.4; cursor: wait; }
     label.field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 
@@ -134,6 +155,63 @@
       outline: none;
     }
 
+    /* Syntax-highlighted editor: a <pre><code> backdrop renders
+       coloured HTML; a transparent <textarea> overlays it and
+       forwards typing/scroll. Both share font metrics so the
+       caret lines up with the underlying text. The textarea's
+       text color is `transparent`; we keep the caret visible by
+       falling back to `caret-color`. */
+    .editor {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+      background: var(--panel);
+    }
+    .editor pre.editor-bg,
+    .editor textarea.editor-fg {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      margin: 0;
+      padding: 14px;
+      font: inherit;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      tab-size: 2;
+      white-space: pre;
+      word-wrap: normal;
+      overflow: auto;
+    }
+    .editor pre.editor-bg {
+      color: var(--text);
+      pointer-events: none;
+      user-select: none;
+    }
+    .editor textarea.editor-fg {
+      color: transparent;
+      caret-color: var(--accent);
+      background: transparent;
+      border: 0;
+      resize: none;
+      outline: none;
+    }
+    .editor textarea.editor-fg::selection {
+      background: rgba(245, 166, 35, 0.25);
+    }
+    /* Token classes — the highlighter wraps matched spans with
+       these. Names mirror typical Prism / highlight.js token
+       conventions so swapping in a richer highlighter later is
+       a one-CSS-rename swap. */
+    .tok-comment { color: var(--syn-comment); font-style: italic; }
+    .tok-keyword { color: var(--syn-keyword); }
+    .tok-string  { color: var(--syn-string); }
+    .tok-number  { color: var(--syn-number); }
+    .tok-fn      { color: var(--syn-fn); }
+    .tok-type    { color: var(--syn-type); font-weight: 600; }
+    .tok-section { color: var(--syn-keyword); font-weight: 600; }
+    .tok-key     { color: var(--syn-fn); }
+
     /* Output column: stage on top (renders the HTML), console below. */
     .output-col { display: grid; grid-template-rows: 1fr 1fr; min-height: 0; }
     .output-col .pane { display: flex; flex-direction: column; min-height: 0; }
@@ -155,7 +233,7 @@
       flex: 1;
       margin: 0;
       padding: 14px;
-      background: #0a0c12;
+      background: var(--panel);
       color: var(--text);
       font: inherit;
       white-space: pre-wrap;
@@ -166,7 +244,7 @@
 
     .banner {
       padding: 8px 16px;
-      background: #2a221a;
+      background: var(--panel-2);
       color: var(--accent);
       font-size: 12px;
       height: fit-content;
@@ -220,9 +298,9 @@
       background: var(--panel-2);
       color: var(--muted);
       border: 1px solid var(--rule);
-      padding: 2px 8px;
+      padding: 3px 10px;
       font-size: 11px;
-      border-radius: 3px;
+      border-radius: 8px;
     }
     button.seg.seg-active { color: var(--accent); border-color: var(--accent); }
     button.seg-x {
@@ -232,6 +310,7 @@
       width: 22px; height: 22px;
       padding: 0;
       font-size: 12px;
+      border-radius: 8px;
     }
 
     a { color: var(--link); text-decoration: none; }
@@ -279,7 +358,9 @@
       <section class="wren-col">
         <div class="pane wren-pane">
         <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
-        <textarea id="src" spellcheck="false">import "@hatch:assert" for Expect
+        <div class="editor">
+        <pre class="editor-bg" aria-hidden="true"><code id="src-bg"></code></pre>
+        <textarea id="src" class="editor-fg" spellcheck="false">import "@hatch:assert" for Expect
 
 // `Future`, `Browser`, `WebSocket`, `Dom`, `LocalStorage` are
 // loaded by the runtime — no boilerplate needed. Async bridges
@@ -314,6 +395,7 @@ Expect.that(elapsed).not.toBeNull()
 System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
 </textarea>
         </div>
+        </div>
         <div class="pane hatchfile-pane">
           <div class="pane-header">
             hatchfile
@@ -335,7 +417,10 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
             <div id="hf-deps"></div>
           </div>
           <!-- Raw TOML view: same hatchfile, editable directly. -->
-          <textarea id="hatchfile-src" class="hidden" spellcheck="false"></textarea>
+          <div class="editor hidden" id="hatchfile-toml-wrap">
+            <pre class="editor-bg" aria-hidden="true"><code id="hatchfile-bg"></code></pre>
+            <textarea id="hatchfile-src" class="editor-fg" spellcheck="false"></textarea>
+          </div>
         </div>
       </section>
 
@@ -390,6 +475,193 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     const modeSel        = document.getElementById("mode-select");
     const autoChk        = document.getElementById("autorun-toggle");
     const bannerEl       = document.getElementById("banner");
+    const srcBgEl        = document.getElementById("src-bg");
+    const hatchfileBgEl  = document.getElementById("hatchfile-bg");
+
+    // ---- Syntax highlighter -----------------------------------------
+    // Minimal regex-based highlighter — small enough to inline,
+    // fast enough for live keystrokes on a few hundred lines. The
+    // Wren tokenizer recognises comments, strings, numbers,
+    // keywords, type-cased identifiers (PascalCase → tok-type),
+    // and call-site identifiers followed by `(`. The TOML
+    // tokenizer covers section headers, key=value pairs, strings,
+    // numbers, and `#` comments — enough for hatchfile shapes.
+    //
+    // Both produce sanitised HTML (no raw user text injected),
+    // so the .editor-bg <code> can render whatever's typed.
+
+    function escapeHtml(s) {
+      return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    const WREN_KEYWORDS = new Set([
+      "as","break","class","construct","continue","else","false",
+      "for","foreign","if","import","in","is","null","return",
+      "static","super","this","true","var","while",
+    ]);
+
+    function highlightWren(src) {
+      // Single pass over the source. Each iteration consumes the
+      // next token (longest-match) and emits a sanitised span.
+      const out = [];
+      let i = 0;
+      const n = src.length;
+      while (i < n) {
+        const c = src[i];
+        // Block comment /* ... */ (Wren has both)
+        if (c === "/" && src[i + 1] === "*") {
+          let j = i + 2;
+          while (j < n && !(src[j] === "*" && src[j + 1] === "/")) j++;
+          j = Math.min(n, j + 2);
+          out.push(`<span class="tok-comment">${escapeHtml(src.slice(i, j))}</span>`);
+          i = j; continue;
+        }
+        // Line comment //...
+        if (c === "/" && src[i + 1] === "/") {
+          let j = i;
+          while (j < n && src[j] !== "\n") j++;
+          out.push(`<span class="tok-comment">${escapeHtml(src.slice(i, j))}</span>`);
+          i = j; continue;
+        }
+        // String literal — Wren uses `"..."` with backslash escapes
+        // and `%(...)` interpolation. Highlight the whole thing
+        // green for now; nested expression colouring is a v2 task.
+        if (c === '"') {
+          let j = i + 1;
+          while (j < n && src[j] !== '"') {
+            if (src[j] === "\\" && j + 1 < n) j += 2;
+            else j++;
+          }
+          j = Math.min(n, j + 1);
+          out.push(`<span class="tok-string">${escapeHtml(src.slice(i, j))}</span>`);
+          i = j; continue;
+        }
+        // Number — `\d+(\.\d+)?` is enough for the playground
+        if (/[0-9]/.test(c)) {
+          let j = i;
+          while (j < n && /[0-9]/.test(src[j])) j++;
+          if (src[j] === "." && /[0-9]/.test(src[j + 1] || "")) {
+            j++;
+            while (j < n && /[0-9]/.test(src[j])) j++;
+          }
+          out.push(`<span class="tok-number">${escapeHtml(src.slice(i, j))}</span>`);
+          i = j; continue;
+        }
+        // Identifier — keyword / type / call / plain
+        if (/[A-Za-z_]/.test(c)) {
+          let j = i;
+          while (j < n && /[A-Za-z0-9_]/.test(src[j])) j++;
+          const word = src.slice(i, j);
+          let cls = null;
+          if (WREN_KEYWORDS.has(word)) cls = "tok-keyword";
+          else if (/^[A-Z]/.test(word)) cls = "tok-type";
+          else if (src[j] === "(") cls = "tok-fn";
+          out.push(cls
+            ? `<span class="${cls}">${escapeHtml(word)}</span>`
+            : escapeHtml(word));
+          i = j; continue;
+        }
+        // Anything else: emit a single escaped char and move on.
+        out.push(escapeHtml(c));
+        i += 1;
+      }
+      return out.join("");
+    }
+
+    function highlightToml(src) {
+      // Section headers, key = value lines, strings, numbers,
+      // comments. Whitespace-preserving so the backdrop lines up
+      // with the textarea.
+      const out = [];
+      const lines = src.split("\n");
+      lines.forEach((line, idx) => {
+        let m;
+        if ((m = /^(\s*)(#.*)$/.exec(line))) {
+          out.push(escapeHtml(m[1]) + `<span class="tok-comment">${escapeHtml(m[2])}</span>`);
+        } else if ((m = /^(\s*)(\[[^\]]+\])(\s*)$/.exec(line))) {
+          out.push(
+            escapeHtml(m[1]) +
+            `<span class="tok-section">${escapeHtml(m[2])}</span>` +
+            escapeHtml(m[3]),
+          );
+        } else if ((m = /^(\s*)("?[^=#"]+"?)(\s*=\s*)(.*)$/.exec(line))) {
+          out.push(
+            escapeHtml(m[1]) +
+            `<span class="tok-key">${escapeHtml(m[2])}</span>` +
+            escapeHtml(m[3]) +
+            highlightTomlValue(m[4]),
+          );
+        } else {
+          out.push(escapeHtml(line));
+        }
+        if (idx < lines.length - 1) out.push("\n");
+      });
+      return out.join("");
+    }
+
+    function highlightTomlValue(v) {
+      // Strings → green; numbers → amber; everything else plain.
+      // No deep nesting / inline-table tokenisation; good enough
+      // for the hatchfile shapes the playground edits.
+      const out = [];
+      let i = 0;
+      const n = v.length;
+      while (i < n) {
+        const c = v[i];
+        if (c === "\"") {
+          let j = i + 1;
+          while (j < n && v[j] !== "\"") {
+            if (v[j] === "\\" && j + 1 < n) j += 2;
+            else j++;
+          }
+          j = Math.min(n, j + 1);
+          out.push(`<span class="tok-string">${escapeHtml(v.slice(i, j))}</span>`);
+          i = j; continue;
+        }
+        if (/[0-9]/.test(c)) {
+          let j = i;
+          while (j < n && /[0-9.]/.test(v[j])) j++;
+          out.push(`<span class="tok-number">${escapeHtml(v.slice(i, j))}</span>`);
+          i = j; continue;
+        }
+        out.push(escapeHtml(c));
+        i += 1;
+      }
+      return out.join("");
+    }
+
+    function bindEditor(textarea, bg, highlighter) {
+      function render() {
+        // Trailing newline keeps the backdrop at-least-one-line
+        // taller than the visible content so the cursor on the
+        // last line doesn't fall off the .editor-bg's bottom
+        // padding.
+        bg.innerHTML = highlighter(textarea.value + "\n");
+      }
+      function syncScroll() {
+        const pre = bg.parentElement;
+        pre.scrollTop = textarea.scrollTop;
+        pre.scrollLeft = textarea.scrollLeft;
+      }
+      textarea.addEventListener("input", () => { render(); syncScroll(); });
+      textarea.addEventListener("scroll", syncScroll);
+      // Tab key inserts two spaces instead of moving focus.
+      textarea.addEventListener("keydown", (e) => {
+        if (e.key === "Tab" && !e.shiftKey) {
+          e.preventDefault();
+          const s = textarea.selectionStart;
+          textarea.setRangeText("  ", s, textarea.selectionEnd, "end");
+          render();
+        }
+      });
+      render();
+      syncScroll();
+      // Expose so callers (form→TOML sync etc.) can re-render.
+      return render;
+    }
 
     // ---- Hatchfile form ↔ TOML sync ---------------------------------
     // The form is the source of truth when active. Toggling to
@@ -471,7 +743,9 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     function setHatchView(view) {
       const isForm = view === "form";
       hatchFormEl.classList.toggle("hidden", !isForm);
-      hatchfileEl.classList.toggle("hidden", isForm);
+      // The TOML editor lives in `#hatchfile-toml-wrap` (the
+      // .editor wrapper) — toggle that, not the bare textarea.
+      document.getElementById("hatchfile-toml-wrap").classList.toggle("hidden", isForm);
       viewFormBtn.classList.toggle("seg-active", isForm);
       viewTomlBtn.classList.toggle("seg-active", !isForm);
       if (isForm) {
@@ -479,6 +753,7 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
         syncTomlToForm();
       } else {
         syncFormToToml();
+        renderHatchfileBg();
       }
     }
 
@@ -498,6 +773,13 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
       const showing = wrenColEl.classList.toggle("show-hatchfile");
       hatchToggleBtn.classList.toggle("seg-active", showing);
     });
+
+    // Wire the syntax-highlight backdrops to their textareas.
+    // `renderHatchfileBg` is called on form→TOML sync so the
+    // backdrop reflects the freshly-generated TOML when the user
+    // toggles to that view.
+    bindEditor(srcEl, srcBgEl, highlightWren);
+    const renderHatchfileBg = bindEditor(hatchfileEl, hatchfileBgEl, highlightToml);
 
     // Local-dev fetcher for the hatchfile-driven resolver.
     // Maps `<registry>/releases/download/<name>-<ver>/<name>-<ver>.hatch`
