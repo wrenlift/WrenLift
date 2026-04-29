@@ -801,7 +801,51 @@ class MainWlift {
           };
 
           const handle = nextCanvasHandle++;
-          canvases.set(handle, { element: canvas, queue, closeRequested: false, teardown });
+          canvases.set(handle, {
+            element: canvas, queue, closeRequested: false, teardown, owned: true,
+          });
+          return handle;
+        },
+        // Attach to a canvas the page already owns. The handle
+        // wires through the same registry / event pipeline as
+        // `wlift_dom_create_canvas` so `@hatch:gpu`'s
+        // `device.createSurface(handle)` works identically. The
+        // teardown skips `removeChild` because the user owns the
+        // element — we only detach our event listeners.
+        wlift_dom_attach_canvas: (id_ptr, id_len) => {
+          const doc = (typeof document !== "undefined") ? document : null;
+          if (!doc) return 0;
+          const id = readPluginUtf8(id_ptr, id_len);
+          if (!id) return 0;
+          const el = doc.getElementById(id);
+          if (!el || el.tagName !== "CANVAS") return 0;
+          const canvas = /** @type {HTMLCanvasElement} */ (el);
+
+          const queue = [];
+          const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
+          const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
+          const onMouseMove = (e) => queue.push({ type: "mouseMove", x: e.offsetX, y: e.offsetY });
+          const onKeyDown   = (e) => queue.push({ type: "keyDown", key: e.key });
+          const onKeyUp     = (e) => queue.push({ type: "keyUp",   key: e.key });
+          canvas.addEventListener("mousedown", onMouseDown);
+          canvas.addEventListener("mouseup",   onMouseUp);
+          canvas.addEventListener("mousemove", onMouseMove);
+          doc.addEventListener("keydown", onKeyDown);
+          doc.addEventListener("keyup",   onKeyUp);
+
+          const teardown = () => {
+            canvas.removeEventListener("mousedown", onMouseDown);
+            canvas.removeEventListener("mouseup",   onMouseUp);
+            canvas.removeEventListener("mousemove", onMouseMove);
+            doc.removeEventListener("keydown", onKeyDown);
+            doc.removeEventListener("keyup",   onKeyUp);
+            // No removeChild: the user owns this element.
+          };
+
+          const handle = nextCanvasHandle++;
+          canvases.set(handle, {
+            element: canvas, queue, closeRequested: false, teardown, owned: false,
+          });
           return handle;
         },
         wlift_dom_destroy_canvas: (handle) => {

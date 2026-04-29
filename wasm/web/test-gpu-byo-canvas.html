@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wlift on-demand GPU plugin smoke test — bring-your-own canvas</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 ui-monospace, monospace; max-height: 240px; }
+    h1 { font-size: 1.4rem; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+    .note  { color: #888; font-size: 0.9rem; }
+
+    .stage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+    .panel {
+      border: 2px solid #1d1812; border-radius: 8px;
+      padding: 8px; background: #1d1812;
+    }
+    .panel h2 {
+      color: #f1e3cc; font: 0.9rem ui-monospace, monospace;
+      margin: 0 0 0.5rem 0;
+    }
+    .panel canvas { display: block; margin: 0 auto; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+  <h1>Smoke test — bring-your-own canvas</h1>
+  <p class="note">
+    Two canvases the page already owns (declared inline in the
+    HTML below). Wren attaches to each by id via
+    <code>Window.create({"canvas": "&lt;id&gt;"})</code>, then
+    paints them with different solid colours from the same Wren
+    program. Demonstrates the multi-canvas path: each call mints
+    a distinct registry handle and feeds an independent
+    <code>device.createSurface</code>.
+  </p>
+  <pre id="out">running…</pre>
+
+  <div class="stage-grid">
+    <div class="panel">
+      <h2>#left  (300 × 200, page-owned)</h2>
+      <canvas id="left"  width="300" height="200"></canvas>
+    </div>
+    <div class="panel">
+      <h2>#right (300 × 200, page-owned)</h2>
+      <canvas id="right" width="300" height="200"></canvas>
+    </div>
+  </div>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+
+    out.textContent = "";
+
+    try {
+      const wlift = await createWlift({ mode: "main" });
+      log(`createWlift: ${wlift.version}`);
+
+      const [windowBytes, gpuBytes] = await Promise.all([
+        fetch("./hatch-window.hatch").then((r) => r.arrayBuffer().then((b) => new Uint8Array(b))),
+        fetch("./hatch-gpu.hatch").then((r) => r.arrayBuffer().then((b) => new Uint8Array(b))),
+      ]);
+      log(`fetched bundles: window=${windowBytes.length} bytes, gpu=${gpuBytes.length} bytes`);
+
+      const source = `
+import "@hatch:window" for Window
+import "@hatch:gpu"    for Gpu
+
+// Two page-owned canvases — Wren attaches by id, no auto-create.
+var left  = Window.create({"canvas": "left"})
+var right = Window.create({"canvas": "right"})
+
+var device = Gpu.requestDevice({})
+
+// One surface per canvas, both backed by the same device.
+var leftSurf  = device.createSurface(left.handle)
+var rightSurf = device.createSurface(right.handle)
+
+// Paint each canvas a different colour using the renderer's
+// clear-only fast path.
+var leftFrame = leftSurf.acquire()
+var leftEnc   = device.createCommandEncoder()
+var leftPass  = leftEnc.beginRenderPass({
+  "colorAttachments": [{
+    "view":       leftFrame.view,
+    "loadOp":     "clear",
+    "clearValue": { "r": 0.85, "g": 0.48, "b": 0.17, "a": 1.0 },
+    "storeOp":    "store"
+  }]
+})
+leftPass.end
+leftEnc.finish
+device.submit([leftEnc])
+leftFrame.present
+
+var rightFrame = rightSurf.acquire()
+var rightEnc   = device.createCommandEncoder()
+var rightPass  = rightEnc.beginRenderPass({
+  "colorAttachments": [{
+    "view":       rightFrame.view,
+    "loadOp":     "clear",
+    "clearValue": { "r": 0.32, "g": 0.55, "b": 0.91, "a": 1.0 },
+    "storeOp":    "store"
+  }]
+})
+rightPass.end
+rightEnc.finish
+device.submit([rightEnc])
+rightFrame.present
+
+System.print("rendered ✓")
+`.trim();
+
+      const result = await wlift.runWithHatches(source, [windowBytes, gpuBytes]);
+      log(`ok=${result.ok}  errorKind=${result.errorKind}  ${result.elapsedMs.toFixed(2)}ms`);
+      log("--- output ---");
+      log(result.output, result.ok ? "ok" : "err");
+
+      if (result.ok && result.output.includes("rendered ✓")) {
+        log("✓ PASS — both canvases painted independently.", "ok");
+      } else {
+        log("✗ FAIL", "err");
+      }
+    } catch (err) {
+      log(`exception: ${err}`, "err");
+      console.error(err);
+    }
+  </script>
+</body>
+</html>

@@ -64,13 +64,10 @@ import "@hatch:gpu"    for Gpu, Camera2D, Renderer2D, Sprite
 var SURF_W = 600
 var SURF_H = 400
 
-var canvas = Window.create_({"width": SURF_W, "height": SURF_H, "parent": "stage", "title": "renderer2d smoke"})
-if (canvas < 0) Fiber.abort("Window.create_ failed")
+var window = Window.create({"width": SURF_W, "height": SURF_H, "parent": "stage", "title": "renderer2d smoke"})
 
 var device = Gpu.requestDevice({})
-System.print("device ready")
-var surface = device.createSurface(canvas)
-System.print("surface attached")
+var surface = device.createSurface(window.handle)
 
 // Renderer2D fragments the WGSL pipeline + shared sampler /
 // uniform buffer; we only need to feed it sprites.

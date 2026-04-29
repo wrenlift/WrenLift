@@ -73,6 +73,11 @@ unsafe extern "C" {
         width: u32,
         height: u32,
     ) -> u32;
+    /// Attach to a `<canvas id="...">` the page already owns.
+    /// Returns 0 if the id doesn't resolve to a canvas element.
+    /// Same handle space as `wlift_dom_create_canvas` so all the
+    /// other dom fns work identically.
+    fn wlift_dom_attach_canvas(id_ptr: *const u8, id_len: i32) -> u32;
     fn wlift_dom_destroy_canvas(handle: u32);
     fn wlift_dom_canvas_width(handle: u32) -> u32;
     fn wlift_dom_canvas_height(handle: u32) -> u32;
@@ -179,12 +184,25 @@ unsafe fn map_string_into<'a>(
 // ---------------------------------------------------------------
 
 /// `Window.create_(descriptor)` — descriptor keys:
+///   "canvas":    String  (optional)         — DOM id of an
+///                                             existing `<canvas>`
+///                                             element to use. When
+///                                             present, "parent" /
+///                                             "width" / "height"
+///                                             are ignored — the
+///                                             user owns the
+///                                             element's layout.
+///                                             Multiple calls with
+///                                             different ids attach
+///                                             distinct canvases
+///                                             (split-screen, PiP).
 ///   "title":     String  (default "wlift")
 ///   "width":     Num     (default 800)
 ///   "height":    Num     (default 600)
 ///   "parent":    String  (default "stage")  — CSS id of the host
 ///                                             element to attach
-///                                             under.
+///                                             a freshly-created
+///                                             canvas under.
 ///   "resizable": Bool    (default true)     — currently unused;
 ///                                             page CSS owns
 ///                                             resize behaviour.
@@ -194,16 +212,22 @@ unsafe fn map_string_into<'a>(
 pub unsafe extern "C" fn wlift_window_create(vm: *mut c_void) {
     let mut title_buf = [0u8; 256];
     let mut parent_buf = [0u8; 256];
+    let mut canvas_buf = [0u8; 256];
 
     let title = unsafe { map_string_into(vm, 1, "title", &mut title_buf) };
-    let parent = unsafe { map_string_into(vm, 1, "parent", &mut parent_buf) }
-        .unwrap_or(b"stage");
-    let width = unsafe { map_num(vm, 1, "width", 800.0) } as u32;
-    let height = unsafe { map_num(vm, 1, "height", 600.0) } as u32;
-    let _resizable = unsafe { map_bool(vm, 1, "resizable", true) };
+    let canvas_id = unsafe { map_string_into(vm, 1, "canvas", &mut canvas_buf) };
 
-    let handle = unsafe {
-        wlift_dom_create_canvas(parent.as_ptr(), parent.len() as i32, width, height)
+    let handle = if let Some(id) = canvas_id {
+        // User supplied a `<canvas id="...">` — attach to it. The
+        // browser's CSS owns size; we don't override width/height.
+        unsafe { wlift_dom_attach_canvas(id.as_ptr(), id.len() as i32) }
+    } else {
+        let parent = unsafe { map_string_into(vm, 1, "parent", &mut parent_buf) }
+            .unwrap_or(b"stage");
+        let width = unsafe { map_num(vm, 1, "width", 800.0) } as u32;
+        let height = unsafe { map_num(vm, 1, "height", 600.0) } as u32;
+        let _resizable = unsafe { map_bool(vm, 1, "resizable", true) };
+        unsafe { wlift_dom_create_canvas(parent.as_ptr(), parent.len() as i32, width, height) }
     };
 
     if handle == 0 {

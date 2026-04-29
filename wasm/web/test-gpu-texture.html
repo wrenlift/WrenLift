@@ -112,11 +112,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
 import "@hatch:window" for Window
 import "@hatch:gpu" for Gpu
 
-var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "textured quad smoke"})
-if (canvas < 0) Fiber.abort("Window.create_ failed")
+var window = Window.create({"width": 600, "height": 400, "parent": "stage", "title": "textured quad smoke"})
 
 var device = Gpu.requestDevice({})
-var surface = device.createSurface(canvas)
+var surface = device.createSurface(window.handle)
 
 var shader = device.createShaderModule({"code": ${JSON.stringify(wgsl)}})
 
