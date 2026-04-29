@@ -671,28 +671,154 @@ class MainWlift {
       }
     };
 
+    // ---------------------------------------------------------
+    // Plugin imports — the env namespace exposed to plugin
+    // wasm modules at instantiation time.
+    //
+    // Three layers stack into one object:
+    //
+    //   1. A *passthrough* of every wlift_wasm export. Plugins
+    //      declare `extern "C" { fn wrenGetSlotDouble(...) }` and
+    //      similar; those get wired straight to the host's C-API
+    //      exports, so calls happen inside the host's wasm
+    //      context with no JS hop. (Yes, we end up exposing
+    //      __wbindgen_* fns the plugin will never use — extras
+    //      in an imports object are harmless.)
+    //
+    //   2. The two slot-shaped bridges — wlift_get_slot_str /
+    //      wlift_set_slot_str — that handle the cross-memory
+    //      copy for string args. These can't live in (1)
+    //      because they need both plugin AND host memory access.
+    //
+    //   3. The DOM bridge surface — wlift_dom_*. JS owns the
+    //      per-canvas state (HTMLCanvasElement, event-listener
+    //      closures, queued events); plugins reference canvases
+    //      by integer handle. Drain happens via direct slot
+    //      writes against the live VM.
+    //
+    // makeDomBridge below builds layer (3); makePluginImports
+    // glues all three together.
+    function makeDomBridge(getInstance) {
+      const canvases = new Map(); // handle -> {element, queue, closeRequested, teardown}
+      let nextHandle = 1;
+      const readPluginUtf8 = (ptr, len) => {
+        if (len <= 0) return "";
+        const view = new Uint8Array(getInstance().exports.memory.buffer, ptr, len);
+        return new TextDecoder().decode(view);
+      };
+      // Allocate-copy-set-free helper — writes `str` into `slot`
+      // as a Wren String, using the host's own memory allocator
+      // because `wrenSetSlotString` reads from host pointers.
+      const writeStringSlot = (vm, slot, str) => {
+        const bytes = new TextEncoder().encode(str);
+        const len = bytes.length;
+        const ptr = wasm.wlift_host_alloc(len + 1);
+        const view = new Uint8Array(wasm.memory.buffer, ptr, len + 1);
+        view.set(bytes);
+        view[len] = 0;
+        wasm.wrenSetSlotString(vm, slot, ptr);
+        wasm.wlift_host_free(ptr, len + 1);
+      };
+      return {
+        wlift_dom_create_canvas: (parent_id_ptr, parent_id_len, width, height) => {
+          const doc = (typeof document !== "undefined") ? document : null;
+          if (!doc) return 0;
+          const canvas = doc.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+          canvas.setAttribute("data-wlift-canvas", "true");
+          const parent_id = readPluginUtf8(parent_id_ptr, parent_id_len);
+          const parent =
+            (parent_id && doc.getElementById(parent_id)) || doc.body || doc.documentElement;
+          if (!parent) return 0;
+          parent.appendChild(canvas);
+
+          const queue = [];
+          const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
+          const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
+          const onMouseMove = (e) => queue.push({ type: "mouseMove", x: e.offsetX, y: e.offsetY });
+          const onKeyDown   = (e) => queue.push({ type: "keyDown", key: e.key });
+          const onKeyUp     = (e) => queue.push({ type: "keyUp",   key: e.key });
+          canvas.addEventListener("mousedown", onMouseDown);
+          canvas.addEventListener("mouseup",   onMouseUp);
+          canvas.addEventListener("mousemove", onMouseMove);
+          doc.addEventListener("keydown", onKeyDown);
+          doc.addEventListener("keyup",   onKeyUp);
+
+          const teardown = () => {
+            canvas.removeEventListener("mousedown", onMouseDown);
+            canvas.removeEventListener("mouseup",   onMouseUp);
+            canvas.removeEventListener("mousemove", onMouseMove);
+            doc.removeEventListener("keydown", onKeyDown);
+            doc.removeEventListener("keyup",   onKeyUp);
+            canvas.parentNode?.removeChild(canvas);
+          };
+
+          const handle = nextHandle++;
+          canvases.set(handle, { element: canvas, queue, closeRequested: false, teardown });
+          return handle;
+        },
+        wlift_dom_destroy_canvas: (handle) => {
+          const c = canvases.get(handle);
+          if (!c) return;
+          c.teardown();
+          canvases.delete(handle);
+        },
+        wlift_dom_canvas_width:  (handle) => canvases.get(handle)?.element.width  ?? 0,
+        wlift_dom_canvas_height: (handle) => canvases.get(handle)?.element.height ?? 0,
+        wlift_dom_close_requested: (handle) =>
+          (canvases.get(handle)?.closeRequested ? 1 : 0),
+        wlift_dom_set_canvas_attribute: (handle, name_ptr, name_len, val_ptr, val_len) => {
+          const c = canvases.get(handle);
+          if (!c) return;
+          const name = readPluginUtf8(name_ptr, name_len);
+          const val  = readPluginUtf8(val_ptr,  val_len);
+          c.element.setAttribute(name, val);
+        },
+        wlift_dom_drain_events_into_list: (vm, list_slot, handle) => {
+          const c = canvases.get(handle);
+          if (!c) return;
+          const events = c.queue.splice(0, c.queue.length);
+          // Slots: list_slot = list, 4 = scratch map, 5 = key
+          // scratch, 3 = value scratch. The plugin already called
+          // wrenEnsureSlots(6) before delegating here.
+          wasm.wrenSetSlotNewList(vm, list_slot);
+          for (let i = 0; i < events.length; i++) {
+            const ev = events[i];
+            wasm.wrenSetSlotNewMap(vm, 4);
+            for (const k of Object.keys(ev)) {
+              writeStringSlot(vm, 5, k);
+              const v = ev[k];
+              if (typeof v === "string") {
+                writeStringSlot(vm, 3, v);
+              } else if (typeof v === "number") {
+                wasm.wrenSetSlotDouble(vm, 3, v);
+              } else if (typeof v === "boolean") {
+                wasm.wrenSetSlotBool(vm, 3, v);
+              } else {
+                wasm.wrenSetSlotNull(vm, 3);
+              }
+              wasm.wrenSetMapValue(vm, 4, 5, 3);
+            }
+            wasm.wrenInsertInList(vm, list_slot, i, 4);
+          }
+        },
+      };
+    }
+
     function makePluginImports(libName, getInstance) {
       // `getInstance` is a getter because the plugin's
       // `instance.exports.memory` isn't available until *after*
       // `WebAssembly.instantiate` resolves — the imports object
       // we hand it has to be built first, and the bridges that
       // reference plugin memory close over a deferred lookup.
-      //
-      // The host side here uses `wasm` (the exports object
-      // returned by `mod.default()`) for raw `wrenGetSlotString`
-      // / `wrenSetSlotString` / `wlift_host_alloc` / memory
-      // access. `mod`'s wasm-bindgen-wrapped exports go through
-      // string-marshalling wrappers that aren't what the bridge
-      // contract wants — the bridge already has raw C-string
-      // pointers in hand.
+      const dom = makeDomBridge(getInstance);
       return {
         env: {
-          // Plugin asks for `wrenGetSlotString(vm, slot)` →
-          // returns a host *const char (pointer into HOST memory).
-          // We read that C-string out of host memory and copy the
-          // bytes into the plugin's memory at `out_ptr`, capped
-          // at `max`. Returns the number of bytes written, or -1
-          // on a NULL host pointer.
+          // Layer 1: passthrough of every wlift_wasm export. Spreads
+          // the wren* C API into the plugin's reach with no JS hop.
+          ...wasm,
+          // Layer 2: slot bridges that handle plugin/host memory copy.
           wlift_get_slot_str: (vm, slot, out_ptr, max) => {
             const host_ptr = wasm.wrenGetSlotString(vm, slot);
             if (!host_ptr) return -1;
@@ -704,12 +830,6 @@ class MainWlift {
             plugin_view.set(host_view.subarray(host_ptr, host_ptr + len));
             return len;
           },
-
-          // Plugin built a string in its own memory (`ptr`/`len`)
-          // and wants it written to slot `slot`. We allocate a
-          // null-terminated buffer in *host* memory, copy the
-          // bytes across, call `wrenSetSlotString` (which copies
-          // again into a Wren-managed string), then free.
           wlift_set_slot_str: (vm, slot, ptr, len) => {
             const inst = getInstance();
             const plugin_view = new Uint8Array(inst.exports.memory.buffer, ptr, len);
@@ -720,6 +840,8 @@ class MainWlift {
             wasm.wrenSetSlotString(vm, slot, host_ptr);
             wasm.wlift_host_free(host_ptr, len + 1);
           },
+          // Layer 3: DOM bridges.
+          ...dom,
         },
       };
     }

@@ -1,0 +1,22 @@
+[package]
+name = "wlift_window_web"
+version = "0.1.0"
+edition = "2021"
+description = "Browser-canvas window provider for the WrenLift game framework. Compiles to wasm32-unknown-unknown only — bundled into @hatch:window's wasm slot. The native winit-backed cdylib lives in `wlift_window`; this crate exposes the same foreign-method names so the Wren-side `Window` API is identical across targets."
+
+[lib]
+# Wasm-only plugin — same shape as `wlift_hello`. Loaded on
+# demand by the runtime when a hatch bundle declares `wasm =
+# "libs/wlift_window_web.wasm"` in [native_libs]. Not statically
+# linked into wlift_wasm.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Zero Rust deps by design. The plugin is pure C-ABI: every
+# capability it needs (Wren slot ops, DOM creation, event
+# drains) is a wasm import provided at instantiation time.
+# wlift_wasm exports the Wren C API directly; the JS-side
+# loader provides the slot bridges and the small DOM bridge
+# surface. No wasm-bindgen, no web-sys — keeps the plugin
+# tiny (~30 KB vs ~750 KB with web-sys) and the boundary
+# stable.

@@ -8,6 +8,7 @@ members = [
     "plugins/wlift_audio",
     "plugins/wlift_physics",
     "plugins/wlift_hello",
+    "plugins/wlift_window_web",
     "wasm",
 ]
 resolver = "2"
