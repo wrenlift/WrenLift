@@ -15,13 +15,16 @@
 //! # URL layout
 //!
 //! ```text
-//! {registry_base}/releases/download/{name}-{version}/{name}-{version}.hatch
+//! {registry_base}/releases/download/publish/{dir}%40{version}/{dir}-{version}.hatch
 //! ```
 //!
 //! where `{registry_base}` defaults to
-//! `https://github.com/wrenlift/hatch`. The scheme matches GitHub
-//! releases exactly — each package is published as its own tag
-//! `{name}-{version}` with a single `{name}-{version}.hatch` asset.
+//! `https://github.com/wrenlift/hatch` and `{dir}` is the package's
+//! source-directory basename (`@hatch:foo` → `hatch-foo`; strip the
+//! leading `@`, swap `:` / `/` for `-`). Matches the layout the
+//! `publish-pkg.yml` workflow attaches under tags shaped
+//! `publish/<dir>@<version>` — `@` is `%40`-encoded because GitHub
+//! keeps the tag verbatim in the asset URL it serves.
 //!
 //! # Cache layout
 //!
@@ -128,21 +131,37 @@ pub fn cached_artifact_path_in(cache_dir: &std::path::Path, name: &str, version:
 }
 
 fn artifact_filename(name: &str, version: &str) -> String {
-    format!("{}-{}.hatch", name, version)
+    // Use the dir-flattened form so the cache filename matches the
+    // remote asset basename and stays portable on filesystems that
+    // reject `:` (Windows). `@hatch:fs` → `hatch-fs-0.1.0.hatch`.
+    format!("{}-{}.hatch", scoped_name_to_dir(name), version)
 }
 
 /// Construct the release URL a `hatch install name@version` will hit.
 /// Kept public so the CLI can print a human-readable hint when a
-/// download fails.
+/// download fails. Mirrors the asset layout `publish-pkg.yml`
+/// produces — see the module docstring.
 pub fn release_url(registry_base: &str, name: &str, version: &str) -> String {
+    let dir = scoped_name_to_dir(name);
     format!(
-        "{}/releases/download/{}-{}/{}-{}.hatch",
+        "{}/releases/download/publish/{}%40{}/{}-{}.hatch",
         registry_base.trim_end_matches('/'),
-        name,
+        dir,
         version,
-        name,
+        dir,
         version,
     )
+}
+
+/// Map a scoped package name (`@hatch:assert`, `@user:lib`,
+/// `@scope/pkg`) to its release-asset directory basename
+/// (`hatch-assert`, `user-lib`, `scope-pkg`). Bare names pass
+/// through unchanged. Mirrors the `scopedNameToDir` helper in
+/// `wasm/web/wlift.js` so host CLI and browser playground build
+/// identical URLs against the same registry.
+pub fn scoped_name_to_dir(name: &str) -> String {
+    let trimmed = name.strip_prefix('@').unwrap_or(name);
+    trimmed.replace([':', '/'], "-")
 }
 
 /// Ensure `name@version` is present in the ambient cache (resolved
@@ -377,17 +396,35 @@ mod tests {
 
     #[test]
     fn release_url_has_expected_shape() {
+        // Bare name passes through; tag is `publish/json@1.0.0`,
+        // `@` shows up in the URL as `%40`.
         let url = release_url("https://example.com/reg", "json", "1.0.0");
         assert_eq!(
             url,
-            "https://example.com/reg/releases/download/json-1.0.0/json-1.0.0.hatch"
+            "https://example.com/reg/releases/download/publish/json%401.0.0/json-1.0.0.hatch"
         );
         // Trailing slash on the base must not double up.
         let url = release_url("https://example.com/reg/", "json", "1.0.0");
         assert_eq!(
             url,
-            "https://example.com/reg/releases/download/json-1.0.0/json-1.0.0.hatch"
+            "https://example.com/reg/releases/download/publish/json%401.0.0/json-1.0.0.hatch"
         );
+        // Scoped name → flattened directory, both in the tag
+        // segment and the asset basename.
+        let url = release_url("https://example.com/reg", "@hatch:fs", "0.1.0");
+        assert_eq!(
+            url,
+            "https://example.com/reg/releases/download/publish/hatch-fs%400.1.0/hatch-fs-0.1.0.hatch"
+        );
+    }
+
+    #[test]
+    fn scoped_name_to_dir_strips_prefix_and_swaps_separators() {
+        assert_eq!(scoped_name_to_dir("@hatch:fs"), "hatch-fs");
+        assert_eq!(scoped_name_to_dir("@scope/pkg"), "scope-pkg");
+        assert_eq!(scoped_name_to_dir("plain"), "plain");
+        // Multi-segment scope shouldn't collapse separators.
+        assert_eq!(scoped_name_to_dir("@a:b/c"), "a-b-c");
     }
 
     /// Drive `ensure_in_cache` against a `file://` URL pointing at a
@@ -430,9 +467,11 @@ mod tests {
         let bytes = crate::hatch::emit(&hatch).unwrap();
 
         // Lay out a fake "registry" directory matching the URL shape
-        // `ensure_in_cache` expects: `.../releases/download/<tag>/<file>`.
+        // `ensure_in_cache` builds: `.../releases/download/publish/<dir>%40<ver>/<file>`.
+        // `curl --output-dir` will URL-decode `%40` back to `@` on
+        // disk, so the local path here uses the literal `@`.
         let reg_root = scratch.path().join("reg");
-        let asset_dir = reg_root.join("releases/download/json-1.0.0");
+        let asset_dir = reg_root.join("releases/download/publish/json@1.0.0");
         std::fs::create_dir_all(&asset_dir).unwrap();
         std::fs::write(asset_dir.join("json-1.0.0.hatch"), &bytes).unwrap();
 
@@ -532,7 +571,7 @@ mod tests {
 
         let scratch = tempfile::tempdir().expect("tempdir");
         let reg_root = scratch.path().join("reg");
-        let asset_dir = reg_root.join("releases/download/bad-0.0.1");
+        let asset_dir = reg_root.join("releases/download/publish/bad@0.0.1");
         std::fs::create_dir_all(&asset_dir).unwrap();
         // Garbage bytes, no HATCH magic.
         std::fs::write(asset_dir.join("bad-0.0.1.hatch"), b"not a hatch").unwrap();
