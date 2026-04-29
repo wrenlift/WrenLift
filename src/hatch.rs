@@ -523,11 +523,15 @@ pub struct EmitOptions {
     pub compress: bool,
 }
 
+// Compress by default on host; on non-host builds (wasm) the
+// zstd dep isn't linked, so the compressed branch wouldn't
+// compile — flip the default off there. clippy flags this as
+// derivable, but `#[derive(Default)]` would default `bool` to
+// `false` on every target; we *want* the cfg-conditional, so
+// suppress the lint.
+#[allow(clippy::derivable_impls)]
 impl Default for EmitOptions {
     fn default() -> Self {
-        // Compress by default on host; on non-host builds (wasm)
-        // the zstd dep isn't linked, so the compressed branch
-        // wouldn't compile — flip the default off there.
         Self {
             compress: cfg!(feature = "host"),
         }
@@ -2336,6 +2340,78 @@ System.print(Util.greet("hatch"))
         assert!(
             out.contains("hi, hatch"),
             "expected cross-module Util.greet output; got {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn at_hatch_package_module_name_matches_user_import() {
+        // Build a `@hatch:foo` package from a source tree where
+        // the entry file is `foo.wren`. The build pass renames
+        // the entry section to the manifest's scoped name so
+        // user code's `import "@hatch:foo" for X` finds the
+        // module at install time. This is the contract the
+        // wasm playground's `runWithHatches` depends on — if it
+        // ever regresses, the playground breaks silently with
+        // "module not found" deep in the import resolver.
+        let dep = tempfile::tempdir().expect("dep tempdir");
+        let dep_root = dep.path();
+        std::fs::write(
+            dep_root.join("hatchfile"),
+            "name = \"@hatch:foo\"\nversion = \"0.1.0\"\nentry = \"foo\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dep_root.join("foo.wren"),
+            "class Foo { static greet() { return \"foo says hi\" } }\n",
+        )
+        .unwrap();
+
+        // Build untargeted (legacy / target-agnostic) so the
+        // host test runtime can install it. The rename behaviour
+        // we're verifying is independent of target — same
+        // section names whether wasm32-* or native.
+        let dep_bytes = build_from_source_tree(dep_root).expect("build dep");
+        let dep_hatch = load(&dep_bytes).expect("load dep");
+        // Manifest entry + module name should both have been
+        // rewritten to "@hatch:foo".
+        assert_eq!(dep_hatch.manifest.entry, "@hatch:foo");
+        assert!(dep_hatch.manifest.modules.iter().any(|m| m == "@hatch:foo"));
+        assert!(
+            dep_hatch
+                .sections
+                .iter()
+                .any(|s| matches!(s.kind, SectionKind::Wlbc) && s.name == "@hatch:foo"),
+            "Wlbc section should be named '@hatch:foo' after rename"
+        );
+
+        // Now drive the install + run path that the wasm
+        // playground uses: `install_hatch_modules` first, then
+        // `interpret` the user source. The user's `import
+        // "@hatch:foo"` must resolve.
+        let mut vm = crate::runtime::vm::VM::new(crate::runtime::vm::VMConfig::default());
+        vm.output_buffer = Some(String::new());
+        let install = vm.install_hatch_modules(&dep_bytes);
+        assert_eq!(
+            install,
+            crate::runtime::engine::InterpretResult::Success,
+            "install_hatch_modules should succeed"
+        );
+        let user_source = r#"
+import "@hatch:foo" for Foo
+System.print(Foo.greet())
+"#;
+        let result = vm.interpret("main", user_source);
+        let out = vm.output_buffer.clone().unwrap_or_default();
+        assert_eq!(
+            result,
+            crate::runtime::engine::InterpretResult::Success,
+            "user source should import @hatch:foo successfully: output={:?}",
+            out
+        );
+        assert!(
+            out.contains("foo says hi"),
+            "expected '@hatch:foo' import to resolve and run; got {:?}",
             out
         );
     }

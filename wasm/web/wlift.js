@@ -76,6 +76,212 @@ export function sharedMemorySupported() {
       && crossOriginIsolated === true;
 }
 
+// Scan a Wren source string for `import "..."` lines whose
+// module name is a *scoped* package — i.e. one containing any
+// of `:`, `@`, or `/`. This matches the host-side build's
+// `is_scoped` rule (cf. `hatch::rename_entry_to_manifest_name`),
+// which is what tells the build to rename the entry module to
+// the package name so consumer imports resolve.
+//
+// Returns unique package names in source order. The playground
+// uses this to drive the prefetch step before
+// `runWithHatches`. The regex tolerates either quote style,
+// whitespace between `import` and the quoted name, and any
+// non-quote bytes inside the package name (so `@user:lib`,
+// `@scope/pkg`, `@hatch:assert`, registry URLs, etc. all
+// match — first-party `@hatch:*` packages aren't privileged).
+//
+// Bare names like `import "util"` (a relative module inside
+// the same project) are intentionally *not* matched: those
+// resolve through the in-project loader, not through a
+// dependency hatch.
+export function scanScopedImports(source) {
+  const re = /import\s+["']([^"']*[:@/][^"']*)["']/g;
+  const names = [];
+  const seen = new Set();
+  for (const m of source.matchAll(re)) {
+    const name = m[1];
+    if (!seen.has(name)) {
+      seen.add(name);
+      names.push(name);
+    }
+  }
+  return names;
+}
+
+// Backwards-compat alias kept around in case callers depend on
+// the original name. New code should use `scanScopedImports`.
+export const scanHatchImports = scanScopedImports;
+
+// Default registry base — first-party `@hatch:*` packages are
+// published here as GitHub release artifacts under the path
+// shape `releases/download/<name>-<version>/<name>-<version>.hatch`
+// (mirrors `hatch_registry::release_url`'s scheme on the host).
+// Override at the call site if you're hosting a private mirror.
+export const DEFAULT_HATCH_REGISTRY = "https://github.com/wrenlift/hatch";
+
+// Lazy import so `parseHatchfileToml` / `peekManifest` callers
+// don't pay the wasm-init cost twice (worker mode already has
+// its own copy; this is for main-thread sync helpers).
+let _modPromise = null;
+async function getMod() {
+  if (!_modPromise) {
+    _modPromise = (async () => {
+      const m = await import("../pkg/wlift_wasm.js");
+      await m.default();
+      return m;
+    })();
+  }
+  return _modPromise;
+}
+
+/// Parse hatchfile TOML → JS object. Same shape as
+/// `crate::hatch::Manifest`. Throws on malformed TOML or
+/// missing required fields.
+export async function parseHatchfileToml(text) {
+  const m = await getMod();
+  return m.parse_hatchfile_toml(text);
+}
+
+/// Peek the manifest from already-fetched `.hatch` bytes
+/// without installing the bundle. Used by the dep walker to
+/// discover transitive `[dependencies]`.
+export async function peekManifest(bytes) {
+  const m = await getMod();
+  const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return m.peek_manifest(buf);
+}
+
+// Resolve a single `[dependencies]` entry into a fetch URL.
+// Mirrors the host's `Dependency` enum:
+//
+//   "@hatch:assert" = "0.2.0"             // version (registry CDN)
+//   "@user:lib"     = { git = "...", rev = "abc" }
+//   "@user:lib"     = { git = "...", tag = "v1" }
+//   "local"         = { path = "../local" }
+//
+// Browser limitations:
+//
+//   * Path deps fail with a clear error — they're build-time
+//     references on the host CLI; nothing to fetch.
+//   * Git deps require a public release artifact at
+//     `<git>/releases/download/<rev|tag>/<name>.hatch`. There's
+//     no general "git clone" in the browser, so we assume the
+//     publisher cut a release matching the rev/tag.
+//
+// Returns `{ url }` on success; throws on unsupported entries
+// so the caller can surface a precise reason.
+export function depEntryToUrl(name, dep, registryBase = DEFAULT_HATCH_REGISTRY) {
+  if (typeof dep === "string") {
+    return {
+      url: `${registryBase}/releases/download/${name}-${dep}/${name}-${dep}.hatch`,
+    };
+  }
+  if (dep && typeof dep === "object") {
+    if (typeof dep.path === "string") {
+      throw new Error(
+        `dep '${name}' is a path reference (${dep.path}); path deps only resolve at build time. ` +
+        `Build the parent project on host with \`wlift project/ --bundle out.hatch --bundle-target wasm32-*\` and load the bundle directly.`
+      );
+    }
+    if (typeof dep.git === "string") {
+      const rev = dep.rev ?? dep.tag;
+      if (!rev) {
+        throw new Error(`dep '${name}' has 'git' but no 'rev' or 'tag' — can't pin a specific release.`);
+      }
+      // Conventional release-asset path; publisher must have
+      // tagged a release with `<name>.hatch` attached.
+      return { url: `${dep.git}/releases/download/${rev}/${name}.hatch` };
+    }
+    // Bare table — try a `version` key as a fallback so
+    // `{ version = "1.0.0" }` works the same as the bare
+    // string form.
+    if (typeof dep.version === "string") {
+      return {
+        url: `${registryBase}/releases/download/${name}-${dep.version}/${name}-${dep.version}.hatch`,
+      };
+    }
+  }
+  throw new Error(`dep '${name}' has an unsupported entry shape: ${JSON.stringify(dep)}`);
+}
+
+// Recursively fetch every dep declared by `manifest`'s
+// `[dependencies]` table, peek inside each fetched bundle for
+// transitive `[dependencies]`, and return the byte streams in
+// install order (deps before consumers — depth-first post-
+// order over the dep graph). `peekManifest` runs synchronously
+// off the already-loaded wasm module so transitive resolution
+// doesn't pay an extra worker round-trip.
+//
+// Pass `registryBase` to override the first-party CDN.
+// `fetcher` defaults to browser `fetch()`; tests / private
+// mirrors / IndexedDB caches can substitute.
+export async function resolveDepsFromManifest(
+  manifest,
+  {
+    registryBase = DEFAULT_HATCH_REGISTRY,
+    fetcher = defaultFetcher,
+  } = {},
+) {
+  const order = [];                  // Uint8Array[] in install order
+  const seen = new Set();            // package names already queued
+  await visit(manifest);
+  return order;
+
+  async function visit(m) {
+    const deps = (m && m.dependencies) || {};
+    for (const [name, entry] of Object.entries(deps)) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const { url } = depEntryToUrl(name, entry, registryBase);
+      const bytes = await fetcher(url, name);
+      // Peek before installing so transitive deps queue ahead
+      // of this one (post-order: deps install before consumers).
+      const childManifest = await peekManifest(bytes);
+      await visit(childManifest);
+      order.push(bytes);
+    }
+  }
+}
+
+async function defaultFetcher(url, name) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    throw new Error(`fetch dep '${name}' from ${url} failed: ${r.status} ${r.statusText}`);
+  }
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+/// One-call convenience: given the user's source + their
+/// hatchfile (TOML text), parse the manifest, walk the dep
+/// graph, fetch each declared dependency from its hatchfile-
+/// metadata-derived URL, then run the user source against the
+/// installed deps. Returns the same `RunResult` shape as
+/// `wlift.run` / `wlift.runWithHatches`.
+///
+///   const result = await runProject(wlift, source, hatchfileText);
+///   // result.output / .ok / .errorKind / .elapsedMs
+///
+/// Errors from any stage (parse, fetch, peek, run) surface as
+/// `result.ok === false` with the error message in
+/// `result.output`.
+export async function runProject(wlift, source, hatchfileText, opts = {}) {
+  const t0 = performance.now();
+  let manifest;
+  try {
+    manifest = await parseHatchfileToml(hatchfileText);
+  } catch (err) {
+    return { output: `hatchfile parse failed: ${err}`, ok: false, errorKind: -1, elapsedMs: performance.now() - t0 };
+  }
+  let deps;
+  try {
+    deps = await resolveDepsFromManifest(manifest, opts);
+  } catch (err) {
+    return { output: `dep resolution failed: ${err}`, ok: false, errorKind: -1, elapsedMs: performance.now() - t0 };
+  }
+  return wlift.runWithHatches(source, deps);
+}
+
 // ---------------------------------------------------------------------------
 // Worker mode (default)
 // ---------------------------------------------------------------------------
@@ -162,6 +368,28 @@ class WorkerWlift {
       this.worker.postMessage(
         { cmd: "run-hatch", id, bytes: buf },
         [buf.buffer],
+      );
+    });
+  }
+
+  // Run user source with a list of pre-fetched `@hatch:*`
+  // dependency bundles installed first. `deps` is an array of
+  // `Uint8Array` (one `.hatch` per dep). Use `scanHatchImports` +
+  // `fetchHatchPackages` together to populate it:
+  //
+  //   const names = scanHatchImports(source);
+  //   const deps  = await fetchHatchPackages(names, fetcher);
+  //   const r     = await wlift.runWithHatches(source, deps);
+  runWithHatches(source, deps) {
+    return new Promise((resolve) => {
+      const id = this.nextId++;
+      this.pending.set(id, resolve);
+      const bufs = (deps ?? []).map((b) =>
+        b instanceof Uint8Array ? b : new Uint8Array(b),
+      );
+      this.worker.postMessage(
+        { cmd: "run-with-hatches", id, source, deps: bufs },
+        bufs.map((b) => b.buffer),
       );
     });
   }
@@ -415,6 +643,37 @@ class MainWlift {
     try {
       const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
       result = await this._mod.run_hatch(buf);
+    } catch (err) {
+      return {
+        cmd: "result",
+        output: String(err),
+        ok: false,
+        errorKind: -1,
+        elapsedMs: performance.now() - t0,
+      };
+    }
+    return {
+      cmd: "result",
+      output: result.output,
+      ok: result.ok,
+      errorKind: result.errorKind,
+      elapsedMs: performance.now() - t0,
+    };
+  }
+
+  async runWithHatches(source, deps) {
+    // `_mod.run_with_hatches` takes a `js_sys::Array` whose
+    // elements are `Uint8Array`s. wasm-bindgen marshals the
+    // outer array; the inner arrays cross by reference + the
+    // Rust side `to_vec()`s them once. Errors during dep install
+    // are surfaced through `result.output` with `ok: false`.
+    const t0 = performance.now();
+    let result;
+    try {
+      const bufs = (deps ?? []).map((b) =>
+        b instanceof Uint8Array ? b : new Uint8Array(b),
+      );
+      result = await this._mod.run_with_hatches(source, bufs);
     } catch (err) {
       return {
         cmd: "result",

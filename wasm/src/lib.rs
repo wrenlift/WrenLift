@@ -688,6 +688,64 @@ pub fn version() -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Hatchfile introspection (drives JS-side dep resolution)
+// ---------------------------------------------------------------------------
+//
+// The browser playground can't `git clone` and can't follow
+// arbitrary path references — but it *can* read the consumer's
+// hatchfile, walk `[dependencies]` to figure out what to fetch,
+// and ask `fetch()` for each. The shape of each dep entry
+// (version string vs `{ git = ..., rev = ... }` vs `{ path = ...
+// }`) is what tells the JS side how to fetch — that's the
+// metadata we surface here.
+//
+// `parse_hatchfile_toml` returns the manifest as a JS object so
+// the JS host doesn't need to ship a TOML parser. `peek_manifest`
+// extracts the manifest from an already-fetched `.hatch` byte
+// stream so transitive deps can be discovered without
+// instantiating the bundle.
+
+/// Parse a hatchfile (TOML text) and return the manifest as a
+/// JS-side object. Errors surface as a JS exception — JS callers
+/// `try { ... } catch { ... }` to recover.
+///
+/// JS shape of the returned object (subset — full mirror of
+/// `crate::hatch::Manifest`):
+/// ```json
+/// {
+///   "name": "@hatch:my-package",
+///   "version": "0.1.0",
+///   "entry": "main",
+///   "modules": [...],
+///   "dependencies": {
+///     "@hatch:assert": "0.2.0",
+///     "@user:lib": { "git": "https://example.com/repo", "rev": "abc" },
+///     "local": { "path": "../local" }
+///   },
+///   "target": "wasm32-unknown-unknown"
+/// }
+/// ```
+#[wasm_bindgen]
+pub fn parse_hatchfile_toml(text: &str) -> Result<JsValue, JsValue> {
+    let manifest: wren_lift::hatch::Manifest =
+        toml::from_str(text).map_err(|e| JsValue::from_str(&format!("hatchfile parse: {e}")))?;
+    serde_wasm_bindgen::to_value(&manifest)
+        .map_err(|e| JsValue::from_str(&format!("manifest → JsValue: {e}")))
+}
+
+/// Inspect a `.hatch` byte stream and return its manifest as a
+/// JS object — same shape as `parse_hatchfile_toml`. Used by
+/// the JS-side dep walker to discover transitive `[dependencies]`
+/// without installing the bundle.
+#[wasm_bindgen]
+pub fn peek_manifest(bytes: &[u8]) -> Result<JsValue, JsValue> {
+    let hatch = wren_lift::hatch::load(bytes)
+        .map_err(|e| JsValue::from_str(&format!("hatch load: {e}")))?;
+    serde_wasm_bindgen::to_value(&hatch.manifest)
+        .map_err(|e| JsValue::from_str(&format!("manifest → JsValue: {e}")))
+}
+
 /// Result of a single `run` call, exported to JS as a structural
 /// object via `wasm_bindgen`'s getter convention.
 #[wasm_bindgen]
@@ -927,10 +985,16 @@ fn perf_log(_label: &str, _start: f64) {}
 /// playground has always used; the `Hatch` arm bypasses that
 /// pipeline by installing a pre-compiled `.hatch` bundle —
 /// multiple modules at once, plus the `target` compatibility
-/// check (cf. `crate::hatch::check_target_compat`).
+/// check (cf. `crate::hatch::check_target_compat`). The
+/// `SourceWithHatches` arm pre-installs a vec of `@hatch:*`
+/// dependency bundles, then runs `Source` against the now-loaded
+/// modules — same shape the host CLI's `HatchRunner` uses for
+/// pulling external packages, but here the JS host has fetched
+/// the bytes itself (wasm can't synchronously fetch).
 enum RunInput<'a> {
     Source(&'a str),
     Hatch(&'a [u8]),
+    SourceWithHatches(&'a str, Vec<Vec<u8>>),
 }
 
 /// Run a `.hatch` bundle in the playground. Same setup as `run`
@@ -951,6 +1015,44 @@ enum RunInput<'a> {
 #[wasm_bindgen]
 pub async fn run_hatch(bytes: &[u8]) -> RunResult {
     run_inner(RunInput::Hatch(bytes)).await
+}
+
+/// Run user source after pre-installing a list of `@hatch:*`
+/// dependency bundles. The JS host is responsible for fetching
+/// each dep's bytes (typically by scanning `import "@hatch:..."`
+/// patterns in the source and pulling matching `.hatch` files
+/// from a CDN); this entry point installs them before the user
+/// source's parser hits an `import "@hatch:foo"` line, so the
+/// import resolves against an already-loaded module.
+///
+/// `deps` is a JS `Array` of `Uint8Array`. Each element is one
+/// `.hatch` byte stream. Order matters only for transitive
+/// dependencies — a hatch that imports another hatch must come
+/// after its dep in the array. The JS-side helper that does the
+/// fetch is responsible for that ordering (topological sort over
+/// the dep graph).
+#[wasm_bindgen]
+pub async fn run_with_hatches(source: &str, deps: js_sys::Array) -> RunResult {
+    // Decode each `Uint8Array` into a `Vec<u8>` once, on this
+    // side of the bindgen boundary. Holding `Uint8Array`
+    // references across the upcoming `await` would land in a
+    // long-running async context — copying out is cheaper and
+    // sidesteps the lifetime question.
+    let mut dep_bytes: Vec<Vec<u8>> = Vec::with_capacity(deps.length() as usize);
+    for entry in deps.iter() {
+        match entry.dyn_into::<js_sys::Uint8Array>() {
+            Ok(arr) => dep_bytes.push(arr.to_vec()),
+            Err(_) => {
+                return RunResult {
+                    output: "run_with_hatches: every `deps` element must be a Uint8Array"
+                        .to_string(),
+                    ok: false,
+                    error_kind: ErrorKind::CompileError,
+                };
+            }
+        }
+    }
+    run_inner(RunInput::SourceWithHatches(source, dep_bytes)).await
 }
 
 #[wasm_bindgen]
@@ -1043,6 +1145,29 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
             // same path the host CLI uses, just without
             // native-lib extraction (gated to `feature = "host"`).
             vm.interpret_hatch(bytes)
+        }
+        RunInput::SourceWithHatches(source, deps) => {
+            // Install each prefetched `@hatch:*` dependency bundle
+            // first. `install_hatch_modules` runs each module's
+            // top-level (class definitions, registrations) so the
+            // user source's `import "@hatch:foo" for Bar` resolves
+            // against an already-loaded module by the time it's
+            // parsed. Stop on the first failure — a missing or
+            // broken dep is unrecoverable for the consumer.
+            let mut install_result = InterpretResult::Success;
+            for dep_bytes in &deps {
+                let r = vm.install_hatch_modules(dep_bytes);
+                if !matches!(r, InterpretResult::Success) {
+                    install_result = r;
+                    break;
+                }
+            }
+            if matches!(install_result, InterpretResult::Success) {
+                let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
+                vm.interpret("main", &combined)
+            } else {
+                install_result
+            }
         }
     };
     perf_log("user_compile_and_run", t_user);
