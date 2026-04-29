@@ -1070,27 +1070,31 @@ entry   = "main"
 `import "@hatch:math"   for Vec3, Mat4, Quat, Math
 import "@hatch:assert" for Expect
 
+// Helper — String interpolation of a Vec3 lands on the default
+// "instance of Vec3" toString today, so we render fields by hand.
+var fmt = Fn.new {|v| "(%(v.x), %(v.y), %(v.z))" }
+
 var a = Vec3.new(1, 2, 3)
 var b = Vec3.new(4, 5, 6)
 
-System.print("a       = %(a)")
-System.print("b       = %(b)")
-System.print("a + b   = %(a + b)")
+System.print("a       = %(fmt.call(a))")
+System.print("b       = %(fmt.call(b))")
+System.print("a + b   = %(fmt.call(a + b))")
 System.print("a · b   = %(a.dot(b))")
-System.print("a × b   = %(a.cross(b))")
+System.print("a × b   = %(fmt.call(a.cross(b)))")
 System.print("|a|     = %(a.length)")
 
-// Mat4 + translate, then transform a point.
-var m = Mat4.translation(Vec3.new(10, 0, 0))
+// Mat4.translation takes three components, not a Vec3.
+var m = Mat4.translation(10, 0, 0)
 var p = m.transformPoint(a)
-System.print("translated a → %(p)")
+System.print("translated a → %(fmt.call(p))")
 Expect.that(p.x).toBe(11)
 
 // Quaternion rotation 90° around Y.
 var q = Quat.fromAxisAngle(Vec3.new(0, 1, 0), Math.radians(90))
 var r = q.rotate(Vec3.new(1, 0, 0))
 // (1,0,0) rotated 90° around Y → (0, 0, -1) (within float epsilon).
-System.print("rotated x-hat by 90°/Y → %(r)")
+System.print("rotated x-hat by 90°/Y → %(fmt.call(r))")
 Expect.that(Math.approxEq(r.z, -1, 0.001)).toBe(true)
 System.print("✓ all assertions pass")
 `,
@@ -1116,20 +1120,30 @@ entry   = "main"
 import "@hatch:assert" for Expect
 
 class Position {
-  construct new(x, y) { _x = x  _y = y }
-  x { _x }   x=(v) { _x = v }
-  y { _y }   y=(v) { _y = v }
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
+  x { _x }
+  x=(v) { _x = v }
+  y { _y }
+  y=(v) { _y = v }
   toString { "(%(_x), %(_y))" }
 }
 
 class Velocity {
-  construct new(x, y) { _x = x  _y = y }
+  construct new(x, y) {
+    _x = x
+    _y = y
+  }
   x { _x }
   y { _y }
 }
 
 class Tag {
-  construct new(name) { _name = name }
+  construct new(name) {
+    _name = name
+  }
   name { _name }
 }
 
@@ -1189,6 +1203,7 @@ entry   = "main"
       {
         id: "sprite-grid",
         label: "Game — sprite grid (WASD)",
+        mode: "main",
         html:
 `<style>
   #stage { background: #0a0810; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
@@ -1322,6 +1337,7 @@ entry   = "main"
       {
         id: "gpu-sprite",
         label: "GPU — sprite batch (canvas)",
+        mode: "main",
         html:
 `<style>
   /* Canvas demos take over the stage — kill the white DOM padding. */
@@ -1439,6 +1455,18 @@ entry   = "main"
       // views sees consistent state.
       syncTomlToForm();
       renderStage();
+
+      // Some examples need a specific mode. Canvas / GPU demos
+      // pin to `main` because plugin-symbol binding currently
+      // only flows through the main-thread runtime; in worker
+      // mode their foreign-method imports come back unresolved
+      // (`Class does not implement create`). When an example
+      // declares `mode`, force the picker + reboot.
+      if (ex.mode && modeSel.value !== ex.mode) {
+        modeSel.value = ex.mode;
+        bootMode(ex.mode);
+        return;
+      }
       // If wlift is already up, restart it so any in-flight
       // long-running fiber (e.g. a game loop) is killed before
       // we re-run with the new source. Skipped on first boot —
