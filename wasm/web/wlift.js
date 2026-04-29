@@ -631,6 +631,117 @@ class MainWlift {
     // designed.
     globalThis.wlift_wasm = mod;
 
+    // ----------------------------------------------------------
+    // On-demand wasm plugin loader (main-mode)
+    // ----------------------------------------------------------
+    // A `.hatch` bundle whose [native_libs] declares a `wasm = …`
+    // entry carries the plugin's wasm bytes alongside its Wren
+    // source. At install time we extract each, instantiate it as a
+    // *separate* WebAssembly.Instance (so wgpu / winit-style plugins
+    // can keep their own wasm-bindgen JS heap if they ever need
+    // one), wire up the host-side slot bridges as imports, and
+    // register every `wlift_*` export in the host's foreign-method
+    // registry via `wlift_register_plugin_dynamic_export`. The
+    // index that returns becomes the key in the dispatch table,
+    // and the same index ends up in `Method::ForeignCDynamic(idx)`
+    // for the Wren side. Run-time foreign-method calls flow:
+    //
+    //   Wren -> dispatch_dynamic(idx) -> JS bridge import
+    //         -> globalThis.wliftDynamicPluginDispatch(idx, vm)
+    //         -> instance.exports[name](vm)
+    //
+    // Plugin imports look the other direction:
+    //
+    //   plugin.exports.* -> wlift_get_slot_str / wlift_set_slot_str
+    //                    -> host's wrenGetSlotString / wrenSetSlotString
+    //                    (with explicit memcpy through wlift_host_alloc).
+    const pluginInstances = new Map(); // libName -> WebAssembly.Instance
+    const dispatchTable   = [];        // idx -> {instance, exportName}
+
+    globalThis.wliftDynamicPluginDispatch = (idx, vm) => {
+      const entry = dispatchTable[idx];
+      if (!entry) {
+        console.warn(`[wlift plugin] dispatch ${idx}: no entry`);
+        return;
+      }
+      try {
+        entry.instance.exports[entry.exportName](vm);
+      } catch (err) {
+        console.error(`[wlift plugin] ${entry.libName}.${entry.exportName} threw:`, err);
+      }
+    };
+
+    function makePluginImports(libName, getInstance) {
+      // `getInstance` is a getter because the plugin's
+      // `instance.exports.memory` isn't available until *after*
+      // `WebAssembly.instantiate` resolves — the imports object
+      // we hand it has to be built first, and the bridges that
+      // reference plugin memory close over a deferred lookup.
+      const wasmModule = mod;
+      return {
+        env: {
+          // Plugin asks for `wrenGetSlotString(vm, slot)` →
+          // returns a host *const char (pointer into HOST memory).
+          // We read that C-string out of host memory and copy the
+          // bytes into the plugin's memory at `out_ptr`, capped
+          // at `max`. Returns the number of bytes written, or -1
+          // on a NULL host pointer.
+          wlift_get_slot_str: (vm, slot, out_ptr, max) => {
+            const host_ptr = wasmModule.wrenGetSlotString(vm, slot);
+            if (!host_ptr) return -1;
+            const host_view = new Uint8Array(wasmModule.__wbindgen_export_0?.buffer ?? wasmModule.memory.buffer);
+            let len = 0;
+            while (len < max && host_view[host_ptr + len] !== 0) len++;
+            const inst = getInstance();
+            const plugin_view = new Uint8Array(inst.exports.memory.buffer, out_ptr, max);
+            plugin_view.set(host_view.subarray(host_ptr, host_ptr + len));
+            return len;
+          },
+
+          // Plugin built a string in its own memory (`ptr`/`len`)
+          // and wants it written to slot `slot`. We allocate a
+          // null-terminated buffer in *host* memory, copy the
+          // bytes across, call `wrenSetSlotString` (which copies
+          // again into a Wren-managed string), then free.
+          wlift_set_slot_str: (vm, slot, ptr, len) => {
+            const inst = getInstance();
+            const plugin_view = new Uint8Array(inst.exports.memory.buffer, ptr, len);
+            const host_ptr = wasmModule.wlift_host_alloc(len + 1);
+            const host_view = new Uint8Array(wasmModule.memory.buffer, host_ptr, len + 1);
+            host_view.set(plugin_view);
+            host_view[len] = 0;
+            wasmModule.wrenSetSlotString(vm, slot, host_ptr);
+            wasmModule.wlift_host_free(host_ptr, len + 1);
+          },
+        },
+      };
+    }
+
+    async function installWasmPlugin(libName, wasmBytes) {
+      if (pluginInstances.has(libName)) return; // idempotent on repeat installs
+      let instance;
+      const imports = makePluginImports(libName, () => instance);
+      const result = await WebAssembly.instantiate(wasmBytes, imports);
+      instance = result.instance;
+      pluginInstances.set(libName, instance);
+
+      // Walk the plugin's exports and register each `wlift_*`
+      // function in the host's foreign-method registry. The host
+      // returns a u32 index per registration; we store
+      // `(instance, exportName)` keyed by that index for the
+      // dispatcher.
+      for (const exportName of Object.keys(instance.exports)) {
+        if (!exportName.startsWith("wlift_")) continue;
+        if (typeof instance.exports[exportName] !== "function") continue;
+        const idx = mod.wlift_register_plugin_dynamic_export(libName, exportName);
+        dispatchTable[idx] = { instance, exportName, libName };
+      }
+    }
+
+    // Expose for the runWithHatches override below.
+    this._installWasmPlugin = installWasmPlugin;
+    this._wliftExtractWasmPlugins = mod.wlift_extract_wasm_plugins;
+
     // Tier-up Phase 2b — JIT instantiate + call shims. The Rust
     // side calls `wlift_wasm::tier_up::emit_*` to produce wasm
     // bytes; these shims compile + instantiate them with the
@@ -773,6 +884,23 @@ class MainWlift {
       const bufs = (deps ?? []).map((b) =>
         b instanceof Uint8Array ? b : new Uint8Array(b),
       );
+      // Phase 1d: install any wasm-targeted NativeLib plugins
+      // each dep declares *before* handing the dep bytes to
+      // `run_with_hatches`. Foreign-class declarations in the
+      // bundle's Wlbc resolve their `#!native` / `#!symbol`
+      // bindings at install time, so the plugin's symbols need
+      // to already be in the registry. `wlift_extract_wasm_plugins`
+      // returns `[{lib, bytes}]` per dep (empty for pure-Wren
+      // deps).
+      if (this._installWasmPlugin) {
+        for (const buf of bufs) {
+          const plugins = this._wliftExtractWasmPlugins(buf);
+          for (let i = 0; i < plugins.length; i++) {
+            const p = plugins[i];
+            await this._installWasmPlugin(p.lib, p.bytes);
+          }
+        }
+      }
       result = await this._mod.run_with_hatches(source, bufs);
     } catch (err) {
       return {
