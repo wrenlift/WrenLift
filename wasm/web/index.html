@@ -103,6 +103,25 @@
     .pill.ok    { color: var(--good); }
     .pill.error { color: var(--bad); }
 
+    /* Runtime status pill (header, right side) — loud version
+       of `.pill`. Filled background, bold weight, larger
+       padding so the elapsed-ms / error kind reads from across
+       the page instead of getting lost in the muted chrome. */
+    .pill.runtime {
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      padding: 4px 12px;
+    }
+    .pill.runtime.ok {
+      background: var(--good);
+      color: var(--panel);
+    }
+    .pill.runtime.error {
+      background: var(--bad);
+      color: var(--panel);
+    }
+
     /* jsbin-style 3-column grid: HTML | Wren | Output (stage + console).
        Explicit single 1fr row so the sections stretch to fill
        main's height. Without this, the implicit auto row sized
@@ -330,8 +349,8 @@
     <header>
       <h1>wlift playground</h1>
       <span id="status" class="pill">loading…</span>
-      <span id="runtime" class="pill" hidden>—</span>
       <span style="margin-left: auto"></span>
+      <span id="runtime" class="pill runtime" hidden>—</span>
       <label class="field">
         mode
         <select id="mode-select">
