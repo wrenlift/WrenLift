@@ -931,6 +931,31 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     bindEditor(srcEl, srcMount, wrenLanguage);
     var hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
+    // Try `/packages/<basename>` on this dev server first; on
+    // 404, fall back to the public registry URL the resolver
+    // would have hit. The local cache is the path that actually
+    // works today (publish workflow for pure-Wren packages
+    // hasn't run yet); GitHub release-asset fetches will start
+    // succeeding once those releases exist.
+    async function localOrRegistryFetcher(url, name) {
+      const filename = url.substring(url.lastIndexOf("/") + 1);
+      const localUrl = `/packages/${filename}`;
+      try {
+        const local = await fetch(localUrl);
+        if (local.ok) return new Uint8Array(await local.arrayBuffer());
+      } catch (_) { /* network unreachable, fall through */ }
+      // Local miss → upstream. CORS may block GitHub responses
+      // until we ship the dev-server proxy; surface the error
+      // verbatim so the user sees what went wrong.
+      const upstream = await fetch(url);
+      if (!upstream.ok) {
+        throw new Error(
+          `dep '${name}' not in /packages/, and upstream ${url} returned ${upstream.status}`,
+        );
+      }
+      return new Uint8Array(await upstream.arrayBuffer());
+    }
+
     let wlift = null;
     // Latch — does the most recent run carry an error? The
     // console-toggle's red dot is the (lastErrored AND
@@ -1034,12 +1059,15 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       const hatchfileText = hatchfileEl.value.trim();
       if (hasScoped && hatchfileText.length > 0) {
         outEl.textContent = "resolving deps…";
-        // No fetcher override — `runProject` falls back to the
-        // default `fetch()` against `DEFAULT_HATCH_REGISTRY`
-        // (the wrenlift/hatch GitHub releases). Browsers cache
-        // the bytes per-URL, so reruns of the same hatchfile
-        // are free after the first hit.
-        result = await runProject(wlift, srcEl.value, hatchfileEl.value);
+        // Local-first fetcher: try the dev server's
+        // `/packages/` mirror first; if absent, fall back to
+        // the public GitHub registry (CORS-permitting). Once
+        // GitHub releases for these packages actually land,
+        // the local cache becomes redundant — flip this to
+        // the default fetcher then.
+        result = await runProject(wlift, srcEl.value, hatchfileEl.value, {
+          fetcher: localOrRegistryFetcher,
+        });
       } else if (hasScoped) {
         result = {
           output:
