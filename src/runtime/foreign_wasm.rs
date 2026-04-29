@@ -291,17 +291,21 @@ pub fn resolve_symbol(
         })
 }
 
-/// Wasm import provided by the JS host at module instantiation.
-/// JS-side dispatcher takes the dynamic-entry index plus the VM
-/// pointer and routes the call to the right plugin module's
-/// exported fn. The `link(wasm_import_module = "env")` attr
-/// makes this a real wasm import (matching the namespace JS
-/// supplies at instantiation) rather than an unresolved Rust
-/// symbol — which would make `wren_lift`'s own wasm cdylib
-/// fail to link.
+/// JS-provided dispatcher. Wasm-bindgen routes the import
+/// through its generated glue, which means the JS side just
+/// has to set `globalThis.wliftDynamicPluginDispatch` to a
+/// `(idx, vm) => …` function and the wasm host sees it
+/// automatically at module init. Without wasm-bindgen the
+/// import would land in the `env` namespace and wren_lift's
+/// own wasm cdylib couldn't link — wasm-bindgen folds it into
+/// the standard import set the loader populates.
 #[cfg(target_arch = "wasm32")]
-#[link(wasm_import_module = "env")]
+#[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(
+        js_namespace = globalThis,
+        js_name = wliftDynamicPluginDispatch
+    )]
     fn wlift_dispatch_dynamic_plugin(idx: u32, vm: *mut VM);
 }
 

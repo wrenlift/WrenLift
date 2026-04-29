@@ -131,6 +131,13 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 # so portable runtime code that needs monotonic time can swap it
 # in via `use web_time as time` under `cfg(target_arch = "wasm32")`.
 web-time = "1"
+# Used by `runtime::foreign_wasm` to declare the JS-provided
+# dynamic-plugin dispatcher. Wasm-bindgen routes `extern` blocks
+# through generated JS glue, so the import shows up in the
+# wasm-bindgen-built host (e.g. `wlift_wasm`) where JS can wire
+# it up. Plain `extern "C"` would leave wren_lift's own wasm
+# cdylib unable to link.
+wasm-bindgen = "0.2"
 
 [dev-dependencies]
 capstone = "0.12"

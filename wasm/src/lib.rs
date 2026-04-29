@@ -703,6 +703,82 @@ pub fn wlift_register_plugin_dynamic_export(library: &str, symbol: &str) -> u32 
     wren_lift::runtime::foreign::register_plugin_dynamic(library, symbol)
 }
 
+/// Wasm-bindgen export. Decode a `.hatch` bundle and surface every
+/// wasm-targeted NativeLib section as `{lib, bytes}` so JS can
+/// instantiate each plugin module before installing the bundle's
+/// Wlbc / Source sections (foreign-class declarations need the
+/// plugin's symbols already registered when they bind).
+///
+/// Returns an empty array on parse failure rather than throwing —
+/// the playground falls back to the no-plugin path naturally.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wlift_extract_wasm_plugins(bytes: &[u8]) -> js_sys::Array {
+    let out = js_sys::Array::new();
+    let Ok(hatch) = wren_lift::hatch::load(bytes) else {
+        return out;
+    };
+    // Plugins ride in NativeLib sections. On a wasm-targeted
+    // bundle the only NativeLibs are .wasm artefacts (the bundle
+    // builder filters by target — see `pack_bundled_native_libs`),
+    // so any NativeLib here is a candidate.
+    for s in &hatch.sections {
+        if !matches!(s.kind, wren_lift::hatch::SectionKind::NativeLib) {
+            continue;
+        }
+        // Quick wasm-magic sanity check: `\0asm\x01\0\0\0`. Skip
+        // anything that doesn't look like a wasm module so we don't
+        // hand JS a `.dylib` to instantiate.
+        if s.data.len() < 8 || &s.data[..4] != b"\0asm" {
+            continue;
+        }
+        let entry = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&entry, &"lib".into(), &s.name.clone().into());
+        let bytes_view = js_sys::Uint8Array::from(s.data.as_slice());
+        let _ = js_sys::Reflect::set(&entry, &"bytes".into(), &bytes_view);
+        out.push(&entry);
+    }
+    out
+}
+
+/// Allocate `len` bytes inside the host's linear memory and
+/// return a pointer. Used by the JS-side bridge fns
+/// (`wlift_set_slot_str` etc.) to land plugin-supplied bytes in
+/// the host's address space before calling Wren-API functions
+/// that read from there. The companion `wlift_host_free` returns
+/// the bytes when the caller is done.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wlift_host_alloc(len: u32) -> u32 {
+    let mut buf = Vec::<u8>::with_capacity(len as usize);
+    // SAFETY: `with_capacity(n)` reserves `n` bytes; setting
+    // length to `n` exposes uninitialised bytes which the caller
+    // immediately overwrites via JS-side memory copy. The Vec
+    // is intentionally leaked — `wlift_host_free` reconstructs
+    // and drops it.
+    unsafe {
+        buf.set_len(len as usize);
+    }
+    let ptr = buf.as_mut_ptr();
+    std::mem::forget(buf);
+    ptr as u32
+}
+
+/// Counterpart to [`wlift_host_alloc`]. Reconstructs the `Vec`
+/// from the raw pointer + length so it drops normally.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wlift_host_free(ptr: u32, len: u32) {
+    if ptr == 0 || len == 0 {
+        return;
+    }
+    // SAFETY: ptr/len pair were produced by `wlift_host_alloc`
+    // above; matching alloc/free contract.
+    unsafe {
+        let _ = Vec::<u8>::from_raw_parts(ptr as *mut u8, len as usize, len as usize);
+    }
+}
+
 /// Build identifier — hard-coded for the moment so JS can sanity-
 /// check the loaded wasm matches what its bundler thought it was
 /// importing.

@@ -6380,6 +6380,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "ureq",
  "uuid",
+ "wasm-bindgen",
  "wasm-encoder 0.245.1",
  "wasmparser 0.226.0",
  "wasmprinter",
