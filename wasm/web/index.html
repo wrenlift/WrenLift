@@ -419,16 +419,6 @@
     </div>
 
     <main>
-      <section id="html-section">
-        <div class="pane-header">html<span class="badge">stage markup</span></div>
-        <div class="editor" id="html-mount"></div>
-        <textarea id="html-src" class="editor-shadow" spellcheck="false"><h1 id="title">hello, wren</h1>
-<p id="msg">edit me from Wren via <code>Dom.setText</code>.</p>
-<button id="ping" onclick="alert('clicked')">ping</button>
-</textarea>
-      </section>
-      <div class="splitter v" id="split-html-wren" data-resize="html"></div>
-
       <section class="wren-col">
         <div class="pane wren-pane">
         <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
@@ -462,7 +452,7 @@ var elapsed = (System.clock - start) * 1000
 // `@hatch:assert` is fetched on demand from the dev server
 Expect.that(result).toBe(6765)
 Expect.that(elapsed).not.toBeNull()
-System.print("fib(20) = %(result)  (%(elapsed) ms")
+System.print("fib(20) = %(result)  (%(elapsed) ms)")
 </textarea>
         </div>
         <div class="splitter h" id="split-wren-hatch" data-resize="wren"></div>
@@ -497,7 +487,11 @@ System.print("fib(20) = %(result)  (%(elapsed) ms")
 
       <section class="output-col show-console">
         <div class="pane">
-          <div class="pane-header">stage<span class="badge">live preview</span></div>
+          <div class="pane-header">
+            stage
+            <span class="badge">live preview</span>
+            <button id="html-toggle" class="seg" title="show/hide html source pane">html</button>
+          </div>
           <div id="stage" class="stage"></div>
         </div>
         <div class="splitter h" id="split-stage-console" data-resize="output"></div>
@@ -506,10 +500,18 @@ System.print("fib(20) = %(result)  (%(elapsed) ms")
           <pre id="out" class="console"></pre>
         </div>
       </section>
+      <div class="splitter v" id="split-html-wren" data-resize="html"></div>
+      <section id="html-section">
+        <div class="pane-header">html<span class="badge">stage markup</span></div>
+        <div class="editor" id="html-mount"></div>
+        <textarea id="html-src" class="editor-shadow" spellcheck="false"><h1 id="title">hello, wren</h1>
+<p id="msg">edit me from Wren via <code>Dom.setText</code>.</p>
+<button id="ping" onclick="alert('clicked')">ping</button>
+</textarea>
+      </section>
     </main>
 
     <footer>
-      <button id="html-toggle" class="seg" title="show/hide html pane">html</button>
       <button id="hatch-toggle" class="seg" title="show/hide hatchfile pane">hatchfile</button>
       <span id="version">…</span>
       <span style="margin-left: auto; display: inline-flex; align-items: center; gap: 12px">
