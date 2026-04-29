@@ -113,16 +113,16 @@ jobs:
           WLIFT="./target/release/wlift"
           RUNS=10
 
-          # Helper: run a command N times, extract best "elapsed: X" time
+          # Helper: run a command N times, extract best "elapsed: X" time.
+          # Failures are silent — `delta_blue` has no .py/.rb/.lua port,
+          # so the cross-language attempts naturally no-op. The wrenlift
+          # / wren paths fail loudly via the surrounding "FAILED for $bench"
+          # gate when their .wren source is missing.
           best_of() {
             local best=""
-            for i in $(seq 1 $RUNS); do
-              local output exit_code
-              output=$(timeout 60 "$@" 2>&1) && exit_code=$? || exit_code=$?
-              if [ $exit_code -ne 0 ] && [ $i -eq 1 ]; then
-                echo "  [debug] exit=$exit_code for: $*" >&2
-                echo "  [debug] output: $(echo "$output" | tail -3)" >&2
-              fi
+            for _ in $(seq 1 $RUNS); do
+              local output
+              output=$(timeout 60 "$@" 2>&1 || true)
               local t
               t=$(echo "$output" | grep -oE 'elapsed: [0-9]+\.?[0-9]*' | tail -1 | awk '{print $2}')
               if [ -n "$t" ]; then
