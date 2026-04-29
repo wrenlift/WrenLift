@@ -6287,6 +6287,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlift_hello"
+version = "0.1.0"
+
+[[package]]
 name = "wlift_image"
 version = "0.1.0"
 dependencies = [

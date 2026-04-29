@@ -1,0 +1,20 @@
+[package]
+name = "wlift_hello"
+version = "0.1.0"
+edition = "2021"
+description = "Trivial demo plugin that exists to exercise the on-demand wasm plugin-loader pipeline. Compiles to wasm32-unknown-unknown only — no native dylib build."
+
+[lib]
+# Plain `cdylib` so `cargo build --target wasm32-unknown-unknown`
+# produces a `.wasm` artefact. We don't add `rlib` because this
+# plugin is *never* statically linked into the wlift_wasm runtime
+# — that would defeat the lite-by-default goal. It's loaded
+# on-demand by the runtime when a hatch bundle declares it.
+crate-type = ["cdylib"]
+
+[dependencies]
+# No `wren_lift` dependency. The plugin only sees the host through
+# the wasm-import boundary, not as a Rust crate. That keeps the
+# plugin's own .wasm tiny — no copy of the runtime, no Cranelift,
+# no codegen. The trade-off is a host-defined wasm ABI that the
+# plugin imports symbolically; see `src/lib.rs` for the imports.
