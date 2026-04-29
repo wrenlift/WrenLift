@@ -823,8 +823,9 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       }
     }
 
-    // Seed: two demo deps that match the locally-built packages
-    // under /packages/. Edit / remove from the form.
+    // Seed: two demo deps that match published GitHub releases
+    // — the resolver fetches `<dir>-<ver>-wasm32.hatch` from
+    // each. Edit / remove from the form to point at others.
     addDepRow("@hatch:test", "0.1.0");
     addDepRow("@hatch:assert", "0.2.0");
     syncFormToToml();
@@ -931,29 +932,21 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     bindEditor(srcEl, srcMount, wrenLanguage);
     var hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
-    // Try `/packages/<basename>` on this dev server first; on
-    // 404, fall back to the public registry URL the resolver
-    // would have hit. The local cache is the path that actually
-    // works today (publish workflow for pure-Wren packages
-    // hasn't run yet); GitHub release-asset fetches will start
-    // succeeding once those releases exist.
-    async function localOrRegistryFetcher(url, name) {
-      const filename = url.substring(url.lastIndexOf("/") + 1);
-      const localUrl = `/packages/${filename}`;
-      try {
-        const local = await fetch(localUrl);
-        if (local.ok) return new Uint8Array(await local.arrayBuffer());
-      } catch (_) { /* network unreachable, fall through */ }
-      // Local miss → upstream. CORS may block GitHub responses
-      // until we ship the dev-server proxy; surface the error
-      // verbatim so the user sees what went wrong.
-      const upstream = await fetch(url);
-      if (!upstream.ok) {
+    // Dep fetcher — routes registry URLs through this dev
+    // server's `/proxy?url=...` route so GitHub release-asset
+    // responses arrive with `Cross-Origin-Resource-Policy:
+    // cross-origin` set. Without that, the COEP-locked page
+    // drops the body. The proxy's allowlist is the real
+    // security boundary; we just rewrite the URL here.
+    async function proxiedFetcher(url, name) {
+      const proxied = `/proxy?url=${encodeURIComponent(url)}`;
+      const r = await fetch(proxied);
+      if (!r.ok) {
         throw new Error(
-          `dep '${name}' not in /packages/, and upstream ${url} returned ${upstream.status}`,
+          `dep '${name}' fetch via proxy failed: ${r.status} ${r.statusText} (upstream: ${url})`,
         );
       }
-      return new Uint8Array(await upstream.arrayBuffer());
+      return new Uint8Array(await r.arrayBuffer());
     }
 
     let wlift = null;
@@ -1059,14 +1052,13 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       const hatchfileText = hatchfileEl.value.trim();
       if (hasScoped && hatchfileText.length > 0) {
         outEl.textContent = "resolving deps…";
-        // Local-first fetcher: try the dev server's
-        // `/packages/` mirror first; if absent, fall back to
-        // the public GitHub registry (CORS-permitting). Once
-        // GitHub releases for these packages actually land,
-        // the local cache becomes redundant — flip this to
-        // the default fetcher then.
+        // Each `[dependencies]` entry resolves to the wasm32
+        // release-asset URL the publish-pkg workflow puts up on
+        // GitHub. The proxied fetcher routes the request
+        // through this dev server's `/proxy` route so the
+        // response carries the COEP-friendly CORP header.
         result = await runProject(wlift, srcEl.value, hatchfileEl.value, {
-          fetcher: localOrRegistryFetcher,
+          fetcher: proxiedFetcher,
         });
       } else if (hasScoped) {
         result = {

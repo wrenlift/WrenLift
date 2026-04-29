@@ -114,11 +114,27 @@ export function scanScopedImports(source) {
 export const scanHatchImports = scanScopedImports;
 
 // Default registry base — first-party `@hatch:*` packages are
-// published here as GitHub release artifacts under the path
-// shape `releases/download/<name>-<version>/<name>-<version>.hatch`
-// (mirrors `hatch_registry::release_url`'s scheme on the host).
-// Override at the call site if you're hosting a private mirror.
+// published here as GitHub release artifacts. The publish-pkg.yml
+// workflow attaches two assets per `publish/<dir>@<ver>` tag:
+//
+//   <base>/releases/download/publish/<dir>%40<ver>/<dir>-<ver>.hatch
+//   <base>/releases/download/publish/<dir>%40<ver>/<dir>-<ver>-wasm32.hatch
+//
+// where `<dir>` is the package's source directory name (e.g.
+// `hatch-assert`). The `@hatch:foo` import name maps to `hatch-foo`
+// via `scopedNameToDir` below — strip the `@`, swap `:` / `/` for
+// `-`. Override at the call site if you're hosting a private mirror.
 export const DEFAULT_HATCH_REGISTRY = "https://github.com/wrenlift/hatch";
+
+// Map a scoped package name (`@hatch:assert`, `@user:lib`,
+// `@scope/pkg`) to its release-asset directory basename
+// (`hatch-assert`, `user-lib`, `scope-pkg`). Bare names are
+// returned verbatim. Mirrors the workflow's own naming: it
+// publishes under `packages/<dir>/`, so `<dir>` is the
+// canonical artifact stem.
+export function scopedNameToDir(name) {
+  return name.replace(/^@/, "").replace(/[:/]/g, "-");
+}
 
 // Lazy import so `parseHatchfileToml` / `peekManifest` callers
 // don't pay the wasm-init cost twice (worker mode already has
@@ -193,6 +209,14 @@ function gitForgeReleaseUrl(gitUrl, rev, name) {
 //   "@user:lib"     = { url = "https://..." }                             // direct, no git
 //   "local"         = { path = "../local" }
 //
+// `target` selects which release-asset variant to fetch for
+// version-pinned deps:
+//
+//   "wasm32" (default in this file — we're the wasm runtime) →
+//     `<dir>-<ver>-wasm32.hatch` (uncompressed, no zstd, target
+//     stamp matches the wasm runtime's family check).
+//   "host" → `<dir>-<ver>.hatch` (zstd-compressed, host-loadable).
+//
 // Browser limitations:
 //
 //   * Path deps fail with a clear error — they're build-time
@@ -204,11 +228,14 @@ function gitForgeReleaseUrl(gitUrl, rev, name) {
 //     forge-pattern guess.
 //
 // Returns `{ url }` on success; throws on unsupported entries.
-export function depEntryToUrl(name, dep, registryBase = DEFAULT_HATCH_REGISTRY) {
+export function depEntryToUrl(
+  name,
+  dep,
+  registryBase = DEFAULT_HATCH_REGISTRY,
+  target = "wasm32",
+) {
   if (typeof dep === "string") {
-    return {
-      url: `${registryBase}/releases/download/${name}-${dep}/${name}-${dep}.hatch`,
-    };
+    return { url: registryReleaseUrl(registryBase, name, dep, target) };
   }
   if (dep && typeof dep === "object") {
     if (typeof dep.path === "string") {
@@ -246,12 +273,25 @@ export function depEntryToUrl(name, dep, registryBase = DEFAULT_HATCH_REGISTRY) 
     // `{ version = "1.0.0" }` works the same as the bare
     // string form.
     if (typeof dep.version === "string") {
-      return {
-        url: `${registryBase}/releases/download/${name}-${dep.version}/${name}-${dep.version}.hatch`,
-      };
+      return { url: registryReleaseUrl(registryBase, name, dep.version, target) };
     }
   }
   throw new Error(`dep '${name}' has an unsupported entry shape: ${JSON.stringify(dep)}`);
+}
+
+// Build the URL for a version-pinned dep on the first-party
+// registry. Matches the asset layout `publish-pkg.yml` produces:
+//
+//   <base>/releases/download/publish/<dir>%40<ver>/<dir>-<ver>[-wasm32].hatch
+//
+// The tag itself (`publish/<dir>@<ver>`) is part of the URL path,
+// which is why `@` is encoded as `%40` — GitHub keeps the tag
+// verbatim in the asset URL it serves.
+function registryReleaseUrl(registryBase, name, version, target) {
+  const base = registryBase.replace(/\/$/, "");
+  const dir = scopedNameToDir(name);
+  const variant = target === "host" ? "" : "-wasm32";
+  return `${base}/releases/download/publish/${dir}%40${version}/${dir}-${version}${variant}.hatch`;
 }
 
 // Recursively fetch every dep declared by `manifest`'s
@@ -270,6 +310,7 @@ export async function resolveDepsFromManifest(
   {
     registryBase = DEFAULT_HATCH_REGISTRY,
     fetcher = defaultFetcher,
+    target = "wasm32",
   } = {},
 ) {
   const order = [];                  // Uint8Array[] in install order
@@ -282,7 +323,7 @@ export async function resolveDepsFromManifest(
     for (const [name, entry] of Object.entries(deps)) {
       if (seen.has(name)) continue;
       seen.add(name);
-      const { url } = depEntryToUrl(name, entry, registryBase);
+      const { url } = depEntryToUrl(name, entry, registryBase, target);
       const bytes = await fetcher(url, name);
       // Peek before installing so transitive deps queue ahead
       // of this one (post-order: deps install before consumers).
