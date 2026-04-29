@@ -173,6 +173,66 @@
       border-bottom: 1px solid var(--rule);
     }
     .banner.hidden { display: none; }
+    .hidden { display: none !important; }
+
+    /* The wren column stacks the source pane on top of an
+       optional hatchfile pane. By default only the source is
+       visible — the wren pane fills 100% height. Toggling the
+       header's `hatchfile` button shows the pane below at a
+       fixed share, with the source pane shrinking to fit. */
+    .wren-col { flex-direction: column; }
+    .wren-col .pane { display: flex; flex-direction: column; min-height: 0; }
+    .wren-col .wren-pane { flex: 1 1 100%; }
+    .wren-col.show-hatchfile .wren-pane { flex: 1 1 60%; }
+    .wren-col .hatchfile-pane {
+      display: none;
+      flex: 0 1 220px;
+      border-top: 1px solid var(--rule);
+    }
+    .wren-col.show-hatchfile .hatchfile-pane {
+      display: flex;
+    }
+    .hatch-form {
+      padding: 10px 14px;
+      display: flex; flex-direction: column; gap: 6px;
+      overflow: auto;
+      font-size: 12px;
+    }
+    .hatch-form input[type="text"] {
+      flex: 1; min-width: 0;
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--rule);
+      border-radius: 3px;
+      padding: 3px 6px;
+      font: inherit;
+    }
+    .hatch-deps-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-top: 4px; color: var(--muted);
+    }
+    .hatch-dep-row {
+      display: flex; gap: 4px; align-items: center;
+    }
+    .hatch-dep-row input { flex: 1; }
+    .hatch-dep-row .hatch-dep-name { flex: 1.4; }
+    button.seg {
+      background: var(--panel-2);
+      color: var(--muted);
+      border: 1px solid var(--rule);
+      padding: 2px 8px;
+      font-size: 11px;
+      border-radius: 3px;
+    }
+    button.seg.seg-active { color: var(--accent); border-color: var(--accent); }
+    button.seg-x {
+      background: transparent;
+      border: 1px solid var(--rule);
+      color: var(--muted);
+      width: 22px; height: 22px;
+      padding: 0;
+      font-size: 12px;
+    }
 
     a { color: var(--link); text-decoration: none; }
     a:hover { text-decoration: underline; }
@@ -195,6 +255,7 @@
         <input type="checkbox" id="autorun-toggle" checked>
         auto-run
       </label>
+      <button id="hatch-toggle" class="seg" title="show/hide hatchfile pane">hatchfile</button>
       <button id="run-btn" class="primary" disabled>Run (⌘↵)</button>
     </header>
 
@@ -215,7 +276,8 @@
 </textarea>
       </section>
 
-      <section>
+      <section class="wren-col">
+        <div class="pane wren-pane">
         <div class="pane-header">wren<span class="badge">main.wren · ⌘↵ to run</span></div>
         <textarea id="src" spellcheck="false">// `Future`, `Browser`, `WebSocket`, `Dom`, `LocalStorage` are
 // loaded by the runtime — no boilerplate needed. Async bridges
@@ -241,6 +303,30 @@ fiber.try()
 // fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
 // System.print("fib(15) = %(fib.call(15))")
 </textarea>
+        </div>
+        <div class="pane hatchfile-pane">
+          <div class="pane-header">
+            hatchfile
+            <span class="badge">drives @hatch:* deps</span>
+            <span style="margin-left: auto; display: inline-flex; gap: 4px;">
+              <button type="button" id="hatch-view-form" class="seg seg-active">Form</button>
+              <button type="button" id="hatch-view-toml" class="seg">TOML</button>
+            </span>
+          </div>
+          <!-- Form view: simple inputs that generate the TOML. -->
+          <div id="hatchfile-form" class="hatch-form">
+            <label class="field">name <input type="text" id="hf-name" value="playground-demo"></label>
+            <label class="field">version <input type="text" id="hf-version" value="0.1.0"></label>
+            <label class="field">entry <input type="text" id="hf-entry" value="main"></label>
+            <div class="hatch-deps-header">
+              <span>dependencies</span>
+              <button type="button" id="hf-add-dep" class="seg">+ add</button>
+            </div>
+            <div id="hf-deps"></div>
+          </div>
+          <!-- Raw TOML view: same hatchfile, editable directly. -->
+          <textarea id="hatchfile-src" class="hidden" spellcheck="false"></textarea>
+        </div>
       </section>
 
       <section class="output-col">
@@ -270,19 +356,159 @@ fiber.try()
     // *the* DOM the Wren program manipulates — `Dom.text("#x")`
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
-    import { createWlift } from "./wlift.js";
+    import { createWlift, runProject } from "./wlift.js";
     import { ErrorKind } from "../pkg/wlift_wasm.js";
 
-    const statusEl  = document.getElementById("status");
-    const versionEl = document.getElementById("version");
-    const htmlEl    = document.getElementById("html-src");
-    const srcEl     = document.getElementById("src");
-    const stageEl   = document.getElementById("stage");
-    const outEl     = document.getElementById("out");
-    const runBtn    = document.getElementById("run-btn");
-    const modeSel   = document.getElementById("mode-select");
-    const autoChk   = document.getElementById("autorun-toggle");
-    const bannerEl  = document.getElementById("banner");
+    const statusEl       = document.getElementById("status");
+    const versionEl      = document.getElementById("version");
+    const htmlEl         = document.getElementById("html-src");
+    const srcEl          = document.getElementById("src");
+    const hatchfileEl    = document.getElementById("hatchfile-src");
+    const hatchFormEl    = document.getElementById("hatchfile-form");
+    const hfNameEl       = document.getElementById("hf-name");
+    const hfVersionEl    = document.getElementById("hf-version");
+    const hfEntryEl      = document.getElementById("hf-entry");
+    const hfDepsEl       = document.getElementById("hf-deps");
+    const hfAddDepBtn    = document.getElementById("hf-add-dep");
+    const viewFormBtn    = document.getElementById("hatch-view-form");
+    const viewTomlBtn    = document.getElementById("hatch-view-toml");
+    const hatchToggleBtn = document.getElementById("hatch-toggle");
+    const wrenColEl      = document.querySelector(".wren-col");
+    const stageEl        = document.getElementById("stage");
+    const outEl          = document.getElementById("out");
+    const runBtn         = document.getElementById("run-btn");
+    const modeSel        = document.getElementById("mode-select");
+    const autoChk        = document.getElementById("autorun-toggle");
+    const bannerEl       = document.getElementById("banner");
+
+    // ---- Hatchfile form ↔ TOML sync ---------------------------------
+    // The form is the source of truth when active. Toggling to
+    // TOML view materialises the current state as TOML text;
+    // toggling back parses it (best-effort) and rebuilds the
+    // form. Edits made directly to the TOML view persist when
+    // the user runs from there — we only re-sync from form on
+    // explicit form-side changes.
+
+    function addDepRow(name = "", version = "") {
+      const row = document.createElement("div");
+      row.className = "hatch-dep-row";
+      row.innerHTML = `
+        <input type="text" class="hatch-dep-name" placeholder="@hatch:foo" value="${name}">
+        <input type="text" class="hatch-dep-version" placeholder="0.1.0" value="${version}">
+        <button type="button" class="seg seg-x" title="remove">×</button>
+      `;
+      row.querySelector(".seg-x").addEventListener("click", () => {
+        row.remove();
+        syncFormToToml();
+      });
+      row.querySelectorAll("input").forEach((inp) =>
+        inp.addEventListener("input", syncFormToToml));
+      hfDepsEl.appendChild(row);
+    }
+
+    function buildTomlFromForm() {
+      const lines = [];
+      const name = hfNameEl.value.trim() || "playground";
+      const version = hfVersionEl.value.trim() || "0.1.0";
+      const entry = hfEntryEl.value.trim() || "main";
+      lines.push(`name    = "${name}"`);
+      lines.push(`version = "${version}"`);
+      lines.push(`entry   = "${entry}"`);
+      const rows = [...hfDepsEl.querySelectorAll(".hatch-dep-row")];
+      const deps = rows
+        .map((r) => [
+          r.querySelector(".hatch-dep-name").value.trim(),
+          r.querySelector(".hatch-dep-version").value.trim(),
+        ])
+        .filter(([n, v]) => n && v);
+      if (deps.length > 0) {
+        lines.push("");
+        lines.push("[dependencies]");
+        for (const [n, v] of deps) lines.push(`"${n}" = "${v}"`);
+      }
+      return lines.join("\n") + "\n";
+    }
+
+    function syncFormToToml() {
+      hatchfileEl.value = buildTomlFromForm();
+    }
+
+    // Try to parse a hatchfile-shaped TOML string back into the
+    // form. We only handle the subset the form generates —
+    // anything fancier stays in raw-TOML mode.
+    function syncTomlToForm() {
+      const text = hatchfileEl.value;
+      const get = (key) => {
+        const m = new RegExp(`^${key}\\s*=\\s*"([^"]*)"`, "m").exec(text);
+        return m ? m[1] : "";
+      };
+      hfNameEl.value = get("name") || "playground";
+      hfVersionEl.value = get("version") || "0.1.0";
+      hfEntryEl.value = get("entry") || "main";
+
+      // Drop existing rows then re-populate from [dependencies].
+      hfDepsEl.innerHTML = "";
+      const depsBlock = /\[dependencies\]([\s\S]*?)(?:\n\[|$)/.exec(text);
+      if (depsBlock) {
+        const lines = depsBlock[1].split(/\r?\n/);
+        for (const line of lines) {
+          const m = /^\s*"([^"]+)"\s*=\s*"([^"]+)"\s*$/.exec(line);
+          if (m) addDepRow(m[1], m[2]);
+        }
+      }
+    }
+
+    function setHatchView(view) {
+      const isForm = view === "form";
+      hatchFormEl.classList.toggle("hidden", !isForm);
+      hatchfileEl.classList.toggle("hidden", isForm);
+      viewFormBtn.classList.toggle("seg-active", isForm);
+      viewTomlBtn.classList.toggle("seg-active", !isForm);
+      if (isForm) {
+        // Coming from TOML — best-effort parse back into the form.
+        syncTomlToForm();
+      } else {
+        syncFormToToml();
+      }
+    }
+
+    // Seed: two demo deps that match the locally-built packages
+    // under /packages/. Edit / remove from the form.
+    addDepRow("@hatch:test", "0.1.0");
+    addDepRow("@hatch:assert", "0.2.0");
+    syncFormToToml();
+
+    hfNameEl.addEventListener("input", syncFormToToml);
+    hfVersionEl.addEventListener("input", syncFormToToml);
+    hfEntryEl.addEventListener("input", syncFormToToml);
+    hfAddDepBtn.addEventListener("click", () => { addDepRow(); syncFormToToml(); });
+    viewFormBtn.addEventListener("click", () => setHatchView("form"));
+    viewTomlBtn.addEventListener("click", () => setHatchView("toml"));
+    hatchToggleBtn.addEventListener("click", () => {
+      const showing = wrenColEl.classList.toggle("show-hatchfile");
+      hatchToggleBtn.classList.toggle("seg-active", showing);
+    });
+
+    // Local-dev fetcher for the hatchfile-driven resolver.
+    // Maps `<registry>/releases/download/<name>-<ver>/<name>-<ver>.hatch`
+    // (the URL `depEntryToUrl` would generate for a bare-version
+    // dep) to `/packages/<name>-<ver>.hatch` on this dev server.
+    // For real deployments the default fetcher (which hits the
+    // configured registry) is what you want; the override is a
+    // playground convenience.
+    async function localPackageFetcher(url, name) {
+      // Take the URL's basename: `@hatch:test-0.1.0.hatch`.
+      const filename = url.substring(url.lastIndexOf("/") + 1);
+      const localUrl = `/packages/${filename}`;
+      const r = await fetch(localUrl);
+      if (!r.ok) {
+        throw new Error(
+          `dep '${name}' not found at ${localUrl} (${r.status}). ` +
+          `Build it for wasm with \`wlift hatch/packages/<dir> --bundle wasm/web/packages/${filename} --bundle-target wasm32-unknown-unknown\`.`,
+        );
+      }
+      return new Uint8Array(await r.arrayBuffer());
+    }
 
     let wlift = null;
 
@@ -317,15 +543,7 @@ fiber.try()
       execute();
     }
 
-    async function execute() {
-      if (!wlift) return;
-      runBtn.disabled = true;
-      outEl.classList.remove("ok", "error");
-      outEl.textContent = "running…";
-      // Render the markup first so DOM ops have something to
-      // hit. The Wren source then runs against the live stage.
-      renderStage();
-      const result = await wlift.run(srcEl.value);
+    function renderResult(result) {
       outEl.textContent = result.output || "(no output)";
       outEl.classList.add(result.ok ? "ok" : "error");
       outEl.textContent +=
@@ -336,6 +554,57 @@ fiber.try()
           : (ErrorKind[result.errorKind] ?? result.errorKind);
         outEl.textContent += ` [${kind}]`;
       }
+    }
+
+    // True if the source has at least one `import "..."` whose
+    // module name carries a scoping char (`:`, `@`, `/`) — same
+    // rule the host build uses to decide whether a package is
+    // a registry / scoped-name dep vs an in-project sibling.
+    function sourceHasScopedImports(source) {
+      return /import\s+["'][^"']*[:@/][^"']*["']/.test(source);
+    }
+
+    async function execute() {
+      if (!wlift) return;
+      runBtn.disabled = true;
+      outEl.classList.remove("ok", "error");
+      outEl.textContent = "running…";
+      // Render the markup first so DOM ops have something to
+      // hit. The Wren source then runs against the live stage.
+      renderStage();
+
+      // Auto-detect: if the source `import`s any scoped name
+      // and the user pasted a hatchfile, route through
+      // `runProject` so each `[dependencies]` entry is fetched
+      // and installed before the user code runs. Otherwise
+      // plain `run` — the hatchfile is purely informational
+      // for sources that don't lean on external packages.
+      let result;
+      const hasScoped = sourceHasScopedImports(srcEl.value);
+      const hatchfileText = hatchfileEl.value.trim();
+      if (hasScoped && hatchfileText.length > 0) {
+        outEl.textContent = "resolving deps…";
+        result = await runProject(
+          wlift,
+          srcEl.value,
+          hatchfileEl.value,
+          // Local-dev override: deps come from /packages/ on
+          // the same origin instead of the public CDN.
+          { fetcher: localPackageFetcher },
+        );
+      } else if (hasScoped) {
+        result = {
+          output:
+            "this source imports a scoped package (e.g. `@hatch:foo`) but there's no hatchfile to pin versions.\n" +
+            "paste a hatchfile in the pane below with a `[dependencies]` table, then Run again.",
+          ok: false,
+          errorKind: -1,
+          elapsedMs: 0,
+        };
+      } else {
+        result = await wlift.run(srcEl.value);
+      }
+      renderResult(result);
       runBtn.disabled = false;
     }
 
