@@ -753,11 +753,8 @@ fn build_hatch_package(root: &str, out_path: &str, target: Option<&str>) {
         );
         process::exit(1);
     }
-    let bytes = match wren_lift::hatch::build_from_source_tree_for_target(
-        &root_path,
-        None,
-        target,
-    ) {
+    let bytes = match wren_lift::hatch::build_from_source_tree_for_target(&root_path, None, target)
+    {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -768,7 +765,9 @@ fn build_hatch_package(root: &str, out_path: &str, target: Option<&str>) {
         eprintln!("error: cannot write '{}': {}", out_path, e);
         process::exit(1);
     }
-    let target_note = target.map(|t| format!(" [target={}]", t)).unwrap_or_default();
+    let target_note = target
+        .map(|t| format!(" [target={}]", t))
+        .unwrap_or_default();
     eprintln!(
         "bundled {} bytes from {} → {}{}",
         bytes.len(),

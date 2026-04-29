@@ -897,10 +897,7 @@ pub fn target_family(target: &str) -> TargetFamily {
 ///   * `bundle == None` (target-agnostic / legacy hatches) — accepted everywhere.
 ///   * Same family — accepted (see `target_family`).
 ///   * Different family — `WrongTarget` error.
-pub fn check_target_compat(
-    bundle: Option<&str>,
-    runtime: &str,
-) -> Result<(), HatchError> {
+pub fn check_target_compat(bundle: Option<&str>, runtime: &str) -> Result<(), HatchError> {
     let Some(bundle) = bundle else {
         return Ok(());
     };
@@ -1167,10 +1164,12 @@ fn resolve_version_cached_or_fetch(
             dep_name,
             version,
         )
-        .map_err(|e| HatchError::Encode(format!(
-            "cached artifact for '{}@{}' failed to validate: {}",
-            dep_name, version, e
-        )))?
+        .map_err(|e| {
+            HatchError::Encode(format!(
+                "cached artifact for '{}@{}' failed to validate: {}",
+                dep_name, version, e
+            ))
+        })?
     } else if offline {
         return Err(HatchError::Encode(format!(
             "dependency '{}@{}' isn't cached and HATCH_OFFLINE is set. \
@@ -1184,15 +1183,17 @@ fn resolve_version_cached_or_fetch(
         let url = crate::hatch_registry::release_url(&registry, dep_name, version);
         eprintln!("hatch: installing {}@{} from {}", dep_name, version, url);
         let dest = match cache_dir {
-            Some(dir) => crate::hatch_registry::ensure_in_cache_dir(
-                dir, &registry, dep_name, version,
-            ),
+            Some(dir) => {
+                crate::hatch_registry::ensure_in_cache_dir(dir, &registry, dep_name, version)
+            }
             None => crate::hatch_registry::ensure_in_cache(&registry, dep_name, version),
         };
-        dest.map_err(|e| HatchError::Encode(format!(
-            "dependency '{}@{}' resolution failed: {}",
-            dep_name, version, e
-        )))?
+        dest.map_err(|e| {
+            HatchError::Encode(format!(
+                "dependency '{}@{}' resolution failed: {}",
+                dep_name, version, e
+            ))
+        })?
     };
     Ok(std::fs::read(&path)?)
 }
@@ -2166,7 +2167,9 @@ ghost = "9.9.9"
         // and we restore the original on exit so neighbouring
         // tests in the same binary aren't affected.
         let prev = std::env::var_os("HATCH_OFFLINE");
-        unsafe { std::env::set_var("HATCH_OFFLINE", "1"); }
+        unsafe {
+            std::env::set_var("HATCH_OFFLINE", "1");
+        }
         let result = build_from_source_tree_with_cache(&workspace, Some(&cache_dir));
         match prev {
             Some(v) => unsafe { std::env::set_var("HATCH_OFFLINE", v) },
@@ -2294,10 +2297,16 @@ notes = "hello"
     #[test]
     fn target_family_buckets_correctly() {
         assert_eq!(target_family("wasm32"), TargetFamily::Wasm32);
-        assert_eq!(target_family("wasm32-unknown-unknown"), TargetFamily::Wasm32);
+        assert_eq!(
+            target_family("wasm32-unknown-unknown"),
+            TargetFamily::Wasm32
+        );
         assert_eq!(target_family("wasm32-wasip1"), TargetFamily::Wasm32);
         assert_eq!(target_family("x86_64-apple-darwin"), TargetFamily::Native);
-        assert_eq!(target_family("aarch64-unknown-linux-gnu"), TargetFamily::Native);
+        assert_eq!(
+            target_family("aarch64-unknown-linux-gnu"),
+            TargetFamily::Native
+        );
         assert_eq!(target_family("native"), TargetFamily::Native);
     }
 
@@ -2385,9 +2394,8 @@ openssl = "libs/openssl.dylib"
         .unwrap();
         std::fs::write(root.join("main.wren"), "System.print(\"hi\")").unwrap();
 
-        let bytes =
-            build_from_source_tree_for_target(root, None, Some("wasm32-unknown-unknown"))
-                .expect("build wasm-targeted");
+        let bytes = build_from_source_tree_for_target(root, None, Some("wasm32-unknown-unknown"))
+            .expect("build wasm-targeted");
         // Header layout (cf. format docs at top of file):
         //   bytes[0..5]  = MAGIC ("HATCH")
         //   bytes[5..9]  = VERSION (u32 LE)
@@ -2406,7 +2414,10 @@ openssl = "libs/openssl.dylib"
         let h = load(&bytes).expect("load uncompressed");
         assert_eq!(h.manifest.name, "u");
         assert_eq!(h.manifest.target.as_deref(), Some("wasm32-unknown-unknown"));
-        assert!(h.sections.iter().any(|s| matches!(s.kind, SectionKind::Wlbc)));
+        assert!(h
+            .sections
+            .iter()
+            .any(|s| matches!(s.kind, SectionKind::Wlbc)));
     }
 
     #[test]
@@ -2601,7 +2612,10 @@ library = "wlift_sqlite"
 "#,
         )
         .expect("parse new");
-        assert_eq!(m_new.plugin_source.as_ref().unwrap().library, "wlift_sqlite");
+        assert_eq!(
+            m_new.plugin_source.as_ref().unwrap().library,
+            "wlift_sqlite"
+        );
 
         // Legacy `crate = "..."` — accepted via serde alias so
         // existing hatchfiles in the wild keep working without a
@@ -2619,7 +2633,10 @@ crate = "wlift_sqlite"
 "#,
         )
         .expect("parse legacy");
-        assert_eq!(m_old.plugin_source.as_ref().unwrap().library, "wlift_sqlite");
+        assert_eq!(
+            m_old.plugin_source.as_ref().unwrap().library,
+            "wlift_sqlite"
+        );
     }
 
     #[test]
@@ -2641,7 +2658,10 @@ library = "wlift_sqlite"
         )
         .expect("parse");
         let ps = m.plugin_source.unwrap();
-        assert_eq!(ps.url.as_deref(), Some("https://cdn.example.com/wlift_sqlite-aarch64-darwin.dylib"));
+        assert_eq!(
+            ps.url.as_deref(),
+            Some("https://cdn.example.com/wlift_sqlite-aarch64-darwin.dylib")
+        );
         assert!(ps.repo.is_none());
         assert_eq!(ps.library, "wlift_sqlite");
     }
@@ -2654,7 +2674,10 @@ library = "wlift_sqlite"
         hatch.manifest.target = Some("wasm32-unknown-unknown".to_string());
         let bytes = emit(&hatch).expect("encode");
         let decoded = load(&bytes).expect("decode");
-        assert_eq!(decoded.manifest.target.as_deref(), Some("wasm32-unknown-unknown"));
+        assert_eq!(
+            decoded.manifest.target.as_deref(),
+            Some("wasm32-unknown-unknown")
+        );
         let err = check_target_compat(decoded.manifest.target.as_deref(), "native")
             .expect_err("cross-family should reject");
         match err {

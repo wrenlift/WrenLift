@@ -666,10 +666,8 @@ impl VM {
         // `#!native` reference, which is a worse failure mode
         // than an early reject.
         let runtime = crate::hatch::current_runtime_target();
-        if let Err(e) = crate::hatch::check_target_compat(
-            hatch.manifest.target.as_deref(),
-            runtime,
-        ) {
+        if let Err(e) = crate::hatch::check_target_compat(hatch.manifest.target.as_deref(), runtime)
+        {
             self.report_error(&format!("failed to load hatch: {}", e));
             return InterpretResult::CompileError;
         }
@@ -902,10 +900,8 @@ impl VM {
         // step so users see a consistent reject regardless of
         // whether the CLI or library API loaded the hatch.
         let runtime = crate::hatch::current_runtime_target();
-        if let Err(e) = crate::hatch::check_target_compat(
-            hatch.manifest.target.as_deref(),
-            runtime,
-        ) {
+        if let Err(e) = crate::hatch::check_target_compat(hatch.manifest.target.as_deref(), runtime)
+        {
             eprintln!("failed to load hatch: {}", e);
             return InterpretResult::CompileError;
         }
