@@ -868,6 +868,14 @@ fn run_fiber_with_stop_depth(
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
+        if vm.fiber.is_null() {
+            // A no-caller yield cleared `vm.fiber` to hand
+            // control back to the host scheduler. The fiber
+            // itself is still alive in the host's parked list
+            // and will be resumed via a future fresh
+            // `run_fiber` call once its awaited future settles.
+            return Ok(Value::null());
+        }
         let mut fiber = vm.fiber;
         unsafe {
             (*fiber).state = FiberState::Running;
@@ -4223,9 +4231,22 @@ fn handle_fiber_action_bc(
             }
             let caller = unsafe { (*fiber).caller };
             if caller.is_null() {
-                return Err(RuntimeError::Error(
-                    "Fiber.yield called with no caller".into(),
-                ));
+                // No caller to resume — typical when the host
+                // scheduler resumed a parked fiber and that fiber
+                // awaits a *second* future. The first yield
+                // returned to its caller and cleared the slot;
+                // subsequent yields have nowhere to return.
+                // Clear `vm.fiber` so `run_fiber` exits cleanly
+                // on its next loop iteration; the host scheduler
+                // resumes the parked fiber via `Browser.parkSelf`
+                // + future settlement (the fiber has to be
+                // registered in the host's parked list before
+                // this yield — an unparked yield with no caller
+                // is still a stuck suspension, but that's the
+                // user's misuse to detect, not a runtime error).
+                let _ = value;
+                vm.fiber = std::ptr::null_mut();
+                return Ok(());
             }
             unsafe {
                 (*fiber).caller = std::ptr::null_mut();

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "tree": {
+    "shaders": {
+      "solid.wgsl": {
+        "hash": "0fd1b0c5a2eb8d4d85ab7fe7ed2c2d1b3c6f9b89aa9c01e9f2f4ab78c2401e22",
+        "size": 286
+      }
+    },
+    "config.json": {
+      "hash": "5d41402abc4b2a76b9719d911017c592",
+      "size": 28
+    }
+  }
+}

@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wlift @hatch:assets web smoke test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 ui-monospace, monospace; max-height: 320px; }
+    h1 { font-size: 1.4rem; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+    .note  { color: #888; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Smoke test — @hatch:assets web backend</h1>
+  <p class="note">
+    Mounts the VFS at <code>/web/assets-test/</code> via
+    <code>Assets.open</code>, then exercises the path-keyed
+    reads (<code>db.text</code>) and the new VFS enumeration
+    (<code>db.list</code> / <code>db.dirs</code> /
+    <code>db.files</code>). Everything routes through
+    <code>Browser.fetch + Future.await</code> on the runtime —
+    the synchronous-looking Wren calls are parked-fiber
+    round-trips under the hood.
+  </p>
+  <pre id="out">running…</pre>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+    out.textContent = "";
+
+    try {
+      const wlift = await createWlift({ mode: "main" });
+      log(`createWlift: ${wlift.version}`);
+
+      const assetsBytes = await fetch("./hatch-assets.hatch")
+        .then((r) => r.arrayBuffer())
+        .then((b) => new Uint8Array(b));
+      log(`fetched bundle: ${assetsBytes.length} bytes`);
+
+      const source = `
+import "@hatch:assets" for Assets
+
+// Browser.fetch suspends the *current* fiber via Future.await,
+// so anything that touches the network has to live inside a
+// child fiber — Wren's top-level main module has no caller to
+// yield to. The scheduler resumes the child once each future
+// settles. (Game framework users get this wrap from Game.run
+// for free.)
+var program = Fiber.new {
+  var db = Assets.open("./assets-test")
+  System.print("mounted: %(db)")
+  System.print("count:   %(db.count)")
+  System.print("")
+
+  System.print("-- db.list --")
+  for (path in db.list) System.print("  %(path)")
+  System.print("")
+
+  System.print("-- db.dirs(\\"\\")  -- root subdirs")
+  for (d in db.dirs("")) System.print("  %(d)")
+  System.print("")
+
+  System.print("-- db.files(\\"\\") -- root files")
+  for (f in db.files("")) System.print("  %(f)")
+  System.print("")
+
+  System.print("-- db.files(\\"shaders\\") --")
+  for (f in db.files("shaders")) System.print("  %(f)")
+  System.print("")
+
+  var wgsl = db.text("shaders/solid.wgsl")
+  System.print("-- shaders/solid.wgsl (first line) --")
+  System.print("  " + wgsl.split("\\n")[0])
+  System.print("")
+
+  var cfg = db.text("config.json")
+  System.print("-- config.json --")
+  System.print("  " + cfg)
+  System.print("")
+
+  System.print("rendered ✓")
+}
+program.try()
+`.trim();
+
+      const result = await wlift.runWithHatches(source, [assetsBytes]);
+      log(`ok=${result.ok}  errorKind=${result.errorKind}  ${result.elapsedMs.toFixed(2)}ms`);
+      log("--- output ---");
+      log(result.output, result.ok ? "ok" : "err");
+
+      if (result.ok && result.output.includes("rendered ✓")) {
+        log("✓ PASS — manifest + lazy fetch + VFS enumeration all good.", "ok");
+      } else {
+        log("✗ FAIL", "err");
+      }
+    } catch (err) {
+      log(`exception: ${err}`, "err");
+      console.error(err);
+    }
+  </script>
+</body>
+</html>

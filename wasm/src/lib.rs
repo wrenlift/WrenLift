@@ -1385,9 +1385,45 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
 
                 // Resume the parked fiber. `vm_interp::run_fiber`
                 // executes whatever fiber is currently in
-                // `vm.fiber` until it yields or returns.
+                // `vm.fiber` until it yields or returns. Errors
+                // get surfaced through the diagnostic buffer
+                // (which lands in `result.output`) — without this,
+                // an abort inside a scheduler-resumed fiber dies
+                // silently because there's no caller fiber to
+                // route it through.
                 vm.fiber = entry.fiber;
-                let _ = wren_lift::runtime::vm_interp::run_fiber(&mut vm);
+                let res = wren_lift::runtime::vm_interp::run_fiber(&mut vm);
+                if let Err(e) = res {
+                    vm.report_error(&format!("scheduler-resumed fiber aborted: {}", e));
+                    continue;
+                }
+                // Even when `run_fiber` returns Ok, an abort under
+                // `is_try` lands in the fiber's `.error` slot
+                // instead of an Err return — the bytecode catch
+                // path marks the fiber Done with the message
+                // stashed there, and run_fiber drops out cleanly.
+                // Without surfacing it, the abort is silent in
+                // the page UI. Pull the message out and route it
+                // through `error_fn` so the diagnostic buffer
+                // picks it up alongside `System.print` output.
+                let err_str = unsafe {
+                    let f = entry.fiber;
+                    if !f.is_null() {
+                        let err = (*f).error;
+                        if err.is_string_object() {
+                            let ptr = err.as_object().expect("string object pointer")
+                                as *const wren_lift::runtime::object::ObjString;
+                            Some((*ptr).as_str().to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(s) = err_str {
+                    vm.report_error(&format!("fiber error: {}", s));
+                }
             }
 
             // Re-park anything still pending. New fibers pushed
