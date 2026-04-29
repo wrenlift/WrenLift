@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// [`VM::check_pending_reload`].
 static RELOAD_PENDING: AtomicBool = AtomicBool::new(false);
 
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", unix))]
 extern "C" fn reload_signal_handler(_sig: libc::c_int) {
     // Async-signal-safe: AtomicBool::store with Release ordering is
     // documented to be lock-free on every platform we run on, so
@@ -32,7 +32,7 @@ extern "C" fn reload_signal_handler(_sig: libc::c_int) {
 /// Intended to be invoked by the `wlift` binary when a `--watch`
 /// flag (or `WLIFT_WATCH=1` env var) is present, so the parent
 /// `hatch` CLI can drive in-process reload via `kill(pid, SIGUSR1)`.
-#[cfg(feature = "host")]
+#[cfg(all(feature = "host", unix))]
 pub fn install_reload_signal_handler() {
     unsafe {
         libc::signal(
@@ -41,6 +41,14 @@ pub fn install_reload_signal_handler() {
         );
     }
 }
+
+/// Windows has no `SIGUSR1` equivalent. Hot reload there is
+/// driven through an explicit `Hatch.reload(...)` call (same path
+/// the wasm runtime uses) — the watcher in the `hatch` CLI can
+/// still detect file changes, but it pokes the runtime via that
+/// API instead of a signal.
+#[cfg(all(feature = "host", not(unix)))]
+pub fn install_reload_signal_handler() {}
 
 /// Wasm builds have no signal infrastructure; reload is driven
 /// by an explicit `Hatch.reload(...)` call from JS host glue.

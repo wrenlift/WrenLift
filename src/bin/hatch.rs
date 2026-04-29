@@ -1260,9 +1260,15 @@ fn cmd_dev(dir: &Path) {
             last = now;
             // SIGUSR1 to the wlift child triggers an in-process
             // module reload at the next safepoint — no respawn, no
-            // lost in-memory state.
+            // lost in-memory state. Windows has no SIGUSR1; the
+            // dev-loop signalling path is unix-only for now.
+            #[cfg(unix)]
             unsafe {
                 libc::kill(child_pid as libc::pid_t, libc::SIGUSR1);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child_pid; // silence unused-variable on Windows
             }
         }
     }
