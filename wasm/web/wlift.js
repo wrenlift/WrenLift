@@ -919,9 +919,11 @@ class MainWlift {
         return bits;
       };
 
-      // Bind-group resource descriptor → live GPU object. Only the
-      // buffer-binding shape is wired today; sampler / texture
-      // bindings would be similar lookups.
+      // Bind-group resource descriptor → live GPU object.
+      // Recognised shapes:
+      //   {kind:"buffer", buffer:<h>, offset?, size?}
+      //   {kind:"textureView", view:<h>}
+      //   {kind:"sampler", sampler:<h>}
       const resolveBindResource = (r) => {
         if (!r) return undefined;
         if (r.kind === "buffer") {
@@ -932,6 +934,16 @@ class MainWlift {
             ...(r.offset !== undefined ? { offset: r.offset } : {}),
             ...(r.size   !== undefined ? { size:   r.size   } : {}),
           };
+        }
+        if (r.kind === "textureView") {
+          const obj = gpuObjects.get(r.view);
+          if (!obj || obj.kind !== "texture_view") return undefined;
+          return obj.view;
+        }
+        if (r.kind === "sampler") {
+          const obj = gpuObjects.get(r.sampler);
+          if (!obj || obj.kind !== "sampler") return undefined;
+          return obj.sampler;
         }
         return undefined;
       };
@@ -1159,6 +1171,122 @@ class MainWlift {
           return handle;
         },
 
+        // ----- Textures + samplers ------------------------------
+        //
+        // Descriptor shapes (parallel to native @hatch:gpu's
+        // GpuCore.textureCreate / samplerCreate):
+        //
+        //   createTexture: { width, height, depth?, format,
+        //                    usage,            // numeric bitset:
+        //                                       //   COPY_SRC=1 COPY_DST=2
+        //                                       //   TEXTURE_BINDING=4
+        //                                       //   STORAGE_BINDING=8
+        //                                       //   RENDER_ATTACHMENT=16
+        //                    dimension?: "2d"|"1d"|"3d",
+        //                    mipLevelCount?, sampleCount? }
+        //
+        //   createSampler: { magFilter?:"linear"|"nearest",
+        //                    minFilter?, mipmapFilter?,
+        //                    addressModeU?:"repeat"|"clamp-to-edge"|"mirror-repeat",
+        //                    addressModeV?, addressModeW?,
+        //                    lodMinClamp?, lodMaxClamp?,
+        //                    compare?, maxAnisotropy? }
+
+        host_gpu_create_texture: (vm, slot) => {
+          if (!gpuDevice) return 0;
+          const desc = decodeSlotJson(vm, slot);
+          if (!desc) return 0;
+          const size = desc.depth
+            ? { width: desc.width, height: desc.height, depthOrArrayLayers: desc.depth }
+            : [desc.width, desc.height];
+          const tex = gpuDevice.createTexture({
+            size,
+            format: desc.format || "rgba8unorm",
+            usage: desc.usage || 0,
+            ...(desc.dimension ? { dimension: desc.dimension } : {}),
+            ...(desc.mipLevelCount !== undefined ? { mipLevelCount: desc.mipLevelCount } : {}),
+            ...(desc.sampleCount  !== undefined ? { sampleCount:  desc.sampleCount  } : {}),
+          });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "texture", texture: tex,
+            width: desc.width, height: desc.height,
+            format: desc.format || "rgba8unorm" });
+          return handle;
+        },
+
+        host_gpu_create_texture_view: (vm, texture_handle, slot) => {
+          if (!gpuDevice) return 0;
+          const tex = gpuObjects.get(texture_handle);
+          if (!tex || tex.kind !== "texture") return 0;
+          // Optional descriptor — `decodeSlotJson` returns null
+          // for a Wren-null slot (no descriptor string), in which
+          // case createView() builds the default whole-texture view.
+          const desc = decodeSlotJson(vm, slot);
+          const view = desc ? tex.texture.createView(desc) : tex.texture.createView();
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "texture_view", view, texture: texture_handle });
+          return handle;
+        },
+
+        // bytes are tightly-packed pixel data (host slot). The
+        // descriptor carries the layout (bytesPerRow, rowsPerImage)
+        // and the destination origin / mip / aspect.
+        //
+        //   { bytesPerRow, rowsPerImage?,
+        //     origin?: {x,y,z}, mipLevel?, aspect?,
+        //     width?, height?, depth?  // copy size, defaults to texture size
+        //   }
+        host_gpu_queue_write_texture: (vm, texture_handle, bytes_slot, desc_slot) => {
+          if (!gpuDevice) return 0;
+          const tex = gpuObjects.get(texture_handle);
+          if (!tex || tex.kind !== "texture") return 0;
+          const bytes = readSlotBytes(vm, bytes_slot);
+          if (!bytes) return 0;
+          const desc = decodeSlotJson(vm, desc_slot) || {};
+          const bytesPerRow = desc.bytesPerRow ?? (tex.width * 4);
+          const writeSize = {
+            width:  desc.width  ?? tex.width,
+            height: desc.height ?? tex.height,
+            depthOrArrayLayers: desc.depth ?? 1,
+          };
+          gpuDevice.queue.writeTexture(
+            {
+              texture: tex.texture,
+              ...(desc.mipLevel !== undefined ? { mipLevel: desc.mipLevel } : {}),
+              ...(desc.origin  ? { origin: desc.origin } : {}),
+              ...(desc.aspect  ? { aspect: desc.aspect } : {}),
+            },
+            bytes.slice(),
+            {
+              bytesPerRow,
+              ...(desc.rowsPerImage !== undefined ? { rowsPerImage: desc.rowsPerImage } : {}),
+            },
+            writeSize,
+          );
+          return 1;
+        },
+
+        host_gpu_create_sampler: (vm, slot) => {
+          if (!gpuDevice) return 0;
+          // Default sampler when descriptor is null / empty.
+          const desc = decodeSlotJson(vm, slot) || {};
+          const sampler = gpuDevice.createSampler({
+            ...(desc.magFilter    ? { magFilter:    desc.magFilter    } : {}),
+            ...(desc.minFilter    ? { minFilter:    desc.minFilter    } : {}),
+            ...(desc.mipmapFilter ? { mipmapFilter: desc.mipmapFilter } : {}),
+            ...(desc.addressModeU ? { addressModeU: desc.addressModeU } : {}),
+            ...(desc.addressModeV ? { addressModeV: desc.addressModeV } : {}),
+            ...(desc.addressModeW ? { addressModeW: desc.addressModeW } : {}),
+            ...(desc.lodMinClamp !== undefined ? { lodMinClamp: desc.lodMinClamp } : {}),
+            ...(desc.lodMaxClamp !== undefined ? { lodMaxClamp: desc.lodMaxClamp } : {}),
+            ...(desc.compare ? { compare: desc.compare } : {}),
+            ...(desc.maxAnisotropy !== undefined ? { maxAnisotropy: desc.maxAnisotropy } : {}),
+          });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "sampler", sampler });
+          return handle;
+        },
+
         host_gpu_create_pipeline: (vm, slot) => {
           if (!gpuDevice) return 0;
           const desc = decodeSlotJson(vm, slot);
@@ -1218,15 +1346,45 @@ class MainWlift {
           if (!frame || frame.kind !== "frame") return 0;
           const desc = decodeSlotJson(vm, slot);
           // colorAttachments default: clear to opaque black.
-          const cas = (desc?.colorAttachments || [{}]).map((c) => ({
-            view: frame.view,
-            clearValue: c.clearValue || { r: 0, g: 0, b: 0, a: 1 },
-            loadOp: c.loadOp || "clear",
-            storeOp: c.storeOp || "store",
-          }));
-          const pass = frame.encoder.beginRenderPass({
-            colorAttachments: cas,
+          // `view` may be a numeric handle to a texture_view (for
+          // off-screen targets); when omitted, default to the
+          // frame's surface view.
+          const cas = (desc?.colorAttachments || [{}]).map((c) => {
+            let view = frame.view;
+            if (c.view !== undefined) {
+              const v = gpuObjects.get(c.view);
+              if (v && v.kind === "texture_view") view = v.view;
+            }
+            return {
+              view,
+              clearValue: c.clearValue || { r: 0, g: 0, b: 0, a: 1 },
+              loadOp:  c.loadOp  || "clear",
+              storeOp: c.storeOp || "store",
+            };
           });
+          // Optional depth attachment:
+          //   { view: <texture_view_handle>,
+          //     depthClearValue?: 1.0, depthLoadOp?: "clear",
+          //     depthStoreOp?: "store",
+          //     stencilClearValue?, stencilLoadOp?, stencilStoreOp? }
+          const passDesc = { colorAttachments: cas };
+          if (desc?.depthStencilAttachment) {
+            const ds = desc.depthStencilAttachment;
+            const v = gpuObjects.get(ds.view);
+            if (v && v.kind === "texture_view") {
+              passDesc.depthStencilAttachment = {
+                view: v.view,
+                ...(ds.depthClearValue !== undefined
+                  ? { depthClearValue: ds.depthClearValue } : { depthClearValue: 1.0 }),
+                depthLoadOp:  ds.depthLoadOp  || "clear",
+                depthStoreOp: ds.depthStoreOp || "store",
+                ...(ds.stencilClearValue !== undefined ? { stencilClearValue: ds.stencilClearValue } : {}),
+                ...(ds.stencilLoadOp  ? { stencilLoadOp:  ds.stencilLoadOp  } : {}),
+                ...(ds.stencilStoreOp ? { stencilStoreOp: ds.stencilStoreOp } : {}),
+              };
+            }
+          }
+          const pass = frame.encoder.beginRenderPass(passDesc);
           const handle = nextGpuHandle++;
           gpuObjects.set(handle, { kind: "render_pass", pass, frame: frame_handle });
           return handle;
@@ -1288,7 +1446,11 @@ class MainWlift {
         host_gpu_destroy: (handle) => {
           const obj = gpuObjects.get(handle);
           if (!obj) return;
-          if (obj.kind === "buffer") obj.buffer.destroy?.();
+          if (obj.kind === "buffer")  obj.buffer.destroy?.();
+          if (obj.kind === "texture") obj.texture.destroy?.();
+          // texture_view / sampler / pipeline / bind_group /
+          // bind_group_layout / shader: no explicit destroy, GC
+          // handles them once the registry entry drops.
           gpuObjects.delete(handle);
         },
       };

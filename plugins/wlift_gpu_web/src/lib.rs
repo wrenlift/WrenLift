@@ -146,6 +146,31 @@ unsafe extern "C" {
     );
     fn host_gpu_render_pass_end(pass: u32);
 
+    // ---- Textures + samplers ----------------------------------
+    /// JSON descriptor in `slot`: { width, height, format,
+    /// usage, dimension?, mipLevelCount?, sampleCount? }.
+    /// Returns texture handle (≥1) or 0.
+    fn host_gpu_create_texture(vm: *mut c_void, slot: i32) -> u32;
+    /// Build a `GPUTextureView`. `desc_slot` is optional — pass
+    /// `-1` for the default view (covers the whole texture).
+    fn host_gpu_create_texture_view(
+        vm: *mut c_void,
+        texture_handle: u32,
+        desc_slot: i32,
+    ) -> u32;
+    /// Upload pixel bytes via `device.queue.writeTexture`.
+    /// `bytes_slot` carries a Wren String/Bytes; `desc_slot`
+    /// carries the layout / origin descriptor JSON.
+    fn host_gpu_queue_write_texture(
+        vm: *mut c_void,
+        texture_handle: u32,
+        bytes_slot: i32,
+        desc_slot: i32,
+    ) -> u32;
+    /// JSON descriptor (or `-1` for defaults). Returns sampler
+    /// handle (≥1) or 0.
+    fn host_gpu_create_sampler(vm: *mut c_void, desc_slot: i32) -> u32;
+
     // ---- Generic destroy --------------------------------------
     fn host_gpu_destroy(handle: u32);
 }
@@ -412,6 +437,77 @@ pub unsafe extern "C" fn wlift_gpu_render_pass_end(vm: *mut c_void) {
     let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
     unsafe { host_gpu_render_pass_end(pass) };
     unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+// ---------------------------------------------------------------
+// Textures + samplers
+// ---------------------------------------------------------------
+
+/// `Gpu.createTexture_(descriptorJson)` — JSON descriptor:
+///   { "width": Num, "height": Num,
+///     "format": "rgba8unorm"|"bgra8unorm"|"depth24plus"|...,
+///     "usage": Num    // GPUTextureUsage bitset:
+///                     //   COPY_SRC=1, COPY_DST=2,
+///                     //   TEXTURE_BINDING=4,
+///                     //   STORAGE_BINDING=8,
+///                     //   RENDER_ATTACHMENT=16
+///     "dimension"?: "1d"|"2d"|"3d",
+///     "depth"?: Num,
+///     "mipLevelCount"?: Num,
+///     "sampleCount"?: Num }
+/// Returns Num (handle) or `-1`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_texture(vm: *mut c_void) {
+    let h = unsafe { host_gpu_create_texture(vm, 1) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.createTextureView_(textureHandle, descriptorJson)` —
+/// pass `null` for the descriptor to use the texture's default
+/// view (covers the whole resource with the original format).
+/// Returns Num (handle) or `-1`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_texture_view(vm: *mut c_void) {
+    let texture = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    // Wren passes the descriptor as either a string (slot 2) or
+    // `null`. For null, signal "default view" by passing slot 0
+    // (the JS bridge skips JSON decode when slot is 0/falsy).
+    let h = unsafe { host_gpu_create_texture_view(vm, texture, 2) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.queueWriteTexture_(textureHandle, bytes, descriptorJson)` —
+/// upload tightly-packed pixel bytes. Descriptor:
+///   { "bytesPerRow": Num,
+///     "rowsPerImage"?: Num,
+///     "origin"?: { x, y, z },
+///     "mipLevel"?: Num, "aspect"?: "all"|"depth-only"|"stencil-only",
+///     "width"?, "height"?, "depth"? } // copy size; defaults to texture size
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_queue_write_texture(vm: *mut c_void) {
+    let texture = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let ok = unsafe { host_gpu_queue_write_texture(vm, texture, 2, 3) };
+    unsafe { wrenSetSlotDouble(vm, 0, ok as f64) };
+}
+
+/// `Gpu.createSampler_(descriptorJson)` — pass `null` for a
+/// default sampler (linear / clamp-to-edge across the board).
+/// Descriptor:
+///   { "magFilter"?: "linear"|"nearest",
+///     "minFilter"?, "mipmapFilter"?,
+///     "addressModeU"?: "repeat"|"clamp-to-edge"|"mirror-repeat",
+///     "addressModeV"?, "addressModeW"?,
+///     "lodMinClamp"?, "lodMaxClamp"?,
+///     "compare"?, "maxAnisotropy"? }
+/// Returns Num (handle) or `-1`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_sampler(vm: *mut c_void) {
+    let h = unsafe { host_gpu_create_sampler(vm, 1) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
 }
 
 #[no_mangle]

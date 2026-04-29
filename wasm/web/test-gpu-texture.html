@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wlift on-demand GPU plugin smoke test — textured quad</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 ui-monospace, monospace; max-height: 240px; }
+    h1 { font-size: 1.4rem; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+    .note  { color: #888; font-size: 0.9rem; }
+    #stage { display: block; margin-top: 1rem; border: 2px solid #1d1812; border-radius: 8px; padding: 8px; background: #1d1812; min-height: 420px; }
+    #stage canvas { display: block; margin: 0 auto; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+  <h1>Smoke test — textured quad via @hatch:gpu (web)</h1>
+  <p class="note">
+    Exercises the texture / sampler / bind-group additions to the
+    web GPU plugin: builds a 2&times;2 RGBA texture (red, green,
+    blue, yellow), creates a sampler, binds them through a
+    bind-group, and renders a quad with a simple WGSL shader.
+    Expect a four-quadrant Mondrian square in the dark stage below.
+  </p>
+  <pre id="out">running…</pre>
+  <div id="stage"></div>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+
+    out.textContent = "";
+
+    try {
+      log("createWlift({ mode: 'main' })…");
+      const wlift = await createWlift({ mode: "main" });
+      log(`  ${wlift.version}`);
+
+      log("fetching unified @hatch:window + @hatch:gpu bundles…");
+      const [windowBytes, gpuBytes] = await Promise.all([
+        fetch("./hatch-window.hatch").then((r) => {
+          if (!r.ok) throw new Error(`window fetch ${r.status}`);
+          return r.arrayBuffer().then((b) => new Uint8Array(b));
+        }),
+        fetch("./hatch-gpu.hatch").then((r) => {
+          if (!r.ok) throw new Error(`gpu fetch ${r.status}`);
+          return r.arrayBuffer().then((b) => new Uint8Array(b));
+        }),
+      ]);
+      log(`  window: ${windowBytes.length} bytes`);
+      log(`  gpu:    ${gpuBytes.length} bytes`);
+
+      const wgsl = `
+struct VsOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+}
+
+@vertex
+fn vs_main(@location(0) pos: vec2f, @location(1) uv: vec2f) -> VsOut {
+  var out: VsOut;
+  out.pos = vec4f(pos, 0.0, 1.0);
+  out.uv = uv;
+  return out;
+}
+
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4f {
+  return textureSample(t, s, in.uv);
+}
+`.trim();
+
+      // Quad: two triangles, position (xy NDC) + UV. Pixelated
+      // sampling will keep the 2x2 swatches sharp.
+      const quad = [
+        // pos       uv
+        -0.7,  0.7,  0.0, 0.0,
+        -0.7, -0.7,  0.0, 1.0,
+         0.7,  0.7,  1.0, 0.0,
+         0.7,  0.7,  1.0, 0.0,
+        -0.7, -0.7,  0.0, 1.0,
+         0.7, -0.7,  1.0, 1.0,
+      ];
+
+      // 2x2 RGBA8 texture. Top-left red, top-right green,
+      // bottom-left blue, bottom-right yellow. tightly-packed
+      // bytes — bytesPerRow = 2 * 4 = 8 (which is below WebGPU's
+      // 256-byte alignment requirement for *copy* operations,
+      // but writeTexture is exempt for these mini-uploads).
+      const pixels = [
+        255,   0,   0, 255,    0, 255,   0, 255,
+          0,   0, 255, 255,  255, 255,   0, 255,
+      ];
+      // Convert to a string so the Wren-side passes through the
+      // `bytes` slot path. Wren strings are UTF-8 safe but the
+      // bridge `wrenGetSlotBytes` reads raw bytes, so any
+      // base-256 string round-trips.
+      const pixelStr = String.fromCharCode(...pixels);
+
+      const source = `
+import "@hatch:window" for Window
+import "@hatch:gpu" for Gpu
+
+var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "textured quad smoke"})
+if (canvas < 0) Fiber.abort("Window.create_ failed")
+
+if (!Gpu.init_()) Fiber.abort("WebGPU not available")
+
+var surface = Gpu.attachCanvas_(canvas)
+if (surface < 0) Fiber.abort("Gpu.attachCanvas_ failed")
+
+var shader = Gpu.createShader_(${JSON.stringify(wgsl)})
+if (shader < 0) Fiber.abort("createShader_ failed")
+
+// vertex buffer (positions + uv) — VERTEX|COPY_DST = 32|8 = 40
+var vb = Gpu.createBufferFromFloats_(${JSON.stringify(quad)}, 40)
+if (vb < 0) Fiber.abort("vertex buffer failed")
+
+// 2x2 RGBA8 texture. usage = TEXTURE_BINDING|COPY_DST = 4|2 = 6
+var tex = Gpu.createTexture_(
+  "{\\"width\\":2,\\"height\\":2,\\"format\\":\\"rgba8unorm\\",\\"usage\\":6}"
+)
+if (tex < 0) Fiber.abort("texture failed")
+System.print("texture handle: %(tex)")
+
+Gpu.queueWriteTexture_(tex, ${JSON.stringify(pixelStr)},
+  "{\\"bytesPerRow\\":8,\\"width\\":2,\\"height\\":2}"
+)
+System.print("uploaded 2x2 RGBA pixels")
+
+var view = Gpu.createTextureView_(tex, null)
+if (view < 0) Fiber.abort("texture view failed")
+System.print("view handle: %(view)")
+
+var sampler = Gpu.createSampler_(
+  "{\\"magFilter\\":\\"nearest\\",\\"minFilter\\":\\"nearest\\",\\"addressModeU\\":\\"clamp-to-edge\\",\\"addressModeV\\":\\"clamp-to-edge\\"}"
+)
+if (sampler < 0) Fiber.abort("sampler failed")
+System.print("sampler handle: %(sampler)")
+
+// bind group layout: texture at binding 0 (fragment-visible),
+// sampler at binding 1.
+var bgl = Gpu.createBindGroupLayout_(
+  "{\\"entries\\":[" +
+    "{\\"binding\\":0,\\"visibility\\":\\"fragment\\",\\"texture\\":{}}," +
+    "{\\"binding\\":1,\\"visibility\\":\\"fragment\\",\\"sampler\\":{}}" +
+  "]}"
+)
+if (bgl < 0) Fiber.abort("bgl failed")
+
+var bg = Gpu.createBindGroup_(
+  "{\\"layout\\":%(bgl),\\"entries\\":[" +
+    "{\\"binding\\":0,\\"resource\\":{\\"kind\\":\\"textureView\\",\\"view\\":%(view)}}," +
+    "{\\"binding\\":1,\\"resource\\":{\\"kind\\":\\"sampler\\",\\"sampler\\":%(sampler)}}" +
+  "]}"
+)
+if (bg < 0) Fiber.abort("bg failed")
+
+var pipeline = Gpu.createPipeline_(
+  "{" +
+    "\\"layouts\\":[%(bgl)]," +
+    "\\"vertex\\":{" +
+      "\\"shader\\":%(shader),\\"entry\\":\\"vs_main\\"," +
+      "\\"buffers\\":[{\\"arrayStride\\":16,\\"attributes\\":[" +
+        "{\\"shaderLocation\\":0,\\"offset\\":0,\\"format\\":\\"float32x2\\"}," +
+        "{\\"shaderLocation\\":1,\\"offset\\":8,\\"format\\":\\"float32x2\\"}" +
+      "]}]" +
+    "}," +
+    "\\"fragment\\":{" +
+      "\\"shader\\":%(shader),\\"entry\\":\\"fs_main\\"," +
+      "\\"targets\\":[{\\"format\\":\\"preferred\\"}]" +
+    "}," +
+    "\\"primitive\\":{\\"topology\\":\\"triangle-list\\"}" +
+  "}"
+)
+if (pipeline < 0) Fiber.abort("pipeline failed")
+
+var frame = Gpu.beginFrame_(surface)
+if (frame < 0) Fiber.abort("beginFrame failed")
+
+var pass = Gpu.renderPassBegin_(frame,
+  "{\\"colorAttachments\\":[{\\"clearValue\\":{\\"r\\":0.06,\\"g\\":0.05,\\"b\\":0.04,\\"a\\":1.0},\\"loadOp\\":\\"clear\\",\\"storeOp\\":\\"store\\"}]}"
+)
+if (pass < 0) Fiber.abort("renderPassBegin failed")
+
+Gpu.renderPassSetPipeline_(pass, pipeline)
+Gpu.renderPassSetBindGroup_(pass, 0, bg)
+Gpu.renderPassSetVertexBuffer_(pass, 0, vb)
+Gpu.renderPassDraw_(pass, 6, 1, 0, 0)
+Gpu.renderPassEnd_(pass)
+Gpu.endFrame_(frame)
+System.print("rendered ✓")
+`.trim();
+
+      log("runWithHatches…");
+      const result = await wlift.runWithHatches(source, [windowBytes, gpuBytes]);
+      log(`  ok=${result.ok}  errorKind=${result.errorKind}  ${result.elapsedMs.toFixed(2)}ms`);
+      log("--- output ---");
+      log(result.output, result.ok ? "ok" : "err");
+
+      if (result.ok && result.output.includes("rendered ✓")) {
+        log("✓ PASS — textured quad rendered. Look for the four-coloured square below.", "ok");
+      } else {
+        log("✗ FAIL", "err");
+      }
+    } catch (err) {
+      log(`exception: ${err}`, "err");
+      console.error(err);
+    }
+  </script>
+</body>
+</html>
