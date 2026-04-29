@@ -1011,7 +1011,12 @@ fn build_recursive(
     let mut module_names: Vec<String> = Vec::with_capacity(wren_files.len());
 
     for (module_name, path) in &wren_files {
-        let source = std::fs::read_to_string(path)?;
+        let raw_source = std::fs::read_to_string(path)?;
+        // Apply target-conditional attributes (`#!wasm`, `#!native`)
+        // before handing the source to the compiler. Declarations
+        // gated to a non-matching target get elided; everything
+        // else passes through verbatim.
+        let source = crate::parse::cfg::apply(&raw_source, target);
         // Fresh VM per compile so interners don't leak across modules.
         // Compilation is cheap and stateless here; the VM's runtime
         // state (modules registered, classes allocated) is never used.
@@ -1027,13 +1032,11 @@ fn build_recursive(
             name: module_name.clone(),
             data: blob,
         });
-        // Bundle the original source text alongside the compiled
+        // Bundle the *filtered* source alongside the compiled
         // bytecode so runtime errors raised inside the module can
-        // render through ariadne labels at install time. Adds the
-        // source bytes to the artifact (typically <10% of the total
-        // — wlbc + native libs dominate) but turns a "Class does
-        // not implement 'create(_)'" runtime error into a labelled
-        // span pointing at the actual call site.
+        // render through ariadne labels at install time. Storing
+        // the post-filter source keeps line numbers consistent
+        // with the bytecode the runtime executes.
         sections.push(Section {
             kind: SectionKind::Source,
             name: module_name.clone(),
