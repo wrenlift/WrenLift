@@ -1133,6 +1133,70 @@ fn rename_entry_to_manifest_name(
 /// already-installed class. Name collisions between modules /
 /// sections are rejected loudly so ambiguous imports never slip
 /// through to runtime.
+/// Resolve a registry version dep to its `.hatch` bytes —
+/// cache hit reads, cache miss fetches from the registry CDN
+/// and populates `cache_dir` (or `$HOME/.hatch/cache` when
+/// `None`) before reading. Fetches are logged to stderr so
+/// the CLI shows progress; set `HATCH_OFFLINE=1` to refuse
+/// network access (preserves the old strict-offline behaviour
+/// for hermetic CI environments).
+#[cfg(feature = "host")]
+fn resolve_version_cached_or_fetch(
+    dep_name: &str,
+    version: &str,
+    cache_dir: Option<&Path>,
+) -> Result<Vec<u8>, HatchError> {
+    let registry = crate::hatch_registry::registry_url();
+    let offline = std::env::var_os("HATCH_OFFLINE").is_some();
+
+    // Compute the cache path up-front for both branches so the
+    // miss logic is symmetric.
+    let cached_path = match cache_dir {
+        Some(dir) => crate::hatch_registry::cached_artifact_path_in(dir, dep_name, version),
+        None => crate::hatch_registry::cached_artifact_path(dep_name, version)
+            .map_err(|e| HatchError::Encode(e.to_string()))?,
+    };
+
+    let path = if cached_path.exists() {
+        // Cache hit — silent. Validate magic so a corrupt
+        // cache entry doesn't surface as a confusing parse
+        // error inside `load()`.
+        crate::hatch_registry::ensure_in_cache_dir(
+            cached_path.parent().unwrap_or_else(|| Path::new(".")),
+            &registry,
+            dep_name,
+            version,
+        )
+        .map_err(|e| HatchError::Encode(format!(
+            "cached artifact for '{}@{}' failed to validate: {}",
+            dep_name, version, e
+        )))?
+    } else if offline {
+        return Err(HatchError::Encode(format!(
+            "dependency '{}@{}' isn't cached and HATCH_OFFLINE is set. \
+             Run `hatch install {}@{}` first or unset HATCH_OFFLINE.",
+            dep_name, version, dep_name, version
+        )));
+    } else {
+        // Cache miss — fetch + populate. Surface the install
+        // so a `hatch build` that walks 20 deps reads as
+        // progress instead of silent stalls during downloads.
+        let url = crate::hatch_registry::release_url(&registry, dep_name, version);
+        eprintln!("hatch: installing {}@{} from {}", dep_name, version, url);
+        let dest = match cache_dir {
+            Some(dir) => crate::hatch_registry::ensure_in_cache_dir(
+                dir, &registry, dep_name, version,
+            ),
+            None => crate::hatch_registry::ensure_in_cache(&registry, dep_name, version),
+        };
+        dest.map_err(|e| HatchError::Encode(format!(
+            "dependency '{}@{}' resolution failed: {}",
+            dep_name, version, e
+        )))?
+    };
+    Ok(std::fs::read(&path)?)
+}
+
 /// Resolve a single dependency declaration to the `.hatch` bytes it
 /// represents. Handles all three `Dependency` shapes — path (build
 /// the sibling workspace), version (registry cache), git (git cache).
@@ -1168,18 +1232,7 @@ fn resolve_dep_bytes_inner(
             })
         }
         Dependency::Version(version) => {
-            let cached = match cache_dir {
-                Some(dir) => crate::hatch_registry::cached_artifact_path_in(dir, dep_name, version),
-                None => crate::hatch_registry::cached_artifact_path(dep_name, version)
-                    .map_err(|e| HatchError::Encode(e.to_string()))?,
-            };
-            if !cached.exists() {
-                return Err(HatchError::Encode(format!(
-                    "dependency '{}@{}' isn't cached. Run `hatch install {}@{}` first.",
-                    dep_name, version, dep_name, version
-                )));
-            }
-            Ok(std::fs::read(&cached)?)
+            resolve_version_cached_or_fetch(dep_name, version, cache_dir)
         }
         Dependency::Url { url } => {
             // Direct-URL deps are wasm-runtime-only; the host
@@ -1253,23 +1306,12 @@ fn merge_path_dependencies(
                 })?
             }
             Dependency::Version(version) => {
-                // Resolve via registry cache. `hatch install` populates
-                // this; during `hatch build` we refuse to fetch so
-                // offline builds remain deterministic.
-                let cached = match cache_dir {
-                    Some(dir) => {
-                        crate::hatch_registry::cached_artifact_path_in(dir, &dep_name, version)
-                    }
-                    None => crate::hatch_registry::cached_artifact_path(&dep_name, version)
-                        .map_err(|e| HatchError::Encode(e.to_string()))?,
-                };
-                if !cached.exists() {
-                    return Err(HatchError::Encode(format!(
-                        "dependency '{}@{}' isn't cached. Run `hatch install {}@{}` first.",
-                        dep_name, version, dep_name, version
-                    )));
-                }
-                std::fs::read(&cached)?
+                // Cache-or-fetch via the registry. `hatch install`
+                // can pre-populate, but `hatch build` is allowed to
+                // pull on demand too — set `HATCH_OFFLINE=1` to
+                // restore strict offline behaviour for hermetic
+                // CI / network-egress-blocked environments.
+                resolve_version_cached_or_fetch(&dep_name, version, cache_dir)?
             }
             Dependency::Git { git, .. } => {
                 let git_ref = dep.git_ref().ok_or_else(|| {
@@ -2095,10 +2137,12 @@ mylib = { git = "https://example.invalid/alice/mylib.git", tag = "v0.1.0" }
     }
 
     #[test]
-    fn build_reports_missing_cached_version() {
-        // A version-pinned dep with nothing in the cache must surface
-        // a pointed error — not silently succeed, not reach the
-        // network during `hatch build`.
+    fn build_reports_missing_cached_version_when_offline() {
+        // With HATCH_OFFLINE set, a version-pinned dep with
+        // nothing in the cache must surface a pointed error
+        // pointing at the explicit-install workflow — not reach
+        // the network. (Default behaviour now auto-fetches on
+        // miss; this test pins the hermetic mode.)
         let scratch = tempfile::tempdir().expect("tempdir");
         let cache_dir = scratch.path().join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
@@ -2117,11 +2161,23 @@ ghost = "9.9.9"
         )
         .unwrap();
 
+        // SAFETY: env mutation is process-wide. Tests run
+        // single-threaded under `cargo test --lib` by default,
+        // and we restore the original on exit so neighbouring
+        // tests in the same binary aren't affected.
+        let prev = std::env::var_os("HATCH_OFFLINE");
+        unsafe { std::env::set_var("HATCH_OFFLINE", "1"); }
         let result = build_from_source_tree_with_cache(&workspace, Some(&cache_dir));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HATCH_OFFLINE", v) },
+            None => unsafe { std::env::remove_var("HATCH_OFFLINE") },
+        }
+
         match result {
             Err(HatchError::Encode(msg)) => {
                 assert!(msg.contains("ghost"));
                 assert!(msg.contains("hatch install"));
+                assert!(msg.contains("HATCH_OFFLINE"));
             }
             other => panic!("expected install hint, got {:?}", other),
         }
