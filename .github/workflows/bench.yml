@@ -194,6 +194,18 @@ jobs:
           mkdir -p site/benchmark
           echo "$RESULTS" > site/benchmark/results.json
 
+      - name: Copy install.sh into the site root
+        # The landing's install one-liner is
+        # `curl -fsSL wrenlift.com/install.sh | sh`. Pages
+        # serves whatever lives in `site/`, so the script needs
+        # to be there. Copy from the repo root so the deployed
+        # version always matches the README's reference; ensure
+        # it's executable for completeness even though GitHub
+        # Pages serves text/plain anyway.
+        run: |
+          cp install.sh site/install.sh
+          chmod +x site/install.sh
+
       - name: Install wasm-pack
         # `wasm-pack` produces the `wasm/pkg/` bundle the
         # playground imports. Cargo-installable so we don't need

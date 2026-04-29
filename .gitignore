@@ -14,6 +14,7 @@ wasm/pkg/
 # rebuilt every commit.
 site/benchmark/results.json
 site/playground/
+site/install.sh
 
 # Local-only state from /loop's wakeup scheduler — never tracked.
 .claude/
