@@ -856,8 +856,86 @@ class MainWlift {
     // GPU bridge factory — exposes the host_gpu_* surface that
     // wlift_gpu_web's plugin imports. Closes over the shared
     // `canvases` registry (so a canvas created via @hatch:window
-    // is referenceable here by handle) and the lazy GPU device.
-    function makeGpuBridge() {
+    // is referenceable here by handle), the shared `gpuObjects`
+    // resource registry, and the lazy GPU device.
+    //
+    // Like makeDomBridge, we parameterise on `getInstance` so
+    // bridge fns that read from plugin memory (shader source,
+    // buffer write, descriptor JSON) can resolve the plugin's
+    // current `WebAssembly.Instance` at call time.
+    function makeGpuBridge(getInstance) {
+      // The variable-length data-carrying bridge fns (shader src,
+      // buffer writes, descriptor JSON) take a `vm` + slot index
+      // and read directly from the host-side Wren slot. That's
+      // cheaper and simpler than the plugin-memory copy dance,
+      // and there's no shared-memory issue because the slot read
+      // happens entirely inside the host's wasm context.
+      const readSlotString = (vm, slot) => {
+        const ptr = wasm.wrenGetSlotString(vm, slot);
+        if (!ptr) return null;
+        const view = new Uint8Array(wasm.memory.buffer);
+        let len = 0;
+        // Bounded scan — wrenGetSlotString returns a NUL-terminated
+        // C-string. Wren-side strings can contain embedded NULs,
+        // but shader WGSL / descriptor JSON never do.
+        while (view[ptr + len] !== 0) len++;
+        return new TextDecoder().decode(view.subarray(ptr, ptr + len));
+      };
+
+      const readSlotBytes = (vm, slot) => {
+        // Reuse wlift_host_alloc-style scratch: host C-API has
+        // wrenGetSlotBytes(vm, slot, &len_out). The length-out
+        // pointer needs scratch space in host memory.
+        const len_ptr = wasm.wlift_host_alloc(4);
+        const ptr = wasm.wrenGetSlotBytes(vm, slot, len_ptr);
+        const len = new Int32Array(wasm.memory.buffer, len_ptr, 1)[0];
+        wasm.wlift_host_free(len_ptr, 4);
+        if (!ptr || len <= 0) return null;
+        return new Uint8Array(wasm.memory.buffer, ptr, len);
+      };
+
+      const decodeSlotJson = (vm, slot) => {
+        const text = readSlotString(vm, slot);
+        if (!text) return null;
+        try {
+          return JSON.parse(text);
+        } catch (err) {
+          console.warn("[wlift gpu] descriptor JSON parse failed:", err);
+          return null;
+        }
+      };
+
+      // GPUShaderStage flags as numeric: VERTEX=1, FRAGMENT=2, COMPUTE=4.
+      // Accept Number or pipe-joined string for ergonomics.
+      const parseVisibility = (v) => {
+        if (typeof v === "number") return v;
+        if (typeof v !== "string") return 0;
+        let bits = 0;
+        for (const part of v.split("|").map((s) => s.trim().toLowerCase())) {
+          if (part === "vertex") bits |= 1;
+          else if (part === "fragment") bits |= 2;
+          else if (part === "compute") bits |= 4;
+        }
+        return bits;
+      };
+
+      // Bind-group resource descriptor → live GPU object. Only the
+      // buffer-binding shape is wired today; sampler / texture
+      // bindings would be similar lookups.
+      const resolveBindResource = (r) => {
+        if (!r) return undefined;
+        if (r.kind === "buffer") {
+          const obj = gpuObjects.get(r.buffer);
+          if (!obj || obj.kind !== "buffer") return undefined;
+          return {
+            buffer: obj.buffer,
+            ...(r.offset !== undefined ? { offset: r.offset } : {}),
+            ...(r.size   !== undefined ? { size:   r.size   } : {}),
+          };
+        }
+        return undefined;
+      };
+
       return {
         host_gpu_ready: () => (gpuDevice ? 1 : 0),
 
@@ -937,6 +1015,282 @@ class MainWlift {
           // refs, the browser handles the actual present.
           gpuObjects.delete(frame_handle);
         },
+
+        // ----- Buffers ------------------------------------------
+
+        host_gpu_create_buffer: (size, usage_bits) => {
+          if (!gpuDevice) return 0;
+          const buf = gpuDevice.createBuffer({
+            size,
+            usage: usage_bits,
+          });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "buffer", buffer: buf, size });
+          return handle;
+        },
+
+        host_gpu_buffer_write: (vm, buffer_handle, offset, slot) => {
+          if (!gpuDevice) return;
+          const obj = gpuObjects.get(buffer_handle);
+          if (!obj || obj.kind !== "buffer") return;
+          const bytes = readSlotBytes(vm, slot);
+          if (!bytes) return;
+          // Copy out of host linear memory into a fresh
+          // ArrayBuffer before handing to queue.writeBuffer.
+          // Safari has historically flagged sharing the live
+          // wasm memory backing while the canvas present is in
+          // flight; the extra memcpy is dwarfed by the CPU→GPU
+          // transfer the queue performs anyway.
+          gpuDevice.queue.writeBuffer(obj.buffer, offset, bytes.slice());
+        },
+
+        host_gpu_destroy_buffer: (handle) => {
+          const obj = gpuObjects.get(handle);
+          if (!obj || obj.kind !== "buffer") return;
+          obj.buffer.destroy?.();
+          gpuObjects.delete(handle);
+        },
+
+        // ----- Float-list ergonomics ----------------------------
+        //
+        // Wren-side byte packing of f32 / u32 is awkward (no
+        // direct float-to-bits intrinsic). These helpers accept
+        // a Wren List of Num values and pack them to typed-array
+        // bytes on the JS side before creating / writing the
+        // buffer. For high-frequency per-frame writes (uniform
+        // buffer updates), the Wren List → Float32Array
+        // conversion is the same shape every frame, so the cost
+        // is bounded.
+
+        host_gpu_create_buffer_from_f32: (vm, list_slot, usage_bits) => {
+          if (!gpuDevice) return 0;
+          const count = wasm.wrenGetListCount(vm, list_slot);
+          if (count <= 0) return 0;
+          const floats = new Float32Array(count);
+          wasm.wrenEnsureSlots(vm, list_slot + 2);
+          const dest = list_slot + 1;
+          for (let i = 0; i < count; i++) {
+            wasm.wrenGetListElement(vm, list_slot, i, dest);
+            floats[i] = wasm.wrenGetSlotDouble(vm, dest);
+          }
+          const buf = gpuDevice.createBuffer({
+            size: floats.byteLength,
+            usage: usage_bits,
+          });
+          gpuDevice.queue.writeBuffer(buf, 0, floats);
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "buffer", buffer: buf, size: floats.byteLength });
+          return handle;
+        },
+
+        host_gpu_buffer_write_f32: (vm, buffer_handle, offset, list_slot) => {
+          if (!gpuDevice) return;
+          const obj = gpuObjects.get(buffer_handle);
+          if (!obj || obj.kind !== "buffer") return;
+          const count = wasm.wrenGetListCount(vm, list_slot);
+          if (count <= 0) return;
+          const floats = new Float32Array(count);
+          wasm.wrenEnsureSlots(vm, list_slot + 2);
+          const dest = list_slot + 1;
+          for (let i = 0; i < count; i++) {
+            wasm.wrenGetListElement(vm, list_slot, i, dest);
+            floats[i] = wasm.wrenGetSlotDouble(vm, dest);
+          }
+          gpuDevice.queue.writeBuffer(obj.buffer, offset, floats);
+        },
+
+        // ----- Shaders ------------------------------------------
+
+        host_gpu_create_shader: (vm, slot) => {
+          if (!gpuDevice) return 0;
+          const code = readSlotString(vm, slot);
+          if (!code) return 0;
+          const module = gpuDevice.createShaderModule({ code });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "shader", module });
+          return handle;
+        },
+
+        // ----- Pipelines / bind groups (descriptor-driven) ------
+        //
+        // Plugin builds a JSON descriptor (Wren-side, via
+        // @hatch:json or a literal-built map) and hands the
+        // bridge a (ptr, len) pair. The bridge unpacks it,
+        // resolves handle references, and constructs the real
+        // WebGPU descriptor.
+
+        host_gpu_create_bind_group_layout: (vm, slot) => {
+          if (!gpuDevice) return 0;
+          const desc = decodeSlotJson(vm, slot);
+          if (!desc) return 0;
+          // Spec shape: { entries: [{binding, visibility, buffer|sampler|texture|storageTexture}] }
+          // Visibility: number (bitflags) or string with '|' joins.
+          const entries = (desc.entries || []).map((e) => ({
+            binding: e.binding,
+            visibility: parseVisibility(e.visibility),
+            ...(e.buffer ? { buffer: e.buffer } : {}),
+            ...(e.sampler ? { sampler: e.sampler } : {}),
+            ...(e.texture ? { texture: e.texture } : {}),
+            ...(e.storageTexture ? { storageTexture: e.storageTexture } : {}),
+          }));
+          const layout = gpuDevice.createBindGroupLayout({ entries });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "bind_group_layout", layout });
+          return handle;
+        },
+
+        host_gpu_create_bind_group: (vm, slot) => {
+          if (!gpuDevice) return 0;
+          const desc = decodeSlotJson(vm, slot);
+          if (!desc) return 0;
+          // { layout: <handle>, entries: [{binding, resource: {kind:"buffer", buffer, offset, size}}] }
+          const layoutObj = gpuObjects.get(desc.layout);
+          if (!layoutObj || layoutObj.kind !== "bind_group_layout") return 0;
+          const entries = (desc.entries || []).map((e) => ({
+            binding: e.binding,
+            resource: resolveBindResource(e.resource),
+          }));
+          const bindGroup = gpuDevice.createBindGroup({
+            layout: layoutObj.layout,
+            entries,
+          });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "bind_group", bindGroup });
+          return handle;
+        },
+
+        host_gpu_create_pipeline: (vm, slot) => {
+          if (!gpuDevice) return 0;
+          const desc = decodeSlotJson(vm, slot);
+          if (!desc) return 0;
+          // {
+          //   "layouts": [<bind_group_layout_handles>] | "auto",
+          //   "vertex":   {"shader": <h>, "entry": "vs_main", "buffers": [...]},
+          //   "fragment": {"shader": <h>, "entry": "fs_main", "targets": [...]},
+          //   "primitive": {"topology": "triangle-list"},
+          //   "depthStencil": null
+          // }
+          const vertShader = gpuObjects.get(desc.vertex.shader);
+          if (!vertShader || vertShader.kind !== "shader") return 0;
+          const fragShader =
+            desc.fragment && gpuObjects.get(desc.fragment.shader);
+          if (desc.fragment && (!fragShader || fragShader.kind !== "shader")) return 0;
+          let layout = "auto";
+          if (Array.isArray(desc.layouts)) {
+            const bgls = desc.layouts.map((h) => {
+              const obj = gpuObjects.get(h);
+              return obj && obj.kind === "bind_group_layout" ? obj.layout : null;
+            }).filter(Boolean);
+            layout = gpuDevice.createPipelineLayout({ bindGroupLayouts: bgls });
+          }
+          const targets = (desc.fragment?.targets || [{}]).map((t) => ({
+            format: t.format === "preferred" || !t.format ? gpuPreferredFormat : t.format,
+            ...(t.blend ? { blend: t.blend } : {}),
+            ...(t.writeMask !== undefined ? { writeMask: t.writeMask } : {}),
+          }));
+          const pipelineDesc = {
+            layout,
+            vertex: {
+              module: vertShader.module,
+              entryPoint: desc.vertex.entry || "vs_main",
+              buffers: desc.vertex.buffers || [],
+            },
+            ...(fragShader ? {
+              fragment: {
+                module: fragShader.module,
+                entryPoint: desc.fragment.entry || "fs_main",
+                targets,
+              },
+            } : {}),
+            primitive: desc.primitive || { topology: "triangle-list" },
+            ...(desc.depthStencil ? { depthStencil: desc.depthStencil } : {}),
+          };
+          const pipeline = gpuDevice.createRenderPipeline(pipelineDesc);
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "pipeline", pipeline });
+          return handle;
+        },
+
+        // ----- Render-pass commands ------------------------------
+
+        host_gpu_render_pass_begin: (vm, frame_handle, slot) => {
+          const frame = gpuObjects.get(frame_handle);
+          if (!frame || frame.kind !== "frame") return 0;
+          const desc = decodeSlotJson(vm, slot);
+          // colorAttachments default: clear to opaque black.
+          const cas = (desc?.colorAttachments || [{}]).map((c) => ({
+            view: frame.view,
+            clearValue: c.clearValue || { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: c.loadOp || "clear",
+            storeOp: c.storeOp || "store",
+          }));
+          const pass = frame.encoder.beginRenderPass({
+            colorAttachments: cas,
+          });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "render_pass", pass, frame: frame_handle });
+          return handle;
+        },
+
+        host_gpu_render_pass_set_pipeline: (pass_handle, pipeline_handle) => {
+          const p = gpuObjects.get(pass_handle);
+          const pl = gpuObjects.get(pipeline_handle);
+          if (!p || p.kind !== "render_pass") return;
+          if (!pl || pl.kind !== "pipeline") return;
+          p.pass.setPipeline(pl.pipeline);
+        },
+
+        host_gpu_render_pass_set_bind_group: (pass_handle, group_index, bg_handle) => {
+          const p = gpuObjects.get(pass_handle);
+          const bg = gpuObjects.get(bg_handle);
+          if (!p || p.kind !== "render_pass") return;
+          if (!bg || bg.kind !== "bind_group") return;
+          p.pass.setBindGroup(group_index, bg.bindGroup);
+        },
+
+        host_gpu_render_pass_set_vertex_buffer: (pass_handle, slot, buffer_handle) => {
+          const p = gpuObjects.get(pass_handle);
+          const buf = gpuObjects.get(buffer_handle);
+          if (!p || p.kind !== "render_pass") return;
+          if (!buf || buf.kind !== "buffer") return;
+          p.pass.setVertexBuffer(slot, buf.buffer);
+        },
+
+        host_gpu_render_pass_set_index_buffer: (pass_handle, buffer_handle, format32) => {
+          const p = gpuObjects.get(pass_handle);
+          const buf = gpuObjects.get(buffer_handle);
+          if (!p || p.kind !== "render_pass") return;
+          if (!buf || buf.kind !== "buffer") return;
+          p.pass.setIndexBuffer(buf.buffer, format32 ? "uint32" : "uint16");
+        },
+
+        host_gpu_render_pass_draw: (pass_handle, vertex_count, instance_count, first_vertex, first_instance) => {
+          const p = gpuObjects.get(pass_handle);
+          if (!p || p.kind !== "render_pass") return;
+          p.pass.draw(vertex_count, instance_count || 1, first_vertex || 0, first_instance || 0);
+        },
+
+        host_gpu_render_pass_draw_indexed: (pass_handle, index_count, instance_count, first_index, base_vertex, first_instance) => {
+          const p = gpuObjects.get(pass_handle);
+          if (!p || p.kind !== "render_pass") return;
+          p.pass.drawIndexed(index_count, instance_count || 1, first_index || 0, base_vertex || 0, first_instance || 0);
+        },
+
+        host_gpu_render_pass_end: (pass_handle) => {
+          const p = gpuObjects.get(pass_handle);
+          if (!p || p.kind !== "render_pass") return;
+          p.pass.end();
+          gpuObjects.delete(pass_handle);
+        },
+
+        // ----- Generic destroy for non-buffer resources --------
+
+        host_gpu_destroy: (handle) => {
+          const obj = gpuObjects.get(handle);
+          if (!obj) return;
+          if (obj.kind === "buffer") obj.buffer.destroy?.();
+          gpuObjects.delete(handle);
+        },
       };
     }
 
@@ -947,7 +1301,7 @@ class MainWlift {
       // we hand it has to be built first, and the bridges that
       // reference plugin memory close over a deferred lookup.
       const dom = makeDomBridge(getInstance);
-      const gpu = makeGpuBridge();
+      const gpu = makeGpuBridge(getInstance);
       return {
         env: {
           // Layer 1: passthrough of every wlift_wasm export. Spreads

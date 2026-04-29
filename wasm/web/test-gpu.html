@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>wlift on-demand GPU plugin smoke test — triangle</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; font: 13px/1.5 ui-monospace, monospace; max-height: 240px; }
+    h1 { font-size: 1.4rem; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+    .note  { color: #888; font-size: 0.9rem; }
+    #stage { display: block; margin-top: 1rem; border: 2px solid #1d1812; border-radius: 8px; padding: 8px; background: #1d1812; min-height: 420px; }
+    #stage canvas { display: block; margin: 0 auto; }
+  </style>
+</head>
+<body>
+  <h1>Phase 3 smoke — triangle via @hatch:window-web + @hatch:gpu-web</h1>
+  <p class="note">
+    Loads two on-demand wasm plugins (<code>wlift_window_web</code> + <code>wlift_gpu_web</code>),
+    instantiates them via the JS-side loader, runs a Wren script that creates a
+    canvas, builds a render pipeline from inline WGSL, and renders one frame of
+    a coloured triangle. Expect a toast-coloured triangle in the dark stage below.
+  </p>
+  <pre id="out">running…</pre>
+  <div id="stage"></div>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+
+    out.textContent = "";
+
+    try {
+      log("createWlift({ mode: 'main' })…");
+      const wlift = await createWlift({ mode: "main" });
+      log(`  ${wlift.version}`);
+
+      log("fetching hatch-gpu-web.hatch (carries window-web as transitive dep)…");
+      const r = await fetch("./hatch-gpu-web.hatch");
+      if (!r.ok) throw new Error(`fetch ${r.status}`);
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      log(`  ${bytes.length} bytes`);
+
+      const wgsl = `
+struct Uniforms {
+  rotation: mat4x4f,
+}
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+@vertex
+fn vs_main(@location(0) pos: vec3f) -> @builtin(position) vec4f {
+  return u.rotation * vec4f(pos, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+  return vec4f(0.85, 0.48, 0.17, 1.0);
+}
+`.trim();
+
+      // Identity matrix (4x4 column-major). Drop animation in a follow-up
+      // once a RAF foreign method lands; for the smoke test, one frame is
+      // enough to prove the pipeline.
+      const identityMat4 = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+      ];
+
+      // Triangle, three vertices in NDC (clip-space); z=0, then viewed
+      // through the identity matrix.
+      const triangle = [
+         0.0,  0.6, 0.0,
+        -0.6, -0.4, 0.0,
+         0.6, -0.4, 0.0,
+      ];
+
+      const source = `
+import "@hatch:window-web" for Window
+import "@hatch:gpu-web" for Gpu
+
+var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "phase 3 smoke"})
+if (canvas < 0) Fiber.abort("Window.create_ failed")
+System.print("canvas handle: %(canvas)")
+
+if (!Gpu.init_()) Fiber.abort("WebGPU not available")
+System.print("Gpu.init_: ok")
+
+var surface = Gpu.attachCanvas_(canvas)
+if (surface < 0) Fiber.abort("Gpu.attachCanvas_ failed")
+System.print("surface: %(surface)")
+
+var shader = Gpu.createShader_(${JSON.stringify(wgsl)})
+if (shader < 0) Fiber.abort("createShader_ failed")
+System.print("shader: %(shader)")
+
+// vertex buffer (positions) — VERTEX|COPY_DST = 32|8 = 40
+var vb = Gpu.createBufferFromFloats_(${JSON.stringify(triangle)}, 40)
+if (vb < 0) Fiber.abort("vertex buffer failed")
+System.print("vb: %(vb)")
+
+// uniform buffer for the rotation matrix — UNIFORM|COPY_DST = 64|8 = 72
+var ub = Gpu.createBufferFromFloats_(${JSON.stringify(identityMat4)}, 72)
+if (ub < 0) Fiber.abort("uniform buffer failed")
+System.print("ub: %(ub)")
+
+// bind group layout: one uniform binding visible to the vertex stage.
+var bgl = Gpu.createBindGroupLayout_(
+  "{\\"entries\\":[{\\"binding\\":0,\\"visibility\\":\\"vertex\\",\\"buffer\\":{\\"type\\":\\"uniform\\"}}]}"
+)
+if (bgl < 0) Fiber.abort("bind group layout failed")
+System.print("bgl: %(bgl)")
+
+var bg = Gpu.createBindGroup_(
+  "{\\"layout\\":%(bgl),\\"entries\\":[{\\"binding\\":0,\\"resource\\":{\\"kind\\":\\"buffer\\",\\"buffer\\":%(ub)}}]}"
+)
+if (bg < 0) Fiber.abort("bind group failed")
+System.print("bg: %(bg)")
+
+var pipelineDesc =
+  "{" +
+    "\\"layouts\\":[%(bgl)]," +
+    "\\"vertex\\":{" +
+      "\\"shader\\":%(shader),\\"entry\\":\\"vs_main\\"," +
+      "\\"buffers\\":[{\\"arrayStride\\":12,\\"attributes\\":[{\\"shaderLocation\\":0,\\"offset\\":0,\\"format\\":\\"float32x3\\"}]}]" +
+    "}," +
+    "\\"fragment\\":{" +
+      "\\"shader\\":%(shader),\\"entry\\":\\"fs_main\\"," +
+      "\\"targets\\":[{\\"format\\":\\"preferred\\"}]" +
+    "}," +
+    "\\"primitive\\":{\\"topology\\":\\"triangle-list\\"}" +
+  "}"
+var pipeline = Gpu.createPipeline_(pipelineDesc)
+if (pipeline < 0) Fiber.abort("pipeline failed")
+System.print("pipeline: %(pipeline)")
+
+var frame = Gpu.beginFrame_(surface)
+if (frame < 0) Fiber.abort("beginFrame failed")
+System.print("frame: %(frame)")
+
+var pass = Gpu.renderPassBegin_(frame,
+  "{\\"colorAttachments\\":[{\\"clearValue\\":{\\"r\\":0.06,\\"g\\":0.05,\\"b\\":0.04,\\"a\\":1.0},\\"loadOp\\":\\"clear\\",\\"storeOp\\":\\"store\\"}]}"
+)
+if (pass < 0) Fiber.abort("renderPassBegin failed")
+System.print("pass: %(pass)")
+
+Gpu.renderPassSetPipeline_(pass, pipeline)
+Gpu.renderPassSetBindGroup_(pass, 0, bg)
+Gpu.renderPassSetVertexBuffer_(pass, 0, vb)
+Gpu.renderPassDraw_(pass, 3, 1, 0, 0)
+Gpu.renderPassEnd_(pass)
+Gpu.endFrame_(frame)
+System.print("rendered ✓")
+`.trim();
+
+      log("runWithHatches…");
+      const result = await wlift.runWithHatches(source, [bytes]);
+      log(`  ok=${result.ok}  errorKind=${result.errorKind}  ${result.elapsedMs.toFixed(2)}ms`);
+      log("--- output ---");
+      log(result.output, result.ok ? "ok" : "err");
+
+      if (result.ok && result.output.includes("rendered ✓")) {
+        log("✓ PASS — pipeline ran end-to-end. Look for the triangle below.", "ok");
+      } else {
+        log("✗ FAIL", "err");
+      }
+    } catch (err) {
+      log(`exception: ${err}`, "err");
+      console.error(err);
+    }
+  </script>
+</body>
+</html>

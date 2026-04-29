@@ -43,6 +43,15 @@ unsafe extern "C" {
     fn wrenSetSlotDouble(vm: *mut c_void, slot: i32, value: f64);
     fn wrenSetSlotBool(vm: *mut c_void, slot: i32, value: bool);
     fn wrenSetSlotNull(vm: *mut c_void, slot: i32);
+    fn wrenGetSlotBytes(vm: *mut c_void, slot: i32, length: *mut i32) -> *const u8;
+}
+
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    // Slot bridges for descriptor JSON / WGSL passing. The host
+    // owns the cross-memory copy.
+    fn wlift_get_slot_str(vm: *mut c_void, slot: i32, out: *mut u8, max: i32) -> i32;
+    fn wlift_set_slot_str(vm: *mut c_void, slot: i32, ptr: *const u8, len: i32);
 }
 
 #[link(wasm_import_module = "env")]
@@ -82,6 +91,63 @@ unsafe extern "C" {
     /// release the per-frame state. The browser presents the
     /// canvas automatically once the queue settles.
     fn host_gpu_end_frame(frame_handle: u32);
+
+    // ---- Buffers ----------------------------------------------
+    fn host_gpu_create_buffer(size: u32, usage_bits: u32) -> u32;
+    /// Bridge reads bytes directly from the host-side Wren slot —
+    /// no plugin-memory boundary. Pass the VM + slot containing
+    /// a Wren String / Bytes value.
+    fn host_gpu_buffer_write(vm: *mut c_void, buffer_handle: u32, offset: u32, slot: i32);
+    fn host_gpu_destroy_buffer(handle: u32);
+
+    /// Wren-side ergonomics — given a List of Nums, pack as a
+    /// `Float32Array` and create a buffer in one shot. Avoids
+    /// the byte-packing dance Wren would otherwise need.
+    fn host_gpu_create_buffer_from_f32(vm: *mut c_void, slot: i32, usage_bits: u32) -> u32;
+    fn host_gpu_buffer_write_f32(vm: *mut c_void, buffer_handle: u32, offset: u32, slot: i32);
+
+    // ---- Shaders ----------------------------------------------
+    /// WGSL source comes from the slot — same slot-based pattern
+    /// as buffer_write.
+    fn host_gpu_create_shader(vm: *mut c_void, slot: i32) -> u32;
+
+    // ---- Pipelines / bind groups (descriptor JSON in slots) ---
+    fn host_gpu_create_bind_group_layout(vm: *mut c_void, slot: i32) -> u32;
+    fn host_gpu_create_bind_group(vm: *mut c_void, slot: i32) -> u32;
+    fn host_gpu_create_pipeline(vm: *mut c_void, slot: i32) -> u32;
+
+    // ---- Render pass commands --------------------------------
+    /// Begin a render pass. `desc_slot` carries an optional JSON
+    /// descriptor; pass `-1` to use defaults (clear to opaque
+    /// black, single color attachment from the frame texture).
+    fn host_gpu_render_pass_begin(
+        vm: *mut c_void,
+        frame_handle: u32,
+        desc_slot: i32,
+    ) -> u32;
+    fn host_gpu_render_pass_set_pipeline(pass: u32, pipeline: u32);
+    fn host_gpu_render_pass_set_bind_group(pass: u32, group_index: u32, bg: u32);
+    fn host_gpu_render_pass_set_vertex_buffer(pass: u32, slot: u32, buffer: u32);
+    fn host_gpu_render_pass_set_index_buffer(pass: u32, buffer: u32, format32: i32);
+    fn host_gpu_render_pass_draw(
+        pass: u32,
+        vertex_count: u32,
+        instance_count: u32,
+        first_vertex: u32,
+        first_instance: u32,
+    );
+    fn host_gpu_render_pass_draw_indexed(
+        pass: u32,
+        index_count: u32,
+        instance_count: u32,
+        first_index: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    );
+    fn host_gpu_render_pass_end(pass: u32);
+
+    // ---- Generic destroy --------------------------------------
+    fn host_gpu_destroy(handle: u32);
 }
 
 // ---------------------------------------------------------------
@@ -135,5 +201,222 @@ pub unsafe extern "C" fn wlift_gpu_clear(vm: *mut c_void) {
 pub unsafe extern "C" fn wlift_gpu_end_frame(vm: *mut c_void) {
     let frame = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
     unsafe { host_gpu_end_frame(frame) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+// ---------------------------------------------------------------
+// Buffers
+// ---------------------------------------------------------------
+
+/// `Gpu.createBuffer_(size, usageBits)` — returns Num (handle) or
+/// `-1`. `usageBits` follows GPUBufferUsage flags (1=MAP_READ,
+/// 2=MAP_WRITE, 4=COPY_SRC, 8=COPY_DST, 16=INDEX, 32=VERTEX,
+/// 64=UNIFORM, 128=STORAGE, 256=INDIRECT, 512=QUERY_RESOLVE).
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_buffer(vm: *mut c_void) {
+    let size = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let usage = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let h = unsafe { host_gpu_create_buffer(size, usage) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.bufferWrite_(handle, offset, bytes)` — bytes is a Wren
+/// String / Bytes value. Returns null.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_buffer_write(vm: *mut c_void) {
+    let handle = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let offset = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    unsafe { host_gpu_buffer_write(vm, handle, offset, 3) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+/// `Gpu.destroyBuffer_(handle)` — releases the GPUBuffer.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_destroy_buffer(vm: *mut c_void) {
+    let handle = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    unsafe { host_gpu_destroy_buffer(handle) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+/// `Gpu.createBufferFromFloats_(floats, usageBits)` — packs a
+/// Wren `List<Num>` as `Float32Array` bytes and creates a
+/// GPUBuffer in one call. The bridge does the f32 conversion;
+/// the Wren side just hands over a list. Returns Num (handle)
+/// or `-1`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_buffer_from_floats(vm: *mut c_void) {
+    let usage = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let h = unsafe { host_gpu_create_buffer_from_f32(vm, 1, usage) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.bufferWriteFloats_(buffer, offset, floats)` — writes a
+/// Wren `List<Num>` to an existing buffer as f32 bytes. Returns
+/// null.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut c_void) {
+    let handle = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let offset = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    unsafe { host_gpu_buffer_write_f32(vm, handle, offset, 3) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+// ---------------------------------------------------------------
+// Shaders / pipelines / bind groups
+// ---------------------------------------------------------------
+
+/// `Gpu.createShader_(wgslSource)` — compiles a `GPUShaderModule`
+/// from a WGSL string. Returns Num (handle) or `-1`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_shader(vm: *mut c_void) {
+    let h = unsafe { host_gpu_create_shader(vm, 1) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.createBindGroupLayout_(descriptorJson)` — descriptor:
+///   { "entries": [
+///       { "binding": Num, "visibility": "vertex|fragment|compute",
+///         "buffer": { "type": "uniform"|"storage"|"read-only-storage" },
+///         "sampler": {...}, "texture": {...}, "storageTexture": {...}
+///       }
+///   ] }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_bind_group_layout(vm: *mut c_void) {
+    let h = unsafe { host_gpu_create_bind_group_layout(vm, 1) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.createBindGroup_(descriptorJson)` — descriptor:
+///   { "layout": Num,
+///     "entries": [
+///       { "binding": Num,
+///         "resource": { "kind": "buffer", "buffer": Num, "offset": Num, "size": Num }
+///       }
+///     ] }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_bind_group(vm: *mut c_void) {
+    let h = unsafe { host_gpu_create_bind_group(vm, 1) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+/// `Gpu.createPipeline_(descriptorJson)` — descriptor:
+///   { "layouts": ["auto" or [Num, Num, ...]],
+///     "vertex":   { "shader": Num, "entry": "vs_main", "buffers": [...] },
+///     "fragment": { "shader": Num, "entry": "fs_main",
+///                   "targets": [{ "format": "preferred"|"rgba8unorm"|... }] },
+///     "primitive": { "topology": "triangle-list"|... } }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_create_pipeline(vm: *mut c_void) {
+    let h = unsafe { host_gpu_create_pipeline(vm, 1) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+// ---------------------------------------------------------------
+// Render pass — explicit pass for shader-based draws (the simple
+// `Gpu.clear_` shortcut above is a single-purpose convenience).
+// ---------------------------------------------------------------
+
+/// `Gpu.renderPassBegin_(frame, descriptorJson)` — `descriptorJson`
+/// can be an empty string (or null) to use sensible defaults
+/// (single colour attachment, clear to opaque black). Otherwise:
+///   { "colorAttachments": [
+///       { "clearValue": {"r":..,"g":..,"b":..,"a":..},
+///         "loadOp": "clear"|"load",
+///         "storeOp": "store"|"discard" }
+///   ] }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_begin(vm: *mut c_void) {
+    let frame = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let h = unsafe { host_gpu_render_pass_begin(vm, frame, 2) };
+    let result = if h == 0 { -1.0 } else { h as f64 };
+    unsafe { wrenSetSlotDouble(vm, 0, result) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_set_pipeline(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let pipeline = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    unsafe { host_gpu_render_pass_set_pipeline(pass, pipeline) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_set_bind_group(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let group = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let bg = unsafe { wrenGetSlotDouble(vm, 3) } as u32;
+    unsafe { host_gpu_render_pass_set_bind_group(pass, group, bg) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_set_vertex_buffer(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let slot_idx = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let buffer = unsafe { wrenGetSlotDouble(vm, 3) } as u32;
+    unsafe { host_gpu_render_pass_set_vertex_buffer(pass, slot_idx, buffer) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+/// `Gpu.renderPassSetIndexBuffer_(pass, buffer, format32)` —
+/// `format32` is true for `uint32`, false (default) for `uint16`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_set_index_buffer(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let buffer = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let format32 = unsafe { wrenGetSlotDouble(vm, 3) } as i32;
+    unsafe { host_gpu_render_pass_set_index_buffer(pass, buffer, format32) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_draw(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let vertex_count = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let instance_count = unsafe { wrenGetSlotDouble(vm, 3) } as u32;
+    let first_vertex = unsafe { wrenGetSlotDouble(vm, 4) } as u32;
+    let first_instance = unsafe { wrenGetSlotDouble(vm, 5) } as u32;
+    unsafe { host_gpu_render_pass_draw(pass, vertex_count, instance_count, first_vertex, first_instance) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_draw_indexed(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    let index_count = unsafe { wrenGetSlotDouble(vm, 2) } as u32;
+    let instance_count = unsafe { wrenGetSlotDouble(vm, 3) } as u32;
+    let first_index = unsafe { wrenGetSlotDouble(vm, 4) } as u32;
+    let base_vertex = unsafe { wrenGetSlotDouble(vm, 5) } as i32;
+    let first_instance = unsafe { wrenGetSlotDouble(vm, 6) } as u32;
+    unsafe {
+        host_gpu_render_pass_draw_indexed(
+            pass,
+            index_count,
+            instance_count,
+            first_index,
+            base_vertex,
+            first_instance,
+        )
+    };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_render_pass_end(vm: *mut c_void) {
+    let pass = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    unsafe { host_gpu_render_pass_end(pass) };
+    unsafe { wrenSetSlotNull(vm, 0) };
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_destroy(vm: *mut c_void) {
+    let handle = unsafe { wrenGetSlotDouble(vm, 1) } as u32;
+    unsafe { host_gpu_destroy(handle) };
     unsafe { wrenSetSlotNull(vm, 0) };
 }
