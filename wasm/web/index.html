@@ -452,7 +452,14 @@ var elapsed = (System.clock - start) * 1000
 // `@hatch:assert` is fetched on demand from the dev server
 Expect.that(result).toBe(6765)
 Expect.that(elapsed).not.toBeNull()
-System.print("fib(20) = %(result)  (%((elapsed * 100).round / 100) ms)")
+// Wren's Num→String drops trailing zeros, so dividing by 100
+// would render `8.0` as `"8"`. Build the two-digit fraction by
+// hand: round to hundredths, split into whole + frac, pad.
+var hundredths = (elapsed * 100).round
+var whole = (hundredths / 100).floor
+var frac = hundredths - whole * 100
+var fracStr = frac < 10 ? "0%(frac)" : "%(frac)"
+System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
 </textarea>
         </div>
         <div class="splitter h" id="split-wren-hatch" data-resize="wren"></div>
