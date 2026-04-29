@@ -474,9 +474,19 @@ class WorkerWlift {
     return new Promise((resolve) => {
       const id = this.nextId++;
       this.pending.set(id, resolve);
-      const bufs = (deps ?? []).map((b) =>
-        b instanceof Uint8Array ? b : new Uint8Array(b),
-      );
+      // `slice()` clones each dep onto a fresh ArrayBuffer
+      // *before* the transfer list detaches it. Without the
+      // clone, callers that hold their dep array across
+      // multiple runs (the playground's dep cache, mode
+      // switches that re-feed the same bundles to a new
+      // worker) hit `DataCloneError: ArrayBuffer is already
+      // detached` on the second send. The clone is one memcpy
+      // per dep — negligible vs the wasm install — and keeps
+      // the per-call transfer optimisation intact.
+      const bufs = (deps ?? []).map((b) => {
+        const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
+        return u8.slice();
+      });
       this.worker.postMessage(
         { cmd: "run-with-hatches", id, source, deps: bufs },
         bufs.map((b) => b.buffer),
