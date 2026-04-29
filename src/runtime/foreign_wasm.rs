@@ -291,12 +291,16 @@ pub fn resolve_symbol(
         })
 }
 
-/// Wasm-bindgen import shim implemented by `wlift_wasm`. JS-side
-/// dispatcher takes the dynamic-entry index plus the VM pointer
-/// and routes the call to the right plugin module's exported fn.
-/// Lives behind `cfg(target_arch = "wasm32")` because it depends
-/// on a wasm import that only the wlift_wasm host shim defines.
+/// Wasm import provided by the JS host at module instantiation.
+/// JS-side dispatcher takes the dynamic-entry index plus the VM
+/// pointer and routes the call to the right plugin module's
+/// exported fn. The `link(wasm_import_module = "env")` attr
+/// makes this a real wasm import (matching the namespace JS
+/// supplies at instantiation) rather than an unresolved Rust
+/// symbol — which would make `wren_lift`'s own wasm cdylib
+/// fail to link.
 #[cfg(target_arch = "wasm32")]
+#[link(wasm_import_module = "env")]
 extern "C" {
     fn wlift_dispatch_dynamic_plugin(idx: u32, vm: *mut VM);
 }

@@ -677,6 +677,32 @@ pub fn register_static_plugins() {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn register_static_plugins() {}
 
+// ---------------------------------------------------------------------------
+// On-demand wasm plugin loader — Rust-side bridge surface
+// ---------------------------------------------------------------------------
+//
+// `wren_lift::runtime::foreign_wasm::dispatch_dynamic` declares
+// `env::wlift_dispatch_dynamic_plugin(idx, vm)` as a wasm import
+// (via `#[link(wasm_import_module = "env")]`). JS provides that
+// import at instantiation — the loader owns the registry of
+// plugin instances + which export to call by index. This file
+// only exposes the *registration* side of the bridge; the
+// dispatch path is JS-only by design (cross-wasm-module calls
+// have no in-Rust shortcut once you skip wasm-bindgen on the
+// plugin side).
+
+/// Wasm-bindgen export. JS calls this once per foreign-method
+/// export discovered in a plugin module. The returned `idx` is
+/// what JS keys its `(plugin_instance, export_name)` map with;
+/// the same idx ends up in `Method::ForeignCDynamic(idx)` and
+/// rides back through `env::wlift_dispatch_dynamic_plugin` at
+/// call time.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wlift_register_plugin_dynamic_export(library: &str, symbol: &str) -> u32 {
+    wren_lift::runtime::foreign::register_plugin_dynamic(library, symbol)
+}
+
 /// Build identifier — hard-coded for the moment so JS can sanity-
 /// check the loaded wasm matches what its bundler thought it was
 /// importing.
