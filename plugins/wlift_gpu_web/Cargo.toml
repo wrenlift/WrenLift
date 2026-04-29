@@ -1,0 +1,17 @@
+[package]
+name = "wlift_gpu_web"
+version = "0.1.0"
+edition = "2021"
+description = "WebGPU plugin for the WrenLift game framework. Thin C-ABI shim — no wgpu, no wasm-bindgen, no web-sys. Maps Wren foreign methods directly onto navigator.gpu via JS-provided host bridges. WGSL shaders pass through verbatim. WebGL2 fallback intentionally absent: WebGPU is widely supported (Chrome 113+, Safari 17.4+, Firefox 141+, ~92% global desktop) and shipping the WGSL→GLSL transpiler / second backend would dominate the plugin's size + maintenance budget for ~10% additional reach."
+
+[lib]
+# Wasm-only on-demand plugin. Loaded lazily by the runtime when
+# a hatch bundle declares `wasm = "libs/wlift_gpu_web.wasm"`.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Same shape as wlift_window_web: zero Rust deps, every
+# capability is a wasm import. The host's wlift_wasm exports
+# pass through directly for Wren C API; wlift.js provides the
+# slot bridges and the wlift_gpu_* surface that drives
+# navigator.gpu.

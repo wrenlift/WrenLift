@@ -698,9 +698,55 @@ class MainWlift {
     //
     // makeDomBridge below builds layer (3); makePluginImports
     // glues all three together.
+    // Shared canvas registry — both makeDomBridge (creator) and
+    // makeGpuBridge (consumer) close over the same Map so a
+    // canvas created by @hatch:window can be referenced by
+    // handle from @hatch:gpu without round-tripping through
+    // Wren or through a separate cross-plugin lookup.
+    const canvases = new Map(); // handle -> { element, queue, closeRequested, teardown }
+    let nextCanvasHandle = 1;
+
+    // ---------------------------------------------------------
+    // GPU bridge — single device per page, lazy-init'd. Browsers
+    // require an async `requestAdapter` -> `requestDevice` dance
+    // before any GPU work can happen, but Wren-side foreign
+    // methods are sync. We pre-resolve at first plugin install
+    // (the install itself is async) and stash the device for
+    // every subsequent host_gpu_* call.
+    let gpuDevicePromise = null;
+    let gpuDevice = null;
+    let gpuPreferredFormat = null;
+    async function ensureGpuDevice() {
+      if (gpuDevice) return gpuDevice;
+      if (!gpuDevicePromise) {
+        gpuDevicePromise = (async () => {
+          const gpu = (typeof navigator !== "undefined") ? navigator.gpu : null;
+          if (!gpu) return null;
+          try {
+            const adapter = await gpu.requestAdapter();
+            if (!adapter) return null;
+            const device = await adapter.requestDevice();
+            gpuDevice = device;
+            gpuPreferredFormat = gpu.getPreferredCanvasFormat();
+            return device;
+          } catch (err) {
+            console.warn("[wlift gpu] requestAdapter/requestDevice failed:", err);
+            return null;
+          }
+        })();
+      }
+      return gpuDevicePromise;
+    }
+
+    // GPU resource registry — surfaces (canvas-bound contexts)
+    // and per-frame state (texture view + command encoder + pass)
+    // share one numeric handle space. WebGPU objects are kept
+    // alive by holding the JS refs; releasing on `endFrame` is
+    // a delete from this map.
+    const gpuObjects = new Map(); // handle -> any (kind-tagged)
+    let nextGpuHandle = 1;
+
     function makeDomBridge(getInstance) {
-      const canvases = new Map(); // handle -> {element, queue, closeRequested, teardown}
-      let nextHandle = 1;
       const readPluginUtf8 = (ptr, len) => {
         if (len <= 0) return "";
         const view = new Uint8Array(getInstance().exports.memory.buffer, ptr, len);
@@ -754,7 +800,7 @@ class MainWlift {
             canvas.parentNode?.removeChild(canvas);
           };
 
-          const handle = nextHandle++;
+          const handle = nextCanvasHandle++;
           canvases.set(handle, { element: canvas, queue, closeRequested: false, teardown });
           return handle;
         },
@@ -806,6 +852,94 @@ class MainWlift {
       };
     }
 
+    // ---------------------------------------------------------
+    // GPU bridge factory — exposes the host_gpu_* surface that
+    // wlift_gpu_web's plugin imports. Closes over the shared
+    // `canvases` registry (so a canvas created via @hatch:window
+    // is referenceable here by handle) and the lazy GPU device.
+    function makeGpuBridge() {
+      return {
+        host_gpu_ready: () => (gpuDevice ? 1 : 0),
+
+        host_gpu_attach_canvas: (canvas_handle) => {
+          if (!gpuDevice) return 0;
+          const c = canvases.get(canvas_handle);
+          if (!c) return 0;
+          // Already configured? Reuse the existing surface handle.
+          for (const [h, obj] of gpuObjects) {
+            if (obj && obj.kind === "surface" && obj.canvasHandle === canvas_handle) {
+              return h;
+            }
+          }
+          let context;
+          try {
+            context = c.element.getContext("webgpu");
+          } catch (_) {
+            return 0;
+          }
+          if (!context) return 0;
+          context.configure({
+            device: gpuDevice,
+            format: gpuPreferredFormat,
+            alphaMode: "premultiplied",
+          });
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, {
+            kind: "surface",
+            canvasHandle: canvas_handle,
+            context,
+          });
+          return handle;
+        },
+
+        host_gpu_begin_frame: (surface_handle) => {
+          if (!gpuDevice) return 0;
+          const surface = gpuObjects.get(surface_handle);
+          if (!surface || surface.kind !== "surface") return 0;
+          let texture;
+          try {
+            texture = surface.context.getCurrentTexture();
+          } catch (err) {
+            console.warn("[wlift gpu] getCurrentTexture failed:", err);
+            return 0;
+          }
+          const view = texture.createView();
+          const encoder = gpuDevice.createCommandEncoder();
+          const handle = nextGpuHandle++;
+          gpuObjects.set(handle, { kind: "frame", surface, texture, view, encoder });
+          return handle;
+        },
+
+        host_gpu_clear: (frame_handle, r, g, b, a) => {
+          const frame = gpuObjects.get(frame_handle);
+          if (!frame || frame.kind !== "frame") return;
+          const pass = frame.encoder.beginRenderPass({
+            colorAttachments: [
+              {
+                view: frame.view,
+                clearValue: { r, g, b, a },
+                loadOp: "clear",
+                storeOp: "store",
+              },
+            ],
+          });
+          pass.end();
+        },
+
+        host_gpu_end_frame: (frame_handle) => {
+          const frame = gpuObjects.get(frame_handle);
+          if (!frame || frame.kind !== "frame") return;
+          const buffer = frame.encoder.finish();
+          gpuDevice.queue.submit([buffer]);
+          // The GPUTexture / GPUTextureView keep refs to the
+          // current swap-chain image until the queue settles;
+          // dropping them from the registry releases the JS
+          // refs, the browser handles the actual present.
+          gpuObjects.delete(frame_handle);
+        },
+      };
+    }
+
     function makePluginImports(libName, getInstance) {
       // `getInstance` is a getter because the plugin's
       // `instance.exports.memory` isn't available until *after*
@@ -813,6 +947,7 @@ class MainWlift {
       // we hand it has to be built first, and the bridges that
       // reference plugin memory close over a deferred lookup.
       const dom = makeDomBridge(getInstance);
+      const gpu = makeGpuBridge();
       return {
         env: {
           // Layer 1: passthrough of every wlift_wasm export. Spreads
@@ -842,12 +977,22 @@ class MainWlift {
           },
           // Layer 3: DOM bridges.
           ...dom,
+          // Layer 4: GPU bridges.
+          ...gpu,
         },
       };
     }
 
     async function installWasmPlugin(libName, wasmBytes) {
       if (pluginInstances.has(libName)) return; // idempotent on repeat installs
+      // GPU plugins need an adapter+device pair acquired before
+      // the first Wren-side call; the request is async so we
+      // resolve it now while we're already in an async context.
+      // Cheap if WebGPU is unavailable (returns null and the
+      // plugin's `Gpu.init()` reports false).
+      if (libName === "wlift_gpu") {
+        await ensureGpuDevice();
+      }
       let instance;
       const imports = makePluginImports(libName, () => instance);
       const result = await WebAssembly.instantiate(wasmBytes, imports);

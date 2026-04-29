@@ -9,6 +9,7 @@ members = [
     "plugins/wlift_physics",
     "plugins/wlift_hello",
     "plugins/wlift_window_web",
+    "plugins/wlift_gpu_web",
     "wasm",
 ]
 resolver = "2"
