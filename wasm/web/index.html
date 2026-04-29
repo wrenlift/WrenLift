@@ -140,22 +140,56 @@
        to its content (≈ pane-header), and the textareas/console
        got `flex: 1` of zero. Result: tiny panes + huge empty
        space above footer. */
+    /* Resizable layout. `main` is a flex row whose children
+       (sections + splitters) share width via flex-grow. Each
+       section's flex-grow lives in an inline style so the JS
+       drag handler can update it on the fly. Splitters are
+       4px-wide gutters with col-resize cursors; hidden via
+       parent class when the adjacent pane is collapsed. */
     main {
-      display: grid;
-      /* Default: HTML pane is hidden, wren | output. Toggle the
-         `.show-html` class on `main` to reveal the html pane;
-         the grid then expands to three columns. */
-      grid-template-columns: 1.2fr 1fr;
-      grid-template-rows: minmax(0, 1fr);
-      gap: 1px;
+      display: flex;
+      flex-direction: row;
       background: var(--rule);
       overflow: hidden;
       min-height: 0;
     }
-    main.show-html {
-      grid-template-columns: 1fr 1.2fr 1fr;
+    main > section {
+      flex: 1 1 0;
+      min-width: 0;
+      background: var(--panel);
     }
-    main:not(.show-html) #html-section { display: none; }
+    main > .wren-col { flex: 1.2 1 0; }
+    main:not(.show-html) #html-section,
+    main:not(.show-html) #split-html-wren { display: none; }
+
+    .splitter {
+      background: var(--rule);
+      position: relative;
+      transition: background 0.1s ease;
+    }
+    .splitter.v {
+      flex: 0 0 4px;
+      cursor: col-resize;
+    }
+    .splitter.h {
+      flex: 0 0 4px;
+      cursor: row-resize;
+    }
+    .splitter:hover,
+    .splitter.dragging { background: var(--accent); }
+    /* Wider invisible hit area centered on the visible bar so
+       the cursor doesn't have to land precisely on 4px. */
+    .splitter::before {
+      content: "";
+      position: absolute;
+      inset: -4px;
+    }
+    .splitter.h::before { inset: -4px 0; }
+    .splitter.v::before { inset: 0 -4px; }
+    /* When dragging, kill text selection in the rest of the
+       page — otherwise the mouse drag highlights random text. */
+    body.resizing { user-select: none; }
+    body.resizing .splitter { background: var(--accent); }
     section {
       background: var(--panel);
       display: flex; flex-direction: column;
@@ -228,19 +262,18 @@
        keep reading `srcEl.value` etc. unchanged. */
     .editor-shadow { display: none; }
 
-    /* Output column: stage on top (renders the HTML), console
-       below behind a toggle. Default: stage takes full height
-       (console row collapsed). With `.show-console` on the col,
-       the console row reveals at half height. */
+    /* Output column: stage on top, console below behind a
+       toggle. flex column so JS can drag-resize the split. */
     .output-col {
-      display: grid;
-      grid-template-rows: 1fr;
+      display: flex;
+      flex-direction: column;
       min-height: 0;
     }
-    .output-col.show-console { grid-template-rows: 1fr 1fr; }
     .output-col .pane { display: flex; flex-direction: column; min-height: 0; }
-    .output-col .pane + .pane { border-top: 1px solid var(--rule); }
-    .output-col:not(.show-console) .console-pane { display: none; }
+    .output-col > .pane:first-child { flex: 1 1 0; }
+    .output-col > .pane.console-pane { flex: 1 1 0; min-height: 60px; }
+    .output-col:not(.show-console) .console-pane,
+    .output-col:not(.show-console) #split-stage-console { display: none; }
 
     /* Error dot on the console-toggle button when the most
        recent run errored AND the console is hidden — pulls
@@ -292,23 +325,23 @@
     .banner.hidden { display: none; }
     .hidden { display: none !important; }
 
-    /* The wren column stacks the source pane on top of an
-       optional hatchfile pane. By default only the source is
-       visible — the wren pane fills 100% height. Toggling the
-       header's `hatchfile` button shows the pane below at a
-       fixed share, with the source pane shrinking to fit. */
-    .wren-col { flex-direction: column; }
-    .wren-col .pane { display: flex; flex-direction: column; min-height: 0; }
-    .wren-col .wren-pane { flex: 1 1 100%; }
-    .wren-col.show-hatchfile .wren-pane { flex: 1 1 60%; }
-    .wren-col .hatchfile-pane {
-      display: none;
-      flex: 0 1 220px;
-      border-top: 1px solid var(--rule);
-    }
-    .wren-col.show-hatchfile .hatchfile-pane {
+    /* Wren column stacks the source pane on top of an optional
+       hatchfile pane. flex-grow on each pane is set inline by
+       the resize JS; the rules here are just the defaults +
+       visibility gate. */
+    .wren-col {
       display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
+    .wren-col .pane { display: flex; flex-direction: column; min-height: 0; }
+    .wren-col .wren-pane { flex: 1 1 0; }
+    .wren-col .hatchfile-pane {
+      flex: 0.6 1 0;
+      min-height: 60px;
+    }
+    .wren-col:not(.show-hatchfile) .hatchfile-pane,
+    .wren-col:not(.show-hatchfile) #split-wren-hatch { display: none; }
     .hatch-form {
       padding: 10px 14px;
       display: flex; flex-direction: column; gap: 6px;
@@ -394,6 +427,7 @@
 <button id="ping" onclick="alert('clicked')">ping</button>
 </textarea>
       </section>
+      <div class="splitter v" id="split-html-wren" data-resize="html"></div>
 
       <section class="wren-col">
         <div class="pane wren-pane">
@@ -417,8 +451,7 @@ var fiber = Fiber.new {
 fiber.try()
 
 // Recursive compute through the wasm tier-up JIT. fib(20) lands
-// at ~3 ms post-warmup on both worker and main mode (call_indirect
-// through a shared funcref table; no JS hop on the hot path).
+// at ~3 ms post-warmup on both worker and main mode.
 // Bump to fib(28) if you want to feel the runtime in earnest.
 var start = System.clock
 var fib
@@ -434,6 +467,7 @@ Expect.that(elapsed).not.toBeNull()
 System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
 </textarea>
         </div>
+        <div class="splitter h" id="split-wren-hatch" data-resize="wren"></div>
         <div class="pane hatchfile-pane">
           <div class="pane-header">
             hatchfile
@@ -461,12 +495,14 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
           </div>
         </div>
       </section>
+      <div class="splitter v" id="split-wren-out" data-resize="main"></div>
 
       <section class="output-col">
         <div class="pane">
           <div class="pane-header">stage<span class="badge">live preview</span></div>
           <div id="stage" class="stage"></div>
         </div>
+        <div class="splitter h" id="split-stage-console" data-resize="output"></div>
         <div class="pane console-pane">
           <div class="pane-header">console<span class="badge">System.print</span></div>
           <pre id="out" class="console"></pre>
@@ -815,6 +851,60 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
     // lives. If it's already open, leave it alone (no toggle-
     // off, since the pill's whole job is "look at me").
     runtimeEl.addEventListener("click", () => setConsoleVisible(true));
+
+    // ---- Drag-resizable panels --------------------------------------
+    // Each `.splitter` separates two flex children of the same
+    // parent. Dragging it adjusts the `flex-grow` of the prev /
+    // next siblings inversely so their sum stays constant — keeps
+    // total width / height of the parent unchanged. Min sizes
+    // clamp via the panes' CSS `min-*` rules; we also enforce a
+    // floor here so tiny drags don't collapse a pane to zero.
+    function bindSplitter(splitter) {
+      const isVertical = splitter.classList.contains("v");
+      const axis = isVertical ? "X" : "Y";
+      const dim = isVertical ? "offsetWidth" : "offsetHeight";
+      const minPx = 80;
+
+      splitter.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        const prev = splitter.previousElementSibling;
+        const next = splitter.nextElementSibling;
+        if (!prev || !next) return;
+        const startMouse = e[`client${axis}`];
+        const prevSize = prev[dim];
+        const nextSize = next[dim];
+        const totalSize = prevSize + nextSize;
+        // Total flex-grow of the two siblings — sum stays constant.
+        const cs1 = parseFloat(getComputedStyle(prev).flexGrow) || 1;
+        const cs2 = parseFloat(getComputedStyle(next).flexGrow) || 1;
+        const totalGrow = cs1 + cs2;
+
+        document.body.classList.add("resizing");
+        splitter.classList.add("dragging");
+
+        function move(ev) {
+          const delta = ev[`client${axis}`] - startMouse;
+          let newPrev = Math.max(minPx, Math.min(totalSize - minPx, prevSize + delta));
+          const newNext = totalSize - newPrev;
+          // Convert px back to flex-grow proportions; the sum
+          // matches `totalGrow` so neighbouring (non-resized)
+          // siblings keep their proportions.
+          prev.style.flexGrow = String((newPrev / totalSize) * totalGrow);
+          next.style.flexGrow = String((newNext / totalSize) * totalGrow);
+        }
+        function up() {
+          document.removeEventListener("mousemove", move);
+          document.removeEventListener("mouseup", up);
+          document.body.classList.remove("resizing");
+          splitter.classList.remove("dragging");
+        }
+        document.addEventListener("mousemove", move);
+        document.addEventListener("mouseup", up);
+      });
+    }
+
+    document.querySelectorAll(".splitter").forEach(bindSplitter);
 
     // Mount the CodeMirror editors. `bindEditor` reads each
     // textarea's current value as the initial doc, then writes
