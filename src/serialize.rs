@@ -78,6 +78,17 @@ pub struct ModuleBlob {
     pub var_sources: Vec<Option<String>>,
 }
 
+/// v5 layout — kept solely for the back-compat read path in
+/// `load()`. v5 artifacts published to the hatch registry before
+/// the v6 bump still install (with empty source pins), so we don't
+/// have to republish every existing package.
+#[derive(serde::Deserialize)]
+struct ModuleBlobV5 {
+    interner: Interner,
+    module: ModuleMir,
+    var_names: Vec<String>,
+}
+
 /// Errors surfaced by `emit` / `load`.
 #[derive(Debug)]
 pub enum SerializeError {
@@ -157,7 +168,14 @@ pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
         return Err(SerializeError::BadMagic);
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    if version != VERSION {
+    // v5 is the previous wlbc layout: same as v6 minus `var_sources`.
+    // Already-published registry artifacts encode v5; loading them
+    // here (with empty source pins) avoids forcing every package to
+    // republish on the v6 bump. v5 artifacts can't honour
+    // `import "<mod>" for <name>` source pins at install time, but
+    // none of the legacy packages use the dispatcher pattern that
+    // needs them.
+    if version != VERSION && version != 5 {
         return Err(SerializeError::VersionMismatch {
             expected: VERSION,
             found: version,
@@ -169,6 +187,20 @@ pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
         return Err(SerializeError::TruncatedPayload {
             declared,
             available: payload.len(),
+        });
+    }
+    if version == 5 {
+        let (v5, _consumed) = bincode::serde::decode_from_slice::<ModuleBlobV5, _>(
+            payload,
+            bincode::config::standard(),
+        )
+        .map_err(|e| SerializeError::Decode(e.to_string()))?;
+        let var_sources = vec![None; v5.var_names.len()];
+        return Ok(ModuleBlob {
+            interner: v5.interner,
+            module: v5.module,
+            var_names: v5.var_names,
+            var_sources,
         });
     }
     let (blob, _consumed) =
@@ -240,21 +272,23 @@ mod tests {
         ));
     }
 
-    /// Stale artifacts carrying a *lower* version number should
-    /// also fail at the version check rather than tumble down into
-    /// bincode and surface as misleading "InvalidBooleanValue"-style
-    /// decoder errors. Locks the rebuild-guidance message format too
-    /// — every developer pulling a wlbc-format change benefits from
-    /// the user-visible "rebuild with hatch build" hint instead of
-    /// having to grep the error.
+    /// Stale artifacts carrying an *unsupported* lower version should
+    /// fail at the version check rather than tumble down into bincode
+    /// and surface as misleading "InvalidBooleanValue"-style decoder
+    /// errors. Locks the rebuild-guidance message format too — every
+    /// developer pulling a wlbc-format change benefits from the
+    /// user-visible "rebuild with hatch build" hint instead of having
+    /// to grep the error. (The current loader also accepts v5 for
+    /// registry back-compat; we synthesise v4 here for the reject
+    /// path.)
     #[test]
     fn load_rejects_older_version_with_rebuild_hint() {
-        if VERSION == 0 {
-            return; // can't synthesise a lower version
+        if VERSION <= 5 {
+            return; // can't synthesise an unsupported lower version
         }
         let mut buf = Vec::new();
         buf.extend_from_slice(&MAGIC);
-        buf.extend_from_slice(&(VERSION - 1).to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         let err = match load(&buf) {
             Err(e) => e,
@@ -263,7 +297,7 @@ mod tests {
         assert!(matches!(err, SerializeError::VersionMismatch { .. }));
         let msg = format!("{}", err);
         assert!(msg.contains(&format!("v{}", VERSION)));
-        assert!(msg.contains(&format!("v{}", VERSION - 1)));
+        assert!(msg.contains("v4"));
         assert!(
             msg.contains("hatch build"),
             "expected rebuild guidance, got: {}",
