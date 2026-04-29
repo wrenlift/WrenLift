@@ -546,7 +546,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // *the* DOM the Wren program manipulates — `Dom.text("#x")`
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
-    import { createWlift, runProject } from "./wlift.js";
+    import { createWlift, parseHatchfileToml, resolveDepsFromManifest } from "./wlift.js";
     import { ErrorKind } from "../pkg/wlift_wasm.js";
     // CodeMirror 6 — modular ESM via esm.sh. The dev server's
     // COOP/COEP headers cooperate with esm.sh's CORP responses,
@@ -976,6 +976,35 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       return new Uint8Array(await r.arrayBuffer());
     }
 
+    // Memoise resolved hatch bundles by the exact hatchfile text.
+    // Mode-switch + autorun both re-enter `execute()` against the
+    // same dependency graph; without this, every keystroke and
+    // every worker↔main flip pays the full network walk again.
+    // Reusing the same bundle bytes is safe — the VM re-installs
+    // them via `runWithHatches` on every run.
+    let depsCache = { hatchfileText: null, deps: null, inflight: null };
+    async function resolveDepsOnce(hatchfileText) {
+      if (depsCache.hatchfileText === hatchfileText && depsCache.deps) {
+        return depsCache.deps;
+      }
+      // Coalesce overlapping autorun calls — if a fetch is in
+      // flight for this same hatchfile, share its result instead
+      // of starting a parallel walk.
+      if (depsCache.inflight && depsCache.inflight.key === hatchfileText) {
+        return depsCache.inflight.promise;
+      }
+      const promise = (async () => {
+        const manifest = await parseHatchfileToml(hatchfileText);
+        const deps = await resolveDepsFromManifest(manifest, {
+          fetcher: proxiedFetcher,
+        });
+        depsCache = { hatchfileText, deps, inflight: null };
+        return deps;
+      })();
+      depsCache.inflight = { key: hatchfileText, promise };
+      return promise;
+    }
+
     let wlift = null;
     // Latch — does the most recent run carry an error? The
     // console-toggle's red dot is the (lastErrored AND
@@ -992,6 +1021,12 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     function renderStage() {
       // Just `innerHTML` — this is a local playground, the user
       // is typing their own markup. No sanitisation needed.
+      // Called only when the *HTML source* changes (or at boot),
+      // not on every Wren run. That keeps Wren-applied mutations
+      // (e.g. `Dom.setText`) persistent across iterations: each
+      // autorun stroke would otherwise reset the DOM to the
+      // skeleton, then briefly flash the pre-mutation text before
+      // Wren reapplies its changes.
       stageEl.innerHTML = htmlEl.value;
     }
 
@@ -1064,9 +1099,13 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       runBtn.disabled = true;
       outEl.classList.remove("ok", "error");
       outEl.textContent = "running…";
-      // Render the markup first so DOM ops have something to
-      // hit. The Wren source then runs against the live stage.
-      renderStage();
+      // The stage is owned by the user's HTML source plus any
+      // Wren-applied mutations from previous runs. We do *not*
+      // reset to the skeleton here, otherwise every keystroke
+      // (under autorun) would briefly flash the pre-mutation text
+      // before Wren reapplies its `Dom.setText` calls. Stage
+      // resets only happen when the HTML source itself changes,
+      // wired below.
 
       // Auto-detect: if the source `import`s any scoped name
       // and the user pasted a hatchfile, route through
@@ -1078,15 +1117,23 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       const hasScoped = sourceHasScopedImports(srcEl.value);
       const hatchfileText = hatchfileEl.value.trim();
       if (hasScoped && hatchfileText.length > 0) {
-        outEl.textContent = "resolving deps…";
-        // Each `[dependencies]` entry resolves to the wasm32
-        // release-asset URL the publish-pkg workflow puts up on
-        // GitHub. The proxied fetcher routes the request
-        // through this dev server's `/proxy` route so the
-        // response carries the COEP-friendly CORP header.
-        result = await runProject(wlift, srcEl.value, hatchfileEl.value, {
-          fetcher: proxiedFetcher,
-        });
+        // Cached vs first-fetch UX: if the bundle bytes are
+        // already memoised, skip the "resolving deps…" placeholder
+        // and go straight to "running…". The proxiedFetcher only
+        // fires when this hatchfile is new (or the user edited it).
+        const cached = depsCache.hatchfileText === hatchfileText && depsCache.deps;
+        outEl.textContent = cached ? "running…" : "resolving deps…";
+        try {
+          const deps = await resolveDepsOnce(hatchfileText);
+          result = await wlift.runWithHatches(srcEl.value, deps);
+        } catch (err) {
+          result = {
+            output: `dep resolution failed: ${err}`,
+            ok: false,
+            errorKind: -1,
+            elapsedMs: 0,
+          };
+        }
       } else if (hasScoped) {
         result = {
           output:
@@ -1112,7 +1159,10 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(execute, 350);
     }
-    htmlEl.addEventListener("input", maybeAutorun);
+    // HTML edits re-render the stage immediately (cheap; just
+    // innerHTML). This also discards any persisted Wren mutations,
+    // which is what the user wants when editing the skeleton.
+    htmlEl.addEventListener("input", () => { renderStage(); maybeAutorun(); });
     srcEl.addEventListener("input", maybeAutorun);
 
     runBtn.addEventListener("click", execute);
@@ -1126,6 +1176,10 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     });
     modeSel.addEventListener("change", () => bootMode(modeSel.value));
 
+    // Seed the stage with the initial HTML so the first Wren run
+    // has DOM to mutate. Subsequent renders only fire when the
+    // HTML source changes (see the `htmlEl` input listener).
+    renderStage();
     bootMode(modeSel.value);
   </script>
 </body>
