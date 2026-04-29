@@ -948,6 +948,17 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage);
     const hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
+    // Hoisted state — `loadExample` reads `wlift` to decide whether
+    // to bounce the engine; both have to exist before the bootstrap
+    // call below runs (otherwise TDZ throws on first paint).
+    let wlift = null;
+    // Latch — does the most recent run carry an error? The
+    // console-toggle's red dot is the (lastErrored AND
+    // console-hidden) intersection; without persisting the
+    // first half, toggling the console open then shut would
+    // clear the dot even though nothing changed about the run.
+    let lastErrored = false;
+
     // ---- Example library --------------------------------------------
     // Curated set of starter programs the dropdown swaps in. Each
     // entry carries its own HTML / Wren / hatchfile so the user can
@@ -1512,13 +1523,10 @@ entry   = "main"
       return promise;
     }
 
-    let wlift = null;
-    // Latch — does the most recent run carry an error? The
-    // console-toggle's red dot is the (lastErrored AND
-    // console-hidden) intersection; without persisting the
-    // first half, toggling the console open then shut would
-    // clear the dot even though nothing changed about the run.
-    let lastErrored = false;
+    // `wlift` and `lastErrored` were declared down here originally,
+    // but `loadExample` (above) reads `wlift` to decide whether to
+    // re-boot. Hoisting the declarations up — they need to be
+    // initialised by the time the bootstrap call runs.
 
     function updateConsoleErrorDot() {
       const consoleHidden = !outputColEl.classList.contains("show-console");
