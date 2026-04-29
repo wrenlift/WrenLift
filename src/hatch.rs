@@ -1436,6 +1436,27 @@ fn merge_path_dependencies(
             }
             new_modules.push(mod_name.clone());
         }
+
+        // Push the dep's own entry to the end of *its* slice so it
+        // installs after the modules it imports from. The dep's
+        // entry is usually a target-conditional re-export dispatcher
+        // (e.g. `@hatch:window` does `#!wasm import "window_web"
+        // for Window`). When the dep ships standalone, the runtime's
+        // `install_hatch_sections` pulls the entry to the end so
+        // the dispatcher's imports resolve. Once the dep is folded
+        // into a parent with a different entry, that entry-pull no
+        // longer protects this dispatcher — without this reordering
+        // the dispatcher installs first, its `import` resolves to
+        // null, and consumers see `Null does not implement create`
+        // when they call e.g. `Window.create({...})`.
+        let dep_entry = &dep_hatch.manifest.entry;
+        if new_modules.iter().any(|m| m == dep_entry)
+            && new_modules.last().map(String::as_str) != Some(dep_entry.as_str())
+        {
+            new_modules.retain(|m| m != dep_entry);
+            new_modules.push(dep_entry.clone());
+        }
+
         let mut merged_modules = new_modules;
         merged_modules.extend(std::mem::take(&mut manifest.modules));
         manifest.modules = merged_modules;
