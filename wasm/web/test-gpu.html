@@ -15,12 +15,14 @@
   </style>
 </head>
 <body>
-  <h1>Phase 3 smoke — triangle via @hatch:window-web + @hatch:gpu-web</h1>
+  <h1>Smoke test — triangle via unified @hatch:window + @hatch:gpu</h1>
   <p class="note">
-    Loads two on-demand wasm plugins (<code>wlift_window_web</code> + <code>wlift_gpu_web</code>),
-    instantiates them via the JS-side loader, runs a Wren script that creates a
-    canvas, builds a render pipeline from inline WGSL, and renders one frame of
-    a coloured triangle. Expect a toast-coloured triangle in the dark stage below.
+    Loads two on-demand wasm plugins via the unified <code>@hatch:window</code> /
+    <code>@hatch:gpu</code> packages — same import names native code uses, with
+    <code>#!wasm</code> / <code>#!native</code> cfg attributes selecting the
+    backend per bundle target. Wren script creates a canvas, builds a render
+    pipeline from inline WGSL, renders one frame of a coloured triangle.
+    Expect a toast-coloured triangle in the dark stage below.
   </p>
   <pre id="out">running…</pre>
   <div id="stage"></div>
@@ -43,11 +45,19 @@
       const wlift = await createWlift({ mode: "main" });
       log(`  ${wlift.version}`);
 
-      log("fetching hatch-gpu-web.hatch (carries window-web as transitive dep)…");
-      const r = await fetch("./hatch-gpu-web.hatch");
-      if (!r.ok) throw new Error(`fetch ${r.status}`);
-      const bytes = new Uint8Array(await r.arrayBuffer());
-      log(`  ${bytes.length} bytes`);
+      log("fetching unified @hatch:window + @hatch:gpu bundles…");
+      const [windowBytes, gpuBytes] = await Promise.all([
+        fetch("./hatch-window.hatch").then((r) => {
+          if (!r.ok) throw new Error(`window fetch ${r.status}`);
+          return r.arrayBuffer().then((b) => new Uint8Array(b));
+        }),
+        fetch("./hatch-gpu.hatch").then((r) => {
+          if (!r.ok) throw new Error(`gpu fetch ${r.status}`);
+          return r.arrayBuffer().then((b) => new Uint8Array(b));
+        }),
+      ]);
+      log(`  window: ${windowBytes.length} bytes`);
+      log(`  gpu:    ${gpuBytes.length} bytes`);
 
       const wgsl = `
 struct Uniforms {
@@ -85,8 +95,8 @@ fn fs_main() -> @location(0) vec4f {
       ];
 
       const source = `
-import "@hatch:window-web" for Window
-import "@hatch:gpu-web" for Gpu
+import "@hatch:window" for Window
+import "@hatch:gpu" for Gpu
 
 var canvas = Window.create_({"width": 600, "height": 400, "parent": "stage", "title": "phase 3 smoke"})
 if (canvas < 0) Fiber.abort("Window.create_ failed")
@@ -163,7 +173,7 @@ System.print("rendered ✓")
 `.trim();
 
       log("runWithHatches…");
-      const result = await wlift.runWithHatches(source, [bytes]);
+      const result = await wlift.runWithHatches(source, [windowBytes, gpuBytes]);
       log(`  ok=${result.ok}  errorKind=${result.errorKind}  ${result.elapsedMs.toFixed(2)}ms`);
       log("--- output ---");
       log(result.output, result.ok ? "ok" : "err");

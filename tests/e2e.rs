@@ -3802,6 +3802,106 @@ System.print(c.value)
 }
 
 #[test]
+fn e2e_hatch_dispatcher_entry_resolves_after_siblings() {
+    // The unified `@hatch:gpu` / `@hatch:window` packages use an
+    // entry-as-dispatcher pattern: the entry only does
+    // `import "<backend>" for <Class>` to re-export the right
+    // backend on each target. `manifest.modules` lists modules in
+    // alphabetical order, so the dispatcher entry can land BEFORE
+    // its backend; if installed in that order, the dispatcher's
+    // import resolves to null and the consumer sees a null Class.
+    // The install loop must hoist non-entry modules first so the
+    // dispatcher's slot fills correctly on its own first install.
+    use std::collections::BTreeMap;
+    use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};
+
+    let backend_src = "class Foo { static greet() { \"from backend\" } }";
+    let dispatcher_src = "import \"backend\" for Foo";
+    let app_src = "import \"@pkg:dispatcher\" for Foo\nSystem.print(Foo.greet())";
+
+    let mut vm_b = VM::new_default();
+    let backend_wlbc = vm_b.compile_source_to_blob(backend_src).expect("backend");
+    let mut vm_d = VM::new_default();
+    let dispatcher_wlbc = vm_d
+        .compile_source_to_blob(dispatcher_src)
+        .expect("dispatcher");
+    let mut vm_a = VM::new_default();
+    let app_wlbc = vm_a.compile_source_to_blob(app_src).expect("app");
+
+    // Modules listed dispatcher-first (the alphabetical case the
+    // build emits when the entry's filename sorts ahead of its
+    // siblings).
+    let pkg_hatch = Hatch {
+        manifest: Manifest {
+            name: "@pkg:dispatcher".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "@pkg:dispatcher".to_string(),
+            description: None,
+            modules: vec!["@pkg:dispatcher".to_string(), "backend".to_string()],
+            dependencies: BTreeMap::new(),
+            spec_dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
+            plugin_source: None,
+            target: None,
+        },
+        sections: vec![
+            Section {
+                kind: SectionKind::Wlbc,
+                name: "@pkg:dispatcher".to_string(),
+                data: dispatcher_wlbc,
+            },
+            Section {
+                kind: SectionKind::Wlbc,
+                name: "backend".to_string(),
+                data: backend_wlbc,
+            },
+        ],
+    };
+    let pkg_bytes = emit(&pkg_hatch).expect("emit pkg");
+
+    let app_hatch = Hatch {
+        manifest: Manifest {
+            name: "app".to_string(),
+            version: "0.1.0".to_string(),
+            entry: "main".to_string(),
+            description: None,
+            modules: vec!["main".to_string()],
+            dependencies: BTreeMap::new(),
+            spec_dependencies: BTreeMap::new(),
+            native_libs: BTreeMap::new(),
+            native_search_paths: Vec::new(),
+            plugin_source: None,
+            target: None,
+        },
+        sections: vec![Section {
+            kind: SectionKind::Wlbc,
+            name: "main".to_string(),
+            data: app_wlbc,
+        }],
+    };
+    let app_bytes = emit(&app_hatch).expect("emit app");
+
+    let mut vm = VM::new_default();
+    vm.output_buffer = Some(String::new());
+    let install = vm.install_hatch_modules(&pkg_bytes);
+    assert!(
+        matches!(install, InterpretResult::Success),
+        "pkg install should succeed, got {:?}",
+        install
+    );
+    let run = vm.interpret_hatch(&app_bytes);
+    let output = vm.take_output();
+    assert!(
+        matches!(run, InterpretResult::Success),
+        "app run should succeed, got {:?}\n{}",
+        run,
+        output
+    );
+    assert_eq!(output.trim(), "from backend");
+}
+
+#[test]
 fn e2e_hatch_extracts_native_lib_sections_to_disk() {
     use std::collections::BTreeMap;
     use wren_lift::hatch::{emit, Hatch, Manifest, Section, SectionKind};

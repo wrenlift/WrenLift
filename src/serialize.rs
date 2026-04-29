@@ -48,26 +48,34 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 /// produces one in serialized output.
 ///
 /// History:
+/// - v6 (2026-04-29): `var_sources` field on `ModuleBlob` so the
+///   install path can honour `import "<module>" for <name>` source
+///   pins (was lost on the wlbc round-trip, breaking dispatcher
+///   re-export modules where two siblings export the same class).
 /// - v5 (2026-04-26): `Instruction::Call::pure_call` field added
 ///   for the Phase 6 effect-summary seed.
 /// - v4: prior; first version this constant gained a written-down
 ///   bump policy.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Combined payload: everything a fresh `VM` needs to materialise the
 /// module without touching the parser, resolver, MIR builder, or the
 /// optimizer.
 ///
 /// `var_names` is the declared module-var layout (one entry per slot,
-/// in the order the resolver assigned them). On load, the VM looks up
-/// each name against its own core classes / imported modules and fills
-/// the corresponding slot, falling back to `null`. This replaces the
-/// `resolve_result.module_vars` list that the source path produces.
+/// in the order the resolver assigned them). `var_sources` parallels
+/// it: `Some("<module>")` when the slot came from `import "<module>"
+/// for <name>`, `None` for local declarations or prelude classes. On
+/// load, the VM resolves each slot against the named source first
+/// (so two modules exporting the same class name don't collide on
+/// HashMap iteration order) and falls back to a name-only scan when
+/// the source isn't recorded.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ModuleBlob {
     pub interner: Interner,
     pub module: ModuleMir,
     pub var_names: Vec<String>,
+    pub var_sources: Vec<Option<String>>,
 }
 
 /// Errors surfaced by `emit` / `load`.
@@ -114,17 +122,21 @@ impl std::error::Error for SerializeError {}
 /// Serialize a compiled module + its interner into a self-describing
 /// blob suitable for `.wlbc` files.
 ///
-/// `var_names` is the module's declared top-level variable order. The
-/// loader uses it to reconstruct the module's var slot layout.
+/// `var_names` is the module's declared top-level variable order;
+/// `var_sources` parallels it with the import source for slots that
+/// came from `import "<module>" for <name>`, or `None` for local
+/// declarations.
 pub fn emit(
     interner: &Interner,
     module: &ModuleMir,
     var_names: &[String],
+    var_sources: &[Option<String>],
 ) -> Result<Vec<u8>, SerializeError> {
     let blob = ModuleBlob {
         interner: interner.clone(),
         module: module.clone(),
         var_names: var_names.to_vec(),
+        var_sources: var_sources.to_vec(),
     };
 
     let payload = bincode::serde::encode_to_vec(&blob, bincode::config::standard())
@@ -194,7 +206,8 @@ mod tests {
         let module = empty_module(&mut interner);
         let var_names = vec!["System".to_string(), "greeting".to_string()];
 
-        let blob_bytes = emit(&interner, &module, &var_names).expect("emit");
+        let var_sources = vec![None; var_names.len()];
+        let blob_bytes = emit(&interner, &module, &var_names, &var_sources).expect("emit");
         let blob = load(&blob_bytes).expect("load");
 
         assert_eq!(
@@ -262,7 +275,7 @@ mod tests {
     fn load_rejects_truncated_payload() {
         let mut interner = Interner::new();
         let module = empty_module(&mut interner);
-        let blob = emit(&interner, &module, &[]).expect("emit");
+        let blob = emit(&interner, &module, &[], &[]).expect("emit");
         let truncated = &blob[..blob.len() - 1];
         assert!(matches!(
             load(truncated),

@@ -598,9 +598,10 @@ impl VM {
             .iter()
             .map(|&sym| interner.resolve(sym).to_string())
             .collect();
+        let var_sources = resolve_result.module_var_sources.clone();
 
         // 6. Serialize.
-        crate::serialize::emit(&interner, &module_mir, &var_names).map_err(|e| {
+        crate::serialize::emit(&interner, &module_mir, &var_names, &var_sources).map_err(|e| {
             crate::diagnostics::Diagnostic::error(format!("failed to emit .wlbc: {}", e))
                 .eprint_no_source();
             InterpretResult::CompileError
@@ -633,7 +634,13 @@ impl VM {
                 return InterpretResult::CompileError;
             }
         };
-        self.install_module_mir_and_run(module_name, &blob.interner, blob.module, blob.var_names)
+        self.install_module_mir_and_run_with_sources(
+            module_name,
+            &blob.interner,
+            blob.module,
+            blob.var_names,
+            blob.var_sources,
+        )
     }
 
     /// Install every module carried by a `.hatch` — same as
@@ -820,7 +827,26 @@ impl VM {
             }
         }
 
-        for module_name in &hatch.manifest.modules {
+        // Install order: every non-entry module first, then the entry.
+        // The entry of a `@hatch:foo` package is often a dispatcher
+        // that does `import "foo_web" for X` (or `_native`); resolving
+        // that import needs the backend module already installed.
+        // `manifest.modules` is sorted alphabetically at build time so
+        // the entry can land mid-list — pulling it to the end here
+        // makes the dispatcher's slot fill on first install instead of
+        // staying null until a (non-existent) backfill pass runs.
+        let entry = &hatch.manifest.entry;
+        let mut install_order: Vec<&String> = hatch
+            .manifest
+            .modules
+            .iter()
+            .filter(|m| *m != entry)
+            .collect();
+        if hatch.manifest.modules.iter().any(|m| m == entry) {
+            install_order.push(entry);
+        }
+
+        for module_name in install_order {
             // Skip modules already loaded (e.g. by a previously
             // installed hatch) so `--link A --link B` where both carry
             // an overlapping transitive dep doesn't re-run it.
@@ -842,11 +868,12 @@ impl VM {
             };
 
             let result = match crate::serialize::load(&section.data) {
-                Ok(blob) => self.install_module_mir_and_run(
+                Ok(blob) => self.install_module_mir_and_run_with_sources(
                     module_name,
                     &blob.interner,
                     blob.module,
                     blob.var_names,
+                    blob.var_sources,
                 ),
                 Err(e) => {
                     // A `decode:` failure here usually means the
@@ -1382,16 +1409,7 @@ impl VM {
         }
     }
 
-    /// Install a freshly compiled (or freshly loaded) `ModuleMir` into
-    /// the engine, build its classes, and run its top-level fiber.
-    ///
-    /// This is the shared suffix of the compilation pipeline — steps 6
-    /// through 10 of `interpret`, reused by the `.wlbc` load path so
-    /// snapshots don't have to pay for parse / sema / MIR-build / opt.
-    /// `interner` is in the snapshot's (or parser's) symbol frame and
-    /// gets remapped into `self.interner` on entry. `var_names` is the
-    /// module's declared top-level var order — normally derived from
-    /// `resolve_result.module_vars` or loaded verbatim from a snapshot.
+    #[allow(dead_code)]
     fn install_module_mir_and_run(
         &mut self,
         module_name: &str,
