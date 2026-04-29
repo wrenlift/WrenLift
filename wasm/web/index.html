@@ -931,27 +931,6 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     bindEditor(srcEl, srcMount, wrenLanguage);
     var hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
-    // Local-dev fetcher for the hatchfile-driven resolver.
-    // Maps `<registry>/releases/download/<name>-<ver>/<name>-<ver>.hatch`
-    // (the URL `depEntryToUrl` would generate for a bare-version
-    // dep) to `/packages/<name>-<ver>.hatch` on this dev server.
-    // For real deployments the default fetcher (which hits the
-    // configured registry) is what you want; the override is a
-    // playground convenience.
-    async function localPackageFetcher(url, name) {
-      // Take the URL's basename: `@hatch:test-0.1.0.hatch`.
-      const filename = url.substring(url.lastIndexOf("/") + 1);
-      const localUrl = `/packages/${filename}`;
-      const r = await fetch(localUrl);
-      if (!r.ok) {
-        throw new Error(
-          `dep '${name}' not found at ${localUrl} (${r.status}). ` +
-          `Build it for wasm with \`wlift hatch/packages/<dir> --bundle wasm/web/packages/${filename} --bundle-target wasm32-unknown-unknown\`.`,
-        );
-      }
-      return new Uint8Array(await r.arrayBuffer());
-    }
-
     let wlift = null;
     // Latch — does the most recent run carry an error? The
     // console-toggle's red dot is the (lastErrored AND
@@ -1055,14 +1034,12 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       const hatchfileText = hatchfileEl.value.trim();
       if (hasScoped && hatchfileText.length > 0) {
         outEl.textContent = "resolving deps…";
-        result = await runProject(
-          wlift,
-          srcEl.value,
-          hatchfileEl.value,
-          // Local-dev override: deps come from /packages/ on
-          // the same origin instead of the public CDN.
-          { fetcher: localPackageFetcher },
-        );
+        // No fetcher override — `runProject` falls back to the
+        // default `fetch()` against `DEFAULT_HATCH_REGISTRY`
+        // (the wrenlift/hatch GitHub releases). Browsers cache
+        // the bytes per-URL, so reruns of the same hatchfile
+        // are free after the first hit.
+        result = await runProject(wlift, srcEl.value, hatchfileEl.value);
       } else if (hasScoped) {
         result = {
           output:
