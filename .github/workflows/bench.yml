@@ -229,14 +229,18 @@ jobs:
           cp -R wasm/web/. site/playground/web/
           cp -R wasm/pkg/. site/playground/pkg/
           if [ -n "${HATCH_BOT_URL:-}" ]; then
-            # Inject `window.WLIFT_PROXY_BASE` right after <head>
-            # so the page-script picks it up before the playground
-            # boots. Escape `&`, `/`, and `$` to keep sed happy
-            # against arbitrary URL contents.
-            esc=$(printf '%s' "$HATCH_BOT_URL" | sed -e 's/[\/&$]/\\&/g')
+            # Strip a trailing `/publish` if present. The org var
+            # is configured as the hatch CLI's publish endpoint
+            # (`<bot>/publish`); the playground wants the function
+            # root so it can append its own `/proxy`. Without this
+            # normalization the playground hits `/publish/proxy`
+            # and 404s.
+            base="${HATCH_BOT_URL%/publish}"
+            base="${base%/}"
+            esc=$(printf '%s' "$base" | sed -e 's/[\/&$]/\\&/g')
             sed -i'' -e "s|<head>|<head>\n  <script>window.WLIFT_PROXY_BASE=\"${esc}\";</script>|" \
               site/playground/web/index.html
-            echo "::notice::injected WLIFT_PROXY_BASE = ${HATCH_BOT_URL}"
+            echo "::notice::injected WLIFT_PROXY_BASE = ${base}"
           else
             echo "::notice::HATCH_BOT_URL var unset; playground will use relative /proxy (no remote registry fetches)"
           fi
