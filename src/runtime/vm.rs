@@ -650,7 +650,13 @@ impl VM {
         let hatch = match crate::hatch::load(hatch_bytes) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("failed to load hatch: {}", e);
+                // Route through `report_error` so the embedder's
+                // `error_fn` (the wasm playground captures into
+                // its diagnostics buffer) sees this. `eprintln!`
+                // on wasm32 evaporates — without this routing
+                // the user got a silent CompileError pill with
+                // no clue what failed.
+                self.report_error(&format!("failed to load hatch: {}", e));
                 return InterpretResult::CompileError;
             }
         };
@@ -664,7 +670,7 @@ impl VM {
             hatch.manifest.target.as_deref(),
             runtime,
         ) {
-            eprintln!("failed to load hatch: {}", e);
+            self.report_error(&format!("failed to load hatch: {}", e));
             return InterpretResult::CompileError;
         }
         self.install_hatch_sections(&hatch)
@@ -829,10 +835,10 @@ impl VM {
             }) {
                 Some(s) => s,
                 None => {
-                    eprintln!(
+                    self.report_error(&format!(
                         "hatch manifest lists module '{}' but no wlbc section carries it",
                         module_name
-                    );
+                    ));
                     return InterpretResult::CompileError;
                 }
             };
@@ -850,17 +856,18 @@ impl VM {
                     // whose VERSION constant didn't get bumped before
                     // the format drifted. Surface a hint pointing at
                     // the rebuild remediation alongside the raw error.
-                    let mut diag = crate::diagnostics::Diagnostic::error(format!(
+                    let stale_hint = matches!(e, crate::serialize::SerializeError::Decode(_));
+                    let mut msg = format!(
                         "hatch module '{}' failed to load its wlbc payload: {}",
                         module_name, e
-                    ));
-                    if matches!(e, crate::serialize::SerializeError::Decode(_)) {
-                        diag = diag.with_note(
-                            "this is usually a stale artifact — rebuild it with `hatch build` \
+                    );
+                    if stale_hint {
+                        msg.push_str(
+                            "\nthis is usually a stale artifact — rebuild it with `hatch build` \
                              against the current wren_lift sources",
                         );
                     }
-                    diag.eprint_no_source();
+                    self.report_error(&msg);
                     return InterpretResult::CompileError;
                 }
             };
