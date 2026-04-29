@@ -1,0 +1,1095 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Wrenlift — a tiered runtime for Wren</title>
+<link rel="icon" href="assets/wrenlift-mascot.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --cream: #FBF3DC;
+    --cream-2: #F5E8C3;
+    --cream-3: #EFDDA8;
+    --ink: #3A2A18;
+    --ink-2: #5A4225;
+    --ink-3: #7B5E36;
+    --butter: #F4C24A;
+    --butter-deep: #E8A92A;
+    --toast: #D97A2B;
+    --toast-deep: #B45F1A;
+    --ember: #E04E1F;
+    --sage: #8FAE6A;
+    --sage-deep: #6B8C48;
+    --sky: #B8D4E3;
+    --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; corner-shape: squircle; }
+  .dot, .tdot, .glyph { corner-shape: round; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body);
+    color: var(--ink);
+    background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.12) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.20) 0, transparent 26%),
+      radial-gradient(circle at 70% 90%, rgba(184, 212, 227, 0.18) 0, transparent 30%);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: var(--toast-deep); text-decoration: none; }
+  a:hover { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }
+  ::selection { background: var(--ember); color: var(--cream); }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 32px; }
+
+  /* ---------- NAV ---------- */
+  .nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 22px 32px;
+    max-width: 1180px; margin: 0 auto;
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 12px;
+    font-family: var(--display); font-weight: 800; font-size: 22px;
+    color: var(--ink); text-decoration: none;
+  }
+  .brand .mark {
+    width: 38px; height: 38px; border-radius: 12px;
+    background: var(--ink); border: 2.5px solid var(--ink);
+    display: grid; place-items: center;
+    box-shadow: 3px 3px 0 var(--ember);
+    color: var(--cream);
+    font-family: var(--mono); font-weight: 700; font-size: 15px;
+  }
+  .brand .word { letter-spacing: -0.01em; }
+  .nav-links {
+    display: flex; gap: 26px; align-items: center;
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+  }
+  .nav-links a { color: var(--ink); }
+  .nav-links a:hover { color: var(--toast-deep); text-decoration: none; }
+  .nav-links a.nav-cta { color: var(--cream); }
+  .nav-cta {
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+    background: var(--ink); color: var(--cream);
+    padding: 9px 14px; border-radius: 999px;
+    border: 2px solid var(--ink);
+    display: inline-flex; align-items: center; gap: 8px;
+    white-space: nowrap;
+  }
+  .nav-cta:hover, .nav-links a.nav-cta:hover { background: var(--ember); border-color: var(--ember); color: var(--cream); text-decoration: none; }
+
+  /* ---------- HERO ---------- */
+  .hero {
+    position: relative;
+    padding: 36px 32px 80px;
+    max-width: 1180px; margin: 0 auto;
+    display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 48px;
+    align-items: center;
+  }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink-2);
+    background: var(--shell); border: 1.5px solid var(--ink);
+    padding: 6px 12px; border-radius: 999px;
+    box-shadow: 0 2px 0 var(--ink);
+  }
+  .eyebrow .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ember); box-shadow: 0 0 0 3px rgba(224,78,31,0.25);
+  }
+  .hero h1 {
+    font-family: var(--display);
+    font-weight: 800;
+    font-size: clamp(50px, 6.6vw, 80px);
+    line-height: 1.04;
+    letter-spacing: -0.02em;
+    margin: 22px 0 18px;
+    color: var(--ink);
+    text-wrap: balance;
+    max-width: 12ch;
+  }
+  .hero h1 .accent {
+    color: var(--ember);
+    font-style: italic;
+    font-weight: 700;
+  }
+  .hero p.lede {
+    font-size: 19px; max-width: 540px; color: var(--ink-2);
+    margin: 0 0 28px; line-height: 1.55;
+  }
+  .hero p.lede code {
+    font-family: var(--mono); font-size: 0.88em;
+    background: var(--shell); padding: 2px 6px; border-radius: 5px;
+    border: 1px solid rgba(58,42,24,0.15);
+  }
+
+  /* CTA row */
+  .cta-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin-bottom: 24px; }
+  .btn {
+    font-family: var(--mono); font-weight: 600; font-size: 14px;
+    padding: 14px 22px;
+    border-radius: 18px;
+    border: 2.5px solid var(--ink);
+    background: var(--butter);
+    color: var(--ink);
+    text-decoration: none;
+    box-shadow: 5px 5px 0 var(--ink);
+    display: inline-flex; align-items: center; gap: 10px;
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
+  }
+  .btn:hover {
+    transform: translate(-2px,-2px);
+    box-shadow: 7px 7px 0 var(--ink);
+    text-decoration: none;
+  }
+  .btn.dark { background: var(--ink); color: var(--cream); }
+  .btn.dark:hover { background: var(--ember); }
+  .btn.try { background: var(--sage); color: var(--ink); position: relative; }
+  .btn.try:hover { background: #A4C17C; }
+  .btn.try .play {
+    width: 22px; height: 22px; border-radius: 999px;
+    background: var(--ink); color: var(--cream);
+    display: inline-grid; place-items: center;
+    font-size: 10px; padding-left: 2px;
+  }
+  .btn.try .pill {
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    background: var(--ink); color: var(--cream);
+    padding: 2px 7px; border-radius: 999px;
+    letter-spacing: 0.05em;
+  }
+  .btn .arrow { transition: transform 0.15s ease; }
+  .btn:hover .arrow { transform: translateX(3px); }
+
+  .hero-meta {
+    display: flex; gap: 22px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink-2);
+  }
+  .hero-meta b { color: var(--ink); font-weight: 700; }
+
+  /* mascot stage */
+  .mascot-stage {
+    position: relative;
+    display: grid; place-items: center;
+    padding: 20px;
+  }
+  .mascot-stage img {
+    display: block;
+    width: 100%; max-width: 520px;
+    filter: drop-shadow(8px 12px 0 rgba(58,42,24,0.18));
+  }
+  /* speed-line decorations */
+  .speedline {
+    position: absolute;
+    height: 3px; background: var(--ink); border-radius: 999px;
+    pointer-events: none;
+  }
+  .speedline.s1 { top: 18%;  left: 4%;   width: 60px; opacity: 0.5; }
+  .speedline.s2 { top: 38%;  left: -2%;  width: 88px; opacity: 0.7; background: var(--ember); }
+  .speedline.s3 { top: 60%;  left: 2%;   width: 48px; opacity: 0.5; }
+  .speedline.s4 { top: 78%;  left: 12%;  width: 70px; opacity: 0.4; background: var(--toast); }
+  .sparkle {
+    position: absolute; font-size: 24px; color: var(--butter-deep);
+    animation: twinkle 2.6s ease-in-out infinite;
+  }
+  .sparkle.k1 { top: 10%; right: 8%; animation-delay: 0s; }
+  .sparkle.k2 { bottom: 16%; right: 24%; animation-delay: 0.8s; color: var(--ember); }
+  .sparkle.k3 { top: 50%; right: -2%; animation-delay: 1.6s; color: var(--toast); }
+  @keyframes twinkle {
+    0%, 100% { transform: scale(1); opacity: 0.85; }
+    50%      { transform: scale(1.25); opacity: 1; }
+  }
+
+  /* terminal float */
+  .term-float {
+    position: absolute;
+    left: -16px; bottom: -28px;
+    width: 320px;
+    background: #2a1f12;
+    color: #FBF3DC;
+    border: 2.5px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 6px 6px 0 var(--ink);
+    font-family: var(--mono); font-size: 12px;
+    overflow: hidden;
+    transform: rotate(-2deg);
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px;
+    background: rgba(0,0,0,0.25);
+    border-bottom: 1.5px solid rgba(251,243,220,0.15);
+  }
+  .term-bar .tdot { width: 9px; height: 9px; border-radius: 50%; background: #5A4225; }
+  .term-bar .tdot:nth-child(1) { background: var(--ember); }
+  .term-bar .tdot:nth-child(2) { background: var(--butter); }
+  .term-bar .tdot:nth-child(3) { background: var(--sage); }
+  .term-bar .ttitle {
+    margin-left: 8px; font-size: 11px; color: rgba(251,243,220,0.6);
+  }
+  .term-body { padding: 12px 14px; line-height: 1.7; }
+  .term-body .pr { color: var(--sage); margin-right: 6px; }
+  .term-body .ok { color: var(--sage); }
+  .term-body .mut { color: rgba(251,243,220,0.5); }
+  .term-body .em { color: var(--ember); }
+
+  /* ---------- HERO DIVIDER ---------- */
+  .hero-divider {
+    max-width: 1180px;
+    margin: 32px auto 24px;
+    padding: 0 32px;
+    display: flex; align-items: center; gap: 18px;
+  }
+  .hero-divider::before, .hero-divider::after {
+    content: ""; flex: 1; height: 0;
+    border-top: 1.5px dashed rgba(58,42,24,0.25);
+  }
+  .hero-divider .glyph {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--ember); border: 2px solid var(--ink);
+    box-shadow: 14px 0 0 -2px var(--butter), -14px 0 0 -2px var(--toast);
+  }
+
+  /* ---------- INSTALL SECTION ---------- */
+  #install { padding: 48px 32px 24px; }
+  .install-grid {
+    display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 56px;
+    align-items: start;
+    max-width: 1180px; margin: 0 auto;
+  }
+  .install-text h2 {
+    font-family: var(--display); font-weight: 800; font-size: clamp(32px, 4vw, 44px);
+    letter-spacing: -0.015em; margin: 0 0 8px;
+    color: var(--ink);
+  }
+  .install-text h2 em { font-style: italic; color: var(--ember); font-weight: 700; }
+  .install-text p { font-size: 16px; color: var(--ink-2); margin: 0 0 18px; max-width: 460px; }
+  .install-text ol {
+    list-style: none; padding: 0; margin: 18px 0 0;
+    counter-reset: step;
+  }
+  .install-text ol li {
+    counter-increment: step;
+    padding: 14px 0 14px 40px;
+    position: relative;
+    border-bottom: 1.5px dashed var(--rule);
+    font-size: 15px; color: var(--ink-2);
+    line-height: 1.7;
+  }
+  .install-text ol li:last-child { border-bottom: 0; }
+  .install-text ol li::before {
+    content: counter(step);
+    position: absolute; left: 0; top: 14px;
+    font-family: var(--mono); font-weight: 700; font-size: 12px;
+    color: var(--cream);
+    background: var(--ink);
+    width: 24px; height: 24px; border-radius: 8px;
+    display: grid; place-items: center;
+  }
+  .install-text code {
+    font-family: var(--mono); font-size: 0.9em;
+    background: rgba(58,42,24,0.07); padding: 1px 6px; border-radius: 5px;
+    color: var(--ink); border: 1px solid rgba(58,42,24,0.1);
+    white-space: nowrap;
+  }
+
+  .codeblock {
+    background: #2a1f12;
+    color: var(--cream);
+    border-radius: 14px;
+    padding: 20px 22px;
+    font-family: var(--mono); font-size: 13px; line-height: 1.85;
+    border: 2.5px solid var(--ink);
+    box-shadow: 6px 6px 0 var(--ink);
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0;
+  }
+  .codeblock .pr { color: var(--sage); }
+  .codeblock .cmt { color: rgba(251,243,220,0.45); }
+  .codeblock .em { color: var(--ember); }
+  .codeblock .ok { color: var(--sage); }
+  .codeblock .mut { color: rgba(251,243,220,0.55); }
+  .codeblock .accent { color: var(--butter); }
+
+  .install-alt {
+    margin-top: 16px;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 12px; color: var(--ink-2);
+  }
+  .install-alt .pchip {
+    background: transparent; border: 1px solid rgba(58,42,24,0.3);
+    padding: 4px 10px; border-radius: 999px;
+    color: var(--ink-2);
+  }
+  .install-alt .pchip:hover { color: var(--ink); border-color: var(--ink); }
+
+  /* ---------- USE WITH HATCH ---------- */
+  #hatch { padding: 56px 32px 24px; }
+  .hatch-card {
+    max-width: 1180px; margin: 0 auto;
+    background: var(--ink);
+    color: var(--cream);
+    border-radius: 28px;
+    padding: 48px 48px 44px;
+    border: 3px solid var(--ink);
+    box-shadow: 8px 8px 0 var(--butter-deep);
+    display: grid; grid-template-columns: 1fr 1.1fr; gap: 40px;
+    align-items: center;
+    position: relative; overflow: hidden;
+  }
+  .hatch-card::before {
+    content: ""; position: absolute;
+    top: -60px; right: -40px;
+    width: 220px; height: 220px; border-radius: 50%;
+    background: var(--ember); opacity: 0.16;
+    corner-shape: round;
+  }
+  .hatch-card .tag {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--butter);
+    background: rgba(251,243,220,0.08);
+    border: 1.5px solid rgba(251,243,220,0.2);
+    padding: 5px 11px; border-radius: 999px;
+  }
+  .hatch-card h2 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(30px, 3.6vw, 42px);
+    letter-spacing: -0.015em;
+    margin: 14px 0 10px;
+    color: var(--cream);
+  }
+  .hatch-card h2 em { font-style: italic; color: var(--butter); font-weight: 700; }
+  .hatch-card p { color: rgba(251,243,220,0.78); margin: 0 0 22px; font-size: 16px; line-height: 1.55; max-width: 440px; }
+  .hatch-card .links { display: flex; gap: 12px; flex-wrap: wrap; }
+  .hatch-card .btn-light {
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+    background: var(--butter); color: var(--ink);
+    padding: 11px 18px; border-radius: 14px;
+    border: 2px solid var(--butter);
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .hatch-card .btn-light:hover { background: var(--cream); border-color: var(--cream); text-decoration: none; }
+  .hatch-card .btn-ghost {
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+    background: transparent; color: var(--cream);
+    padding: 11px 18px; border-radius: 14px;
+    border: 2px solid rgba(251,243,220,0.3);
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .hatch-card .btn-ghost:hover { border-color: var(--cream); text-decoration: none; }
+
+  .hatch-snippet {
+    background: rgba(0,0,0,0.32);
+    border: 1.5px solid rgba(251,243,220,0.12);
+    border-radius: 16px;
+    padding: 18px 20px;
+    font-family: var(--mono); font-size: 13px; line-height: 1.85;
+    color: rgba(251,243,220,0.94);
+    white-space: pre;
+    overflow-x: auto;
+    position: relative;
+    z-index: 1;
+  }
+  .hatch-snippet .pr { color: var(--sage); }
+  .hatch-snippet .cmt { color: rgba(251,243,220,0.4); }
+  .hatch-snippet .em { color: var(--ember); }
+  .hatch-snippet .accent { color: var(--butter); }
+
+  /* ---------- EMBED SECTION ---------- */
+  #embed { padding: 80px 32px 24px; }
+  .embed-grid {
+    max-width: 1180px; margin: 0 auto;
+    display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 56px;
+    align-items: start;
+  }
+  .embed-text .tag {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink-2);
+    background: var(--shell); border: 1.5px solid var(--ink);
+    padding: 5px 11px; border-radius: 999px;
+    box-shadow: 0 2px 0 var(--ink);
+  }
+  .embed-text h2 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(32px, 4vw, 44px);
+    letter-spacing: -0.015em;
+    line-height: 1.08;
+    margin: 14px 0 14px;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  .embed-text h2 em { font-style: italic; color: var(--ember); font-weight: 700; }
+  .embed-text p {
+    font-size: 15.5px; color: var(--ink-2); margin: 0 0 18px; max-width: 460px; line-height: 1.55;
+  }
+  .embed-text p code {
+    font-family: var(--mono); font-size: 0.9em;
+    background: rgba(58,42,24,0.07); padding: 1.5px 6px; border-radius: 5px;
+    color: var(--ink); border: 1px solid rgba(58,42,24,0.1);
+  }
+  .embed-points {
+    list-style: none; padding: 0; margin: 0;
+    display: grid; gap: 10px;
+  }
+  .embed-points li {
+    display: grid; grid-template-columns: 22px 1fr; gap: 12px;
+    font-size: 14px; color: var(--ink-2); line-height: 1.5;
+  }
+  .embed-points li .ck {
+    width: 20px; height: 20px; border-radius: 6px;
+    background: var(--butter); border: 1.5px solid var(--ink);
+    display: grid; place-items: center; margin-top: 2px;
+    font-size: 12px; color: var(--ink); font-weight: 800;
+  }
+  .embed-points li code {
+    font-family: var(--mono); font-size: 0.86em;
+    color: var(--ink); background: rgba(58,42,24,0.07);
+    padding: 1px 5px; border-radius: 4px;
+    border: 1px solid rgba(58,42,24,0.1);
+  }
+  .embed-points li b { color: var(--ink); font-weight: 700; }
+
+  /* code-tabs panel */
+  .codepanel {
+    background: #2a1f12;
+    border: 2.5px solid var(--ink);
+    border-radius: 16px;
+    box-shadow: 6px 6px 0 var(--ink);
+    overflow: hidden;
+  }
+  .codepanel .tabs {
+    display: flex; align-items: stretch;
+    background: rgba(0,0,0,0.28);
+    border-bottom: 1.5px solid rgba(251,243,220,0.12);
+  }
+  .codepanel .tab {
+    appearance: none;
+    background: transparent; border: 0;
+    color: rgba(251,243,220,0.55);
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    padding: 11px 16px;
+    cursor: pointer;
+    border-right: 1.5px solid rgba(251,243,220,0.08);
+    display: inline-flex; align-items: center; gap: 8px;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .codepanel .tab .ext {
+    font-size: 10px;
+    background: rgba(251,243,220,0.08);
+    border: 1px solid rgba(251,243,220,0.12);
+    padding: 1px 5px; border-radius: 4px;
+    color: rgba(251,243,220,0.7);
+  }
+  .codepanel .tab.active {
+    color: var(--cream);
+    background: rgba(251,243,220,0.06);
+  }
+  .codepanel .tab.active .ext { background: var(--butter); color: var(--ink); border-color: var(--butter); }
+  .codepanel .tab:hover:not(.active) { color: rgba(251,243,220,0.85); }
+  .codepanel .panes { position: relative; }
+  .codepanel pre {
+    margin: 0;
+    padding: 18px 22px 22px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.75;
+    color: rgba(251,243,220,0.95);
+    white-space: pre;
+    overflow-x: auto;
+    display: none;
+  }
+  .codepanel pre.active { display: block; }
+  .codepanel .kw  { color: #E8A92A; }
+  .codepanel .ty  { color: #B8D4E3; }
+  .codepanel .fn  { color: var(--cream); font-weight: 600; }
+  .codepanel .str { color: var(--sage); }
+  .codepanel .cmt { color: rgba(251,243,220,0.4); font-style: italic; }
+  .codepanel .pp  { color: var(--ember); }
+  .codepanel .num { color: var(--ember); }
+  .codepanel .pr  { color: var(--sage); }
+  .codepanel .em  { color: var(--ember); }
+  .codepanel .accent { color: var(--butter); }
+  .codepanel .mut { color: rgba(251,243,220,0.55); }
+
+  /* tabler-style inline icons */
+  .ti { width: 1em; height: 1em; vertical-align: -0.18em; flex: none; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .hero-meta .ti { width: 14px; height: 14px; }
+  .embed-text .tag .ti { width: 14px; height: 14px; }
+  .hatch-card .tag .ti { width: 13px; height: 13px; }
+
+  /* embed lang toggle */
+  .lang-toggle {
+    display: inline-flex; align-items: center; gap: 0;
+    background: var(--shell);
+    border: 2px solid var(--ink);
+    border-radius: 999px;
+    padding: 3px;
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+  .lang-toggle button {
+    appearance: none; border: 0; background: transparent;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink-2);
+    padding: 7px 16px; border-radius: 999px;
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 7px;
+    letter-spacing: 0.02em;
+  }
+  .lang-toggle button .ti { width: 13px; height: 13px; }
+  .lang-toggle button.active {
+    background: var(--ink); color: var(--cream);
+  }
+  .lang-toggle button:hover:not(.active) { color: var(--ink); }
+
+  .embed-mode { display: none; }
+  .embed-mode.active { display: block; }
+  .codepanel.hidden { display: none; }
+
+  /* ---------- DIAGNOSTICS ---------- */
+  #diagnostics { padding: 80px 32px 24px; }
+  .diag-grid {
+    max-width: 1180px; margin: 0 auto;
+    display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 56px;
+    align-items: start;
+  }
+  .diag-text .tag {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink-2);
+    background: var(--shell); border: 1.5px solid var(--ink);
+    padding: 5px 11px; border-radius: 999px;
+    box-shadow: 0 2px 0 var(--ink);
+  }
+  .diag-text .tag .ti { width: 13px; height: 13px; }
+  .diag-text h2 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(32px, 4vw, 44px);
+    letter-spacing: -0.015em;
+    line-height: 1.08;
+    margin: 14px 0 14px;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  .diag-text h2 em { font-style: italic; color: var(--ember); font-weight: 700; }
+  .diag-text p {
+    font-size: 15.5px; color: var(--ink-2); margin: 0 0 18px; max-width: 460px; line-height: 1.55;
+  }
+  .diag-text p code {
+    font-family: var(--mono); font-size: 0.9em;
+    background: rgba(58,42,24,0.07); padding: 1.5px 6px; border-radius: 5px;
+    color: var(--ink); border: 1px solid rgba(58,42,24,0.1);
+  }
+  .diag-points {
+    list-style: none; padding: 0; margin: 0;
+    display: grid; gap: 10px;
+  }
+  .diag-points li {
+    display: grid; grid-template-columns: 22px 1fr; gap: 12px;
+    font-size: 14px; color: var(--ink-2); line-height: 1.5;
+  }
+  .diag-points li .ck {
+    width: 20px; height: 20px; border-radius: 6px;
+    background: var(--sage); border: 1.5px solid var(--ink);
+    display: grid; place-items: center; margin-top: 2px;
+    font-size: 12px; color: var(--ink); font-weight: 800;
+  }
+  .diag-points li code {
+    font-family: var(--mono); font-size: 0.86em;
+    color: var(--ink); background: rgba(58,42,24,0.07);
+    padding: 1px 5px; border-radius: 4px;
+    border: 1px solid rgba(58,42,24,0.1);
+  }
+  .diag-points li b { color: var(--ink); font-weight: 700; }
+
+  .diag-report {
+    background: #2a1f12;
+    border: 2.5px solid var(--ink);
+    border-radius: 16px;
+    box-shadow: 6px 6px 0 var(--ink);
+    overflow: hidden;
+  }
+  .diag-bar {
+    display: flex; align-items: center; gap: 8px;
+    background: rgba(0,0,0,0.28);
+    border-bottom: 1.5px solid rgba(251,243,220,0.12);
+    padding: 10px 16px;
+    font-family: var(--mono); font-size: 11px; color: rgba(251,243,220,0.6);
+    letter-spacing: 0.04em;
+  }
+  .diag-bar .tdot { width: 9px; height: 9px; border-radius: 50%; }
+  .diag-bar .tdot:nth-child(1) { background: #d97a4a; }
+  .diag-bar .tdot:nth-child(2) { background: #d9b34a; }
+  .diag-bar .tdot:nth-child(3) { background: #8FAE6A; }
+  .diag-bar .filename { margin-left: 10px; color: rgba(251,243,220,0.7); }
+  .diag-bar .badge {
+    margin-left: auto;
+    color: var(--ember);
+    background: rgba(220,103,63,0.12);
+    border: 1px solid rgba(220,103,63,0.4);
+    padding: 1px 8px; border-radius: 4px;
+    font-weight: 700; letter-spacing: 0.05em;
+  }
+  .diag-report pre {
+    margin: 0;
+    padding: 22px 26px 24px;
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.7;
+    color: rgba(251,243,220,0.92);
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .diag-report .err     { color: var(--ember); font-weight: 700; }
+  .diag-report .errlbl  { color: var(--ember); font-weight: 700; }
+  .diag-report .rule    { color: rgba(251,243,220,0.5); }
+  .diag-report .ln      { color: rgba(251,243,220,0.4); }
+  .diag-report .ident   { color: var(--cream); }
+  .diag-report .str     { color: var(--sage); }
+  .diag-report .kw      { color: #E8A92A; }
+  .diag-report .num     { color: var(--ember); }
+  .diag-report .dot     { color: rgba(251,243,220,0.4); }
+  .diag-report .caret   { color: var(--ember); }
+  .diag-report .underline { color: var(--ember); font-weight: 700; }
+  .diag-report .note-tag { color: var(--butter); font-weight: 700; }
+  .diag-report .note    { color: rgba(251,243,220,0.85); }
+  .diag-report .hint-code { color: var(--butter); }
+
+  /* ---------- FOOTER ---------- */
+  footer {
+    margin-top: 64px;
+    background: var(--cream-2);
+    border-top: 2.5px solid var(--ink);
+    padding: 40px 32px 28px;
+  }
+  .foot-inner {
+    max-width: 1180px; margin: 0 auto;
+    display: flex; justify-content: space-between; align-items: center; gap: 24px; flex-wrap: wrap;
+  }
+  .foot-brand { display: flex; align-items: center; gap: 10px; }
+  .foot-brand .mark {
+    width: 32px; height: 32px; border-radius: 10px;
+    background: var(--ink); color: var(--cream);
+    display: grid; place-items: center;
+    font-family: var(--mono); font-weight: 700; font-size: 13px;
+  }
+  .foot-brand b { font-family: var(--display); font-weight: 800; font-size: 18px; color: var(--ink); }
+  .foot-links { display: flex; gap: 22px; font-family: var(--mono); font-size: 12.5px; }
+  .foot-links a { color: var(--ink-2); }
+  .foot-links a:hover { color: var(--toast-deep); }
+  .foot-bottom {
+    max-width: 1180px; margin: 24px auto 0;
+    padding-top: 18px;
+    border-top: 1.5px dashed var(--rule);
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    font-family: var(--mono); font-size: 12px; color: var(--ink-3);
+  }
+
+  /* Responsive */
+  @media (max-width: 980px) {
+    .hero { grid-template-columns: 1fr; padding-bottom: 60px; }
+    .mascot-stage { max-width: 460px; margin: 0 auto; }
+    .install-grid { grid-template-columns: 1fr; gap: 28px; }
+    .hatch-card { grid-template-columns: 1fr; padding: 36px 28px; }
+    .term-float { left: 0; width: 280px; }
+  }
+  @media (max-width: 600px) {
+    .nav-links a { display: none; }
+    .term-float { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="nav">
+  <a class="brand" href="/">
+    <span class="word">wrenlift</span>
+  </a>
+  <div class="nav-links">
+    <a href="#install">Install</a>
+    <a href="#diagnostics">Diagnostics</a>
+    <a href="#embed">Embed</a>
+    <a href="#hatch">Packages</a>
+    <a href="benchmark/">Benchmarks</a>
+    <a href="https://github.com/wrenlift">GitHub</a>
+    <a class="nav-cta" href="https://github.com/wrenlift/WrenLift">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-1.96c-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.15 1.18a10.95 10.95 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.58.23 2.75.11 3.04.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.27 5.69.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.8.55C20.21 21.39 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+      <span>Star on GitHub</span>
+    </a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero">
+  <div>
+    <span class="eyebrow"><span class="dot"></span>v0.1.0 · a <i>fast</i> standalone runtime for wren</span>
+    <h1>Wren scripts, now <span class="accent">standalone</span> and portable.</h1>
+    <p class="lede">
+      <a href="https://wren.io" target="_blank" rel="noopener"><code>Wren</code></a>
+      was intended to be small and embedded. Wrenlift flips that &mdash;
+      it runs your <code>.wren</code> files directly as standalone, portable scripts
+      and apps. One static binary, <code>wlift</code>, with zero runtime deps.
+    </p>
+
+    <div class="cta-row">
+      <a class="btn try" href="playground/web/">
+        <span class="play">▶</span>
+        <span>Try it in your browser</span>
+        <span class="pill">NEW</span>
+      </a>
+      <a class="btn" href="#install">
+        <span>Install wrenlift</span>
+        <span class="arrow">→</span>
+      </a>
+      <a class="btn dark" href="https://github.com/wrenlift">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.1.79-.25.79-.56v-1.96c-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.68-1.27-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.18-3.1-.12-.29-.51-1.46.11-3.04 0 0 .96-.31 3.15 1.18a10.95 10.95 0 0 1 5.74 0c2.19-1.49 3.15-1.18 3.15-1.18.62 1.58.23 2.75.11 3.04.74.81 1.18 1.84 1.18 3.1 0 4.43-2.7 5.4-5.27 5.69.41.36.78 1.06.78 2.13v3.16c0 .31.21.66.8.55C20.21 21.39 23.5 17.08 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+        <span>github.com/wrenlift</span>
+      </a>
+    </div>
+
+    <div class="hero-meta">
+      <span><svg class="ti" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg> <b>standalone</b> &middot; no host required</span>
+      <span><svg class="ti" viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg> <b>tiered JIT</b> · interpret then Cranelift</span>
+      <span><svg class="ti" viewBox="0 0 24 24"><path d="M12 4v12m0 0l-5-5m5 5l5-5M4 20h16"/></svg> <b>zero</b> runtime deps</span>
+    </div>
+  </div>
+
+  <div class="mascot-stage">
+    <span class="speedline s1"></span>
+    <span class="speedline s2"></span>
+    <span class="speedline s3"></span>
+    <span class="speedline s4"></span>
+    <div class="sparkle k1">✦</div>
+    <div class="sparkle k2">✦</div>
+    <div class="sparkle k3">✦</div>
+    <img src="assets/wrenlift-mascot.png" alt="Wrenlift mascot — a wren bird strapped to twin rocket boosters, trailing flame and smoke"/>
+
+    <div class="term-float" aria-hidden="true">
+      <div class="term-bar">
+        <span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>
+        <span class="ttitle">~/projects/api</span>
+      </div>
+      <div class="term-body">
+        <div><span class="pr">$</span> wlift run server.wren</div>
+        <div class="mut">  no host needed · standalone</div>
+        <div><span class="ok">✓</span> listening on :8080 <span class="em">&gt;</span></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- HERO DIVIDER -->
+<div class="hero-divider" aria-hidden="true">
+  <span class="glyph"></span>
+</div>
+
+<!-- INSTALL -->
+<section id="install">
+  <div class="install-grid">
+    <div class="install-text">
+      <h2>Quick <em>setup</em>.</h2>
+      <p>One curl gives you both binaries &mdash; <code>wlift</code> (the runtime) and <code>hatch</code> (the package + build tool) &mdash; pulled from the latest GitHub Release, SHA256-verified, dropped into <code>~/.local/bin</code>. No Node, no Python, no Docker.</p>
+      <ol>
+        <li>Run the script. The default install dir is <code>~/.local/bin</code>; override with <code>INSTALL_DIR</code>.</li>
+        <li>Open a new shell so <code>wlift</code> and <code>hatch</code> land on your <code>PATH</code>.</li>
+        <li>Run <code>wlift hello.wren</code> &mdash; you&rsquo;re lifting.</li>
+      </ol>
+    </div>
+
+    <div>
+      <pre class="codeblock"><span class="cmt"># install (macos · linux)</span>
+<span class="pr">$</span> curl -fsSL <span class="accent">https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh</span> | bash
+
+<span class="cmt"># verify</span>
+<span class="pr">$</span> wlift --version
+<span class="mut">  wrenlift </span><span class="em">0.1.0</span><span class="mut"> (release, jit)</span>
+
+<span class="cmt"># run a script</span>
+<span class="pr">$</span> wlift hello.wren
+<span class="ok">  hello, world</span></pre>
+      <div class="install-alt">
+        <span>or build from source</span>
+        <a class="pchip" href="https://github.com/wrenlift/WrenLift">cargo install --git github.com/wrenlift/WrenLift</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- USE WITH HATCH -->
+<section id="hatch">
+  <div class="hatch-card">
+    <div>
+      <span class="tag"><svg class="ti" viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h10"/><circle cx="19" cy="17" r="2"/></svg> packages &amp; libraries</span>
+      <h2>Pair with <em>Hatch</em><br/>for libraries.</h2>
+      <p>Wrenlift powers <a href="https://github.com/wrenlift/hatch" style="color:var(--butter);">Hatch</a>, and Hatch brings the ecosystem. Add a package, lock the version, and <code style="font-family:var(--mono);font-size:13px;background:rgba(251,243,220,0.1);padding:2px 7px;border-radius:6px;color:var(--cream);">hatch run</code> takes care of the rest &mdash; same runtime under the hood.</p>
+      <div class="links">
+        <a class="btn-light" href="https://github.com/wrenlift/hatch/blob/main/index.toml">
+          <span>Browse hatch packages</span>
+          <span>→</span>
+        </a>
+        <a class="btn-ghost" href="https://github.com/wrenlift/hatch#readme">
+          <span>Read the docs</span>
+        </a>
+      </div>
+    </div>
+
+    <pre class="hatch-snippet"><span class="cmt"># add a hatch package</span>
+<span class="pr">$</span> hatch add <span class="accent">@hatch:http</span>
+<span class="cmt">  resolved 3 packages</span>
+
+<span class="cmt"># run with the hatch cli &mdash; it wraps wlift</span>
+<span class="pr">$</span> hatch run app.wren
+<span class="cmt">  loading </span><span class="accent">@hatch:http</span><span class="cmt">@0.3.0</span>
+<span class="cmt">  loading </span><span class="accent">@hatch:json</span><span class="cmt">@0.1.0</span>
+<span class="em">  &gt; standalone &middot; serving :8080</span></pre>
+  </div>
+</section>
+
+<!-- DIAGNOSTICS -->
+<section id="diagnostics">
+  <div class="diag-grid">
+    <div class="diag-text">
+      <span class="tag"><svg class="ti" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v4M12 16h.01"/></svg> diagnostics</span>
+      <h2>Errors that <em>read like prose</em>.</h2>
+      <p>When something goes wrong, Wrenlift doesn't just say "method not found." It points at the exact identifier, names the type involved, and &mdash; when it can &mdash; tells you what to try next.</p>
+      <ul class="diag-points">
+        <li><span class="ck">1</span><span><b>Located.</b> File, line, and column.</span></li>
+        <li><span class="ck">2</span><span><b>Source-anchored.</b> Caret on the failing identifier.</span></li>
+        <li><span class="ck">3</span><span><b>Class-aware.</b> Names the type, not just the symbol.</span></li>
+        <li><span class="ck">4</span><span><b>Actionable.</b> Suggests the fix when it can.</span></li>
+      </ul>
+    </div>
+
+    <div class="diag-report">
+      <div class="diag-bar">
+        <span class="tdot"></span><span class="tdot"></span><span class="tdot"></span>
+        <span class="filename">counter.wren</span>
+        <span class="badge">RUNTIME ERROR</span>
+      </div>
+<pre><span class="errlbl">Error</span>: <span class="ident">Counter</span> does not implement <span class="str">'tally'</span>
+    <span class="rule">╭─[</span><span class="ident">counter.wren</span><span class="rule">:</span><span class="num">22</span><span class="rule">:</span><span class="num">34</span><span class="rule">]</span>
+    <span class="rule">│</span>
+ <span class="ln">22</span> <span class="rule">│</span> <span class="kw">System</span>.<span class="ident">print</span>(<span class="str">"Final count: "</span> + c.<span class="underline">tally</span>.<span class="ident">toString</span>)
+    <span class="rule">│</span>                                  <span class="caret">─────┬───────</span>
+    <span class="rule">│</span>                                       <span class="caret">╰─────── error occurred here</span>
+    <span class="rule">│</span>
+    <span class="rule">│</span> <span class="note-tag">Note:</span> <span class="note">`<span class="hint-code">Counter</span>` has no getter or method `<span class="hint-code">tally</span>`.</span>
+    <span class="rule">│</span>       <span class="note">Did you mean to call it with `<span class="hint-code">()</span>`?</span>
+<span class="rule">────╯</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- EMBED IN YOUR HOST -->
+<section id="embed">
+  <div class="embed-grid">
+    <div class="embed-text">
+      <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+        <span class="tag"><svg class="ti" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9c.3.6.9 1 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg> host embedding</span>
+        <div class="lang-toggle" id="langToggle" role="tablist">
+          <button class="active" data-lang="c">C</button>
+          <button data-lang="rust">Rust</button>
+        </div>
+      </div>
+
+      <div class="embed-mode active" data-mode="c">
+        <h2>Or <em>embed it</em> in your C host.</h2>
+        <p>Drop-in for the upstream Wren C API. Same <code>WrenVM</code>, same <code>WrenConfiguration</code> &mdash; grab the <a href="https://github.com/wrenlift/WrenLift/blob/main/examples/wrenlift.h" target="_blank" rel="noopener"><code>wrenlift.h</code></a> shim, link <code>libwrenlift.a</code>, and your existing host keeps working.</p>
+        <ul class="embed-points">
+          <li><span class="ck">✓</span><span><b>API-compatible.</b> <code>wrenNewVM</code>, <code>wrenInterpret</code>, <code>wrenCall</code>, foreign methods, slots: all of it.</span></li>
+          <li><span class="ck">✓</span><span><b>One library, two modes.</b> Same build powers <code>wlift</code> on the CLI and embeds inside your game, editor, or daemon.</span></li>
+          <li><span class="ck">✓</span><span><b>Bring your own loader.</b> <code>WrenLoadModuleFn</code> is honoured &mdash; ship Hatch packages or your own modules.</span></li>
+        </ul>
+      </div>
+
+      <div class="embed-mode" data-mode="rust">
+        <h2>Or <em>embed it</em> in your Rust host.</h2>
+        <p>Wrenlift ships first-class Rust bindings. Reach for <a href="https://github.com/wrenlift/WrenLift/blob/main/src/hatch_runner.rs" target="_blank" rel="noopener"><code>hatch_runner</code></a> when you want the Hatch-aware runtime in two lines, or drop down to the raw <a href="https://github.com/wrenlift/WrenLift/blob/main/src/capi.rs" target="_blank" rel="noopener"><code>capi</code></a> externs for full VM control.</p>
+        <ul class="embed-points">
+          <li><span class="ck">✓</span><span><b>High level &mdash; <code>hatch_runner</code>.</b> One <code>HatchRunner::new()</code>, then <code>run_file()</code>. Resolves Hatch packages automatically.</span></li>
+          <li><span class="ck">✓</span><span><b>Low level &mdash; <code>capi</code>.</b> <code>extern "C"</code> bindings to <code>wrenNewVM</code>, <code>wrenInterpret</code>, slots, foreign methods. <code>unsafe</code> when you need it.</span></li>
+          <li><span class="ck">✓</span><span><b>Cargo-native.</b> Add <code>wren_lift</code> to your <code>Cargo.toml</code> &mdash; the build links the static lib for you.</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- C panel -->
+    <div class="codepanel" id="embedPanelC">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-pane="c-host"><span>host.c</span><span class="ext">C</span></button>
+        <button class="tab" data-pane="c-script"><span>greet.wren</span><span class="ext">WREN</span></button>
+        <button class="tab" data-pane="c-build"><span>build &amp; run</span><span class="ext">SH</span></button>
+      </div>
+      <div class="panes">
+<pre class="active" data-pane="c-host"><span class="pp">#include</span> <span class="str">"wrenlift.h"</span>   <span class="cmt">// drop-in for &lt;wren.h&gt;</span>
+<span class="pp">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="kw">static void</span> <span class="fn">writeFn</span>(<span class="ty">WrenVM</span>* vm, <span class="kw">const char</span>* text) {
+  <span class="fn">printf</span>(<span class="str">"%s"</span>, text);
+}
+
+<span class="kw">int</span> <span class="fn">main</span>(<span class="kw">void</span>) {
+  <span class="ty">WrenConfiguration</span> cfg;
+  <span class="fn">wrenInitConfiguration</span>(&amp;cfg);
+  cfg.writeFn = writeFn;
+
+  <span class="ty">WrenVM</span>* vm = <span class="fn">wrenNewVM</span>(&amp;cfg);
+
+  <span class="fn">wrenInterpret</span>(vm, <span class="str">"main"</span>,
+    <span class="str">"import \"greet\" for Greeter\n"</span>
+    <span class="str">"Greeter.hello(\"world\")\n"</span>);
+
+  <span class="fn">wrenFreeVM</span>(vm);
+  <span class="kw">return</span> <span class="num">0</span>;
+}</pre>
+
+<pre data-pane="c-script"><span class="cmt">// greet.wren &mdash; loaded by your host</span>
+<span class="kw">class</span> <span class="ty">Greeter</span> {
+  <span class="kw">static</span> <span class="fn">hello</span>(name) {
+    <span class="ty">System</span>.<span class="fn">print</span>(<span class="str">"hello, %(name) ✦"</span>)
+  }
+}</pre>
+
+<pre data-pane="c-build"><span class="cmt"># link against wrenlift</span>
+<span class="pr">$</span> cc host.c -o host \
+     -I<span class="accent">examples</span> \
+     <span class="accent">target/release/libwren_lift.a</span>
+
+<span class="pr">$</span> ./host
+<span class="mut">  hello, world </span><span class="em">✦</span></pre>
+      </div>
+    </div>
+
+    <!-- Rust panel -->
+    <div class="codepanel hidden" id="embedPanelRust">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-pane="r-runner"><span>main.rs</span><span class="ext">RUNNER</span></button>
+        <button class="tab" data-pane="r-capi"><span>main.rs</span><span class="ext">CAPI</span></button>
+        <button class="tab" data-pane="r-cargo"><span>Cargo.toml</span><span class="ext">TOML</span></button>
+      </div>
+      <div class="panes">
+<pre class="active" data-pane="r-runner"><span class="cmt">// high-level: hatch-aware runtime</span>
+<span class="kw">use</span> wren_lift::<span class="ty">hatch_runner</span>::<span class="ty">HatchRunner</span>;
+
+<span class="kw">fn</span> <span class="fn">main</span>() -&gt; <span class="ty">anyhow</span>::<span class="ty">Result</span>&lt;()&gt; {
+    <span class="kw">let mut</span> runner = <span class="ty">HatchRunner</span>::<span class="fn">new</span>();
+
+    <span class="cmt">// install hatch packages</span>
+    runner.<span class="fn">install</span>(<span class="str">"@hatch:math"</span>)?;
+    runner.<span class="fn">install</span>(<span class="str">"@hatch:fp"</span>)?;
+
+    <span class="cmt">// now run application code</span>
+    <span class="kw">let</span> src = <span class="str">r#"
+        import "@hatch:math" for Vec3
+        System.print(Vec3.new(1, 2, 3))
+    "#</span>;
+    runner.<span class="fn">run_source</span>(<span class="str">"main"</span>, src)?;
+
+    <span class="ty">Ok</span>(())
+}</pre>
+
+<pre data-pane="r-capi"><span class="cmt">// low-level: raw c api bindings</span>
+<span class="kw">use</span> wren_lift::capi::*;
+<span class="kw">use</span> std::ffi::<span class="ty">CString</span>;
+
+<span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">unsafe</span> {
+        <span class="kw">let mut</span> cfg: <span class="ty">WrenConfiguration</span> = std::mem::<span class="fn">zeroed</span>();
+        <span class="fn">wrenInitConfiguration</span>(&amp;<span class="kw">mut</span> cfg);
+
+        <span class="kw">let</span> vm = <span class="fn">wrenNewVM</span>(&amp;<span class="kw">mut</span> cfg);
+        <span class="kw">let</span> module = <span class="ty">CString</span>::<span class="fn">new</span>(<span class="str">"main"</span>).<span class="fn">unwrap</span>();
+        <span class="kw">let</span> src = <span class="ty">CString</span>::<span class="fn">new</span>(
+            <span class="str">"System.print(\"hello from rust\")"</span>
+        ).<span class="fn">unwrap</span>();
+
+        <span class="fn">wrenInterpret</span>(vm, module.<span class="fn">as_ptr</span>(), src.<span class="fn">as_ptr</span>());
+        <span class="fn">wrenFreeVM</span>(vm);
+    }
+}</pre>
+
+<pre data-pane="r-cargo"><span class="cmt"># Cargo.toml</span>
+<span class="kw">[dependencies]</span>
+<span class="accent">wren_lift</span> = { git = <span class="str">"https://github.com/wrenlift/WrenLift.git"</span>, branch = <span class="str">"main"</span> }
+<span class="accent">anyhow</span>    = <span class="str">"1"</span>
+
+<span class="cmt"># build &amp; run</span>
+<span class="pr">$</span> cargo run
+<span class="mut">   Compiling wren_lift v0.1.0</span>
+<span class="mut">   Compiling host v0.1.0</span>
+<span class="ok">    Finished</span><span class="mut"> dev [unoptimized] in 4.1s</span>
+<span class="mut">     Running `target/debug/host`</span>
+<span class="mut">  hello, world </span><span class="em">✦</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="foot-inner">
+    <div class="foot-brand">
+      <b>wrenlift</b>
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/wrenlift">GitHub</a>
+      <a href="#install">Install</a>
+      <a href="#embed">Embed</a>
+      <a href="benchmark/">Benchmarks</a>
+      <a href="https://github.com/wrenlift/hatch">Hatch</a>
+      <a href="https://wren.io" target="_blank" rel="noopener">Wren</a>
+    </div>
+  </div>
+  <div class="foot-bottom">
+    <span>© 2026 The Wrenlift contributors · MIT licensed</span>
+    <span>built fast for portable <a href="https://wren.io" target="_blank" rel="noopener">Wren</a> scripts</span>
+  </div>
+</footer>
+
+<script>
+  // Embed-section: language toggle + tab switcher
+  (function() {
+    const langToggle = document.getElementById('langToggle');
+    const panelC = document.getElementById('embedPanelC');
+    const panelR = document.getElementById('embedPanelRust');
+    const modes = document.querySelectorAll('.embed-mode');
+    if (!langToggle) return;
+
+    langToggle.querySelectorAll('button').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const lang = btn.dataset.lang;
+        langToggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+        modes.forEach(m => m.classList.toggle('active', m.dataset.mode === lang));
+        panelC.classList.toggle('hidden', lang !== 'c');
+        panelR.classList.toggle('hidden', lang !== 'rust');
+      });
+    });
+
+    // tab switching within either panel
+    document.querySelectorAll('.codepanel').forEach(panel => {
+      const tabs = panel.querySelectorAll('.tab');
+      const panes = panel.querySelectorAll('pre[data-pane]');
+      tabs.forEach(t => t.addEventListener('click', () => {
+        const target = t.dataset.pane;
+        tabs.forEach(x => x.classList.toggle('active', x === t));
+        panes.forEach(p => p.classList.toggle('active', p.dataset.pane === target));
+      }));
+    });
+  })();
+</script>
+
+</body>
+</html>

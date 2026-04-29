@@ -1,4 +1,10 @@
-name: Benchmarks
+name: Benchmarks + site deploy
+
+# Two jobs: `benchmark` runs the timing matrix and writes
+# `site/benchmark/results.json`; `deploy` then publishes the
+# whole `site/` (landing + benchmark page + assets) to GitHub
+# Pages. The wrenlift landing lives at `/`, benchmark results
+# at `/benchmark/`.
 
 on:
   push:
@@ -185,7 +191,31 @@ jobs:
             '. + {meta: {date: $date, commit: $sha, branch: $ref, arch: $runner, runs: $runs}}')
 
           echo "$RESULTS" | jq .
-          echo "$RESULTS" > bench/site/results.json
+          mkdir -p site/benchmark
+          echo "$RESULTS" > site/benchmark/results.json
+
+      - name: Install wasm-pack
+        # `wasm-pack` produces the `wasm/pkg/` bundle the
+        # playground imports. Cargo-installable so we don't need
+        # the upstream curl-bash installer in CI.
+        run: cargo install wasm-pack --locked
+
+      - name: Build the wasm playground
+        # `--no-typescript` matches `wasm/README.md` — the
+        # playground's JS imports the .js shim directly, no .d.ts
+        # consumers in the deploy.
+        run: wasm-pack build wasm --target web --release --no-typescript
+
+      - name: Stage playground into site/
+        # Layout the playground expects: `playground/web/` +
+        # sibling `playground/pkg/`. wlift.js / worker.js import
+        # `../pkg/wlift_wasm.js`, which resolves cleanly with
+        # this shape. The "Try it in your browser" CTA on the
+        # landing points at `playground/web/`.
+        run: |
+          mkdir -p site/playground/web site/playground/pkg
+          cp -R wasm/web/. site/playground/web/
+          cp -R wasm/pkg/. site/playground/pkg/
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
@@ -193,7 +223,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: bench/site
+          path: site
 
   deploy:
     needs: benchmark

@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Wrenlift — benchmarks</title>
+<link rel="icon" href="../assets/wrenlift-mascot.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --cream: #FBF3DC;
+    --cream-2: #F5E8C3;
+    --cream-3: #EFDDA8;
+    --ink: #3A2A18;
+    --ink-2: #5A4225;
+    --ink-3: #7B5E36;
+    --butter: #F4C24A;
+    --butter-deep: #E8A92A;
+    --toast: #D97A2B;
+    --toast-deep: #B45F1A;
+    --ember: #E04E1F;
+    --sage: #8FAE6A;
+    --sage-deep: #6B8C48;
+    --sky: #B8D4E3;
+    --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; corner-shape: squircle; }
+  .dot, .tdot, .glyph, .bar-fill { corner-shape: round; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body);
+    color: var(--ink);
+    background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.18) 0, transparent 26%),
+      radial-gradient(circle at 70% 90%, rgba(184, 212, 227, 0.14) 0, transparent 30%);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  a { color: var(--toast-deep); text-decoration: none; }
+  a:hover { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }
+  ::selection { background: var(--ember); color: var(--cream); }
+
+  /* ---------- NAV ---------- */
+  .nav {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 22px 32px;
+    max-width: 1180px; margin: 0 auto;
+  }
+  .brand {
+    display: inline-flex; align-items: center; gap: 12px;
+    font-family: var(--display); font-weight: 800; font-size: 22px;
+    color: var(--ink); text-decoration: none;
+  }
+  .brand .word { letter-spacing: -0.01em; }
+  .nav-links {
+    display: flex; gap: 26px; align-items: center;
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+  }
+  .nav-links a { color: var(--ink); }
+  .nav-links a:hover { color: var(--toast-deep); text-decoration: none; }
+
+  /* ---------- HEADER ---------- */
+  .head {
+    max-width: 920px; margin: 0 auto;
+    padding: 28px 32px 24px;
+    text-align: left;
+  }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink-2);
+    background: var(--shell); border: 1.5px solid var(--ink);
+    padding: 6px 12px; border-radius: 999px;
+    box-shadow: 0 2px 0 var(--ink);
+  }
+  .eyebrow .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--sage); box-shadow: 0 0 0 3px rgba(143,174,106,0.25);
+  }
+  .head h1 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(40px, 5.4vw, 60px);
+    letter-spacing: -0.02em; line-height: 1.05;
+    margin: 18px 0 12px;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  .head h1 em { font-style: italic; color: var(--ember); font-weight: 700; }
+  .head p {
+    font-size: 16px; color: var(--ink-2); max-width: 620px;
+    line-height: 1.55; margin: 0 0 4px;
+  }
+
+  /* ---------- METHODOLOGY CARD ---------- */
+  .method {
+    max-width: 920px; margin: 24px auto 28px;
+    padding: 0 32px;
+  }
+  .method-card {
+    background: var(--shell);
+    border: 2px solid var(--ink);
+    border-radius: 16px;
+    box-shadow: 4px 4px 0 var(--ink);
+    padding: 16px 22px;
+    display: flex; gap: 22px; flex-wrap: wrap; align-items: center;
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink-2);
+  }
+  .method-card span { display: inline-flex; align-items: center; gap: 8px; }
+  .method-card b { color: var(--ink); font-weight: 700; }
+  .method-card .ti { width: 14px; height: 14px; flex: none; stroke: var(--ink-2); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  /* ---------- CHART ---------- */
+  #charts { max-width: 920px; margin: 0 auto; padding: 0 32px; }
+
+  .chart-card {
+    background: var(--cream);
+    border: 2.5px solid var(--ink);
+    border-radius: 18px;
+    box-shadow: 6px 6px 0 var(--ink);
+    padding: 24px 26px 22px;
+    margin-bottom: 28px;
+    position: relative;
+  }
+  .chart-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    flex-wrap: wrap; gap: 8px;
+    margin-bottom: 18px;
+    border-bottom: 1.5px dashed var(--rule);
+    padding-bottom: 12px;
+  }
+  .chart-head h2 {
+    font-family: var(--display); font-weight: 800;
+    font-size: 22px; letter-spacing: -0.01em;
+    color: var(--ink); margin: 0;
+  }
+  .chart-head .key {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-3);
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .chart {
+    display: grid; gap: 8px;
+  }
+  .bar-row {
+    display: grid; grid-template-columns: 130px 1fr;
+    align-items: center;
+    gap: 14px;
+    height: 32px;
+  }
+  .bar-label {
+    font-family: var(--mono); font-weight: 600; font-size: 12.5px;
+    color: var(--ink-2);
+    text-align: right;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .bar-row.is-wrenlift .bar-label {
+    color: var(--ink); font-weight: 800;
+  }
+  .bar-track {
+    position: relative; height: 100%;
+  }
+  .bar-fill {
+    height: 22px; margin-top: 5px;
+    border: 1.5px solid var(--ink);
+    border-radius: 6px;
+    background: var(--sky);
+    min-width: 4px;
+    position: relative;
+    transition: width 0.6s ease-out;
+  }
+  .bar-row.is-wrenlift .bar-fill {
+    background: var(--ember);
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+  .bar-time {
+    position: absolute;
+    left: calc(100% + 10px); top: 50%; transform: translateY(-50%);
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink); white-space: nowrap;
+  }
+  .bar-row.is-wrenlift .bar-time { color: var(--ink); font-weight: 800; }
+
+  .loading {
+    color: var(--ink-3); font-style: italic; margin: 32px 0;
+    font-family: var(--mono); font-size: 13px;
+  }
+
+  /* ---------- FOOTNOTE ---------- */
+  .footnote {
+    max-width: 920px; margin: 8px auto 0;
+    padding: 18px 32px 0;
+    border-top: 1.5px dashed var(--rule);
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink-2);
+    line-height: 1.7;
+  }
+  .footnote strong { color: var(--ink); font-weight: 700; }
+  .meta {
+    max-width: 920px; margin: 18px auto 0;
+    padding: 0 32px;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-3);
+    display: flex; flex-wrap: wrap; gap: 14px;
+  }
+  .meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .meta code {
+    background: var(--shell);
+    border: 1px solid rgba(58,42,24,0.15);
+    padding: 1px 6px; border-radius: 4px;
+    color: var(--ink);
+  }
+
+  /* ---------- FOOTER ---------- */
+  footer {
+    margin-top: 56px;
+    background: var(--cream-2);
+    border-top: 2.5px solid var(--ink);
+    padding: 32px 32px 24px;
+  }
+  .foot-inner {
+    max-width: 1180px; margin: 0 auto;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 24px; flex-wrap: wrap;
+  }
+  .foot-brand b { font-family: var(--display); font-weight: 800; font-size: 18px; color: var(--ink); }
+  .foot-links { display: flex; gap: 22px; font-family: var(--mono); font-size: 12.5px; }
+  .foot-links a { color: var(--ink-2); }
+  .foot-links a:hover { color: var(--toast-deep); }
+
+  @media (max-width: 600px) {
+    .nav-links a:not(:last-child) { display: none; }
+    .bar-row { grid-template-columns: 96px 1fr; }
+    .bar-label { font-size: 11.5px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="nav">
+  <a class="brand" href="../"><span class="word">wrenlift</span></a>
+  <div class="nav-links">
+    <a href="../#install">Install</a>
+    <a href="../#diagnostics">Diagnostics</a>
+    <a href="../#embed">Embed</a>
+    <a href="../#hatch">Packages</a>
+    <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+  </div>
+</nav>
+
+<!-- HEAD -->
+<header class="head">
+  <span class="eyebrow"><span class="dot"></span>microbenchmarks · refreshed on every commit to <code style="font-family:var(--mono);font-size:11px;background:transparent;border:none;padding:0;color:inherit;">main</code></span>
+  <h1>How <em>fast</em> does it lift?</h1>
+  <p>
+    Wrenlift compared head-to-head with standard Wren and a handful of other scripting languages on the same GitHub Actions runner.
+    Best of 10 runs, executed code only — interpreter startup is excluded.
+    Source for every benchmark lives in <a href="https://github.com/wrenlift/WrenLift/tree/main/bench" target="_blank" rel="noopener">bench/</a>.
+  </p>
+</header>
+
+<!-- METHODOLOGY -->
+<section class="method">
+  <div class="method-card">
+    <span><svg class="ti" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"/></svg><b>Tiered JIT</b> · interpret then Cranelift-compile</span>
+    <span><svg class="ti" viewBox="0 0 24 24"><path d="M3 12h4l3-9 4 18 3-9h4"/></svg><b>OSR</b> · hot loops switch mid-iteration</span>
+    <span><svg class="ti" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><b>Best of 10</b> · per language</span>
+    <span><svg class="ti" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><b>Same runner</b> · ubuntu-latest</span>
+  </div>
+</section>
+
+<!-- CHARTS -->
+<main id="charts">
+  <p class="loading">Loading benchmark results…</p>
+</main>
+
+<div id="meta"></div>
+
+<div class="footnote">
+  <strong>Shorter bars are better.</strong>
+  Each benchmark is run 10 times and the best wall-clock time is kept.
+  Only the benchmarked code is timed — interpreter startup is excluded.
+  Output is correctness-checked against standard Wren before timing; any divergence fails the workflow.
+</div>
+
+<!-- FOOTER -->
+<footer>
+  <div class="foot-inner">
+    <div class="foot-brand"><b>wrenlift</b></div>
+    <div class="foot-links">
+      <a href="../">Home</a>
+      <a href="../#install">Install</a>
+      <a href="../#embed">Embed</a>
+      <a href="https://github.com/wrenlift/hatch">Hatch</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  const CHART_TITLES = {
+    method_call: "Method Call",
+    fib: "Recursive Fibonacci",
+    binary_trees: "Binary Trees",
+    delta_blue: "DeltaBlue",
+  };
+  const BENCH_ORDER = ["method_call", "binary_trees", "fib", "delta_blue"];
+
+  function buildChart(name, data) {
+    const title = CHART_TITLES[name] || name;
+    const entries = Object
+      .entries(data)
+      .map(([lang, time]) => ({ name: lang, time }))
+      .sort((a, b) => a.time - b.time);
+
+    const maxTime = Math.max(...entries.map(e => e.time));
+
+    let rows = "";
+    entries.forEach(e => {
+      const pct = (e.time / maxTime) * 78;
+      const isW = e.name === "wrenlift";
+      rows += `
+        <div class="bar-row ${isW ? "is-wrenlift" : ""}">
+          <div class="bar-label">${e.name}</div>
+          <div class="bar-track">
+            <div class="bar-fill" style="width: ${pct}%">
+              <span class="bar-time">${e.time.toFixed(2)}s</span>
+            </div>
+          </div>
+        </div>`;
+    });
+
+    return `
+      <article class="chart-card">
+        <div class="chart-head">
+          <h2>${title}</h2>
+          <span class="key">lower is faster</span>
+        </div>
+        <div class="chart">${rows}</div>
+      </article>`;
+  }
+
+  async function main() {
+    const container = document.getElementById("charts");
+    const metaEl = document.getElementById("meta");
+
+    let results = {};
+    try {
+      const resp = await fetch("results.json");
+      if (resp.ok) results = await resp.json();
+    } catch (_) {
+      container.innerHTML = `<p class="loading">Failed to load results. Run the benchmark workflow first.</p>`;
+      return;
+    }
+
+    if (!results || Object.keys(results).length === 0) {
+      container.innerHTML = `<p class="loading">No results available yet. Run the benchmark workflow first.</p>`;
+      return;
+    }
+
+    let html = "";
+    BENCH_ORDER.forEach(name => {
+      if (results[name] && typeof results[name] === "object") {
+        html += buildChart(name, results[name]);
+      }
+    });
+    container.innerHTML = html || `<p class="loading">No benchmarks matched expected names.</p>`;
+
+    if (results.meta) {
+      const m = results.meta;
+      const sha = m.commit ? m.commit.substring(0, 7) : "—";
+      metaEl.innerHTML = `
+        <div class="meta">
+          <span>updated <b>${m.date || "—"}</b></span>
+          <span>commit <code>${sha}</code></span>
+          <span>arch <code>${m.arch || "—"}</code></span>
+          <span>best of ${m.runs || 10} runs</span>
+        </div>`;
+    }
+  }
+
+  main();
+</script>
+
+</body>
+</html>
