@@ -1168,8 +1168,8 @@ w.attach(rock, Tag.new("rock"))
 System.print("world has %(w.count) entities")
 Expect.that(w.count).toBe(3)
 
-// Fluent query builder is reached via World.query (NOT Query.new).
-// `.iterate` runs the filter and returns an iterable; for-in does
+// Fluent query builder is reached via World.query (not Query.new).
+// .iterate runs the filter and returns an iterable; for-in does
 // the rest.
 for (e in w.query.with(Position).with(Velocity).iterate) {
   var p = w.get(e, Position)
