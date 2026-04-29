@@ -106,18 +106,30 @@
     /* Runtime status pill (header, right side) — loud version
        of `.pill`. Filled background, bold weight, larger
        padding so the elapsed-ms / error kind reads from across
-       the page instead of getting lost in the muted chrome. */
-    .pill.runtime {
+       the page instead of getting lost in the muted chrome.
+       It's a <button> so a click jumps to the console (where
+       the actual output lives); the cursor + hover hint at
+       that affordance. */
+    button.pill.runtime {
       font-weight: 700;
       font-size: 12px;
       letter-spacing: 0.02em;
       padding: 4px 12px;
+      border: 0;
+      cursor: pointer;
+      font-family: inherit;
+      transition: filter 0.12s ease;
     }
-    .pill.runtime.ok {
+    button.pill.runtime:hover { filter: brightness(1.08); }
+    button.pill.runtime:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    button.pill.runtime.ok {
       background: var(--good);
       color: var(--panel);
     }
-    .pill.runtime.error {
+    button.pill.runtime.error {
       background: var(--bad);
       color: var(--panel);
     }
@@ -350,7 +362,7 @@
       <h1>wlift playground</h1>
       <span id="status" class="pill">loading…</span>
       <span style="margin-left: auto"></span>
-      <span id="runtime" class="pill runtime" hidden>—</span>
+      <button id="runtime" type="button" class="pill runtime" hidden title="open console">—</button>
       <label class="field">
         mode
         <select id="mode-select">
@@ -788,14 +800,21 @@ System.print("fib(20) = %(result)  (%(elapsed) ms, asserted via @hatch:assert)")
       const showing = mainEl.classList.toggle("show-html");
       htmlToggleBtn.classList.toggle("seg-active", showing);
     });
-    consoleToggleBtn.addEventListener("click", () => {
-      const showing = outputColEl.classList.toggle("show-console");
+    function setConsoleVisible(showing) {
+      outputColEl.classList.toggle("show-console", showing);
       consoleToggleBtn.classList.toggle("seg-active", showing);
-      // Recompute from the latched error state so the dot
-      // reappears the next time the user collapses the console
-      // while an error is still the latest result.
       updateConsoleErrorDot();
+    }
+
+    consoleToggleBtn.addEventListener("click", () => {
+      setConsoleVisible(!outputColEl.classList.contains("show-console"));
     });
+
+    // Click the runtime pill to jump to the console — that's
+    // where the actual output / stack trace / print stream
+    // lives. If it's already open, leave it alone (no toggle-
+    // off, since the pill's whole job is "look at me").
+    runtimeEl.addEventListener("click", () => setConsoleVisible(true));
 
     // Mount the CodeMirror editors. `bindEditor` reads each
     // textarea's current value as the initial doc, then writes
