@@ -1092,7 +1092,7 @@ Expect.that(p.x).toBe(11)
 
 // Quaternion rotation 90° around Y.
 var q = Quat.fromAxisAngle(Vec3.new(0, 1, 0), Math.radians(90))
-var r = q.rotate(Vec3.new(1, 0, 0))
+var r = q.rotateVec3(Vec3.new(1, 0, 0))
 // (1,0,0) rotated 90° around Y → (0, 0, -1) (within float epsilon).
 System.print("rotated x-hat by 90°/Y → %(fmt.call(r))")
 Expect.that(Math.approxEq(r.z, -1, 0.001)).toBe(true)
@@ -1116,7 +1116,7 @@ entry   = "main"
 `<h2>ECS demo</h2>
 <p>spawn entities, attach components, query — output in console.</p>`,
         wren:
-`import "@hatch:ecs"    for World, Query
+`import "@hatch:ecs"    for World
 import "@hatch:assert" for Expect
 
 class Position {
@@ -1168,18 +1168,17 @@ w.attach(rock, Tag.new("rock"))
 System.print("world has %(w.count) entities")
 Expect.that(w.count).toBe(3)
 
-// Step every (Position, Velocity) pair forward one tick.
-var moving = Query.new(w).with(Position).with(Velocity)
-for (e in moving) {
+// Fluent query builder is reached via World.query (NOT Query.new).
+// `.iterate` runs the filter and returns an iterable; for-in does
+// the rest.
+for (e in w.query.with(Position).with(Velocity).iterate) {
   var p = w.get(e, Position)
   var v = w.get(e, Velocity)
   p.x = p.x + v.x
   p.y = p.y + v.y
 }
 
-// Print everyone tagged.
-var tagged = Query.new(w).with(Position).with(Tag)
-for (e in tagged) {
+for (e in w.query.with(Position).with(Tag).iterate) {
   var name = w.get(e, Tag).name
   var p    = w.get(e, Position)
   System.print("  %(name): %(p)")
