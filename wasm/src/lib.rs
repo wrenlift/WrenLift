@@ -726,11 +726,26 @@ pub fn version() -> String {
 ///   "target": "wasm32-unknown-unknown"
 /// }
 /// ```
+/// Serialize the manifest as a *plain JS object* so the
+/// playground's `Object.entries(manifest.dependencies)` works.
+/// `serde_wasm_bindgen`'s default round-trips `BTreeMap` /
+/// `HashMap` as `js_sys::Map`, which silently no-ops under
+/// `Object.entries()` — leading to "no deps to install" with
+/// no error, then the user code's `import "@hatch:..."` looks
+/// like a missing module. `json_compatible()` flips
+/// `serialize_maps_as_objects(true)` (alongside a couple of
+/// other knobs); behaviour now matches `JSON.parse` shape.
+fn json_serializer() -> serde_wasm_bindgen::Serializer {
+    serde_wasm_bindgen::Serializer::json_compatible()
+}
+
 #[wasm_bindgen]
 pub fn parse_hatchfile_toml(text: &str) -> Result<JsValue, JsValue> {
     let manifest: wren_lift::hatch::Manifest =
         toml::from_str(text).map_err(|e| JsValue::from_str(&format!("hatchfile parse: {e}")))?;
-    serde_wasm_bindgen::to_value(&manifest)
+    use serde::Serialize;
+    manifest
+        .serialize(&json_serializer())
         .map_err(|e| JsValue::from_str(&format!("manifest → JsValue: {e}")))
 }
 
@@ -742,7 +757,10 @@ pub fn parse_hatchfile_toml(text: &str) -> Result<JsValue, JsValue> {
 pub fn peek_manifest(bytes: &[u8]) -> Result<JsValue, JsValue> {
     let hatch = wren_lift::hatch::load(bytes)
         .map_err(|e| JsValue::from_str(&format!("hatch load: {e}")))?;
-    serde_wasm_bindgen::to_value(&hatch.manifest)
+    use serde::Serialize;
+    hatch
+        .manifest
+        .serialize(&json_serializer())
         .map_err(|e| JsValue::from_str(&format!("manifest → JsValue: {e}")))
 }
 

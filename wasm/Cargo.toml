@@ -24,6 +24,7 @@ js-sys = "0.3"
 # `serde::Serialize` Rust value into a JS object so the playground
 # doesn't need to ship a TOML parser to read hatchfile metadata.
 serde-wasm-bindgen = "0.6"
+serde = "1"
 toml = "0.8"
 
 # Plugins statically linked into the wasm runtime. Each one
