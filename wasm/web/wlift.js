@@ -677,7 +677,14 @@ class MainWlift {
       // `WebAssembly.instantiate` resolves — the imports object
       // we hand it has to be built first, and the bridges that
       // reference plugin memory close over a deferred lookup.
-      const wasmModule = mod;
+      //
+      // The host side here uses `wasm` (the exports object
+      // returned by `mod.default()`) for raw `wrenGetSlotString`
+      // / `wrenSetSlotString` / `wlift_host_alloc` / memory
+      // access. `mod`'s wasm-bindgen-wrapped exports go through
+      // string-marshalling wrappers that aren't what the bridge
+      // contract wants — the bridge already has raw C-string
+      // pointers in hand.
       return {
         env: {
           // Plugin asks for `wrenGetSlotString(vm, slot)` →
@@ -687,9 +694,9 @@ class MainWlift {
           // at `max`. Returns the number of bytes written, or -1
           // on a NULL host pointer.
           wlift_get_slot_str: (vm, slot, out_ptr, max) => {
-            const host_ptr = wasmModule.wrenGetSlotString(vm, slot);
+            const host_ptr = wasm.wrenGetSlotString(vm, slot);
             if (!host_ptr) return -1;
-            const host_view = new Uint8Array(wasmModule.__wbindgen_export_0?.buffer ?? wasmModule.memory.buffer);
+            const host_view = new Uint8Array(wasm.memory.buffer);
             let len = 0;
             while (len < max && host_view[host_ptr + len] !== 0) len++;
             const inst = getInstance();
@@ -706,12 +713,12 @@ class MainWlift {
           wlift_set_slot_str: (vm, slot, ptr, len) => {
             const inst = getInstance();
             const plugin_view = new Uint8Array(inst.exports.memory.buffer, ptr, len);
-            const host_ptr = wasmModule.wlift_host_alloc(len + 1);
-            const host_view = new Uint8Array(wasmModule.memory.buffer, host_ptr, len + 1);
+            const host_ptr = wasm.wlift_host_alloc(len + 1);
+            const host_view = new Uint8Array(wasm.memory.buffer, host_ptr, len + 1);
             host_view.set(plugin_view);
             host_view[len] = 0;
-            wasmModule.wrenSetSlotString(vm, slot, host_ptr);
-            wasmModule.wlift_host_free(host_ptr, len + 1);
+            wasm.wrenSetSlotString(vm, slot, host_ptr);
+            wasm.wlift_host_free(host_ptr, len + 1);
           },
         },
       };
