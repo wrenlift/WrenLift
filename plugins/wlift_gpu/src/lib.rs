@@ -3297,8 +3297,14 @@ unsafe fn decode_window_handle(
             ))
         }
         "xlib" => {
+            // `XlibWindowHandle::new` takes `c_ulong` — that's `u64`
+            // on x86_64 Linux but `u32` on Windows (LP64 vs LLP64).
+            // Cast via `c_ulong` so the same source compiles on
+            // every target. X11 isn't used on Windows in practice;
+            // the truncating cast there is harmless because the
+            // arm is unreachable.
             let window_id = match unsafe { map_get(desc, "window").and_then(|v| v.as_num()) } {
-                Some(n) if n.is_finite() => n as u64,
+                Some(n) if n.is_finite() => n as std::os::raw::c_ulong,
                 _ => {
                     vm.runtime_error(
                         "Device.createSurface: xlib requires `window` (XID) integer.".to_string(),
@@ -3311,7 +3317,7 @@ unsafe fn decode_window_handle(
                 map_get(desc, "visual_id")
                     .and_then(|v| v.as_num())
                     .unwrap_or(0.0)
-            } as u64;
+            } as std::os::raw::c_ulong;
             let mut wh = raw_window_handle::XlibWindowHandle::new(window_id);
             wh.visual_id = visual_id;
             Some((
