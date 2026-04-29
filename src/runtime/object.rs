@@ -1099,6 +1099,16 @@ pub enum Method {
     /// `#!native` + `#!symbol`. Dispatched through the slot-based
     /// bridge that matches the standard Wren embedding API.
     ForeignC(ForeignCFn),
+    /// A C-ABI foreign method whose implementation lives in a
+    /// separately-loaded wasm module (a `.hatch`-bundled plugin
+    /// instantiated at install time on `wasm32-*`). The `u32` is
+    /// an index into the `foreign::dynamic_entries` side-table —
+    /// the dispatcher uses it to route the call to the right
+    /// plugin module's exported fn via the JS-side bridge.
+    /// On host builds this variant is unreachable; the host
+    /// always loads plugins via `dlopen` + `dlsym`, which gives
+    /// back a real `ForeignCFn`.
+    ForeignCDynamic(u32),
 }
 
 impl fmt::Debug for Method {
@@ -1108,6 +1118,7 @@ impl fmt::Debug for Method {
             Method::Constructor(_) => write!(f, "Method::Constructor(...)"),
             Method::Native(_) => write!(f, "Method::Native(...)"),
             Method::ForeignC(_) => write!(f, "Method::ForeignC(...)"),
+            Method::ForeignCDynamic(idx) => write!(f, "Method::ForeignCDynamic({idx})"),
         }
     }
 }
@@ -1280,6 +1291,14 @@ impl ObjClass {
     pub fn bind_native(&mut self, name: SymbolId, func: NativeFn) {
         self.ensure_capacity(name);
         self.methods[name.index() as usize] = Some(Method::Native(func));
+    }
+
+    /// Bind a dynamic-plugin foreign method by side-table index.
+    /// See `Method::ForeignCDynamic` and `runtime::foreign` for the
+    /// dispatch path that consumes this index.
+    pub fn bind_foreign_c_dynamic(&mut self, name: SymbolId, idx: u32) {
+        self.ensure_capacity(name);
+        self.methods[name.index() as usize] = Some(Method::ForeignCDynamic(idx));
     }
 
     /// Bind a C-ABI foreign method resolved from a dynamic library.

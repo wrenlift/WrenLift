@@ -31,13 +31,42 @@ pub const WLIFT_PLUGIN_ABI_SYMBOL: &str = "wlift_plugin_abi_version";
 // Static plugin registry
 // ---------------------------------------------------------------------------
 
-/// Process-wide map of `library_name -> symbol -> fn_ptr`. Populated
-/// by [`register_plugin_symbol`] at startup, consulted by
-/// [`load_library`] / [`resolve_symbol`] at every foreign-class
-/// install.
-fn registry() -> &'static Mutex<HashMap<String, HashMap<String, ForeignCFn>>> {
-    static REG: OnceLock<Mutex<HashMap<String, HashMap<String, ForeignCFn>>>> = OnceLock::new();
+/// What `resolve_symbol` hands back. Static plugins (linked into
+/// the runtime crate at build time, e.g. `wlift_image`) hold a
+/// Rust function pointer. Dynamic plugins (loaded from a
+/// `.hatch` bundle's wasm `NativeLib` section at install time)
+/// hold a side-table index instead — the actual dispatch goes
+/// through the JS-side loader because the plugin lives in its
+/// own wasm module with its own linear memory.
+///
+/// On host builds the same enum exists in `foreign.rs` with only
+/// the `Static` variant ever populated, keeping a single
+/// `Method::ForeignC*` family of variants in `object.rs` valid
+/// across both targets.
+#[derive(Clone, Copy)]
+pub enum ResolvedSymbol {
+    Static(ForeignCFn),
+    Dynamic(u32),
+}
+
+/// Process-wide map of `library_name -> symbol -> registry-entry`.
+/// Populated by [`register_plugin_symbol`] (static path) and
+/// [`register_plugin_dynamic`] (dynamic path) at startup or
+/// install time, consulted by [`load_library`] /
+/// [`resolve_symbol`] at every foreign-class install.
+fn registry() -> &'static Mutex<HashMap<String, HashMap<String, ResolvedSymbol>>> {
+    static REG: OnceLock<Mutex<HashMap<String, HashMap<String, ResolvedSymbol>>>> =
+        OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Side-table for dynamic plugin entries. Each `register_plugin_dynamic`
+/// call appends a `(lib, sym)` pair and returns the index. The
+/// `Method::ForeignCDynamic(u32)` variant stores that index, so the
+/// `Method` enum can stay `Copy`.
+fn dynamic_entries() -> &'static Mutex<Vec<(String, String)>> {
+    static REG: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Register a single foreign-method symbol against a library name.
@@ -51,7 +80,34 @@ pub fn register_plugin_symbol(library: &str, symbol: &str, func: ForeignCFn) {
     let mut reg = registry().lock().expect("foreign registry poisoned");
     reg.entry(library.to_string())
         .or_default()
-        .insert(symbol.to_string(), func);
+        .insert(symbol.to_string(), ResolvedSymbol::Static(func));
+}
+
+/// Register a dynamic-plugin foreign symbol. Used by the wasm-side
+/// loader after instantiating a `.hatch`-bundled plugin module —
+/// the plugin's actual fn lives in its own wasm module, so we
+/// can't store a Rust fn pointer here. The returned `idx` is
+/// stashed in `Method::ForeignCDynamic` and consumed by
+/// `dispatch_dynamic` at call time, which forwards to the
+/// JS-side dispatcher.
+pub fn register_plugin_dynamic(library: &str, symbol: &str) -> u32 {
+    let mut entries = dynamic_entries().lock().expect("dynamic entries poisoned");
+    let idx = entries.len() as u32;
+    entries.push((library.to_string(), symbol.to_string()));
+    drop(entries);
+    let mut reg = registry().lock().expect("foreign registry poisoned");
+    reg.entry(library.to_string())
+        .or_default()
+        .insert(symbol.to_string(), ResolvedSymbol::Dynamic(idx));
+    idx
+}
+
+/// Look up the `(library, symbol)` pair for a previously-registered
+/// dynamic entry. The dispatcher consumes this when routing the
+/// call across the wasm-module boundary.
+pub fn dynamic_entry(idx: u32) -> Option<(String, String)> {
+    let entries = dynamic_entries().lock().expect("dynamic entries poisoned");
+    entries.get(idx as usize).cloned()
 }
 
 /// Convenience for plugins whose exports are declared
@@ -215,7 +271,7 @@ pub fn resolve_symbol(
     library: &Library,
     library_name: &str,
     symbol: &str,
-) -> Result<ForeignCFn, ForeignLoadError> {
+) -> Result<ResolvedSymbol, ForeignLoadError> {
     let reg = registry().lock().expect("foreign registry poisoned");
     // Trust the caller's `library_name` over the handle's stored
     // name — the runtime passes both because the host loader's
@@ -233,6 +289,42 @@ pub fn resolve_symbol(
             library: library_name.to_string(),
             symbol: symbol.to_string(),
         })
+}
+
+/// Wasm-bindgen import shim implemented by `wlift_wasm`. JS-side
+/// dispatcher takes the dynamic-entry index plus the VM pointer
+/// and routes the call to the right plugin module's exported fn.
+/// Lives behind `cfg(target_arch = "wasm32")` because it depends
+/// on a wasm import that only the wlift_wasm host shim defines.
+#[cfg(target_arch = "wasm32")]
+extern "C" {
+    fn wlift_dispatch_dynamic_plugin(idx: u32, vm: *mut VM);
+}
+
+/// Drive a dynamic-plugin call. Same shape as `dispatch_foreign_c`
+/// but goes through the JS-side dispatcher because the plugin's
+/// fn lives in its own wasm module. The JS shim handles the
+/// memory-translation between the host and plugin linear memories
+/// for any string / byte arguments the plugin reads off the slot
+/// stack via `wlift_get_slot_str`.
+pub fn dispatch_dynamic(vm: &mut VM, idx: u32, args: &[Value]) -> Value {
+    let vm_ptr = vm as *mut VM;
+    vm.api_stack.clear();
+    vm.api_stack.extend_from_slice(args);
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        wlift_dispatch_dynamic_plugin(idx, vm_ptr);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Dynamic plugins are wasm-only by construction. On
+        // host targets `dispatch_dynamic` should never be reached
+        // — the registry never contains `Dynamic` entries on host
+        // because `register_plugin_dynamic` doesn't exist there.
+        let _ = (idx, vm_ptr);
+        debug_assert!(false, "dispatch_dynamic called on host build");
+    }
+    vm.api_stack.first().copied().unwrap_or_else(Value::null)
 }
 
 pub fn default_native_lib_filename(raw: &str) -> String {

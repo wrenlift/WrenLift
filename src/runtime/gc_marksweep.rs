@@ -192,7 +192,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                             mark_gray(*ptr as *mut ObjHeader, gray_stack);
                         }
                     }
-                    Method::Native(_) | Method::ForeignC(_) => {}
+                    Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_) => {}
                 }
             }
             for &val in class.static_fields.values() {

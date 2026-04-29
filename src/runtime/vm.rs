@@ -1761,7 +1761,7 @@ impl VM {
                                 lib_name,
                                 &symbol_name,
                             ) {
-                                Ok(func) => {
+                                Ok(resolved) => {
                                     let sig_sym = self.interner.intern(&fm.signature);
                                     let bind_sym = if fm.is_static {
                                         let static_sig = format!("static:{}", fm.signature);
@@ -1779,7 +1779,14 @@ impl VM {
                                         .eprint_no_source();
                                     }
                                     unsafe {
-                                        (*class_ptr).bind_foreign_c(bind_sym, func);
+                                        match resolved {
+                                            crate::runtime::foreign::ResolvedSymbol::Static(func) => {
+                                                (*class_ptr).bind_foreign_c(bind_sym, func);
+                                            }
+                                            crate::runtime::foreign::ResolvedSymbol::Dynamic(idx) => {
+                                                (*class_ptr).bind_foreign_c_dynamic(bind_sym, idx);
+                                            }
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -3234,7 +3241,7 @@ impl NativeContext for VM {
         all_args.extend_from_slice(args);
 
         match method_entry {
-            m @ (Method::Native(_) | Method::ForeignC(_)) => {
+            m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_)) => {
                 let root_len_before = crate::codegen::runtime_fns::jit_roots_snapshot_len();
                 for &arg in &all_args {
                     crate::codegen::runtime_fns::push_jit_root(arg);
@@ -3246,6 +3253,9 @@ impl NativeContext for VM {
                     Method::Native(func) => func(self, &rooted_args),
                     Method::ForeignC(func) => {
                         crate::runtime::foreign::dispatch_foreign_c(self, func, &rooted_args)
+                    }
+                    Method::ForeignCDynamic(idx) => {
+                        crate::runtime::foreign::dispatch_dynamic(self, idx, &rooted_args)
                     }
                     _ => unreachable!(),
                 });
@@ -4434,6 +4444,9 @@ mod tests {
             Some(Method::ForeignC(func)) => {
                 crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
             }
+            Some(Method::ForeignCDynamic(idx)) => {
+                crate::runtime::foreign::dispatch_dynamic(vm, idx, args)
+            }
             _ => panic!("Method '{}' not found", sig),
         }
     }
@@ -4446,6 +4459,9 @@ mod tests {
             Some(Method::Native(func)) => func(vm, args),
             Some(Method::ForeignC(func)) => {
                 crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
+            }
+            Some(Method::ForeignCDynamic(idx)) => {
+                crate::runtime::foreign::dispatch_dynamic(vm, idx, args)
             }
             _ => panic!("Static method '{}' not found", sig),
         }

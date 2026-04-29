@@ -264,6 +264,16 @@ pub fn load_library(
     })
 }
 
+/// What `resolve_symbol` returns. Host builds always populate
+/// `Static`; the `Dynamic` variant exists for ABI parity with the
+/// wasm-side `foreign_wasm.rs` so `Method::ForeignC*` and the
+/// dispatch sites in `vm.rs` can stay target-agnostic.
+#[derive(Clone, Copy)]
+pub enum ResolvedSymbol {
+    Static(ForeignCFn),
+    Dynamic(u32),
+}
+
 /// Look up `symbol` inside `library` and cast it to the Wren foreign
 /// method ABI. The returned function pointer is tied to the library's
 /// lifetime — the VM must outlive the caller's use of the pointer.
@@ -271,7 +281,7 @@ pub fn resolve_symbol(
     library: &Library,
     library_name: &str,
     symbol: &str,
-) -> Result<ForeignCFn, ForeignLoadError> {
+) -> Result<ResolvedSymbol, ForeignLoadError> {
     unsafe {
         let sym: libloading::Symbol<ForeignCFn> =
             library
@@ -280,8 +290,19 @@ pub fn resolve_symbol(
                     library: library_name.to_string(),
                     symbol: symbol.to_string(),
                 })?;
-        Ok(*sym)
+        Ok(ResolvedSymbol::Static(*sym))
     }
+}
+
+/// Drive a dynamic-plugin call. Wasm-only in practice — host builds
+/// never produce `Dynamic` entries because dlopen returns real fn
+/// pointers — but the symbol exists here for shape parity with
+/// `foreign_wasm::dispatch_dynamic`.
+pub fn dispatch_dynamic(vm: &mut VM, idx: u32, args: &[Value]) -> Value {
+    let _ = (idx, args);
+    debug_assert!(false, "dispatch_dynamic called on host build");
+    let _ = vm;
+    Value::null()
 }
 
 /// Pick the on-disk filename for a `.hatch` `NativeLib` section whose
