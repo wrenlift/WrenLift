@@ -1046,21 +1046,12 @@ fn build_recursive(
             name: module_name.clone(),
             data: blob,
         });
-        // Bundle the *filtered* source alongside the compiled
-        // bytecode so runtime errors raised inside the module can
-        // render through ariadne labels at install time. Storing
-        // the post-filter source keeps line numbers consistent
-        // with the bytecode the runtime executes.
-        sections.push(Section {
-            kind: SectionKind::Source,
-            name: module_name.clone(),
-            data: source.into_bytes(),
-        });
-        // Collect publish-time docs. The fresh parse here is
-        // deliberate — `compile_source_to_blob` consumes its
-        // own parser pass, and the `///` doc-comment side-channel
-        // travels with that parse. Re-parsing is cheap and means
-        // the bundled docs always match the bundled bytecode.
+        // Collect publish-time docs *before* the Source section
+        // is pushed (which consumes `source` via `into_bytes`).
+        // The fresh parse here is deliberate —
+        // `compile_source_to_blob` consumes its own parser pass,
+        // and the `///` doc-comment side-channel travels with
+        // that parse.
         //
         // Parse against the *cfg-stripped* source so platform-
         // gated lines (`#!wasm` on `import "wlift_prelude" for
@@ -1079,6 +1070,16 @@ fn build_recursive(
                 &pr.interner,
             ));
         }
+        // Bundle the *filtered* source alongside the compiled
+        // bytecode so runtime errors raised inside the module can
+        // render through ariadne labels at install time. Storing
+        // the post-filter source keeps line numbers consistent
+        // with the bytecode the runtime executes.
+        sections.push(Section {
+            kind: SectionKind::Source,
+            name: module_name.clone(),
+            data: source.into_bytes(),
+        });
         module_names.push(module_name.clone());
     }
 
