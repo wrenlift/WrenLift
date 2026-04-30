@@ -213,12 +213,40 @@ pub struct Lexeme {
     pub text: String,
 }
 
+/// Doc-comment kind. `///` describes the next declaration; `//!`
+/// describes the enclosing module (only valid at the top of a file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocKind {
+    Decl,
+    Module,
+}
+
+/// A single doc-comment line captured by the lexer. The parser
+/// ignores these in the token stream; the docs generator collects
+/// them from this side channel and associates each with the next
+/// declaration (Decl) or the module itself (Module).
+#[derive(Debug, Clone)]
+pub struct DocComment {
+    pub kind: DocKind,
+    pub span: Span,
+    /// Body text, with the leading `///` or `//!` (and a single
+    /// space if present) stripped. Trailing newline is not included.
+    pub text: String,
+}
+
 /// Lex Wren source code into a sequence of [`Lexeme`]s.
 ///
 /// Handles string interpolation, nested block comments, and raw strings
 /// via a custom pass on top of logos.
-pub fn lex(source: &str) -> (Vec<Lexeme>, Vec<crate::diagnostics::Diagnostic>) {
+pub fn lex(
+    source: &str,
+) -> (
+    Vec<Lexeme>,
+    Vec<DocComment>,
+    Vec<crate::diagnostics::Diagnostic>,
+) {
     let mut lexemes = Vec::new();
+    let mut docs: Vec<DocComment> = Vec::new();
     let mut errors = Vec::new();
     let bytes = source.as_bytes();
     let mut pos = 0;
@@ -241,14 +269,47 @@ pub fn lex(source: &str) -> (Vec<Lexeme>, Vec<crate::diagnostics::Diagnostic>) {
             continue;
         }
 
-        // Line comment
+        // Line comment. Three flavours:
+        //   `//`  → ordinary code comment, skipped without trace.
+        //   `///` → outer doc comment, attached to the next decl.
+        //   `//!` → inner / module doc comment.
+        // The doc variants are routed into the `docs` side channel
+        // and *not* emitted as tokens, so the parser doesn't need
+        // to know they exist. wlift_docs reads `docs` directly.
         if pos + 1 < source.len() && bytes[pos] == b'/' && bytes[pos + 1] == b'/' {
             let start = pos;
-            pos += 2;
+            // Order matters: check the four-character `////` case
+            // first so we don't classify a horizontal-rule comment
+            // (e.g. `////////////`) as a doc comment.
+            let kind = if pos + 3 < source.len()
+                && bytes[pos + 2] == b'/'
+                && bytes[pos + 3] != b'/'
+            {
+                Some(DocKind::Decl)
+            } else if pos + 2 < source.len() && bytes[pos + 2] == b'!' {
+                Some(DocKind::Module)
+            } else {
+                None
+            };
+            pos += if kind.is_some() { 3 } else { 2 };
+            // Body runs from `pos` (just after the marker) to the
+            // newline. Trim a single leading space — the convention
+            // is `/// body` with one space between marker and prose.
+            let body_start = if pos < source.len() && bytes[pos] == b' ' {
+                pos + 1
+            } else {
+                pos
+            };
             while pos < source.len() && bytes[pos] != b'\n' {
                 pos += 1;
             }
-            let _ = start; // comment skipped
+            if let Some(kind) = kind {
+                docs.push(DocComment {
+                    kind,
+                    span: start..pos,
+                    text: source[body_start..pos].to_string(),
+                });
+            }
             continue;
         }
 
@@ -383,7 +444,7 @@ pub fn lex(source: &str) -> (Vec<Lexeme>, Vec<crate::diagnostics::Diagnostic>) {
         }
     }
 
-    (lexemes, errors)
+    (lexemes, docs, errors)
 }
 
 /// Lex a regular string starting at `"`, handling escape sequences and
@@ -627,7 +688,7 @@ mod tests {
     use super::*;
 
     fn lex_tokens(source: &str) -> Vec<Token> {
-        let (lexemes, errors) = lex(source);
+        let (lexemes, _docs, errors) = lex(source);
         assert!(errors.is_empty(), "unexpected errors: {:?}", errors);
         lexemes.iter().map(|l| l.token.clone()).collect()
     }
@@ -793,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_strings_simple() {
-        let (lexemes, errors) = lex(r#""hello" "" "with spaces""#);
+        let (lexemes, _docs, errors) = lex(r#""hello" "" "with spaces""#);
         assert!(errors.is_empty());
         let texts: Vec<_> = lexemes.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["hello", "", "with spaces"]);
@@ -802,28 +863,28 @@ mod tests {
 
     #[test]
     fn test_strings_escapes() {
-        let (lexemes, errors) = lex(r#""\n\t\r\\\"\0\a\b\e\f\v\%""#);
+        let (lexemes, _docs, errors) = lex(r#""\n\t\r\\\"\0\a\b\e\f\v\%""#);
         assert!(errors.is_empty());
         assert_eq!(lexemes[0].text, "\n\t\r\\\"\0\x07\x08\x1b\x0c\x0b%");
     }
 
     #[test]
     fn test_strings_hex_escape() {
-        let (lexemes, errors) = lex(r#""\x41\x42""#);
+        let (lexemes, _docs, errors) = lex(r#""\x41\x42""#);
         assert!(errors.is_empty());
         assert_eq!(lexemes[0].text, "AB");
     }
 
     #[test]
     fn test_strings_unicode_escape() {
-        let (lexemes, errors) = lex(r#""\u0041\u00e9""#);
+        let (lexemes, _docs, errors) = lex(r#""\u0041\u00e9""#);
         assert!(errors.is_empty());
         assert_eq!(lexemes[0].text, "A\u{e9}");
     }
 
     #[test]
     fn test_strings_interpolation() {
-        let (lexemes, errors) = lex(r#""a %(b) c""#);
+        let (lexemes, _docs, errors) = lex(r#""a %(b) c""#);
         assert!(errors.is_empty(), "errors: {:?}", errors);
 
         let tokens: Vec<_> = lexemes.iter().map(|l| &l.token).collect();
@@ -842,7 +903,7 @@ mod tests {
 
     #[test]
     fn test_strings_nested_interpolation() {
-        let (lexemes, errors) = lex(r#""a %(b + "c %(d) e") f""#);
+        let (lexemes, _docs, errors) = lex(r#""a %(b + "c %(d) e") f""#);
         assert!(errors.is_empty(), "errors: {:?}", errors);
 
         // Should produce: InterpStart("a "), Ident(b), Plus, InterpStart("c "), Ident(d), InterpEnd(" e"), InterpEnd(" f")
@@ -856,7 +917,7 @@ mod tests {
     fn test_strings_multiple_interpolation() {
         // "%(x) and %(y)" should produce:
         // InterpolationStart(""), Ident(x), InterpolationMid(" and "), Ident(y), InterpolationEnd("")
-        let (lexemes, errors) = lex(r#""%(x) and %(y)""#);
+        let (lexemes, _docs, errors) = lex(r#""%(x) and %(y)""#);
         assert!(errors.is_empty(), "errors: {:?}", errors);
 
         let tokens: Vec<_> = lexemes.iter().map(|l| &l.token).collect();
@@ -880,7 +941,7 @@ mod tests {
     #[test]
     fn test_strings_triple_interpolation() {
         // "%(a)%(b)%(c)" — three consecutive interpolations
-        let (lexemes, errors) = lex(r#""%(a)%(b)%(c)""#);
+        let (lexemes, _docs, errors) = lex(r#""%(a)%(b)%(c)""#);
         assert!(errors.is_empty(), "errors: {:?}", errors);
 
         let tokens: Vec<_> = lexemes.iter().map(|l| &l.token).collect();
@@ -900,7 +961,7 @@ mod tests {
 
     #[test]
     fn test_raw_strings() {
-        let (lexemes, errors) = lex(r#""""raw\nstring""""#);
+        let (lexemes, _docs, errors) = lex(r#""""raw\nstring""""#);
         assert!(errors.is_empty());
         assert_eq!(lexemes[0].token, Token::RawString);
         assert_eq!(lexemes[0].text, r"raw\nstring");
@@ -964,7 +1025,7 @@ mod tests {
     System.print("Hello, %(_name)!")
   }
 }"#;
-        let (lexemes, errors) = lex(source);
+        let (lexemes, _docs, errors) = lex(source);
         assert!(errors.is_empty(), "errors: {:?}", errors);
         // Just verify it produces tokens without errors
         assert!(lexemes.len() > 10);

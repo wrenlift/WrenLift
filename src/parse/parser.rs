@@ -1,13 +1,18 @@
 use crate::ast::*;
 use crate::diagnostics::Diagnostic;
 use crate::intern::{Interner, SymbolId};
-use crate::parse::lexer::{Lexeme, Token};
+use crate::parse::lexer::{DocComment, Lexeme, Token};
 
 /// Parse result: AST module + any diagnostics.
 pub struct ParseResult {
     pub module: Module,
     pub errors: Vec<Diagnostic>,
     pub interner: Interner,
+    /// Doc comments captured by the lexer (`///` and `//!`). The
+    /// parser doesn't bind them to AST nodes; downstream tools
+    /// (wlift_docs, the LSP hover handler) associate each comment
+    /// with the next declaration by span proximity.
+    pub docs: Vec<DocComment>,
 }
 
 /// Recursive-descent parser for Wren.
@@ -16,6 +21,11 @@ pub struct Parser {
     pos: usize,
     interner: Interner,
     errors: Vec<Diagnostic>,
+    /// Doc-comment side channel populated by the lexer; passed
+    /// through into `ParseResult.docs`. Empty for callers that
+    /// construct the parser manually without going through the
+    /// `parse(source)` convenience.
+    docs: Vec<DocComment>,
 }
 
 impl Parser {
@@ -25,6 +35,19 @@ impl Parser {
             pos: 0,
             interner,
             errors: Vec::new(),
+            docs: Vec::new(),
+        }
+    }
+
+    /// Construct a parser with pre-collected doc comments from the
+    /// lexer side channel. Used by `parse(source)`.
+    pub fn with_docs(tokens: Vec<Lexeme>, interner: Interner, docs: Vec<DocComment>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            interner,
+            errors: Vec::new(),
+            docs,
         }
     }
 
@@ -43,10 +66,12 @@ impl Parser {
             }
             self.skip_newlines();
         }
+        let docs = std::mem::take(&mut self.docs);
         ParseResult {
             module: stmts,
             errors: self.errors,
             interner: self.interner,
+            docs,
         }
     }
 
@@ -1969,9 +1994,9 @@ impl Parser {
 
 /// Convenience: lex and parse source code in one call.
 pub fn parse(source: &str) -> ParseResult {
-    let (lexemes, lex_errors) = crate::parse::lexer::lex(source);
+    let (lexemes, docs, lex_errors) = crate::parse::lexer::lex(source);
     let interner = Interner::new();
-    let mut parser = Parser::new(lexemes, interner);
+    let mut parser = Parser::with_docs(lexemes, interner, docs);
     parser.errors.extend(lex_errors);
     parser.parse()
 }

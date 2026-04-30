@@ -108,6 +108,14 @@ struct Cli {
     #[arg(long)]
     inspect: bool,
 
+    /// Generate HTML documentation for a source tree (the positional
+    /// `file` argument is the root directory) and exit. One HTML file
+    /// per module gets written under the given output directory; an
+    /// `index.html` lists every module. Doc bodies come from `///` and
+    /// `//!` comments, rendered as CommonMark.
+    #[arg(long, value_name = "OUT_DIR")]
+    docs: Option<String>,
+
     /// Maximum interpreter steps before aborting. Pass `0` to disable
     /// the limit entirely — recommended for long-running servers
     /// where the default cap (1B interp / 10B tiered) caps out after
@@ -417,7 +425,7 @@ fn run_file(source: &str, filename: &str, cli: &Cli) {
 
     // 1. Lex
     if cli.dump_tokens {
-        let (lexemes, errors) = lexer::lex(source);
+        let (lexemes, _docs, errors) = lexer::lex(source);
         for err in &errors {
             err.eprint(source);
         }
@@ -777,6 +785,161 @@ fn build_hatch_package(root: &str, out_path: &str, target: Option<&str>) {
     );
 }
 
+/// Walk a source root (file or directory), parse every `.wren`
+/// file, collect `///` and `//!` comments alongside the typed AST,
+/// and emit one HTML page per module plus an `index.html` linking
+/// them. Doc bodies render as CommonMark.
+///
+/// Layout in `<out_dir>/`:
+///
+/// ```text
+/// out_dir/
+///   index.html         — module list + any module-level summary
+///   <module>.html      — one page per .wren file (slashes → dashes)
+/// ```
+fn generate_docs(root: &str, out_dir: &str) {
+    let root_path = std::path::PathBuf::from(root);
+    let out_path = std::path::PathBuf::from(out_dir);
+    if let Err(e) = fs::create_dir_all(&out_path) {
+        eprintln!("error: cannot create '{}': {}", out_dir, e);
+        process::exit(1);
+    }
+
+    // Collect every .wren file under the root. Single-file inputs
+    // pass through unchanged. Order: alphabetical by qualified
+    // module name so the index reads predictably.
+    let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if root_path.is_file() {
+        let name = root_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("module")
+            .to_string();
+        wren_files.push((name, root_path.clone()));
+    } else if root_path.is_dir() {
+        walk_wren_files(&root_path, &root_path, &mut wren_files);
+    } else {
+        eprintln!("error: '{}' is neither a file nor a directory", root);
+        process::exit(1);
+    }
+    wren_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut index_entries: Vec<(String, String)> = Vec::new(); // (module, summary)
+    for (name, path) in &wren_files {
+        let source = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: skipping '{}': {}", path.display(), e);
+                continue;
+            }
+        };
+        let pr = wren_lift::parse::parser::parse(&source);
+        let module = wren_lift::docs::collect_module(name, &source, &pr.module, &pr.docs, &pr.interner);
+        let html = wren_lift::docs::render_module_html(&module);
+        let html_path = out_path.join(format!("{}.html", name));
+        if let Err(e) = fs::write(&html_path, html) {
+            eprintln!("error: cannot write '{}': {}", html_path.display(), e);
+            process::exit(1);
+        }
+        index_entries.push((name.clone(), module.summary().to_string()));
+    }
+
+    let index_html = render_docs_index(&index_entries);
+    let index_path = out_path.join("index.html");
+    if let Err(e) = fs::write(&index_path, index_html) {
+        eprintln!("error: cannot write '{}': {}", index_path.display(), e);
+        process::exit(1);
+    }
+    eprintln!(
+        "wrote {} module page(s) + index.html → {}",
+        wren_files.len(),
+        out_dir
+    );
+}
+
+/// Walk `dir` recursively, collecting (qualified-name, path) pairs
+/// for every `.wren` file. The qualified name is the path relative
+/// to `root` with slashes replaced by dashes and the `.wren`
+/// extension stripped — same convention as the bundle builder.
+fn walk_wren_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Skip hidden + build artefacts.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with('.') || n == "target" || n == "node_modules")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if path.is_dir() {
+            walk_wren_files(root, &path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("wren") {
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let mut name = rel.with_extension("").to_string_lossy().to_string();
+            name = name.replace(std::path::MAIN_SEPARATOR, "-");
+            out.push((name, path.clone()));
+        }
+    }
+}
+
+fn render_docs_index(modules: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("<!doctype html>\n<html><head><meta charset=\"utf-8\">");
+    out.push_str("<title>API documentation</title>");
+    out.push_str("<style>");
+    out.push_str(
+        "body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; \
+         max-width: 760px; margin: 40px auto; padding: 0 24px; \
+         background: #f1e3cc; color: #2a1f12; }\
+         h1 { font: 800 26px ui-sans-serif, system-ui, sans-serif; \
+              margin: 0 0 18px; letter-spacing: -0.01em; }\
+         ul { list-style: none; padding: 0; }\
+         li { padding: 10px 0; border-bottom: 1px dashed rgba(58,42,24,0.25); }\
+         a { color: #2a1f12; text-decoration: none; font-weight: 700; }\
+         a:hover { color: #c9a878; }\
+         .summary { color: #4a3a26; font-weight: 400; margin-left: 8px; }",
+    );
+    out.push_str("</style></head><body>");
+    out.push_str("<h1>API documentation</h1>");
+    out.push_str("<ul>");
+    for (name, summary) in modules {
+        out.push_str("<li><a href=\"");
+        // Filenames are constrained to safe identifiers by the
+        // collector's renaming, so we don't escape here.
+        out.push_str(name);
+        out.push_str(".html\">");
+        out.push_str(name);
+        out.push_str("</a>");
+        if !summary.is_empty() {
+            out.push_str("<span class=\"summary\">— ");
+            // First-paragraph summary may contain markdown markers;
+            // strip them down to plain text for the index.
+            for ch in summary.chars() {
+                match ch {
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '&' => out.push_str("&amp;"),
+                    _ => out.push(ch),
+                }
+            }
+            out.push_str("</span>");
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ul></body></html>");
+    out
+}
+
 /// Parse a `.hatch` byte stream and print its manifest + section
 /// listing to stdout. Non-zero exit on format errors.
 fn inspect_hatch(bytes: &[u8]) {
@@ -896,6 +1059,14 @@ fn main() {
             // file-read path below.
             if let Some(out_path) = &cli.bundle {
                 build_hatch_package(filename, out_path, cli.bundle_target.as_deref());
+                return;
+            }
+
+            // `--docs` likewise treats the positional argument as a
+            // root path (file or directory). Generates an HTML page
+            // per module under <out>/.
+            if let Some(out_dir) = &cli.docs {
+                generate_docs(filename, out_dir);
                 return;
             }
 
