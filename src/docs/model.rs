@@ -2,14 +2,15 @@
 //! LSP hover handler consume. Kept deliberately small: a class, its
 //! members, and the Markdown body for each.
 //!
-//! The collector populates this from `(ParseResult, source)`; the
-//! renderer reads it and produces HTML.
+//! Output IR is JSON. The wrenlift.com docs viewer owns the visual
+//! design and renders the Markdown bodies in its own theme — the
+//! generator's job stops at producing well-typed structured data.
 
 use crate::ast::Span;
+use serde::Serialize;
 
-/// A whole module's docs — the things published as one HTML page
-/// per file in the static-site output.
-#[derive(Debug, Clone, Default)]
+/// A whole module's docs — emitted as one JSON document per file.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ModuleDoc {
     /// Module name (file stem with directory dotted in, e.g.
     /// `foo.bar` for `foo/bar.wren`). The CLI fills this in;
@@ -22,30 +23,33 @@ pub struct ModuleDoc {
     pub classes: Vec<ClassDoc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClassDoc {
     pub name: String,
+    #[serde(serialize_with = "ser_span")]
     pub span: Span,
     /// `///` body for the class itself, Markdown.
     pub doc: String,
     pub members: Vec<MemberDoc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MemberDoc {
     pub name: String,
     pub kind: MemberKind,
     /// `///` body, Markdown. Empty when the member has no doc
     /// comment.
     pub doc: String,
+    #[serde(serialize_with = "ser_span")]
     pub span: Span,
     /// Pretty-printed signature line — `static foo(x, y)`,
-    /// `bar=(value)`, `baz { _baz }`, etc. Renderer prints this
+    /// `bar=(value)`, `baz { _baz }`, etc. Consumers print it
     /// above the body.
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MemberKind {
     Method,
     StaticMethod,
@@ -53,6 +57,17 @@ pub enum MemberKind {
     Setter,
     Constructor,
     Field,
+}
+
+/// Wrap the foreign `Span` (a `Range<usize>`) as a 2-element JSON
+/// array: `[start, end]`. Lets consumers do `span[0]`, `span[1]`
+/// without naming the field.
+fn ser_span<S: serde::Serializer>(span: &Span, s: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeTuple;
+    let mut t = s.serialize_tuple(2)?;
+    t.serialize_element(&span.start)?;
+    t.serialize_element(&span.end)?;
+    t.end()
 }
 
 impl ModuleDoc {

@@ -44,7 +44,6 @@ host = [
     "dep:libloading",
     "dep:tempfile",
     "dep:ureq",
-    "dep:pulldown-cmark",
     "dep:beadie",
     "dep:zstd",
     "dep:zip",
@@ -91,7 +90,6 @@ dynasm = { version = "2", optional = true }
 libloading = { version = "0.8", optional = true }
 libc = { version = "0.2", optional = true }
 tempfile = { version = "3", optional = true }
-pulldown-cmark = { version = "0.10", default-features = false, features = ["html"], optional = true }
 sha2 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }

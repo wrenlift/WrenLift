@@ -694,7 +694,7 @@ mod tests {
     }
 
     fn lex_texts(source: &str) -> Vec<String> {
-        let (lexemes, _) = lex(source);
+        let (lexemes, _, _) = lex(source);
         lexemes.iter().map(|l| l.text.clone()).collect()
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_spans_correct() {
-        let (lexemes, _) = lex("var x = 42");
+        let (lexemes, _, _) = lex("var x = 42");
         assert_eq!(lexemes[0].span, 0..3); // var
         assert_eq!(lexemes[1].span, 4..5); // x
         assert_eq!(lexemes[2].span, 6..7); // =
@@ -1042,14 +1042,14 @@ mod tests {
 
     #[test]
     fn test_unterminated_string_error() {
-        let (_, errors) = lex(r#""hello"#);
+        let (_, _docs, errors) = lex(r#""hello"#);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("unterminated"));
     }
 
     #[test]
     fn test_unterminated_block_comment_error() {
-        let (_, errors) = lex("/* no end");
+        let (_, _docs, errors) = lex("/* no end");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("unterminated"));
     }

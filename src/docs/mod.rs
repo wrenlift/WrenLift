@@ -20,4 +20,4 @@ pub mod render;
 
 pub use collect::collect_module;
 pub use model::{ClassDoc, MemberDoc, MemberKind, ModuleDoc};
-pub use render::render_module_html;
+pub use render::{render_manifest, render_module_json, PackageManifest};

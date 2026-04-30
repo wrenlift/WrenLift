@@ -20,7 +20,6 @@ pub mod ast;
 pub mod capi;
 pub mod codegen;
 pub mod diagnostics;
-#[cfg(feature = "host")]
 pub mod docs;
 pub mod intern;
 pub mod mir;

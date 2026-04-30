@@ -807,7 +807,7 @@ fn generate_docs(root: &str, out_dir: &str) {
 
     // Collect every .wren file under the root. Single-file inputs
     // pass through unchanged. Order: alphabetical by qualified
-    // module name so the index reads predictably.
+    // module name so the manifest reads predictably.
     let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     if root_path.is_file() {
         let name = root_path
@@ -824,7 +824,16 @@ fn generate_docs(root: &str, out_dir: &str) {
     }
     wren_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut index_entries: Vec<(String, String)> = Vec::new(); // (module, summary)
+    // Use the source-tree directory name as the package name for
+    // the manifest. The wrenlift.com docs viewer can override this
+    // by reading the `name` from a sibling hatchfile if it cares.
+    let pkg_name = root_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("package")
+        .to_string();
+
+    let mut modules: Vec<wren_lift::docs::ModuleDoc> = Vec::new();
     for (name, path) in &wren_files {
         let source = match fs::read_to_string(path) {
             Ok(s) => s,
@@ -835,24 +844,24 @@ fn generate_docs(root: &str, out_dir: &str) {
         };
         let pr = wren_lift::parse::parser::parse(&source);
         let module = wren_lift::docs::collect_module(name, &source, &pr.module, &pr.docs, &pr.interner);
-        let html = wren_lift::docs::render_module_html(&module);
-        let html_path = out_path.join(format!("{}.html", name));
-        if let Err(e) = fs::write(&html_path, html) {
-            eprintln!("error: cannot write '{}': {}", html_path.display(), e);
+        let json = wren_lift::docs::render_module_json(&module);
+        let json_path = out_path.join(format!("{}.json", name));
+        if let Err(e) = fs::write(&json_path, json) {
+            eprintln!("error: cannot write '{}': {}", json_path.display(), e);
             process::exit(1);
         }
-        index_entries.push((name.clone(), module.summary().to_string()));
+        modules.push(module);
     }
 
-    let index_html = render_docs_index(&index_entries);
-    let index_path = out_path.join("index.html");
-    if let Err(e) = fs::write(&index_path, index_html) {
-        eprintln!("error: cannot write '{}': {}", index_path.display(), e);
+    let manifest_json = wren_lift::docs::render_manifest(&pkg_name, &modules);
+    let manifest_path = out_path.join("manifest.json");
+    if let Err(e) = fs::write(&manifest_path, manifest_json) {
+        eprintln!("error: cannot write '{}': {}", manifest_path.display(), e);
         process::exit(1);
     }
     eprintln!(
-        "wrote {} module page(s) + index.html → {}",
-        wren_files.len(),
+        "wrote {} module(s) + manifest.json → {}",
+        modules.len(),
         out_dir
     );
 }
@@ -890,54 +899,6 @@ fn walk_wren_files(
             out.push((name, path.clone()));
         }
     }
-}
-
-fn render_docs_index(modules: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(2048);
-    out.push_str("<!doctype html>\n<html><head><meta charset=\"utf-8\">");
-    out.push_str("<title>API documentation</title>");
-    out.push_str("<style>");
-    out.push_str(
-        "body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; \
-         max-width: 760px; margin: 40px auto; padding: 0 24px; \
-         background: #f1e3cc; color: #2a1f12; }\
-         h1 { font: 800 26px ui-sans-serif, system-ui, sans-serif; \
-              margin: 0 0 18px; letter-spacing: -0.01em; }\
-         ul { list-style: none; padding: 0; }\
-         li { padding: 10px 0; border-bottom: 1px dashed rgba(58,42,24,0.25); }\
-         a { color: #2a1f12; text-decoration: none; font-weight: 700; }\
-         a:hover { color: #c9a878; }\
-         .summary { color: #4a3a26; font-weight: 400; margin-left: 8px; }",
-    );
-    out.push_str("</style></head><body>");
-    out.push_str("<h1>API documentation</h1>");
-    out.push_str("<ul>");
-    for (name, summary) in modules {
-        out.push_str("<li><a href=\"");
-        // Filenames are constrained to safe identifiers by the
-        // collector's renaming, so we don't escape here.
-        out.push_str(name);
-        out.push_str(".html\">");
-        out.push_str(name);
-        out.push_str("</a>");
-        if !summary.is_empty() {
-            out.push_str("<span class=\"summary\">— ");
-            // First-paragraph summary may contain markdown markers;
-            // strip them down to plain text for the index.
-            for ch in summary.chars() {
-                match ch {
-                    '<' => out.push_str("&lt;"),
-                    '>' => out.push_str("&gt;"),
-                    '&' => out.push_str("&amp;"),
-                    _ => out.push(ch),
-                }
-            }
-            out.push_str("</span>");
-        }
-        out.push_str("</li>");
-    }
-    out.push_str("</ul></body></html>");
-    out
 }
 
 /// Parse a `.hatch` byte stream and print its manifest + section
