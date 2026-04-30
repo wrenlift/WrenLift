@@ -97,12 +97,19 @@
        wrenHover extension creates. Matches the dark code-pane
        palette so the tooltip reads as part of the editor. */
     .cm-tooltip .wlift-hover {
-      max-width: 480px; padding: 10px 14px;
+      max-width: 480px;
+      /* Cap the height so a chatty doc body doesn't paint over
+         half the editor. Anything past the cap scrolls — the
+         signature pane stays sticky-pinned at the top so the
+         user always sees what they're hovering on. */
+      max-height: 280px;
+      overflow: auto;
+      padding: 10px 14px;
       font-size: 12px; line-height: 1.5;
       color: var(--text);
     }
     .cm-tooltip .wlift-hover pre {
-      margin: 0 0 6px;
+      margin: 0 0 4px;
       padding: 6px 10px;
       background: rgba(244, 194, 74, 0.06);
       border: 1px solid rgba(244, 194, 74, 0.18);
@@ -110,7 +117,20 @@
       color: var(--accent);
       font-size: 12px;
     }
+    .cm-tooltip .wlift-hover pre:first-child {
+      /* Pin the signature line so it stays visible while the
+         user scrolls through the body underneath. */
+      position: sticky; top: 0;
+      background: var(--panel);
+      margin: 0 0 2px;
+    }
+    /* Body text sits flush against the signature pane — drop the
+       leading line-break the markdown emits. */
+    .cm-tooltip .wlift-hover br:first-of-type { display: none; }
     .cm-tooltip .wlift-hover code { font-family: inherit; }
+    /* CodeMirror's default tooltip frame has its own padding;
+       collapse it so our inner padding owns the gutter. */
+    .cm-tooltip-hover .cm-tooltip-section { padding: 0; }
     footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
 
     h1 { font-size: 13px; margin: 0; color: var(--accent); letter-spacing: 0.04em; }

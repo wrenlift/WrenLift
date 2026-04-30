@@ -24,13 +24,24 @@ use super::{collect_module, ModuleDoc};
 /// Prelude class stubs baked into the binary at compile time.
 /// `(module_name, source_text)` tuples.
 const STUBS: &[(&str, &str)] = &[
-    ("System", include_str!("../runtime/prelude/system.wren")),
-    ("Num",    include_str!("../runtime/prelude/num.wren")),
-    ("String", include_str!("../runtime/prelude/string.wren")),
-    ("List",   include_str!("../runtime/prelude/list.wren")),
-    ("Map",    include_str!("../runtime/prelude/map.wren")),
-    ("Fiber",  include_str!("../runtime/prelude/fiber.wren")),
-    ("Fn",     include_str!("../runtime/prelude/fn.wren")),
+    // Core (always-on prelude)
+    ("System",       include_str!("../runtime/prelude/system.wren")),
+    ("Num",          include_str!("../runtime/prelude/num.wren")),
+    ("String",       include_str!("../runtime/prelude/string.wren")),
+    ("List",         include_str!("../runtime/prelude/list.wren")),
+    ("Map",          include_str!("../runtime/prelude/map.wren")),
+    ("Fiber",        include_str!("../runtime/prelude/fiber.wren")),
+    ("Fn",           include_str!("../runtime/prelude/fn.wren")),
+    // Wasm-runtime prelude — the BROWSER_PRELUDE classes the
+    // runtime auto-imports into every wasm `run()` invocation.
+    // On native these aren't present; surfacing their docs in
+    // the host LSP is harmless (the user won't reach them at
+    // runtime there).
+    ("Browser",      include_str!("../runtime/prelude/browser.wren")),
+    ("Dom",          include_str!("../runtime/prelude/dom.wren")),
+    ("Future",       include_str!("../runtime/prelude/future.wren")),
+    ("WebSocket",    include_str!("../runtime/prelude/websocket.wren")),
+    ("Storage",      include_str!("../runtime/prelude/storage.wren")),
 ];
 
 /// Lazily-parsed prelude doc model. First access pays the parse

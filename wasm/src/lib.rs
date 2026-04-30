@@ -1081,42 +1081,47 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
     // etc.) rather than a declaration site, so identifier-match
     // wins over enclosing-span before we fall back to "show the
     // method I'm inside".
+    //
+    // When the cursor sits on `<Receiver>.<member>`, restrict the
+    // member lookup to the class named by the receiver. Without
+    // this, `Renderer2D.new` would match FruitSlicer's `new`
+    // constructor first because both classes register a `new`
+    // method and the local module wins the iteration order.
     if let Some(ident_span) = identifier_at(source, byte) {
         let ident = &source[ident_span.clone()];
+        let receiver = receiver_before(source, ident_span.start);
 
-        // Local module: any class or member whose name equals the
-        // identifier the cursor sits on.
-        for class in &module.classes {
-            if class.name == ident {
-                return hover_out(
-                    &format!("class {}", class.name),
-                    &class.doc,
-                    ident_span.start,
-                    ident_span.end,
-                );
-            }
-            for member in &class.members {
-                if member.name == ident {
-                    return hover_out(
-                        &format_member_sig(&class.name, &member.signature),
-                        &member.doc,
-                        ident_span.start,
-                        ident_span.end,
-                    );
+        // Class-name hover (the cursor lands on a name that's
+        // itself a known class). Same priority as the receiver
+        // case — identity-class hits skip the receiver gating.
+        let mut all_modules: Vec<&wren_lift::docs::ModuleDoc> =
+            wren_lift::docs::prelude_docs().iter().collect();
+        all_modules.insert(0, &module);
+
+        if receiver.is_none() {
+            for m in &all_modules {
+                for class in &m.classes {
+                    if class.name == ident {
+                        return hover_out(
+                            &format!("class {}", class.name),
+                            &class.doc,
+                            ident_span.start,
+                            ident_span.end,
+                        );
+                    }
                 }
             }
         }
 
-        // Prelude.
-        for prelude_module in wren_lift::docs::prelude_docs() {
-            for class in &prelude_module.classes {
-                if class.name == ident {
-                    return hover_out(
-                        &format!("class {}", class.name),
-                        &class.doc,
-                        ident_span.start,
-                        ident_span.end,
-                    );
+        // Member match. With a receiver, scan only that class's
+        // members; without one, scan every class (the legacy
+        // best-effort).
+        for m in &all_modules {
+            for class in &m.classes {
+                if let Some(recv) = receiver {
+                    if class.name != recv {
+                        continue;
+                    }
                 }
                 for member in &class.members {
                     if member.name == ident {
@@ -1159,6 +1164,52 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
     }
 
     JsValue::NULL
+}
+
+/// Identifier sitting immediately before a `.` at `before_byte`.
+/// Used to detect receiver expressions (`Renderer2D` in
+/// `Renderer2D.new`) so the hover lookup can restrict member
+/// matches to the receiver's class instead of taking the first
+/// hit from any class with the same method name.
+///
+/// Returns `None` when there's no `.` directly before the
+/// position, the receiver isn't a bare identifier, or the
+/// receiver is a literal (number / string).
+fn receiver_before(source: &str, before_byte: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    if before_byte == 0 {
+        return None;
+    }
+    // Skip whitespace between the receiver and the `.`. Allows
+    // `Foo .bar` but in practice we just need the `.` directly
+    // before the cursor's identifier.
+    let mut i = before_byte;
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    if i == 0 || bytes[i - 1] != b'.' {
+        return None;
+    }
+    i -= 1; // step past the `.`
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    let recv_end = i;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == recv_end {
+        return None; // no identifier found
+    }
+    if bytes[i].is_ascii_digit() {
+        return None; // numeric literal — receiver-by-class doesn't apply
+    }
+    Some(&source[i..recv_end])
 }
 
 /// Walk back / forward from `byte` to find an identifier-shaped

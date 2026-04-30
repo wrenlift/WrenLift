@@ -294,9 +294,15 @@ impl LanguageServer for Backend {
 }
 
 /// Identifier-match version of `hover_at`. Walks the local
-/// module's classes / members for a name equal to the
-/// identifier under the cursor, regardless of whether that
-/// identifier appears at a decl site or a use site.
+/// module's classes / members and the prelude for a name equal
+/// to the identifier under the cursor, regardless of whether
+/// that identifier appears at a decl site or a use site.
+///
+/// When the cursor sits on `<Receiver>.<member>`, restricts the
+/// member lookup to the class named by the receiver. Without
+/// this, `Renderer2D.new` would match FruitSlicer's `new`
+/// constructor (or any other `new`) before reaching the right
+/// class.
 fn identifier_hover(
     module: &wren_lift::docs::ModuleDoc,
     doc: &Document,
@@ -304,41 +310,100 @@ fn identifier_hover(
 ) -> Option<Hover> {
     let span = identifier_at(&doc.text, byte)?;
     let ident = doc.text.get(span.clone())?;
-    for class in &module.classes {
-        if class.name == ident {
-            let body = format!(
-                "```wren\nclass {}\n```{}{}",
-                class.name,
-                if class.doc.is_empty() { "" } else { "\n\n" },
-                class.doc,
-            );
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: body,
-                }),
-                range: Some(doc.byte_range_to_lsp(span)),
-            });
+    let receiver = receiver_before(&doc.text, span.start);
+
+    let mut all: Vec<&wren_lift::docs::ModuleDoc> =
+        wren_lift::docs::prelude_docs().iter().collect();
+    all.insert(0, module);
+
+    // Class-name hover (cursor on the class identifier itself).
+    if receiver.is_none() {
+        for m in &all {
+            for class in &m.classes {
+                if class.name == ident {
+                    let body = format!(
+                        "```wren\nclass {}\n```{}{}",
+                        class.name,
+                        if class.doc.is_empty() { "" } else { "\n\n" },
+                        class.doc,
+                    );
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: body,
+                        }),
+                        range: Some(doc.byte_range_to_lsp(span)),
+                    });
+                }
+            }
         }
-        for member in &class.members {
-            if member.name == ident {
-                let body = format!(
-                    "```wren\n{}\n```{}{}",
-                    format_member_sig(&class.name, &member.signature),
-                    if member.doc.is_empty() { "" } else { "\n\n" },
-                    member.doc,
-                );
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: body,
-                    }),
-                    range: Some(doc.byte_range_to_lsp(span)),
-                });
+    }
+
+    // Member match — gated on the receiver class name when one
+    // sits before the cursor.
+    for m in &all {
+        for class in &m.classes {
+            if let Some(recv) = receiver {
+                if class.name != recv {
+                    continue;
+                }
+            }
+            for member in &class.members {
+                if member.name == ident {
+                    let body = format!(
+                        "```wren\n{}\n```{}{}",
+                        format_member_sig(&class.name, &member.signature),
+                        if member.doc.is_empty() { "" } else { "\n\n" },
+                        member.doc,
+                    );
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: body,
+                        }),
+                        range: Some(doc.byte_range_to_lsp(span)),
+                    });
+                }
             }
         }
     }
     None
+}
+
+/// Identifier sitting immediately before a `.` at `before_byte`.
+/// Mirrors `wasm/src/lib.rs::receiver_before`.
+fn receiver_before(source: &str, before_byte: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    if before_byte == 0 {
+        return None;
+    }
+    let mut i = before_byte;
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    if i == 0 || bytes[i - 1] != b'.' {
+        return None;
+    }
+    i -= 1;
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    let recv_end = i;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == recv_end {
+        return None;
+    }
+    if bytes[i].is_ascii_digit() {
+        return None;
+    }
+    Some(&source[i..recv_end])
 }
 
 /// Identifier-under-cursor lookup against the runtime prelude
