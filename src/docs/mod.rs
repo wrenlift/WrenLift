@@ -16,8 +16,10 @@
 
 pub mod collect;
 pub mod model;
+pub mod prelude;
 pub mod render;
 
 pub use collect::collect_module;
 pub use model::{ClassDoc, MemberDoc, MemberKind, ModuleDoc};
+pub use prelude::prelude_docs;
 pub use render::{render_manifest, render_module_json, PackageManifest};

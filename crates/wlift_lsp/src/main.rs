@@ -273,8 +273,86 @@ impl LanguageServer for Backend {
         let Some(module) = doc.docs.as_ref() else {
             return Ok(None);
         };
-        Ok(hover_at(module, byte, &doc))
+        if let Some(h) = hover_at(module, byte, &doc) {
+            return Ok(Some(h));
+        }
+        // Prelude fallback: identifier under cursor → look up in
+        // the cached System/Num/String/List/Map/Fiber/Fn stubs.
+        Ok(prelude_hover(&doc, byte))
     }
+}
+
+/// Identifier-under-cursor lookup against the runtime prelude
+/// stubs. Mirrors `hover_wren`'s prelude path so the desktop LSP
+/// answers the same questions as the playground.
+fn prelude_hover(doc: &Document, byte: usize) -> Option<Hover> {
+    let span = identifier_at(&doc.text, byte)?;
+    let ident = doc.text.get(span.clone())?;
+    for prelude_module in wren_lift::docs::prelude_docs() {
+        for class in &prelude_module.classes {
+            if class.name == ident {
+                let body = format!(
+                    "```wren\nclass {}\n```{}{}",
+                    class.name,
+                    if class.doc.is_empty() { "" } else { "\n\n" },
+                    class.doc,
+                );
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: body,
+                    }),
+                    range: Some(doc.byte_range_to_lsp(span)),
+                });
+            }
+            for member in &class.members {
+                if member.name == ident {
+                    let body = format!(
+                        "```wren\n{}\n```{}{}",
+                        format_member_sig(&class.name, &member.signature),
+                        if member.doc.is_empty() { "" } else { "\n\n" },
+                        member.doc,
+                    );
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: body,
+                        }),
+                        range: Some(doc.byte_range_to_lsp(span)),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+fn identifier_at(source: &str, byte: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    if byte > len {
+        return None;
+    }
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let pivot = if byte < len && is_id(bytes[byte]) {
+        byte
+    } else if byte > 0 && is_id(bytes[byte - 1]) {
+        byte - 1
+    } else {
+        return None;
+    };
+    let mut start = pivot;
+    while start > 0 && is_id(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = pivot + 1;
+    while end < len && is_id(bytes[end]) {
+        end += 1;
+    }
+    if bytes[start].is_ascii_digit() {
+        return None;
+    }
+    Some(start..end)
 }
 
 impl Backend {
@@ -429,8 +507,8 @@ fn member_hover(
     doc: &Document,
 ) -> Hover {
     let mut markdown = format!(
-        "```wren\n{}.{}\n```\n",
-        class.name, member.signature
+        "```wren\n{}\n```\n",
+        format_member_sig(&class.name, &member.signature)
     );
     if !member.doc.is_empty() {
         markdown.push('\n');
@@ -442,6 +520,19 @@ fn member_hover(
             value: markdown,
         }),
         range: Some(doc.byte_range_to_lsp(member.span.clone())),
+    }
+}
+
+/// Same helper the wasm shim uses — hoists the `static `/
+/// `construct ` prefix to the front of the qualified name so
+/// hover text reads naturally.
+fn format_member_sig(class_name: &str, signature: &str) -> String {
+    if let Some(rest) = signature.strip_prefix("static ") {
+        format!("static {}.{}", class_name, rest)
+    } else if let Some(rest) = signature.strip_prefix("construct ") {
+        format!("{}.{}", class_name, rest)
+    } else {
+        format!("{}.{}", class_name, signature)
     }
 }
 
@@ -472,7 +563,24 @@ impl Backend {
         // problem list.
         let mut module_docs: Option<wren_lift::docs::ModuleDoc> = None;
         if pr.errors.is_empty() {
-            let sema = sema_resolve::resolve(&pr.module, &pr.interner);
+            // Match the runtime's prelude — same names sema's
+            // resolve sees in the wasm `run()` path. Without
+            // this, every `System.print` / `Fiber.new` shows
+            // up as "undefined".
+            let mut interner = pr.interner;
+            let prelude_names: [&str; 16] = [
+                "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range",
+                "Null", "Fn", "Fiber", "System", "Sequence", "ByteArray",
+                "Float32Array", "Float64Array",
+            ];
+            let prelude: Vec<wren_lift::intern::SymbolId> = prelude_names
+                .iter()
+                .map(|n| interner.intern(n))
+                .collect();
+            let sema = sema_resolve::resolve_with_prelude(&pr.module, &interner, &prelude);
+            // Restore the (possibly mutated) interner so the doc
+            // collector below sees the same identifier ids.
+            let pr_interner = interner;
             {
                 let doc = self.docs.get(uri).unwrap();
                 for d in &sema.errors {
@@ -492,7 +600,7 @@ impl Backend {
                 &text,
                 &pr.module,
                 &pr.docs,
-                &pr.interner,
+                &pr_interner,
             ));
         }
 

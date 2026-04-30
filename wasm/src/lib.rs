@@ -1010,11 +1010,8 @@ pub fn complete_wren(source: &str) -> JsValue {
     );
 
     let mut out: Vec<Item> = Vec::new();
-    for class in &module.classes {
-        // Class entry — `detail` is the summary, `doc` is the
-        // full body so the side panel shows the rest of the
-        // explanation when the user pauses on the entry.
-        out.push(Item {
+    let mut emit_class = |class: &wren_lift::docs::ClassDoc, items: &mut Vec<Item>| {
+        items.push(Item {
             label: class.name.clone(),
             kind: "class",
             detail: class.summary().to_string(),
@@ -1029,12 +1026,26 @@ pub fn complete_wren(source: &str) -> JsValue {
                 wren_lift::docs::MemberKind::Constructor => "constructor",
                 wren_lift::docs::MemberKind::Field => "field",
             };
-            out.push(Item {
+            items.push(Item {
                 label: member.name.clone(),
                 kind,
                 detail: member.signature.clone(),
                 doc: member.doc.clone(),
             });
+        }
+    };
+
+    // Local module first (so a user-defined `Foo` shadows a
+    // prelude class of the same name in the dropdown).
+    for class in &module.classes {
+        emit_class(class, &mut out);
+    }
+    // Then the prelude — System / Num / String / List / Map /
+    // Fiber / Fn — so the user gets `print`, `count`, `add`, etc.
+    // in the same fuzzy-search list as their own decls.
+    for prelude_module in wren_lift::docs::prelude_docs() {
+        for class in &prelude_module.classes {
+            emit_class(class, &mut out);
         }
     }
     out.serialize(&json_serializer())
@@ -1051,13 +1062,6 @@ pub fn complete_wren(source: &str) -> JsValue {
 /// playground renders this through its `hoverTooltip` extension.
 #[wasm_bindgen]
 pub fn hover_wren(source: &str, byte: usize) -> JsValue {
-    use serde::Serialize;
-    #[derive(Serialize)]
-    struct HoverOut {
-        markdown: String,
-        span: (usize, usize),
-    }
-
     let pr = wren_lift::parse::parser::parse(source);
     if !pr.errors.is_empty() {
         // Hover off a half-parsed module produces noise. Stay
@@ -1072,41 +1076,137 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         &pr.interner,
     );
 
+    // Local module hover via span containment — finds the
+    // declaration whose span actually wraps the cursor.
     for class in &module.classes {
         if class.span.start > byte || byte >= class.span.end {
             continue;
         }
         for member in &class.members {
             if member.span.start <= byte && byte < member.span.end {
-                let markdown = format!(
-                    "```wren\n{}.{}\n```\n{}{}",
-                    class.name,
-                    member.signature,
-                    if member.doc.is_empty() { "" } else { "\n" },
-                    member.doc,
+                return hover_out(
+                    &format_member_sig(&class.name, &member.signature),
+                    &member.doc,
+                    member.span.start,
+                    member.span.end,
                 );
-                return HoverOut {
-                    markdown,
-                    span: (member.span.start, member.span.end),
-                }
-                .serialize(&json_serializer())
-                .unwrap_or(JsValue::NULL);
             }
         }
-        let markdown = format!(
-            "```wren\nclass {}\n```\n{}{}",
-            class.name,
-            if class.doc.is_empty() { "" } else { "\n" },
-            class.doc,
+        return hover_out(
+            &format!("class {}", class.name),
+            &class.doc,
+            class.span.start,
+            class.span.end,
         );
-        return HoverOut {
-            markdown,
-            span: (class.span.start, class.span.end),
-        }
-        .serialize(&json_serializer())
-        .unwrap_or(JsValue::NULL);
     }
+
+    // Prelude fallback — the cursor isn't on a local declaration,
+    // but might be on a *use* of a prelude class or method
+    // (`System.print`, `String.split`, etc.). Look up the
+    // identifier under the cursor in the cached prelude model.
+    if let Some(ident_span) = identifier_at(source, byte) {
+        let ident = &source[ident_span.clone()];
+        for prelude_module in wren_lift::docs::prelude_docs() {
+            for class in &prelude_module.classes {
+                if class.name == ident {
+                    return hover_out(
+                        &format!("class {}", class.name),
+                        &class.doc,
+                        ident_span.start,
+                        ident_span.end,
+                    );
+                }
+                for member in &class.members {
+                    if member.name == ident {
+                        return hover_out(
+                            &format_member_sig(&class.name, &member.signature),
+                            &member.doc,
+                            ident_span.start,
+                            ident_span.end,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     JsValue::NULL
+}
+
+/// Walk back / forward from `byte` to find an identifier-shaped
+/// run (`[A-Za-z_][A-Za-z0-9_]*`). Returns the byte range or
+/// `None` when the cursor isn't on an identifier.
+fn identifier_at(source: &str, byte: usize) -> Option<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    if byte > len {
+        return None;
+    }
+    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // If `byte` sits between two identifiers (e.g. on a `.`),
+    // prefer the one to the left so hover-on-`.` still works.
+    let pivot = if byte < len && is_id(bytes[byte]) {
+        byte
+    } else if byte > 0 && is_id(bytes[byte - 1]) {
+        byte - 1
+    } else {
+        return None;
+    };
+    let mut start = pivot;
+    while start > 0 && is_id(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = pivot + 1;
+    while end < len && is_id(bytes[end]) {
+        end += 1;
+    }
+    // Reject if the run starts with a digit — then it's a number
+    // literal, not an identifier.
+    if bytes[start].is_ascii_digit() {
+        return None;
+    }
+    Some(start..end)
+}
+
+/// Glue a class name to a member signature for hover display.
+/// The collector encodes static-ness as a `static ` prefix on
+/// the signature; hoist that to the front of the rendered string
+/// so we get `static Class.method(args)` rather than the
+/// nonsensical `Class.static method(args)`.
+fn format_member_sig(class_name: &str, signature: &str) -> String {
+    if let Some(rest) = signature.strip_prefix("static ") {
+        format!("static {}.{}", class_name, rest)
+    } else if let Some(rest) = signature.strip_prefix("construct ") {
+        // Constructors read more naturally as
+        // `Class.new(args)` (the form most users see at the call
+        // site) than `construct new(args)`.
+        format!("{}.{}", class_name, rest)
+    } else {
+        format!("{}.{}", class_name, signature)
+    }
+}
+
+/// Build a `HoverOut` JSON value with the given signature + body
+/// and span range.
+fn hover_out(signature: &str, body: &str, start: usize, end: usize) -> JsValue {
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct HoverOut {
+        markdown: String,
+        span: (usize, usize),
+    }
+    let markdown = format!(
+        "```wren\n{}\n```\n{}{}",
+        signature,
+        if body.is_empty() { "" } else { "\n" },
+        body,
+    );
+    HoverOut {
+        markdown,
+        span: (start, end),
+    }
+    .serialize(&json_serializer())
+    .unwrap_or(JsValue::NULL)
 }
 
 fn diag_to_lint(d: &wren_lift::diagnostics::Diagnostic) -> LintDiag {
