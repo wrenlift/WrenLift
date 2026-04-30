@@ -237,9 +237,24 @@ jobs:
           HATCH_BOT_URL: ${{ vars.HATCH_BOT_URL }}
         run: |
           set -eu
-          mkdir -p site/playground/web site/playground/pkg
+          # One flat directory for the playground — wlift.js,
+          # wlift_wasm.js, wlift_wasm_bg.wasm, examples.json,
+          # gpu-bridge.js, hatch bundles, and assets all live
+          # together so the relative `./wlift_wasm.js` import
+          # resolves cleanly from a single origin.
+          mkdir -p site/playground/web
           cp -R wasm/web/. site/playground/web/
-          cp -R wasm/pkg/. site/playground/pkg/
+          cp wasm/pkg/wlift_wasm.js wasm/pkg/wlift_wasm_bg.wasm \
+            site/playground/web/
+
+          # Public distribution endpoint. `wrenlift.com/dist/wlift.js`
+          # is the canonical CDN URL embedders import; we stage
+          # the same three files here (no playground UI clutter)
+          # so the import URL doesn't leak the playground path.
+          mkdir -p site/dist
+          cp wasm/web/wlift.js wasm/web/gpu-bridge.js wasm/web/worker.js \
+            wasm/pkg/wlift_wasm.js wasm/pkg/wlift_wasm_bg.wasm \
+            site/dist/
           if [ -n "${HATCH_BOT_URL:-}" ]; then
             # Strip a trailing `/publish` if present. The org var
             # is configured as the hatch CLI's publish endpoint

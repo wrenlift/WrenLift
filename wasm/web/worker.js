@@ -50,7 +50,7 @@
 // `import` list. The wlift_wasm wasm exports are returned by
 // `init()` and stashed below for use as JIT-module imports.
 import { createGpuBridge } from "./gpu-bridge.js";
-import * as wlift_wasm from "../pkg/wlift_wasm.js";
+import * as wlift_wasm from "./wlift_wasm.js";
 const {
   default: init,
   version,

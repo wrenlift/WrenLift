@@ -1035,6 +1035,7 @@
         <div class="lang-toggle" id="langToggle" role="tablist">
           <button class="active" data-lang="c">C</button>
           <button data-lang="rust">Rust</button>
+          <button data-lang="web">Web</button>
         </div>
       </div>
 
@@ -1055,6 +1056,16 @@
           <li><span class="ck">✓</span><span><b>High level: <code>hatch_runner</code>.</b> One <code>HatchRunner::new()</code>, then <code>run_file()</code>. Resolves Hatch packages automatically.</span></li>
           <li><span class="ck">✓</span><span><b>Low level: <code>capi</code>.</b> <code>extern "C"</code> bindings to <code>wrenNewVM</code>, <code>wrenInterpret</code>, slots, foreign methods. <code>unsafe</code> when you need it.</span></li>
           <li><span class="ck">✓</span><span><b>Cargo-native.</b> Add <code>wren_lift</code> to your <code>Cargo.toml</code>; the build links the static lib for you.</span></li>
+        </ul>
+      </div>
+
+      <div class="embed-mode" data-mode="web">
+        <h2>Or <em>embed it</em> in the browser.</h2>
+        <p>One ES-module import, no build step, no toolchain. <code>https://wrenlift.com/dist/wlift.js</code> is the canonical CDN URL — call <code>createWlift()</code> and run Wren in the page or a worker. Same runtime, same diagnostics, async bridges already wired (<code>fetch</code>, <code>setTimeout</code>, <code>WebSocket</code>, DOM). An npm package with versioned tags is on the roadmap.</p>
+        <ul class="embed-points">
+          <li><span class="ck">✓</span><span><b>One factory: <code>createWlift({ mode })</code>.</b> <code>main</code> for the page thread, <code>worker</code> for off-main; canvas + DOM bridges round-trip transparently.</span></li>
+          <li><span class="ck">✓</span><span><b>Hatchfile-aware.</b> <code>runProject(wlift, src, hatchfileText)</code> walks deps, fetches each <code>.hatch</code> bundle, and installs them before the user source runs.</span></li>
+          <li><span class="ck">✓</span><span><b>Tier-up wasm JIT.</b> Hot functions are emitted as fresh wasm modules at runtime (via <code>wasm-encoder</code>) and instantiated alongside the runtime — no extra dependency on the host browser's JIT.</span></li>
         </ul>
       </div>
     </div>
@@ -1168,6 +1179,71 @@
 <span class="mut">  hello, world </span><span class="em">✦</span></pre>
       </div>
     </div>
+
+    <!-- Web panel -->
+    <div class="codepanel hidden" id="embedPanelWeb">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-pane="w-host"><span>simple.html</span><span class="ext">HTML</span></button>
+        <button class="tab" data-pane="w-hatch"><span>with-hatch.html</span><span class="ext">HTML</span></button>
+        <button class="tab" data-pane="w-toml"><span>hatchfile</span><span class="ext">TOML</span></button>
+      </div>
+      <div class="panes">
+<pre class="active" data-pane="w-host"><span class="cmt">&lt;!-- Bare embed: one wlift.run() call. No package resolution. --&gt;</span>
+<span class="kw">&lt;script type=</span><span class="str">"module"</span><span class="kw">&gt;</span>
+  <span class="kw">import</span> { createWlift } <span class="kw">from</span>
+    <span class="str">"https://wrenlift.com/dist/wlift.js"</span>;
+
+  <span class="cmt">// `mode: "main"` runs on the page thread; "worker" off-mains.</span>
+  <span class="kw">const</span> wlift = <span class="kw">await</span> <span class="fn">createWlift</span>({ mode: <span class="str">"main"</span> });
+
+  <span class="kw">const</span> { output } = <span class="kw">await</span> wlift.<span class="fn">run</span>(<span class="str">`
+    class Greeter {
+      static hello(name) { System.print("hello, %(name) ✦") }
+    }
+    Greeter.hello("browser")
+  `</span>);
+
+  document.<span class="ident">getElementById</span>(<span class="str">"out"</span>).<span class="ident">textContent</span> = output;
+<span class="kw">&lt;/script&gt;</span>
+<span class="kw">&lt;pre id=</span><span class="str">"out"</span><span class="kw">&gt;&lt;/pre&gt;</span></pre>
+
+<pre data-pane="w-hatch"><span class="cmt">&lt;!-- Hatch resolution: walk a hatchfile, fetch each @hatch:*</span>
+<span class="cmt">     package, install before the user source runs. Same flow</span>
+<span class="cmt">     the playground uses. --&gt;</span>
+<span class="kw">&lt;script type=</span><span class="str">"module"</span><span class="kw">&gt;</span>
+  <span class="kw">import</span> { createWlift, runProject } <span class="kw">from</span>
+    <span class="str">"https://wrenlift.com/dist/wlift.js"</span>;
+
+  <span class="kw">const</span> wlift = <span class="kw">await</span> <span class="fn">createWlift</span>({ mode: <span class="str">"main"</span> });
+
+  <span class="kw">const</span> hatchfile = <span class="kw">await</span> <span class="fn">fetch</span>(<span class="str">"./hatchfile"</span>).<span class="fn">then</span>(r =&gt; r.<span class="fn">text</span>());
+
+  <span class="kw">const</span> source = <span class="str">`
+    import "@hatch:assert" for Expect
+    import "@hatch:json"   for JSON
+
+    var data = JSON.parse("{\"name\": \"wlift\", \"version\": 1}")
+    Expect.that(data["name"]).toBe("wlift")
+    Expect.that(data["version"]).toBe(1)
+
+    System.print("parsed %(data["name"]) v%(data["version"]) ✦")
+  `</span>;
+
+  <span class="kw">const</span> { output } = <span class="kw">await</span> <span class="fn">runProject</span>(wlift, source, hatchfile);
+  document.<span class="ident">getElementById</span>(<span class="str">"out"</span>).<span class="ident">textContent</span> = output;
+<span class="kw">&lt;/script&gt;</span>
+<span class="kw">&lt;pre id=</span><span class="str">"out"</span><span class="kw">&gt;&lt;/pre&gt;</span></pre>
+
+<pre data-pane="w-toml"><span class="cmt"># hatchfile — declares the deps `runProject` will install.</span>
+name    = <span class="str">"my-app"</span>
+version = <span class="str">"0.1.0"</span>
+entry   = <span class="str">"main"</span>
+
+<span class="kw">[dependencies]</span>
+<span class="accent">"@hatch:assert"</span> = <span class="str">"0.2.0"</span>
+<span class="accent">"@hatch:json"</span>   = <span class="str">"0.1.0"</span></pre>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -1198,6 +1274,7 @@
     const langToggle = document.getElementById('langToggle');
     const panelC = document.getElementById('embedPanelC');
     const panelR = document.getElementById('embedPanelRust');
+    const panelW = document.getElementById('embedPanelWeb');
     const modes = document.querySelectorAll('.embed-mode');
     if (!langToggle) return;
 
@@ -1208,6 +1285,7 @@
         modes.forEach(m => m.classList.toggle('active', m.dataset.mode === lang));
         panelC.classList.toggle('hidden', lang !== 'c');
         panelR.classList.toggle('hidden', lang !== 'rust');
+        panelW.classList.toggle('hidden', lang !== 'web');
       });
     });
 

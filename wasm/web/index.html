@@ -580,7 +580,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
     import { createWlift, parseHatchfileToml, resolveDepsFromManifest } from "./wlift.js";
-    import { ErrorKind } from "../pkg/wlift_wasm.js";
+    import { ErrorKind } from "./wlift_wasm.js";
     // CodeMirror 6 — modular ESM via esm.sh. The dev server's
     // COOP/COEP headers cooperate with esm.sh's CORP responses,
     // so cross-origin module fetch works without a build step.

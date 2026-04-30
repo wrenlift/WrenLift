@@ -145,7 +145,7 @@ let _modPromise = null;
 async function getMod() {
   if (!_modPromise) {
     _modPromise = (async () => {
-      const m = await import("../pkg/wlift_wasm.js");
+      const m = await import("./wlift_wasm.js");
       await m.default();
       return m;
     })();
@@ -665,7 +665,7 @@ class MainWlift {
   }
 
   async init() {
-    const mod = await import("../pkg/wlift_wasm.js");
+    const mod = await import("./wlift_wasm.js");
 
     // Same async-bridge shims `worker.js` installs, but on the
     // page's `globalThis` instead. The bridges are workload-side
