@@ -7,6 +7,55 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### Hover on a method parameter shows `local <name>` instead of the inferred class
+
+Status: **open (2026-04-30)**
+
+Symptom. Hover on a method parameter shows the bare-identifier
+fallback even when sema knows the argument's class from how it's
+used. The classic case is a `Game` subclass:
+
+```wren
+class FruitSlicer is Game {
+  update(g) {        // hover on `g` → "local g"
+    var dt = g.dt   // hover on `g.dt` → "GameState.dt" ✓
+  }
+}
+```
+
+`g.dt` resolves correctly because
+`Analysis::receiver_type_for_call_at` finds the call, asks sema
+for the receiver's expression type, and matches `GameState`. The
+bare `g` reference goes through `identifier_kind_hint`'s
+param-line fallback, which only knows the method's signature
+line — no type splicing.
+
+Root cause. `TypeInferrer` records var types (at decl-name
+spans), field types (per class), and method *return* types (per
+class). It does not track parameter types — params start as
+`Any` and stay there. There's no inter-procedural inference that
+says "every override of `Game.update(g)` is called with a
+`GameState`, so `g: GameState` inside the body."
+
+Fix sketch.
+1. Sema gains a per-`(class, method, param_index)` type table,
+   populated from declared parameter annotations once the docs
+   collector forwards JSDoc-style `@param {Type}` types into
+   sema's pre-pass.
+2. Hover post-pass: when a method's signature matches a known
+   override (e.g. `Game.update(g)`), copy the framework's
+   declared param types onto the user's parameter spans. The
+   docs model already has the param types from the prelude /
+   dep stubs.
+3. Failing both, hover could fall back to the receiver-side
+   answer: if every `<param>.<x>` use in scope agrees on a
+   class, surface that as the param's type. Heuristic, but
+   strictly better than the current bare hint.
+
+The existing param-line fallback in
+`find_param_in_method_header` is intentional placeholder
+behaviour, not the desired final story.
+
 ### `@hatch:web` request handler returns null in tiered mode (counter / chat)
 
 Status: **fixed (commit pending, 2026-04-27)**
