@@ -91,6 +91,21 @@ pub mod js {
 
         /// JS-provided shim:
         ///
+        ///   globalThis._wlift_fetch_bytes = (handle, url) => {
+        ///       fetch(url)
+        ///         .then(r => r.arrayBuffer())
+        ///         .then(ab => resolve_future_bytes(handle, new Uint8Array(ab)))
+        ///         .catch(e => reject_future(handle, String(e)));
+        ///   };
+        ///
+        /// Same shape as `_wlift_fetch` but settles via
+        /// `resolve_future_bytes`, so the Wren-side `await`
+        /// hands back a `ByteArray` instead of a `String`.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_fetch_bytes)]
+        pub fn wlift_fetch_bytes(handle: u32, url: &str);
+
+        /// JS-provided shim:
+        ///
         ///   globalThis._wlift_ws_open = (handle, url) => {
         ///       const ws = new WebSocket(url);
         ///       ws.addEventListener("open",    () => ws_open(handle));
@@ -246,12 +261,16 @@ pub enum FutureState {
 #[derive(Debug)]
 struct FutureSlot {
     state: FutureState,
-    /// Resolved value, currently encoded as a UTF-8 string (JSON
-    /// for fetch payloads, plain text for echo APIs). Switching
-    /// to a richer encoding (e.g. wasm-bindgen `JsValue` round-
-    /// trip via the wlift heap) lands when there's a second
-    /// consumer that actually needs it.
+    /// Resolved text value (JSON for fetch payloads, plain text
+    /// for echo APIs, error message on `Rejected`).
     value: Option<String>,
+    /// Resolved bytes value — populated by `resolve_future_bytes`
+    /// when a binary-shaped bridge (e.g. `Browser.fetchBytes`)
+    /// settles the handle. Mutually exclusive with `value` for
+    /// the resolved-success case; an `Rejected` slot uses
+    /// `error` for the reason regardless of which fetch shape
+    /// was in flight.
+    bytes: Option<Vec<u8>>,
     /// Error message on `Rejected`. Surfaced to Wren via
     /// `Fiber.abort` inside `Future.await`.
     error: Option<String>,
@@ -280,6 +299,7 @@ pub fn create_pending_future() -> u32 {
         FutureSlot {
             state: FutureState::Pending,
             value: None,
+            bytes: None,
             error: None,
         },
     );
@@ -406,6 +426,32 @@ pub fn resolve_future(handle: u32, value: String) {
     }
 }
 
+/// JS-callable: flip a handle to `Resolved` with a binary
+/// payload. Companion to `resolve_future` for bridges that
+/// produce raw bytes (`Browser.fetchBytes` -> ArrayBuffer ->
+/// Uint8Array). The bytes land on the slot as a `Vec<u8>` and
+/// the Wren-side take path materialises a `ByteArray` (the
+/// `TypedArrayKind::U8` runtime variant) without round-tripping
+/// through a string. Idempotent: settling an already-settled
+/// handle is a no-op, matching `resolve_future`.
+#[wasm_bindgen]
+pub fn resolve_future_bytes(handle: u32, bytes: Vec<u8>) {
+    let settled = {
+        let mut store = future_store().lock().expect("future store poisoned");
+        match store.get_mut(&handle) {
+            Some(slot) if slot.state == FutureState::Pending => {
+                slot.state = FutureState::Resolved;
+                slot.bytes = Some(bytes);
+                true
+            }
+            _ => false,
+        }
+    };
+    if settled {
+        wake_scheduler_if_armed();
+    }
+}
+
 /// JS-callable: flip a handle to `Rejected` with an error message.
 #[wasm_bindgen]
 pub fn reject_future(handle: u32, error: String) {
@@ -453,6 +499,20 @@ pub fn future_store_take_value(handle: u32) -> Option<String> {
         FutureState::Pending => None,
         FutureState::Resolved => slot.value,
         FutureState::Rejected => slot.error,
+    }
+}
+
+/// Companion to `future_store_take_value` for the binary path.
+/// Removes the slot from the store and returns the resolved
+/// `Vec<u8>` (or `None` on miss / pending / rejected / text-
+/// resolved). Caller is `browser::browser_take_bytes`, which
+/// only invokes this after `peekState` reports `Resolved`.
+pub fn future_store_take_bytes(handle: u32) -> Option<Vec<u8>> {
+    let mut store = future_store().lock().expect("future store poisoned");
+    let slot = store.remove(&handle)?;
+    match slot.state {
+        FutureState::Resolved => slot.bytes,
+        _ => None,
     }
 }
 
@@ -934,6 +994,10 @@ foreign class BrowserCore {
     foreign static nextFrameHandle()
     #!symbol = "browser_fetch"
     foreign static fetchHandle(url)
+    #!symbol = "browser_fetch_bytes"
+    foreign static fetchBytesHandle(url)
+    #!symbol = "browser_take_bytes"
+    foreign static takeBytes(handle)
     #!symbol = "browser_ws_open"
     foreign static wsOpen(url)
     #!symbol = "browser_ws_send"
@@ -999,6 +1063,29 @@ class WebSocket {
     recv        { Future.new_(BrowserCore.wsRecv(_h)) }
     close       { BrowserCore.wsClose(_h) }
 }
+// Variant of Future for binary-shaped resolutions. Same parking +
+// scheduling shape as Future, but `await` hands back a `ByteArray`
+// (the runtime's U8 typed-array) instead of a String. Use this
+// for `Browser.fetchBytes` when you want to read raw asset bytes
+// straight into a GPU texture without a UTF-8 round-trip.
+class ByteFuture {
+    construct new_(handle) { _h = handle }
+    handle { _h }
+    state  { BrowserCore.peekState(_h) }
+    await {
+        while (state == 0) {
+            BrowserCore.parkSelf(_h)
+            Fiber.yield()
+        }
+        var settled = state
+        if (settled == 2) {
+            var msg = BrowserCore.takeValue(_h)
+            Fiber.abort(msg == null ? "ByteFuture rejected" : msg)
+        }
+        return BrowserCore.takeBytes(_h)
+    }
+}
+
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
     // Vsync-paced yield. Use this in render loops instead of
@@ -1006,9 +1093,13 @@ class Browser {
     // (no upper bound) and keeps firing in backgrounded tabs;
     // rAF naturally caps at the display refresh rate and pauses
     // when the tab is hidden.
-    static nextFrame      { Future.new_(BrowserCore.nextFrameHandle()) }
-    static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
-    static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
+    static nextFrame       { Future.new_(BrowserCore.nextFrameHandle()) }
+    static fetch(url)      { Future.new_(BrowserCore.fetchHandle(url)) }
+    // Binary fetch — resolves to a ByteArray, not a String. Used
+    // for raw asset loading (`atlas.rgba8` straight into
+    // `device.writeTexture`, etc.).
+    static fetchBytes(url) { ByteFuture.new_(BrowserCore.fetchBytesHandle(url)) }
+    static connect(url)    { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }
 class Dom {
     static text(selector)                  { Future.new_(DomCore.textHandle(selector)) }

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Browser.fetchBytes smoke test</title>
+  <style>
+    body { font: 13px ui-monospace, monospace; max-width: 700px; margin: 1.5rem auto; padding: 0 1rem; }
+    pre { background: #1d1812; color: #f1e3cc; padding: 12px 16px; border-radius: 8px; overflow-x: auto; max-height: 380px; }
+    .ok    { color: #4caf50; }
+    .err   { color: #ff5252; }
+  </style>
+</head>
+<body>
+  <h2>Browser.fetchBytes smoke test</h2>
+  <p>Loads <code>./assets/fruit-ninja/atlas.rgba8</code> via the new
+     <code>Browser.fetchBytes(url)</code> bridge in main + worker
+     modes; asserts the returned value is a <code>ByteArray</code>
+     of length 393216 (= 384 × 256 × 4).</p>
+  <pre id="out">running…</pre>
+
+  <script type="module">
+    import { createWlift } from "./wlift.js";
+
+    const out = document.getElementById("out");
+    const log = (msg, cls = "") => {
+      const span = document.createElement("span");
+      if (cls) span.className = cls;
+      span.textContent = msg + "\n";
+      out.appendChild(span);
+    };
+    out.textContent = "";
+
+    const PROBE_SRC = `
+var bytes = Browser.fetchBytes("./assets/fruit-ninja/atlas.rgba8").await
+System.print("type:  %(bytes is ByteArray ? "ByteArray" : bytes.type)")
+System.print("count: %(bytes.count)")
+System.print("[0..7]: %(bytes[0]) %(bytes[1]) %(bytes[2]) %(bytes[3]) %(bytes[4]) %(bytes[5]) %(bytes[6]) %(bytes[7])")
+if (bytes.count != 393216) Fiber.abort("FAIL: expected 393216 bytes, got %(bytes.count)")
+if (!(bytes is ByteArray))  Fiber.abort("FAIL: expected ByteArray, got %(bytes.type)")
+System.print("OK")
+`;
+
+    for (const mode of ["main", "worker"]) {
+      log(`--- ${mode} mode ---`);
+      try {
+        const wlift = await createWlift({ mode });
+        log(`createWlift: ${wlift.version}`, "ok");
+        const result = await wlift.run(PROBE_SRC);
+        log(`ok=${result.ok}  ${result.elapsedMs.toFixed(1)} ms`, result.ok ? "ok" : "err");
+        log(result.output || "(no output)");
+        wlift.terminate();
+      } catch (err) {
+        log(`exception: ${err}`, "err");
+        console.error(err);
+      }
+      log("");
+    }
+  </script>
+</body>
+</html>

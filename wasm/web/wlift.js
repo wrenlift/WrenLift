@@ -659,6 +659,17 @@ class MainWlift {
         .then((t) => mod.resolve_future(handle, t))
         .catch((e) => mod.reject_future(handle, String(e)));
     };
+    // Binary fetch — same shape as `_wlift_fetch` but settles via
+    // `resolve_future_bytes`, so the awaiting Wren fiber gets a
+    // `ByteArray` (U8 typed-array) instead of a `String`. Used by
+    // `Browser.fetchBytes` for asset loading where the bytes are
+    // headed straight into a GPU texture / image decoder.
+    globalThis._wlift_fetch_bytes = (handle, url) => {
+      fetch(url)
+        .then((r) => r.arrayBuffer())
+        .then((ab) => mod.resolve_future_bytes(handle, new Uint8Array(ab)))
+        .catch((e) => mod.reject_future(handle, String(e)));
+    };
     globalThis.__wlift_sockets ??= new Map();
     globalThis._wlift_ws_open = (handle, url) => {
       const ws = new WebSocket(url);

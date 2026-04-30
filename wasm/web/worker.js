@@ -58,6 +58,7 @@ const {
   run_hatch,
   run_with_hatches,
   resolve_future,
+  resolve_future_bytes,
   reject_future,
   ws_open,
   ws_message,
@@ -84,6 +85,14 @@ globalThis._wlift_fetch = (handle, url) => {
   fetch(url)
     .then((r) => r.text())
     .then((t) => resolve_future(handle, t))
+    .catch((e) => reject_future(handle, String(e)));
+};
+// Worker-side binary fetch — see wlift.js MainWlift.init for the
+// main-mode pair. `resolve_future_bytes` is destructured below.
+globalThis._wlift_fetch_bytes = (handle, url) => {
+  fetch(url)
+    .then((r) => r.arrayBuffer())
+    .then((ab) => resolve_future_bytes(handle, new Uint8Array(ab)))
     .catch((e) => reject_future(handle, String(e)));
 };
 

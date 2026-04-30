@@ -197,6 +197,52 @@ pub unsafe extern "C" fn browser_fetch(vm: *mut VM) {
     }
 }
 
+/// `Browser.fetchBytes(url)` — same shape as `Browser.fetch` but
+/// the future resolves to a `ByteArray` (the runtime's U8 typed
+/// array) instead of a `String`. Used for raw asset loading
+/// (sprite atlas RGBA bytes straight into `device.writeTexture`).
+///
+/// # Safety
+///
+/// Foreign-method ABI: reads `url` (String) from slot 1; writes
+/// the handle (or null on bad args) to slot 0.
+pub unsafe extern "C" fn browser_fetch_bytes(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let url: String = if arg.is_string_object() {
+            let ptr = arg.as_object().expect("string object pointer");
+            (*(ptr as *const ObjString)).as_str().to_string()
+        } else {
+            vm_ref.runtime_error("Browser.fetchBytes: url must be a String.".to_string());
+            return;
+        };
+        let handle = create_pending_future();
+
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::js::wlift_fetch_bytes(handle, &url);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            // Wasi / native — no fetch implementation. Resolve
+            // synchronously with a deterministic mock byte
+            // sequence (`0xFF` × url-length-mod-256, padded to 16)
+            // so the bridge round-trip is exercisable in tests
+            // without a network stack.
+            let mock: Vec<u8> = (0..16u8).collect();
+            let _ = url; // silence unused-warning on host build
+            crate::resolve_future_bytes(handle, mock);
+        }
+
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(Value::num(handle as f64));
+        } else {
+            vm_ref.api_stack[0] = Value::num(handle as f64);
+        }
+    }
+}
+
 /// `Future.await`'s scheduler hook — captures the currently-
 /// executing fiber so the host-side scheduler can resume it
 /// once the awaited future settles. Called from Wren just
@@ -301,6 +347,59 @@ pub unsafe extern "C" fn browser_take_value(vm: *mut VM) {
         let value = future_store_take_value(handle);
         let result = match value {
             Some(s) => vm_ref.new_string(s),
+            None => Value::null(),
+        };
+        if vm_ref.api_stack.is_empty() {
+            vm_ref.api_stack.push(result);
+        } else {
+            vm_ref.api_stack[0] = result;
+        }
+    }
+}
+
+/// `Browser.takeBytes(handle)` — companion to `takeValue` for the
+/// binary-resolution path. Removes the slot from the future store
+/// and materialises the resolved `Vec<u8>` as a Wren `ByteArray`
+/// (the runtime's `TypedArrayKind::U8` typed-array variant), so
+/// callers can pass the bytes straight into `device.writeTexture`
+/// or `Image.decode` without a UTF-8 round-trip. Returns `null`
+/// on miss / pending / rejected / text-resolved (the
+/// `ByteFuture.await` Wren wrapper guards the call by checking
+/// `peekState` first).
+///
+/// # Safety
+///
+/// Reads the handle from slot 1; writes a `ByteArray` (or null)
+/// to slot 0.
+pub unsafe extern "C" fn browser_take_bytes(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let arg = vm_ref.api_stack.get(1).copied().unwrap_or(Value::null());
+        let handle = match arg.as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 => n as u32,
+            _ => {
+                vm_ref.runtime_error(
+                    "Browser.takeBytes: handle must be a non-negative integer.".to_string(),
+                );
+                return;
+            }
+        };
+        let result = match crate::future_store_take_bytes(handle) {
+            Some(bytes) => {
+                // Allocate a U8 typed-array of the right length,
+                // memcpy the payload in. `new_typed_array` returns
+                // a `Value` whose object pointer is an
+                // `ObjTypedArray` we can deref for `as_bytes_mut`.
+                let val = vm_ref.new_typed_array(
+                    bytes.len() as u32,
+                    wren_lift::runtime::object::TypedArrayKind::U8,
+                );
+                if let Some(obj_ptr) = val.as_object() {
+                    let arr = obj_ptr as *mut wren_lift::runtime::object::ObjTypedArray;
+                    (*arr).as_bytes_mut().copy_from_slice(&bytes);
+                }
+                val
+            }
             None => Value::null(),
         };
         if vm_ref.api_stack.is_empty() {
@@ -485,6 +584,8 @@ pub fn register_static_symbols() {
         register_plugin_symbol_unsafe("browser", "browser_set_timeout", browser_set_timeout);
         register_plugin_symbol_unsafe("browser", "browser_next_frame", browser_next_frame);
         register_plugin_symbol_unsafe("browser", "browser_fetch", browser_fetch);
+        register_plugin_symbol_unsafe("browser", "browser_fetch_bytes", browser_fetch_bytes);
+        register_plugin_symbol_unsafe("browser", "browser_take_bytes", browser_take_bytes);
         register_plugin_symbol_unsafe("browser", "browser_ws_open", browser_ws_open);
         register_plugin_symbol_unsafe("browser", "browser_ws_send", browser_ws_send);
         register_plugin_symbol_unsafe("browser", "browser_ws_recv", browser_ws_recv);
@@ -519,6 +620,10 @@ foreign class BrowserCore {
     foreign static nextFrameHandle()
     #!symbol = "browser_fetch"
     foreign static fetchHandle(url)
+    #!symbol = "browser_fetch_bytes"
+    foreign static fetchBytesHandle(url)
+    #!symbol = "browser_take_bytes"
+    foreign static takeBytes(handle)
     #!symbol = "browser_ws_open"
     foreign static wsOpen(url)
     #!symbol = "browser_ws_send"
@@ -559,6 +664,24 @@ class WebSocket {
     close       { BrowserCore.wsClose(_h) }
 }
 
+// Variant of Future for binary-shaped resolutions. Same parking +
+// scheduling shape as Future, but `await` hands back a `ByteArray`
+// (the runtime's U8 typed-array) instead of a String.
+class ByteFuture {
+    construct new_(handle) { _h = handle }
+    handle { _h }
+    state  { BrowserCore.peekState(_h) }
+    await {
+        while (state == 0) Fiber.yield()
+        var settled = state
+        if (settled == 2) {
+            var msg = BrowserCore.takeValue(_h)
+            Fiber.abort(msg == null ? "ByteFuture rejected" : msg)
+        }
+        return BrowserCore.takeBytes(_h)
+    }
+}
+
 class Browser {
     static setTimeout(ms) { Future.new_(BrowserCore.setTimeoutHandle(ms)) }
     // Vsync-paced yield. Use this in render loops instead of
@@ -566,8 +689,12 @@ class Browser {
     // drain (no upper bound) and keeps firing in backgrounded
     // tabs; rAF naturally caps at the display refresh rate and
     // pauses when the tab is hidden.
-    static nextFrame      { Future.new_(BrowserCore.nextFrameHandle()) }
-    static fetch(url)     { Future.new_(BrowserCore.fetchHandle(url)) }
-    static connect(url)   { WebSocket.new_(BrowserCore.wsOpen(url)) }
+    static nextFrame       { Future.new_(BrowserCore.nextFrameHandle()) }
+    static fetch(url)      { Future.new_(BrowserCore.fetchHandle(url)) }
+    // Binary fetch — resolves to a ByteArray, not a String.
+    // Used for raw asset loading (atlas RGBA bytes straight into
+    // `device.writeTexture`, etc.).
+    static fetchBytes(url) { ByteFuture.new_(BrowserCore.fetchBytesHandle(url)) }
+    static connect(url)    { WebSocket.new_(BrowserCore.wsOpen(url)) }
 }
 "#;
