@@ -7,6 +7,45 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### Playground autocomplete pops inside comments
+
+Status: **open (2026-04-30)**
+
+Symptom. Typing inside a `//` or `///` line — or inside a
+`"..."` string literal — fires the CodeMirror autocompletion
+override, popping a class / member dropdown. The completion
+anchor isn't grounded in the language's syntax: any word-shape
+prefix triggers a request, regardless of whether the cursor is
+actually in code.
+
+Root cause. `wrenCompletionSource` in `wasm/web/index.html`
+matches `\w*` against the line and forwards the result to
+`completeWren(source, byte)`. It doesn't classify the cursor
+context — string and comment runs look like ordinary text to
+the regex.
+
+`complete_wren` itself doesn't gate either; it returns
+matches for any cursor position the playground hands it.
+
+Fix sketch.
+1. Cheap JS-side gate: re-use the same masking
+   (`mask_strings_and_comments` shape) we already have in
+   `src/docs/hover.rs::find_var_decl_line` — port it to JS or
+   expose a wasm export that returns whether a byte is inside
+   `//`, `///`, `/* */`, or a string. Bail from
+   `wrenCompletionSource` when it is.
+2. Better: have `complete_wren` itself short-circuit when the
+   cursor lands inside a comment / string lex token. The
+   lexer already knows; we'd just need to expose that decision.
+3. `///` is the doc-comment context — there's a future
+   reason to *want* completion there (cross-ref autocomplete
+   for `[ClassName]`, `[Class.method]`), so the gate should
+   distinguish doc-comment from other comment shapes once
+   that lands.
+
+Tracked here so the noisy popups don't get mistaken for
+correct completion behaviour.
+
 ### Hover doesn't propagate superclass `///` docs to subclass overrides
 
 Status: **open (2026-04-30)**

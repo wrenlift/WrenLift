@@ -1152,38 +1152,57 @@ pub fn register_hatch_docs(bundle_bytes: &[u8]) -> JsValue {
         Err(_) => return JsValue::NULL,
     };
     let pkg_name = hatch.manifest.name.clone();
-    let mut modules = Vec::new();
-    for section in &hatch.sections {
-        if !matches!(section.kind, wren_lift::hatch::SectionKind::Source) {
-            continue;
+
+    // Fast path: if the bundle ships a pre-baked Docs section
+    // (publish workflow ran the collector at publish time),
+    // deserialise it directly. Skips re-parsing every Source
+    // section at workspace boot, and means the docs match the
+    // exact code that was published.
+    let prebaked: Option<Vec<wren_lift::docs::ModuleDoc>> = hatch
+        .sections
+        .iter()
+        .find(|s| matches!(s.kind, wren_lift::hatch::SectionKind::Docs))
+        .and_then(|s| wren_lift::docs::parse_module_docs_json(&s.data).ok());
+
+    let modules = if let Some(m) = prebaked {
+        m
+    } else {
+        // Fallback: parse each Source section and run the
+        // collector ourselves. Older published bundles
+        // (pre-Docs-section) come through this path; matches
+        // the legacy behaviour exactly.
+        let mut modules = Vec::new();
+        for section in &hatch.sections {
+            if !matches!(section.kind, wren_lift::hatch::SectionKind::Source) {
+                continue;
+            }
+            let raw = match std::str::from_utf8(&section.data) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            // Run the cfg pre-pass for the wasm target before
+            // parsing. Published bundles keep platform-gated lines
+            // intact (`#!wasm` on a `Browser.nextFrame.await`,
+            // `#!native` on a dlopen helper), and the parser's
+            // attribute-position rules reject those when applied
+            // verbatim. Pre-stripping mirrors what the runtime does
+            // when it loads the same bundle.
+            let cfg_source = wren_lift::parse::cfg::apply(raw, Some("wasm32"));
+            let pr = wren_lift::parse::parser::parse(&cfg_source);
+            if !pr.errors.is_empty() {
+                continue;
+            }
+            modules.push(wren_lift::docs::collect_module(
+                section.name.clone(),
+                &cfg_source,
+                &pr.module,
+                &pr.docs,
+                &pr.interner,
+            ));
         }
-        let raw = match std::str::from_utf8(&section.data) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        // Run the cfg pre-pass for the wasm target before
-        // parsing. Published bundles keep platform-gated lines
-        // intact (`#!wasm` on a `Browser.nextFrame.await`,
-        // `#!native` on a dlopen helper), and the parser's
-        // attribute-position rules reject those when applied
-        // verbatim. Pre-stripping mirrors what the runtime does
-        // when it loads the same bundle.
-        let cfg_source = wren_lift::parse::cfg::apply(raw, Some("wasm32"));
-        let pr = wren_lift::parse::parser::parse(&cfg_source);
-        // Skip modules the parser still can't handle — better
-        // to lose a few sections' docs than blow up the whole
-        // register.
-        if !pr.errors.is_empty() {
-            continue;
-        }
-        modules.push(wren_lift::docs::collect_module(
-            section.name.clone(),
-            &cfg_source,
-            &pr.module,
-            &pr.docs,
-            &pr.interner,
-        ));
-    }
+        modules
+    };
+
     if let Ok(mut cache) = dep_docs().lock() {
         cache.insert(pkg_name.clone(), modules);
     }

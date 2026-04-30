@@ -7,10 +7,10 @@
 //! generator's job stops at producing well-typed structured data.
 
 use crate::ast::Span;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A whole module's docs — emitted as one JSON document per file.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModuleDoc {
     /// Module name (file stem with directory dotted in, e.g.
     /// `foo.bar` for `foo/bar.wren`). The CLI fills this in;
@@ -25,14 +25,14 @@ pub struct ModuleDoc {
     /// module. The consumer site uses these to turn bracketed
     /// identifiers into clickable links — the generator does the
     /// resolution; the site does the rendering.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub cross_refs: Vec<CrossRef>,
 }
 
 /// A single bracket reference (`[Class]`, `[Class.method]`,
 /// `[#anchor]`, `[@hatch:pkg Name]`) discovered in some Markdown
 /// body inside this module.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossRef {
     /// The raw bracketed text *without* the surrounding `[]`,
     /// exactly as the author wrote it. Consumers match on this
@@ -49,7 +49,7 @@ pub struct CrossRef {
 }
 
 /// Where a cross-reference was found inside the module.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RefOrigin {
     /// The module's `//!` doc body.
@@ -62,7 +62,7 @@ pub enum RefOrigin {
 }
 
 /// Resolved target of a cross-reference.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RefTarget {
     /// Same-module class. `class` is the class name.
@@ -85,24 +85,24 @@ pub enum RefTarget {
     Unresolved,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassDoc {
     pub name: String,
-    #[serde(serialize_with = "ser_span")]
+    #[serde(serialize_with = "ser_span", deserialize_with = "de_span")]
     pub span: Span,
     /// `///` body for the class itself, Markdown.
     pub doc: String,
     pub members: Vec<MemberDoc>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberDoc {
     pub name: String,
     pub kind: MemberKind,
     /// `///` body, Markdown. Empty when the member has no doc
     /// comment.
     pub doc: String,
-    #[serde(serialize_with = "ser_span")]
+    #[serde(serialize_with = "ser_span", deserialize_with = "de_span")]
     pub span: Span,
     /// Pretty-printed signature line — `static foo(x: Num, y: Num)`,
     /// `bar=(value)`, `baz { _baz }`, etc. When the body has
@@ -113,24 +113,24 @@ pub struct MemberDoc {
     /// Per-parameter type annotations parsed from the doc body's
     /// `@param {Type} name [— description]` lines. Empty when no
     /// annotations were authored.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub param_types: Vec<ParamTypeInfo>,
     /// `@returns {Type}` annotation, if present.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub return_type: Option<String>,
 }
 
 /// One row from a `@param {Type} name — description` line.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParamTypeInfo {
     pub name: String,
     #[serde(rename = "type")]
     pub type_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MemberKind {
     Method,
@@ -150,6 +150,14 @@ fn ser_span<S: serde::Serializer>(span: &Span, s: S) -> Result<S::Ok, S::Error> 
     t.serialize_element(&span.start)?;
     t.serialize_element(&span.end)?;
     t.end()
+}
+
+/// Counterpart to [`ser_span`]: parse a 2-element JSON array
+/// back into a `Range<usize>`. Used when the runtime
+/// deserialises the `Docs` section out of a published bundle.
+fn de_span<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Span, D::Error> {
+    let pair: [usize; 2] = serde::Deserialize::deserialize(d)?;
+    Ok(pair[0]..pair[1])
 }
 
 impl ModuleDoc {

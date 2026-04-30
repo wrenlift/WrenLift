@@ -82,6 +82,14 @@ pub enum SectionKind {
     /// same ariadne label / span path the on-disk module loader uses;
     /// without source the loader falls back to bare prose.
     Source = 4,
+    /// JSON-serialized [`crate::docs::ModuleDoc`] vector covering every
+    /// Source module in the same bundle. Written by the publish
+    /// workflow so workspaces (LSP, playground) read pre-collected
+    /// signatures + `///` doc bodies + spans without re-parsing the
+    /// source at boot. Section name is `"docs"`. Optional — older
+    /// bundles without this section fall back to per-source parsing
+    /// at register time.
+    Docs = 5,
 }
 
 impl SectionKind {
@@ -92,6 +100,7 @@ impl SectionKind {
             2 => Some(SectionKind::Resource),
             3 => Some(SectionKind::NativeLib),
             4 => Some(SectionKind::Source),
+            5 => Some(SectionKind::Docs),
             _ => None,
         }
     }
@@ -1009,6 +1018,11 @@ fn build_recursive(
     // Compile each to a .wlbc section.
     let mut sections: Vec<Section> = Vec::with_capacity(wren_files.len());
     let mut module_names: Vec<String> = Vec::with_capacity(wren_files.len());
+    // Collected per-module docs (`///` + JSDoc), serialised at
+    // the end as a single Docs section so workspaces (LSP +
+    // playground) can hand them to the hover collector without
+    // re-parsing the source at boot.
+    let mut module_docs: Vec<crate::docs::ModuleDoc> = Vec::with_capacity(wren_files.len());
 
     for (module_name, path) in &wren_files {
         let raw_source = std::fs::read_to_string(path)?;
@@ -1042,7 +1056,47 @@ fn build_recursive(
             name: module_name.clone(),
             data: source.into_bytes(),
         });
+        // Collect publish-time docs. The fresh parse here is
+        // deliberate — `compile_source_to_blob` consumes its
+        // own parser pass, and the `///` doc-comment side-channel
+        // travels with that parse. Re-parsing is cheap and means
+        // the bundled docs always match the bundled bytecode.
+        // We re-read the *raw* source so spans + comment
+        // positions match what users see in their editors —
+        // the cfg pass strips lines but keeps file offsets.
+        let pr = crate::parse::parser::parse(&raw_source);
+        if pr.errors.is_empty() {
+            module_docs.push(crate::docs::collect_module(
+                module_name.clone(),
+                &raw_source,
+                &pr.module,
+                &pr.docs,
+                &pr.interner,
+            ));
+        }
         module_names.push(module_name.clone());
+    }
+
+    // One Docs section per bundle. JSON-serialised list of
+    // every successfully-collected ModuleDoc; absent (or empty)
+    // when no module produced docs. Older runtimes / loaders
+    // skip unknown section kinds, so this is additive: pre-Docs
+    // hosts continue to install the bundle untouched.
+    if !module_docs.is_empty() {
+        match crate::docs::render_module_docs_json(&module_docs) {
+            Ok(json) => {
+                sections.push(Section {
+                    kind: SectionKind::Docs,
+                    name: "docs".to_string(),
+                    data: json.into_bytes(),
+                });
+            }
+            Err(_) => {
+                // Doc serialization failed — skip the section
+                // rather than failing the whole publish. Hover
+                // falls back to per-source parsing.
+            }
+        }
     }
 
     // Manifest: `hatchfile` at project root, or synthesized.
