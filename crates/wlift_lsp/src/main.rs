@@ -9,15 +9,14 @@
 //! from `wren_lift::docs` is the same model the hover handler will
 //! consume — no second source of truth.
 
-use std::collections::HashMap;
-
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use wren_lift::diagnostics::Severity as WlSeverity;
+use wren_lift::diagnostics::{Diagnostic as WlDiagnostic, Severity as WlSeverity};
 use wren_lift::parse::parser::parse;
+use wren_lift::sema::resolve as sema_resolve;
 
 #[derive(Debug)]
 struct Backend {
@@ -163,40 +162,49 @@ impl Backend {
             return;
         };
         let pr = parse(&doc.text);
-        let mut by_uri: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
-        for diag in &pr.errors {
-            let Some(span) = diag.labels.first().map(|l| l.span.clone()) else {
-                // Span-less diagnostic (rare; shouldn't happen for
-                // parse / lex errors). Fall back to position
-                // 0:0 — better than dropping the message.
-                let zero = Position::default();
-                by_uri.entry(uri.clone()).or_default().push(Diagnostic {
-                    range: Range {
-                        start: zero,
-                        end: zero,
-                    },
-                    severity: Some(map_severity(diag.severity)),
-                    source: Some("wlift".into()),
-                    message: diag.message.clone(),
-                    ..Default::default()
-                });
-                continue;
-            };
-            let range = doc.byte_range_to_lsp(span);
-            by_uri.entry(uri.clone()).or_default().push(Diagnostic {
-                range,
-                severity: Some(map_severity(diag.severity)),
-                source: Some("wlift".into()),
-                message: diag.message.clone(),
-                ..Default::default()
-            });
+        let mut diags: Vec<Diagnostic> = pr
+            .errors
+            .iter()
+            .map(|d| translate_diagnostic(&doc, d))
+            .collect();
+
+        // Only run sema when the parser produced a usable AST. If
+        // parse errored, sema would emit confused follow-on
+        // diagnostics that overwhelm the editor's problem list.
+        if pr.errors.is_empty() {
+            let sema = sema_resolve::resolve(&pr.module, &pr.interner);
+            for d in &sema.errors {
+                diags.push(translate_diagnostic(&doc, d));
+            }
         }
-        // Empty Vec clears existing diagnostics — required when an
-        // edit fixes the last error.
-        let diags = by_uri.remove(uri).unwrap_or_default();
+
         self.client
             .publish_diagnostics(uri.clone(), diags, None)
             .await;
+    }
+}
+
+/// Translate a `wren_lift::diagnostics::Diagnostic` into the LSP
+/// `Diagnostic` shape, mapping byte spans to UTF-16 positions and
+/// stamping `source: "wlift"` so editor problem lists group ours.
+fn translate_diagnostic(doc: &Document, diag: &WlDiagnostic) -> Diagnostic {
+    let range = match diag.labels.first() {
+        Some(l) => doc.byte_range_to_lsp(l.span.clone()),
+        None => {
+            // Span-less diagnostic. Fall back to position 0:0 —
+            // better than dropping the message.
+            Range {
+                start: Position::default(),
+                end: Position::default(),
+            }
+        }
+    };
+    Diagnostic {
+        range,
+        severity: Some(map_severity(diag.severity)),
+        source: Some("wlift".into()),
+        message: diag.message.clone(),
+        ..Default::default()
     }
 }
 
