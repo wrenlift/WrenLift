@@ -1139,20 +1139,61 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                 }
             }
         }
-        // Pass 2: unrestricted member lookup. First-class wins.
-        for m in &all_modules {
-            for class in &m.classes {
-                for member in &class.members {
-                    if member.name == ident {
-                        return hover_out(
-                            &format_member_sig(&class.name, &member.signature),
-                            &member.doc,
-                            ident_span.start,
-                            ident_span.end,
-                        );
+        // Pass 2: unrestricted member lookup. Only fires when
+        // the receiver looks like a *value* — a local var,
+        // field, or `this` (lowercase / `_` first char). When
+        // the receiver is a class-shaped uppercase name that
+        // we *don't* have docs for (e.g. `Renderer2D` from a
+        // hatch dep we haven't loaded), don't guess — guessing
+        // produces wrong results like reporting
+        // `FruitSlicer.new()` for `Renderer2D.new(...)`.
+        if let Some(recv) = receiver {
+            let first = recv.chars().next().unwrap_or('_');
+            let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
+            if receiver_looks_like_value {
+                for m in &all_modules {
+                    for class in &m.classes {
+                        for member in &class.members {
+                            if member.name == ident {
+                                return hover_out(
+                                    &format_member_sig(&class.name, &member.signature),
+                                    &member.doc,
+                                    ident_span.start,
+                                    ident_span.end,
+                                );
+                            }
+                        }
                     }
                 }
             }
+            // Class-shaped receiver we don't have docs for —
+            // produce a "method on <Receiver>, docs unavailable"
+            // hint so the user doesn't get a misleading match
+            // from a same-named method on a different class.
+            else {
+                return hover_out(
+                    &format!("{}.{}", recv, ident),
+                    &format!(
+                        "`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep that the workspace hasn't loaded yet.",
+                        ident
+                    ),
+                    ident_span.start,
+                    ident_span.end,
+                );
+            }
+        }
+
+        // Pass 3: identifier-kind classification. Locals,
+        // parameters, and fields don't appear in the docs
+        // model — surface a brief "declared at line N" hint
+        // so hover-on-anything-named always says something.
+        if let Some(hint) = identifier_kind_hint(source, ident, ident_span.start) {
+            return hover_out(
+                &hint.signature,
+                &hint.body,
+                ident_span.start,
+                ident_span.end,
+            );
         }
     }
 
@@ -1183,6 +1224,104 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
     }
 
     JsValue::NULL
+}
+
+/// Identifier-kind hint produced when class / member lookup
+/// misses. Three buckets:
+///
+/// * `_name`   → instance field
+/// * `__name`  → static field
+/// * lowercase → local var (search back for `var name`) or
+///   method parameter (look at the enclosing `name(args)` line)
+///
+/// Each path returns a one-line signature + a short body that
+/// mirrors the doc-model `MemberDoc` shape, so the same hover
+/// renderer can surface it without a separate template.
+struct IdentKind {
+    signature: String,
+    body: String,
+}
+
+fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<IdentKind> {
+    // Field: `_name` (instance) / `__name` (static). The
+    // collector doesn't model fields explicitly, so we look at
+    // the bytes — leading underscore is the shape contract.
+    if let Some(rest) = ident.strip_prefix("__") {
+        return Some(IdentKind {
+            signature: format!("static field {}", ident),
+            body: format!(
+                "Class-level static field. Persists across instances of the enclosing class.\n\nDeclared by use; first reference in the class body sets the slot.\n\nIdentifier: `{}`.",
+                rest
+            ),
+        });
+    }
+    if ident.starts_with('_') && !ident.starts_with("__") {
+        return Some(IdentKind {
+            signature: format!("instance field {}", ident),
+            body: "Per-instance field. Wren doesn't require an explicit declaration — the first reference inside a method allocates a slot on `this`. Read by name; assign with `=`.".into(),
+        });
+    }
+
+    // Class-shaped identifier (uppercase first char) that didn't
+    // resolve to a local class or prelude entry. Most likely
+    // it's imported from an `@hatch:*` package whose docs we
+    // haven't loaded — say so explicitly so the user knows
+    // it's not a typo.
+    if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+        return Some(IdentKind {
+            signature: format!("class {}", ident),
+            body: "Class-shaped name not found in the local module or runtime prelude — likely imported from an `@hatch:*` package the workspace hasn't loaded docs for.".into(),
+        });
+    }
+
+    // Local / parameter. Walk back through the source from
+    // `byte` looking for the closest `var <ident>` declaration.
+    if let Some(decl_line) = find_var_decl_line(source, ident, byte) {
+        return Some(IdentKind {
+            signature: format!("local {}", ident),
+            body: format!("Declared on line {}:\n\n```wren\n{}\n```", decl_line.0, decl_line.1.trim()),
+        });
+    }
+
+    // Otherwise: probably a parameter or an enclosing-scope
+    // local we couldn't find. Still produce *something* so the
+    // user gets a hover instead of nothing.
+    Some(IdentKind {
+        signature: format!("identifier {}", ident),
+        body: "Local-scope name (parameter, block-local, or class-level identifier). No declaration found in the surrounding source — likely a method parameter or an inherited binding.".into(),
+    })
+}
+
+/// Search back from `byte` for the closest `var <ident>` decl.
+/// Returns `(line_number, full_line_text)` when found.
+fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {
+    // Look at the prefix up to the cursor; later text doesn't
+    // shadow what's already in scope at the cursor's position.
+    let prefix = source.get(..byte)?;
+    // Reverse-iterate over lines so the most recent decl wins.
+    let mut line_no = prefix.matches('\n').count() + 1;
+    for line in prefix.rsplit('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("var ") {
+            // Match `var <ident>` (followed by `=`, `,`, or end).
+            let after = &trimmed["var ".len()..];
+            let after = after.trim_start();
+            if after.starts_with(ident) {
+                let tail = &after[ident.len()..];
+                if tail.is_empty()
+                    || tail.starts_with('=')
+                    || tail.starts_with(',')
+                    || tail.starts_with(' ')
+                {
+                    return Some((line_no, line.to_string()));
+                }
+            }
+        }
+        if line_no > 1 {
+            line_no -= 1;
+        }
+    }
+    None
 }
 
 /// Identifier sitting immediately before a `.` at `before_byte`.

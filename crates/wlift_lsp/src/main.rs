@@ -368,26 +368,134 @@ fn identifier_hover(
             }
         }
     }
-    // Pass 2 — first matching member from any class.
-    for m in &all {
-        for class in &m.classes {
-            for member in &class.members {
-                if member.name == ident {
-                    let body = format!(
-                        "```wren\n{}\n```{}{}",
-                        format_member_sig(&class.name, &member.signature),
-                        if member.doc.is_empty() { "" } else { "\n\n" },
-                        member.doc,
-                    );
-                    return Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: body,
-                        }),
-                        range: Some(doc.byte_range_to_lsp(span)),
-                    });
+    // Pass 2 — receiver is a value (local / field / `this`).
+    // Scan every class's members for the name — useful for
+    // chained calls against locals (`fiber.try()`) where the
+    // receiver isn't itself a class. *Skipped* for class-shaped
+    // uppercase receivers we don't have docs for: guessing
+    // there returns the wrong class's method.
+    if let Some(recv) = receiver {
+        let first = recv.chars().next().unwrap_or('_');
+        let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
+        if receiver_looks_like_value {
+            for m in &all {
+                for class in &m.classes {
+                    for member in &class.members {
+                        if member.name == ident {
+                            let body = format!(
+                                "```wren\n{}\n```{}{}",
+                                format_member_sig(&class.name, &member.signature),
+                                if member.doc.is_empty() { "" } else { "\n\n" },
+                                member.doc,
+                            );
+                            return Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: body,
+                                }),
+                                range: Some(doc.byte_range_to_lsp(span)),
+                            });
+                        }
+                    }
                 }
             }
+        } else {
+            // Class-shaped receiver, no docs. Produce a brief
+            // "<Receiver>.<member>, docs unavailable" hint so
+            // the user doesn't see a wrong class's method.
+            let body_md = format!(
+                "```wren\n{}.{}\n```\n\n`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep the workspace hasn't loaded yet.",
+                recv, ident, ident
+            );
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: body_md,
+                }),
+                range: Some(doc.byte_range_to_lsp(span)),
+            });
+        }
+    }
+
+    // Pass 3 — identifier-kind classifier. Surfaces a brief
+    // "field / local / parameter" hint when nothing else
+    // matches so hover always says something useful.
+    let (signature, body_text) = identifier_kind_hint(&doc.text, ident, span.start)?;
+    let body_md = format!(
+        "```wren\n{}\n```{}{}",
+        signature,
+        if body_text.is_empty() { "" } else { "\n\n" },
+        body_text,
+    );
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: body_md,
+        }),
+        range: Some(doc.byte_range_to_lsp(span)),
+    })
+}
+
+/// Same shape as `wasm/src/lib.rs::identifier_kind_hint`.
+fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<(String, String)> {
+    if let Some(rest) = ident.strip_prefix("__") {
+        return Some((
+            format!("static field {}", ident),
+            format!(
+                "Class-level static field. Persists across instances of the enclosing class.\n\nDeclared by use; first reference in the class body sets the slot.\n\nIdentifier: `{}`.",
+                rest
+            ),
+        ));
+    }
+    if ident.starts_with('_') && !ident.starts_with("__") {
+        return Some((
+            format!("instance field {}", ident),
+            "Per-instance field. Wren doesn't require an explicit declaration — the first reference inside a method allocates a slot on `this`. Read by name; assign with `=`.".into(),
+        ));
+    }
+    if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+        return Some((
+            format!("class {}", ident),
+            "Class-shaped name not found in the local module or runtime prelude — likely imported from an `@hatch:*` package the workspace hasn't loaded docs for.".into(),
+        ));
+    }
+    if let Some(decl_line) = find_var_decl_line(source, ident, byte) {
+        return Some((
+            format!("local {}", ident),
+            format!(
+                "Declared on line {}:\n\n```wren\n{}\n```",
+                decl_line.0,
+                decl_line.1.trim()
+            ),
+        ));
+    }
+    Some((
+        format!("identifier {}", ident),
+        "Local-scope name (parameter, block-local, or class-level identifier). No declaration found in the surrounding source — likely a method parameter or an inherited binding.".into(),
+    ))
+}
+
+fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {
+    let prefix = source.get(..byte)?;
+    let mut line_no = prefix.matches('\n').count() + 1;
+    for line in prefix.rsplit('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("var ") {
+            let after = &trimmed["var ".len()..];
+            let after = after.trim_start();
+            if after.starts_with(ident) {
+                let tail = &after[ident.len()..];
+                if tail.is_empty()
+                    || tail.starts_with('=')
+                    || tail.starts_with(',')
+                    || tail.starts_with(' ')
+                {
+                    return Some((line_no, line.to_string()));
+                }
+            }
+        }
+        if line_no > 1 {
+            line_no -= 1;
         }
     }
     None
