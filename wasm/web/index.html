@@ -94,17 +94,21 @@
     #back-to-site span:first-child { font-size: 14px; line-height: 1; }
 
     /* Hover tooltip styling for the live `///` doc preview the
-       wrenHover extension creates. Matches the dark code-pane
-       palette so the tooltip reads as part of the editor. */
+       wrenHover extension creates. Layout layers, outermost in:
+         .cm-tooltip                — frame, border + background
+         .cm-tooltip-section        — padded gutter (14/18px)
+         .wlift-hover               — scroll container (no padding)
+       The padding lives on the section, NOT the .wlift-hover
+       inside it, because position:sticky anchors to its scroll
+       container's padding edge — putting padding on .wlift-hover
+       made the sticky title pane overlap the gutter and read as
+       flush with the frame border. */
+    .cm-tooltip-hover .cm-tooltip-section { padding: 14px 18px; }
     .cm-tooltip .wlift-hover {
       max-width: 480px;
-      /* Cap the height so a chatty doc body doesn't paint over
-         half the editor. Anything past the cap scrolls — the
-         signature pane stays sticky-pinned at the top so the
-         user always sees what they're hovering on. */
       max-height: 280px;
       overflow: auto;
-      padding: 14px 18px;
+      padding: 0;
       font-size: 12px; line-height: 1.5;
       color: var(--text);
     }
@@ -119,17 +123,14 @@
     }
     .cm-tooltip .wlift-hover pre:first-child {
       /* Pin the signature line so it stays visible while the
-         user scrolls through the body underneath. Margin gives
-         the body breathing room without the markdown-`<br>`
-         slack we used to ship. */
+         user scrolls. With padding now on the outer section,
+         the sticky pane sits flush with the .wlift-hover top
+         (which is *inside* the section's gutter). */
       position: sticky; top: 0;
       background: var(--panel);
       margin: 0 0 12px;
     }
     .cm-tooltip .wlift-hover code { font-family: inherit; }
-    /* CodeMirror's default tooltip frame has its own padding;
-       collapse it so our inner padding owns the gutter. */
-    .cm-tooltip-hover .cm-tooltip-section { padding: 0; }
     footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
 
     h1 { font-size: 13px; margin: 0; color: var(--accent); letter-spacing: 0.04em; }
@@ -756,6 +757,10 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       },
       ".cm-activeLine, .cm-activeLineGutter": {
         backgroundColor: "rgba(245, 166, 35, 0.06)",
+      },
+      ".cm-tooltip":{
+        padding:"8px",
+        gap: "2"
       },
     }, { dark: true });
 

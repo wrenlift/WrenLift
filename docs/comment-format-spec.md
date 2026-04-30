@@ -53,6 +53,28 @@ Bracketed identifiers auto-resolve:
 
 Any other heading renders as a normal section.
 
+## Type annotations
+
+JSDoc-style `@param {Type} name` / `@returns {Type}` lines are
+parsed out of the doc body. Types splice into the rendered
+hover signature so the reader sees `spawn(x: Num, y: Num) → Map`
+without opening the body.
+
+```wren
+/// Spawn a fruit at (x, y).
+///
+/// @param {Num} x — horizontal pixel position
+/// @param {Num} y — vertical pixel position
+/// @returns {Map} the fruit instance, with keys "x" / "y" / "vx" / "vy"
+spawn(x, y) { ... }
+```
+
+Type names are free-form strings — match a class name in the
+prelude or your package (`Num`, `String`, `List`, `Map`,
+`Sequence`, `Object`, `Fn`, `Future`, etc.) for clickable docs
+later. Annotations are optional; omit them and the signature
+stays bare.
+
 ## One-sentence summary
 
 The first paragraph is the symbol's summary. It shows up in the

@@ -437,26 +437,20 @@ fn identifier_hover(
 }
 
 /// Same shape as `wasm/src/lib.rs::identifier_kind_hint`.
+/// Returns (signature, body). Body is empty for the
+/// signature-only buckets (fields, generic fallback) so we
+/// don't ship template boilerplate on every hover.
 fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<(String, String)> {
-    if let Some(rest) = ident.strip_prefix("__") {
-        return Some((
-            format!("static field {}", ident),
-            format!(
-                "Class-level static field. Persists across instances of the enclosing class.\n\nDeclared by use; first reference in the class body sets the slot.\n\nIdentifier: `{}`.",
-                rest
-            ),
-        ));
+    if ident.starts_with("__") {
+        return Some((format!("static field {}", ident), String::new()));
     }
-    if ident.starts_with('_') && !ident.starts_with("__") {
-        return Some((
-            format!("instance field {}", ident),
-            "Per-instance field. Wren doesn't require an explicit declaration — the first reference inside a method allocates a slot on `this`. Read by name; assign with `=`.".into(),
-        ));
+    if ident.starts_with('_') {
+        return Some((format!("instance field {}", ident), String::new()));
     }
     if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
         return Some((
             format!("class {}", ident),
-            "Class-shaped name not found in the local module or runtime prelude — likely imported from an `@hatch:*` package the workspace hasn't loaded docs for.".into(),
+            "Likely imported from an `@hatch:*` package whose docs the workspace hasn't loaded.".into(),
         ));
     }
     if let Some(decl_line) = find_var_decl_line(source, ident, byte) {
@@ -469,10 +463,7 @@ fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<(Strin
             ),
         ));
     }
-    Some((
-        format!("identifier {}", ident),
-        "Local-scope name (parameter, block-local, or class-level identifier). No declaration found in the surrounding source — likely a method parameter or an inherited binding.".into(),
-    ))
+    Some((format!("identifier {}", ident), String::new()))
 }
 
 fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {

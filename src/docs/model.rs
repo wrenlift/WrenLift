@@ -104,10 +104,30 @@ pub struct MemberDoc {
     pub doc: String,
     #[serde(serialize_with = "ser_span")]
     pub span: Span,
-    /// Pretty-printed signature line — `static foo(x, y)`,
-    /// `bar=(value)`, `baz { _baz }`, etc. Consumers print it
-    /// above the body.
+    /// Pretty-printed signature line — `static foo(x: Num, y: Num)`,
+    /// `bar=(value)`, `baz { _baz }`, etc. When the body has
+    /// `@param {Type} name` annotations, the parser splices them
+    /// into the param list here so the hover signature alone
+    /// communicates types.
     pub signature: String,
+    /// Per-parameter type annotations parsed from the doc body's
+    /// `@param {Type} name [— description]` lines. Empty when no
+    /// annotations were authored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub param_types: Vec<ParamTypeInfo>,
+    /// `@returns {Type}` annotation, if present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
+}
+
+/// One row from a `@param {Type} name — description` line.
+#[derive(Debug, Clone, Serialize)]
+pub struct ParamTypeInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

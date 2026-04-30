@@ -107,14 +107,148 @@ fn collect_member(
         }
     };
 
-    let (name, signature) = signature_text(&method.signature, method.is_static, interner);
+    let (name, base_signature) = signature_text(&method.signature, method.is_static, interner);
+    let doc = doc_for_decl(decl_span, source, docs);
+    let (param_types, return_type) = parse_jsdoc_annotations(&doc);
+    let signature = enrich_signature(&base_signature, &param_types, return_type.as_deref());
 
     MemberDoc {
         name,
         kind,
-        doc: doc_for_decl(decl_span, source, docs),
+        doc,
         span: decl_span.clone(),
         signature,
+        param_types,
+        return_type,
+    }
+}
+
+/// Splice JSDoc-parsed types into a base signature like
+/// `foo(x, y)` to produce `foo(x: Num, y: Num) → Map`. Params
+/// without an annotation stay bare. The `→` arrow is appended
+/// only when a `@returns {Type}` line is present.
+fn enrich_signature(
+    base: &str,
+    param_types: &[crate::docs::ParamTypeInfo],
+    return_type: Option<&str>,
+) -> String {
+    if param_types.is_empty() && return_type.is_none() {
+        return base.to_string();
+    }
+    let mut out = base.to_string();
+    if !param_types.is_empty() {
+        if let (Some(open), Some(close)) = (base.find('('), base.rfind(')')) {
+            let prefix = &base[..open + 1];
+            let inside = &base[open + 1..close];
+            let suffix = &base[close..];
+            let typed = inside
+                .split(',')
+                .map(|p| {
+                    let p = p.trim();
+                    if p.is_empty() {
+                        return p.to_string();
+                    }
+                    if let Some(info) = param_types.iter().find(|t| t.name == p) {
+                        format!("{}: {}", p, info.type_name)
+                    } else {
+                        p.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out = format!("{}{}{}", prefix, typed, suffix);
+        }
+    }
+    if let Some(rt) = return_type {
+        out.push_str(" → ");
+        out.push_str(rt);
+    }
+    out
+}
+
+/// Scan a Markdown doc body for JSDoc-style annotations:
+///
+/// ```text
+/// /// @param {Type} name — description
+/// /// @param {Type} [name=default] description
+/// /// @returns {Type} description
+/// ```
+///
+/// Returns the parsed list + an optional return type. Lines that
+/// don't match either pattern are left in the body untouched.
+fn parse_jsdoc_annotations(body: &str) -> (Vec<crate::docs::ParamTypeInfo>, Option<String>) {
+    let mut params = Vec::new();
+    let mut return_ty: Option<String> = None;
+    for raw in body.lines() {
+        let line = raw.trim_start();
+        if let Some(rest) = line.strip_prefix("@param") {
+            if let Some(p) = parse_one_param(rest) {
+                params.push(p);
+            }
+        } else if let Some(rest) = line.strip_prefix("@returns") {
+            return_ty = parse_returns(rest);
+        } else if let Some(rest) = line.strip_prefix("@return") {
+            // Tolerate `@return` (singular) — common typo /
+            // alternative spelling.
+            return_ty = parse_returns(rest);
+        }
+    }
+    (params, return_ty)
+}
+
+/// Parse `{Type} name [— description]` (everything after
+/// `@param`).
+fn parse_one_param(rest: &str) -> Option<crate::docs::ParamTypeInfo> {
+    let rest = rest.trim_start();
+    // Type in braces.
+    let open = rest.find('{')?;
+    let close = rest[open..].find('}')?;
+    let type_name = rest[open + 1..open + close].trim().to_string();
+    let after = rest[open + close + 1..].trim_start();
+    // Identifier — strip optional `[...]` brackets, ignore default-
+    // value markers (`name=42`).
+    let after = after.strip_prefix('[').unwrap_or(after);
+    let mut name_end = 0;
+    for (i, ch) in after.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            name_end = i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if name_end == 0 {
+        return None;
+    }
+    let name = after[..name_end].to_string();
+    // Description: everything past the name, after stripping
+    // leading punctuation (`—`, `-`, `:`).
+    let tail = after[name_end..]
+        .trim_start_matches(|c: char| c == ']' || c == '=' || c.is_ascii_alphanumeric() || c == '"' || c == '_')
+        .trim();
+    let tail = tail
+        .trim_start_matches(|c: char| c == '—' || c == '-' || c == ':')
+        .trim();
+    let description = if tail.is_empty() {
+        None
+    } else {
+        Some(tail.to_string())
+    };
+    Some(crate::docs::ParamTypeInfo {
+        name,
+        type_name,
+        description,
+    })
+}
+
+fn parse_returns(rest: &str) -> Option<String> {
+    let rest = rest.trim_start();
+    let open = rest.find('{')?;
+    let close = rest[open..].find('}')?;
+    let ty = rest[open + 1..open + close].trim().to_string();
+    if ty.is_empty() {
+        None
+    } else {
+        Some(ty)
     }
 }
 
@@ -572,6 +706,40 @@ class Foo {}
             }
             other => panic!("expected external, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parses_jsdoc_param_and_returns() {
+        let src = "\
+class Foo {
+  /// Spawn a fruit at (x, y).
+  ///
+  /// @param {Num} x — horizontal pixel position
+  /// @param {Num} y — vertical pixel position
+  /// @returns {Map} the fruit instance
+  spawn(x, y) {}
+}
+";
+        let doc = collect(src);
+        let m = &doc.classes[0].members[0];
+        assert_eq!(m.signature, "spawn(x: Num, y: Num) → Map");
+        assert_eq!(m.param_types.len(), 2);
+        assert_eq!(m.param_types[0].name, "x");
+        assert_eq!(m.param_types[0].type_name, "Num");
+        assert_eq!(
+            m.param_types[0].description.as_deref(),
+            Some("horizontal pixel position")
+        );
+        assert_eq!(m.return_type.as_deref(), Some("Map"));
+    }
+
+    #[test]
+    fn signature_left_alone_without_annotations() {
+        let src = "class Foo { spawn(x, y) {} }\n";
+        let doc = collect(src);
+        assert_eq!(doc.classes[0].members[0].signature, "spawn(x, y)");
+        assert!(doc.classes[0].members[0].param_types.is_empty());
+        assert!(doc.classes[0].members[0].return_type.is_none());
     }
 
     #[test]
