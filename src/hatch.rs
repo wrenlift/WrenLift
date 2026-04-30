@@ -1061,14 +1061,19 @@ fn build_recursive(
         // own parser pass, and the `///` doc-comment side-channel
         // travels with that parse. Re-parsing is cheap and means
         // the bundled docs always match the bundled bytecode.
-        // We re-read the *raw* source so spans + comment
-        // positions match what users see in their editors —
-        // the cfg pass strips lines but keeps file offsets.
-        let pr = crate::parse::parser::parse(&raw_source);
+        //
+        // Parse against the *cfg-stripped* source so platform-
+        // gated lines (`#!wasm` on `import "wlift_prelude" for
+        // Browser`, `#!native` on dlopen helpers) elide cleanly
+        // — the parser rejects attributes in those positions
+        // when applied verbatim. Spans in the resulting docs are
+        // relative to the cfg-stripped source, which is also
+        // what ships in the `Source` section.
+        let pr = crate::parse::parser::parse(&source);
         if pr.errors.is_empty() {
             module_docs.push(crate::docs::collect_module(
                 module_name.clone(),
-                &raw_source,
+                &source,
                 &pr.module,
                 &pr.docs,
                 &pr.interner,
