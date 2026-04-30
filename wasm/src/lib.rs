@@ -1243,85 +1243,273 @@ struct IdentKind {
 }
 
 fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<IdentKind> {
-    // Field: `_name` (instance) / `__name` (static). The
-    // collector doesn't model fields explicitly, so we look at
-    // the bytes — leading underscore is the shape contract.
-    if let Some(rest) = ident.strip_prefix("__") {
+    // Fields (instance + static). Signature only — until we
+    // model field docs, the body would just be boilerplate
+    // template text on every hover, which is noise.
+    if ident.starts_with("__") {
         return Some(IdentKind {
             signature: format!("static field {}", ident),
-            body: format!(
-                "Class-level static field. Persists across instances of the enclosing class.\n\nDeclared by use; first reference in the class body sets the slot.\n\nIdentifier: `{}`.",
-                rest
-            ),
+            body: String::new(),
         });
     }
-    if ident.starts_with('_') && !ident.starts_with("__") {
+    if ident.starts_with('_') {
         return Some(IdentKind {
             signature: format!("instance field {}", ident),
-            body: "Per-instance field. Wren doesn't require an explicit declaration — the first reference inside a method allocates a slot on `this`. Read by name; assign with `=`.".into(),
+            body: String::new(),
         });
     }
 
     // Class-shaped identifier (uppercase first char) that didn't
-    // resolve to a local class or prelude entry. Most likely
-    // it's imported from an `@hatch:*` package whose docs we
-    // haven't loaded — say so explicitly so the user knows
-    // it's not a typo.
+    // resolve to a local class or prelude entry. The body here
+    // *is* useful — it tells the user the name resolved to a
+    // class shape but the docs weren't loaded yet.
     if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
         return Some(IdentKind {
             signature: format!("class {}", ident),
-            body: "Class-shaped name not found in the local module or runtime prelude — likely imported from an `@hatch:*` package the workspace hasn't loaded docs for.".into(),
+            body: "Likely imported from an `@hatch:*` package whose docs the workspace hasn't loaded.".into(),
         });
     }
 
-    // Local / parameter. Walk back through the source from
-    // `byte` looking for the closest `var <ident>` declaration.
+    // Local: surface the declaring line — that's real info, not
+    // boilerplate.
     if let Some(decl_line) = find_var_decl_line(source, ident, byte) {
+        // Try to infer the local's type from the RHS of the
+        // `var <ident> = <expr>` decl — string/number/bool/null
+        // literals, list/map literals, and `Class.new(...)` /
+        // `Class.staticMethod(...)` calls whose @returns we
+        // know about.
+        let rhs = decl_rhs(decl_line.1.trim());
+        let ty = rhs.and_then(|r| infer_rhs_type(r));
+        let signature = match &ty {
+            Some(t) => format!("local {}: {}", ident, t),
+            None => format!("local {}", ident),
+        };
         return Some(IdentKind {
-            signature: format!("local {}", ident),
-            body: format!("Declared on line {}:\n\n```wren\n{}\n```", decl_line.0, decl_line.1.trim()),
+            signature,
+            body: format!(
+                "Declared on line {}:\n\n```wren\n{}\n```",
+                decl_line.0,
+                decl_line.1.trim()
+            ),
         });
     }
 
-    // Otherwise: probably a parameter or an enclosing-scope
-    // local we couldn't find. Still produce *something* so the
-    // user gets a hover instead of nothing.
+    // Generic fallback — signature only.
     Some(IdentKind {
         signature: format!("identifier {}", ident),
-        body: "Local-scope name (parameter, block-local, or class-level identifier). No declaration found in the surrounding source — likely a method parameter or an inherited binding.".into(),
+        body: String::new(),
     })
 }
 
-/// Search back from `byte` for the closest `var <ident>` decl.
-/// Returns `(line_number, full_line_text)` when found.
-fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {
-    // Look at the prefix up to the cursor; later text doesn't
-    // shadow what's already in scope at the cursor's position.
-    let prefix = source.get(..byte)?;
-    // Reverse-iterate over lines so the most recent decl wins.
-    let mut line_no = prefix.matches('\n').count() + 1;
-    for line in prefix.rsplit('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("var ") {
-            // Match `var <ident>` (followed by `=`, `,`, or end).
-            let after = &trimmed["var ".len()..];
-            let after = after.trim_start();
-            if after.starts_with(ident) {
-                let tail = &after[ident.len()..];
-                if tail.is_empty()
-                    || tail.starts_with('=')
-                    || tail.starts_with(',')
-                    || tail.starts_with(' ')
-                {
-                    return Some((line_no, line.to_string()));
+/// Pull the right-hand side of a `var name = <rhs>` line.
+/// Returns the trimmed expression text; `None` for var decls
+/// without an initializer.
+fn decl_rhs(line: &str) -> Option<&str> {
+    let after_var = line.trim_start().strip_prefix("var ")?;
+    let eq = after_var.find('=')?;
+    Some(after_var[eq + 1..].trim())
+}
+
+/// Best-effort type inference from a var-decl's RHS expression.
+/// Recognised shapes (in order):
+///
+/// * `"..."`         → `String`
+/// * `42` / `-3.1`   → `Num`
+/// * `true`/`false`  → `Bool`
+/// * `null`          → `Null`
+/// * `[...]`         → `List`
+/// * `{...}`         → `Map`
+/// * `Class.new(...)`              → `Class`
+/// * `Class.staticMethod(...)`     → method's `@returns {Type}` if we have docs
+/// * anything else                 → `None`
+fn infer_rhs_type(rhs: &str) -> Option<String> {
+    let r = rhs.trim_start();
+    let first = r.chars().next()?;
+    match first {
+        '"' => return Some("String".into()),
+        '\'' => return Some("String".into()),
+        '[' => return Some("List".into()),
+        '{' => return Some("Map".into()),
+        '0'..='9' => return Some("Num".into()),
+        '-' => {
+            // Negative number literal: `-` followed by a digit.
+            if r.chars().nth(1).map_or(false, |c| c.is_ascii_digit()) {
+                return Some("Num".into());
+            }
+        }
+        _ => {}
+    }
+    if r.starts_with("true") || r.starts_with("false") {
+        return Some("Bool".into());
+    }
+    if r.starts_with("null") {
+        return Some("Null".into());
+    }
+    // `Class.method(...)` shape — read class + method name.
+    let dot = r.find('.')?;
+    let class_name = r[..dot].trim();
+    if class_name.is_empty() || !class_name.chars().next()?.is_ascii_uppercase() {
+        return None;
+    }
+    let after_dot = &r[dot + 1..];
+    let mut name_end = 0;
+    for (i, ch) in after_dot.char_indices() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            name_end = i + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if name_end == 0 {
+        return None;
+    }
+    let method_name = &after_dot[..name_end];
+    // Constructor: any `new(...)` call returns the class itself.
+    let mut base_type = if method_name == "new" {
+        Some(class_name.to_string())
+    } else {
+        // Static-method call: look up the method's @returns
+        // annotation in our docs model.
+        let mut found: Option<String> = None;
+        for module in wren_lift::docs::prelude_docs() {
+            for class in &module.classes {
+                if class.name != class_name {
+                    continue;
+                }
+                for member in &class.members {
+                    if member.name == method_name {
+                        found = member.return_type.clone();
+                    }
                 }
             }
         }
-        if line_no > 1 {
-            line_no -= 1;
+        found
+    };
+
+    // Walk any trailing chain — `.await`, `.something`, etc. —
+    // and update the inferred type as we recognise links.
+    let mut tail = after_dot[name_end..].trim_start();
+    // Skip a parenthesised arg list (`(...)`) — it's part of
+    // the call we already attributed to `method_name`.
+    if tail.starts_with('(') {
+        let mut depth = 0;
+        let mut bytes = tail.bytes().enumerate();
+        let close = loop {
+            match bytes.next() {
+                Some((i, b'(')) => depth += 1,
+                Some((i, b')')) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break Some(i);
+                    }
+                }
+                Some(_) => {}
+                None => break None,
+            }
+        };
+        if let Some(end) = close {
+            tail = tail[end + 1..].trim_start();
         }
     }
-    None
+    while tail.starts_with('.') {
+        let after = tail[1..].trim_start();
+        let mut len = 0;
+        for (i, ch) in after.char_indices() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                len = i + ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if len == 0 {
+            break;
+        }
+        let chained = &after[..len];
+        // Update base_type for known await-style transformations.
+        base_type = match (base_type.as_deref(), chained) {
+            (Some("ByteFuture"), "await") => Some("ByteArray".into()),
+            (Some("Future"), "await") => Some("Object".into()),
+            // Unknown chain — keep the previous type. A real
+            // resolver would walk member return types here.
+            _ => base_type,
+        };
+        // Skip a `(...)` arg list if the chained name is a
+        // method call rather than a getter.
+        let mut rest = after[len..].trim_start();
+        if rest.starts_with('(') {
+            let mut depth = 0;
+            let close = rest.bytes().enumerate().find_map(|(i, b)| match b {
+                b'(' => {
+                    depth += 1;
+                    None
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            if let Some(end) = close {
+                rest = rest[end + 1..].trim_start();
+            } else {
+                break;
+            }
+        }
+        tail = rest;
+    }
+    base_type
+}
+
+/// Search the whole file for the closest `var <ident>` decl —
+/// preferring matches *before* the cursor (in-scope at the
+/// cursor) but falling back to matches *after* it so hovers in
+/// preceding comments / docstrings still resolve.
+fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {
+    let mut backward: Option<(usize, String)> = None;
+    let mut forward: Option<(usize, String)> = None;
+    for (idx, line) in source.lines().enumerate() {
+        let line_no = idx + 1;
+        if !line_matches_var_decl(line, ident) {
+            continue;
+        }
+        // Compute the line's start byte to compare against the
+        // cursor.
+        let line_start = source
+            .lines()
+            .take(idx)
+            .map(|l| l.len() + 1) // +1 for the '\n'
+            .sum::<usize>();
+        if line_start <= byte {
+            // Most-recent backward match: keep overwriting so we
+            // end up with the closest decl <= cursor.
+            backward = Some((line_no, line.to_string()));
+        } else if forward.is_none() {
+            // First match after the cursor — used as fallback
+            // when no backward decl exists.
+            forward = Some((line_no, line.to_string()));
+        }
+    }
+    backward.or(forward)
+}
+
+fn line_matches_var_decl(line: &str, ident: &str) -> bool {
+    let trimmed = line.trim_start();
+    let after = match trimmed.strip_prefix("var ") {
+        Some(s) => s.trim_start(),
+        None => return false,
+    };
+    if !after.starts_with(ident) {
+        return false;
+    }
+    let tail = &after[ident.len()..];
+    tail.is_empty()
+        || tail.starts_with('=')
+        || tail.starts_with(',')
+        || tail.starts_with(' ')
 }
 
 /// Identifier sitting immediately before a `.` at `before_byte`.
