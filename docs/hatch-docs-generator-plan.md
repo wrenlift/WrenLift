@@ -207,6 +207,39 @@ Concurrent with v0:
 - Update the `wlift package new` template (if/when it exists, else
   the closest scaffold) to include the standardized doc skeleton.
 
+## Built-in / prelude docs
+
+The generator only sees `///` comments in user-authored Wren
+source. The runtime's prelude — `Num`, `String`, `List`, `Map`,
+`Fiber`, `System`, `Browser`, `Dom`, etc. — lives in Rust, so its
+methods are invisible to the collector and to every consumer
+(LSP hover, playground autocomplete, generated package sites).
+
+Resolution path:
+
+1. **Rust-side stub modules.** Each Rust core class registers a
+   parallel "prelude stub" — a `///`-doc-only Wren file that
+   declares the same surface (`class Num { /* ... */ }`) without
+   bodies. The generator collects from those stubs the same way it
+   collects from real source. Lives at `src/runtime/prelude/*.wren`,
+   built into the runtime as a static blob, exposed via a new
+   `wren_lift::docs::prelude_doc_model()` accessor.
+2. **Bundled into every consumer.** The CLI's `--docs` flag emits
+   prelude docs alongside user-package docs (or as a sibling
+   `prelude.json`). The wasm `wlift_wasm` binary embeds the same
+   blob so the playground hover / completion can answer "what's
+   `String.split` do?" without a network round-trip.
+3. **Imported-dep docs.** Same model the LSP plan v3 hatch-deps
+   pass already uses — every installed `.hatch` bundle's source
+   sections feed `collect_module`, the resulting `ModuleDoc`s
+   land in a workspace-level lookup keyed by package name. Hover
+   on `@hatch:assert` `Expect.that(x).toBe(y)` then reaches into
+   the assert package's docs.
+
+Phase placement: prelude stubs are a v3 deliverable (after the
+v2 registry aggregate so the cross-package linker has a target
+to point at). The wasm-side embed is its own follow-up.
+
 ## Open questions
 
 - Should `///` doc comments mutate semantics anywhere (e.g. the

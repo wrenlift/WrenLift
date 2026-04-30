@@ -170,12 +170,27 @@ syntax errors with the same messages the CLI emits.
 9. `textDocument/definition`, `textDocument/references`.
 10. `textDocument/documentSymbol` for the editor's outline view.
 
-### v3 — hatch deps
+### v3 — hatch deps + prelude
 
 11. Fetch + cache `@hatch:*` bundles using the existing dep walker.
-12. Surface dep symbols in hover/goto-def.
-13. Completion across hatch deps after `import "@hatch:foo" for `.
-14. `workspace/executeCommand`: `wlift-lsp.reloadDeps`.
+12. Surface dep symbols in hover/goto-def — every cached bundle's
+    `Source` sections feed `wren_lift::docs::collect_module`; the
+    resulting `ModuleDoc`s sit in a workspace-level `HashMap<pkg,
+    ModuleDoc>` keyed by package name. The hover handler walks
+    *that* table when the receiver of a `.method` access binds to
+    an imported name (e.g. hovering on `.toBe` inside an
+    `Expect.that(x).toBe(y)` call falls through to
+    `@hatch:assert`'s docs).
+13. Prelude docs. The runtime's core classes (Num / String / List
+    / Map / Fiber / System / Browser / Dom / …) are Rust-defined
+    so the generator can't see them today. Ship Rust-side
+    `///`-doc-only Wren stubs at `src/runtime/prelude/*.wren`,
+    collect them at build time into a static `prelude_doc_model`,
+    and prepend it to the workspace lookup table. Same blob
+    embedded into `wlift_wasm` so the playground hover /
+    completion gets prelude docs without a network round-trip.
+14. Completion across hatch deps after `import "@hatch:foo" for `.
+15. `workspace/executeCommand`: `wlift-lsp.reloadDeps`.
 
 ### v4 — completion + rename + inlay
 
