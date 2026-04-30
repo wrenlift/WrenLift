@@ -18,7 +18,7 @@ use crate::ast::{ClassDecl, Method, MethodSig, Op, Spanned, Stmt};
 use crate::intern::Interner;
 use crate::parse::lexer::{DocComment, DocKind};
 
-use super::model::{ClassDoc, MemberDoc, MemberKind, ModuleDoc};
+use super::model::{ClassDoc, CrossRef, MemberDoc, MemberKind, ModuleDoc, RefOrigin, RefTarget};
 
 /// Build a [`ModuleDoc`] from a parsed result + the original source.
 ///
@@ -57,6 +57,11 @@ pub fn collect_module(
         // `var` declarations are module-level data, not part of the
         // public API surface for v0. Skip them.
     }
+
+    // Second pass: resolve `[X]` bracket cross-references in every
+    // body. Builds a tiny symbol table from the classes we just
+    // collected and walks each Markdown blob for bracketed text.
+    module_doc.cross_refs = resolve_cross_refs(&module_doc);
 
     module_doc
 }
@@ -285,6 +290,184 @@ fn is_adjacent_to(comment_end: usize, decl_start: usize, source: &str) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// Cross-reference resolution
+// ---------------------------------------------------------------------------
+
+/// Walk every Markdown body in `module` and resolve bracketed
+/// references against a tiny symbol table built from the module's
+/// own classes. Returns one `CrossRef` per discovered bracket.
+///
+/// The site is the rendering layer — it'll consult this list when
+/// emitting links, so unresolved brackets are kept (with kind =
+/// `Unresolved`) rather than dropped.
+fn resolve_cross_refs(module: &ModuleDoc) -> Vec<CrossRef> {
+    let mut symbols = SymbolTable::default();
+    for class in &module.classes {
+        symbols.classes.push(class.name.clone());
+        for member in &class.members {
+            symbols
+                .members
+                .push((class.name.clone(), member.name.clone()));
+        }
+    }
+
+    let mut refs = Vec::new();
+    let mut emit = |body: &str, origin: RefOrigin| {
+        for raw in scan_brackets(body) {
+            let target = resolve_one(&raw, &symbols);
+            refs.push(CrossRef {
+                text: raw,
+                origin: origin.clone(),
+                target,
+            });
+        }
+    };
+
+    emit(&module.doc, RefOrigin::Module);
+    for class in &module.classes {
+        emit(
+            &class.doc,
+            RefOrigin::Class {
+                class: class.name.clone(),
+            },
+        );
+        for member in &class.members {
+            emit(
+                &member.doc,
+                RefOrigin::Member {
+                    class: class.name.clone(),
+                    member: member.name.clone(),
+                },
+            );
+        }
+    }
+    refs
+}
+
+#[derive(Default)]
+struct SymbolTable {
+    classes: Vec<String>,
+    members: Vec<(String, String)>, // (class, member)
+}
+
+/// Match a single bracket reference against the symbol table.
+///
+/// Recognized shapes:
+/// * `Class`              → same-module class
+/// * `Class.member`       → same-module member
+/// * `#anchor`            → same-doc heading anchor
+/// * `@scope:pkg`         → external package
+/// * `@scope:pkg Symbol`  → external symbol inside a package
+fn resolve_one(text: &str, symbols: &SymbolTable) -> RefTarget {
+    let trimmed = text.trim();
+
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        if !rest.is_empty() {
+            return RefTarget::Anchor {
+                anchor: rest.to_string(),
+            };
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('@') {
+        // External package. Two forms:
+        //   `@hatch:foo`           — package only
+        //   `@hatch:foo Symbol`    — symbol inside package
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let package = parts.next().unwrap_or("").to_string();
+        let symbol = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        if !package.is_empty() {
+            return RefTarget::External { package, symbol };
+        }
+    }
+
+    if let Some((class, member)) = trimmed.split_once('.') {
+        if symbols
+            .members
+            .iter()
+            .any(|(c, m)| c == class && m == member)
+        {
+            return RefTarget::Member {
+                class: class.to_string(),
+                member: member.to_string(),
+            };
+        }
+    }
+
+    if symbols.classes.iter().any(|c| c == trimmed) {
+        return RefTarget::Class {
+            class: trimmed.to_string(),
+        };
+    }
+
+    RefTarget::Unresolved
+}
+
+/// Pull every `[X]` bracket out of a Markdown body, ignoring those
+/// inside fenced code blocks (so a code sample doesn't accidentally
+/// register `[Class]` as a cross-reference) and `\[escaped\]` ones.
+///
+/// Returns the inner text of each bracket, in source order. We
+/// don't try to be cute here — heuristic match is fine, the site
+/// re-checks against the cross_refs list when rewriting.
+fn scan_brackets(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut in_code = false;
+    while i < bytes.len() {
+        // Toggle on triple-backtick fences. Single backticks for
+        // inline code are handled by the same skip path below.
+        if i + 2 < bytes.len() && &bytes[i..i + 3] == b"```" {
+            in_code = !in_code;
+            i += 3;
+            continue;
+        }
+        if in_code {
+            i += 1;
+            continue;
+        }
+        // Inline code (`...`) — skip up to the next backtick.
+        if bytes[i] == b'`' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'`' {
+                i += 1;
+            }
+            i += 1; // step past the closing backtick
+            continue;
+        }
+        // Escaped bracket (`\[`) — skip both bytes.
+        if bytes[i] == b'\\' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'[' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b']' && bytes[end] != b'\n' {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end] == b']' {
+                // Skip the `[text](...)` standard-link form — those
+                // are real markdown links, not cross-refs.
+                if end + 1 < bytes.len() && bytes[end + 1] == b'(' {
+                    i = end + 1;
+                    continue;
+                }
+                let inner = body[start..end].to_string();
+                if !inner.is_empty() {
+                    out.push(inner);
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +516,76 @@ mod tests {
         let src = "class Foo {\n  static greet(name) {}\n}\n";
         let doc = collect(src);
         assert_eq!(doc.classes[0].members[0].signature, "static greet(name)");
+    }
+
+    #[test]
+    fn resolves_local_class_and_member_refs() {
+        let src = "\
+/// See [Foo] and [Foo.greet] for details. [Bar] is unknown.
+class Foo {
+  greet(name) {}
+}
+";
+        let doc = collect(src);
+        let class_refs: Vec<&CrossRef> = doc
+            .cross_refs
+            .iter()
+            .filter(|r| matches!(r.origin, RefOrigin::Class { .. }))
+            .collect();
+        assert_eq!(class_refs.len(), 3);
+        assert!(matches!(
+            class_refs[0].target,
+            RefTarget::Class { ref class } if class == "Foo"
+        ));
+        assert!(matches!(
+            class_refs[1].target,
+            RefTarget::Member { ref class, ref member } if class == "Foo" && member == "greet"
+        ));
+        assert!(matches!(class_refs[2].target, RefTarget::Unresolved));
+    }
+
+    #[test]
+    fn resolves_anchor_and_external_refs() {
+        let src = "\
+//! See [#intro] in this doc, and [@hatch:gpu Renderer2D] elsewhere.
+class Foo {}
+";
+        let doc = collect(src);
+        let anchor = doc
+            .cross_refs
+            .iter()
+            .find(|r| r.text == "#intro")
+            .expect("anchor ref present");
+        match &anchor.target {
+            RefTarget::Anchor { anchor } => assert_eq!(anchor, "intro"),
+            other => panic!("expected anchor, got {:?}", other),
+        }
+        let ext = doc
+            .cross_refs
+            .iter()
+            .find(|r| r.text.starts_with("@hatch:gpu"))
+            .expect("external ref present");
+        match &ext.target {
+            RefTarget::External { package, symbol } => {
+                assert_eq!(package, "hatch:gpu");
+                assert_eq!(symbol.as_deref(), Some("Renderer2D"));
+            }
+            other => panic!("expected external, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ignores_brackets_inside_code_fences() {
+        let src = "\
+/// Outside [Foo] resolves.
+///
+/// ```
+/// var x = list[0]   // [NotAClass] inside code is left alone
+/// ```
+class Foo {}
+";
+        let doc = collect(src);
+        let names: Vec<_> = doc.cross_refs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(names, vec!["Foo"]);
     }
 }

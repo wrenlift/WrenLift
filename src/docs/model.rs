@@ -21,6 +21,68 @@ pub struct ModuleDoc {
     /// the file has no module-level docs.
     pub doc: String,
     pub classes: Vec<ClassDoc>,
+    /// Cross-references found across every Markdown body in this
+    /// module. The consumer site uses these to turn bracketed
+    /// identifiers into clickable links — the generator does the
+    /// resolution; the site does the rendering.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cross_refs: Vec<CrossRef>,
+}
+
+/// A single bracket reference (`[Class]`, `[Class.method]`,
+/// `[#anchor]`, `[@hatch:pkg Name]`) discovered in some Markdown
+/// body inside this module.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossRef {
+    /// The raw bracketed text *without* the surrounding `[]`,
+    /// exactly as the author wrote it. Consumers match on this
+    /// when rewriting the Markdown.
+    pub text: String,
+    /// Where this reference lives — the body it was scanned from
+    /// (so the site doesn't accidentally rewrite a string of the
+    /// same shape that happens to live in a different doc).
+    pub origin: RefOrigin,
+    /// What the reference resolved to. `Unresolved` keeps the
+    /// reference in the output so the site can render it as
+    /// plain bracketed text.
+    pub target: RefTarget,
+}
+
+/// Where a cross-reference was found inside the module.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RefOrigin {
+    /// The module's `//!` doc body.
+    Module,
+    /// A class doc body.
+    Class { class: String },
+    /// A member doc body. `class` is the enclosing class; `member`
+    /// is the member's display name.
+    Member { class: String, member: String },
+}
+
+/// Resolved target of a cross-reference.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RefTarget {
+    /// Same-module class. `class` is the class name.
+    Class { class: String },
+    /// Same-module member. `class` + `member` identify it.
+    Member { class: String, member: String },
+    /// Same-doc heading anchor (`[#some-section]`).
+    Anchor { anchor: String },
+    /// Cross-package reference (`[@hatch:foo]` or
+    /// `[@hatch:foo Bar]`). Resolution against a registry index
+    /// happens at site-build time; we just preserve the package
+    /// name and optional symbol so the site can hyperlink.
+    External {
+        package: String,
+        symbol: Option<String>,
+    },
+    /// Bracket pattern that didn't match any known shape. The
+    /// site renders these as literal text — the bracket is part
+    /// of the body's prose, not a reference.
+    Unresolved,
 }
 
 #[derive(Debug, Clone, Serialize)]
