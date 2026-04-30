@@ -271,15 +271,74 @@ impl LanguageServer for Backend {
         }
 
         let Some(module) = doc.docs.as_ref() else {
-            return Ok(None);
+            // No doc model yet — try the prelude path on a raw
+            // identifier-under-cursor. (Pre-cache state.)
+            return Ok(prelude_hover(&doc, byte));
         };
-        if let Some(h) = hover_at(module, byte, &doc) {
+
+        // Identifier-under-cursor lookup wins over span-based
+        // enclosing-decl: when the cursor sits on a *use* of a
+        // name (Renderer2D.new, System.print) we should show
+        // *that* class's docs, not the docs of the method we
+        // happen to be inside.
+        if let Some(h) = identifier_hover(module, &doc, byte) {
             return Ok(Some(h));
         }
-        // Prelude fallback: identifier under cursor → look up in
-        // the cached System/Num/String/List/Map/Fiber/Fn stubs.
-        Ok(prelude_hover(&doc, byte))
+        if let Some(h) = prelude_hover(&doc, byte) {
+            return Ok(Some(h));
+        }
+        // Span-based fallback for hovers on the keyword itself
+        // (e.g. on the `class` token) or whitespace.
+        Ok(hover_at(module, byte, &doc))
     }
+}
+
+/// Identifier-match version of `hover_at`. Walks the local
+/// module's classes / members for a name equal to the
+/// identifier under the cursor, regardless of whether that
+/// identifier appears at a decl site or a use site.
+fn identifier_hover(
+    module: &wren_lift::docs::ModuleDoc,
+    doc: &Document,
+    byte: usize,
+) -> Option<Hover> {
+    let span = identifier_at(&doc.text, byte)?;
+    let ident = doc.text.get(span.clone())?;
+    for class in &module.classes {
+        if class.name == ident {
+            let body = format!(
+                "```wren\nclass {}\n```{}{}",
+                class.name,
+                if class.doc.is_empty() { "" } else { "\n\n" },
+                class.doc,
+            );
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: body,
+                }),
+                range: Some(doc.byte_range_to_lsp(span)),
+            });
+        }
+        for member in &class.members {
+            if member.name == ident {
+                let body = format!(
+                    "```wren\n{}\n```{}{}",
+                    format_member_sig(&class.name, &member.signature),
+                    if member.doc.is_empty() { "" } else { "\n\n" },
+                    member.doc,
+                );
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: body,
+                    }),
+                    range: Some(doc.byte_range_to_lsp(span)),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// Identifier-under-cursor lookup against the runtime prelude

@@ -1076,36 +1076,38 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         &pr.interner,
     );
 
-    // Local module hover via span containment — finds the
-    // declaration whose span actually wraps the cursor.
-    for class in &module.classes {
-        if class.span.start > byte || byte >= class.span.end {
-            continue;
-        }
-        for member in &class.members {
-            if member.span.start <= byte && byte < member.span.end {
-                return hover_out(
-                    &format_member_sig(&class.name, &member.signature),
-                    &member.doc,
-                    member.span.start,
-                    member.span.end,
-                );
-            }
-        }
-        return hover_out(
-            &format!("class {}", class.name),
-            &class.doc,
-            class.span.start,
-            class.span.end,
-        );
-    }
-
-    // Prelude fallback — the cursor isn't on a local declaration,
-    // but might be on a *use* of a prelude class or method
-    // (`System.print`, `String.split`, etc.). Look up the
-    // identifier under the cursor in the cached prelude model.
+    // Step 1: identifier-under-cursor lookup. The cursor is most
+    // likely on a *use* of a name (`Renderer2D.new`, `System.print`,
+    // etc.) rather than a declaration site, so identifier-match
+    // wins over enclosing-span before we fall back to "show the
+    // method I'm inside".
     if let Some(ident_span) = identifier_at(source, byte) {
         let ident = &source[ident_span.clone()];
+
+        // Local module: any class or member whose name equals the
+        // identifier the cursor sits on.
+        for class in &module.classes {
+            if class.name == ident {
+                return hover_out(
+                    &format!("class {}", class.name),
+                    &class.doc,
+                    ident_span.start,
+                    ident_span.end,
+                );
+            }
+            for member in &class.members {
+                if member.name == ident {
+                    return hover_out(
+                        &format_member_sig(&class.name, &member.signature),
+                        &member.doc,
+                        ident_span.start,
+                        ident_span.end,
+                    );
+                }
+            }
+        }
+
+        // Prelude.
         for prelude_module in wren_lift::docs::prelude_docs() {
             for class in &prelude_module.classes {
                 if class.name == ident {
@@ -1128,6 +1130,32 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                 }
             }
         }
+    }
+
+    // Step 2: span-based fallback. When the cursor isn't on a
+    // recognisable identifier — e.g. the user hovers on the
+    // `class` keyword itself, or whitespace inside a method body
+    // — show the enclosing decl's docs instead of nothing.
+    for class in &module.classes {
+        if class.span.start > byte || byte >= class.span.end {
+            continue;
+        }
+        for member in &class.members {
+            if member.span.start <= byte && byte < member.span.end {
+                return hover_out(
+                    &format_member_sig(&class.name, &member.signature),
+                    &member.doc,
+                    member.span.start,
+                    member.span.end,
+                );
+            }
+        }
+        return hover_out(
+            &format!("class {}", class.name),
+            &class.doc,
+            class.span.start,
+            class.span.end,
+        );
     }
 
     JsValue::NULL
