@@ -1506,7 +1506,18 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     let prefetchTimer = null;
     function prefetchDepDocs(hatchfileText) {
       if (!hatchfileText || !hatchfileText.trim()) return;
-      resolveDepsOnce(hatchfileText).catch(() => { /* hover-only */ });
+      // Surface failures to the console — they used to die in
+      // an empty catch, so a broken proxy / wrong server route
+      // looked like "the prefetch silently never populates"
+      // (works only after the user clicks Run, because the run
+      // path doesn't swallow errors). Console-only, no UI: the
+      // user can still Run, this is purely diagnostic.
+      resolveDepsOnce(hatchfileText).catch((err) => {
+        console.warn(
+          "[wlift] dep-doc prefetch failed; hover hints will stay sparse until the next successful resolve:",
+          err,
+        );
+      });
     }
     function schedulePrefetchDepDocs(hatchfileText) {
       // Debounce — typing in the hatchfile pane fires `input` per
