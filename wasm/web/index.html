@@ -1408,11 +1408,16 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     }
     exampleSel.addEventListener("change", () => loadExample(exampleSel.value));
 
-    // Boot from the first example. This runs before `bootMode`,
-    // so the user sees the loaded program while wlift is still
-    // spinning up — autorun fires once wlift is ready (see
-    // `maybeAutorun` guards on `wlift`).
-    loadExample(EXAMPLES[0].id);
+    // Boot call moved further down — `loadExample` calls
+    // `prefetchDepDocs` → `resolveDepsOnce`, which reads the
+    // `let depsCache` declared after the proxy / resolver
+    // definitions below. `let` isn't hoisted (TDZ), so calling
+    // it from here used to throw `ReferenceError: Cannot access
+    // 'depsCache' before initialization`. The error was caught
+    // by the prefetch's empty `.catch(...)` and silently dropped,
+    // which is why deps only resolved after the user clicked Run
+    // (by then the script had finished initialising). The boot
+    // call now lives just past `schedulePrefetchDepDocs` below.
 
     // Dep fetcher — routes registry URLs through an allowlisted
     // proxy so GitHub release-asset responses arrive with the
@@ -1528,6 +1533,12 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       if (prefetchTimer) clearTimeout(prefetchTimer);
       prefetchTimer = setTimeout(() => prefetchDepDocs(hatchfileText), 600);
     }
+
+    // Boot from the first example. Has to live AFTER `let depsCache`
+    // and the resolver definitions above so the prefetch chain
+    // (`prefetchDepDocs` → `resolveDepsOnce` → reads `depsCache`)
+    // doesn't ReferenceError its way into a swallowed empty catch.
+    loadExample(EXAMPLES[0].id);
 
     // `wlift` and `lastErrored` were declared down here originally,
     // but `loadExample` (above) reads `wlift` to decide whether to
