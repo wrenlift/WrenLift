@@ -337,6 +337,29 @@ fn identifier_hover(
                 }
             }
         }
+        // Bare member reference in the local module — covers
+        // doc bodies mentioning a sibling method by name.
+        // Prelude is skipped here to avoid `name`/`count` /
+        // `print` matching params or locals.
+        for class in &module.classes {
+            for member in &class.members {
+                if member.name == ident {
+                    let body = format!(
+                        "```wren\n{}\n```{}{}",
+                        format_member_sig(&class.name, &member.signature),
+                        if member.doc.is_empty() { "" } else { "\n\n" },
+                        member.doc,
+                    );
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: body,
+                        }),
+                        range: Some(doc.byte_range_to_lsp(span)),
+                    });
+                }
+            }
+        }
     }
 
     // Pass 1 — receiver-restricted. Skipped when the receiver

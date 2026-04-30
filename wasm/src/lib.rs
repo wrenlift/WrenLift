@@ -1111,6 +1111,25 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                     }
                 }
             }
+            // Bare member reference inside the local module
+            // — covers things like a `///` doc body
+            // mentioning `checkSlice_` by name. We deliberately
+            // skip the prelude here: matching a parameter named
+            // `name` against `Class.name` would be wrong, but a
+            // local class's own method names rarely collide
+            // with bare identifier shapes the user types.
+            for class in &module.classes {
+                for member in &class.members {
+                    if member.name == ident {
+                        return hover_out(
+                            &format_member_sig(&class.name, &member.signature),
+                            &member.doc,
+                            ident_span.start,
+                            ident_span.end,
+                        );
+                    }
+                }
+            }
         }
 
         // Member match — pass 1: receiver-restricted. When the
