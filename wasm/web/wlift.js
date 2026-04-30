@@ -360,55 +360,104 @@ export async function resolveDepsFromManifest(
     const m = await getMod();
     if (m.clear_hatch_docs) m.clear_hatch_docs();
   } catch { /* nothing to clear yet */ }
-  await visit(manifest, true);
-  return order;
 
-  async function visit(m, isRoot = false) {
-    const deps = (m && m.dependencies) || {};
-    let entries = Object.entries(deps);
-    // Top-level deps win over any transitive pin of the same
-    // name. Manifest deps come from a BTreeMap on the Rust side,
-    // so iteration order is alphabetical — without this
-    // pre-registration, an alphabetically-earlier package can
-    // pull in a transitive `@scope:foo` and lock the user's
-    // `{ url = "..." }` override out of the queue. We claim the
-    // names up-front, then fetch each below.
-    //
-    // We also reorder: URL/path overrides install before
-    // version-pinned entries. The runtime's `install_hatch_sections`
-    // is first-wins on duplicate module names, and registry
-    // bundles often carry their transitive deps (e.g. @hatch:game
-    // embeds gpu_web). Installing the override first makes the
-    // user's modified module register before the registry copy
-    // can claim the slot.
-    if (isRoot) {
-      for (const [name] of entries) seen.add(name);
-      entries = entries.slice().sort(([, a], [, b]) => {
-        const aOverride = a && typeof a === "object" && (typeof a.url === "string" || typeof a.path === "string");
-        const bOverride = b && typeof b === "object" && (typeof b.url === "string" || typeof b.path === "string");
-        return Number(bOverride) - Number(aOverride);
-      });
-    }
-    for (const [name, entry] of entries) {
-      if (!isRoot) {
-        if (seen.has(name)) continue;
-        seen.add(name);
-      }
+  // ---- Root deps: topological visit ---------------------------
+  // The runtime's `install_hatch_sections` is first-wins on
+  // duplicate module names, and published bundles often embed
+  // their transitive deps (`@hatch:game` 0.2.6 ships a frozen
+  // copy of `@hatch:gpu` 0.2.4 sources). If we visit the root
+  // alphabetically — which is what `Object.entries` of a
+  // serialized BTreeMap gives us — `@hatch:game` installs
+  // before `@hatch:gpu`, claims the gpu module names with the
+  // stale embedded copy, and shadows the user-pinned 0.2.5.
+  //
+  // Topological order fixes that without forcing users back to
+  // `{ url = ... }` overrides: deps that appear in another
+  // root's manifest install first, so the consumer's embedded
+  // copies can't shadow them. Falls back to declaration order
+  // for unrelated deps.
+  const rootDeps = (manifest && manifest.dependencies) || {};
+  const rootEntries = Object.entries(rootDeps);
+  for (const [name] of rootEntries) seen.add(name);
+
+  // Phase 1: fetch + peek every root in parallel so we can
+  // build the dependency graph between root entries.
+  const fetched = await Promise.all(
+    rootEntries.map(async ([name, entry]) => {
       const { url } = depEntryToUrl(name, entry, registryBase, target);
       const bytes = await fetcher(url, name);
-      // Peek before installing so transitive deps queue ahead
-      // of this one (post-order: deps install before consumers).
       const childManifest = await peekManifest(bytes);
-      await visit(childManifest, false);
+      return { name, entry, bytes, childManifest };
+    }),
+  );
+  const rootByName = new Map(fetched.map((r) => [r.name, r]));
+
+  // Phase 2: edges A → B mean "A depends on B (transitively)".
+  // We sort so B installs before A (Kahn's algorithm).
+  const indegree = new Map(fetched.map((r) => [r.name, 0]));
+  const reverseEdges = new Map(fetched.map((r) => [r.name, new Set()]));
+  for (const r of fetched) {
+    const childDeps = (r.childManifest && r.childManifest.dependencies) || {};
+    for (const childName of Object.keys(childDeps)) {
+      if (!rootByName.has(childName)) continue; // transitive non-root: handled later
+      // Edge: r depends on childName; install childName first.
+      indegree.set(r.name, indegree.get(r.name) + 1);
+      reverseEdges.get(childName).add(r.name);
+    }
+  }
+
+  // Phase 3: Kahn's. Stable: when several roots are ready,
+  // visit them in the order they appear in the hatchfile (well,
+  // in the alphabetical order BTreeMap gives us — at least
+  // it's deterministic).
+  const ready = fetched.filter((r) => indegree.get(r.name) === 0).map((r) => r.name);
+  const sorted = [];
+  while (ready.length > 0) {
+    const name = ready.shift();
+    sorted.push(name);
+    for (const dependent of reverseEdges.get(name)) {
+      const next = indegree.get(dependent) - 1;
+      indegree.set(dependent, next);
+      if (next === 0) ready.push(dependent);
+    }
+  }
+  // Cycle / orphan fallback — preserve declaration order for
+  // anything the toposort didn't reach (cyclic deps in the
+  // graph would pin packages here).
+  for (const r of fetched) {
+    if (!sorted.includes(r.name)) sorted.push(r.name);
+  }
+
+  // ---- Visit roots in topological order -----------------------
+  for (const name of sorted) {
+    const r = rootByName.get(name);
+    // Recurse into transitive deps (skipping anything claimed
+    // at root) before pushing self — post-order so a transitive
+    // dep that *isn't* also a root entry installs before its
+    // consumer.
+    await visitTransitive(r.childManifest);
+    order.push(r.bytes);
+    try {
+      const m = await getMod();
+      if (m.register_hatch_docs) m.register_hatch_docs(r.bytes);
+    } catch { /* docs are nice-to-have */ }
+  }
+  return order;
+
+  async function visitTransitive(m) {
+    const deps = (m && m.dependencies) || {};
+    for (const [name, entry] of Object.entries(deps)) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const { url } = depEntryToUrl(name, entry, registryBase, target);
+      const bytes = await fetcher(url, name);
+      const childManifest = await peekManifest(bytes);
+      await visitTransitive(childManifest);
       order.push(bytes);
-      // Register the bundle's source-section docs in the
-      // workspace cache so hover / completion can find
-      // imported `@hatch:foo` symbols. Best-effort — failure
-      // here doesn't block the actual install.
       try {
         const m = await getMod();
         if (m.register_hatch_docs) m.register_hatch_docs(bytes);
-      } catch (e) { /* swallow — docs are nice-to-have */ }
+      } catch { /* docs are nice-to-have */ }
     }
   }
 }

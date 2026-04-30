@@ -1219,8 +1219,27 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
     // restricts `<recv>.<member>` lookups to the receiver's
     // *inferred* class — sema saw `_trail = []` and knows
     // `_trail: List`, so `_trail.count` resolves to `List.count`
-    // without any text-shape guesswork.
-    let analysis = wren_lift::docs::hover::Analysis::run(source);
+    // without any text-shape guesswork. We also flow every
+    // class name we know about (local module + dep packages +
+    // prelude) into sema so imports like `Renderer2D` resolve
+    // to `Class(Renderer2D)` and `Renderer2D.new(...)` infers as
+    // `Renderer2D` instead of `Any`.
+    let dep_modules = dep_docs_snapshot();
+    let mut class_pool: Vec<String> = Vec::new();
+    for m in &dep_modules {
+        for c in &m.classes {
+            class_pool.push(c.name.clone());
+        }
+    }
+    for m in wren_lift::docs::prelude_docs() {
+        for c in &m.classes {
+            class_pool.push(c.name.clone());
+        }
+    }
+    let analysis = wren_lift::docs::hover::Analysis::run_with_extra_classes(
+        source,
+        class_pool.iter().map(String::as_str),
+    );
 
     // Step 1: identifier-under-cursor lookup. The cursor is most
     // likely on a *use* of a name (`Renderer2D.new`, `System.print`,
@@ -1249,7 +1268,8 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         //   2. installed `@hatch:*` package docs (registered
         //      from JS via `register_hatch_docs`)
         //   3. the prelude
-        let dep_modules = dep_docs_snapshot();
+        // (`dep_modules` was snapshotted earlier so the class
+        // pool fed to sema and the lookup pool stay coherent.)
         let mut all_modules: Vec<&wren_lift::docs::ModuleDoc> = Vec::new();
         all_modules.push(&module);
         for m in &dep_modules {

@@ -19,7 +19,7 @@
 ///
 /// The key win: tight numeric loops AND class methods with numeric fields
 /// get unboxed f64 ops in codegen.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::intern::SymbolId;
@@ -186,6 +186,19 @@ pub struct TypeInferrer {
     current_class: Option<SymbolId>,
     /// Current method being inferred (for return type recording).
     current_method: Option<SymbolId>,
+    /// Symbols the caller has flagged as class names (local class
+    /// decls, `import for X` aliases, prelude / dep classes whose
+    /// names exist in this interner). Bare references to these
+    /// resolve to `Class(sym)` instead of `Any`, so
+    /// `Renderer2D.new(...)` infers as `Renderer2D`. Empty set
+    /// means "infer locally only" — sufficient for the original
+    /// callers (MIR, lints) that don't care about class identity
+    /// of imported names.
+    known_classes: HashSet<SymbolId>,
+    /// Symbol id of the `new` method, used to short-circuit
+    /// `<Class>.new(args)` to `Class(sym)`. `None` disables the
+    /// constructor convention (matches the original behaviour).
+    new_symbol: Option<SymbolId>,
 }
 
 impl Default for TypeInferrer {
@@ -200,6 +213,8 @@ impl TypeInferrer {
             env: TypeEnv::new(),
             current_class: None,
             current_method: None,
+            known_classes: HashSet::new(),
+            new_symbol: None,
         }
     }
 
@@ -209,7 +224,30 @@ impl TypeInferrer {
             env,
             current_class: None,
             current_method: None,
+            known_classes: HashSet::new(),
+            new_symbol: None,
         }
+    }
+
+    /// Tell the inferrer which symbols name classes. References
+    /// to these symbols resolve to `Class(sym)` and `<sym>.new(args)`
+    /// infers as `Class(sym)`.
+    pub fn with_known_classes(mut self, classes: HashSet<SymbolId>) -> Self {
+        self.known_classes = classes;
+        self
+    }
+
+    /// Tell the inferrer which symbol corresponds to the `new`
+    /// method name. Required for the constructor convention
+    /// (`<Class>.new(args) → Class(sym)`); pass
+    /// `interner.lookup("new")`.
+    pub fn with_new_symbol(mut self, sym: Option<SymbolId>) -> Self {
+        self.new_symbol = sym;
+        self
+    }
+
+    fn is_new_method(&self, sym: SymbolId) -> bool {
+        self.new_symbol == Some(sym)
     }
 
     /// Run type inference on a module, returning the type environment.
@@ -351,9 +389,20 @@ impl TypeInferrer {
                 }
             }
 
-            Expr::Ident(_) => {
-                // Look up from var types if we tracked it.
-                self.env.get_expr_type(expr.1.start).clone()
+            Expr::Ident(sym) => {
+                // Class names (local decls, `import for X`,
+                // prelude / dep classes whose symbols the caller
+                // wired in via `with_known_classes`) resolve to
+                // `Class(sym)` so `Renderer2D.new(args)` and
+                // friends infer as constructor calls. Otherwise
+                // fall back to whatever expr type sema recorded
+                // earlier — typically the var-decl pass's local
+                // assignment.
+                if self.known_classes.contains(sym) {
+                    InferredType::Class(*sym)
+                } else {
+                    self.env.get_expr_type(expr.1.start).clone()
+                }
             }
 
             Expr::Field(field_name) => {
@@ -447,8 +496,18 @@ impl TypeInferrer {
                 if let Some(block) = block_arg {
                     self.infer_expr(block);
                 }
-                // Look up method return type if receiver class is known.
+                // `<Class>.new(args)` is the constructor
+                // convention in Wren — it returns an instance
+                // of the class. Treat this as a primitive so
+                // imported classes (whose method return types
+                // sema can't have recorded) still resolve. This
+                // is the lever that fires for
+                // `_renderer = Renderer2D.new(...)` →
+                // `_renderer: Renderer2D`.
                 if let InferredType::Class(class_sym) = &recv_ty {
+                    if self.is_new_method(method.0) {
+                        return InferredType::Class(*class_sym);
+                    }
                     let ret_ty = self
                         .env
                         .get_method_return_type(*class_sym, method.0)
@@ -583,19 +642,44 @@ impl TypeInferrer {
 /// Pass 2: Re-infer with field type knowledge → record method return types.
 /// Pass 3: Re-infer with field + method return types → final TypeEnv.
 pub fn infer_types(module: &Module) -> TypeEnv {
+    infer_types_with_classes(module, HashSet::new(), None)
+}
+
+/// Same as [`infer_types`] but with caller-supplied class
+/// knowledge: `known_classes` flags symbols that name classes
+/// (so bare references infer as `Class(sym)`), and `new_symbol`
+/// is the interner id of the `new` method (used to short-circuit
+/// `<Class>.new(args)` to `Class(sym)`).
+///
+/// Hover / LSP uses this with the union of local class decls,
+/// `import for X` aliases, prelude class names, and registered
+/// dep-package class names — that's what makes
+/// `_renderer = Renderer2D.new(...)` resolve as `Renderer2D`
+/// when sema otherwise has no idea what `Renderer2D` is.
+pub fn infer_types_with_classes(
+    module: &Module,
+    known_classes: HashSet<SymbolId>,
+    new_symbol: Option<SymbolId>,
+) -> TypeEnv {
     // Pass 1: Collect field types + initial method return types.
-    let inferrer1 = TypeInferrer::new();
+    let inferrer1 = TypeInferrer::new()
+        .with_known_classes(known_classes.clone())
+        .with_new_symbol(new_symbol);
     let mut env = inferrer1.infer(module);
 
     // Pass 2: Re-infer with field types → better method return types.
     env.clear_ephemeral();
-    let mut inferrer2 = TypeInferrer::with_env(env);
+    let mut inferrer2 = TypeInferrer::with_env(env)
+        .with_known_classes(known_classes.clone())
+        .with_new_symbol(new_symbol);
     inferrer2.infer_module(module);
     env = inferrer2.env;
 
     // Pass 3: Re-infer with field + method types → final expression types.
     env.clear_ephemeral();
-    let mut inferrer3 = TypeInferrer::with_env(env);
+    let mut inferrer3 = TypeInferrer::with_env(env)
+        .with_known_classes(known_classes)
+        .with_new_symbol(new_symbol);
     inferrer3.infer_module(module);
     inferrer3.env
 }

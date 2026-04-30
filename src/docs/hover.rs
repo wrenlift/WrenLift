@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use crate::ast::{Expr, Module, Spanned, Stmt};
 use crate::intern::{Interner, SymbolId};
-use crate::sema::types::{infer_types, InferredType, TypeEnv};
+use crate::sema::types::{infer_types_with_classes, InferredType, TypeEnv};
 
 use super::{ModuleDoc, ParamTypeInfo};
 
@@ -31,18 +31,40 @@ impl Analysis {
     /// Parse + run the type inferrer. Returns `None` when the
     /// parser couldn't produce a usable module — callers fall
     /// back to text heuristics in that case.
+    /// Convenience: run with only the prelude class names plus
+    /// names sema can derive from the source itself (local class
+    /// decls, `import for X`). Most callers should prefer
+    /// [`Analysis::run_with_extra_classes`] so dep-package
+    /// classes (`Renderer2D`, `Game`, …) also flow through.
     pub fn run(source: &str) -> Option<Self> {
+        Self::run_with_extra_classes(source, std::iter::empty::<&str>())
+    }
+
+    /// Same as [`Analysis::run`], plus extra class names the
+    /// caller knows about (typically every class name the
+    /// playground / LSP has loaded from `@hatch:*` packages).
+    /// Sema then treats matching `Expr::Ident`s as `Class(sym)`
+    /// and `<Sym>.new(args)` as a constructor call returning
+    /// that class — so `_renderer = Renderer2D.new(...)` infers
+    /// `_renderer: Renderer2D` even though sema has no source
+    /// for the `Renderer2D` class.
+    pub fn run_with_extra_classes<'a>(
+        source: &str,
+        extra_class_names: impl IntoIterator<Item = &'a str>,
+    ) -> Option<Self> {
         let pr = crate::parse::parser::parse(source);
         if !pr.errors.is_empty() {
             return None;
         }
+        let known_classes = build_known_classes(&pr.module, &pr.interner, extra_class_names);
+        let new_symbol = pr.interner.lookup("new");
         // 3-pass inference: pass 1 collects field assignment
         // types, pass 2 records method return types from the
         // field-aware inference, pass 3 emits the final
         // per-expression type map. Single-pass left field
         // references as `Any` because the field hadn't been
         // recorded yet when the use site was visited.
-        let type_env = infer_types(&pr.module);
+        let type_env = infer_types_with_classes(&pr.module, known_classes, new_symbol);
         Some(Analysis {
             module: pr.module,
             interner: pr.interner,
@@ -102,9 +124,47 @@ impl Analysis {
                 self.type_env.get_field_type(class, *field_sym).clone()
             }
             Expr::This => InferredType::Class(self.enclosing_class(byte)?),
+            Expr::Ident(sym) => {
+                // Try sema's per-expr type first; fall back to
+                // the var-decl table when sema didn't connect
+                // the use to its declaration. Keys: sema records
+                // var types by *decl name span*, but Ident uses
+                // are at a different span.
+                let direct = self.type_env.get_expr_type(recv.1.start).clone();
+                if direct.is_known() {
+                    direct
+                } else {
+                    self.local_var_type(byte, *sym)
+                        .unwrap_or(InferredType::Any)
+                }
+            }
             _ => self.type_env.get_expr_type(recv.1.start).clone(),
         };
         ty.is_known().then_some(ty)
+    }
+
+    /// Find the nearest `var <sym>` declaration that's lexically
+    /// in scope at `byte`, and return the type sema recorded for
+    /// it. Walks the AST so the lookup is structure-aware
+    /// (different `var x` in different methods don't collide).
+    fn local_var_type(&self, byte: usize, sym: SymbolId) -> Option<InferredType> {
+        let mut found: Option<usize> = None;
+        for stmt in &self.module {
+            walk_stmt_for_var_decl(stmt, byte, sym, &mut found);
+        }
+        let decl_span = found?;
+        let ty = self.type_env.get_var_type(decl_span).clone();
+        if ty.is_known() {
+            Some(ty)
+        } else {
+            // Sema recorded the var but couldn't pin a type
+            // (e.g. the initializer was a chained call whose
+            // return type wasn't traceable). Re-infer the
+            // initializer's RHS using the field-type table —
+            // covers the `var quad = _quad` shape where the
+            // RHS is itself a typed field.
+            None
+        }
     }
 
     /// Walk the AST to find the receiver expression of the call
@@ -145,6 +205,252 @@ pub fn inferred_to_class_name(ty: &InferredType, interner: &Interner) -> Option<
 
 fn span_contains(span: &Range<usize>, byte: usize) -> bool {
     span.start <= byte && byte < span.end
+}
+
+/// Symbols sema should treat as classes during type inference:
+///
+/// 1. Every `class Foo {...}` in the source.
+/// 2. Every `import "..." for X, Y as Z` — imported names are
+///    almost always classes, and treating them as such gives
+///    `X.new(args) → X` for free.
+/// 3. Every entry in `extra_class_names` whose name is interned
+///    in this source's interner. Hover passes the union of
+///    prelude class names + dep-package class names here so
+///    `Renderer2D`, `Game`, `Num`, `String`, … all resolve.
+fn build_known_classes<'a>(
+    module: &Module,
+    interner: &Interner,
+    extra_class_names: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<SymbolId> {
+    let mut out = std::collections::HashSet::new();
+    for stmt in module {
+        match &stmt.0 {
+            Stmt::Class(decl) => {
+                out.insert(decl.name.0);
+            }
+            Stmt::Import { names, .. } => {
+                for n in names {
+                    let sym = n.alias.as_ref().unwrap_or(&n.name);
+                    out.insert(sym.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    for name in extra_class_names {
+        if let Some(sym) = interner.lookup(name) {
+            out.insert(sym);
+        }
+    }
+    out
+}
+
+/// Find the nearest `var <sym> = ...` decl that's lexically
+/// in scope at `byte`. Out-param is the decl's *name span
+/// start* (the same key sema's TypeEnv uses for var types).
+fn walk_stmt_for_var_decl(
+    stmt: &Spanned<Stmt>,
+    byte: usize,
+    sym: SymbolId,
+    out: &mut Option<usize>,
+) {
+    match &stmt.0 {
+        Stmt::Var { name, initializer, .. } => {
+            // Var must be declared *before* the cursor and at
+            // module level (or in an enclosing block — which
+            // walk_stmt_for_var_decl handles by recursing into
+            // Block / If / While / For below).
+            if name.0 == sym && name.1.start <= byte {
+                *out = Some(name.1.start);
+            }
+            // Still descend into the initializer in case it
+            // contains a closure with its own decls.
+            if let Some(init) = initializer {
+                walk_expr_for_var_decl(init, byte, sym, out);
+            }
+        }
+        Stmt::Class(class) => {
+            for method in &class.methods {
+                // Method parameters declare locals at the
+                // parameter span. Walk the signature first.
+                walk_method_sig_for_var_decl(&method.0.signature, sym, byte, out);
+                if let Some(body) = &method.0.body {
+                    walk_stmt_for_var_decl(body, byte, sym, out);
+                }
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                // Block variables only shadow up to the cursor.
+                walk_stmt_for_var_decl(s, byte, sym, out);
+            }
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr_for_var_decl(condition, byte, sym, out);
+            walk_stmt_for_var_decl(then_branch, byte, sym, out);
+            if let Some(eb) = else_branch {
+                walk_stmt_for_var_decl(eb, byte, sym, out);
+            }
+        }
+        Stmt::While { condition, body } => {
+            walk_expr_for_var_decl(condition, byte, sym, out);
+            walk_stmt_for_var_decl(body, byte, sym, out);
+        }
+        Stmt::For {
+            variable,
+            iterator,
+            body,
+        } => {
+            if variable.0 == sym && variable.1.start <= byte {
+                *out = Some(variable.1.start);
+            }
+            walk_expr_for_var_decl(iterator, byte, sym, out);
+            walk_stmt_for_var_decl(body, byte, sym, out);
+        }
+        Stmt::Expr(e) => walk_expr_for_var_decl(e, byte, sym, out),
+        Stmt::Return(Some(e)) => walk_expr_for_var_decl(e, byte, sym, out),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Import { .. } => {}
+    }
+}
+
+fn walk_expr_for_var_decl(
+    expr: &Spanned<Expr>,
+    byte: usize,
+    sym: SymbolId,
+    out: &mut Option<usize>,
+) {
+    match &expr.0 {
+        Expr::Closure { params, body } => {
+            for p in params {
+                if p.0 == sym && p.1.start <= byte {
+                    *out = Some(p.1.start);
+                }
+            }
+            walk_stmt_for_var_decl(body, byte, sym, out);
+        }
+        Expr::Call {
+            receiver, args, block_arg, ..
+        } => {
+            if let Some(r) = receiver {
+                walk_expr_for_var_decl(r, byte, sym, out);
+            }
+            for a in args {
+                walk_expr_for_var_decl(a, byte, sym, out);
+            }
+            if let Some(b) = block_arg {
+                walk_expr_for_var_decl(b, byte, sym, out);
+            }
+        }
+        Expr::UnaryOp { operand, .. } => walk_expr_for_var_decl(operand, byte, sym, out),
+        Expr::BinaryOp { left, right, .. } | Expr::LogicalOp { left, right, .. } => {
+            walk_expr_for_var_decl(left, byte, sym, out);
+            walk_expr_for_var_decl(right, byte, sym, out);
+        }
+        Expr::Is { value, type_name } => {
+            walk_expr_for_var_decl(value, byte, sym, out);
+            walk_expr_for_var_decl(type_name, byte, sym, out);
+        }
+        Expr::Assign { target, value } | Expr::CompoundAssign { target, value, .. } => {
+            walk_expr_for_var_decl(target, byte, sym, out);
+            walk_expr_for_var_decl(value, byte, sym, out);
+        }
+        Expr::Subscript { receiver, args } => {
+            walk_expr_for_var_decl(receiver, byte, sym, out);
+            for a in args {
+                walk_expr_for_var_decl(a, byte, sym, out);
+            }
+        }
+        Expr::SubscriptSet {
+            receiver,
+            index_args,
+            value,
+        } => {
+            walk_expr_for_var_decl(receiver, byte, sym, out);
+            for a in index_args {
+                walk_expr_for_var_decl(a, byte, sym, out);
+            }
+            walk_expr_for_var_decl(value, byte, sym, out);
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            walk_expr_for_var_decl(condition, byte, sym, out);
+            walk_expr_for_var_decl(then_expr, byte, sym, out);
+            walk_expr_for_var_decl(else_expr, byte, sym, out);
+        }
+        Expr::ListLiteral(items) => {
+            for it in items {
+                walk_expr_for_var_decl(it, byte, sym, out);
+            }
+        }
+        Expr::MapLiteral(pairs) => {
+            for (k, v) in pairs {
+                walk_expr_for_var_decl(k, byte, sym, out);
+                walk_expr_for_var_decl(v, byte, sym, out);
+            }
+        }
+        Expr::Range { from, to, .. } => {
+            walk_expr_for_var_decl(from, byte, sym, out);
+            walk_expr_for_var_decl(to, byte, sym, out);
+        }
+        Expr::Interpolation(parts) => {
+            for p in parts {
+                walk_expr_for_var_decl(p, byte, sym, out);
+            }
+        }
+        Expr::SuperCall { args, .. } => {
+            for a in args {
+                walk_expr_for_var_decl(a, byte, sym, out);
+            }
+        }
+        Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::This
+        | Expr::Ident(_)
+        | Expr::Field(_)
+        | Expr::StaticField(_) => {}
+    }
+}
+
+fn walk_method_sig_for_var_decl(
+    sig: &crate::ast::MethodSig,
+    sym: SymbolId,
+    byte: usize,
+    out: &mut Option<usize>,
+) {
+    use crate::ast::MethodSig::*;
+    let params: &[Spanned<SymbolId>] = match sig {
+        Named { params, .. }
+        | Subscript { params }
+        | Operator { params, .. }
+        | Construct { params, .. } => params,
+        SubscriptSetter { params, value } => {
+            walk_param(value, sym, byte, out);
+            params
+        }
+        Setter { param, .. } => {
+            walk_param(param, sym, byte, out);
+            return;
+        }
+        Getter(_) => return,
+    };
+    for p in params {
+        walk_param(p, sym, byte, out);
+    }
+}
+
+fn walk_param(p: &Spanned<SymbolId>, sym: SymbolId, byte: usize, out: &mut Option<usize>) {
+    if p.0 == sym && p.1.start <= byte {
+        *out = Some(p.1.start);
+    }
 }
 
 fn walk_stmt_for_call<'a>(
@@ -1028,6 +1334,61 @@ class Foo {
         assert_eq!(
             inferred_to_class_name(&ty, &a.interner).as_deref(),
             Some("List")
+        );
+    }
+
+    #[test]
+    fn imported_class_constructor_propagates_to_field() {
+        // The exact shape that broke before: an imported class
+        // (`Sprite`) has its constructor called and the result
+        // assigned to a field. With the imported name in the
+        // class pool, sema infers the field as `Sprite`.
+        let src = r#"
+import "@hatch:gpu" for Sprite
+
+class Slicer {
+  setup(g) {
+    _quad = Sprite.new(g)
+  }
+  draw() {
+    _quad.draw(g)
+  }
+}
+"#;
+        let a = Analysis::run(src).expect("parse + sema");
+        // Cursor on the `_quad` reference inside `draw()`.
+        let cursor = src.find("_quad.draw").unwrap();
+        let ty = a.field_type_at(cursor, "quad").expect("field typed");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("Sprite")
+        );
+    }
+
+    #[test]
+    fn local_assigned_from_field_keeps_class_type() {
+        // `var quad = _quad` where `_quad: Sprite` — the local
+        // should also be `Sprite`. This is the chain the user
+        // hit when `quad.draw(_renderer)` resolved to
+        // `FruitSlicer.draw(g)` instead of `Sprite.draw`.
+        let src = r#"
+import "@hatch:gpu" for Sprite
+
+class Slicer {
+  setup(g) { _quad = Sprite.new(g) }
+  drawAll() {
+    var quad = _quad
+    quad.draw(g)
+  }
+}
+"#;
+        let a = Analysis::run(src).expect("parse + sema");
+        // The receiver of `quad.draw(...)` is the Ident `quad`.
+        let cursor = src.find("quad.draw").unwrap() + "quad.dr".len();
+        let ty = a.receiver_type_for_call_at(cursor).expect("recv typed");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("Sprite")
         );
     }
 }
