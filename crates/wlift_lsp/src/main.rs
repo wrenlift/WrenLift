@@ -35,12 +35,20 @@ struct Document {
     /// line 1 = byte after the first '\n', …). Always has at
     /// least one entry.
     line_starts: Vec<usize>,
+    /// Cached doc model — populated when parse + sema produce a
+    /// usable AST. Used by `textDocument/hover` to look up class /
+    /// method docs without re-parsing.
+    docs: Option<wren_lift::docs::ModuleDoc>,
 }
 
 impl Document {
     fn new(text: String) -> Self {
         let line_starts = compute_line_starts(&text);
-        Self { text, line_starts }
+        Self {
+            text,
+            line_starts,
+            docs: None,
+        }
     }
 
     /// Convert a byte offset into a UTF-16-encoded LSP `Position`.
@@ -67,6 +75,28 @@ impl Document {
             start: self.byte_to_position(span.start),
             end: self.byte_to_position(span.end),
         }
+    }
+
+    /// Convert an LSP `Position` (UTF-16 line + column) into a UTF-8
+    /// byte offset. Inverse of `byte_to_position`.
+    fn position_to_byte(&self, pos: Position) -> usize {
+        let line_idx = (pos.line as usize).min(self.line_starts.len().saturating_sub(1));
+        let line_start = self.line_starts[line_idx];
+        let line_end = self
+            .line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(self.text.len());
+        let line_text = &self.text[line_start..line_end];
+        let mut utf16_left = pos.character as usize;
+        for (byte_off, ch) in line_text.char_indices() {
+            let units = ch.len_utf16();
+            if utf16_left < units {
+                return line_start + byte_off;
+            }
+            utf16_left -= units;
+        }
+        line_end
     }
 }
 
@@ -102,6 +132,7 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -154,28 +185,140 @@ impl LanguageServer for Backend {
             .publish_diagnostics(uri, Vec::new(), None)
             .await;
     }
+
+    async fn hover(&self, p: HoverParams) -> Result<Option<Hover>> {
+        let uri = p.text_document_position_params.text_document.uri;
+        let pos = p.text_document_position_params.position;
+        let Some(doc) = self.docs.get(&uri) else {
+            return Ok(None);
+        };
+        let byte = doc.position_to_byte(pos);
+        let Some(module) = doc.docs.as_ref() else {
+            return Ok(None);
+        };
+        Ok(hover_at(module, byte, &doc))
+    }
+}
+
+/// Find the smallest declaration whose span contains `byte` and
+/// build an LSP `Hover` for it. Returns `None` when the cursor
+/// isn't on any documented decl.
+fn hover_at(
+    module: &wren_lift::docs::ModuleDoc,
+    byte: usize,
+    doc: &Document,
+) -> Option<Hover> {
+    for class in &module.classes {
+        if !contains(&class.span, byte) {
+            continue;
+        }
+        // Cursor inside class body — try the methods first.
+        for member in &class.members {
+            if contains(&member.span, byte) {
+                return Some(member_hover(class, member, doc));
+            }
+        }
+        // Class itself.
+        return Some(class_hover(class, doc));
+    }
+    None
+}
+
+fn contains(span: &std::ops::Range<usize>, byte: usize) -> bool {
+    span.start <= byte && byte < span.end
+}
+
+fn class_hover(class: &wren_lift::docs::ClassDoc, doc: &Document) -> Hover {
+    let mut markdown = format!("```wren\nclass {}\n```\n", class.name);
+    if !class.doc.is_empty() {
+        markdown.push('\n');
+        markdown.push_str(&class.doc);
+    }
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }),
+        range: Some(doc.byte_range_to_lsp(class.span.clone())),
+    }
+}
+
+fn member_hover(
+    class: &wren_lift::docs::ClassDoc,
+    member: &wren_lift::docs::MemberDoc,
+    doc: &Document,
+) -> Hover {
+    let mut markdown = format!(
+        "```wren\n{}.{}\n```\n",
+        class.name, member.signature
+    );
+    if !member.doc.is_empty() {
+        markdown.push('\n');
+        markdown.push_str(&member.doc);
+    }
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: markdown,
+        }),
+        range: Some(doc.byte_range_to_lsp(member.span.clone())),
+    }
 }
 
 impl Backend {
     async fn publish_diagnostics(&self, uri: &Url) {
-        let Some(doc) = self.docs.get(uri) else {
-            return;
+        // Snapshot the source text + clear any prior cached doc
+        // before re-running the pipeline. The collected ModuleDoc
+        // gets written back at the end so the hover handler sees
+        // the freshest version.
+        let text = match self.docs.get(uri) {
+            Some(d) => d.text.clone(),
+            None => return,
         };
-        let pr = parse(&doc.text);
-        let mut diags: Vec<Diagnostic> = pr
-            .errors
-            .iter()
-            .map(|d| translate_diagnostic(&doc, d))
-            .collect();
+        let pr = parse(&text);
 
-        // Only run sema when the parser produced a usable AST. If
-        // parse errored, sema would emit confused follow-on
-        // diagnostics that overwhelm the editor's problem list.
+        // Translate parse errors first.
+        let mut diags: Vec<Diagnostic> = {
+            let doc = self.docs.get(uri).unwrap();
+            pr.errors
+                .iter()
+                .map(|d| translate_diagnostic(&doc, d))
+                .collect()
+        };
+
+        // Only run sema + collect docs when the parser produced a
+        // usable AST. If parse errored, sema would emit confused
+        // follow-on diagnostics that overwhelm the editor's
+        // problem list.
+        let mut module_docs: Option<wren_lift::docs::ModuleDoc> = None;
         if pr.errors.is_empty() {
             let sema = sema_resolve::resolve(&pr.module, &pr.interner);
-            for d in &sema.errors {
-                diags.push(translate_diagnostic(&doc, d));
+            {
+                let doc = self.docs.get(uri).unwrap();
+                for d in &sema.errors {
+                    diags.push(translate_diagnostic(&doc, d));
+                }
             }
+            // Build the doc model from the same parse — feeds the
+            // hover handler.
+            let module_name = uri
+                .path_segments()
+                .and_then(|mut s| s.next_back())
+                .unwrap_or("module")
+                .trim_end_matches(".wren")
+                .to_string();
+            module_docs = Some(wren_lift::docs::collect_module(
+                module_name,
+                &text,
+                &pr.module,
+                &pr.docs,
+                &pr.interner,
+            ));
+        }
+
+        // Write back the doc cache.
+        if let Some(mut entry) = self.docs.get_mut(uri) {
+            entry.docs = module_docs;
         }
 
         self.client
