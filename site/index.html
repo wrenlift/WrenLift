@@ -336,6 +336,91 @@
   }
   .install-alt .pchip:hover { color: var(--ink); border-color: var(--ink); }
 
+  /* ---------- TARGET PLATFORMS ---------- */
+  #targets { padding: 64px 32px 24px; }
+  .targets-grid {
+    max-width: 1180px; margin: 0 auto;
+    display: grid; grid-template-columns: 0.85fr 1.15fr; gap: 56px;
+    align-items: start;
+  }
+  .targets-text .tag {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    color: var(--ink-2);
+    background: var(--shell); border: 1.5px solid var(--ink);
+    padding: 5px 11px; border-radius: 999px;
+    box-shadow: 0 2px 0 var(--ink);
+  }
+  .targets-text .tag .ti { width: 13px; height: 13px; }
+  .targets-text h2 {
+    font-family: var(--display); font-weight: 800;
+    font-size: clamp(32px, 4vw, 44px);
+    letter-spacing: -0.015em;
+    line-height: 1.08;
+    margin: 14px 0 14px;
+    color: var(--ink);
+    text-wrap: balance;
+  }
+  .targets-text h2 em { font-style: italic; color: var(--ember); font-weight: 700; }
+  .targets-text p {
+    font-size: 15.5px; color: var(--ink-2); margin: 0 0 18px;
+    max-width: 460px; line-height: 1.55;
+  }
+  .targets-text p code {
+    font-family: var(--mono); font-size: 0.9em;
+    background: rgba(58,42,24,0.07); padding: 1.5px 6px; border-radius: 5px;
+    color: var(--ink); border: 1px solid rgba(58,42,24,0.1);
+  }
+  .targets-cards {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+  }
+  .target-card {
+    background: var(--shell);
+    border: 2.5px solid var(--ink);
+    border-radius: 16px;
+    padding: 22px 22px 20px;
+    box-shadow: 6px 6px 0 var(--ink);
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .target-card header {
+    display: flex; align-items: center; gap: 10px;
+    font-family: var(--display); font-weight: 800;
+    font-size: 22px; color: var(--ink);
+    letter-spacing: -0.01em;
+  }
+  .target-card header .ti {
+    width: 22px; height: 22px;
+    color: var(--ember); flex-shrink: 0;
+  }
+  .target-card .lede {
+    font-family: var(--mono); font-size: 11px; font-weight: 600;
+    color: var(--ink-2); letter-spacing: 0.03em;
+    text-transform: uppercase;
+    margin: -8px 0 0;
+  }
+  .target-card ul {
+    list-style: none; padding: 0; margin: 0;
+    display: grid; gap: 10px;
+  }
+  .target-card ul li {
+    display: grid; grid-template-columns: 22px 1fr; gap: 12px;
+    font-size: 14px; color: var(--ink-2); line-height: 1.5;
+  }
+  .target-card ul li .ck {
+    width: 20px; height: 20px; border-radius: 6px;
+    background: var(--butter); border: 1.5px solid var(--ink);
+    display: grid; place-items: center; margin-top: 2px;
+    color: var(--ink); flex-shrink: 0;
+  }
+  .target-card ul li .ck svg { width: 12px; height: 12px; }
+  .target-card ul li b { color: var(--ink); font-weight: 700; }
+  .target-card ul li code {
+    font-family: var(--mono); font-size: 0.86em;
+    color: var(--ink); background: rgba(58,42,24,0.07);
+    padding: 1px 5px; border-radius: 4px;
+    border: 1px solid rgba(58,42,24,0.1);
+  }
+
   /* ---------- USE WITH HATCH ---------- */
   #hatch { padding: 56px 32px 24px; }
   .hatch-card {
@@ -702,6 +787,8 @@
     .hero { grid-template-columns: 1fr; padding-bottom: 60px; }
     .mascot-stage { max-width: 460px; margin: 0 auto; }
     .install-grid { grid-template-columns: 1fr; gap: 28px; }
+    .targets-grid { grid-template-columns: 1fr; gap: 28px; }
+    .targets-cards { grid-template-columns: 1fr; }
     .hatch-card { grid-template-columns: 1fr; padding: 36px 28px; }
     .term-float { left: 0; width: 280px; }
     /* Diagnostics + Embed: side-by-side text/code layout collapses
@@ -726,6 +813,7 @@
   </a>
   <div class="nav-links">
     <a href="#install">Install</a>
+    <a href="#targets">Targets</a>
     <a href="#diagnostics">Diagnostics</a>
     <a href="#embed">Embed</a>
     <a href="#hatch">Packages</a>
@@ -830,6 +918,45 @@
         <span>or build from source</span>
         <a class="pchip" href="https://github.com/wrenlift/WrenLift">cargo install --git github.com/wrenlift/WrenLift</a>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- TARGET PLATFORMS -->
+<section id="targets">
+  <div class="targets-grid">
+    <div class="targets-text">
+      <span class="tag"><svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 18 0 9 9 0 0 0-18 0Z"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg> targets</span>
+      <h2>Runs <em>everywhere</em>.</h2>
+      <p>Same source, multiple ABIs. The native build cross-compiles to Linux, Windows, and macOS; the wasm build runs interpreted or tier-up JIT'd in any modern browser. <code>wlift --target wasm</code> swaps the backend.</p>
+    </div>
+
+    <div class="targets-cards">
+      <article class="target-card">
+        <header>
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          Desktop
+        </header>
+        <p class="lede">native runtime · tier-up cranelift JIT</p>
+        <ul>
+          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><b>Linux</b> — <code>x86_64</code>, <code>aarch64</code></span></li>
+          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><b>macOS</b> — Intel + Apple Silicon</span></li>
+          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><b>Windows</b> — <code>x86_64</code></span></li>
+        </ul>
+      </article>
+
+      <article class="target-card">
+        <header>
+          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
+          Web
+        </header>
+        <p class="lede">webassembly · tier-up wasm JIT</p>
+        <ul>
+          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><b>WebAssembly</b> — <code>wasm32-unknown</code></span></li>
+          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><b>Browser</b> — main + worker, WebGPU canvas</span></li>
+          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><b>Async bridges</b> — <code>fetch</code>, <code>setTimeout</code>, <code>WebSocket</code></span></li>
+        </ul>
+      </article>
     </div>
   </div>
 </section>
