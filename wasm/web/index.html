@@ -760,6 +760,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       },
       ".cm-tooltip":{
         padding:"8px",
+        borderRadius: "8px",
         gap: "2"
       },
     }, { dark: true });
@@ -949,14 +950,24 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
 
     async function wrenCompletionSource(ctx) {
       // Pick up the identifier-shaped prefix the user just typed.
-      // `\w*` matches the empty word too — explicit-trigger
-      // (Ctrl-Space) flows still pop the menu when the user
-      // hasn't typed anything yet.
+      // Two trigger flavours:
+      //   1. user is mid-identifier — `\w+` matches; pop menu.
+      //   2. user just typed `.` — empty word at the cursor, but
+      //      the previous char is a dot. Pop a member-access menu
+      //      anchored at the cursor itself (`from = ctx.pos`).
+      // Explicit (Ctrl-Space) always pops.
       const word = ctx.matchBefore(/\w*/);
-      if (!word || (word.from === word.to && !ctx.explicit)) return null;
+      const prevChar = ctx.state.doc.sliceString(Math.max(0, ctx.pos - 1), ctx.pos);
+      const dotTrigger = prevChar === ".";
+      if (!word || (word.from === word.to && !ctx.explicit && !dotTrigger)) return null;
+      // CM6 positions are codepoint-counted; the wasm side wants
+      // a UTF-8 byte offset.
+      const source = ctx.state.doc.toString();
+      const charToByte = buildCharToByteTable(source);
+      const byte = charToByte[Math.min(ctx.pos, charToByte.length - 1)];
       let items = [];
       try {
-        items = await completeWren(ctx.state.doc.toString()) || [];
+        items = await completeWren(source, byte) || [];
       } catch {
         return null;
       }

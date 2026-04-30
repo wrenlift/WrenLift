@@ -308,9 +308,12 @@ fn identifier_hover(
     doc: &Document,
     byte: usize,
 ) -> Option<Hover> {
-    let span = identifier_at(&doc.text, byte)?;
+    let span = wren_lift::docs::hover::identifier_at(&doc.text, byte)?;
     let ident = doc.text.get(span.clone())?;
-    let receiver = receiver_before(&doc.text, span.start);
+    if wren_lift::docs::hover::is_keyword(ident) {
+        return None;
+    }
+    let receiver = wren_lift::docs::hover::receiver_before(&doc.text, span.start);
 
     let mut all: Vec<&wren_lift::docs::ModuleDoc> =
         wren_lift::docs::prelude_docs().iter().collect();
@@ -346,7 +349,7 @@ fn identifier_hover(
                 if member.name == ident {
                     let body = format!(
                         "```wren\n{}\n```{}{}",
-                        format_member_sig(&class.name, &member.signature),
+                        wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                         if member.doc.is_empty() { "" } else { "\n\n" },
                         member.doc,
                     );
@@ -375,7 +378,7 @@ fn identifier_hover(
                     if member.name == ident {
                         let body = format!(
                             "```wren\n{}\n```{}{}",
-                            format_member_sig(&class.name, &member.signature),
+                            wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                             if member.doc.is_empty() { "" } else { "\n\n" },
                             member.doc,
                         );
@@ -407,7 +410,7 @@ fn identifier_hover(
                         if member.name == ident {
                             let body = format!(
                                 "```wren\n{}\n```{}{}",
-                                format_member_sig(&class.name, &member.signature),
+                                wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                                 if member.doc.is_empty() { "" } else { "\n\n" },
                                 member.doc,
                             );
@@ -443,7 +446,12 @@ fn identifier_hover(
     // Pass 3 — identifier-kind classifier. Surfaces a brief
     // "field / local / parameter" hint when nothing else
     // matches so hover always says something useful.
-    let (signature, body_text) = identifier_kind_hint(&doc.text, ident, span.start)?;
+    let (signature, body_text) = wren_lift::docs::hover::identifier_kind_hint(
+        &doc.text,
+        ident,
+        span.start,
+        wren_lift::docs::prelude_docs(),
+    )?;
     let body_md = format!(
         "```wren\n{}\n```{}{}",
         signature,
@@ -459,104 +467,16 @@ fn identifier_hover(
     })
 }
 
-/// Same shape as `wasm/src/lib.rs::identifier_kind_hint`.
-/// Returns (signature, body). Body is empty for the
-/// signature-only buckets (fields, generic fallback) so we
-/// don't ship template boilerplate on every hover.
-fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<(String, String)> {
-    if ident.starts_with("__") {
-        return Some((format!("static field {}", ident), String::new()));
-    }
-    if ident.starts_with('_') {
-        return Some((format!("instance field {}", ident), String::new()));
-    }
-    if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-        return Some((
-            format!("class {}", ident),
-            "Likely imported from an `@hatch:*` package whose docs the workspace hasn't loaded.".into(),
-        ));
-    }
-    if let Some(decl_line) = find_var_decl_line(source, ident, byte) {
-        return Some((
-            format!("local {}", ident),
-            format!(
-                "Declared on line {}:\n\n```wren\n{}\n```",
-                decl_line.0,
-                decl_line.1.trim()
-            ),
-        ));
-    }
-    Some((format!("identifier {}", ident), String::new()))
-}
-
-fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {
-    let prefix = source.get(..byte)?;
-    let mut line_no = prefix.matches('\n').count() + 1;
-    for line in prefix.rsplit('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("var ") {
-            let after = &trimmed["var ".len()..];
-            let after = after.trim_start();
-            if after.starts_with(ident) {
-                let tail = &after[ident.len()..];
-                if tail.is_empty()
-                    || tail.starts_with('=')
-                    || tail.starts_with(',')
-                    || tail.starts_with(' ')
-                {
-                    return Some((line_no, line.to_string()));
-                }
-            }
-        }
-        if line_no > 1 {
-            line_no -= 1;
-        }
-    }
-    None
-}
-
-/// Identifier sitting immediately before a `.` at `before_byte`.
-/// Mirrors `wasm/src/lib.rs::receiver_before`.
-fn receiver_before(source: &str, before_byte: usize) -> Option<&str> {
-    let bytes = source.as_bytes();
-    if before_byte == 0 {
-        return None;
-    }
-    let mut i = before_byte;
-    while i > 0 && bytes[i - 1] == b' ' {
-        i -= 1;
-    }
-    if i == 0 || bytes[i - 1] != b'.' {
-        return None;
-    }
-    i -= 1;
-    while i > 0 && bytes[i - 1] == b' ' {
-        i -= 1;
-    }
-    let recv_end = i;
-    while i > 0 {
-        let b = bytes[i - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' {
-            i -= 1;
-        } else {
-            break;
-        }
-    }
-    if i == recv_end {
-        return None;
-    }
-    if bytes[i].is_ascii_digit() {
-        return None;
-    }
-    Some(&source[i..recv_end])
-}
 
 /// Identifier-under-cursor lookup against the runtime prelude
 /// stubs. Mirrors `hover_wren`'s prelude path so the desktop LSP
 /// answers the same questions as the playground.
 fn prelude_hover(doc: &Document, byte: usize) -> Option<Hover> {
-    let span = identifier_at(&doc.text, byte)?;
+    let span = wren_lift::docs::hover::identifier_at(&doc.text, byte)?;
     let ident = doc.text.get(span.clone())?;
+    if wren_lift::docs::hover::is_keyword(ident) {
+        return None;
+    }
     for prelude_module in wren_lift::docs::prelude_docs() {
         for class in &prelude_module.classes {
             if class.name == ident {
@@ -578,7 +498,7 @@ fn prelude_hover(doc: &Document, byte: usize) -> Option<Hover> {
                 if member.name == ident {
                     let body = format!(
                         "```wren\n{}\n```{}{}",
-                        format_member_sig(&class.name, &member.signature),
+                        wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                         if member.doc.is_empty() { "" } else { "\n\n" },
                         member.doc,
                     );
@@ -594,34 +514,6 @@ fn prelude_hover(doc: &Document, byte: usize) -> Option<Hover> {
         }
     }
     None
-}
-
-fn identifier_at(source: &str, byte: usize) -> Option<std::ops::Range<usize>> {
-    let bytes = source.as_bytes();
-    let len = bytes.len();
-    if byte > len {
-        return None;
-    }
-    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let pivot = if byte < len && is_id(bytes[byte]) {
-        byte
-    } else if byte > 0 && is_id(bytes[byte - 1]) {
-        byte - 1
-    } else {
-        return None;
-    };
-    let mut start = pivot;
-    while start > 0 && is_id(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut end = pivot + 1;
-    while end < len && is_id(bytes[end]) {
-        end += 1;
-    }
-    if bytes[start].is_ascii_digit() {
-        return None;
-    }
-    Some(start..end)
 }
 
 impl Backend {
@@ -777,7 +669,7 @@ fn member_hover(
 ) -> Hover {
     let mut markdown = format!(
         "```wren\n{}\n```\n",
-        format_member_sig(&class.name, &member.signature)
+        wren_lift::docs::hover::format_member_sig(&class.name, &member.signature)
     );
     if !member.doc.is_empty() {
         markdown.push('\n');
@@ -789,19 +681,6 @@ fn member_hover(
             value: markdown,
         }),
         range: Some(doc.byte_range_to_lsp(member.span.clone())),
-    }
-}
-
-/// Same helper the wasm shim uses — hoists the `static `/
-/// `construct ` prefix to the front of the qualified name so
-/// hover text reads naturally.
-fn format_member_sig(class_name: &str, signature: &str) -> String {
-    if let Some(rest) = signature.strip_prefix("static ") {
-        format!("static {}.{}", class_name, rest)
-    } else if let Some(rest) = signature.strip_prefix("construct ") {
-        format!("{}.{}", class_name, rest)
-    } else {
-        format!("{}.{}", class_name, signature)
     }
 }
 

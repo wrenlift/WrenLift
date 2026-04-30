@@ -193,14 +193,17 @@ export async function hoverWren(source, byte) {
   return m.hover_wren(source, byte);
 }
 
-/// Completion suggestions for `source`. Returns a flat array of
-/// every class + member declared in the file —
-/// `{ label, kind, detail }` — for the editor's autocomplete
-/// extension to fuzzy-filter against. Empty array when the parser
-/// errors (we don't return half-truths from a half-parsed module).
-export async function completeWren(source) {
+/// Completion suggestions for `source` at `byte` (UTF-8 offset).
+/// Context-aware: after a `<Receiver>.` the result is restricted
+/// to that class's members (or a deduped pool when the receiver
+/// isn't a known class); at top level only class names come back
+/// since bare methods (`print`, `count`) aren't valid identifiers
+/// in Wren. Each entry: `{ label, kind, detail, doc }`. Empty
+/// array when the parser errors (no half-truths from a half-
+/// parsed module).
+export async function completeWren(source, byte) {
   const m = await getMod();
-  return m.complete_wren(source);
+  return m.complete_wren(source, byte | 0);
 }
 
 // Map a parsed git remote URL to the host's release-asset URL
@@ -350,6 +353,13 @@ export async function resolveDepsFromManifest(
 ) {
   const order = [];                  // Uint8Array[] in install order
   const seen = new Set();            // package names already queued
+  // Drop any docs cached from a previous resolution so a
+  // removed dep doesn't keep showing up in hover. Each visit
+  // re-registers what's actually in the new dep set.
+  try {
+    const m = await getMod();
+    if (m.clear_hatch_docs) m.clear_hatch_docs();
+  } catch { /* nothing to clear yet */ }
   await visit(manifest, true);
   return order;
 
@@ -391,6 +401,14 @@ export async function resolveDepsFromManifest(
       const childManifest = await peekManifest(bytes);
       await visit(childManifest, false);
       order.push(bytes);
+      // Register the bundle's source-section docs in the
+      // workspace cache so hover / completion can find
+      // imported `@hatch:foo` symbols. Best-effort — failure
+      // here doesn't block the actual install.
+      try {
+        const m = await getMod();
+        if (m.register_hatch_docs) m.register_hatch_docs(bytes);
+      } catch (e) { /* swallow — docs are nice-to-have */ }
     }
   }
 }

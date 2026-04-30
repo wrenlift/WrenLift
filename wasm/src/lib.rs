@@ -963,7 +963,7 @@ pub fn lint_wren(source: &str) -> JsValue {
         out.extend(sema.errors.iter().map(diag_to_lint));
     }
     out.serialize(&json_serializer())
-        .unwrap_or_else(|_| JsValue::from_str("[]"))
+        .unwrap_or_else(|_| js_sys::Array::new().into())
 }
 
 #[derive(serde::Serialize)]
@@ -985,8 +985,9 @@ struct LintDiag {
 /// kinds: "class" | "method" | "static-method" | "getter" |
 /// "setter" | "constructor".
 #[wasm_bindgen]
-pub fn complete_wren(source: &str) -> JsValue {
+pub fn complete_wren(source: &str, byte: usize) -> JsValue {
     use serde::Serialize;
+    use std::collections::HashSet;
     #[derive(Serialize)]
     struct Item {
         label: String,
@@ -995,61 +996,199 @@ pub fn complete_wren(source: &str) -> JsValue {
         doc: String,
     }
 
+    // Mid-typing source almost always has parse errors
+    // (`String.` alone, an unclosed brace, etc.). We *don't*
+    // bail in that case — the prelude + dep docs are still
+    // valid and the user wants suggestions while editing. The
+    // local module's class list comes from a best-effort
+    // collect, and may be empty when the parse failed.
     let pr = wren_lift::parse::parser::parse(source);
-    if !pr.errors.is_empty() {
-        // Half-parsed source produces noisy / wrong completions.
-        // Stay silent until the parser is happy with the AST.
-        return JsValue::from_str("[]");
-    }
-    let module = wren_lift::docs::collect_module(
-        "module",
-        source,
-        &pr.module,
-        &pr.docs,
-        &pr.interner,
-    );
-
-    let mut out: Vec<Item> = Vec::new();
-    let mut emit_class = |class: &wren_lift::docs::ClassDoc, items: &mut Vec<Item>| {
-        items.push(Item {
-            label: class.name.clone(),
-            kind: "class",
-            detail: class.summary().to_string(),
-            doc: class.doc.clone(),
-        });
-        for member in &class.members {
-            let kind = match member.kind {
-                wren_lift::docs::MemberKind::Method => "method",
-                wren_lift::docs::MemberKind::StaticMethod => "static-method",
-                wren_lift::docs::MemberKind::Getter => "getter",
-                wren_lift::docs::MemberKind::Setter => "setter",
-                wren_lift::docs::MemberKind::Constructor => "constructor",
-                wren_lift::docs::MemberKind::Field => "field",
-            };
-            items.push(Item {
-                label: member.name.clone(),
-                kind,
-                detail: member.signature.clone(),
-                doc: member.doc.clone(),
-            });
-        }
+    let local_module = if pr.errors.is_empty() {
+        Some(wren_lift::docs::collect_module(
+            "module",
+            source,
+            &pr.module,
+            &pr.docs,
+            &pr.interner,
+        ))
+    } else {
+        None
     };
 
-    // Local module first (so a user-defined `Foo` shadows a
-    // prelude class of the same name in the dropdown).
-    for class in &module.classes {
-        emit_class(class, &mut out);
+    // Build the lookup pool in priority order: local module
+    // (if it parsed), installed `@hatch:*` deps, then the prelude.
+    let dep_modules = dep_docs_snapshot();
+    let mut pool: Vec<&wren_lift::docs::ModuleDoc> = Vec::new();
+    if let Some(m) = local_module.as_ref() {
+        pool.push(m);
     }
-    // Then the prelude — System / Num / String / List / Map /
-    // Fiber / Fn — so the user gets `print`, `count`, `add`, etc.
-    // in the same fuzzy-search list as their own decls.
-    for prelude_module in wren_lift::docs::prelude_docs() {
-        for class in &prelude_module.classes {
-            emit_class(class, &mut out);
+    for m in &dep_modules {
+        pool.push(m);
+    }
+    for m in wren_lift::docs::prelude_docs() {
+        pool.push(m);
+    }
+
+    let kind_of = |k: wren_lift::docs::MemberKind| match k {
+        wren_lift::docs::MemberKind::Method => "method",
+        wren_lift::docs::MemberKind::StaticMethod => "static-method",
+        wren_lift::docs::MemberKind::Getter => "getter",
+        wren_lift::docs::MemberKind::Setter => "setter",
+        wren_lift::docs::MemberKind::Constructor => "constructor",
+        wren_lift::docs::MemberKind::Field => "field",
+    };
+
+    let mut out: Vec<Item> = Vec::new();
+
+    // Detect the receiver immediately before the cursor: a bare
+    // identifier preceding a `.` in `recv.partial`. Drives the
+    // member-access vs top-level branch below.
+    //
+    // CM6 hands us a byte that's either at the dot, just after it,
+    // or anywhere inside the partially-typed member name. Walk
+    // back past the in-progress identifier first, then look for
+    // the receiver.
+    let bytes = source.as_bytes();
+    let id_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut probe = byte.min(bytes.len());
+    while probe > 0 && id_byte(bytes[probe - 1]) {
+        probe -= 1;
+    }
+    let receiver = wren_lift::docs::hover::receiver_before(source, probe);
+
+    if let Some(recv) = receiver {
+        // Member-access completion. Restrict to the receiver's
+        // class when we recognise it; otherwise dedup *every*
+        // class's members by name so the dropdown isn't a
+        // jumble of duplicates (`Fn.call`, `List.call`-shaped
+        // overloads, etc.). Each class+member pair contributes
+        // at most one entry (the first signature seen).
+        let receiver_is_class = recv.chars().next().map_or(false, |c| c.is_ascii_uppercase());
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for m in &pool {
+            for class in &m.classes {
+                if receiver_is_class && class.name != recv {
+                    continue;
+                }
+                for member in &class.members {
+                    let key = (class.name.clone(), member.name.clone());
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    out.push(Item {
+                        label: member.name.clone(),
+                        kind: kind_of(member.kind),
+                        detail: wren_lift::docs::hover::format_member_sig(
+                            &class.name,
+                            &member.signature,
+                        ),
+                        doc: member.doc.clone(),
+                    });
+                }
+            }
+        }
+    } else {
+        // Top-level completion: only classes are valid as bare
+        // identifiers. Bare method names (`print`, `count`,
+        // `add`) wouldn't compile outside a `Receiver.method`
+        // call, so we don't surface them — they're noise here.
+        let mut seen: HashSet<String> = HashSet::new();
+        for m in &pool {
+            for class in &m.classes {
+                if !seen.insert(class.name.clone()) {
+                    continue;
+                }
+                out.push(Item {
+                    label: class.name.clone(),
+                    kind: "class",
+                    detail: class.summary().to_string(),
+                    doc: class.doc.clone(),
+                });
+            }
         }
     }
+
     out.serialize(&json_serializer())
-        .unwrap_or_else(|_| JsValue::from_str("[]"))
+        .unwrap_or_else(|_| js_sys::Array::new().into())
+}
+
+/// Workspace-level cache of installed `@hatch:*` package docs.
+/// Populated by `register_hatch_docs(bundle_bytes)` from the
+/// playground / LSP side after each bundle fetch; consulted by
+/// `hover_wren` / `complete_wren` after local + prelude misses.
+///
+/// Keyed by package name (`"@hatch:gpu"` etc.) so re-registering
+/// the same package overwrites the previous entry instead of
+/// stacking duplicates.
+fn dep_docs() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<wren_lift::docs::ModuleDoc>>> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Vec<wren_lift::docs::ModuleDoc>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Visit every cached dep `ModuleDoc`. Snapshots a clone so the
+/// lock isn't held across the iteration.
+fn dep_docs_snapshot() -> Vec<wren_lift::docs::ModuleDoc> {
+    let cache = match dep_docs().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    cache.values().flatten().cloned().collect()
+}
+
+/// Register a fetched `.hatch` bundle's docs in the workspace
+/// cache. Returns the package name on success, or null on
+/// parse / load failure.
+///
+/// Called from the playground's dep walker (and the desktop
+/// LSP later) after each bundle fetch — every consumer that
+/// touches `@hatch:foo` then sees `Foo.method` hovers with the
+/// package's authored docs.
+#[wasm_bindgen]
+pub fn register_hatch_docs(bundle_bytes: &[u8]) -> JsValue {
+    let hatch = match wren_lift::hatch::load(bundle_bytes) {
+        Ok(h) => h,
+        Err(_) => return JsValue::NULL,
+    };
+    let pkg_name = hatch.manifest.name.clone();
+    let mut modules = Vec::new();
+    for section in &hatch.sections {
+        if !matches!(section.kind, wren_lift::hatch::SectionKind::Source) {
+            continue;
+        }
+        let source = match std::str::from_utf8(&section.data) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let pr = wren_lift::parse::parser::parse(source);
+        // Skip modules the parser can't handle — better to lose
+        // a few sections' docs than blow up the whole register.
+        if !pr.errors.is_empty() {
+            continue;
+        }
+        modules.push(wren_lift::docs::collect_module(
+            section.name.clone(),
+            source,
+            &pr.module,
+            &pr.docs,
+            &pr.interner,
+        ));
+    }
+    if let Ok(mut cache) = dep_docs().lock() {
+        cache.insert(pkg_name.clone(), modules);
+    }
+    JsValue::from_str(&pkg_name)
+}
+
+/// Drop every entry from the dep-docs cache. Called by the
+/// playground when the user changes the hatchfile so a removed
+/// dep doesn't keep showing up in hover.
+#[wasm_bindgen]
+pub fn clear_hatch_docs() {
+    if let Ok(mut cache) = dep_docs().lock() {
+        cache.clear();
+    }
 }
 
 /// Hover content for `source` at UTF-8 byte offset `byte`.
@@ -1087,16 +1226,34 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
     // this, `Renderer2D.new` would match FruitSlicer's `new`
     // constructor first because both classes register a `new`
     // method and the local module wins the iteration order.
-    if let Some(ident_span) = identifier_at(source, byte) {
+    if let Some(ident_span) = wren_lift::docs::hover::identifier_at(source, byte) {
         let ident = &source[ident_span.clone()];
-        let receiver = receiver_before(source, ident_span.start);
+        // Wren keywords are not hoverable. The lexer recognises
+        // them as syntax tokens, not identifiers — surfacing
+        // "identifier var" on hover would just be wrong.
+        if wren_lift::docs::hover::is_keyword(ident) {
+            return JsValue::NULL;
+        }
+        let receiver = wren_lift::docs::hover::receiver_before(source, ident_span.start);
 
         // Class-name hover (the cursor lands on a name that's
         // itself a known class). Same priority as the receiver
         // case — identity-class hits skip the receiver gating.
-        let mut all_modules: Vec<&wren_lift::docs::ModuleDoc> =
-            wren_lift::docs::prelude_docs().iter().collect();
-        all_modules.insert(0, &module);
+        //
+        // Lookup pool, in order:
+        //   1. the local module (highest priority)
+        //   2. installed `@hatch:*` package docs (registered
+        //      from JS via `register_hatch_docs`)
+        //   3. the prelude
+        let dep_modules = dep_docs_snapshot();
+        let mut all_modules: Vec<&wren_lift::docs::ModuleDoc> = Vec::new();
+        all_modules.push(&module);
+        for m in &dep_modules {
+            all_modules.push(m);
+        }
+        for m in wren_lift::docs::prelude_docs() {
+            all_modules.push(m);
+        }
 
         if receiver.is_none() {
             for m in &all_modules {
@@ -1122,7 +1279,7 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                 for member in &class.members {
                     if member.name == ident {
                         return hover_out(
-                            &format_member_sig(&class.name, &member.signature),
+                            &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                             &member.doc,
                             ident_span.start,
                             ident_span.end,
@@ -1148,7 +1305,7 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                     for member in &class.members {
                         if member.name == ident {
                             return hover_out(
-                                &format_member_sig(&class.name, &member.signature),
+                                &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                                 &member.doc,
                                 ident_span.start,
                                 ident_span.end,
@@ -1175,7 +1332,7 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                         for member in &class.members {
                             if member.name == ident {
                                 return hover_out(
-                                    &format_member_sig(&class.name, &member.signature),
+                                    &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                                     &member.doc,
                                     ident_span.start,
                                     ident_span.end,
@@ -1206,13 +1363,13 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         // parameters, and fields don't appear in the docs
         // model — surface a brief "declared at line N" hint
         // so hover-on-anything-named always says something.
-        if let Some(hint) = identifier_kind_hint(source, ident, ident_span.start) {
-            return hover_out(
-                &hint.signature,
-                &hint.body,
-                ident_span.start,
-                ident_span.end,
-            );
+        if let Some((signature, body)) = wren_lift::docs::hover::identifier_kind_hint(
+            source,
+            ident,
+            ident_span.start,
+            wren_lift::docs::prelude_docs(),
+        ) {
+            return hover_out(&signature, &body, ident_span.start, ident_span.end);
         }
     }
 
@@ -1227,7 +1384,7 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         for member in &class.members {
             if member.span.start <= byte && byte < member.span.end {
                 return hover_out(
-                    &format_member_sig(&class.name, &member.signature),
+                    &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                     &member.doc,
                     member.span.start,
                     member.span.end,
@@ -1245,390 +1402,6 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
     JsValue::NULL
 }
 
-/// Identifier-kind hint produced when class / member lookup
-/// misses. Three buckets:
-///
-/// * `_name`   → instance field
-/// * `__name`  → static field
-/// * lowercase → local var (search back for `var name`) or
-///   method parameter (look at the enclosing `name(args)` line)
-///
-/// Each path returns a one-line signature + a short body that
-/// mirrors the doc-model `MemberDoc` shape, so the same hover
-/// renderer can surface it without a separate template.
-struct IdentKind {
-    signature: String,
-    body: String,
-}
-
-fn identifier_kind_hint(source: &str, ident: &str, byte: usize) -> Option<IdentKind> {
-    // Fields (instance + static). Signature only — until we
-    // model field docs, the body would just be boilerplate
-    // template text on every hover, which is noise.
-    if ident.starts_with("__") {
-        return Some(IdentKind {
-            signature: format!("static field {}", ident),
-            body: String::new(),
-        });
-    }
-    if ident.starts_with('_') {
-        return Some(IdentKind {
-            signature: format!("instance field {}", ident),
-            body: String::new(),
-        });
-    }
-
-    // Class-shaped identifier (uppercase first char) that didn't
-    // resolve to a local class or prelude entry. The body here
-    // *is* useful — it tells the user the name resolved to a
-    // class shape but the docs weren't loaded yet.
-    if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-        return Some(IdentKind {
-            signature: format!("class {}", ident),
-            body: "Likely imported from an `@hatch:*` package whose docs the workspace hasn't loaded.".into(),
-        });
-    }
-
-    // Local: surface the declaring line — that's real info, not
-    // boilerplate.
-    if let Some(decl_line) = find_var_decl_line(source, ident, byte) {
-        // Try to infer the local's type from the RHS of the
-        // `var <ident> = <expr>` decl — string/number/bool/null
-        // literals, list/map literals, and `Class.new(...)` /
-        // `Class.staticMethod(...)` calls whose @returns we
-        // know about.
-        let rhs = decl_rhs(decl_line.1.trim());
-        let ty = rhs.and_then(|r| infer_rhs_type(r));
-        let signature = match &ty {
-            Some(t) => format!("local {}: {}", ident, t),
-            None => format!("local {}", ident),
-        };
-        return Some(IdentKind {
-            signature,
-            body: format!(
-                "Declared on line {}:\n\n```wren\n{}\n```",
-                decl_line.0,
-                decl_line.1.trim()
-            ),
-        });
-    }
-
-    // Generic fallback — signature only.
-    Some(IdentKind {
-        signature: format!("identifier {}", ident),
-        body: String::new(),
-    })
-}
-
-/// Pull the right-hand side of a `var name = <rhs>` line.
-/// Returns the trimmed expression text; `None` for var decls
-/// without an initializer.
-fn decl_rhs(line: &str) -> Option<&str> {
-    let after_var = line.trim_start().strip_prefix("var ")?;
-    let eq = after_var.find('=')?;
-    Some(after_var[eq + 1..].trim())
-}
-
-/// Best-effort type inference from a var-decl's RHS expression.
-/// Recognised shapes (in order):
-///
-/// * `"..."`         → `String`
-/// * `42` / `-3.1`   → `Num`
-/// * `true`/`false`  → `Bool`
-/// * `null`          → `Null`
-/// * `[...]`         → `List`
-/// * `{...}`         → `Map`
-/// * `Class.new(...)`              → `Class`
-/// * `Class.staticMethod(...)`     → method's `@returns {Type}` if we have docs
-/// * anything else                 → `None`
-fn infer_rhs_type(rhs: &str) -> Option<String> {
-    let r = rhs.trim_start();
-    let first = r.chars().next()?;
-    match first {
-        '"' => return Some("String".into()),
-        '\'' => return Some("String".into()),
-        '[' => return Some("List".into()),
-        '{' => return Some("Map".into()),
-        '0'..='9' => return Some("Num".into()),
-        '-' => {
-            // Negative number literal: `-` followed by a digit.
-            if r.chars().nth(1).map_or(false, |c| c.is_ascii_digit()) {
-                return Some("Num".into());
-            }
-        }
-        _ => {}
-    }
-    if r.starts_with("true") || r.starts_with("false") {
-        return Some("Bool".into());
-    }
-    if r.starts_with("null") {
-        return Some("Null".into());
-    }
-    // `Class.method(...)` shape — read class + method name.
-    let dot = r.find('.')?;
-    let class_name = r[..dot].trim();
-    if class_name.is_empty() || !class_name.chars().next()?.is_ascii_uppercase() {
-        return None;
-    }
-    let after_dot = &r[dot + 1..];
-    let mut name_end = 0;
-    for (i, ch) in after_dot.char_indices() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            name_end = i + ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-    if name_end == 0 {
-        return None;
-    }
-    let method_name = &after_dot[..name_end];
-    // Constructor: any `new(...)` call returns the class itself.
-    let mut base_type = if method_name == "new" {
-        Some(class_name.to_string())
-    } else {
-        // Static-method call: look up the method's @returns
-        // annotation in our docs model.
-        let mut found: Option<String> = None;
-        for module in wren_lift::docs::prelude_docs() {
-            for class in &module.classes {
-                if class.name != class_name {
-                    continue;
-                }
-                for member in &class.members {
-                    if member.name == method_name {
-                        found = member.return_type.clone();
-                    }
-                }
-            }
-        }
-        found
-    };
-
-    // Walk any trailing chain — `.await`, `.something`, etc. —
-    // and update the inferred type as we recognise links.
-    let mut tail = after_dot[name_end..].trim_start();
-    // Skip a parenthesised arg list (`(...)`) — it's part of
-    // the call we already attributed to `method_name`.
-    if tail.starts_with('(') {
-        let mut depth = 0;
-        let mut bytes = tail.bytes().enumerate();
-        let close = loop {
-            match bytes.next() {
-                Some((i, b'(')) => depth += 1,
-                Some((i, b')')) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break Some(i);
-                    }
-                }
-                Some(_) => {}
-                None => break None,
-            }
-        };
-        if let Some(end) = close {
-            tail = tail[end + 1..].trim_start();
-        }
-    }
-    while tail.starts_with('.') {
-        let after = tail[1..].trim_start();
-        let mut len = 0;
-        for (i, ch) in after.char_indices() {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                len = i + ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if len == 0 {
-            break;
-        }
-        let chained = &after[..len];
-        // Update base_type for known await-style transformations.
-        base_type = match (base_type.as_deref(), chained) {
-            (Some("ByteFuture"), "await") => Some("ByteArray".into()),
-            (Some("Future"), "await") => Some("Object".into()),
-            // Unknown chain — keep the previous type. A real
-            // resolver would walk member return types here.
-            _ => base_type,
-        };
-        // Skip a `(...)` arg list if the chained name is a
-        // method call rather than a getter.
-        let mut rest = after[len..].trim_start();
-        if rest.starts_with('(') {
-            let mut depth = 0;
-            let close = rest.bytes().enumerate().find_map(|(i, b)| match b {
-                b'(' => {
-                    depth += 1;
-                    None
-                }
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            });
-            if let Some(end) = close {
-                rest = rest[end + 1..].trim_start();
-            } else {
-                break;
-            }
-        }
-        tail = rest;
-    }
-    base_type
-}
-
-/// Search the whole file for the closest `var <ident>` decl —
-/// preferring matches *before* the cursor (in-scope at the
-/// cursor) but falling back to matches *after* it so hovers in
-/// preceding comments / docstrings still resolve.
-fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usize, String)> {
-    let mut backward: Option<(usize, String)> = None;
-    let mut forward: Option<(usize, String)> = None;
-    for (idx, line) in source.lines().enumerate() {
-        let line_no = idx + 1;
-        if !line_matches_var_decl(line, ident) {
-            continue;
-        }
-        // Compute the line's start byte to compare against the
-        // cursor.
-        let line_start = source
-            .lines()
-            .take(idx)
-            .map(|l| l.len() + 1) // +1 for the '\n'
-            .sum::<usize>();
-        if line_start <= byte {
-            // Most-recent backward match: keep overwriting so we
-            // end up with the closest decl <= cursor.
-            backward = Some((line_no, line.to_string()));
-        } else if forward.is_none() {
-            // First match after the cursor — used as fallback
-            // when no backward decl exists.
-            forward = Some((line_no, line.to_string()));
-        }
-    }
-    backward.or(forward)
-}
-
-fn line_matches_var_decl(line: &str, ident: &str) -> bool {
-    let trimmed = line.trim_start();
-    let after = match trimmed.strip_prefix("var ") {
-        Some(s) => s.trim_start(),
-        None => return false,
-    };
-    if !after.starts_with(ident) {
-        return false;
-    }
-    let tail = &after[ident.len()..];
-    tail.is_empty()
-        || tail.starts_with('=')
-        || tail.starts_with(',')
-        || tail.starts_with(' ')
-}
-
-/// Identifier sitting immediately before a `.` at `before_byte`.
-/// Used to detect receiver expressions (`Renderer2D` in
-/// `Renderer2D.new`) so the hover lookup can restrict member
-/// matches to the receiver's class instead of taking the first
-/// hit from any class with the same method name.
-///
-/// Returns `None` when there's no `.` directly before the
-/// position, the receiver isn't a bare identifier, or the
-/// receiver is a literal (number / string).
-fn receiver_before(source: &str, before_byte: usize) -> Option<&str> {
-    let bytes = source.as_bytes();
-    if before_byte == 0 {
-        return None;
-    }
-    // Skip whitespace between the receiver and the `.`. Allows
-    // `Foo .bar` but in practice we just need the `.` directly
-    // before the cursor's identifier.
-    let mut i = before_byte;
-    while i > 0 && bytes[i - 1] == b' ' {
-        i -= 1;
-    }
-    if i == 0 || bytes[i - 1] != b'.' {
-        return None;
-    }
-    i -= 1; // step past the `.`
-    while i > 0 && bytes[i - 1] == b' ' {
-        i -= 1;
-    }
-    let recv_end = i;
-    while i > 0 {
-        let b = bytes[i - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' {
-            i -= 1;
-        } else {
-            break;
-        }
-    }
-    if i == recv_end {
-        return None; // no identifier found
-    }
-    if bytes[i].is_ascii_digit() {
-        return None; // numeric literal — receiver-by-class doesn't apply
-    }
-    Some(&source[i..recv_end])
-}
-
-/// Walk back / forward from `byte` to find an identifier-shaped
-/// run (`[A-Za-z_][A-Za-z0-9_]*`). Returns the byte range or
-/// `None` when the cursor isn't on an identifier.
-fn identifier_at(source: &str, byte: usize) -> Option<std::ops::Range<usize>> {
-    let bytes = source.as_bytes();
-    let len = bytes.len();
-    if byte > len {
-        return None;
-    }
-    let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    // If `byte` sits between two identifiers (e.g. on a `.`),
-    // prefer the one to the left so hover-on-`.` still works.
-    let pivot = if byte < len && is_id(bytes[byte]) {
-        byte
-    } else if byte > 0 && is_id(bytes[byte - 1]) {
-        byte - 1
-    } else {
-        return None;
-    };
-    let mut start = pivot;
-    while start > 0 && is_id(bytes[start - 1]) {
-        start -= 1;
-    }
-    let mut end = pivot + 1;
-    while end < len && is_id(bytes[end]) {
-        end += 1;
-    }
-    // Reject if the run starts with a digit — then it's a number
-    // literal, not an identifier.
-    if bytes[start].is_ascii_digit() {
-        return None;
-    }
-    Some(start..end)
-}
-
-/// Glue a class name to a member signature for hover display.
-/// The collector encodes static-ness as a `static ` prefix on
-/// the signature; hoist that to the front of the rendered string
-/// so we get `static Class.method(args)` rather than the
-/// nonsensical `Class.static method(args)`.
-fn format_member_sig(class_name: &str, signature: &str) -> String {
-    if let Some(rest) = signature.strip_prefix("static ") {
-        format!("static {}.{}", class_name, rest)
-    } else if let Some(rest) = signature.strip_prefix("construct ") {
-        // Constructors read more naturally as
-        // `Class.new(args)` (the form most users see at the call
-        // site) than `construct new(args)`.
-        format!("{}.{}", class_name, rest)
-    } else {
-        format!("{}.{}", class_name, signature)
-    }
-}
 
 /// Build a `HoverOut` JSON value with the given signature + body
 /// and span range.

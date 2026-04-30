@@ -15,6 +15,7 @@
 //! hover handler pull from here.
 
 pub mod collect;
+pub mod hover;
 pub mod model;
 pub mod prelude;
 pub mod render;
