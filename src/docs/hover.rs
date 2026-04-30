@@ -208,6 +208,27 @@ fn span_contains(span: &Range<usize>, byte: usize) -> bool {
     span.start <= byte && byte < span.end
 }
 
+/// Walk the module's top-level imports looking for `name` (or
+/// any alias). Returns the source module string from the matching
+/// `import "..." for ...` so hover can say *"imported from
+/// @hatch:gpu"* instead of the generic "workspace hasn't loaded"
+/// when the class is sitting in a dep that just hasn't finished
+/// fetching.
+fn imported_from(module: &Module, interner: &Interner, name: &str) -> Option<String> {
+    let sym = interner.lookup(name)?;
+    for stmt in module {
+        if let Stmt::Import { module: src, names } = &stmt.0 {
+            for n in names {
+                let bind = n.alias.as_ref().unwrap_or(&n.name);
+                if bind.0 == sym {
+                    return Some(src.0.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Symbols sema should treat as classes during type inference:
 ///
 /// 1. Every `class Foo {...}` in the source.
@@ -813,10 +834,21 @@ pub fn identifier_kind_hint(
         return Some((sig, String::new()));
     }
     if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
-        return Some((
-            format!("class {}", ident),
-            "Likely imported from an `@hatch:*` package whose docs the workspace hasn't loaded.".into(),
-        ));
+        // Class-shaped name we couldn't match against any class
+        // in the local module, dep_docs, or the prelude. Tailor
+        // the body to whether the source actually imports it:
+        //   * imported here → "imported from <pkg>; docs may
+        //     still be loading" (true mid-prefetch).
+        //   * otherwise → no docs for this name; could be a
+        //     class the workspace doesn't know about yet.
+        let body = match analysis.and_then(|a| imported_from(&a.module, &a.interner, ident)) {
+            Some(pkg) => format!(
+                "Imported from `{}`. Docs may still be loading — they appear once the workspace finishes resolving the dep graph.",
+                pkg
+            ),
+            None => "No matching class in the local module, loaded `@hatch:*` packages, or the prelude.".into(),
+        };
+        return Some((format!("class {}", ident), body));
     }
     if let Some((line_no, line)) = find_var_decl_line(source, ident, byte) {
         // Prefer the typed AST: walk to the var's *name* span
@@ -1434,5 +1466,90 @@ class Slicer {
             inferred_to_class_name(&ty, &a.interner).as_deref(),
             Some("Sprite")
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_smoke {
+    use super::Analysis;
+    #[test]
+    #[ignore]
+    fn parses_published_gpu_source() {
+        let src = std::fs::read_to_string("hatch/packages/hatch-gpu/gpu_web.wren").unwrap();
+        let pr = crate::parse::parser::parse(&src);
+        if !pr.errors.is_empty() {
+            for e in pr.errors.iter().take(5) {
+                eprintln!("parse err: {:?}", e);
+            }
+            panic!("{} parse errors", pr.errors.len());
+        }
+        let mut classes: Vec<&str> = Vec::new();
+        for stmt in &pr.module {
+            if let crate::ast::Stmt::Class(c) = &stmt.0 {
+                classes.push(pr.interner.resolve(c.name.0));
+            }
+        }
+        eprintln!("classes: {:?}", classes);
+        assert!(classes.contains(&"Camera2D"));
+        assert!(classes.contains(&"Renderer2D"));
+        assert!(classes.contains(&"Sprite"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_bundle_smoke {
+    #[test]
+    #[ignore]
+    fn camera2d_in_collected_module_doc() {
+        let src = std::fs::read_to_string("hatch/packages/hatch-gpu/gpu_web.wren").unwrap();
+        let pr = crate::parse::parser::parse(&src);
+        assert!(pr.errors.is_empty(), "gpu_web.wren has parse errors: {}", pr.errors.len());
+        let m = crate::docs::collect::collect_module(
+            "gpu_web", &src, &pr.module, &pr.docs, &pr.interner,
+        );
+        let class_names: Vec<&str> = m.classes.iter().map(|c| c.name.as_str()).collect();
+        eprintln!("collected classes: {:?}", class_names);
+        assert!(class_names.contains(&"Camera2D"), "Camera2D missing");
+        let r2d = m.classes.iter().find(|c| c.name == "Renderer2D").unwrap();
+        let new_members: Vec<&str> = r2d
+            .members
+            .iter()
+            .filter(|mb| mb.name == "new")
+            .map(|mb| mb.signature.as_str())
+            .collect();
+        eprintln!("Renderer2D.new members: {:?}", new_members);
+        assert!(!new_members.is_empty(), "Renderer2D has no `new` member");
+    }
+
+    #[test]
+    #[ignore]
+    fn input_mousejustpressed_in_collected_game_docs() {
+        let raw = std::fs::read_to_string("hatch/packages/hatch-game/game.wren").unwrap();
+        // Same cfg pre-pass that `register_hatch_docs` runs on
+        // wasm — the published source has `#!wasm` attributes
+        // that the parser rejects in place but the cfg pass
+        // either keeps or strips depending on target.
+        let src = crate::parse::cfg::apply(&raw, Some("wasm32"));
+        let pr = crate::parse::parser::parse(&src);
+        for e in pr.errors.iter().take(5) {
+            eprintln!("parse err: {:?}", e);
+        }
+        assert!(pr.errors.is_empty(), "{} parse errors", pr.errors.len());
+        let m = crate::docs::collect::collect_module(
+            "game", &src, &pr.module, &pr.docs, &pr.interner,
+        );
+        let input = m
+            .classes
+            .iter()
+            .find(|c| c.name == "Input")
+            .expect("no Input class in collected docs");
+        let mjp: Vec<&str> = input
+            .members
+            .iter()
+            .filter(|mb| mb.name == "mouseJustPressed")
+            .map(|mb| mb.signature.as_str())
+            .collect();
+        eprintln!("Input.mouseJustPressed: {:?}", mjp);
+        assert!(!mjp.is_empty(), "Input has no mouseJustPressed");
     }
 }

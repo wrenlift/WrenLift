@@ -353,13 +353,16 @@ export async function resolveDepsFromManifest(
 ) {
   const order = [];                  // Uint8Array[] in install order
   const seen = new Set();            // package names already queued
-  // Drop any docs cached from a previous resolution so a
-  // removed dep doesn't keep showing up in hover. Each visit
-  // re-registers what's actually in the new dep set.
-  try {
-    const m = await getMod();
-    if (m.clear_hatch_docs) m.clear_hatch_docs();
-  } catch { /* nothing to clear yet */ }
+  // We deliberately do NOT clear `dep_docs` here. Every fetched
+  // bundle calls `register_hatch_docs(bytes)` which overwrites
+  // its package's entry, so re-running resolution naturally
+  // refreshes any dep that's still in the manifest. Clearing
+  // up-front created a window where hover saw an empty cache —
+  // typing in the hatchfile re-fetched, mid-walk hovers landed
+  // on the "Likely imported from an `@hatch:*` package whose
+  // docs the workspace hasn't loaded" placeholder. Stale
+  // entries for removed deps are a separate concern (rare;
+  // worst case is one obsolete hover until the page reloads).
 
   // ---- Root deps: topological visit ---------------------------
   // The runtime's `install_hatch_sections` is first-wins on
