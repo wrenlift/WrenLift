@@ -11,6 +11,7 @@ members = [
     "plugins/wlift_window_web",
     "plugins/wlift_gpu_web",
     "wasm",
+    "crates/wlift_lsp",
 ]
 resolver = "2"
 

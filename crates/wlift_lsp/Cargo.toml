@@ -1,0 +1,21 @@
+[package]
+name = "wlift_lsp"
+version = "0.1.0"
+edition = "2021"
+description = "Language Server Protocol implementation for Wren projects compiled through WrenLift. Reuses the parser + semantic analyzer; surfaces parse / sema errors as LSP diagnostics, with hover + goto-def + completion + rename arriving in later phases."
+
+[[bin]]
+name = "wlift-lsp"
+path = "src/main.rs"
+
+[dependencies]
+# Compiler frontend — parser + AST + sema. `default-features` on
+# wren_lift includes the JIT and plugin dlopen, neither of which
+# the LSP needs. Disable defaults; we only consume parse + sema +
+# the docs model, all portable.
+wren_lift = { path = "../..", default-features = false }
+
+# LSP plumbing.
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync"] }
+dashmap = "6"
