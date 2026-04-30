@@ -2631,6 +2631,18 @@ fn run_fiber_with_stop_depth(
                         None => {
                             let method_name = vm.interner.resolve(method).to_string();
                             let class_name = vm.class_name_of(recv_val);
+                            // Save `pc` into the frame before bailing so
+                            // `extract_error_location` reads the actual
+                            // failing-call PC. Without this the frame
+                            // keeps whatever pc was last persisted by
+                            // a successful dispatch — which can be far
+                            // past the failing call (often in a later
+                            // statement), and the diagnostic span lands
+                            // on a comment several lines down.
+                            unsafe {
+                                let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                frame.pc = pc;
+                            }
                             // Honour `Fiber.try` for method-not-found
                             // errors the same way the native-error path
                             // already does.
@@ -2791,6 +2803,15 @@ fn run_fiber_with_stop_depth(
                                 let method_name = vm.interner.resolve(method).to_string();
                                 let class_name =
                                     unsafe { vm.interner.resolve((*super_cls).name).to_string() };
+                                // Same `frame.pc = pc` save as the
+                                // regular Op::Call site above — without
+                                // it the diagnostic span lands on
+                                // whatever statement was last
+                                // persisted, not the failing super call.
+                                unsafe {
+                                    let frame = (*fiber).mir_frames.last_mut().unwrap();
+                                    frame.pc = pc;
+                                }
                                 let msg =
                                     format!("{} does not implement '{}'", class_name, method_name);
                                 if let Some(err_val) =

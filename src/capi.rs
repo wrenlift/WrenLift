@@ -27,7 +27,9 @@
 use std::ffi::{c_char, c_double, c_int, c_void, CStr, CString};
 use std::ptr;
 
-use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
+use crate::runtime::object::{
+    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray,
+};
 use crate::runtime::value::Value;
 use crate::runtime::vm::{VMConfig, VM};
 
@@ -406,14 +408,28 @@ pub extern "C" fn wrenGetSlotBytes(
     let ptr = val.as_object().unwrap();
     let header = ptr as *const ObjHeader;
     unsafe {
-        if (*header).obj_type != ObjType::String {
-            return ptr::null();
+        match (*header).obj_type {
+            ObjType::String => {
+                let obj = &*(ptr as *const ObjString);
+                if !length.is_null() {
+                    *length = obj.value.len() as c_int;
+                }
+                obj.value.as_ptr() as *const c_char
+            }
+            ObjType::TypedArray => {
+                let obj = &*(ptr as *const ObjTypedArray);
+                let n = obj.byte_len();
+                if !length.is_null() {
+                    *length = n as c_int;
+                }
+                if obj.data.is_null() || n == 0 {
+                    ptr::null()
+                } else {
+                    obj.data as *const c_char
+                }
+            }
+            _ => ptr::null(),
         }
-        let obj = &*(ptr as *const ObjString);
-        if !length.is_null() {
-            *length = obj.value.len() as c_int;
-        }
-        obj.value.as_ptr() as *const c_char
     }
 }
 

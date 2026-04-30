@@ -1922,7 +1922,7 @@ impl VM {
     }
 
     /// Extract source location from a fiber's current MIR frame for error reporting.
-    pub(crate) fn extract_error_location(
+    pub fn extract_error_location(
         &self,
         fiber: *mut ObjFiber,
     ) -> Option<super::vm_interp::SourceLoc> {
@@ -2098,7 +2098,7 @@ impl VM {
 
     /// Report a runtime error with full ariadne diagnostics, source snippets,
     /// contextual help, and a stack trace.
-    fn report_runtime_error(
+    pub fn report_runtime_error(
         &self,
         error: &super::vm_interp::RuntimeError,
         loc: Option<&super::vm_interp::SourceLoc>,

@@ -1364,7 +1364,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
         };
     }
     let t_user = perf_mark();
-    let result = match input {
+    let mut result = match input {
         RunInput::Source(source) => {
             let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
             vm.interpret("main", &combined)
@@ -1518,7 +1518,23 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                 vm.fiber = entry.fiber;
                 let res = wren_lift::runtime::vm_interp::run_fiber(&mut vm);
                 if let Err(e) = res {
-                    vm.report_error(&format!("scheduler-resumed fiber aborted: {}", e));
+                    // Route through `report_runtime_error` so the
+                    // scheduler-resumed abort gets the same ariadne
+                    // diagnostic — labelled span, source snippet,
+                    // contextual help note, full fiber stack trace
+                    // — as the synchronous interpret() path. The
+                    // older `report_error("scheduler-resumed fiber
+                    // aborted: …")` was a flat one-liner that
+                    // looked like a green log line in the page,
+                    // not an error.
+                    let loc = vm.extract_error_location(entry.fiber);
+                    vm.report_runtime_error(&e, loc.as_ref(), entry.fiber);
+                    // Mark the run as failed so the page paints the
+                    // console pane red and the runtime pill flips
+                    // to "error" — the initial interpret() returned
+                    // Success because the abort fired on a parked
+                    // fiber, not the main one.
+                    result = InterpretResult::RuntimeError;
                     continue;
                 }
                 // Even when `run_fiber` returns Ok, an abort under
@@ -1547,6 +1563,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                 };
                 if let Some(s) = err_str {
                     vm.report_error(&format!("fiber error: {}", s));
+                    result = InterpretResult::RuntimeError;
                 }
             }
 

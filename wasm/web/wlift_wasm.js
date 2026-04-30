@@ -305,6 +305,24 @@ export function resolve_future(handle, value) {
 }
 
 /**
+ * JS-callable: flip a handle to `Resolved` with a binary
+ * payload. Companion to `resolve_future` for bridges that
+ * produce raw bytes (`Browser.fetchBytes` -> ArrayBuffer ->
+ * Uint8Array). The bytes land on the slot as a `Vec<u8>` and
+ * the Wren-side take path materialises a `ByteArray` (the
+ * `TypedArrayKind::U8` runtime variant) without round-tripping
+ * through a string. Idempotent: settling an already-settled
+ * handle is a no-op, matching `resolve_future`.
+ * @param {number} handle
+ * @param {Uint8Array} bytes
+ */
+export function resolve_future_bytes(handle, bytes) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    wasm.resolve_future_bytes(handle, ptr0, len0);
+}
+
+/**
  * @param {string} source
  * @returns {Promise<RunResult>}
  */
@@ -819,6 +837,9 @@ function __wbg_get_imports() {
         __wbg__wlift_dom_text_6d119a35df8b8b48: function(arg0, arg1, arg2) {
             globalThis._wlift_dom_text(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
+        __wbg__wlift_fetch_bytes_0d863e7c4ed078e6: function(arg0, arg1, arg2) {
+            globalThis._wlift_fetch_bytes(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
+        },
         __wbg__wlift_fetch_ea0f744df833158f: function(arg0, arg1, arg2) {
             globalThis._wlift_fetch(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
@@ -840,6 +861,9 @@ function __wbg_get_imports() {
         },
         __wbg__wlift_jit_reset_8583ff9d77c43989: function() {
             globalThis._wlift_jit_reset();
+        },
+        __wbg__wlift_next_frame_edc6ca9b5eadc327: function(arg0) {
+            globalThis._wlift_next_frame(arg0 >>> 0);
         },
         __wbg__wlift_perf_log_7b0935b5b8ba7abc: function(arg0, arg1, arg2) {
             globalThis._wlift_perf_log(getStringFromWasm0(arg0, arg1), arg2);
@@ -1071,7 +1095,7 @@ function __wbg_get_imports() {
             globalThis.wliftDynamicPluginDispatch(arg0 >>> 0, arg1 >>> 0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 109, function: Function { arguments: [Externref], shim_idx: 110, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 117, function: Function { arguments: [Externref], shim_idx: 118, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_20bf61ce484b8279___closure__destroy___dyn_core_2b72ad5d24e5930c___ops__function__FnMut__wasm_bindgen_20bf61ce484b8279___JsValue____Output___core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___, wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_);
             return ret;
         },
