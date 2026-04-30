@@ -1202,7 +1202,12 @@ entry   = "main"
       {
         id: "sprite-grid",
         label: "Game — sprite grid (WASD)",
-        mode: "main",
+        // Game.run is an infinite frame loop — switching to this
+        // example with the autorun toggle on would silently start
+        // burning frames the moment it's selected. Force autorun
+        // off so the user clicks Run explicitly when they want to
+        // play; the toggle's own state is unchanged.
+        autorun: "off",
         html:
 `<style>
   #stage { background: #0a0810; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
@@ -1336,17 +1341,18 @@ entry   = "main"
       {
         id: "gpu-sprite",
         label: "GPU — sprite batch (canvas)",
-        mode: "main",
         html:
 `<style>
-  /* Canvas demos take over the stage — kill the white DOM padding. */
-  #stage { background: #1d1812; padding: 0; }
-  #stage canvas { display: block; margin: 0 auto; image-rendering: pixelated; }
+  #stage { background: #1d1812; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
+  #stage-canvas { display: block; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
+  #stage-hint {
+    position: absolute; bottom: 8px; left: 14px; right: 14px;
+    color: #8a7e6b; pointer-events: none; font-size: 11px;
+    text-align: center;
+  }
 </style>
-<p style="color:#8a7e6b; padding: 8px 14px; margin: 0;">
-  WebGPU sprite batch — Renderer2D draws a 4×4 grid of tinted sprites
-  into a canvas attached to this pane. One frame, one flush.
-</p>`,
+<canvas id="stage-canvas" width="600" height="400"></canvas>
+<p id="stage-hint">WebGPU sprite batch — Renderer2D draws a 4×4 grid into the canvas above. One frame, one flush.</p>`,
         wren:
 `import "@hatch:window" for Window
 import "@hatch:gpu"    for Gpu, Camera2D, Renderer2D
@@ -1354,12 +1360,13 @@ import "@hatch:gpu"    for Gpu, Camera2D, Renderer2D
 var SURF_W = 600
 var SURF_H = 400
 
-// On web, \`parent: "stage"\` appends a fresh <canvas> into the
-// stage <div>. Same Wren code drives a winit window on native.
+// BYO canvas — same shape main + worker honour. The page already
+// owns <canvas id="stage-canvas">; \`Window.create({"canvas": <id>})\`
+// attaches without touching the DOM, so this works in worker mode
+// (where the canvas arrives via \`transferControlToOffscreen\`).
 var window = Window.create({
-  "width": SURF_W, "height": SURF_H,
-  "parent": "stage",
-  "title": "renderer2d demo"
+  "canvas": "stage-canvas",
+  "title":  "renderer2d demo"
 })
 
 var device  = Gpu.requestDevice({})
@@ -1462,19 +1469,21 @@ entry   = "main"
       // browser APIs — so canvas-touching plugins keep their
       // `mode: "main"` pin until that lands. When set, force
       // the picker + reboot.
+      // `ex.autorun === "off"` forces no-autorun regardless of the
+      // toggle (game loops shouldn't silently start on switch).
+      // Otherwise honour the user's autorun setting.
+      const wantsRun = ex.autorun !== "off" && autoChk.checked;
+
       if (ex.mode && modeSel.value !== ex.mode) {
         modeSel.value = ex.mode;
-        // Forced mode switch on a pinned example. Honour the
-        // autorun toggle: switching examples with autorun off
-        // shouldn't auto-start a long-running game loop.
-        bootMode(ex.mode, autoChk.checked);
+        bootMode(ex.mode, wantsRun);
         return;
       }
       // If wlift is already up, restart it so any in-flight
       // long-running fiber (e.g. a game loop) is killed before
       // we re-run with the new source. Skipped on first boot —
       // `wlift` is null until the initial `bootMode` resolves.
-      if (wlift) bootMode(modeSel.value, autoChk.checked);
+      if (wlift) bootMode(modeSel.value, wantsRun);
     }
 
     // Populate the dropdown from EXAMPLES.

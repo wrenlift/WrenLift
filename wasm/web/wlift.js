@@ -476,19 +476,70 @@ class WorkerWlift {
     return new Promise((resolve) => {
       const id = this.nextId++;
       this.pending.set(id, resolve);
-      // `slice()` clones each dep onto a fresh ArrayBuffer
-      // *before* the transfer list detaches it. Without the
-      // clone, callers that hold their dep array across
-      // multiple runs (the playground's dep cache, mode
-      // switches that re-feed the same bundles to a new
-      // worker) hit `DataCloneError: ArrayBuffer is already
-      // detached` on the second send. The clone is one memcpy
-      // per dep — negligible vs the wasm install — and keeps
-      // the per-call transfer optimisation intact.
       const bufs = (deps ?? []).map((b) => {
         const u8 = b instanceof Uint8Array ? b : new Uint8Array(b);
         return u8.slice();
       });
+
+      // Canvas transfer for worker-side @hatch:gpu / @hatch:window.
+      // Worker can't reach the page DOM, but `OffscreenCanvas` works
+      // in worker scope and `getContext("webgpu")` is identical to
+      // an `HTMLCanvasElement`'s. Find any `<canvas>` with an id on
+      // the page, transfer control via postMessage, and have the
+      // worker register them by id so `Window.create({"canvas": "<id>"})`
+      // resolves to the matching `OffscreenCanvas`.
+      //
+      // `transferControlToOffscreen` is one-shot per element — once
+      // called, the page-side canvas becomes a placeholder and a
+      // future call throws. We swallow that case silently because
+      // the playground rebuilds canvases on every renderStage()
+      // (HTML pane edit) which produces a fresh element. Mode
+      // switches go through bootMode → fresh canvas via the same
+      // path. If there's no fresh canvas available, the
+      // `Window.create({"canvas": "<id>"})` lookup in the worker
+      // returns 0 and the user gets a Wren-level error.
+      const canvasTransfers = [];
+      if (typeof document !== "undefined") {
+        for (const el of document.querySelectorAll("canvas[id]")) {
+          if (typeof el.transferControlToOffscreen !== "function") continue;
+          let off;
+          try {
+            off = el.transferControlToOffscreen();
+          } catch (_) {
+            // Already transferred or detached. Worker keeps its
+            // previous registration; nothing to do here.
+            continue;
+          }
+          canvasTransfers.push({ id: el.id, offscreen: off });
+        }
+      }
+
+      // Send the OffscreenCanvases first so the worker can register
+      // them before run_with_hatches kicks off plugin install (which
+      // is when `wlift_dom_attach_canvas("<id>")` resolves).
+      if (canvasTransfers.length > 0) {
+        this.worker.postMessage(
+          { cmd: "transfer-canvases", canvases: canvasTransfers },
+          canvasTransfers.map((c) => c.offscreen),
+        );
+        // Install page-side keyboard + mouse forwarders. The
+        // <canvas> element on the page becomes a "placeholder"
+        // after transferControlToOffscreen but DOM events still
+        // fire on it — we capture them and postMessage to the
+        // worker, which queues them per canvas handle for the
+        // plugin's drain to pick up.
+        this._installCanvasEventForwarders(canvasTransfers);
+      }
+
+      // `slice()` clones each dep onto a fresh ArrayBuffer *before*
+      // the transfer list detaches it. Without the clone, callers
+      // that hold their dep array across multiple runs (the
+      // playground's dep cache, mode switches that re-feed the
+      // same bundles to a new worker) hit `DataCloneError:
+      // ArrayBuffer is already detached` on the second send. The
+      // clone is one memcpy per dep — negligible vs the wasm
+      // install — and keeps the per-call transfer optimisation
+      // intact.
       this.worker.postMessage(
         { cmd: "run-with-hatches", id, source, deps: bufs },
         bufs.map((b) => b.buffer),
@@ -501,7 +552,57 @@ class WorkerWlift {
   // (the boundary is the point). Feature-probe with `if (wlift.memory)`.
   get memory() { return this._memory; }
 
-  terminate() { this.worker.terminate(); }
+  terminate() {
+    // Detach any canvas event forwarders we installed so the next
+    // worker (after a fresh `bootMode`) doesn't get duplicate
+    // events from a still-listening previous instance. Listeners
+    // close over `this.worker.postMessage`, so leaving them around
+    // would be a leak that postMessages a dead worker.
+    if (this._canvasListenerTeardowns) {
+      for (const fn of this._canvasListenerTeardowns) {
+        try { fn(); } catch (_) { /* element already gone */ }
+      }
+      this._canvasListenerTeardowns = null;
+    }
+    this.worker.terminate();
+  }
+
+  // Wire keyboard + mouse forwarders for each canvas the worker
+  // received an `OffscreenCanvas` for. Called from `runWithHatches`
+  // right after the transfer postMessage. The worker enqueues into
+  // its per-handle event queue; `wlift_dom_drain_events_into_list`
+  // drains it on the plugin's first request each frame. Mirrors the
+  // shape `makeDomBridge` produces directly on main mode.
+  _installCanvasEventForwarders(transfers) {
+    if (typeof document === "undefined") return;
+    if (!this._canvasListenerTeardowns) this._canvasListenerTeardowns = [];
+    for (const { id } of transfers) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const send = (event) =>
+        this.worker.postMessage({ cmd: "dom-event", canvasId: id, event });
+      const onMouseDown = (e) => send({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
+      const onMouseUp   = (e) => send({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
+      const onMouseMove = (e) => send({ type: "mouseMoved", x: e.offsetX, y: e.offsetY });
+      const onKeyDown   = (e) => send({ type: "keyDown", code: e.code, key: e.key });
+      const onKeyUp     = (e) => send({ type: "keyUp",   code: e.code, key: e.key });
+      el.addEventListener("mousedown", onMouseDown);
+      el.addEventListener("mouseup",   onMouseUp);
+      el.addEventListener("mousemove", onMouseMove);
+      // Keys land on document to match main-mode behavior — the
+      // canvas placeholder still doesn't reliably receive
+      // keyboard focus on the page.
+      document.addEventListener("keydown", onKeyDown);
+      document.addEventListener("keyup",   onKeyUp);
+      this._canvasListenerTeardowns.push(() => {
+        el.removeEventListener("mousedown", onMouseDown);
+        el.removeEventListener("mouseup",   onMouseUp);
+        el.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("keydown", onKeyDown);
+        document.removeEventListener("keyup",   onKeyUp);
+      });
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

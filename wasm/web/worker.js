@@ -49,6 +49,7 @@
 // `wren_*` runtime helpers without enumerating each name in the
 // `import` list. The wlift_wasm wasm exports are returned by
 // `init()` and stashed below for use as JIT-module imports.
+import { createGpuBridge } from "./gpu-bridge.js";
 import * as wlift_wasm from "../pkg/wlift_wasm.js";
 const {
   default: init,
@@ -279,6 +280,157 @@ __wliftWrenImports = {
 globalThis.wlift_wasm = wlift_wasm;
 
 // ---------------------------------------------------------------
+// Canvas + DOM bridge state (worker side)
+// ---------------------------------------------------------------
+// Main thread `transferControlToOffscreen()`s each `<canvas>`
+// element with a known id and postMessages the OffscreenCanvas
+// here. We register them keyed by both element id (for
+// `wlift_dom_attach_canvas("stage-canvas")` lookups) and an
+// integer handle (the value Wren-side code holds onto and the
+// GPU bridge consumes).
+//
+// Events flow the other direction: main thread listens on the
+// original `<canvas>` (which becomes a placeholder once
+// transferred) and postMessages each event here, where it
+// queues onto the matching canvas entry. `wlift_dom_drain_events_into_list`
+// drains the queue into a Wren list.
+const canvases = new Map();          // handle -> { element, queue, closeRequested, idAlias }
+const canvasIdToHandle = new Map();  // string id -> handle
+let nextCanvasHandle = 1;
+
+function registerOffscreenCanvas(idAlias, offscreen) {
+  // Re-attach replaces the previous entry — main thread may
+  // re-transfer (mode switch / fresh boot) and the worker should
+  // forget the old handle so it doesn't reuse a detached canvas.
+  const prev = canvasIdToHandle.get(idAlias);
+  if (prev !== undefined) canvases.delete(prev);
+  const handle = nextCanvasHandle++;
+  canvases.set(handle, {
+    element: offscreen,
+    queue: [],
+    closeRequested: false,
+    idAlias,
+  });
+  canvasIdToHandle.set(idAlias, handle);
+  return handle;
+}
+
+// Build the GPU bridge once per worker. The factory closes over
+// the canvases registry above so `host_gpu_attach_canvas(handle)`
+// resolves through the same Map the DOM bridge populates.
+const { bridge: gpuBridge, ensureGpuDevice } = createGpuBridge({
+  wasm,
+  canvases,
+});
+
+// Slot helpers — read plugin memory by (ptr, len). Mirrors the
+// main-side `readPluginUtf8`. Plugin's WebAssembly.Instance lives
+// in this worker too, so we get its memory via the closed-over
+// `instance` ref each `installWasmPlugin` set up.
+function makeWorkerDomBridge(getInstance) {
+  const readPluginUtf8 = (ptr, len) => {
+    if (len <= 0) return "";
+    const view = new Uint8Array(getInstance().exports.memory.buffer, ptr, len);
+    return new TextDecoder().decode(view);
+  };
+
+  return {
+    // Worker can't `document.createElement` — it has no DOM.
+    // Plugin code that expects to create a fresh canvas must
+    // either use the BYO-canvas attach path
+    // (`Window.create({"canvas": "<id>"})`) or pin the example
+    // to main mode. The throw names the bridge so the failure
+    // is self-explanatory.
+    wlift_dom_create_canvas: () => {
+      throw new Error(
+        "[wlift dom/worker] wlift_dom_create_canvas: workers can't create DOM elements. " +
+        "Use Window.create({\"canvas\": \"<id>\"}) against a <canvas> the page already owns, " +
+        "or run this example in main mode.",
+      );
+    },
+
+    // Worker-local lookup against the OffscreenCanvases the main
+    // thread already transferred at run-with-hatches time.
+    wlift_dom_attach_canvas: (id_ptr, id_len) => {
+      const id = readPluginUtf8(id_ptr, id_len);
+      if (!id) return 0;
+      return canvasIdToHandle.get(id) ?? 0;
+    },
+
+    wlift_dom_destroy_canvas: (handle) => {
+      const c = canvases.get(handle);
+      if (!c) return;
+      canvases.delete(handle);
+      canvasIdToHandle.delete(c.idAlias);
+      // OffscreenCanvas has no removeChild; the placeholder DOM
+      // element on main remains for re-transfer on the next run.
+    },
+
+    // OffscreenCanvas exposes width/height directly — same shape
+    // as HTMLCanvasElement.
+    wlift_dom_canvas_width:  (handle) => canvases.get(handle)?.element.width  ?? 0,
+    wlift_dom_canvas_height: (handle) => canvases.get(handle)?.element.height ?? 0,
+
+    wlift_dom_close_requested: (handle) =>
+      canvases.get(handle)?.closeRequested ? 1 : 0,
+
+    // No DOM to set attributes on. No-op in worker (the canvas
+    // has whatever attributes the page set before transfer).
+    wlift_dom_set_canvas_attribute: () => {},
+
+    // Drain the worker-local event queue into a Wren list. The
+    // queue is fed by `dom-event` postMessages from main. Mirrors
+    // `makeDomBridge`'s drain on the page side, which is the
+    // shape `wlift_window_drain_events` expects: write a fresh
+    // list into the receiver slot regardless of queue size, then
+    // populate it with one map per event. Skipping the
+    // wrenSetSlotNewList on an empty queue would leave the
+    // receiver class in slot 0 — the Wren caller then reads
+    // `events.count` on the class and gets "Class does not
+    // implement 'count'".
+    wlift_dom_drain_events_into_list: (vm, list_slot, handle) => {
+      const c = canvases.get(handle);
+      // Plugin already called `wrenEnsureSlots(vm, 6)` before
+      // delegating; slots 0..5 are available.
+      wasm.wrenSetSlotNewList(vm, list_slot);
+      if (!c) return;
+      const events = c.queue.splice(0, c.queue.length);
+      const evSlot  = 4;
+      const keySlot = 5;
+      const valSlot = 3;
+      for (const ev of events) {
+        wasm.wrenSetSlotNewMap(vm, evSlot);
+        for (const k of Object.keys(ev)) {
+          writeStringSlot(vm, keySlot, k);
+          const v = ev[k];
+          if (typeof v === "string") writeStringSlot(vm, valSlot, v);
+          else if (typeof v === "number") wasm.wrenSetSlotDouble(vm, valSlot, v);
+          else if (typeof v === "boolean") wasm.wrenSetSlotBool(vm, valSlot, v);
+          else wasm.wrenSetSlotNull(vm, valSlot);
+          wasm.wrenSetMapValue(vm, evSlot, keySlot, valSlot);
+        }
+        wasm.wrenInsertInList(vm, list_slot, -1, evSlot);
+      }
+    },
+  };
+}
+
+// Allocate a NUL-terminated copy of `str` in host memory and call
+// wrenSetSlotString. wrenSetSlotString copies the bytes into Wren's
+// heap so the host allocation can be released once the call returns.
+// Mirrors `writeStringSlot` on the main side.
+function writeStringSlot(vm, slot, str) {
+  const bytes = new TextEncoder().encode(str);
+  const len = bytes.length;
+  const ptr = wasm.wlift_host_alloc(len + 1);
+  const view = new Uint8Array(wasm.memory.buffer, ptr, len + 1);
+  view.set(bytes);
+  view[len] = 0;
+  wasm.wrenSetSlotString(vm, slot, ptr);
+  wasm.wlift_host_free(ptr, len + 1);
+}
+
+// ---------------------------------------------------------------
 // Plugin loader — worker mirror of the main-thread plumbing in
 // `wlift.js::MainWlift.init()`. The runtime (this worker) and
 // every cdylib plugin live in the same wasm process, so plugin
@@ -331,6 +483,11 @@ function makeBridgeStub(name) {
 }
 
 function buildPluginEnv(libName, getInstance) {
+  // Layer 3 (DOM bridge subset) needs `getInstance` for plugin-
+  // memory utf8 reads; layer 4 (GPU bridge) is stateless wrt the
+  // plugin instance. Compose them into one env object alongside
+  // layers 1 + 2.
+  const dom = makeWorkerDomBridge(getInstance);
   return {
     // Layer 1: passthrough of every wlift_wasm export. Plugin
     // calls into `wrenGetSlotDouble` etc. land directly in the
@@ -360,13 +517,35 @@ function buildPluginEnv(libName, getInstance) {
       wasm.wrenSetSlotString(vm, slot, host_ptr);
       wasm.wlift_host_free(host_ptr, len + 1);
     },
-    // Layers 3 + 4 are filled in dynamically per-plugin below
-    // so we can stub exactly the imports the plugin declares.
+    // Layer 3: DOM bridge subset. Worker can't touch the real
+    // DOM, but BYO-canvas attach + size queries + event drain
+    // are all worker-local against the OffscreenCanvas the main
+    // thread transfers in.
+    ...dom,
+    // Layer 4: full GPU bridge — same imports object MainWlift
+    // uses, sourced from the shared `gpu-bridge.js` factory.
+    // Runs against `OffscreenCanvas.getContext("webgpu")` in
+    // worker scope; identical surface to main.
+    ...gpuBridge,
+    // Anything the plugin imports that isn't covered above (e.g.
+    // unhandled `host_*` bridges) gets stubbed dynamically in
+    // `installWasmPlugin` so the failure mode is a self-named
+    // throw rather than a wasm validation error.
   };
 }
 
 async function installWasmPlugin(libName, wasmBytes) {
   if (pluginInstances.has(libName)) return;
+
+  // GPU plugins need a `navigator.gpu` adapter+device pair
+  // resolved before the plugin's first synchronous host_gpu_*
+  // call. The Wren-side foreign methods can't await; pre-resolve
+  // here while we're already in an async context. Cheap if
+  // WebGPU is unavailable (returns null and `host_gpu_ready`
+  // reports false).
+  if (libName === "wlift_gpu" || libName === "wlift_gpu_web") {
+    await ensureGpuDevice();
+  }
 
   // Compile first so we can read the import list and stub every
   // missing `env.*` import dynamically. Hardcoded lists drift
@@ -412,6 +591,30 @@ self.postMessage({ cmd: "ready", version: version() });
 
 self.addEventListener("message", (e) => {
   const msg = e.data;
+  if (msg.cmd === "transfer-canvases") {
+    // Main side transferred one or more OffscreenCanvases via the
+    // structured-clone transfer list. Each entry is
+    // `{ id: <elementId>, offscreen: <OffscreenCanvas> }`.
+    // Register them so the next `wlift_dom_attach_canvas("<id>")`
+    // call from inside a plugin resolves locally.
+    for (const c of (msg.canvases || [])) {
+      registerOffscreenCanvas(c.id, c.offscreen);
+    }
+    return;
+  }
+  if (msg.cmd === "dom-event") {
+    // Main thread captured a DOM event (keydown/keyup/mouse*) on
+    // the page-side canvas placeholder and forwarded it. The
+    // worker queues it on the matching canvas entry; the next
+    // `wlift_dom_drain_events_into_list(handle)` call drains it.
+    // `handle` is resolved by id alias rather than element ref
+    // because the actual element ref doesn't cross the worker
+    // boundary.
+    const handle = canvasIdToHandle.get(msg.canvasId);
+    const c = handle !== undefined ? canvases.get(handle) : null;
+    if (c) c.queue.push(msg.event);
+    return;
+  }
   if (msg.cmd === "run-with-hatches") {
     const { id, source, deps } = msg;
     // Pre-installs each `@hatch:*` dep, then runs user source.

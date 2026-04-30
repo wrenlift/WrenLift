@@ -183,6 +183,42 @@ Game.run(SpriteGrid)
       } else {
         log("✗ FAIL — Game.run errored.", "err");
       }
+
+      // ----- probe 3 — worker mode parity --------------------------
+      // Tear down the main-mode wlift, spin up a worker-mode one,
+      // and run a SHORTER variant of the same source against the
+      // canvas the page already exposed. This lights up the full
+      // worker-side path: OffscreenCanvas transfer, GPU bridge in
+      // worker, DOM bridge subset, plugin loader's bridge env.
+      log("");
+      log("probe 3 — Game.run in worker mode (60 frames)…");
+      // Build a fresh canvas DOM element — the previous one had its
+      // control transferred and is now a placeholder. Replace it so
+      // worker mode has a transferable target.
+      const oldCanvas = document.getElementById("stage-canvas");
+      if (oldCanvas && oldCanvas.parentNode) {
+        const fresh = document.createElement("canvas");
+        fresh.id = "stage-canvas";
+        fresh.width  = 640;
+        fresh.height = 480;
+        fresh.tabIndex = 0;
+        oldCanvas.parentNode.replaceChild(fresh, oldCanvas);
+      }
+      wlift.terminate();
+      const wlift2 = await createWlift({ mode: "worker" });
+      log(`  worker version=${wlift2.version}`, "ok");
+      // Probe the same Window.create + GPU surface path with a short
+      // 60-frame run — long enough to exercise plugin install + a
+      // few real frames, short enough to keep the test page snappy.
+      const workerSrc = spriteSrc.replace(/g\.tick > 1500/, "g.tick > 60");
+      const probe3 = await wlift2.runWithHatches(workerSrc, [bytes]);
+      log(`  ok=${probe3.ok}  ${probe3.elapsedMs.toFixed(1)} ms`, probe3.ok ? "ok" : "err");
+      log(probe3.output || "(no output)");
+      if (probe3.ok) {
+        log("✓ PASS — Sprite Grid runs in worker mode (OffscreenCanvas + GPU bridge in worker).", "ok");
+      } else {
+        log("✗ FAIL — worker-mode run errored. OffscreenCanvas / bridge proxy needs work.", "err");
+      }
     } catch (err) {
       log(`exception: ${err}`, "err");
       console.error(err);
