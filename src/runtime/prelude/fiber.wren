@@ -16,18 +16,32 @@ class Fiber {
   /// Return the fiber that's currently running.
   static current {}
 
-  /// Suspend the running fiber's enclosing transfer. Resumes
-  /// whatever scheduled this fiber next time control returns.
+  /// Suspend the running fiber's enclosing transfer.
   static suspend() {}
 
-  /// Yield a value to the caller. The yielding fiber stays
-  /// alive; its caller's `call` returns `value`.
-  static yield(value) {}
+  /// Yield to the caller. The yielding fiber stays alive; its
+  /// caller's `.call` returns `null` (or `value`).
   static yield() {}
+  static yield(value) {}
 
-  /// Abort the fiber with an error message. Up the stack,
-  /// `.try { ... }` catches it as the fiber's error slot.
+  /// Abort the fiber with an error. Up the stack, `.try { ... }`
+  /// catches it as the fiber's `.error` slot.
   static abort(error) {}
+
+  /// Cooperative-cancel hook — get / set the current fiber's
+  /// cancel flag. Long-running compute can poll
+  /// `Fiber.isCancelled` and bail early.
+  static isCancelled {}
+  static cancel() {}
+
+  /// Deadline in milliseconds (host-monotonic). Get / set the
+  /// current fiber's deadline; cooperative timeouts.
+  static deadlineMs {}
+  static setDeadlineMs(ms) {}
+
+  /// Per-fiber context bag — arbitrary user-supplied state
+  /// stashed for the duration of the fiber.
+  static context {}
 
   /// Run this fiber to its next yield / return / abort.
   call() {}
@@ -38,10 +52,31 @@ class Fiber {
   try() {}
   try(arg) {}
 
+  /// Transfer control to another fiber, optionally with a
+  /// value. Unlike `call`, the transferring fiber doesn't
+  /// resume on the next `yield` — control only returns when
+  /// some other fiber transfers back.
+  transfer() {}
+  transfer(arg) {}
+
+  /// Transfer with an error — receiver re-aborts on resume.
+  transferError(error) {}
+
   /// Last error stashed by an abort under `try`. `null` when
   /// the fiber finished cleanly.
   error {}
 
   /// `true` when the fiber has run to completion.
   isDone {}
+
+  /// Recorded stack trace for the fiber, if available.
+  stackTrace {}
+
+  /// Per-instance versions of the cancel / deadline / context
+  /// hooks above.
+  context {}
+  cancel() {}
+  isCancelled {}
+  deadlineMs {}
+  setDeadlineMs(ms) {}
 }

@@ -9,7 +9,7 @@ class Map {
   /// Entry count.
   count {}
 
-  /// Subscript get / set. Missing keys return `null`.
+  /// Subscript get / set. Missing keys return `null` on get.
   ///
   /// ```wren
   /// var m = {}
@@ -24,9 +24,6 @@ class Map {
   /// an absent key — `m[k]` returns `null` for both.
   containsKey(key) {}
 
-  /// Insert without overwriting an existing entry.
-  add(key, value) {}
-
   /// Remove an entry. Returns the removed value, or `null` when
   /// the key wasn't present.
   remove(key) {}
@@ -38,9 +35,17 @@ class Map {
   keys {}
   values {}
 
-  /// Iteration (`for (k in map.keys)`).
+  /// Iteration over keys (`for (k in map.keys)`).
   iterate(iterator) {}
   iteratorValue(iterator) {}
 
+  toString {}
+}
+
+/// One key/value pair as yielded by `Map.iterate` when the
+/// receiver is a `Map` directly (no `.keys` / `.values` view).
+class MapEntry {
+  key {}
+  value {}
   toString {}
 }

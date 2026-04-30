@@ -16,34 +16,71 @@ class List {
   /// out-of-range indices. Negative indices count from the end.
   [index] {}
 
-  /// Slice view via a `Range`.
+  /// Slice via a `Range`.
   [range] {}
 
-  /// Mutating ops.
-  add(value) {}
-  insert(index, value) {}
-  removeAt(index) {}
-  remove(value) {}
-  clear() {}
+  /// Indexed write.
+  [index]=(value) {}
 
-  /// Search.
-  contains(value) {}
+  /// Append a value. Grows the list.
+  add(value) {}
+
+  /// Append every element of another list / sequence.
+  addAll(other) {}
+
+  /// Insert `value` at `index`; shifts later elements right.
+  insert(index, value) {}
+
+  /// Remove and return the element at `index`. Negative
+  /// indices count from the end.
+  removeAt(index) {}
+
+  /// Remove the first element equal to `value`. Returns the
+  /// value when removed, `null` otherwise.
+  remove(value) {}
+
+  /// First codepoint-equal index of `value`, or `-1`.
   indexOf(value) {}
 
-  /// Concatenation — returns a new list combining `this` and
-  /// `other`. Both lists' elements are shallow-copied.
+  /// Swap two elements in place.
+  swap(a, b) {}
+
+  /// Drop every element.
+  clear() {}
+
+  /// Sort in place using the natural comparison operator (`<`).
+  sort() {}
+
+  /// Sort in place by a callback returning a Num — negative
+  /// for less, positive for greater, zero for equal.
+  sort(comparator) {}
+
+  /// Concatenation — `[1,2] + [3,4]` → `[1,2,3,4]`.
   +(other) {}
 
-  /// Iteration (`for (x in list)`).
+  /// Repeat — `[1,2] * 3` → `[1,2,1,2,1,2]`.
+  *(count) {}
+
+  /// `true` when `value` appears anywhere in the list.
+  contains(value) {}
+
+  /// Iteration (`for (x in list) ...`).
   iterate(iterator) {}
   iteratorValue(iterator) {}
 
-  /// Functional helpers — return new lists / sequences.
+  /// Functional helpers (defined on `Sequence`, inherited
+  /// by `List`).
   map(callback) {}
   where(callback) {}
   reduce(seed, callback) {}
   any(callback) {}
   all(callback) {}
+  each(callback) {}
+  count(callback) {}
+  skip(count) {}
+  take(count) {}
+  join() {}
+  join(separator) {}
 
   toString {}
 }

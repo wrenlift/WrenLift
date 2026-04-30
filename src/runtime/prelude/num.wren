@@ -5,9 +5,58 @@
 
 /// Numeric scalar.
 class Num {
+  /// Constants.
+  static infinity {}
+  static nan {}
+  static pi {}
+  static tau {}
+  /// `Num.largest` is `f64::MAX` (~1.797e308).
+  static largest {}
+  /// Smallest *positive* normal value (~2.225e-308).
+  static smallest {}
+  /// `2^53 - 1` and `-(2^53 - 1)` — bounds where every integer
+  /// round-trips exactly through a 64-bit float.
+  static maxSafeInteger {}
+  static minSafeInteger {}
+
+  /// Parse a decimal / hex / scientific string into a Num.
+  /// Returns `null` when the input doesn't parse.
+  ///
+  /// ```wren
+  /// Num.fromString("3.14")   // 3.14
+  /// Num.fromString("0xff")   // 255
+  /// Num.fromString("oops")   // null
+  /// ```
+  static fromString(text) {}
+
+  /// Arithmetic.
+  +(other) {}
+  -(other) {}
+  *(other) {}
+  /(other) {}
+  %(other) {}
+
+  /// Comparison.
+  <(other)  {}
+  >(other)  {}
+  <=(other) {}
+  >=(other) {}
+  ==(other) {}
+  !=(other) {}
+
+  /// Bitwise (operands cast to u32).
+  &(other) {}
+  |(other) {}
+  ^(other) {}
+  <<(other) {}
+  >>(other) {}
+  ~ {}
+
+  /// Unary negate.
+  - {}
+
   /// Decimal-string representation. Integer-valued floats render
-  /// without a `.0` (`(3).toString` → `"3"`); fractional values
-  /// use the shortest round-trippable form.
+  /// without a trailing `.0`.
   toString {}
 
   /// Absolute value.
@@ -22,10 +71,10 @@ class Num {
   /// Round to the nearest integer; ties round half-away-from-zero.
   round {}
 
-  /// Largest integer less than or equal to this number.
+  /// Largest integer ≤ this number.
   floor {}
 
-  /// Smallest integer greater than or equal to this number.
+  /// Smallest integer ≥ this number.
   ceil {}
 
   /// Fractional part — `this - this.truncate`.
@@ -41,10 +90,8 @@ class Num {
   /// `true` when the value is `NaN`.
   isNan {}
 
-  /// Square root.
+  /// Square / cube root.
   sqrt {}
-
-  /// Cube root.
   cbrt {}
 
   /// Trig functions. Angles are in radians.

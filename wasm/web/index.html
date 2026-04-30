@@ -119,12 +119,12 @@
     }
     .cm-tooltip .wlift-hover pre:first-child {
       /* Pin the signature line so it stays visible while the
-         user scrolls through the body underneath. Tight
-         margin-bottom — the body sits a hair below, no
-         markdown-`<br>` slack. */
+         user scrolls through the body underneath. Margin gives
+         the body breathing room without the markdown-`<br>`
+         slack we used to ship. */
       position: sticky; top: 0;
       background: var(--panel);
-      margin: 0 0 4px;
+      margin: 0 0 12px;
     }
     .cm-tooltip .wlift-hover code { font-family: inherit; }
     /* CodeMirror's default tooltip frame has its own padding;

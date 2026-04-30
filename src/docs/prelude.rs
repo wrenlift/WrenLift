@@ -24,14 +24,25 @@ use super::{collect_module, ModuleDoc};
 /// Prelude class stubs baked into the binary at compile time.
 /// `(module_name, source_text)` tuples.
 const STUBS: &[(&str, &str)] = &[
-    // Core (always-on prelude)
+    // Core (always-on prelude). Order is intentional: classes
+    // earlier in the list win when an unrestricted member
+    // lookup matches more than one — putting `Object` first
+    // means generic methods like `toString` / `==` resolve to
+    // their root-class definitions.
+    ("Object",       include_str!("../runtime/prelude/object.wren")),
+    ("Class",        include_str!("../runtime/prelude/class.wren")),
+    ("Bool",         include_str!("../runtime/prelude/bool.wren")),
+    ("Null",         include_str!("../runtime/prelude/null.wren")),
     ("System",       include_str!("../runtime/prelude/system.wren")),
     ("Num",          include_str!("../runtime/prelude/num.wren")),
     ("String",       include_str!("../runtime/prelude/string.wren")),
+    ("Range",        include_str!("../runtime/prelude/range.wren")),
+    ("Sequence",     include_str!("../runtime/prelude/sequence.wren")),
     ("List",         include_str!("../runtime/prelude/list.wren")),
     ("Map",          include_str!("../runtime/prelude/map.wren")),
     ("Fiber",        include_str!("../runtime/prelude/fiber.wren")),
     ("Fn",           include_str!("../runtime/prelude/fn.wren")),
+    ("TypedArrays",  include_str!("../runtime/prelude/typed_arrays.wren")),
     // Wasm-runtime prelude — the BROWSER_PRELUDE classes the
     // runtime auto-imports into every wasm `run()` invocation.
     // On native these aren't present; surfacing their docs in
@@ -87,7 +98,7 @@ mod tests {
             .find(|m| m.name == "print")
             .expect("System.print stub present");
         assert!(
-            print_doc.doc.contains("Print one or more values"),
+            print_doc.doc.contains("Print"),
             "System.print docs missing"
         );
     }

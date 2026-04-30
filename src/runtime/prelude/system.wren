@@ -2,14 +2,10 @@
 //! introspection. Every Wren program has this in scope; no
 //! import needed.
 
-/// The host-level standard-output and time-of-day primitives.
+/// Host-level standard-output and time-of-day primitives.
 class System {
-  /// Print one or more values followed by a newline. Each value
-  /// is converted via its `toString` getter; objects without one
-  /// fall back to a class-name placeholder. Returns the value
-  /// printed (the last one when multiple are passed).
-  ///
-  /// ## Example
+  /// Print a value followed by a newline. Each value is
+  /// converted via its `toString`.
   ///
   /// ```wren
   /// System.print("hello, world")
@@ -17,9 +13,18 @@ class System {
   /// ```
   static print(value) {}
 
-  /// Print without a trailing newline. Otherwise identical to
-  /// `print`.
+  /// Print a blank line.
+  static print {}
+
+  /// Print every element of `seq`, joined into one line, then
+  /// a newline.
+  static printAll(seq) {}
+
+  /// Print without a trailing newline.
   static write(value) {}
+
+  /// Concatenated `write` over a sequence.
+  static writeAll(seq) {}
 
   /// Wall-clock seconds since the runtime started. Monotonic;
   /// useful for benchmarking but not for time-of-day.
@@ -31,8 +36,6 @@ class System {
   /// ```
   static clock {}
 
-  /// Trigger a garbage collection cycle. Mostly a no-op on the
-  /// generational + arena GCs; the mark-sweep one runs a full
-  /// pass. Returns null.
+  /// Trigger a garbage collection cycle.
   static gc() {}
 }
