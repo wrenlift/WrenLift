@@ -765,6 +765,12 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // squigglies for parse / unresolved-name errors before the
     // user clicks Run. Cheap path of the LSP plan: same wasm
     // module the runtime uses, no separate server.
+    //
+    // The `lint_wren` spans come back as UTF-8 byte offsets;
+    // CM6 indexes by codepoint count. We build a single
+    // byte→codepoint table per lint and translate every span
+    // through it. Pure-ASCII source (the common case) does no
+    // extra work — the table degenerates to identity.
     const wrenLinter = linter(async (view) => {
       const source = view.state.doc.toString();
       let diags = [];
@@ -778,16 +784,15 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
         return [];
       }
       const docLen = view.state.doc.length;
+      const byteToChar = buildByteToCharTable(source);
+      const docByteLen = byteToChar.length - 1; // table is 0..N inclusive
       return diags.map((d) => {
-        // The lint_wren span is in UTF-8 byte offsets. CM6 uses
-        // codepoint offsets — close enough for ASCII Wren
-        // source. Clamp to the document length so the editor
-        // doesn't reject out-of-range markers when an edit just
-        // shrank the source mid-lint.
-        const from = Math.min(d.span[0], docLen);
-        // Empty-range diagnostics are treated as a single-char
+        const fromByte = Math.max(0, Math.min(d.span[0], docByteLen));
+        const toByte   = Math.max(0, Math.min(d.span[1], docByteLen));
+        const from = Math.min(byteToChar[fromByte], docLen);
+        // Empty-range diagnostics expand to a single-char
         // marker so the squiggle is visible.
-        const to = Math.max(Math.min(d.span[1], docLen), from + 1);
+        const to = Math.max(Math.min(byteToChar[toByte], docLen), from + 1);
         return {
           from,
           to,
@@ -798,6 +803,46 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       });
     }, { delay: 200 });
 
+    // Build a [byte_offset → char_offset] lookup table. For an
+    // all-ASCII source this is a tight loop; multi-byte UTF-8
+    // chars (em-dashes, glyphs) bump the char count once per
+    // codepoint regardless of how many bytes they consume.
+    function buildByteToCharTable(source) {
+      const enc = new TextEncoder();
+      const table = new Int32Array(enc.encode(source).length + 1);
+      let byte = 0;
+      let char = 0;
+      for (const cp of source) {
+        const len = enc.encode(cp).length;
+        for (let i = 0; i < len; i++) {
+          table[byte + i] = char;
+        }
+        byte += len;
+        char += cp.length; // JS string `length` is UTF-16 units; CM6 uses the same
+      }
+      table[byte] = char;
+      return table;
+    }
+
+    // Inverse: CM6 char position → UTF-8 byte offset. Same scan,
+    // emitting one entry per codepoint so the consumer indexes
+    // by `pos` directly.
+    function buildCharToByteTable(source) {
+      const enc = new TextEncoder();
+      const table = new Int32Array(source.length + 1);
+      let byte = 0;
+      let char = 0;
+      for (const cp of source) {
+        for (let i = 0; i < cp.length; i++) {
+          table[char + i] = byte;
+        }
+        byte += enc.encode(cp).length;
+        char += cp.length;
+      }
+      table[char] = byte;
+      return table;
+    }
+
     // Hover tooltip — shows `///` doc comments + signatures when
     // the cursor lands on a class or method declaration. Same
     // model `wlift-lsp` serves over `textDocument/hover`; the
@@ -805,16 +850,28 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // straight into a tooltip element. Plain CommonMark for now;
     // a future iteration can ship a Markdown renderer in-page.
     const wrenHover = hoverTooltip(async (view, pos) => {
+      const source = view.state.doc.toString();
+      // CM6 hands us a CM-position (codepoint-counted); the wasm
+      // entry expects a UTF-8 byte offset. Same translation
+      // story as the linter, just inverted.
+      const charToByte = buildCharToByteTable(source);
+      const byte = charToByte[Math.min(pos, charToByte.length - 1)];
       let result;
       try {
-        result = await hoverWren(view.state.doc.toString(), pos);
+        result = await hoverWren(source, byte);
       } catch {
         return null;
       }
       if (!result) return null;
+      // The result span is in bytes; convert back to CM
+      // positions before handing it to CM6.
+      const byteToChar = buildByteToCharTable(source);
+      const docByteLen = byteToChar.length - 1;
+      const fromByte = Math.max(0, Math.min(result.span[0], docByteLen));
+      const toByte   = Math.max(0, Math.min(result.span[1], docByteLen));
       return {
-        pos: result.span[0],
-        end: result.span[1],
+        pos: byteToChar[fromByte],
+        end: byteToChar[toByte],
         above: true,
         create() {
           const dom = document.createElement("div");
@@ -882,8 +939,37 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
           label: it.label,
           type:  KIND_MAP[it.kind] || "variable",
           detail: it.detail || undefined,
+          // `info` populates CM6's side tooltip on the highlighted
+          // entry. Returning a DOM node lets us style fenced code
+          // blocks the same way the hover handler does.
+          info: it.doc
+            ? () => completionInfoDom(it.detail, it.doc)
+            : undefined,
         })),
       };
+    }
+
+    function completionInfoDom(signature, body) {
+      const dom = document.createElement("div");
+      dom.className = "wlift-hover";
+      let html = "";
+      if (signature) {
+        html += `<pre><code>${escapeHtml(signature)}</code></pre>`;
+      }
+      // Body is Markdown. Cheap rendering: pull out fenced wren
+      // blocks, escape the rest, keep newlines as <br>. Same
+      // approach the hover handler uses.
+      const fenceRe = /```wren\n([\s\S]*?)\n```/g;
+      let lastIdx = 0;
+      let m;
+      while ((m = fenceRe.exec(body)) !== null) {
+        html += escapeHtml(body.slice(lastIdx, m.index)).replace(/\n/g, "<br>");
+        html += `<pre><code>${escapeHtml(m[1])}</code></pre>`;
+        lastIdx = m.index + m[0].length;
+      }
+      html += escapeHtml(body.slice(lastIdx)).replace(/\n/g, "<br>");
+      dom.innerHTML = html;
+      return dom;
     }
 
     function bindEditor(textarea, mount, language, extras = []) {

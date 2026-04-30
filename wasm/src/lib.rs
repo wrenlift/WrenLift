@@ -935,10 +935,31 @@ fn json_serializer() -> serde_wasm_bindgen::Serializer {
 #[wasm_bindgen]
 pub fn lint_wren(source: &str) -> JsValue {
     use serde::Serialize;
-    let pr = wren_lift::parse::parser::parse(source);
+    let mut pr = wren_lift::parse::parser::parse(source);
     let mut out: Vec<LintDiag> = pr.errors.iter().map(diag_to_lint).collect();
     if pr.errors.is_empty() {
-        let sema = wren_lift::sema::resolve::resolve(&pr.module, &pr.interner);
+        // Match the runtime's prelude — same names the wasm `run()`
+        // path pre-installs as module vars before sema sees the
+        // user source. Without this, every `Browser.fetch` /
+        // `System.print` / `Fiber.new` shows up as "undefined".
+        let prelude_names: [&str; 22] = [
+            // Core classes (vm.rs:528)
+            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range",
+            "Null", "Fn", "Fiber", "System", "Sequence", "ByteArray",
+            "Float32Array", "Float64Array",
+            // Browser bridges injected by the wasm runtime's
+            // PRELUDE_IMPORT.
+            "Future", "Browser", "WebSocket", "Dom", "LocalStorage", "SessionStorage",
+        ];
+        let prelude: Vec<wren_lift::intern::SymbolId> = prelude_names
+            .iter()
+            .map(|n| pr.interner.intern(n))
+            .collect();
+        let sema = wren_lift::sema::resolve::resolve_with_prelude(
+            &pr.module,
+            &pr.interner,
+            &prelude,
+        );
         out.extend(sema.errors.iter().map(diag_to_lint));
     }
     out.serialize(&json_serializer())
@@ -953,11 +974,13 @@ struct LintDiag {
 }
 
 /// Completion suggestions for `source`. Returns a JSON array of
-/// `{ label, kind, detail }` items — every class + member declared
-/// in the file, plus the module-level summary as `detail`. The
-/// playground's CodeMirror autocomplete extension fuzzy-filters
-/// against the prefix the user has typed, so we don't try to be
-/// clever with context detection here.
+/// `{ label, kind, detail, doc }` items — every class + member
+/// declared in the file. The playground's CodeMirror autocomplete
+/// extension fuzzy-filters against the prefix the user has typed,
+/// so we don't try to be clever with context detection here.
+///
+/// * `detail` — short signature line shown inline in the dropdown.
+/// * `doc`    — full Markdown body for the side `info` tooltip.
 ///
 /// kinds: "class" | "method" | "static-method" | "getter" |
 /// "setter" | "constructor".
@@ -969,6 +992,7 @@ pub fn complete_wren(source: &str) -> JsValue {
         label: String,
         kind: &'static str,
         detail: String,
+        doc: String,
     }
 
     let pr = wren_lift::parse::parser::parse(source);
@@ -987,10 +1011,14 @@ pub fn complete_wren(source: &str) -> JsValue {
 
     let mut out: Vec<Item> = Vec::new();
     for class in &module.classes {
+        // Class entry — `detail` is the summary, `doc` is the
+        // full body so the side panel shows the rest of the
+        // explanation when the user pauses on the entry.
         out.push(Item {
             label: class.name.clone(),
             kind: "class",
             detail: class.summary().to_string(),
+            doc: class.doc.clone(),
         });
         for member in &class.members {
             let kind = match member.kind {
@@ -1005,6 +1033,7 @@ pub fn complete_wren(source: &str) -> JsValue {
                 label: member.name.clone(),
                 kind,
                 detail: member.signature.clone(),
+                doc: member.doc.clone(),
             });
         }
     }
