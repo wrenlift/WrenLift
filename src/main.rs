@@ -805,6 +805,18 @@ fn generate_docs(root: &str, out_dir: &str) {
         process::exit(1);
     }
 
+    // .hatch bundle input: extract source sections, run the
+    // collector per module. Lets the publish pipeline emit docs
+    // for any registry artefact without a source checkout.
+    if root_path.is_file() {
+        if let Ok(bytes) = fs::read(&root_path) {
+            if wren_lift::hatch::looks_like_hatch(&bytes) {
+                generate_docs_from_hatch(&bytes, &out_path);
+                return;
+            }
+        }
+    }
+
     // Collect every .wren file under the root. Single-file inputs
     // pass through unchanged. Order: alphabetical by qualified
     // module name so the manifest reads predictably.
@@ -842,28 +854,85 @@ fn generate_docs(root: &str, out_dir: &str) {
                 continue;
             }
         };
-        let pr = wren_lift::parse::parser::parse(&source);
-        let module = wren_lift::docs::collect_module(name, &source, &pr.module, &pr.docs, &pr.interner);
-        let json = wren_lift::docs::render_module_json(&module);
-        let json_path = out_path.join(format!("{}.json", name));
-        if let Err(e) = fs::write(&json_path, json) {
-            eprintln!("error: cannot write '{}': {}", json_path.display(), e);
-            process::exit(1);
-        }
-        modules.push(module);
+        modules.push(emit_module(name, &source, &out_path));
     }
 
-    let manifest_json = wren_lift::docs::render_manifest(&pkg_name, &modules);
-    let manifest_path = out_path.join("manifest.json");
-    if let Err(e) = fs::write(&manifest_path, manifest_json) {
-        eprintln!("error: cannot write '{}': {}", manifest_path.display(), e);
-        process::exit(1);
-    }
+    write_manifest(&pkg_name, &modules, &out_path);
     eprintln!(
         "wrote {} module(s) + manifest.json → {}",
         modules.len(),
         out_dir
     );
+}
+
+/// Same flow as `generate_docs` but driven by an in-memory hatch
+/// bundle's `Source` sections. The bundle's manifest provides the
+/// package name + version directly.
+fn generate_docs_from_hatch(bytes: &[u8], out_path: &std::path::Path) {
+    let hatch = match wren_lift::hatch::load(bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("error: hatch load failed: {}", e);
+            process::exit(1);
+        }
+    };
+    let pkg_name = hatch.manifest.name.clone();
+
+    let mut modules: Vec<wren_lift::docs::ModuleDoc> = Vec::new();
+    for section in &hatch.sections {
+        if !matches!(section.kind, wren_lift::hatch::SectionKind::Source) {
+            continue;
+        }
+        let source = match std::str::from_utf8(&section.data) {
+            Ok(s) => s,
+            Err(_) => {
+                eprintln!("warning: skipping non-UTF-8 source section '{}'", section.name);
+                continue;
+            }
+        };
+        modules.push(emit_module(&section.name, source, out_path));
+    }
+
+    write_manifest(&pkg_name, &modules, out_path);
+    eprintln!(
+        "wrote {} module(s) + manifest.json → {} [package={}]",
+        modules.len(),
+        out_path.display(),
+        pkg_name,
+    );
+}
+
+/// Parse a single source string, run the doc collector, and write
+/// `<out>/<name>.json`. Returns the collected `ModuleDoc` so the
+/// caller can also write the package-level manifest.
+fn emit_module(
+    name: &str,
+    source: &str,
+    out_path: &std::path::Path,
+) -> wren_lift::docs::ModuleDoc {
+    let pr = wren_lift::parse::parser::parse(source);
+    let module =
+        wren_lift::docs::collect_module(name, source, &pr.module, &pr.docs, &pr.interner);
+    let json = wren_lift::docs::render_module_json(&module);
+    let json_path = out_path.join(format!("{}.json", name));
+    if let Err(e) = fs::write(&json_path, json) {
+        eprintln!("error: cannot write '{}': {}", json_path.display(), e);
+        process::exit(1);
+    }
+    module
+}
+
+fn write_manifest(
+    pkg_name: &str,
+    modules: &[wren_lift::docs::ModuleDoc],
+    out_path: &std::path::Path,
+) {
+    let manifest_json = wren_lift::docs::render_manifest(pkg_name, modules);
+    let manifest_path = out_path.join("manifest.json");
+    if let Err(e) = fs::write(&manifest_path, manifest_json) {
+        eprintln!("error: cannot write '{}': {}", manifest_path.display(), e);
+        process::exit(1);
+    }
 }
 
 /// Walk `dir` recursively, collecting (qualified-name, path) pairs
