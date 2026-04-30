@@ -952,6 +952,66 @@ struct LintDiag {
     span: (usize, usize),
 }
 
+/// Completion suggestions for `source`. Returns a JSON array of
+/// `{ label, kind, detail }` items — every class + member declared
+/// in the file, plus the module-level summary as `detail`. The
+/// playground's CodeMirror autocomplete extension fuzzy-filters
+/// against the prefix the user has typed, so we don't try to be
+/// clever with context detection here.
+///
+/// kinds: "class" | "method" | "static-method" | "getter" |
+/// "setter" | "constructor".
+#[wasm_bindgen]
+pub fn complete_wren(source: &str) -> JsValue {
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct Item {
+        label: String,
+        kind: &'static str,
+        detail: String,
+    }
+
+    let pr = wren_lift::parse::parser::parse(source);
+    if !pr.errors.is_empty() {
+        // Half-parsed source produces noisy / wrong completions.
+        // Stay silent until the parser is happy with the AST.
+        return JsValue::from_str("[]");
+    }
+    let module = wren_lift::docs::collect_module(
+        "module",
+        source,
+        &pr.module,
+        &pr.docs,
+        &pr.interner,
+    );
+
+    let mut out: Vec<Item> = Vec::new();
+    for class in &module.classes {
+        out.push(Item {
+            label: class.name.clone(),
+            kind: "class",
+            detail: class.summary().to_string(),
+        });
+        for member in &class.members {
+            let kind = match member.kind {
+                wren_lift::docs::MemberKind::Method => "method",
+                wren_lift::docs::MemberKind::StaticMethod => "static-method",
+                wren_lift::docs::MemberKind::Getter => "getter",
+                wren_lift::docs::MemberKind::Setter => "setter",
+                wren_lift::docs::MemberKind::Constructor => "constructor",
+                wren_lift::docs::MemberKind::Field => "field",
+            };
+            out.push(Item {
+                label: member.name.clone(),
+                kind,
+                detail: member.signature.clone(),
+            });
+        }
+    }
+    out.serialize(&json_serializer())
+        .unwrap_or_else(|_| JsValue::from_str("[]"))
+}
+
 /// Hover content for `source` at UTF-8 byte offset `byte`.
 ///
 /// Returns `null` when the cursor isn't on a documented decl, or

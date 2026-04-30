@@ -193,6 +193,16 @@ export async function hoverWren(source, byte) {
   return m.hover_wren(source, byte);
 }
 
+/// Completion suggestions for `source`. Returns a flat array of
+/// every class + member declared in the file —
+/// `{ label, kind, detail }` — for the editor's autocomplete
+/// extension to fuzzy-filter against. Empty array when the parser
+/// errors (we don't return half-truths from a half-parsed module).
+export async function completeWren(source) {
+  const m = await getMod();
+  return m.complete_wren(source);
+}
+
 // Map a parsed git remote URL to the host's release-asset URL
 // pattern. Each forge has its own; this is intentionally a
 // short list — anything self-hosted should use an explicit

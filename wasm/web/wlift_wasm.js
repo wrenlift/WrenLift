@@ -101,6 +101,26 @@ export function _wasm_init() {
 }
 
 /**
+ * Completion suggestions for `source`. Returns a JSON array of
+ * `{ label, kind, detail }` items — every class + member declared
+ * in the file, plus the module-level summary as `detail`. The
+ * playground's CodeMirror autocomplete extension fuzzy-filters
+ * against the prefix the user has typed, so we don't try to be
+ * clever with context detection here.
+ *
+ * kinds: "class" | "method" | "static-method" | "getter" |
+ * "setter" | "constructor".
+ * @param {string} source
+ * @returns {any}
+ */
+export function complete_wren(source) {
+    const ptr0 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.complete_wren(ptr0, len0);
+    return ret;
+}
+
+/**
  * JS-callable: read the current state of a handle. Used by
  * JS-side debugging / introspection tooling AND by the
  * `browser::browser_peek_state` foreign method that Wren's

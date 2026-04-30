@@ -598,7 +598,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // *the* DOM the Wren program manipulates — `Dom.text("#x")`
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
-    import { createWlift, parseHatchfileToml, resolveDepsFromManifest, lintWren, hoverWren } from "./wlift.js";
+    import { createWlift, parseHatchfileToml, resolveDepsFromManifest, lintWren, hoverWren, completeWren } from "./wlift.js";
     import { ErrorKind } from "./wlift_wasm.js";
     // CodeMirror 6 — modular ESM via esm.sh. The dev server's
     // COOP/COEP headers cooperate with esm.sh's CORP responses,
@@ -612,6 +612,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       from "https://esm.sh/@codemirror/commands@6";
     import { linter, lintGutter } from "https://esm.sh/@codemirror/lint@6";
     import { hoverTooltip } from "https://esm.sh/@codemirror/view@6";
+    import { autocompletion, completionKeymap } from "https://esm.sh/@codemirror/autocomplete@6";
     import { StreamLanguage, syntaxHighlighting,
       HighlightStyle, bracketMatching, indentOnInput }
       from "https://esm.sh/@codemirror/language@6";
@@ -844,6 +845,45 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+    }
+
+    // Wren autocomplete — returns every class + member declared in
+    // the current file. CM6 fuzzy-filters by what the user typed
+    // around the cursor, so we don't try to be context-aware.
+    // CM6 kind names (`class`, `method`, `function`, …) drive the
+    // little glyph next to each entry; we map our custom kinds to
+    // the closest stock match.
+    const KIND_MAP = {
+      "class":          "class",
+      "method":         "method",
+      "static-method":  "function",
+      "getter":         "property",
+      "setter":         "property",
+      "constructor":    "constructor",
+      "field":          "variable",
+    };
+
+    async function wrenCompletionSource(ctx) {
+      // Pick up the identifier-shaped prefix the user just typed.
+      // `\w*` matches the empty word too — explicit-trigger
+      // (Ctrl-Space) flows still pop the menu when the user
+      // hasn't typed anything yet.
+      const word = ctx.matchBefore(/\w*/);
+      if (!word || (word.from === word.to && !ctx.explicit)) return null;
+      let items = [];
+      try {
+        items = await completeWren(ctx.state.doc.toString()) || [];
+      } catch {
+        return null;
+      }
+      return {
+        from: word.from,
+        options: items.map((it) => ({
+          label: it.label,
+          type:  KIND_MAP[it.kind] || "variable",
+          detail: it.detail || undefined,
+        })),
+      };
     }
 
     function bindEditor(textarea, mount, language, extras = []) {
@@ -1083,7 +1123,13 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     const hatchfileMount = document.getElementById("hatchfile-mount");
     const htmlMount = document.getElementById("html-mount");
     const htmlEditor      = bindEditor(htmlEl, htmlMount, html());
-    const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage, [lintGutter(), wrenLinter, wrenHover]);
+    const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage, [
+      lintGutter(),
+      wrenLinter,
+      wrenHover,
+      autocompletion({ override: [wrenCompletionSource] }),
+      keymap.of(completionKeymap),
+    ]);
     const hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
     // Hoisted state — `loadExample` reads `wlift` to decide whether
