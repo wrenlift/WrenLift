@@ -154,17 +154,18 @@ impl Analysis {
         }
         let decl_span = found?;
         let ty = self.type_env.get_var_type(decl_span).clone();
-        if ty.is_known() {
-            Some(ty)
-        } else {
-            // Sema recorded the var but couldn't pin a type
-            // (e.g. the initializer was a chained call whose
-            // return type wasn't traceable). Re-infer the
-            // initializer's RHS using the field-type table —
-            // covers the `var quad = _quad` shape where the
-            // RHS is itself a typed field.
-            None
-        }
+        ty.is_known().then_some(ty)
+    }
+
+    /// Same as [`local_var_type`](Self::local_var_type) but takes
+    /// the variable name as a string. Looks the symbol up in
+    /// this analysis's interner and routes through the AST walk
+    /// — used by `identifier_kind_hint` so a `var quad = _quad`
+    /// hover can splice the field's type into the local's
+    /// signature without any regex over the source.
+    pub fn local_var_type_by_name(&self, byte: usize, name: &str) -> Option<InferredType> {
+        let sym = self.interner.lookup(name)?;
+        self.local_var_type(byte, sym)
     }
 
     /// Walk the AST to find the receiver expression of the call
@@ -818,23 +819,21 @@ pub fn identifier_kind_hint(
         ));
     }
     if let Some((line_no, line)) = find_var_decl_line(source, ident, byte) {
-        // Prefer the typed AST: sema records every `var x = ...`
-        // initializer at the decl's span_start. Fall back to the
-        // RHS regex only when sema couldn't run (parser broken)
-        // or the type came back as Any.
-        let line_byte = source.lines().take(line_no - 1).map(|l| l.len() + 1).sum::<usize>();
-        let typed = analysis.and_then(|a| {
-            // The decl span starts at the `var` keyword's first
-            // byte; the var-name token sits a few chars in. Find
-            // the name's offset on the line and look it up.
-            let trimmed = line.trim_start();
-            let var_at = line_byte + (line.len() - line.trim_start().len());
-            let _ = trimmed;
-            a.var_type_at_span(var_at).and_then(|t| inferred_to_class_name(&t, &a.interner))
-        });
+        // Prefer the typed AST: walk to the var's *name* span
+        // (sema records var types there, not at `var`'s span)
+        // and look up the recorded type. The hand-rolled
+        // `var_at = line_byte + indent` previously pointed at
+        // the `v` of `var`, so the type lookup always missed —
+        // hence `local quad` instead of `local quad: Sprite`.
+        let typed = analysis
+            .and_then(|a| a.local_var_type_by_name(byte, ident))
+            .and_then(|t| analysis.and_then(|a| inferred_to_class_name(&t, &a.interner)));
         let signature = match typed {
             Some(t) => format!("local {}: {}", ident, t),
             None => {
+                // Last-resort RHS regex — only fires when sema
+                // couldn't pin a type (e.g. the initializer
+                // chains through an untyped builder).
                 let rhs = decl_rhs(line.trim());
                 let fallback = rhs.and_then(|r| infer_rhs_type(r, prelude));
                 match fallback {
@@ -1362,6 +1361,51 @@ class Slicer {
         assert_eq!(
             inferred_to_class_name(&ty, &a.interner).as_deref(),
             Some("Sprite")
+        );
+    }
+
+    #[test]
+    fn local_var_type_via_local_var_type_by_name() {
+        // `var quad = _quad` where `_quad: Sprite`. The
+        // identifier_kind_hint path now drives type lookup
+        // through `local_var_type_by_name`, which finds the
+        // var's *name* span (sema's recording key) instead of
+        // the previous regex-derived line-byte that pointed at
+        // `var`.
+        let src = r#"
+import "@hatch:gpu" for Sprite
+
+class Slicer {
+  setup(g) { _quad = Sprite.new(g) }
+  drawAll() {
+    var quad = _quad
+  }
+}
+"#;
+        let a = Analysis::run(src).expect("parse + sema");
+        let cursor = src.find("quad = _quad").unwrap() + 1;
+        let ty = a.local_var_type_by_name(cursor, "quad").expect("local typed");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("Sprite")
+        );
+    }
+
+    #[test]
+    fn arithmetic_with_unknown_operand_is_num() {
+        // `var n = some.getter * 22`. Sema can't pin the
+        // method-return type for `some.getter` (that needs the
+        // primitive method-return table that hasn't landed
+        // yet), but the multiplication should still infer
+        // `Num` — Wren's arithmetic ops only accept Num
+        // operands, so the well-typed result is Num regardless.
+        let src = "var n = 1.cos * 22\n";
+        let a = Analysis::run(src).expect("parse + sema");
+        let name_at = src.find("n =").unwrap();
+        let ty = a.var_type_at_span(name_at).expect("var typed");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("Num")
         );
     }
 

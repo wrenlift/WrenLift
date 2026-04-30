@@ -593,19 +593,33 @@ impl TypeInferrer {
         left: &InferredType,
         right: &InferredType,
     ) -> InferredType {
+        // True when an operand could plausibly be a `Num` —
+        // either we proved it (`is_num()`) or sema couldn't pin
+        // a type at all (`Any`). Arithmetic ops only make
+        // sense on Nums in Wren; if either operand has a known
+        // *non*-Num concrete type the result stays `Any`, but
+        // an unknown side shouldn't poison an otherwise
+        // arithmetic expression.
+        let could_be_num = |t: &InferredType| matches!(t, InferredType::Num | InferredType::Any);
+
         match op {
-            // Arithmetic ops: Num × Num → Num
+            // Arithmetic ops: Num × Num → Num. `+` doubles as
+            // string concatenation: keep the `String` rule for
+            // it but otherwise fall back to the could-be-num
+            // gate so `Num × Any` and `Any × Any` (the common
+            // shape when one operand is a method call sema
+            // hasn't typed yet) infer as `Num`.
             BinaryOp::Add => {
-                if left.is_num() && right.is_num() {
-                    InferredType::Num
-                } else if *left == InferredType::String || *right == InferredType::String {
+                if *left == InferredType::String || *right == InferredType::String {
                     InferredType::String
+                } else if could_be_num(left) && could_be_num(right) {
+                    InferredType::Num
                 } else {
                     InferredType::Any
                 }
             }
             BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                if left.is_num() && right.is_num() {
+                if could_be_num(left) && could_be_num(right) {
                     InferredType::Num
                 } else {
                     InferredType::Any
@@ -618,7 +632,7 @@ impl TypeInferrer {
             | BinaryOp::BitXor
             | BinaryOp::Shl
             | BinaryOp::Shr => {
-                if left.is_num() && right.is_num() {
+                if could_be_num(left) && could_be_num(right) {
                     InferredType::Num
                 } else {
                     InferredType::Any
