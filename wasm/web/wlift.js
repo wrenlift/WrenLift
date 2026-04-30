@@ -182,6 +182,17 @@ export async function lintWren(source) {
   return m.lint_wren(source);
 }
 
+/// Hover content at `byte` (UTF-8 offset into `source`). Returns
+/// `null` when the cursor isn't on a documented declaration, or
+/// `{ markdown, span: [start, end] }` otherwise. Markdown is
+/// CommonMark with a fenced wren signature line on top and the
+/// collected `///` body underneath. Same shape the wlift-lsp
+/// server emits for `textDocument/hover`.
+export async function hoverWren(source, byte) {
+  const m = await getMod();
+  return m.hover_wren(source, byte);
+}
+
 // Map a parsed git remote URL to the host's release-asset URL
 // pattern. Each forge has its own; this is intentionally a
 // short list — anything self-hosted should use an explicit

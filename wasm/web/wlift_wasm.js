@@ -114,6 +114,26 @@ export function future_state(handle) {
 }
 
 /**
+ * Hover content for `source` at UTF-8 byte offset `byte`.
+ *
+ * Returns `null` when the cursor isn't on a documented decl, or
+ * `{ markdown, span: [start, end] }` when it is. `markdown` is
+ * CommonMark with a fenced ```wren signature line on top and the
+ * collected `///` body underneath — same shape the LSP server
+ * emits for `textDocument/hover`. The CodeMirror editor in the
+ * playground renders this through its `hoverTooltip` extension.
+ * @param {string} source
+ * @param {number} byte
+ * @returns {any}
+ */
+export function hover_wren(source, byte) {
+    const ptr0 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.hover_wren(ptr0, len0, byte);
+    return ret;
+}
+
+/**
  * Number of MIR functions successfully compiled to wasm.
  * @returns {number}
  */

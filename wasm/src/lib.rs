@@ -952,6 +952,74 @@ struct LintDiag {
     span: (usize, usize),
 }
 
+/// Hover content for `source` at UTF-8 byte offset `byte`.
+///
+/// Returns `null` when the cursor isn't on a documented decl, or
+/// `{ markdown, span: [start, end] }` when it is. `markdown` is
+/// CommonMark with a fenced ```wren signature line on top and the
+/// collected `///` body underneath — same shape the LSP server
+/// emits for `textDocument/hover`. The CodeMirror editor in the
+/// playground renders this through its `hoverTooltip` extension.
+#[wasm_bindgen]
+pub fn hover_wren(source: &str, byte: usize) -> JsValue {
+    use serde::Serialize;
+    #[derive(Serialize)]
+    struct HoverOut {
+        markdown: String,
+        span: (usize, usize),
+    }
+
+    let pr = wren_lift::parse::parser::parse(source);
+    if !pr.errors.is_empty() {
+        // Hover off a half-parsed module produces noise. Stay
+        // silent until the parser is happy.
+        return JsValue::NULL;
+    }
+    let module = wren_lift::docs::collect_module(
+        "module",
+        source,
+        &pr.module,
+        &pr.docs,
+        &pr.interner,
+    );
+
+    for class in &module.classes {
+        if class.span.start > byte || byte >= class.span.end {
+            continue;
+        }
+        for member in &class.members {
+            if member.span.start <= byte && byte < member.span.end {
+                let markdown = format!(
+                    "```wren\n{}.{}\n```\n{}{}",
+                    class.name,
+                    member.signature,
+                    if member.doc.is_empty() { "" } else { "\n" },
+                    member.doc,
+                );
+                return HoverOut {
+                    markdown,
+                    span: (member.span.start, member.span.end),
+                }
+                .serialize(&json_serializer())
+                .unwrap_or(JsValue::NULL);
+            }
+        }
+        let markdown = format!(
+            "```wren\nclass {}\n```\n{}{}",
+            class.name,
+            if class.doc.is_empty() { "" } else { "\n" },
+            class.doc,
+        );
+        return HoverOut {
+            markdown,
+            span: (class.span.start, class.span.end),
+        }
+        .serialize(&json_serializer())
+        .unwrap_or(JsValue::NULL);
+    }
+    JsValue::NULL
+}
+
 fn diag_to_lint(d: &wren_lift::diagnostics::Diagnostic) -> LintDiag {
     use wren_lift::diagnostics::Severity;
     let severity = match d.severity {

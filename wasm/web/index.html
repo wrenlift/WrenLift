@@ -92,6 +92,25 @@
       color: var(--accent); border-color: var(--accent);
     }
     #back-to-site span:first-child { font-size: 14px; line-height: 1; }
+
+    /* Hover tooltip styling for the live `///` doc preview the
+       wrenHover extension creates. Matches the dark code-pane
+       palette so the tooltip reads as part of the editor. */
+    .cm-tooltip .wlift-hover {
+      max-width: 480px; padding: 10px 14px;
+      font-size: 12px; line-height: 1.5;
+      color: var(--text);
+    }
+    .cm-tooltip .wlift-hover pre {
+      margin: 0 0 6px;
+      padding: 6px 10px;
+      background: rgba(244, 194, 74, 0.06);
+      border: 1px solid rgba(244, 194, 74, 0.18);
+      border-radius: 6px;
+      color: var(--accent);
+      font-size: 12px;
+    }
+    .cm-tooltip .wlift-hover code { font-family: inherit; }
     footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
 
     h1 { font-size: 13px; margin: 0; color: var(--accent); letter-spacing: 0.04em; }
@@ -579,7 +598,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // *the* DOM the Wren program manipulates — `Dom.text("#x")`
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
-    import { createWlift, parseHatchfileToml, resolveDepsFromManifest, lintWren } from "./wlift.js";
+    import { createWlift, parseHatchfileToml, resolveDepsFromManifest, lintWren, hoverWren } from "./wlift.js";
     import { ErrorKind } from "./wlift_wasm.js";
     // CodeMirror 6 — modular ESM via esm.sh. The dev server's
     // COOP/COEP headers cooperate with esm.sh's CORP responses,
@@ -592,6 +611,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     import { defaultKeymap, indentWithTab, history, historyKeymap }
       from "https://esm.sh/@codemirror/commands@6";
     import { linter, lintGutter } from "https://esm.sh/@codemirror/lint@6";
+    import { hoverTooltip } from "https://esm.sh/@codemirror/view@6";
     import { StreamLanguage, syntaxHighlighting,
       HighlightStyle, bracketMatching, indentOnInput }
       from "https://esm.sh/@codemirror/language@6";
@@ -776,6 +796,55 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
         };
       });
     }, { delay: 200 });
+
+    // Hover tooltip — shows `///` doc comments + signatures when
+    // the cursor lands on a class or method declaration. Same
+    // model `wlift-lsp` serves over `textDocument/hover`; the
+    // wasm `hover_wren` returns rendered Markdown which we drop
+    // straight into a tooltip element. Plain CommonMark for now;
+    // a future iteration can ship a Markdown renderer in-page.
+    const wrenHover = hoverTooltip(async (view, pos) => {
+      let result;
+      try {
+        result = await hoverWren(view.state.doc.toString(), pos);
+      } catch {
+        return null;
+      }
+      if (!result) return null;
+      return {
+        pos: result.span[0],
+        end: result.span[1],
+        above: true,
+        create() {
+          const dom = document.createElement("div");
+          dom.className = "wlift-hover";
+          // Minimal Markdown rendering: triple-backtick fences
+          // become <pre>, everything else stays as text. Good
+          // enough for the signature + doc body we emit.
+          const text = result.markdown;
+          const fenceRe = /```wren\n([\s\S]*?)\n```/g;
+          let html = "";
+          let lastIdx = 0;
+          let m;
+          while ((m = fenceRe.exec(text)) !== null) {
+            html += escapeHtml(text.slice(lastIdx, m.index));
+            html += `<pre><code>${escapeHtml(m[1])}</code></pre>`;
+            lastIdx = m.index + m[0].length;
+          }
+          html += escapeHtml(text.slice(lastIdx)).replace(/\n/g, "<br>");
+          dom.innerHTML = html;
+          return { dom };
+        },
+      };
+    });
+
+    function escapeHtml(s) {
+      return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
 
     function bindEditor(textarea, mount, language, extras = []) {
       const initial = textarea.value;
@@ -1014,7 +1083,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     const hatchfileMount = document.getElementById("hatchfile-mount");
     const htmlMount = document.getElementById("html-mount");
     const htmlEditor      = bindEditor(htmlEl, htmlMount, html());
-    const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage, [lintGutter(), wrenLinter]);
+    const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage, [lintGutter(), wrenLinter, wrenHover]);
     const hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
     // Hoisted state — `loadExample` reads `wlift` to decide whether
