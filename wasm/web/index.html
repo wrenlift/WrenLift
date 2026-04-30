@@ -81,6 +81,17 @@
       height: fit-content;
     }
     header { border-bottom: 1px solid var(--rule); }
+    #back-to-site {
+      display: inline-flex; align-items: center; gap: 6px;
+      color: var(--muted); text-decoration: none;
+      font-size: 12px; padding: 4px 10px;
+      border: 1px solid var(--rule); border-radius: 10px;
+      transition: color 120ms, border-color 120ms;
+    }
+    #back-to-site:hover {
+      color: var(--accent); border-color: var(--accent);
+    }
+    #back-to-site span:first-child { font-size: 14px; line-height: 1; }
     footer { border-top: 1px solid var(--rule); color: var(--muted); font-size: 11px; }
 
     h1 { font-size: 13px; margin: 0; color: var(--accent); letter-spacing: 0.04em; }
@@ -417,7 +428,11 @@
 <body>
   <div class="layout">
     <header>
-      <h1>wlift playground</h1>
+      <a id="back-to-site" href="https://wrenlift.com" rel="home" title="back to wrenlift.com">
+        <span aria-hidden="true">←</span>
+        <span>wrenlift.com</span>
+      </a>
+      <h1>playground</h1>
       <span id="status" class="pill">loading…</span>
       <span style="margin-left: auto"></span>
       <button id="runtime" type="button" class="pill runtime" hidden title="open console">—</button>
@@ -1014,489 +1029,14 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // ---- Example library --------------------------------------------
     // Curated set of starter programs the dropdown swaps in. Each
     // entry carries its own HTML / Wren / hatchfile so the user can
-    // see how three or four hatch packages compose; selecting from
-    // the menu replaces all three editors at once and triggers an
-    // autorun. New examples just slot in here — no other wiring.
-    const EXAMPLES = [
-      {
-        id: "dom-async",
-        label: "DOM + async scheduler",
-        html:
-`<h1 id="title">hello, wren</h1>
-<p id="msg">edit me from Wren via <code>Dom.setText</code>.</p>
-<button id="ping" onclick="alert('clicked')">ping</button>`,
-        wren:
-`import "@hatch:assert" for Expect
-
-// \`Future\`, \`Browser\`, \`WebSocket\`, \`Dom\`, \`LocalStorage\` are
-// loaded by the runtime — no boilerplate needed. Async bridges
-// resume through the scheduler in both modes; print *inside*
-// the fiber so results land in the output pane.
-
-var fiber = Fiber.new {
-  System.print("before: %(Dom.text("#title").await)")
-  Browser.setTimeout(0).await
-  Dom.setText("#title", "rewritten by wren").await
-  Dom.setText("#msg", "scheduler resumed me after 0ms").await
-  Dom.addClass("#title", "dim").await
-  System.print("done")
-}
-fiber.try()
-
-// Recursive compute through the wasm tier-up JIT. fib(20) lands
-// at ~3 ms post-warmup on both worker and main mode.
-var start = System.clock
-var fib
-fib = Fn.new {|n| n < 2 ? n : fib.call(n - 1) + fib.call(n - 2) }
-var result = fib.call(20)
-var elapsed = (System.clock - start) * 1000
-
-Expect.that(result).toBe(6765)
-var hundredths = (elapsed * 100).round
-var whole = (hundredths / 100).floor
-var frac = hundredths - whole * 100
-var fracStr = frac < 10 ? "0%(frac)" : "%(frac)"
-System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
-`,
-        hatchfile:
-`name    = "dom-async"
-version = "0.1.0"
-entry   = "main"
-
-[dependencies]
-"@hatch:assert" = "0.2.0"
-`,
-      },
-
-      {
-        id: "json",
-        label: "JSON parse + assertions",
-        html:
-`<h2>JSON demo</h2>
-<p>output is in the console pane.</p>`,
-        wren:
-`import "@hatch:json"   for JSON
-import "@hatch:assert" for Expect
-
-var text =
-  "{\\"package\\": \\"wlift\\"," +
-  " \\"version\\": \\"0.4.0\\"," +
-  " \\"targets\\": [\\"x86_64\\", \\"aarch64\\", \\"wasm32\\"]," +
-  " \\"jit\\": true}"
-
-var obj = JSON.parse(text)
-
-System.print("name     = %(obj["package"])")
-System.print("version  = %(obj["version"])")
-System.print("targets  = %(obj["targets"].join(", "))")
-System.print("jit      = %(obj["jit"])")
-
-Expect.that(obj["package"]).toBe("wlift")
-Expect.that(obj["targets"].count).toBe(3)
-Expect.that(obj["jit"]).toBe(true)
-
-// Round-trip through encode/decode.
-var encoded = JSON.encode({"hello": "world", "n": 42})
-var back = JSON.parse(encoded)
-Expect.that(back["n"]).toBe(42)
-System.print("✓ round-trip: %(encoded)")
-`,
-        hatchfile:
-`name    = "json-demo"
-version = "0.1.0"
-entry   = "main"
-
-[dependencies]
-"@hatch:json"   = "0.1.0"
-"@hatch:assert" = "0.2.0"
-`,
-      },
-
-      {
-        id: "math",
-        label: "Math — Vec3 / Mat4 / Quat",
-        html:
-`<h2>Math demo</h2>
-<p>vector + matrix + quaternion arithmetic — output in console.</p>`,
-        wren:
-`import "@hatch:math"   for Vec3, Mat4, Quat, Math
-import "@hatch:assert" for Expect
-
-// Helper — String interpolation of a Vec3 lands on the default
-// "instance of Vec3" toString today, so we render fields by hand.
-var fmt = Fn.new {|v| "(%(v.x), %(v.y), %(v.z))" }
-
-var a = Vec3.new(1, 2, 3)
-var b = Vec3.new(4, 5, 6)
-
-System.print("a       = %(fmt.call(a))")
-System.print("b       = %(fmt.call(b))")
-System.print("a + b   = %(fmt.call(a + b))")
-System.print("a · b   = %(a.dot(b))")
-System.print("a × b   = %(fmt.call(a.cross(b)))")
-System.print("|a|     = %(a.length)")
-
-// Mat4.translation takes three components, not a Vec3.
-var m = Mat4.translation(10, 0, 0)
-var p = m.transformPoint(a)
-System.print("translated a → %(fmt.call(p))")
-Expect.that(p.x).toBe(11)
-
-// Quaternion rotation 90° around Y.
-var q = Quat.fromAxisAngle(Vec3.new(0, 1, 0), Math.radians(90))
-var r = q.rotateVec3(Vec3.new(1, 0, 0))
-// (1,0,0) rotated 90° around Y → (0, 0, -1) (within float epsilon).
-System.print("rotated x-hat by 90°/Y → %(fmt.call(r))")
-Expect.that(Math.approxEq(r.z, -1, 0.001)).toBe(true)
-System.print("✓ all assertions pass")
-`,
-        hatchfile:
-`name    = "math-demo"
-version = "0.1.0"
-entry   = "main"
-
-[dependencies]
-"@hatch:math"   = "0.1.1"
-"@hatch:assert" = "0.2.0"
-`,
-      },
-
-      {
-        id: "ecs",
-        label: "ECS — entities + queries",
-        html:
-`<h2>ECS demo</h2>
-<p>spawn entities, attach components, query — output in console.</p>`,
-        wren:
-`import "@hatch:ecs"    for World
-import "@hatch:assert" for Expect
-
-class Position {
-  construct new(x, y) {
-    _x = x
-    _y = y
-  }
-  x { _x }
-  x=(v) { _x = v }
-  y { _y }
-  y=(v) { _y = v }
-  toString { "(%(_x), %(_y))" }
-}
-
-class Velocity {
-  construct new(x, y) {
-    _x = x
-    _y = y
-  }
-  x { _x }
-  y { _y }
-}
-
-class Tag {
-  construct new(name) {
-    _name = name
-  }
-  name { _name }
-}
-
-var w = World.new()
-
-// Spawn three entities, attach component bundles.
-var alice = w.spawn()
-w.attach(alice, Position.new(0, 0))
-w.attach(alice, Velocity.new(1, 2))
-w.attach(alice, Tag.new("alice"))
-
-var bob = w.spawn()
-w.attach(bob, Position.new(10, 5))
-w.attach(bob, Velocity.new(-1, 0))
-w.attach(bob, Tag.new("bob"))
-
-// Static entity — no Velocity component.
-var rock = w.spawn()
-w.attach(rock, Position.new(50, 50))
-w.attach(rock, Tag.new("rock"))
-
-System.print("world has %(w.count) entities")
-Expect.that(w.count).toBe(3)
-
-// Fluent query builder is reached via World.query (not Query.new).
-// .iterate runs the filter and returns an iterable; for-in does
-// the rest.
-for (e in w.query.with(Position).with(Velocity).iterate) {
-  var p = w.get(e, Position)
-  var v = w.get(e, Velocity)
-  p.x = p.x + v.x
-  p.y = p.y + v.y
-}
-
-for (e in w.query.with(Position).with(Tag).iterate) {
-  var name = w.get(e, Tag).name
-  var p    = w.get(e, Position)
-  System.print("  %(name): %(p)")
-}
-
-Expect.that(w.get(alice, Position).x).toBe(1)
-Expect.that(w.get(rock, Position).x).toBe(50)  // no velocity → static
-System.print("✓ motion + static both as expected")
-`,
-        hatchfile:
-`name    = "ecs-demo"
-version = "0.1.0"
-entry   = "main"
-
-[dependencies]
-"@hatch:ecs"    = "0.2.0"
-"@hatch:assert" = "0.2.0"
-`,
-      },
-
-      {
-        id: "sprite-grid",
-        label: "Game — sprite grid (WASD)",
-        // Game.run is an infinite frame loop — switching to this
-        // example with the autorun toggle on would silently start
-        // burning frames the moment it's selected. Force autorun
-        // off so the user clicks Run explicitly when they want to
-        // play; the toggle's own state is unchanged.
-        autorun: "off",
-        html:
-`<style>
-  #stage { background: #0a0810; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
-  #stage-canvas { display: block; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
-  #stage-hint {
-    position: absolute; bottom: 8px; left: 14px; right: 14px;
-    color: #8a7e6b; pointer-events: none; font-size: 11px;
-    text-align: center;
-  }
-</style>
-<canvas id="stage-canvas" width="640" height="480" tabindex="0"></canvas>
-<p id="stage-hint">WASD / arrows to nudge · click the canvas, then keys</p>`,
-        wren:
-`import "@hatch:game" for Game
-import "@hatch:gpu"  for Renderer2D, Camera2D, Sprite
-
-class SpriteGrid is Game {
-  construct new() {}
-
-  config { {
-    "title":      "Sprite Grid",
-    "width":      640,
-    "height":     480,
-    "clearColor": [0.04, 0.05, 0.08, 1.0],
-    // Web-only: attach to the existing <canvas> in the playground
-    // stage instead of spawning a fresh one. Ignored on native.
-    "canvas":     "stage-canvas"
-  } }
-
-  setup(g) {
-    _renderer = Renderer2D.new(g.device, g.surfaceFormat)
-    _camera   = Camera2D.contain(640, 480, g.width, g.height)
-
-    // Solid-white 8×8 atlas built byte-by-byte. Sidesteps
-    // \`@hatch:image\` (which has no web cdylib today). Sprites
-    // tint the atlas via vertex colour, so a single texture
-    // backs the whole rainbow grid.
-    var w = 8
-    var h = 8
-    var bytes = ""
-    var i = 0
-    while (i < w * h * 4) {
-      bytes = bytes + String.fromCodePoint(255)
-      i = i + 1
-    }
-    _texture = g.device.createTexture({
-      "width":  w, "height": h,
-      "format": "rgba8unorm",
-      "usage":  ["texture-binding", "copy-dst"]
-    })
-    g.device.writeTexture(_texture, bytes, {
-      "width": w, "height": h, "bytesPerRow": w * 4
-    })
-
-    _cols = 18
-    _rows = 14
-    _cell = 28
-    _offsetX = 0
-    _offsetY = 0
-
-    // Pre-build sprites once; positions + tints update each frame.
-    _sprites = []
-    var r = 0
-    while (r < _rows) {
-      var c = 0
-      while (c < _cols) {
-        var s = Sprite.new(_texture)
-        s.width  = _cell - 4
-        s.height = _cell - 4
-        s.anchor(0.5, 0.5)
-        _sprites.add(s)
-        c = c + 1
-      }
-      r = r + 1
-    }
-  }
-
-  resize(g, w, h) { _camera.fitContain(w, h) }
-
-  update(g) {
-    if (g.input.justPressed("Escape")) g.requestQuit
-    var speed = 200 * g.dt
-    if (g.input.isDown("KeyA") || g.input.isDown("ArrowLeft"))  _offsetX = _offsetX - speed
-    if (g.input.isDown("KeyD") || g.input.isDown("ArrowRight")) _offsetX = _offsetX + speed
-    if (g.input.isDown("KeyW") || g.input.isDown("ArrowUp"))    _offsetY = _offsetY - speed
-    if (g.input.isDown("KeyS") || g.input.isDown("ArrowDown"))  _offsetY = _offsetY + speed
-  }
-
-  draw(g) {
-    _renderer.beginFrame(_camera)
-    var t = g.elapsed
-    var originX = (_camera.width  - _cols * _cell) / 2 + _offsetX
-    var originY = (_camera.height - _rows * _cell) / 2 + _offsetY
-    var idx = 0
-    var r = 0
-    while (r < _rows) {
-      var c = 0
-      while (c < _cols) {
-        var s = _sprites[idx]
-        s.x = originX + c * _cell + _cell / 2
-        s.y = originY + r * _cell + _cell / 2
-        var phase = (c + r) * 0.25 + t * 1.5
-        s.setTint(
-          0.5 + 0.5 * phase.sin,
-          0.5 + 0.5 * (phase + 2.094).sin,
-          0.5 + 0.5 * (phase + 4.188).sin,
-          1.0
-        )
-        s.draw(_renderer)
-        idx = idx + 1
-        c = c + 1
-      }
-      r = r + 1
-    }
-    _renderer.flush(g.pass)
-  }
-}
-
-Game.run(SpriteGrid)
-`,
-        hatchfile:
-`name    = "sprite-grid"
-version = "0.1.0"
-entry   = "main"
-
-[dependencies]
-"@hatch:game" = "0.2.6"
-`,
-      },
-
-      {
-        id: "gpu-sprite",
-        label: "GPU — sprite batch (canvas)",
-        html:
-`<style>
-  #stage { background: #1d1812; padding: 0; display: flex; align-items: center; justify-content: center; position: relative; }
-  #stage-canvas { display: block; max-width: 100%; max-height: 100%; image-rendering: pixelated; }
-  #stage-hint {
-    position: absolute; bottom: 8px; left: 14px; right: 14px;
-    color: #8a7e6b; pointer-events: none; font-size: 11px;
-    text-align: center;
-  }
-</style>
-<canvas id="stage-canvas" width="600" height="400"></canvas>
-<p id="stage-hint">WebGPU sprite batch — Renderer2D draws a 4×4 grid into the canvas above. One frame, one flush.</p>`,
-        wren:
-`import "@hatch:window" for Window
-import "@hatch:gpu"    for Gpu, Camera2D, Renderer2D
-
-var SURF_W = 600
-var SURF_H = 400
-
-// BYO canvas — same shape main + worker honour. The page already
-// owns <canvas id="stage-canvas">; \`Window.create({"canvas": <id>})\`
-// attaches without touching the DOM, so this works in worker mode
-// (where the canvas arrives via \`transferControlToOffscreen\`).
-var window = Window.create({
-  "canvas": "stage-canvas",
-  "title":  "renderer2d demo"
-})
-
-var device  = Gpu.requestDevice({})
-var surface = device.createSurface(window.handle)
-var renderer = Renderer2D.new(device, "preferred")
-
-// 4x4 RGBA8 white texture — sprites tint it via vertex colour
-// so we don't need any image asset.
-var whiteBytes = ""
-var i = 0
-while (i < 4 * 4 * 4) {
-  whiteBytes = whiteBytes + String.fromCodePoint(255)
-  i = i + 1
-}
-var atlas = device.createTexture({
-  "width":  4, "height": 4,
-  "format": "rgba8unorm",
-  "usage":  ["texture-binding", "copy-dst"]
-})
-device.writeTexture(atlas, whiteBytes, {
-  "width": 4, "height": 4, "bytesPerRow": 16
-})
-
-var camera = Camera2D.contain(SURF_W, SURF_H, SURF_W, SURF_H)
-renderer.beginFrame(camera)
-
-// 4×4 grid, four-colour rotation.
-var palette = [
-  [0.85, 0.48, 0.17, 1.0],
-  [0.36, 0.78, 0.50, 1.0],
-  [0.32, 0.55, 0.91, 1.0],
-  [0.93, 0.84, 0.36, 1.0],
-]
-var size   = 80
-var gap    = 12
-var totalW = 4 * size + 3 * gap
-var totalH = 4 * size + 3 * gap
-var ox = (SURF_W - totalW) / 2
-var oy = (SURF_H - totalH) / 2
-var cell = 0
-while (cell < 16) {
-  var col = cell % 4
-  var row = (cell / 4).floor
-  var x = ox + col * (size + gap)
-  var y = oy + row * (size + gap)
-  var c = palette[(row + col) % 4]
-  renderer.drawSpriteTinted(atlas, x, y, size, size, c[0], c[1], c[2], c[3])
-  cell = cell + 1
-}
-
-var frame = surface.acquire()
-var enc   = device.createCommandEncoder()
-var pass  = enc.beginRenderPass({
-  "colorAttachments": [{
-    "view":       frame.view,
-    "loadOp":     "clear",
-    "clearValue": { "r": 0.06, "g": 0.05, "b": 0.04, "a": 1.0 },
-    "storeOp":    "store"
-  }]
-})
-renderer.flush(pass)
-pass.end
-enc.finish
-device.submit([enc])
-frame.present
-System.print("rendered ✓ (4×4 grid)")
-`,
-        hatchfile:
-`name    = "gpu-sprite"
-version = "0.1.0"
-entry   = "main"
-
-[dependencies]
-"@hatch:window" = "0.2.4"
-"@hatch:gpu"    = "0.2.4"
-`,
-      },
-    ];
+    // see how three or four hatch packages compose. Source of
+    // truth lives in ./examples.json — edit there to add or
+    // tweak entries; this fetch picks them up on next load.
+    const EXAMPLES = await (async () => {
+      const r = await fetch("./examples.json", { cache: "no-cache" });
+      if (!r.ok) throw new Error(`examples.json: ${r.status} ${r.statusText}`);
+      return r.json();
+    })();
 
     function loadExample(id) {
       const ex = EXAMPLES.find((e) => e.id === id);
@@ -1519,6 +1059,16 @@ entry   = "main"
       // Programmatic writes don't fire `change`, so the
       // `userAutorunPref` tracker stays untouched.
       autoChk.checked = ex.autorun === "off" ? false : userAutorunPref;
+      // Game / GPU examples paint into the canvas; the console pane
+      // is dead weight that crops the play area. `console: "off"`
+      // collapses it on load (the user can still pop it back via the
+      // header toggle). Anything else honours whatever state the
+      // pane is already in so we don't fight the user's choice.
+      if (ex.console === "off") {
+        setConsoleVisible(false);
+      } else if (ex.console === "on") {
+        setConsoleVisible(true);
+      }
       // Hide the prior example's runtime pill the moment the user
       // switches — the elapsed-ms / error kind from a totally
       // different example reads as state of the new one until the
@@ -1600,6 +1150,20 @@ entry   = "main"
       return "/proxy";
     }
     async function proxiedFetcher(url, name) {
+      // Same-origin / relative URLs (`./foo.hatch`, `/foo.hatch`)
+      // need no proxy and would 403 against the registry-only
+      // allowlist anyway. Hit them directly.
+      const isRelative = url.startsWith("./") || url.startsWith("/");
+      let isSameOrigin = false;
+      try { isSameOrigin = new URL(url, location.href).origin === location.origin; }
+      catch { /* invalid URL — fall through to proxied path */ }
+      if (isRelative || isSameOrigin) {
+        const direct = await fetch(url);
+        if (!direct.ok) {
+          throw new Error(`dep '${name}' direct fetch failed: ${direct.status} ${direct.statusText} (${url})`);
+        }
+        return new Uint8Array(await direct.arrayBuffer());
+      }
       const proxied = `${resolveProxyBase()}?url=${encodeURIComponent(url)}`;
       const r = await fetch(proxied);
       if (!r.ok) {
@@ -1947,7 +1511,12 @@ entry   = "main"
     // has DOM to mutate. Subsequent renders only fire when the
     // HTML source changes (see the `htmlEl` input listener).
     renderStage();
-    bootMode(modeSel.value);
+    // Honour the first-loaded example's autorun flag on boot. If
+    // it's `autorun: "off"` (long-running games), the wlift VM
+    // still spins up but the user has to hit Run — landing on
+    // Fruit Slicer with the loop already running blocks the user
+    // from reading the source first.
+    bootMode(modeSel.value, currentExampleAutorun !== "off");
   </script>
 </body>
 </html>

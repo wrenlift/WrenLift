@@ -317,20 +317,46 @@ export async function resolveDepsFromManifest(
 ) {
   const order = [];                  // Uint8Array[] in install order
   const seen = new Set();            // package names already queued
-  await visit(manifest);
+  await visit(manifest, true);
   return order;
 
-  async function visit(m) {
+  async function visit(m, isRoot = false) {
     const deps = (m && m.dependencies) || {};
-    for (const [name, entry] of Object.entries(deps)) {
-      if (seen.has(name)) continue;
-      seen.add(name);
+    let entries = Object.entries(deps);
+    // Top-level deps win over any transitive pin of the same
+    // name. Manifest deps come from a BTreeMap on the Rust side,
+    // so iteration order is alphabetical — without this
+    // pre-registration, an alphabetically-earlier package can
+    // pull in a transitive `@scope:foo` and lock the user's
+    // `{ url = "..." }` override out of the queue. We claim the
+    // names up-front, then fetch each below.
+    //
+    // We also reorder: URL/path overrides install before
+    // version-pinned entries. The runtime's `install_hatch_sections`
+    // is first-wins on duplicate module names, and registry
+    // bundles often carry their transitive deps (e.g. @hatch:game
+    // embeds gpu_web). Installing the override first makes the
+    // user's modified module register before the registry copy
+    // can claim the slot.
+    if (isRoot) {
+      for (const [name] of entries) seen.add(name);
+      entries = entries.slice().sort(([, a], [, b]) => {
+        const aOverride = a && typeof a === "object" && (typeof a.url === "string" || typeof a.path === "string");
+        const bOverride = b && typeof b === "object" && (typeof b.url === "string" || typeof b.path === "string");
+        return Number(bOverride) - Number(aOverride);
+      });
+    }
+    for (const [name, entry] of entries) {
+      if (!isRoot) {
+        if (seen.has(name)) continue;
+        seen.add(name);
+      }
       const { url } = depEntryToUrl(name, entry, registryBase, target);
       const bytes = await fetcher(url, name);
       // Peek before installing so transitive deps queue ahead
       // of this one (post-order: deps install before consumers).
       const childManifest = await peekManifest(bytes);
-      await visit(childManifest);
+      await visit(childManifest, false);
       order.push(bytes);
     }
   }
