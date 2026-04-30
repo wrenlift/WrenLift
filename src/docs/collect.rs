@@ -58,6 +58,22 @@ pub fn collect_module(
         // public API surface for v0. Skip them.
     }
 
+    // Single-class module fallback: when a file declares exactly
+    // one class and that class has no `///` doc of its own,
+    // promote the module's `//!` block onto the class. The
+    // prelude (and most authored single-class hatch packages)
+    // ships its description in the file header rather than
+    // duplicating it above the class declaration; without this,
+    // `Fiber` / `List` / `Map` / `Future` / `Sequence` etc. all
+    // hovered as bare `class Name` lines even though the module
+    // documented them in detail.
+    if module_doc.classes.len() == 1 && !module_doc.doc.is_empty() {
+        let cls = &mut module_doc.classes[0];
+        if cls.doc.is_empty() {
+            cls.doc = module_doc.doc.clone();
+        }
+    }
+
     // Second pass: resolve `[X]` bracket cross-references in every
     // body. Builds a tiny symbol table from the classes we just
     // collected and walks each Markdown blob for bracketed text.
@@ -617,6 +633,42 @@ mod tests {
         let doc = collect("//! Top of file.\n//! Second line.\n\nclass Foo {}\n");
         assert!(doc.doc.contains("Top of file."));
         assert!(doc.doc.contains("Second line."));
+    }
+
+    #[test]
+    fn single_class_inherits_module_doc_when_class_has_none() {
+        // Mirrors the prelude shape: `//!` describes the class,
+        // `class X {}` has no `///` of its own. Hovering on `X`
+        // used to show a bare `class X` line; the fallback now
+        // surfaces the module description.
+        let src = "//! Cooperative coroutines.\n//! Build with `Fiber.new {...}`.\n\nclass Fiber {}\n";
+        let doc = collect(src);
+        assert_eq!(doc.classes.len(), 1);
+        assert_eq!(doc.classes[0].name, "Fiber");
+        assert!(doc.classes[0].doc.contains("Cooperative coroutines"));
+        assert!(doc.classes[0].doc.contains("Fiber.new"));
+    }
+
+    #[test]
+    fn class_doc_wins_over_module_doc_when_both_present() {
+        // When the author wrote both a `//!` block and a `///`
+        // block, the `///` is more specific — keep it.
+        let src =
+            "//! Module-level prose.\n\n/// Class-level prose.\nclass Foo {}\n";
+        let doc = collect(src);
+        assert_eq!(doc.classes[0].doc, "Class-level prose.");
+        assert_eq!(doc.doc, "Module-level prose.");
+    }
+
+    #[test]
+    fn module_doc_fallback_skips_multi_class_files() {
+        // Two classes — ambiguous which one should inherit, so
+        // neither gets the module fallback.
+        let src = "//! Two-class module.\n\nclass A {}\n\nclass B {}\n";
+        let doc = collect(src);
+        assert_eq!(doc.classes.len(), 2);
+        assert_eq!(doc.classes[0].doc, "");
+        assert_eq!(doc.classes[1].doc, "");
     }
 
     #[test]
