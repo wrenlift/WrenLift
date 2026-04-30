@@ -313,14 +313,24 @@ fn identifier_hover(
     if wren_lift::docs::hover::is_keyword(ident) {
         return None;
     }
-    let receiver = wren_lift::docs::hover::receiver_before(&doc.text, span.start);
+    let text_receiver = wren_lift::docs::hover::receiver_before(&doc.text, span.start);
+    // Sema's typed AST. Drives field/local type splices and the
+    // typed-receiver-class lookup below — sema knows `_trail: List`
+    // when the field was assigned `[]`, so `_trail.count` resolves
+    // against List's `count` instead of the first class with a
+    // `count` member.
+    let analysis = wren_lift::docs::hover::Analysis::run(&doc.text);
+    let typed_receiver_class: Option<String> = analysis.as_ref().and_then(|a| {
+        a.receiver_type_for_call_at(byte)
+            .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
+    });
 
     let mut all: Vec<&wren_lift::docs::ModuleDoc> =
         wren_lift::docs::prelude_docs().iter().collect();
     all.insert(0, module);
 
     // Class-name hover (cursor on the class identifier itself).
-    if receiver.is_none() {
+    if text_receiver.is_none() {
         for m in &all {
             for class in &m.classes {
                 if class.name == ident {
@@ -365,13 +375,24 @@ fn identifier_hover(
         }
     }
 
-    // Pass 1 — receiver-restricted. Skipped when the receiver
-    // isn't a known class name (e.g. a local `fiber` variable);
-    // pass 2 then handles the unrestricted match.
-    if let Some(recv) = receiver {
+    // Effective receiver class for member lookup. Order:
+    //   1. sema's inferred receiver class (typed-AST truth);
+    //   2. text receiver, when class-shaped uppercase.
+    let effective_receiver: Option<String> = typed_receiver_class.clone().or_else(|| {
+        text_receiver.and_then(|r| {
+            let first = r.chars().next()?;
+            if first.is_ascii_uppercase() {
+                Some(r.to_string())
+            } else {
+                None
+            }
+        })
+    });
+
+    if let Some(recv_class) = effective_receiver.as_deref() {
         for m in &all {
             for class in &m.classes {
-                if class.name != recv {
+                if class.name != recv_class {
                     continue;
                 }
                 for member in &class.members {
@@ -394,63 +415,59 @@ fn identifier_hover(
             }
         }
     }
-    // Pass 2 — receiver is a value (local / field / `this`).
-    // Scan every class's members for the name — useful for
-    // chained calls against locals (`fiber.try()`) where the
-    // receiver isn't itself a class. *Skipped* for class-shaped
-    // uppercase receivers we don't have docs for: guessing
-    // there returns the wrong class's method.
-    if let Some(recv) = receiver {
-        let first = recv.chars().next().unwrap_or('_');
-        let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
-        if receiver_looks_like_value {
-            for m in &all {
-                for class in &m.classes {
-                    for member in &class.members {
-                        if member.name == ident {
-                            let body = format!(
-                                "```wren\n{}\n```{}{}",
-                                wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
-                                if member.doc.is_empty() { "" } else { "\n\n" },
-                                member.doc,
-                            );
-                            return Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: body,
-                                }),
-                                range: Some(doc.byte_range_to_lsp(span)),
-                            });
+
+    // Last-resort scan-all only when sema couldn't pin the
+    // receiver type AND the text receiver isn't class-shaped.
+    if effective_receiver.is_none() {
+        if let Some(recv) = text_receiver {
+            let first = recv.chars().next().unwrap_or('_');
+            let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
+            if receiver_looks_like_value {
+                for m in &all {
+                    for class in &m.classes {
+                        for member in &class.members {
+                            if member.name == ident {
+                                let body = format!(
+                                    "```wren\n{}\n```{}{}",
+                                    wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                                    if member.doc.is_empty() { "" } else { "\n\n" },
+                                    member.doc,
+                                );
+                                return Some(Hover {
+                                    contents: HoverContents::Markup(MarkupContent {
+                                        kind: MarkupKind::Markdown,
+                                        value: body,
+                                    }),
+                                    range: Some(doc.byte_range_to_lsp(span)),
+                                });
+                            }
                         }
                     }
                 }
+            } else {
+                let body_md = format!(
+                    "```wren\n{}.{}\n```\n\n`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep the workspace hasn't loaded yet.",
+                    recv, ident, ident
+                );
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: body_md,
+                    }),
+                    range: Some(doc.byte_range_to_lsp(span)),
+                });
             }
-        } else {
-            // Class-shaped receiver, no docs. Produce a brief
-            // "<Receiver>.<member>, docs unavailable" hint so
-            // the user doesn't see a wrong class's method.
-            let body_md = format!(
-                "```wren\n{}.{}\n```\n\n`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep the workspace hasn't loaded yet.",
-                recv, ident, ident
-            );
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: body_md,
-                }),
-                range: Some(doc.byte_range_to_lsp(span)),
-            });
         }
     }
 
-    // Pass 3 — identifier-kind classifier. Surfaces a brief
-    // "field / local / parameter" hint when nothing else
-    // matches so hover always says something useful.
+    // Pass 3 — identifier-kind classifier. Sema's TypeEnv
+    // splices the inferred type for fields and locals.
     let (signature, body_text) = wren_lift::docs::hover::identifier_kind_hint(
         &doc.text,
         ident,
         span.start,
         wren_lift::docs::prelude_docs(),
+        analysis.as_ref(),
     )?;
     let body_md = format!(
         "```wren\n{}\n```{}{}",

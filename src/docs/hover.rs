@@ -11,7 +11,361 @@
 
 use std::ops::Range;
 
+use crate::ast::{Expr, Module, Spanned, Stmt};
+use crate::intern::{Interner, SymbolId};
+use crate::sema::types::{infer_types, InferredType, TypeEnv};
+
 use super::{ModuleDoc, ParamTypeInfo};
+
+/// Parsed module + interner + inferred type environment, kept
+/// together so hover / completion can consult sema's typed AST
+/// instead of falling back to text heuristics. Built once per
+/// hover request via [`Analysis::run`]; cheap to throw away.
+pub struct Analysis {
+    pub module: Module,
+    pub interner: Interner,
+    pub type_env: TypeEnv,
+}
+
+impl Analysis {
+    /// Parse + run the type inferrer. Returns `None` when the
+    /// parser couldn't produce a usable module — callers fall
+    /// back to text heuristics in that case.
+    pub fn run(source: &str) -> Option<Self> {
+        let pr = crate::parse::parser::parse(source);
+        if !pr.errors.is_empty() {
+            return None;
+        }
+        // 3-pass inference: pass 1 collects field assignment
+        // types, pass 2 records method return types from the
+        // field-aware inference, pass 3 emits the final
+        // per-expression type map. Single-pass left field
+        // references as `Any` because the field hadn't been
+        // recorded yet when the use site was visited.
+        let type_env = infer_types(&pr.module);
+        Some(Analysis {
+            module: pr.module,
+            interner: pr.interner,
+            type_env,
+        })
+    }
+
+    /// Symbol id of the class whose body contains `byte`, or
+    /// `None` when the cursor sits outside any class.
+    pub fn enclosing_class(&self, byte: usize) -> Option<SymbolId> {
+        for stmt in &self.module {
+            if !span_contains(&stmt.1, byte) {
+                continue;
+            }
+            if let Stmt::Class(class) = &stmt.0 {
+                return Some(class.name.0);
+            }
+        }
+        None
+    }
+
+    /// Inferred type for the field `name` (sans leading `_`)
+    /// inside the class containing `byte`. `None` when sema
+    /// hasn't recorded a type — i.e. the field has no
+    /// initialiser or is only assigned values whose types didn't
+    /// converge.
+    pub fn field_type_at(&self, byte: usize, field_name: &str) -> Option<InferredType> {
+        let class = self.enclosing_class(byte)?;
+        let field = self.interner.lookup(field_name)?;
+        let ty = self.type_env.get_field_type(class, field).clone();
+        ty.is_known().then_some(ty)
+    }
+
+    /// Inferred type recorded at a `var <name>` declaration's
+    /// span_start. Look up via [`find_var_decl_span`].
+    pub fn var_type_at_span(&self, decl_span_start: usize) -> Option<InferredType> {
+        let ty = self.type_env.get_var_type(decl_span_start).clone();
+        ty.is_known().then_some(ty)
+    }
+
+    /// Walk the AST to find a method-call whose method-name span
+    /// covers `byte`, and return the inferred type of its
+    /// receiver. Used to resolve `<recv>.<member>` hovers
+    /// against the actual receiver class instead of taking the
+    /// first same-named member from any class.
+    pub fn receiver_type_for_call_at(&self, byte: usize) -> Option<InferredType> {
+        let recv = self.find_call_receiver_at(byte)?;
+        // Choose the look-up that's robust to multi-pass
+        // inference. `expr_types` is "ephemeral" and gets cleared
+        // between passes, so a Field reference often comes back
+        // as `Any` even when the underlying field type is known.
+        // The field-table and the enclosing class together give
+        // a stable answer.
+        let ty = match &recv.0 {
+            Expr::Field(field_sym) => {
+                let class = self.enclosing_class(byte)?;
+                self.type_env.get_field_type(class, *field_sym).clone()
+            }
+            Expr::This => InferredType::Class(self.enclosing_class(byte)?),
+            _ => self.type_env.get_expr_type(recv.1.start).clone(),
+        };
+        ty.is_known().then_some(ty)
+    }
+
+    /// Walk the AST to find the receiver expression of the call
+    /// whose method-name span covers `byte`. Returned as a
+    /// reference into the analysed module so the caller can
+    /// inspect the AST node directly (the receiver might be a
+    /// field, `this`, a chained call, etc.).
+    fn find_call_receiver_at(&self, byte: usize) -> Option<&Spanned<Expr>> {
+        let mut found: Option<&Spanned<Expr>> = None;
+        for stmt in &self.module {
+            walk_stmt_for_call(stmt, byte, &mut found);
+            if found.is_some() {
+                break;
+            }
+        }
+        found
+    }
+}
+
+/// Map a sema [`InferredType`] to a printable class name suitable
+/// for hover signatures (`local x: List`, etc.). Built-in types
+/// resolve to their prelude class name; user classes resolve via
+/// the interner. `None` for `Any`.
+pub fn inferred_to_class_name(ty: &InferredType, interner: &Interner) -> Option<String> {
+    match ty {
+        InferredType::Num => Some("Num".into()),
+        InferredType::Bool => Some("Bool".into()),
+        InferredType::Null => Some("Null".into()),
+        InferredType::String => Some("String".into()),
+        InferredType::List => Some("List".into()),
+        InferredType::Map => Some("Map".into()),
+        InferredType::Range => Some("Range".into()),
+        InferredType::Fn => Some("Fn".into()),
+        InferredType::Class(sym) => Some(interner.resolve(*sym).to_string()),
+        InferredType::Any => None,
+    }
+}
+
+fn span_contains(span: &Range<usize>, byte: usize) -> bool {
+    span.start <= byte && byte < span.end
+}
+
+fn walk_stmt_for_call<'a>(
+    stmt: &'a Spanned<Stmt>,
+    byte: usize,
+    out: &mut Option<&'a Spanned<Expr>>,
+) {
+    // No span gating — see `find_call_receiver_at`. Descend
+    // through every node and let the leaf check (the method
+    // name span) gate the actual match.
+    match &stmt.0 {
+        Stmt::Expr(expr) => walk_expr_for_call(expr, byte, out),
+        Stmt::Var { initializer, .. } => {
+            if let Some(init) = initializer {
+                walk_expr_for_call(init, byte, out);
+            }
+        }
+        Stmt::Class(class) => {
+            for method in &class.methods {
+                if let Some(body) = &method.0.body {
+                    walk_stmt_for_call(body, byte, out);
+                    if out.is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                walk_stmt_for_call(s, byte, out);
+                if out.is_some() {
+                    return;
+                }
+            }
+        }
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            walk_expr_for_call(condition, byte, out);
+            if out.is_none() {
+                walk_stmt_for_call(then_branch, byte, out);
+            }
+            if out.is_none() {
+                if let Some(eb) = else_branch {
+                    walk_stmt_for_call(eb, byte, out);
+                }
+            }
+        }
+        Stmt::While { condition, body } => {
+            walk_expr_for_call(condition, byte, out);
+            if out.is_none() {
+                walk_stmt_for_call(body, byte, out);
+            }
+        }
+        Stmt::For {
+            iterator, body, ..
+        } => {
+            walk_expr_for_call(iterator, byte, out);
+            if out.is_none() {
+                walk_stmt_for_call(body, byte, out);
+            }
+        }
+        Stmt::Return(Some(e)) => walk_expr_for_call(e, byte, out),
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Import { .. } => {}
+    }
+}
+
+fn walk_expr_for_call<'a>(
+    expr: &'a Spanned<Expr>,
+    byte: usize,
+    out: &mut Option<&'a Spanned<Expr>>,
+) {
+    // Descend into children first so the *innermost* matching
+    // call wins — `a.b().c().d()` with the cursor on `d` should
+    // resolve against the inner `.c()`'s return type, not the
+    // outer chain head.
+    match &expr.0 {
+        Expr::Call {
+            receiver,
+            method,
+            args,
+            block_arg,
+            ..
+        } => {
+            for arg in args {
+                walk_expr_for_call(arg, byte, out);
+                if out.is_some() {
+                    return;
+                }
+            }
+            if let Some(b) = block_arg {
+                walk_expr_for_call(b, byte, out);
+                if out.is_some() {
+                    return;
+                }
+            }
+            if let Some(recv) = receiver {
+                walk_expr_for_call(recv, byte, out);
+                if out.is_some() {
+                    return;
+                }
+            }
+            if span_contains(&method.1, byte) {
+                if let Some(recv) = receiver {
+                    *out = Some(recv);
+                }
+            }
+        }
+        Expr::UnaryOp { operand, .. } => walk_expr_for_call(operand, byte, out),
+        Expr::BinaryOp { left, right, .. } | Expr::LogicalOp { left, right, .. } => {
+            walk_expr_for_call(left, byte, out);
+            if out.is_none() {
+                walk_expr_for_call(right, byte, out);
+            }
+        }
+        Expr::Is { value, type_name } => {
+            walk_expr_for_call(value, byte, out);
+            if out.is_none() {
+                walk_expr_for_call(type_name, byte, out);
+            }
+        }
+        Expr::Assign { target, value } | Expr::CompoundAssign { target, value, .. } => {
+            walk_expr_for_call(target, byte, out);
+            if out.is_none() {
+                walk_expr_for_call(value, byte, out);
+            }
+        }
+        Expr::Subscript { receiver, args } => {
+            walk_expr_for_call(receiver, byte, out);
+            for a in args {
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(a, byte, out);
+            }
+        }
+        Expr::SubscriptSet {
+            receiver,
+            index_args,
+            value,
+        } => {
+            walk_expr_for_call(receiver, byte, out);
+            for a in index_args {
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(a, byte, out);
+            }
+            if out.is_none() {
+                walk_expr_for_call(value, byte, out);
+            }
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            walk_expr_for_call(condition, byte, out);
+            if out.is_none() {
+                walk_expr_for_call(then_expr, byte, out);
+            }
+            if out.is_none() {
+                walk_expr_for_call(else_expr, byte, out);
+            }
+        }
+        Expr::ListLiteral(items) => {
+            for it in items {
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(it, byte, out);
+            }
+        }
+        Expr::MapLiteral(pairs) => {
+            for (k, v) in pairs {
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(k, byte, out);
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(v, byte, out);
+            }
+        }
+        Expr::Range { from, to, .. } => {
+            walk_expr_for_call(from, byte, out);
+            if out.is_none() {
+                walk_expr_for_call(to, byte, out);
+            }
+        }
+        Expr::Closure { body, .. } => walk_stmt_for_call(body, byte, out),
+        Expr::Interpolation(parts) => {
+            for p in parts {
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(p, byte, out);
+            }
+        }
+        Expr::SuperCall { args, .. } => {
+            for a in args {
+                if out.is_some() {
+                    return;
+                }
+                walk_expr_for_call(a, byte, out);
+            }
+        }
+        // Leaves — no children to descend into.
+        Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::This
+        | Expr::Ident(_)
+        | Expr::Field(_)
+        | Expr::StaticField(_) => {}
+    }
+}
 
 /// Glue a class name to a member signature for hover display.
 /// The collector encodes static-ness as a `static ` prefix on
@@ -126,20 +480,30 @@ pub fn is_keyword(ident: &str) -> bool {
 /// member name. Returns `(signature, body)`. Body is empty for
 /// signature-only buckets (fields, generic fallback) so we
 /// don't ship template boilerplate on every hover.
+///
+/// `analysis` is the parsed AST + sema's [`TypeEnv`]. When
+/// present, fields and `var` locals get typed signatures
+/// (`instance field _trail: List`, `local count: Num`) sourced
+/// from the typed AST instead of regex over the source text.
+/// Pass `None` only when the parser couldn't produce a usable
+/// module — a literal text-fallback path for half-typed code.
 pub fn identifier_kind_hint(
     source: &str,
     ident: &str,
     byte: usize,
     prelude: &[ModuleDoc],
+    analysis: Option<&Analysis>,
 ) -> Option<(String, String)> {
     if is_keyword(ident) {
         return None;
     }
     if ident.starts_with("__") {
-        return Some((format!("static field {}", ident), String::new()));
+        let sig = field_signature("static field", ident, ident.trim_start_matches('_'), byte, analysis);
+        return Some((sig, String::new()));
     }
     if ident.starts_with('_') {
-        return Some((format!("instance field {}", ident), String::new()));
+        let sig = field_signature("instance field", ident, ident.trim_start_matches('_'), byte, analysis);
+        return Some((sig, String::new()));
     }
     if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
         return Some((
@@ -148,11 +512,30 @@ pub fn identifier_kind_hint(
         ));
     }
     if let Some((line_no, line)) = find_var_decl_line(source, ident, byte) {
-        let rhs = decl_rhs(line.trim());
-        let ty = rhs.and_then(|r| infer_rhs_type(r, prelude));
-        let signature = match &ty {
+        // Prefer the typed AST: sema records every `var x = ...`
+        // initializer at the decl's span_start. Fall back to the
+        // RHS regex only when sema couldn't run (parser broken)
+        // or the type came back as Any.
+        let line_byte = source.lines().take(line_no - 1).map(|l| l.len() + 1).sum::<usize>();
+        let typed = analysis.and_then(|a| {
+            // The decl span starts at the `var` keyword's first
+            // byte; the var-name token sits a few chars in. Find
+            // the name's offset on the line and look it up.
+            let trimmed = line.trim_start();
+            let var_at = line_byte + (line.len() - line.trim_start().len());
+            let _ = trimmed;
+            a.var_type_at_span(var_at).and_then(|t| inferred_to_class_name(&t, &a.interner))
+        });
+        let signature = match typed {
             Some(t) => format!("local {}: {}", ident, t),
-            None => format!("local {}", ident),
+            None => {
+                let rhs = decl_rhs(line.trim());
+                let fallback = rhs.and_then(|r| infer_rhs_type(r, prelude));
+                match fallback {
+                    Some(t) => format!("local {}: {}", ident, t),
+                    None => format!("local {}", ident),
+                }
+            }
         };
         return Some((
             signature,
@@ -164,6 +547,29 @@ pub fn identifier_kind_hint(
         ));
     }
     Some((format!("identifier {}", ident), String::new()))
+}
+
+/// Build a field-style signature with the inferred type spliced
+/// in when sema knows it. `kind` is the human-readable bucket
+/// (`"instance field"` or `"static field"`); `display` is the
+/// full underscore-prefixed identifier; `bare` is the field name
+/// with leading underscores stripped (the form sema interns).
+fn field_signature(
+    kind: &str,
+    display: &str,
+    bare: &str,
+    byte: usize,
+    analysis: Option<&Analysis>,
+) -> String {
+    let typed = analysis.and_then(|a| {
+        a.field_type_at(byte, bare)
+            .as_ref()
+            .and_then(|t| inferred_to_class_name(t, &a.interner))
+    });
+    match typed {
+        Some(t) => format!("{} {}: {}", kind, display, t),
+        None => format!("{} {}", kind, display),
+    }
 }
 
 /// Pull the right-hand side of a `var name = <rhs>` line.
@@ -558,5 +964,70 @@ mod tests {
         // bare-identifier shape returned by `identifier_at`.
         assert!(!is_keyword("var x"));
         assert!(!is_keyword(""));
+    }
+
+    use super::{inferred_to_class_name, Analysis};
+
+    #[test]
+    fn field_type_resolves_via_sema_list_literal() {
+        // A field assigned `[]` inside the constructor must
+        // surface as `List` on hover. This is the
+        // `_fruitNames = []` case the user flagged.
+        let src = r#"
+class Foo {
+  construct new() {
+    _items = []
+  }
+  use() {
+    var c = _items.count
+  }
+}
+"#;
+        let a = Analysis::run(src).expect("parse + sema");
+        // Cursor on the `_items` token inside `use()`.
+        let byte = src.find("var c = _items").unwrap() + "var c = ".len() + 2; // mid-_items
+        let ty = a.field_type_at(byte, "items").expect("field type known");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("List")
+        );
+    }
+
+    #[test]
+    fn receiver_type_resolves_for_list_field() {
+        // `_items.count` with cursor on `count` should report
+        // the receiver as `List` — fixes the
+        // `_trail.count → String.count` mis-hover.
+        let src = r#"
+class Foo {
+  construct new() { _items = [] }
+  use() {
+    var c = _items.count
+  }
+}
+"#;
+        let a = Analysis::run(src).expect("parse + sema");
+        let dot = src.find(".count").unwrap();
+        let cursor = dot + 1 + 2; // inside `count`
+        let ty = a.receiver_type_for_call_at(cursor).expect("recv typed");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("List")
+        );
+    }
+
+    #[test]
+    fn local_var_type_records_at_decl_span() {
+        let src = "var nums = []\n";
+        let a = Analysis::run(src).expect("parse + sema");
+        // The `var` keyword's first byte is index 0; sema
+        // records the var's type at the *name* span, not the
+        // statement span. Pick out the `nums` start.
+        let name_at = src.find("nums").unwrap();
+        let ty = a.var_type_at_span(name_at).expect("var type known");
+        assert_eq!(
+            inferred_to_class_name(&ty, &a.interner).as_deref(),
+            Some("List")
+        );
     }
 }

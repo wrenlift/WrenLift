@@ -1214,32 +1214,36 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         &pr.docs,
         &pr.interner,
     );
+    // Typed AST + sema's TypeEnv for the same source. This is
+    // what drives field/local type splices in the signature and
+    // restricts `<recv>.<member>` lookups to the receiver's
+    // *inferred* class — sema saw `_trail = []` and knows
+    // `_trail: List`, so `_trail.count` resolves to `List.count`
+    // without any text-shape guesswork.
+    let analysis = wren_lift::docs::hover::Analysis::run(source);
 
     // Step 1: identifier-under-cursor lookup. The cursor is most
     // likely on a *use* of a name (`Renderer2D.new`, `System.print`,
     // etc.) rather than a declaration site, so identifier-match
     // wins over enclosing-span before we fall back to "show the
     // method I'm inside".
-    //
-    // When the cursor sits on `<Receiver>.<member>`, restrict the
-    // member lookup to the class named by the receiver. Without
-    // this, `Renderer2D.new` would match FruitSlicer's `new`
-    // constructor first because both classes register a `new`
-    // method and the local module wins the iteration order.
     if let Some(ident_span) = wren_lift::docs::hover::identifier_at(source, byte) {
         let ident = &source[ident_span.clone()];
-        // Wren keywords are not hoverable. The lexer recognises
-        // them as syntax tokens, not identifiers — surfacing
-        // "identifier var" on hover would just be wrong.
         if wren_lift::docs::hover::is_keyword(ident) {
             return JsValue::NULL;
         }
-        let receiver = wren_lift::docs::hover::receiver_before(source, ident_span.start);
+        let text_receiver = wren_lift::docs::hover::receiver_before(source, ident_span.start);
+        // Type-driven receiver class. Sema's typed AST tells us
+        // what class the receiver is, regardless of whether the
+        // textual form is a class name (`Fiber.new`), a field
+        // (`_trail.count`), or a local (`fiber.try()`). When
+        // sema knows, this overrides the text receiver so we
+        // never guess `String.count` for a List-typed `_trail`.
+        let typed_receiver_class: Option<String> = analysis.as_ref().and_then(|a| {
+            a.receiver_type_for_call_at(byte)
+                .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
+        });
 
-        // Class-name hover (the cursor lands on a name that's
-        // itself a known class). Same priority as the receiver
-        // case — identity-class hits skip the receiver gating.
-        //
         // Lookup pool, in order:
         //   1. the local module (highest priority)
         //   2. installed `@hatch:*` package docs (registered
@@ -1255,7 +1259,11 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
             all_modules.push(m);
         }
 
-        if receiver.is_none() {
+        // Class-name hover (the cursor lands on a name that's
+        // itself a known class). Skipped when there's a
+        // receiver — `Foo.bar` with the cursor on `bar` is a
+        // member match, not a class match.
+        if text_receiver.is_none() {
             for m in &all_modules {
                 for class in &m.classes {
                     if class.name == ident {
@@ -1268,13 +1276,10 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                     }
                 }
             }
-            // Bare member reference inside the local module
-            // — covers things like a `///` doc body
-            // mentioning `checkSlice_` by name. We deliberately
-            // skip the prelude here: matching a parameter named
-            // `name` against `Class.name` would be wrong, but a
-            // local class's own method names rarely collide
-            // with bare identifier shapes the user types.
+            // Bare member reference inside the local module —
+            // covers `///` doc bodies mentioning a sibling
+            // method. Prelude is skipped: matching a parameter
+            // named `name` against `Class.name` would be wrong.
             for class in &module.classes {
                 for member in &class.members {
                     if member.name == ident {
@@ -1289,17 +1294,26 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
             }
         }
 
-        // Member match — pass 1: receiver-restricted. When the
-        // cursor sits on `Class.method`, scan only that class's
-        // members so `Renderer2D.new` doesn't accidentally hit
-        // `FruitSlicer.new`. Pass 2 (below) ignores the receiver
-        // and scans every class — used when the receiver is a
-        // *local* (`fiber.try()` where `fiber` is a `Fiber.new`
-        // instance) and we have no type-inference yet.
-        if let Some(recv) = receiver {
+        // Effective receiver class for member lookup. Order of
+        // preference:
+        //   1. sema's inferred receiver class (typed-AST truth);
+        //   2. the text receiver, when it's class-shaped
+        //      (`Fiber.new`, `Renderer2D.new`).
+        let effective_receiver: Option<String> = typed_receiver_class.clone().or_else(|| {
+            text_receiver.and_then(|r| {
+                let first = r.chars().next()?;
+                if first.is_ascii_uppercase() {
+                    Some(r.to_string())
+                } else {
+                    None
+                }
+            })
+        });
+
+        if let Some(recv_class) = effective_receiver.as_deref() {
             for m in &all_modules {
                 for class in &m.classes {
-                    if class.name != recv {
+                    if class.name != recv_class {
                         continue;
                     }
                     for member in &class.members {
@@ -1315,59 +1329,60 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                 }
             }
         }
-        // Pass 2: unrestricted member lookup. Only fires when
-        // the receiver looks like a *value* — a local var,
-        // field, or `this` (lowercase / `_` first char). When
-        // the receiver is a class-shaped uppercase name that
-        // we *don't* have docs for (e.g. `Renderer2D` from a
-        // hatch dep we haven't loaded), don't guess — guessing
-        // produces wrong results like reporting
-        // `FruitSlicer.new()` for `Renderer2D.new(...)`.
-        if let Some(recv) = receiver {
-            let first = recv.chars().next().unwrap_or('_');
-            let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
-            if receiver_looks_like_value {
-                for m in &all_modules {
-                    for class in &m.classes {
-                        for member in &class.members {
-                            if member.name == ident {
-                                return hover_out(
-                                    &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
-                                    &member.doc,
-                                    ident_span.start,
-                                    ident_span.end,
-                                );
+
+        // No typed receiver, no class-shaped text receiver —
+        // value-receiver of unknown type. Fall back to a
+        // scan-all only as a *last resort*; this is the path
+        // that misfires (`String.count` for a `_trail` whose
+        // type sema couldn't pin down). We still take it
+        // because the alternative ("docs unavailable") gives
+        // worse hover for common cases like `fiber.try()`.
+        if effective_receiver.is_none() {
+            if let Some(recv) = text_receiver {
+                let first = recv.chars().next().unwrap_or('_');
+                let receiver_looks_like_value = first.is_ascii_lowercase() || first == '_';
+                if receiver_looks_like_value {
+                    for m in &all_modules {
+                        for class in &m.classes {
+                            for member in &class.members {
+                                if member.name == ident {
+                                    return hover_out(
+                                        &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                                        &member.doc,
+                                        ident_span.start,
+                                        ident_span.end,
+                                    );
+                                }
                             }
                         }
                     }
+                } else {
+                    // Class-shaped receiver with no docs we know
+                    // about — most likely an `@hatch:*` import
+                    // we haven't loaded.
+                    return hover_out(
+                        &format!("{}.{}", recv, ident),
+                        &format!(
+                            "`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep that the workspace hasn't loaded yet.",
+                            ident
+                        ),
+                        ident_span.start,
+                        ident_span.end,
+                    );
                 }
-            }
-            // Class-shaped receiver we don't have docs for —
-            // produce a "method on <Receiver>, docs unavailable"
-            // hint so the user doesn't get a misleading match
-            // from a same-named method on a different class.
-            else {
-                return hover_out(
-                    &format!("{}.{}", recv, ident),
-                    &format!(
-                        "`{}` belongs to a class we don't have local docs for — likely an imported `@hatch:*` dep that the workspace hasn't loaded yet.",
-                        ident
-                    ),
-                    ident_span.start,
-                    ident_span.end,
-                );
             }
         }
 
         // Pass 3: identifier-kind classification. Locals,
         // parameters, and fields don't appear in the docs
-        // model — surface a brief "declared at line N" hint
-        // so hover-on-anything-named always says something.
+        // model — sema's TypeEnv splices the inferred type
+        // into the signature here.
         if let Some((signature, body)) = wren_lift::docs::hover::identifier_kind_hint(
             source,
             ident,
             ident_span.start,
             wren_lift::docs::prelude_docs(),
+            analysis.as_ref(),
         ) {
             return hover_out(&signature, &body, ident_span.start, ident_span.end);
         }

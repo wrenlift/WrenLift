@@ -1361,6 +1361,10 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       htmlEditor.setValue(ex.html);
       srcEditor.setValue(ex.wren);
       hatchfileEditor.setValue(ex.hatchfile);
+      // Kick off the dep-doc prefetch so hover/completion on
+      // `Renderer2D`, `Game`, etc. is wired up the moment the
+      // editor opens — well before the user clicks Run.
+      prefetchDepDocs(ex.hatchfile);
       // Form is the source-of-truth in the form view; rebuild it
       // from the freshly-loaded TOML so a user toggling between
       // views sees consistent state.
@@ -1480,6 +1484,34 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       })();
       depsCache.inflight = { key: hatchfileText, promise };
       return promise;
+    }
+
+    // Eager dep-doc prefetch. Hover/completion on imported names
+    // (`Renderer2D.new`, `Game.run`, etc.) reads the wasm-side
+    // `dep_docs` cache, which is populated as a side-effect of
+    // `resolveDepsFromManifest` calling `register_hatch_docs` on
+    // each fetched bundle. Without this prefetch the cache is
+    // empty until the user clicks Run — which means the moment
+    // they want hints (mid-edit) is exactly when the docs aren't
+    // there yet.
+    //
+    // Re-uses `resolveDepsOnce`'s memo so example-switch + edit-
+    // debounce don't hammer the network. Errors are intentionally
+    // swallowed: dep walking can fail (offline, registry blip)
+    // and we'd rather lose hover hints than block the editor.
+    let prefetchTimer = null;
+    function prefetchDepDocs(hatchfileText) {
+      if (!hatchfileText || !hatchfileText.trim()) return;
+      resolveDepsOnce(hatchfileText).catch(() => { /* hover-only */ });
+    }
+    function schedulePrefetchDepDocs(hatchfileText) {
+      // Debounce — typing in the hatchfile pane fires `input` per
+      // keystroke. 600 ms is long enough that a partial dep entry
+      // (`"@hatch:gp` mid-typing) doesn't trigger a doomed fetch
+      // round-trip, short enough to be ready by the time the user
+      // tabs to the Wren editor.
+      if (prefetchTimer) clearTimeout(prefetchTimer);
+      prefetchTimer = setTimeout(() => prefetchDepDocs(hatchfileText), 600);
     }
 
     // `wlift` and `lastErrored` were declared down here originally,
@@ -1728,6 +1760,13 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // which is what the user wants when editing the skeleton.
     htmlEl.addEventListener("input", () => { renderStage(); maybeAutorun(); });
     srcEl.addEventListener("input", maybeAutorun);
+    // Editing the hatchfile re-fetches dep docs in the background
+    // so hover/completion on imported names stays current. Debounced
+    // inside `schedulePrefetchDepDocs` (600 ms) so partial typing
+    // doesn't kick off doomed network round-trips.
+    hatchfileEl.addEventListener("input", () => {
+      schedulePrefetchDepDocs(hatchfileEl.value);
+    });
 
     // Cancel an in-flight run. Used by both the Escape key and
     // the Run button's `running` mode (it morphs into "Cancel
