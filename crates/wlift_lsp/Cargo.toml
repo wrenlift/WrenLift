@@ -19,3 +19,8 @@ wren_lift = { path = "../..", default-features = false }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync"] }
 dashmap = "6"
+
+# Workspace hatchfile parsing — same crate the host CLI uses,
+# pinned identically so the LSP and the runtime accept the same
+# manifest shape.
+toml = "0.8"
