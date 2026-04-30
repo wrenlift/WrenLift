@@ -1332,12 +1332,16 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       // is whatever they leave the box at.
       currentExampleAutorun = ex.autorun ?? null;
       // Visible autorun toggle reflects the per-example gate.
-      // `autorun: "off"` (game loops) forces the box unchecked;
-      // any other example restores the user's actual preference
-      // so the toggle isn't stuck off after they leave a game.
-      // Programmatic writes don't fire `change`, so the
-      // `userAutorunPref` tracker stays untouched.
-      autoChk.checked = ex.autorun === "off" ? false : userAutorunPref;
+      // `autorun: "off"` (game loops) → toggle off. Anything
+      // else → toggle on and auto-run on load: the example
+      // wants its output visible immediately, not gated behind
+      // a Run click. The user can still uncheck mid-session
+      // and the change handler updates `userAutorunPref` so
+      // future Run-on-edit (within this example) honours it,
+      // but switching examples re-applies the per-example
+      // default. Programmatic writes don't fire `change` so
+      // this assignment doesn't perturb `userAutorunPref`.
+      autoChk.checked = ex.autorun !== "off";
       // Game / GPU examples paint into the canvas; the console pane
       // is dead weight that crops the play area. `console: "off"`
       // collapses it on load (the user can still pop it back via the
