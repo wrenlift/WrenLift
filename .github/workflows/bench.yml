@@ -255,6 +255,30 @@ jobs:
           cp wasm/web/wlift.js wasm/web/gpu-bridge.js wasm/web/worker.js \
             wasm/pkg/wlift_wasm.js wasm/pkg/wlift_wasm_bg.wasm \
             site/dist/
+
+          # Per-package docs JSON for every wrenlift/hatch package.
+          # `wlift --docs` walks each package's source tree, runs
+          # the doc collector, and writes per-module JSON + a
+          # manifest.json. The viewer at site/docs/ (TBD) reads
+          # these to populate the package list + render bodies.
+          # Builds against `target/release/wlift` from the bench
+          # job above. If a package fails to parse or generate,
+          # skip it with a notice — one bad package shouldn't
+          # block the rest of the deploy.
+          mkdir -p site/docs
+          if git clone --depth 1 https://github.com/wrenlift/hatch.git /tmp/hatch-src 2>/dev/null; then
+            for pkg_dir in /tmp/hatch-src/packages/*/; do
+              pkg=$(basename "$pkg_dir")
+              if ./target/release/wlift "$pkg_dir" --docs "site/docs/$pkg" >/dev/null 2>&1; then
+                echo "  docs ok: $pkg"
+              else
+                echo "::notice::docs gen failed for $pkg — skipping"
+                rm -rf "site/docs/$pkg"
+              fi
+            done
+          else
+            echo "::notice::wrenlift/hatch clone failed; skipping docs aggregation"
+          fi
           if [ -n "${HATCH_BOT_URL:-}" ]; then
             # Strip a trailing `/publish` if present. The org var
             # is configured as the hatch CLI's publish endpoint
