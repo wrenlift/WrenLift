@@ -236,6 +236,35 @@ export function jit_test_emit() {
 }
 
 /**
+ * Lint a Wren source string. Returns a JSON-shaped array of
+ * diagnostics — same model the LSP server uses, but exposed here
+ * so the playground's CodeMirror editor can paint red squigglies
+ * without spinning up a real LSP. Each entry has:
+ *
+ * ```json
+ * {
+ *   "severity": "error" | "warning" | "info",
+ *   "message":  "...",
+ *   "span":     [start_byte, end_byte]
+ * }
+ * ```
+ *
+ * `span` is in UTF-8 byte offsets into the input string. Empty
+ * array on a clean parse + sema. Sema is skipped when the parser
+ * errors (parse-only diagnostics in that case) so the editor
+ * doesn't drown the user in cascading "undefined" errors while
+ * they're still typing.
+ * @param {string} source
+ * @returns {any}
+ */
+export function lint_wren(source) {
+    const ptr0 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.lint_wren(ptr0, len0);
+    return ret;
+}
+
+/**
  * @param {string} text
  * @returns {any}
  */
@@ -1099,9 +1128,19 @@ function __wbg_get_imports() {
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_20bf61ce484b8279___closure__destroy___dyn_core_2b72ad5d24e5930c___ops__function__FnMut__wasm_bindgen_20bf61ce484b8279___JsValue____Output___core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___, wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_);
             return ret;
         },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000002: function(arg0) {
+            // Cast intrinsic for `F64 -> Externref`.
+            const ret = arg0;
+            return ret;
+        },
+        __wbindgen_cast_0000000000000003: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
+            return ret;
+        },
+        __wbindgen_cast_0000000000000004: function(arg0) {
+            // Cast intrinsic for `U64 -> Externref`.
+            const ret = BigInt.asUintN(64, arg0);
             return ret;
         },
         __wbindgen_init_externref_table: function() {

@@ -914,6 +914,63 @@ fn json_serializer() -> serde_wasm_bindgen::Serializer {
     serde_wasm_bindgen::Serializer::json_compatible()
 }
 
+/// Lint a Wren source string. Returns a JSON-shaped array of
+/// diagnostics — same model the LSP server uses, but exposed here
+/// so the playground's CodeMirror editor can paint red squigglies
+/// without spinning up a real LSP. Each entry has:
+///
+/// ```json
+/// {
+///   "severity": "error" | "warning" | "info",
+///   "message":  "...",
+///   "span":     [start_byte, end_byte]
+/// }
+/// ```
+///
+/// `span` is in UTF-8 byte offsets into the input string. Empty
+/// array on a clean parse + sema. Sema is skipped when the parser
+/// errors (parse-only diagnostics in that case) so the editor
+/// doesn't drown the user in cascading "undefined" errors while
+/// they're still typing.
+#[wasm_bindgen]
+pub fn lint_wren(source: &str) -> JsValue {
+    use serde::Serialize;
+    let pr = wren_lift::parse::parser::parse(source);
+    let mut out: Vec<LintDiag> = pr.errors.iter().map(diag_to_lint).collect();
+    if pr.errors.is_empty() {
+        let sema = wren_lift::sema::resolve::resolve(&pr.module, &pr.interner);
+        out.extend(sema.errors.iter().map(diag_to_lint));
+    }
+    out.serialize(&json_serializer())
+        .unwrap_or_else(|_| JsValue::from_str("[]"))
+}
+
+#[derive(serde::Serialize)]
+struct LintDiag {
+    severity: &'static str,
+    message: String,
+    span: (usize, usize),
+}
+
+fn diag_to_lint(d: &wren_lift::diagnostics::Diagnostic) -> LintDiag {
+    use wren_lift::diagnostics::Severity;
+    let severity = match d.severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+    };
+    let span = d
+        .labels
+        .first()
+        .map(|l| (l.span.start, l.span.end))
+        .unwrap_or((0, 0));
+    LintDiag {
+        severity,
+        message: d.message.clone(),
+        span,
+    }
+}
+
 #[wasm_bindgen]
 pub fn parse_hatchfile_toml(text: &str) -> Result<JsValue, JsValue> {
     let manifest: wren_lift::hatch::Manifest =

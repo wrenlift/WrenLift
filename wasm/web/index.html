@@ -579,7 +579,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // *the* DOM the Wren program manipulates — `Dom.text("#x")`
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
-    import { createWlift, parseHatchfileToml, resolveDepsFromManifest } from "./wlift.js";
+    import { createWlift, parseHatchfileToml, resolveDepsFromManifest, lintWren } from "./wlift.js";
     import { ErrorKind } from "./wlift_wasm.js";
     // CodeMirror 6 — modular ESM via esm.sh. The dev server's
     // COOP/COEP headers cooperate with esm.sh's CORP responses,
@@ -591,6 +591,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       drawSelection } from "https://esm.sh/@codemirror/view@6";
     import { defaultKeymap, indentWithTab, history, historyKeymap }
       from "https://esm.sh/@codemirror/commands@6";
+    import { linter, lintGutter } from "https://esm.sh/@codemirror/lint@6";
     import { StreamLanguage, syntaxHighlighting,
       HighlightStyle, bracketMatching, indentOnInput }
       from "https://esm.sh/@codemirror/language@6";
@@ -718,7 +719,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       },
     }, { dark: true });
 
-    function buildExtensions(language) {
+    function buildExtensions(language, extras = []) {
       return [
         lineNumbers(),
         history(),
@@ -734,16 +735,55 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
         language,
         syntaxHighlighting(wlightTheme),
         wlightEditorTheme,
+        ...extras,
       ];
     }
 
-    function bindEditor(textarea, mount, language) {
+    // Wren live linter — runs the wasm parser+sema on every edit
+    // and returns CM6 diagnostics so the editor paints red
+    // squigglies for parse / unresolved-name errors before the
+    // user clicks Run. Cheap path of the LSP plan: same wasm
+    // module the runtime uses, no separate server.
+    const wrenLinter = linter(async (view) => {
+      const source = view.state.doc.toString();
+      let diags = [];
+      try {
+        diags = await lintWren(source) || [];
+      } catch (e) {
+        // `lint_wren` shouldn't throw; if it does, swallow so we
+        // don't block typing. The runtime errors will still
+        // surface on Run.
+        console.warn("wlift lint:", e);
+        return [];
+      }
+      const docLen = view.state.doc.length;
+      return diags.map((d) => {
+        // The lint_wren span is in UTF-8 byte offsets. CM6 uses
+        // codepoint offsets — close enough for ASCII Wren
+        // source. Clamp to the document length so the editor
+        // doesn't reject out-of-range markers when an edit just
+        // shrank the source mid-lint.
+        const from = Math.min(d.span[0], docLen);
+        // Empty-range diagnostics are treated as a single-char
+        // marker so the squiggle is visible.
+        const to = Math.max(Math.min(d.span[1], docLen), from + 1);
+        return {
+          from,
+          to,
+          severity: d.severity, // "error" / "warning" / "info" matches CM6
+          message: d.message,
+          source: "wlift",
+        };
+      });
+    }, { delay: 200 });
+
+    function bindEditor(textarea, mount, language, extras = []) {
       const initial = textarea.value;
       const view = new EditorView({
         state: EditorState.create({
           doc: initial,
           extensions: [
-            ...buildExtensions(language),
+            ...buildExtensions(language, extras),
             EditorView.updateListener.of((u) => {
               if (!u.docChanged) return;
               // Mirror CM doc back to the shadow textarea so the
@@ -974,7 +1014,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     const hatchfileMount = document.getElementById("hatchfile-mount");
     const htmlMount = document.getElementById("html-mount");
     const htmlEditor      = bindEditor(htmlEl, htmlMount, html());
-    const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage);
+    const srcEditor       = bindEditor(srcEl, srcMount, wrenLanguage, [lintGutter(), wrenLinter]);
     const hatchfileEditor = bindEditor(hatchfileEl, hatchfileMount, StreamLanguage.define(toml));
 
     // Hoisted state — `loadExample` reads `wlift` to decide whether

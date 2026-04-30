@@ -170,6 +170,18 @@ export async function peekManifest(bytes) {
   return m.peek_manifest(buf);
 }
 
+/// Lint a Wren source string. Returns an array of diagnostics —
+/// `{ severity: "error" | "warning" | "info", message, span: [start, end] }`
+/// — keyed by UTF-8 byte offsets into the source. Empty array on
+/// a clean parse + sema pass. Drives the playground editor's
+/// CodeMirror lint extension; same model the wlift-lsp server
+/// uses, just exposed synchronously here so the editor can
+/// render squigglies on every keystroke without a worker.
+export async function lintWren(source) {
+  const m = await getMod();
+  return m.lint_wren(source);
+}
+
 // Map a parsed git remote URL to the host's release-asset URL
 // pattern. Each forge has its own; this is intentionally a
 // short list — anything self-hosted should use an explicit
