@@ -101,6 +101,15 @@ export function _wasm_init() {
 }
 
 /**
+ * Drop every entry from the dep-docs cache. Called by the
+ * playground when the user changes the hatchfile so a removed
+ * dep doesn't keep showing up in hover.
+ */
+export function clear_hatch_docs() {
+    wasm.clear_hatch_docs();
+}
+
+/**
  * Completion suggestions for `source`. Returns a JSON array of
  * `{ label, kind, detail, doc }` items — every class + member
  * declared in the file. The playground's CodeMirror autocomplete
@@ -113,12 +122,13 @@ export function _wasm_init() {
  * kinds: "class" | "method" | "static-method" | "getter" |
  * "setter" | "constructor".
  * @param {string} source
+ * @param {number} byte
  * @returns {any}
  */
-export function complete_wren(source) {
+export function complete_wren(source, byte) {
     const ptr0 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.complete_wren(ptr0, len0);
+    const ret = wasm.complete_wren(ptr0, len0, byte);
     return ret;
 }
 
@@ -349,6 +359,25 @@ export function peek_manifest(bytes) {
 export function prelude_line_count() {
     const ret = wasm.prelude_line_count();
     return ret >>> 0;
+}
+
+/**
+ * Register a fetched `.hatch` bundle's docs in the workspace
+ * cache. Returns the package name on success, or null on
+ * parse / load failure.
+ *
+ * Called from the playground's dep walker (and the desktop
+ * LSP later) after each bundle fetch — every consumer that
+ * touches `@hatch:foo` then sees `Foo.method` hovers with the
+ * package's authored docs.
+ * @param {Uint8Array} bundle_bytes
+ * @returns {any}
+ */
+export function register_hatch_docs(bundle_bytes) {
+    const ptr0 = passArray8ToWasm0(bundle_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.register_hatch_docs(ptr0, len0);
+    return ret;
 }
 
 /**
@@ -1166,7 +1195,7 @@ function __wbg_get_imports() {
             globalThis.wliftDynamicPluginDispatch(arg0 >>> 0, arg1 >>> 0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 116, function: Function { arguments: [Externref], shim_idx: 117, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 117, function: Function { arguments: [Externref], shim_idx: 118, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_20bf61ce484b8279___closure__destroy___dyn_core_2b72ad5d24e5930c___ops__function__FnMut__wasm_bindgen_20bf61ce484b8279___JsValue____Output___core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___, wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_);
             return ret;
         },
