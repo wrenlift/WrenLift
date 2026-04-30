@@ -553,6 +553,27 @@ class WorkerWlift {
   get memory() { return this._memory; }
 
   terminate() {
+    // Settle any in-flight `run` / `runWithHatches` / `runHatch`
+    // promise BEFORE killing the worker. Once `worker.terminate()`
+    // fires the worker stops processing messages, so the
+    // result postMessage we were waiting on never arrives. The
+    // page-side `await wlift.runWithHatches(...)` would hang
+    // forever, leaving `runBtn.disabled` true and the UI stuck.
+    // Synthesise a cancelled-shape result that callers
+    // (`execute()` + render path) can render through their normal
+    // ok=false path.
+    if (this.pending && this.pending.size > 0) {
+      for (const [, resolve] of this.pending) {
+        resolve({
+          cmd: "result",
+          output: "(cancelled — runtime restarted)",
+          ok: false,
+          errorKind: -1,
+          elapsedMs: 0,
+        });
+      }
+      this.pending.clear();
+    }
     // Detach any canvas event forwarders we installed so the next
     // worker (after a fresh `bootMode`) doesn't get duplicate
     // events from a still-listening previous instance. Listeners
@@ -1220,20 +1241,20 @@ class MainWlift {
     // outer array; the inner arrays cross by reference + the
     // Rust side `to_vec()`s them once. Errors during dep install
     // are surfaced through `result.output` with `ok: false`.
-    const t0 = performance.now();
     let result;
+    let t0;
     try {
       const bufs = (deps ?? []).map((b) =>
         b instanceof Uint8Array ? b : new Uint8Array(b),
       );
       // Phase 1d: install any wasm-targeted NativeLib plugins
       // each dep declares *before* handing the dep bytes to
-      // `run_with_hatches`. Foreign-class declarations in the
-      // bundle's Wlbc resolve their `#!native` / `#!symbol`
-      // bindings at install time, so the plugin's symbols need
-      // to already be in the registry. `wlift_extract_wasm_plugins`
-      // returns `[{lib, bytes}]` per dep (empty for pure-Wren
-      // deps).
+      // `run_with_hatches`. WebAssembly.compile + instantiate
+      // for each plugin (~100–500 ms total for canvas demos with
+      // wlift_window/wlift_gpu) is build-time machinery, not
+      // user code — start the runtime clock *after* the install
+      // so the displayed elapsed-ms reflects only `run_with_hatches`
+      // itself. Same convention worker.js uses.
       if (this._installWasmPlugin) {
         for (const buf of bufs) {
           const plugins = this._wliftExtractWasmPlugins(buf);
@@ -1243,6 +1264,7 @@ class MainWlift {
           }
         }
       }
+      t0 = performance.now();
       result = await this._mod.run_with_hatches(source, bufs);
     } catch (err) {
       return this._mirrorErrorToConsole({
@@ -1250,7 +1272,7 @@ class MainWlift {
         output: String(err),
         ok: false,
         errorKind: -1,
-        elapsedMs: performance.now() - t0,
+        elapsedMs: t0 != null ? performance.now() - t0 : 0,
       });
     }
     return this._mirrorErrorToConsole({

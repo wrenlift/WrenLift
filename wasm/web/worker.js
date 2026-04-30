@@ -622,9 +622,18 @@ self.addEventListener("message", (e) => {
     // — `#!native` / `#!symbol` resolution at install time looks
     // the symbols up in the foreign-method registry that the
     // plugin's exports must already have populated.
-    const t0 = performance.now();
+    //
+    // Don't bill plugin compile/instantiate time to the runtime
+    // pill — `WebAssembly.compile` + `instantiate` for each
+    // bundled plugin is build machinery, not user code. Start
+    // the clock *after* `installPluginsForDeps` resolves so
+    // the displayed elapsed-ms reflects only `run_with_hatches`.
+    let t0;
     installPluginsForDeps(deps)
-      .then(() => run_with_hatches(source, deps))
+      .then(() => {
+        t0 = performance.now();
+        return run_with_hatches(source, deps);
+      })
       .then(
         (result) => {
           self.postMessage({
@@ -633,7 +642,7 @@ self.addEventListener("message", (e) => {
             output: result.output,
             ok: result.ok,
             errorKind: result.errorKind,
-            elapsedMs: performance.now() - t0,
+            elapsedMs: t0 != null ? performance.now() - t0 : 0,
           });
         },
         (err) => {
@@ -643,7 +652,7 @@ self.addEventListener("message", (e) => {
             output: String(err),
             ok: false,
             errorKind: -1,
-            elapsedMs: performance.now() - t0,
+            elapsedMs: t0 != null ? performance.now() - t0 : 0,
           });
         },
       );

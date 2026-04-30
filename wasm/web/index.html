@@ -100,6 +100,15 @@
       border-color: transparent;
       padding: 6px 16px;
     }
+    /* Run button morphs into a cancel button while a long-running
+       script is executing — same shape, red fill so it reads
+       like a stop signal. The button stays clickable in this
+       state so the user can cancel without reaching for Escape. */
+    button.primary.cancel {
+      background: var(--bad);
+      color: var(--panel);
+    }
+    button.primary.cancel:hover { filter: brightness(1.05); }
     button:disabled { opacity: 0.4; cursor: wait; }
     label.field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 
@@ -113,6 +122,11 @@
     }
     .pill.ok    { color: var(--good); }
     .pill.error { color: var(--bad); }
+    /* `.pill { display: inline-block }` is more specific than the
+       UA's default `[hidden] { display: none }`, so the `hidden`
+       attribute alone doesn't hide a `.pill` element. Re-assert
+       the rule at class+attribute specificity. */
+    .pill[hidden] { display: none !important; }
 
     /* Runtime status pill (header, right side) — loud version
        of `.pill`. Filled background, bold weight, larger
@@ -952,12 +966,50 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // to bounce the engine; both have to exist before the bootstrap
     // call below runs (otherwise TDZ throws on first paint).
     let wlift = null;
+    // Run-button state machine. Three modes:
+    //   "idle"    — green "Run (⌘↵)", clickable, fires execute().
+    //   "running" — red  "Cancel (ESC)", clickable, fires cancelRun().
+    //   "booting" — disabled while createWlift resolves.
+    // Encoded via the dataset attr so the click handler can route
+    // without re-reading text content; CSS keys off the .cancel
+    // class for the red fill.
+    function setRunMode(mode) {
+      runBtn.dataset.mode = mode;
+      if (mode === "running") {
+        runBtn.textContent = "Cancel (ESC)";
+        runBtn.classList.add("cancel");
+        runBtn.disabled = false;
+      } else if (mode === "booting") {
+        runBtn.textContent = "Run (⌘↵)";
+        runBtn.classList.remove("cancel");
+        runBtn.disabled = true;
+      } else { // "idle"
+        runBtn.textContent = "Run (⌘↵)";
+        runBtn.classList.remove("cancel");
+        runBtn.disabled = false;
+      }
+    }
+    // The user's actual autorun preference, separate from the
+    // per-example forced-off state. When `loadExample` lands on
+    // an `autorun: "off"` entry we uncheck the box (visible
+    // feedback) but remember the user's prior preference here so
+    // a subsequent switch to a normal example restores it.
+    // Updated only by genuine `change` events from the checkbox,
+    // not by our own programmatic writes (those don't fire
+    // `change`). Initialised below from the markup default.
+    let userAutorunPref = true;
     // Latch — does the most recent run carry an error? The
     // console-toggle's red dot is the (lastErrored AND
     // console-hidden) intersection; without persisting the
     // first half, toggling the console open then shut would
     // clear the dot even though nothing changed about the run.
     let lastErrored = false;
+    // Per-example autorun gate (read by `maybeAutorun`, set by
+    // `loadExample`). Hoisted up here so the bootstrap
+    // `loadExample(EXAMPLES[0].id)` call below can write to it
+    // without hitting `let`'s temporal dead zone — same TDZ
+    // pattern that bit `wlift` earlier.
+    let currentExampleAutorun = null;
 
     // ---- Example library --------------------------------------------
     // Curated set of starter programs the dropdown swaps in. Each
@@ -1449,6 +1501,30 @@ entry   = "main"
     function loadExample(id) {
       const ex = EXAMPLES.find((e) => e.id === id);
       if (!ex) return;
+      // Per-example autorun. `autorun: "off"` means the example
+      // is long-running (game loops); switching to it shouldn't
+      // silently start it. Reflect the gate in the visible
+      // toggle so the user isn't confused by "auto-run is checked
+      // but nothing's running" — unchecking the box ALSO blocks
+      // the debounce timer that `setValue` arms below (the
+      // `autoChk.checked` test in `maybeAutorun` reads this).
+      // The user can re-check if they actually want autorun for
+      // this game; their preference for the next example switch
+      // is whatever they leave the box at.
+      currentExampleAutorun = ex.autorun ?? null;
+      // Visible autorun toggle reflects the per-example gate.
+      // `autorun: "off"` (game loops) forces the box unchecked;
+      // any other example restores the user's actual preference
+      // so the toggle isn't stuck off after they leave a game.
+      // Programmatic writes don't fire `change`, so the
+      // `userAutorunPref` tracker stays untouched.
+      autoChk.checked = ex.autorun === "off" ? false : userAutorunPref;
+      // Hide the prior example's runtime pill the moment the user
+      // switches — the elapsed-ms / error kind from a totally
+      // different example reads as state of the new one until the
+      // run completes, which is misleading.
+      runtimeEl.hidden = true;
+      runtimeEl.classList.remove("ok", "error");
       // setValue triggers each editor's docChanged listener which
       // mirrors back to the shadow textarea AND fires its `input`
       // event — that's how `htmlEl input` triggers renderStage()
@@ -1585,20 +1661,61 @@ entry   = "main"
       stageEl.innerHTML = htmlEl.value;
     }
 
+    // Once a `<canvas>` has had `getContext("webgpu")` (main mode)
+    // or `transferControlToOffscreen()` (worker mode) called on
+    // it, the element is locked to that mode. Switching the
+    // runtime mid-page (mode picker, or even a fresh boot in the
+    // same mode after a worker run) means the next run hits an
+    // "InvalidStateError: canvas in use" or attach-returns-0
+    // failure. Cloning every `<canvas[id]>` on `bootMode` makes
+    // each run see a fresh element, preserving id + size + tab
+    // ordering. State from the prior run is dropped — for the
+    // playground that's the expected semantics anyway (Run =
+    // restart).
+    function resetCanvases() {
+      for (const el of document.querySelectorAll("canvas[id]")) {
+        if (!el.parentNode) continue;
+        const fresh = document.createElement("canvas");
+        // Preserve id + width/height + every attribute the user's
+        // HTML pane set (tabindex, class, data-*). Style is
+        // attribute-driven for `<canvas>` so this catches it too.
+        for (const attr of el.attributes) {
+          fresh.setAttribute(attr.name, attr.value);
+        }
+        // Width/height are mirrored to JS properties; setAttribute
+        // already updated them via the loop, but assert the
+        // numeric form so 0/NaN don't slip through if the user
+        // omitted an explicit width="..." attribute.
+        if (el.width)  fresh.width  = el.width;
+        if (el.height) fresh.height = el.height;
+        el.parentNode.replaceChild(fresh, el);
+      }
+    }
+
     async function bootMode(mode, runAfter = true) {
       bannerEl.classList.toggle("hidden", mode !== "worker");
-      runBtn.disabled = true;
+      setRunMode("booting");
       statusEl.classList.remove("ok", "error");
       statusEl.textContent = `loading (${mode})…`;
       if (wlift) {
         wlift.terminate();
         wlift = null;
       }
+      // Replace canvas elements with fresh clones now that the
+      // previous wlift is gone. A canvas that had `getContext` or
+      // `transferControlToOffscreen` called on it can't be reused
+      // by the other mode (or re-transferred for a second worker)
+      // — see resetCanvases for why.
+      resetCanvases();
       try {
         wlift = await createWlift({ mode });
       } catch (e) {
         statusEl.textContent = `failed: ${e}`;
         statusEl.classList.add("error");
+        // Re-enable Run so the user can retry; without this the
+        // button stays in `booting` (disabled) forever after a
+        // boot failure.
+        setRunMode("idle");
         return;
       }
       statusEl.textContent = `ready · ${mode}`;
@@ -1606,7 +1723,7 @@ entry   = "main"
       versionEl.textContent = wlift.memory
         ? `${wlift.version} · linear memory ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB (direct)`
         : `${wlift.version} · linear memory hidden behind worker boundary`;
-      runBtn.disabled = false;
+      setRunMode("idle");
       // Initial boot + mode-switch: run by default. Example
       // dropdown switches respect the autorun toggle and pass
       // `runAfter: autoChk.checked` so flipping examples with
@@ -1655,9 +1772,23 @@ entry   = "main"
 
     async function execute() {
       if (!wlift) return;
-      runBtn.disabled = true;
+      // Run button morphs into Cancel — clickable, red, same place
+      // on screen so the affordance stays put.
+      setRunMode("running");
       outEl.classList.remove("ok", "error");
       outEl.textContent = "running…";
+      // Hide the stale runtime pill while we kick off a new run —
+      // the prior run's elapsed-ms (green / red) confuses the
+      // "what state are we in right now" read, especially during
+      // a slow dep download.
+      runtimeEl.hidden = true;
+      // Fresh canvas for each Run: wlift's surfaces / OffscreenCanvas
+      // refs are tied to a specific canvas DOM element. A
+      // re-run in the same mode would otherwise hit
+      // `transferControlToOffscreen` on an already-transferred
+      // canvas (worker) or `getContext` on a placeholder
+      // (main), and Window.create returns -1.
+      resetCanvases();
       // The stage is owned by the user's HTML source plus any
       // Wren-applied mutations from previous runs. We do *not*
       // reset to the skeleton here, otherwise every keystroke
@@ -1676,12 +1807,24 @@ entry   = "main"
       const hasScoped = sourceHasScopedImports(srcEl.value);
       const hatchfileText = hatchfileEl.value.trim();
       if (hasScoped && hatchfileText.length > 0) {
-        // Cached vs first-fetch UX: if the bundle bytes are
-        // already memoised, skip the "resolving deps…" placeholder
-        // and go straight to "running…". The proxiedFetcher only
-        // fires when this hatchfile is new (or the user edited it).
+        // Cached vs first-fetch UX. The fetch path can take 1–10 s
+        // on first hit (each dep is a separate GitHub release-asset
+        // download), and a vague "resolving deps…" reads as runtime
+        // latency. Spell out "downloading" + the package count so
+        // the user knows it's network, not the JIT.
         const cached = depsCache.hatchfileText === hatchfileText && depsCache.deps;
-        outEl.textContent = cached ? "running…" : "resolving deps…";
+        if (cached) {
+          outEl.textContent = "running…";
+        } else {
+          // Crude depcount: scan the hatchfile's [dependencies]
+          // block for `"name" = "version"` lines. Used only for
+          // the message — proper resolution still walks transitives.
+          const depMatches = hatchfileText.match(/^\s*"@?[^"]+"\s*=/gm) || [];
+          const n = depMatches.length;
+          outEl.textContent = n > 0
+            ? `downloading ${n} hatch package${n === 1 ? "" : "s"} from the registry…`
+            : "downloading hatch packages from the registry…";
+        }
         try {
           const deps = await resolveDepsOnce(hatchfileText);
           result = await wlift.runWithHatches(srcEl.value, deps);
@@ -1706,15 +1849,34 @@ entry   = "main"
         result = await wlift.run(srcEl.value);
       }
       renderResult(result);
-      runBtn.disabled = false;
+      // Cancel-via-Escape / cancel-button-click already kicked us
+      // through bootMode, which set mode back to "idle" once the
+      // fresh runtime came up. If that race lost (we resolved
+      // before bootMode), we'd otherwise leave the button in
+      // "running" mode. Always hand back to idle here as the
+      // canonical end-of-run transition.
+      setRunMode("idle");
     }
 
     // Re-run on every keystroke when auto-run is on, debounced
     // so we don't fire on every keypress in the middle of a
     // word. 350ms feels close to live without being thrashy.
     let debounceTimer = null;
+    // Per-example autorun gate (declared up top to dodge TDZ
+    // against the bootstrap loadExample call). Long-running game
+    // loops set `autorun: "off"` so switching to them via the
+    // dropdown doesn't start an infinite frame loop unprompted.
+    // The gate also has to apply *here* because `loadExample`'s
+    // `setValue` calls dispatch synthetic `input` events that
+    // arm this debounce — without the check, the timer fires
+    // 350 ms later and runs the example anyway.
     function maybeAutorun() {
-      if (!autoChk.checked || !wlift || runBtn.disabled) return;
+      if (currentExampleAutorun === "off") return;
+      if (!autoChk.checked || !wlift) return;
+      // Don't re-arm if we're mid-run or mid-boot — the in-flight
+      // call will finish and the next user edit picks up from
+      // there.
+      if (runBtn.dataset.mode !== "idle") return;
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(execute, 350);
     }
@@ -1724,30 +1886,53 @@ entry   = "main"
     htmlEl.addEventListener("input", () => { renderStage(); maybeAutorun(); });
     srcEl.addEventListener("input", maybeAutorun);
 
-    // Escape-to-cancel. Captures at window level so it wins
-    // before any keydown listener the running script's canvas
-    // bridge installed (those are bubble-phase listeners on
-    // `document` — capture fires first; stopPropagation keeps
-    // the game from seeing the keypress at all). Only acts
-    // when a run is actually in flight (`runBtn.disabled` is the
-    // proxy — both bootMode and execute flip it).
-    window.addEventListener("keydown", (e) => {
-      if (e.key !== "Escape") return;
-      if (!runBtn.disabled || !wlift) return;
-      e.preventDefault();
-      e.stopPropagation();
-      outEl.textContent = "cancelled by Escape";
+    // Cancel an in-flight run. Used by both the Escape key and
+    // the Run button's `running` mode (it morphs into "Cancel
+    // (ESC)"). bootMode terminates the worker / main wlift so any
+    // parked fiber dies; `runAfter: false` keeps the fresh
+    // runtime idle so the user can Run again on demand.
+    function cancelRun() {
+      if (!wlift) return;
+      if (runBtn.dataset.mode !== "running") return;
+      outEl.textContent = "cancelled";
       outEl.classList.remove("ok");
       outEl.classList.add("error");
       lastErrored = true;
       updateConsoleErrorDot();
-      // Reboot terminates the in-flight wasm so any long-running
-      // fiber (game loop) goes away. `runAfter: false` keeps the
-      // fresh runtime idle — the user can Run again on demand.
       bootMode(modeSel.value, false);
+    }
+
+    // Escape-to-cancel. Captures at window level so it wins
+    // before any keydown listener the running script's canvas
+    // bridge installed (those are bubble-phase listeners on
+    // `document` — capture fires first; stopPropagation keeps
+    // the game from seeing the keypress at all).
+    window.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (runBtn.dataset.mode !== "running") return;
+      e.preventDefault();
+      e.stopPropagation();
+      cancelRun();
     }, true);
 
-    runBtn.addEventListener("click", execute);
+    // Run button: dispatches to execute or cancel based on the
+    // current state. The button stays at the same DOM coordinates
+    // either way; only the label/colour swap.
+    runBtn.addEventListener("click", () => {
+      if (runBtn.dataset.mode === "running") cancelRun();
+      else execute();
+    });
+
+    // Track the user's actual autorun preference. Only `change`
+    // events from the checkbox count — programmatic writes (e.g.
+    // `loadExample` un-checking the box for an `autorun:"off"`
+    // example) don't trigger this listener. Initialised below
+    // from the markup default; updated whenever the user
+    // explicitly toggles.
+    userAutorunPref = autoChk.checked;
+    autoChk.addEventListener("change", () => {
+      userAutorunPref = autoChk.checked;
+    });
     [htmlEl, srcEl].forEach((el) => {
       el.addEventListener("keydown", (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
