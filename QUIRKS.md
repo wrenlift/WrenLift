@@ -7,6 +7,56 @@ rationale for anyone who reads just this file.
 
 ## Open
 
+### Hover doesn't propagate superclass `///` docs to subclass overrides
+
+Status: **open (2026-04-30)**
+
+Symptom. Hover on a subclass's overriding method shows the bare
+signature when the subclass's own definition has no `///`,
+even though the parent class documents the same method:
+
+```wren
+class FruitSlicer is Game {
+  // No ///                                       ← would-be source for the doc
+  setup(g) { ... }
+}
+```
+
+Hovering on `setup` in `FruitSlicer` returns `setup(g)` with an
+empty body. The parent `Game.setup(g)`'s `///` block (now
+authored in `@hatch:game`) is ignored.
+
+Root cause. The doc collector
+(`wren_lift::docs::collect::collect_module`) builds one
+`ClassDoc` per `class` AST node and only walks that class's
+own member list. It captures the parent class's symbol
+(`ClassDecl::superclass`) but doesn't follow the chain at
+hover time.
+
+The hover lookup
+(`wren_lift::docs::hover::identifier_kind_hint`'s member-match
+loops) takes the first member whose name matches the cursor's
+identifier; with no doc, it returns the empty body verbatim.
+
+Fix sketch.
+1. `ClassDoc` learns a `superclass: Option<String>` field
+   populated from `ClassDecl::superclass.0` interned name.
+2. When the hover member-match loop returns a member with an
+   empty `doc`, walk the receiver class's superclass chain
+   (in the local module, dep_docs, then the prelude) and
+   substitute the first non-empty doc found. Track the source
+   class so the rendered hint can say
+   `*inherited from Game*`.
+3. Same propagation for `format_member_sig` if the override
+   doesn't have its own `@param` / `@returns` annotations —
+   the parent's signature shape can splice through.
+
+The `superclass` chain isn't infinite (Wren single-inheritance
+roots at `Object`), so the walk is bounded.
+
+Tracked here so the empty-body fallback isn't mistaken for
+"the parent doesn't document this method either."
+
 ### Hover on a method parameter shows `local <name>` instead of the inferred class
 
 Status: **open (2026-04-30)**
