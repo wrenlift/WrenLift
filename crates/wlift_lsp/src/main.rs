@@ -339,15 +339,38 @@ fn identifier_hover(
         }
     }
 
-    // Member match — gated on the receiver class name when one
-    // sits before the cursor.
-    for m in &all {
-        for class in &m.classes {
-            if let Some(recv) = receiver {
+    // Pass 1 — receiver-restricted. Skipped when the receiver
+    // isn't a known class name (e.g. a local `fiber` variable);
+    // pass 2 then handles the unrestricted match.
+    if let Some(recv) = receiver {
+        for m in &all {
+            for class in &m.classes {
                 if class.name != recv {
                     continue;
                 }
+                for member in &class.members {
+                    if member.name == ident {
+                        let body = format!(
+                            "```wren\n{}\n```{}{}",
+                            format_member_sig(&class.name, &member.signature),
+                            if member.doc.is_empty() { "" } else { "\n\n" },
+                            member.doc,
+                        );
+                        return Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: body,
+                            }),
+                            range: Some(doc.byte_range_to_lsp(span)),
+                        });
+                    }
+                }
             }
+        }
+    }
+    // Pass 2 — first matching member from any class.
+    for m in &all {
+        for class in &m.classes {
             for member in &class.members {
                 if member.name == ident {
                     let body = format!(

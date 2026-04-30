@@ -119,14 +119,13 @@
     }
     .cm-tooltip .wlift-hover pre:first-child {
       /* Pin the signature line so it stays visible while the
-         user scrolls through the body underneath. */
+         user scrolls through the body underneath. Tight
+         margin-bottom — the body sits a hair below, no
+         markdown-`<br>` slack. */
       position: sticky; top: 0;
       background: var(--panel);
-      margin: 0 0 2px;
+      margin: 0 0 4px;
     }
-    /* Body text sits flush against the signature pane — drop the
-       leading line-break the markdown emits. */
-    .cm-tooltip .wlift-hover br:first-of-type { display: none; }
     .cm-tooltip .wlift-hover code { font-family: inherit; }
     /* CodeMirror's default tooltip frame has its own padding;
        collapse it so our inner padding owns the gutter. */
@@ -905,11 +904,14 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
           let lastIdx = 0;
           let m;
           while ((m = fenceRe.exec(text)) !== null) {
-            html += escapeHtml(text.slice(lastIdx, m.index));
+            html += escapeHtml(text.slice(lastIdx, m.index)).replace(/^\n+/, "");
             html += `<pre><code>${escapeHtml(m[1])}</code></pre>`;
             lastIdx = m.index + m[0].length;
           }
-          html += escapeHtml(text.slice(lastIdx)).replace(/\n/g, "<br>");
+          // Strip leading newlines (the markdown's paragraph
+          // break between fence end and body) so the body
+          // sits flush below the signature pane.
+          html += escapeHtml(text.slice(lastIdx).replace(/^\n+/, "")).replace(/\n/g, "<br>");
           dom.innerHTML = html;
           return { dom };
         },
@@ -983,11 +985,11 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       let lastIdx = 0;
       let m;
       while ((m = fenceRe.exec(body)) !== null) {
-        html += escapeHtml(body.slice(lastIdx, m.index)).replace(/\n/g, "<br>");
+        html += escapeHtml(body.slice(lastIdx, m.index).replace(/^\n+/, "")).replace(/\n/g, "<br>");
         html += `<pre><code>${escapeHtml(m[1])}</code></pre>`;
         lastIdx = m.index + m[0].length;
       }
-      html += escapeHtml(body.slice(lastIdx)).replace(/\n/g, "<br>");
+      html += escapeHtml(body.slice(lastIdx).replace(/^\n+/, "")).replace(/\n/g, "<br>");
       dom.innerHTML = html;
       return dom;
     }

@@ -1113,16 +1113,35 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
             }
         }
 
-        // Member match. With a receiver, scan only that class's
-        // members; without one, scan every class (the legacy
-        // best-effort).
-        for m in &all_modules {
-            for class in &m.classes {
-                if let Some(recv) = receiver {
+        // Member match — pass 1: receiver-restricted. When the
+        // cursor sits on `Class.method`, scan only that class's
+        // members so `Renderer2D.new` doesn't accidentally hit
+        // `FruitSlicer.new`. Pass 2 (below) ignores the receiver
+        // and scans every class — used when the receiver is a
+        // *local* (`fiber.try()` where `fiber` is a `Fiber.new`
+        // instance) and we have no type-inference yet.
+        if let Some(recv) = receiver {
+            for m in &all_modules {
+                for class in &m.classes {
                     if class.name != recv {
                         continue;
                     }
+                    for member in &class.members {
+                        if member.name == ident {
+                            return hover_out(
+                                &format_member_sig(&class.name, &member.signature),
+                                &member.doc,
+                                ident_span.start,
+                                ident_span.end,
+                            );
+                        }
+                    }
                 }
+            }
+        }
+        // Pass 2: unrestricted member lookup. First-class wins.
+        for m in &all_modules {
+            for class in &m.classes {
                 for member in &class.members {
                     if member.name == ident {
                         return hover_out(
