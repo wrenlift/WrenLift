@@ -2721,7 +2721,8 @@ pub extern "C" fn wren_ic_call_3(ic_ptr: u64, recv: u64, a0: u64, a1: u64, a2: u
 }
 
 fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
-    let ic = unsafe { &*(ic_ptr_raw as *const crate::mir::bytecode::CallSiteIC) };
+    let ic_ptr = ic_ptr_raw as *mut crate::mir::bytecode::CallSiteIC;
+    let ic = unsafe { &*ic_ptr };
     let jit_ptr = ic.jit_ptr;
     if jit_ptr.is_null() {
         return Value::null().to_bits();
@@ -2732,7 +2733,27 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     // module_vars / jit_code_base are already correct, so we can skip the
     // full save/restore and jit_depth bump — for tight dispatch loops this
     // removes ~6 TLS roundtrips and a 48-byte copy per call.
+    //
+    // Revalidate `jit_ptr` against the live `engine.jit_code` slot
+    // before the transmute — a tier-up since this IC was installed
+    // may have freed / relocated the code blob, and reading the
+    // stale pointer PAC-faults on arm64. On a miss we clear the IC
+    // and fall back to `Value::null()` so the caller's slow path
+    // repopulates on the next call. Same shape kind=6 already does
+    // (see `dispatch_call_rooted`).
     if ic.kind == 1 {
+        if let Some(vm) = unsafe { vm_ref() } {
+            let live = vm
+                .engine
+                .jit_code
+                .get(ic.func_id as usize)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            if live != jit_ptr {
+                unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
+                return Value::null().to_bits();
+            }
+        }
         let args_val: smallvec::SmallVec<[Value; 5]> =
             args.iter().map(|&a| Value::from_bits(a)).collect();
         return unsafe { call_jit_with_shadow_raw(jit_ptr, &args_val) };
