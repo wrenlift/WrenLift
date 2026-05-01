@@ -6512,6 +6512,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-time",
  "wlift_image",
+ "wlift_physics",
  "wren_lift",
 ]
 

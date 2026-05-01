@@ -33,7 +33,8 @@ toml = "0.8"
 # on `wasm32-*` targets. Adding a plugin here is the wasm
 # equivalent of dropping `lib<crate>.so` into a host package's
 # `libs/` directory.
-wlift_image = { path = "../plugins/wlift_image", default-features = false }
+wlift_image   = { path = "../plugins/wlift_image",   default-features = false }
+wlift_physics = { path = "../plugins/wlift_physics", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browser-side panic visibility: any unhandled panic surfaces as a

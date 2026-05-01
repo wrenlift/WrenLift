@@ -914,3 +914,51 @@ pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut VM) {
         set_return(vm, Value::null());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Static-link symbol registry (wasm only)
+//
+// On `wasm32-*`, plugins ship as Rust crates statically linked into
+// `wlift_wasm` rather than as separate `.wasm` cdylibs — the wasm
+// runtime has no `dlsym`, so foreign-method exports register
+// themselves into a static table at host-init. Hosts call this
+// once after `wlift_wasm`'s panic hook is installed.
+// ---------------------------------------------------------------------------
+
+/// Register every `#[no_mangle] wlift_physics_*` foreign-method
+/// export under the library name `"wlift_physics"`. Idempotent —
+/// re-calling overwrites the same `(library, symbol)` keys.
+///
+/// Only exists on `wasm32-*` targets. Host builds resolve these
+/// symbols via `dlsym` and never call this; the function isn't
+/// compiled there at all.
+#[cfg(target_arch = "wasm32")]
+pub fn register_static_symbols() {
+    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
+    // SAFETY: each export is `unsafe extern "C" fn(*mut VM)` with
+    // the same ABI the host build dispatches via `dlsym`.
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_create",              wlift_physics_world2d_create);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_destroy",             wlift_physics_world2d_destroy);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_step",                wlift_physics_world2d_step);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_spawn_dynamic",       wlift_physics_world2d_spawn_dynamic);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_spawn_static",        wlift_physics_world2d_spawn_static);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_spawn_kinematic",     wlift_physics_world2d_spawn_kinematic);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_despawn",             wlift_physics_world2d_despawn);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_position",            wlift_physics_world2d_position);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_linear_velocity",     wlift_physics_world2d_linear_velocity);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_set_linear_velocity", wlift_physics_world2d_set_linear_velocity);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_apply_impulse",       wlift_physics_world2d_apply_impulse);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world2d_apply_force",         wlift_physics_world2d_apply_force);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_create",              wlift_physics_world3d_create);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_destroy",             wlift_physics_world3d_destroy);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_step",                wlift_physics_world3d_step);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_spawn_dynamic",       wlift_physics_world3d_spawn_dynamic);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_spawn_static",        wlift_physics_world3d_spawn_static);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_spawn_kinematic",     wlift_physics_world3d_spawn_kinematic);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_despawn",             wlift_physics_world3d_despawn);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_position",            wlift_physics_world3d_position);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_linear_velocity",     wlift_physics_world3d_linear_velocity);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_set_linear_velocity", wlift_physics_world3d_set_linear_velocity);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_apply_impulse",       wlift_physics_world3d_apply_impulse);
+    register_plugin_symbol_unsafe("wlift_physics", "wlift_physics_world3d_apply_force",         wlift_physics_world3d_apply_force);
+}

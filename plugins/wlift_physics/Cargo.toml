@@ -5,15 +5,27 @@ edition = "2021"
 description = "Rapier-backed physics for the WrenLift game framework. One cdylib bundles rapier2d + rapier3d so @hatch:physics can expose World2D and World3D from a single import."
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` for the host plugin loader (libloading dlopens the
+# `.dylib`/`.so`/`.dll`). `rlib` for the wasm build path that
+# statically links the plugin into `wlift_wasm` — wasm has no
+# dynamic-library loader, so plugins ship as Rust crates the
+# runtime crate links in directly.
+crate-type = ["cdylib", "rlib"]
+
+# Plugins must compile against the SAME `wren_lift` feature set the
+# host binary uses, otherwise host-gated fields in `VM` /
+# `NativeContext` shift offsets and the cdylib's `&mut VM` decode
+# is wrong → silent SIGSEGV on the first foreign-method dispatch.
+# The `host` feature here flips `wren_lift/host` so the plugin's
+# view of those structs matches the binary's. The cdylib build
+# keeps `host` on by default; the wasm static-link path in
+# `wlift_wasm` explicitly disables it via `default-features = false`.
+[features]
+default = ["host"]
+host = ["wren_lift/host"]
 
 [dependencies]
-# `features = ["host"]` matches the binary's view of `wren_lift`,
-# so host-gated fields in `VM` / `NativeContext` line up. Without
-# it the plugin's `&mut VM` decode is offset → silent SIGSEGV on
-# the first foreign-method dispatch. `default-features = false`
-# still keeps `cranelift` out — the JIT bloat doesn't belong here.
-wren_lift = { path = "../..", default-features = false, features = ["host"] }
+wren_lift = { path = "../..", default-features = false }
 # Pinned to 0.32 — the API has changed across versions; if we
 # bump these, audit the descriptor decoders below.
 rapier2d = "0.32"
