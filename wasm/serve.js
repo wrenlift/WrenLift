@@ -84,6 +84,15 @@ function resolveRequest(urlPath) {
   if (urlPath.startsWith("/web/")) {
     return normalize(join(ROOT, urlPath.slice(1)));
   }
+  // wasm-pack output. `web/index.html` does
+  // `import "./wlift_wasm.js"` which resolves to a bare `/`
+  // path, so route those two filenames straight to `wasm/pkg/`.
+  // Otherwise the locally-served playground would fall back to
+  // a stale tracked copy in `web/` whenever someone forgets to
+  // re-sync after `wasm-pack build`.
+  if (urlPath === "/wlift_wasm.js" || urlPath === "/wlift_wasm_bg.wasm") {
+    return normalize(join(ROOT, "pkg", urlPath.slice(1)));
+  }
   // Default: treat as relative to `web/` so `<script src="worker.js">`
   // and `<link href="style.css">` work without a leading `/web/`.
   return normalize(join(ROOT, "web", urlPath));
