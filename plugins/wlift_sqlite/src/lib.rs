@@ -45,6 +45,14 @@ mod backend_wasm;
 use backend_wasm as backend;
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
+///
+/// Native-only. The host's `libloading::dlsym` path uses it to
+/// reject a dylib built against a different `wren_lift` than the
+/// host. Statically-linked wasm plugins can't drift versions
+/// (everything's compiled from the same tree), and re-exporting
+/// the symbol from every linked rlib produces wasm-linker
+/// duplicate-symbol errors.
+#[cfg(not(target_arch = "wasm32"))]
 #[no_mangle]
 pub extern "C" fn wlift_plugin_abi_version() -> u32 {
     wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
