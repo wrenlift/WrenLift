@@ -127,6 +127,22 @@ pub struct Manifest {
     /// output. Optional but strongly encouraged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Where this package is hosted on the public web — the user-
+    /// facing landing page, not necessarily a git URL. Surfaces on
+    /// the docs page header. Optional; the catalog falls back to
+    /// the `git` URL when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// Where this package's README lives. Two shapes:
+    ///   * Absolute URL — used verbatim by the docs renderer
+    ///     (`https://raw.githubusercontent.com/.../README.md`,
+    ///     a custom CDN, …).
+    ///   * Relative path — resolved against the `git` URL using
+    ///     the host's `raw` URL convention (GitHub:
+    ///     `<git>/raw/main/<path>`).
+    /// Defaults to `"README.md"` at the repo root when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readme: Option<String>,
     /// Ordered list of module names in this hatch. The loader installs
     /// them in this order so a module's imports resolve against
     /// already-loaded peers. Producers are expected to write this in
@@ -1155,6 +1171,8 @@ fn build_recursive(
             version: "0.1.0".to_string(),
             entry: pick_default_entry(&module_names),
             description: None,
+            homepage: None,
+            readme: None,
             modules: module_names.clone(),
             dependencies: BTreeMap::new(),
             spec_dependencies: BTreeMap::new(),
@@ -1728,6 +1746,40 @@ fn pack_bundled_native_libs(
         }
     }
     Ok(())
+}
+
+/// Walk a workspace directory, run the doc collector on every
+/// `.wren` module, and emit the same JSON shape that the bundler
+/// stuffs into a `Docs` section. Useful for tooling that wants
+/// the docs without producing a full `.hatch` (e.g. the docs
+/// site's API-reference renderer, an LSP feed, etc.). Skips
+/// `*.spec.wren` for the same reason `pack_bundled_native_libs`
+/// does — test code isn't part of the published surface.
+#[cfg(feature = "host")]
+pub fn collect_workspace_docs(root: &Path) -> Result<String, HatchError> {
+    let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    collect_wren_files(root, root, &mut wren_files)?;
+    let mut module_docs: Vec<crate::docs::ModuleDoc> = Vec::with_capacity(wren_files.len());
+    for (module_name, path) in &wren_files {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| HatchError::Encode(format!("read {}: {}", path.display(), e)))?;
+        // Apply target-conditional cfg the same way the publish
+        // path does so the docs match the *bundled* source. None
+        // here means "host target".
+        let source = crate::parse::cfg::apply(&raw, None);
+        let pr = crate::parse::parser::parse(&source);
+        if pr.errors.is_empty() {
+            module_docs.push(crate::docs::collect_module(
+                module_name.clone(),
+                &source,
+                &pr.module,
+                &pr.docs,
+                &pr.interner,
+            ));
+        }
+    }
+    crate::docs::render_module_docs_json(&module_docs)
+        .map_err(|e| HatchError::Encode(format!("docs json: {}", e)))
 }
 
 #[cfg(feature = "host")]

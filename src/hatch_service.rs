@@ -73,6 +73,18 @@ pub struct PackageRecord {
     pub git: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Public landing page for the package — distinct from `git`,
+    /// which is the source repo. Mirrors the manifest's
+    /// `homepage` field. Falls back to `git` on the consumer side
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// README location. Either an absolute URL or a path relative
+    /// to the `git` repo root. Mirrors the manifest's `readme`
+    /// field. The docs renderer uses it verbatim (URL) or
+    /// resolves against `git` via the host's raw-URL convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readme: Option<String>,
     /// Present in server responses, omitted on submission (the
     /// server sets it from the auth'd JWT).
     #[serde(default, skip_serializing_if = "Option::is_none")]

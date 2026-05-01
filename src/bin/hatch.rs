@@ -80,6 +80,21 @@ enum Command {
         #[arg(value_name = "PACKAGE")]
         path: PathBuf,
     },
+    /// Emit the package's API documentation as JSON — one
+    /// `ModuleDoc` per `.wren` module, every class / member
+    /// pulled from `///` doc comments. The same JSON the
+    /// publish path stuffs into the bundle's `Docs` section.
+    /// Reads either a workspace directory (live source) or an
+    /// already-built `.hatch` (cached docs section). Output
+    /// goes to stdout for piping; pass `--out` to write a file.
+    Docs {
+        /// Workspace directory or `.hatch` file. Defaults to `.`.
+        #[arg(value_name = "TARGET", default_value = ".")]
+        target: PathBuf,
+        /// Optional output path; stdout when omitted.
+        #[arg(short, long, value_name = "OUT")]
+        out: Option<PathBuf>,
+    },
     /// Run a workspace or an already-built `.hatch`.
     ///
     /// If `target` is a directory (or omitted, meaning `.`) the
@@ -141,6 +156,35 @@ enum Command {
         #[arg(long = "git", value_name = "URL")]
         git: Option<String>,
     },
+    /// Walk every `<root>/*/hatchfile` and publish each package
+    /// sequentially. Same metadata + auth flow as `hatch publish`,
+    /// just batched so a monorepo of 30+ packages doesn't need
+    /// 30 invocations. Skips on per-package failures (logs and
+    /// continues), exits non-zero if any package errored.
+    PublishAll {
+        /// Root directory containing `<pkg>/hatchfile` workspaces.
+        /// Typical use: `hatch publish-all hatch/packages`.
+        #[arg(value_name = "ROOT", default_value = ".")]
+        root: PathBuf,
+        /// Override the git URL written for every package. Useful
+        /// when the monorepo's origin is different from where the
+        /// bundles get fetched. Defaults to each workspace's git
+        /// `origin` (looked up once at the root, since every
+        /// workspace in a monorepo shares the same remote).
+        #[arg(long = "git", value_name = "URL")]
+        git: Option<String>,
+        /// Comma-separated package names to skip (e.g. for the
+        /// site itself or work-in-progress packages). Match is
+        /// against the `name = "..."` field in each hatchfile.
+        #[arg(long = "skip", value_name = "NAMES")]
+        skip: Option<String>,
+        /// Continue past auth / network failures rather than
+        /// stopping at the first one. Useful for re-runs after a
+        /// transient hiccup; default is to stop on the first
+        /// hard failure (everything beyond a per-package error).
+        #[arg(long = "keep-going")]
+        keep_going: bool,
+    },
     /// Look up a package by name and print where it's hosted. Read-
     /// only — works without `hatch login`.
     Find { name: String },
@@ -201,6 +245,7 @@ fn main() {
         },
         Command::Build { dir, out } => cmd_build(&dir, out.as_deref()),
         Command::Inspect { path } => cmd_inspect(&path),
+        Command::Docs { target, out } => cmd_docs(&target, out.as_deref()),
         Command::Run { target, withs } => cmd_run(&target, &withs),
         Command::Add { name, version } => cmd_stub(&format!(
             "add {name}@{version} — resolver + registry lookups are planned; see the README roadmap"
@@ -216,6 +261,12 @@ fn main() {
             "get {name} — needs the registry client to land first; see the README roadmap"
         )),
         Command::Publish { dir, git } => cmd_publish(&dir, git.as_deref()),
+        Command::PublishAll {
+            root,
+            git,
+            skip,
+            keep_going,
+        } => cmd_publish_all(&root, git.as_deref(), skip.as_deref(), keep_going),
         Command::Find { name } => cmd_find(&name),
         Command::Login { token } => cmd_login(token.as_deref()),
         Command::Logout => cmd_logout(),
@@ -607,6 +658,71 @@ fn cmd_build(dir: &Path, out: Option<&Path>) {
 // ---------------------------------------------------------------------------
 // inspect
 // ---------------------------------------------------------------------------
+
+/// `hatch docs <TARGET> [--out FILE]` — emit the package's API
+/// documentation as JSON. The same `Vec<ModuleDoc>` shape the
+/// publish path stuffs into a bundle's `Docs` section, suitable
+/// for tooling (the docs site's API-reference renderer, an LSP
+/// feed, an offline doc browser).
+///
+/// `<TARGET>` may be either a workspace directory (live source
+/// — collected via `hatch::collect_workspace_docs`) or an
+/// already-built `.hatch` (we extract the `Docs` section bytes
+/// verbatim, so the output matches whatever shipped at publish).
+fn cmd_docs(target: &Path, out: Option<&Path>) {
+    let json = if target.is_dir() {
+        match wren_lift::hatch::collect_workspace_docs(target) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(65);
+            }
+        }
+    } else {
+        let bytes = match std::fs::read(target) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: cannot read '{}': {}", target.display(), e);
+                process::exit(1);
+            }
+        };
+        let hatch = match wren_lift::hatch::load(&bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(65);
+            }
+        };
+        let section = hatch
+            .sections
+            .iter()
+            .find(|s| matches!(s.kind, wren_lift::hatch::SectionKind::Docs));
+        match section {
+            Some(s) => match std::str::from_utf8(&s.data) {
+                Ok(s) => s.to_string(),
+                Err(e) => {
+                    eprintln!("error: docs section is not valid utf-8: {}", e);
+                    process::exit(65);
+                }
+            },
+            None => {
+                // No docs section in this bundle — emit an empty
+                // array so consumers can treat "no docs" and
+                // "valid empty" identically.
+                "[]".to_string()
+            }
+        }
+    };
+
+    if let Some(path) = out {
+        if let Err(e) = std::fs::write(path, &json) {
+            eprintln!("error: write {}: {}", path.display(), e);
+            process::exit(1);
+        }
+    } else {
+        println!("{}", json);
+    }
+}
 
 fn cmd_inspect(path: &Path) {
     let bytes = match std::fs::read(path) {
@@ -1020,31 +1136,13 @@ fn cmd_find(name: &str) {
 }
 
 fn cmd_publish(dir: &Path, git_override: Option<&str>) {
-    // Read the workspace's hatchfile for name + description.
-    let hatchfile_path = dir.join(HATCHFILE);
-    let text = match std::fs::read_to_string(&hatchfile_path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "error: cannot read '{}': {} (run `hatch init` first?)",
-                hatchfile_path.display(),
-                e
-            );
-            process::exit(1);
-        }
-    };
-    let manifest: wren_lift::hatch::Manifest = match toml::from_str(&text) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: cannot parse hatchfile: {}", e);
-            process::exit(1);
-        }
-    };
+    // Load auth + service config once. The credentials path /
+    // refresh logic exits the process on hard errors (not logged
+    // in, expired session) so the caller doesn't have to.
+    let (cfg, creds) = load_publish_session();
 
-    // Git URL: explicit --git wins; else probe the workspace's
-    // `origin` remote. If neither is available, the user hasn't
-    // committed anywhere yet and publishing would produce a
-    // dangling catalog entry.
+    // Resolve git URL: explicit --git wins; else probe the
+    // workspace's `origin` remote.
     let git = match git_override {
         Some(g) => g.to_string(),
         None => match detect_origin_remote(dir) {
@@ -1059,7 +1157,207 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
         },
     };
 
-    // Load credentials.
+    match publish_workspace(dir, &git, &cfg, &creds) {
+        Ok(record) => {
+            println!(
+                "published {}@{} → {}",
+                record.name, record.version, record.git
+            );
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+/// Bulk publish — walks `<root>/<pkg>/hatchfile`, runs the same
+/// publish flow against each. Per-package errors are logged and
+/// (by default) abort; `--keep-going` flips that to "log and
+/// continue, exit non-zero at the end if anything failed".
+fn cmd_publish_all(
+    root: &Path,
+    git_override: Option<&str>,
+    skip: Option<&str>,
+    keep_going: bool,
+) {
+    if !root.is_dir() {
+        eprintln!("error: '{}' is not a directory", root.display());
+        process::exit(1);
+    }
+
+    // Discover every workspace under the root. Walk one level
+    // deep — the canonical layout is `<root>/<pkg>/hatchfile`,
+    // not deeper. `cli` and other workspaces that aren't meant
+    // for the registry can be excluded via --skip.
+    let mut workspaces: Vec<PathBuf> = Vec::new();
+    match std::fs::read_dir(root) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                if path.join(HATCHFILE).is_file() {
+                    workspaces.push(path);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("error: cannot read '{}': {}", root.display(), e);
+            process::exit(1);
+        }
+    }
+    workspaces.sort();
+
+    if workspaces.is_empty() {
+        eprintln!(
+            "error: no workspaces found under '{}' (looked for '*/{}')",
+            root.display(),
+            HATCHFILE
+        );
+        process::exit(1);
+    }
+
+    // Skip list — comma-separated. Matched against the `name`
+    // field in each hatchfile, not the directory basename, so
+    // `--skip @hatch:cli` works regardless of dirname casing.
+    let skip_set: std::collections::HashSet<String> = skip
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    // Resolve git origin once at the root. Every workspace in a
+    // monorepo shares the same remote, so we don't need to probe
+    // per package — saves N git calls. Explicit --git still wins.
+    let default_git = match git_override {
+        Some(g) => Some(g.to_string()),
+        None => detect_origin_remote(root),
+    };
+
+    let (cfg, creds) = load_publish_session();
+
+    let mut published: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    for ws in &workspaces {
+        // Pre-read the manifest just to know the name (for skip /
+        // logging). `publish_workspace` reads it again — cheap.
+        let name_for_log = match std::fs::read_to_string(ws.join(HATCHFILE))
+            .ok()
+            .and_then(|t| toml::from_str::<wren_lift::hatch::Manifest>(&t).ok())
+        {
+            Some(m) => m.name,
+            None => {
+                let dirname = ws.file_name().map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| ws.display().to_string());
+                eprintln!("[skip] {}: cannot parse hatchfile", dirname);
+                skipped.push(dirname);
+                continue;
+            }
+        };
+
+        if skip_set.contains(&name_for_log) {
+            println!("[skip] {} (excluded via --skip)", name_for_log);
+            skipped.push(name_for_log);
+            continue;
+        }
+
+        // Per-workspace git override: explicit --git first; else
+        // the root's origin. If we have neither, we can't publish
+        // this package — log + skip rather than crash the whole
+        // sweep.
+        let git = match &default_git {
+            Some(g) => g.clone(),
+            None => match detect_origin_remote(ws) {
+                Some(g) => g,
+                None => {
+                    eprintln!(
+                        "[fail] {}: no git origin and no --git provided",
+                        name_for_log
+                    );
+                    failed.push((name_for_log, "no git origin".to_string()));
+                    if !keep_going {
+                        break;
+                    }
+                    continue;
+                }
+            },
+        };
+
+        match publish_workspace(ws, &git, &cfg, &creds) {
+            Ok(record) => {
+                println!("[ok]   {}@{} → {}", record.name, record.version, record.git);
+                published.push(format!("{}@{}", record.name, record.version));
+            }
+            Err(e) => {
+                eprintln!("[fail] {}: {}", name_for_log, e);
+                failed.push((name_for_log, e.clone()));
+                if !keep_going {
+                    eprintln!("\nstopping at first failure (pass --keep-going to continue past errors)");
+                    break;
+                }
+            }
+        }
+    }
+
+    println!("\n--- publish-all summary ---");
+    println!("  published: {}", published.len());
+    println!("  skipped:   {}", skipped.len());
+    println!("  failed:    {}", failed.len());
+    if !failed.is_empty() {
+        for (name, msg) in &failed {
+            println!("    {} — {}", name, msg);
+        }
+        process::exit(1);
+    }
+}
+
+/// Read a workspace's manifest, build the `PackageRecord`, and
+/// upsert it into the catalog. Returns the published record so
+/// the caller can format the success line with the resolved git
+/// URL. Errors are stringified for the bulk-publish summary.
+fn publish_workspace(
+    dir: &Path,
+    git: &str,
+    cfg: &wren_lift::hatch_service::ServiceConfig,
+    creds: &wren_lift::hatch_service::Credentials,
+) -> Result<wren_lift::hatch_service::PackageRecord, String> {
+    let hatchfile_path = dir.join(HATCHFILE);
+    let text = std::fs::read_to_string(&hatchfile_path)
+        .map_err(|e| format!("cannot read '{}': {}", hatchfile_path.display(), e))?;
+    let manifest: wren_lift::hatch::Manifest =
+        toml::from_str(&text).map_err(|e| format!("cannot parse hatchfile: {}", e))?;
+
+    // The `homepage` / `readme` columns were added to PackageRecord
+    // ahead of the corresponding Supabase migration. Until the DB
+    // schema gains those columns (see `migrations/20260501_*.sql`),
+    // strip them from the publish payload to dodge the PGRST204
+    // "Could not find the 'homepage' column" rejection. Once the
+    // migration lands, drop these `None` overrides and pass the
+    // manifest values through directly.
+    let record = wren_lift::hatch_service::PackageRecord {
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        git: git.to_string(),
+        description: manifest.description.clone(),
+        homepage: None,
+        readme: None,
+        owner: None, // server sets from JWT
+    };
+
+    wren_lift::hatch_service::publish_package(cfg, creds, &record)
+        .map_err(|e| format!("{}", e))?;
+    Ok(record)
+}
+
+/// Load the saved JWT and refresh it if near expiry. Exits the
+/// process on hard auth failures so callers can use it as a
+/// non-failing setup step.
+fn load_publish_session() -> (
+    wren_lift::hatch_service::ServiceConfig,
+    wren_lift::hatch_service::Credentials,
+) {
     let creds = match wren_lift::hatch_service::load_credentials() {
         Ok(Some(c)) => c,
         Ok(None) => {
@@ -1073,9 +1371,6 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
     };
 
     let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
-    // Quietly refresh the JWT if it's near expiry so long-idle
-    // sessions don't 401 mid-publish. No-op when the token's still
-    // good (or when we don't have a refresh token to redeem).
     let creds = match wren_lift::hatch_service::ensure_fresh_credentials(&cfg, creds) {
         Ok(c) => c,
         Err(wren_lift::hatch_service::ServiceError::NotLoggedIn) => {
@@ -1088,26 +1383,7 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
         }
     };
 
-    let record = wren_lift::hatch_service::PackageRecord {
-        name: manifest.name.clone(),
-        version: manifest.version.clone(),
-        git: git.clone(),
-        description: manifest.description.clone(),
-        owner: None, // server sets from JWT
-    };
-
-    match wren_lift::hatch_service::publish_package(&cfg, &creds, &record) {
-        Ok(()) => {
-            println!(
-                "published {}@{} → {}",
-                record.name, record.version, record.git
-            );
-        }
-        Err(e) => {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        }
-    }
+    (cfg, creds)
 }
 
 fn detect_origin_remote(dir: &Path) -> Option<String> {

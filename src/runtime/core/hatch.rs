@@ -66,6 +66,14 @@ fn hatch_loaded_modules(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     ctx.alloc_list(elements)
 }
 
+/// `Hatch.runtimeVersion` — semver string of the underlying
+/// `wren_lift` runtime, sourced from `CARGO_PKG_VERSION` at
+/// compile time. Lets host code / docs pages avoid hardcoding
+/// the version in two places.
+fn hatch_runtime_version(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    ctx.alloc_string(env!("CARGO_PKG_VERSION").to_string())
+}
+
 /// `Hatch.onReload(fn)` — register a Wren `Fn` invoked with the
 /// reloaded module's canonical path after every successful module
 /// reload. Frameworks use this to re-run setup that registers state
@@ -129,6 +137,7 @@ pub fn register(vm: &mut crate::runtime::vm::VM) -> *mut crate::runtime::object:
     vm.primitive_static(class, "moduleMtime(_)", hatch_module_mtime);
     vm.primitive_static(class, "modulePath(_)", hatch_module_path);
     vm.primitive_static(class, "loadedModules", hatch_loaded_modules);
+    vm.primitive_static(class, "runtimeVersion", hatch_runtime_version);
     vm.primitive_static(class, "onReload(_)", hatch_on_reload);
     vm.primitive_static(class, "beforeReload(_)", hatch_before_reload);
     vm.primitive_static(class, "watchFile(_,_)", hatch_watch_file);

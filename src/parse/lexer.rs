@@ -288,10 +288,29 @@ pub fn lex(
                 Some(DocKind::Decl)
             } else if pos + 2 < source.len() && bytes[pos + 2] == b'!' {
                 Some(DocKind::Module)
+            } else if !lexemes.iter().any(|l| !matches!(l.token, Token::Newline)) {
+                // Plain `//` line at the head of the file — promote
+                // to module doc so existing packages' `//` file
+                // headers feed the docs collector without an edit.
+                // The "head of the file" check ignores blank lines
+                // (only Newline tokens emitted so far).
+                Some(DocKind::Module)
             } else {
                 None
             };
-            pos += if kind.is_some() { 3 } else { 2 };
+            // `///` and `//!` consume three marker chars; bare `//`
+            // (whether code-comment or promoted-module-doc) only two.
+            let marker_len = if pos + 3 < source.len()
+                && bytes[pos + 2] == b'/'
+                && bytes[pos + 3] != b'/'
+            {
+                3
+            } else if pos + 2 < source.len() && bytes[pos + 2] == b'!' {
+                3
+            } else {
+                2
+            };
+            pos += marker_len;
             // Body runs from `pos` (just after the marker) to the
             // newline. Trim a single leading space — the convention
             // is `/// body` with one space between marker and prose.
