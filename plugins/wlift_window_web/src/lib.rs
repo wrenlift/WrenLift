@@ -1,5 +1,5 @@
 //! `wlift_window_web` — browser-canvas window provider for the
-//! WrenLift game framework. Pure C-ABI plugin: zero Rust deps,
+//! WrenLift apps. Pure C-ABI plugin: zero Rust deps,
 //! every capability is a wasm import.
 //!
 //! Architecture

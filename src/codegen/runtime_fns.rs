@@ -2751,6 +2751,7 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     // was stale, and the bogus `null` propagated as the receiver.
     if ic.kind == 1 {
         let mut call_ptr = jit_ptr;
+        let mut closure_for_fallback: *mut ObjClosure = std::ptr::null_mut();
         if let Some(vm) = unsafe { vm_ref() } {
             let live = vm
                 .engine
@@ -2759,18 +2760,33 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
                 .copied()
                 .unwrap_or(std::ptr::null());
             if live.is_null() {
-                // Function genuinely lost its JIT code — sticky in
-                // tiered mode so this only fires under aggressive
-                // eviction or interpreter-mode runs. Clear the IC
-                // and fall back to dispatch_call so the next visit
-                // through the JIT IC stub goes via the slow path.
+                // Function genuinely lost its JIT code (eviction or
+                // interpreter-mode run). The kind=1 IC still has the
+                // closure pointer, so dispatch through
+                // `call_closure_jit_or_sync` — that's the canonical
+                // path that picks the right backend (re-JIT if
+                // re-tiered, bytecode interpret otherwise). Clear
+                // the kind=1 entry first so subsequent visits go
+                // through the slow path on the JIT side too. We
+                // reset the closure_for_fallback pointer outside the
+                // borrow so we don't double-borrow `vm` on the call.
+                closure_for_fallback = ic.closure as *mut ObjClosure;
                 unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
-                return Value::null().to_bits();
-            }
-            if live != jit_ptr {
+            } else if live != jit_ptr {
                 unsafe { (*ic_ptr).jit_ptr = live };
                 call_ptr = live;
             }
+        }
+        if !closure_for_fallback.is_null() {
+            // Outside the `if let Some(vm)` borrow above so we can
+            // call `call_closure_jit_or_sync`, which itself takes
+            // `&mut vm`. Re-fetch the VM here.
+            if let Some(vm) = unsafe { vm_ref() } {
+                let args_val: smallvec::SmallVec<[Value; 5]> =
+                    args.iter().map(|&a| Value::from_bits(a)).collect();
+                return call_closure_jit_or_sync(vm, closure_for_fallback, &args_val, None);
+            }
+            return Value::null().to_bits();
         }
         let args_val: smallvec::SmallVec<[Value; 5]> =
             args.iter().map(|&a| Value::from_bits(a)).collect();

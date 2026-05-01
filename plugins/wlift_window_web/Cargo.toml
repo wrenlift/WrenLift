@@ -2,7 +2,7 @@
 name = "wlift_window_web"
 version = "0.1.0"
 edition = "2021"
-description = "Browser-canvas window provider for the WrenLift game framework. Compiles to wasm32-unknown-unknown only — bundled into @hatch:window's wasm slot. The native winit-backed cdylib lives in `wlift_window`; this crate exposes the same foreign-method names so the Wren-side `Window` API is identical across targets."
+description = "Browser-canvas window provider for the WrenLift apps. Compiles to wasm32-unknown-unknown only — bundled into @hatch:window's wasm slot. The native winit-backed cdylib lives in `wlift_window`; this crate exposes the same foreign-method names so the Wren-side `Window` API is identical across targets."
 
 [lib]
 # Wasm-only plugin — same shape as `wlift_hello`. Loaded on
