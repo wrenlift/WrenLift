@@ -162,6 +162,50 @@
     button:disabled { opacity: 0.4; cursor: wait; }
     label.field { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 
+    /* Searchable example picker. `combo-input` styled to match
+       the native button/select pair so the header pills line up;
+       the popover is absolutely positioned beneath, indexed list
+       items keyed off `aria-selected` for keyboard nav. */
+    .combo-wrap { position: relative; display: inline-flex; align-items: center; }
+    .combo-input {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--rule); padding: 6px 26px 6px 10px;
+      font: inherit; font-size: 12px;
+      border-radius: 10px; corner-shape: squircle;
+      width: 220px;
+    }
+    .combo-input:focus {
+      outline: none; border-color: var(--accent);
+    }
+    .combo-caret {
+      position: absolute; right: 9px; top: 50%;
+      transform: translateY(-50%);
+      pointer-events: none; color: var(--muted); font-size: 10px;
+    }
+    .combo-list {
+      position: absolute; top: calc(100% + 4px); left: 0;
+      min-width: 100%; max-height: 320px; overflow-y: auto;
+      background: var(--panel); border: 1px solid var(--rule);
+      border-radius: 10px; corner-shape: squircle;
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+      list-style: none; margin: 0; padding: 4px;
+      z-index: 50;
+    }
+    .combo-list[hidden] { display: none; }
+    .combo-list li {
+      padding: 6px 10px; border-radius: 6px;
+      font-size: 12px; color: var(--text); cursor: pointer;
+      white-space: nowrap;
+    }
+    .combo-list li[aria-selected="true"],
+    .combo-list li:hover {
+      background: var(--panel-2); color: var(--accent);
+    }
+    .combo-list li.combo-empty {
+      color: var(--muted); cursor: default; font-style: italic;
+    }
+    .combo-list li.combo-empty:hover { background: transparent; }
+
     .pill {
       display: inline-block;
       padding: 2px 8px;
@@ -475,9 +519,21 @@
       <span id="status" class="pill">loading…</span>
       <span style="margin-left: auto"></span>
       <button id="runtime" type="button" class="pill runtime" hidden title="open console">—</button>
-      <label class="field">
+      <label class="field combo" id="example-combo">
         example
-        <select id="example-select"></select>
+        <span class="combo-wrap">
+          <input type="text"
+                 id="example-input"
+                 class="combo-input"
+                 placeholder="search…"
+                 autocomplete="off"
+                 spellcheck="false"
+                 role="combobox"
+                 aria-expanded="false"
+                 aria-controls="example-list"/>
+          <span class="combo-caret" aria-hidden="true">▾</span>
+          <ul id="example-list" class="combo-list" role="listbox" hidden></ul>
+        </span>
       </label>
       <label class="field">
         mode
@@ -664,7 +720,8 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     const outEl          = document.getElementById("out");
     const runBtn         = document.getElementById("run-btn");
     const modeSel        = document.getElementById("mode-select");
-    const exampleSel     = document.getElementById("example-select");
+    const exampleInput   = document.getElementById("example-input");
+    const exampleListEl  = document.getElementById("example-list");
     const autoChk        = document.getElementById("autorun-toggle");
     const bannerEl       = document.getElementById("banner");
     const srcBgEl        = document.getElementById("src-bg");
@@ -1320,6 +1377,10 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     function loadExample(id) {
       const ex = EXAMPLES.find((e) => e.id === id);
       if (!ex) return;
+      // Sync the searchable picker so the input shows the new
+      // example's label after boot / hash-driven loads / autorun
+      // — not just clicks inside the popover.
+      setComboValue_(id);
       // Per-example autorun. `autorun: "off"` means the example
       // is long-running (game loops); switching to it shouldn't
       // silently start it. Reflect the gate in the visible
@@ -1399,14 +1460,133 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       if (wlift) bootMode(modeSel.value, wantsRun);
     }
 
-    // Populate the dropdown from EXAMPLES.
-    for (const ex of EXAMPLES) {
-      const opt = document.createElement("option");
-      opt.value = ex.id;
-      opt.textContent = ex.label;
-      exampleSel.appendChild(opt);
+    // Searchable combobox over EXAMPLES. `currentExampleId` tracks
+    // the actually-selected example (so blur can restore the input
+    // value if the user typed without picking); `comboActive` is
+    // the highlighted index for keyboard nav inside the open popover.
+    let currentExampleId = null;
+    let comboActive = -1;
+
+    function comboFilteredExamples_() {
+      const q = exampleInput.value.trim().toLowerCase();
+      // When the input still equals the *selected* example's label,
+      // treat it as "no filter" so opening the popover shows the
+      // full list rather than just the current entry. Otherwise the
+      // user has actively typed a query.
+      const sel = EXAMPLES.find((e) => e.id === currentExampleId);
+      const showAll = q === "" || (sel && sel.label.toLowerCase() === q);
+      if (showAll) return EXAMPLES.slice();
+      return EXAMPLES.filter((ex) => ex.label.toLowerCase().includes(q));
     }
-    exampleSel.addEventListener("change", () => loadExample(exampleSel.value));
+
+    function comboRender_() {
+      const matches = comboFilteredExamples_();
+      exampleListEl.innerHTML = "";
+      if (matches.length === 0) {
+        const li = document.createElement("li");
+        li.className = "combo-empty";
+        li.textContent = "no matches";
+        exampleListEl.appendChild(li);
+        comboActive = -1;
+        return;
+      }
+      // If the previously-active index has moved out of range,
+      // reset it so the next ↓/↑ press lands on the first item.
+      if (comboActive >= matches.length) comboActive = matches.length - 1;
+      if (comboActive < 0 && currentExampleId) {
+        const idx = matches.findIndex((m) => m.id === currentExampleId);
+        comboActive = idx;
+      }
+      matches.forEach((ex, i) => {
+        const li = document.createElement("li");
+        li.dataset.id = ex.id;
+        li.textContent = ex.label;
+        li.role = "option";
+        if (i === comboActive) li.setAttribute("aria-selected", "true");
+        li.addEventListener("mousedown", (e) => {
+          // mousedown (not click) so the input's blur doesn't fire
+          // and close the popover before the pick lands.
+          e.preventDefault();
+          loadExample(ex.id);
+          comboClose_();
+        });
+        exampleListEl.appendChild(li);
+      });
+    }
+
+    function comboOpen_() {
+      exampleListEl.hidden = false;
+      exampleInput.setAttribute("aria-expanded", "true");
+      comboRender_();
+    }
+    function comboClose_() {
+      exampleListEl.hidden = true;
+      exampleInput.setAttribute("aria-expanded", "false");
+      // Restore the input's text to the selected example's label
+      // (if any) so a half-typed search doesn't linger after blur.
+      const sel = EXAMPLES.find((e) => e.id === currentExampleId);
+      if (sel) exampleInput.value = sel.label;
+    }
+
+    // Public hook used by `loadExample` to sync the visible label
+    // when the example changes via boot / hash / autorun, not just
+    // a click in the popover.
+    function setComboValue_(id) {
+      const ex = EXAMPLES.find((e) => e.id === id);
+      if (!ex) return;
+      currentExampleId = id;
+      exampleInput.value = ex.label;
+    }
+
+    exampleInput.addEventListener("focus", () => {
+      // Open + select-all so typing replaces the label cleanly.
+      comboOpen_();
+      exampleInput.select();
+    });
+    exampleInput.addEventListener("click", () => {
+      // Re-clicking an already-focused input doesn't refire `focus`,
+      // so without this the popover would stay closed and the user
+      // can't browse other examples without typing first.
+      if (exampleListEl.hidden) comboOpen_();
+    });
+    exampleInput.addEventListener("input", () => {
+      comboActive = 0; // first match becomes the Enter target
+      if (exampleListEl.hidden) comboOpen_();
+      else comboRender_();
+    });
+    exampleInput.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (exampleListEl.hidden) comboOpen_();
+        const matches = comboFilteredExamples_();
+        comboActive = Math.min(matches.length - 1, comboActive + 1);
+        comboRender_();
+        const li = exampleListEl.children[comboActive];
+        if (li) li.scrollIntoView({ block: "nearest" });
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        comboActive = Math.max(0, comboActive - 1);
+        comboRender_();
+        const li = exampleListEl.children[comboActive];
+        if (li) li.scrollIntoView({ block: "nearest" });
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const matches = comboFilteredExamples_();
+        const pick = matches[comboActive] || matches[0];
+        if (pick) {
+          loadExample(pick.id);
+          comboClose_();
+          exampleInput.blur();
+        }
+      } else if (e.key === "Escape") {
+        comboClose_();
+        exampleInput.blur();
+      }
+    });
+    exampleInput.addEventListener("blur", () => {
+      // Defer so an in-flight mousedown on a list item still wins.
+      setTimeout(() => { if (!exampleListEl.matches(":hover")) comboClose_(); }, 0);
+    });
 
     // Boot call moved further down — `loadExample` calls
     // `prefetchDepDocs` → `resolveDepsOnce`, which reads the
