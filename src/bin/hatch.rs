@@ -1329,20 +1329,13 @@ fn publish_workspace(
     let manifest: wren_lift::hatch::Manifest =
         toml::from_str(&text).map_err(|e| format!("cannot parse hatchfile: {}", e))?;
 
-    // The `homepage` / `readme` columns were added to PackageRecord
-    // ahead of the corresponding Supabase migration. Until the DB
-    // schema gains those columns (see `migrations/20260501_*.sql`),
-    // strip them from the publish payload to dodge the PGRST204
-    // "Could not find the 'homepage' column" rejection. Once the
-    // migration lands, drop these `None` overrides and pass the
-    // manifest values through directly.
     let record = wren_lift::hatch_service::PackageRecord {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
         git: git.to_string(),
         description: manifest.description.clone(),
-        homepage: None,
-        readme: None,
+        homepage: manifest.homepage.clone(),
+        readme: manifest.readme.clone(),
         owner: None, // server sets from JWT
     };
 
