@@ -742,16 +742,27 @@ impl VM {
         }
     }
 
-    /// Extract every `NativeLib` section to a per-hatch temp directory
-    /// and register the resulting paths in `native_lib_paths` so
-    /// `#!native = "<section name>"` resolves to the extracted file.
-    /// The temp directory is prepended to `native_search_paths` so
-    /// bare-name lookups without an explicit override also find the
-    /// bundled library. Returns `CompileError` on any I/O failure —
-    /// partial extraction would leave the hatch in an inconsistent
-    /// state.
+    /// Extract the right `NativeLib` section for the host platform to a
+    /// per-hatch temp directory and register the resulting path in
+    /// `native_lib_paths` so `#!native = "<libname>"` resolves to the
+    /// extracted file.
+    ///
+    /// Bundles built before this scheme stored one section per native
+    /// library, named just `<libname>` — and ONLY for the platform
+    /// that ran the bundler (CI's Linux runner, which left Mac users
+    /// with a Linux ELF mis-cached as a `.dylib`). Modern bundles
+    /// embed every platform variant with `<libname>__<platform-key>`
+    /// section names; we walk them, pick the one matching the host
+    /// per `manifest.native_libs[name].resolve()`, and ignore the
+    /// rest. The legacy single-section shape still works as a
+    /// fallback.
+    ///
+    /// Returns `CompileError` on any I/O failure — partial extraction
+    /// would leave the hatch in an inconsistent state.
     #[cfg(feature = "host")]
     fn extract_hatch_native_sections(&mut self, hatch: &crate::hatch::Hatch) -> InterpretResult {
+        use crate::hatch::NATIVE_LIB_PLATFORM_SEP;
+
         let has_native = hatch
             .sections
             .iter()
@@ -772,25 +783,86 @@ impl VM {
         };
         let dir_path = temp_dir.path().to_path_buf();
 
+        // Group composite-named sections under their bare libname so
+        // we can pick a single platform variant per library.
+        use std::collections::HashMap;
+        let mut by_lib: HashMap<&str, Vec<(&str, &crate::hatch::Section)>> = HashMap::new();
         for section in &hatch.sections {
             if !matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
                 continue;
             }
-            let filename = crate::runtime::foreign::default_native_lib_filename(&section.name);
+            let (lib, key) = match section.name.split_once(NATIVE_LIB_PLATFORM_SEP) {
+                Some((l, k)) => (l, k),
+                None => (section.name.as_str(), ""), // legacy single-section bundle
+            };
+            by_lib.entry(lib).or_default().push((key, section));
+        }
+
+        for (lib, candidates) in by_lib {
+            // Single-section legacy bundle — extract as-is and trust
+            // it matches the host. (If a Linux .so winds up here,
+            // Library::new will fail at load time with a clear msg.)
+            if candidates.len() == 1 && candidates[0].0.is_empty() {
+                let section = candidates[0].1;
+                let filename = crate::runtime::foreign::default_native_lib_filename(lib);
+                let full = dir_path.join(&filename);
+                if let Err(e) = std::fs::write(&full, &section.data) {
+                    eprintln!(
+                        "failed to write bundled native lib '{}' to {}: {}",
+                        lib,
+                        full.display(),
+                        e
+                    );
+                    return InterpretResult::CompileError;
+                }
+                self.native_lib_paths.insert(lib.to_string(), full);
+                continue;
+            }
+
+            // Multi-platform bundle. Find which key the host wants
+            // from the manifest's [native_libs].<lib> entry. The
+            // entry should still be present — `pack_bundled_native_libs`
+            // strips bundled keys but only when *every* key was
+            // bundled; multi-platform bundles always carry the entry
+            // until extract registers it.
+            //
+            // Fallback: if the manifest doesn't carry the entry (older
+            // bundles or hand-rolled), score candidates against
+            // `(host_os, host_arch)` directly using
+            // `NativeLibEntry::resolve_for`'s lookup vocabulary.
+            let host_os = std::env::consts::OS;
+            let host_arch = crate::hatch::canonical_arch_name_pub(std::env::consts::ARCH);
+            let host_os_arch = format!("{}-{}", host_os, host_arch);
+
+            let preference = [host_os_arch.as_str(), host_os, "any", "path"];
+            let mut picked: Option<&crate::hatch::Section> = None;
+            'outer: for want in &preference {
+                for (key, section) in &candidates {
+                    if key == want {
+                        picked = Some(*section);
+                        break 'outer;
+                    }
+                }
+            }
+
+            let Some(section) = picked else {
+                // No matching variant. Skip — the foreign-class loader
+                // will surface a clear "library not found" if any
+                // class actually tries to use this lib.
+                continue;
+            };
+            let filename = crate::runtime::foreign::default_native_lib_filename(lib);
             let full = dir_path.join(&filename);
             if let Err(e) = std::fs::write(&full, &section.data) {
                 eprintln!(
                     "failed to write bundled native lib '{}' to {}: {}",
-                    section.name,
+                    lib,
                     full.display(),
                     e
                 );
                 return InterpretResult::CompileError;
             }
-            // Per-name override wins over candidate mangling, so
-            // `#!native = "<section name>"` maps directly to the
-            // extracted file.
-            self.native_lib_paths.insert(section.name.clone(), full);
+            self.native_lib_paths.insert(lib.to_string(), full);
         }
 
         // Prepend the extraction dir so bundled libs are reachable by

@@ -430,6 +430,30 @@ impl NativeLibEntry {
         }
     }
 
+    /// Every `(key, path)` pair declared on this entry. Used by the
+    /// publish path when a bundle needs to carry every platform's
+    /// dylib (so a Mac user can `hatch install` a package CI built
+    /// on Linux and still find a Mach-O to dlopen). Returns an empty
+    /// list for an absolute system reference (don't bundle), one
+    /// entry for a `Path` shorthand (key = `"any"`), or all the map
+    /// keys for a full `[native_libs]` map.
+    pub fn all_relative(&self) -> Vec<(&str, &str)> {
+        match self {
+            NativeLibEntry::Path(p) => {
+                if std::path::Path::new(p).is_absolute() {
+                    Vec::new()
+                } else {
+                    vec![("any", p.as_str())]
+                }
+            }
+            NativeLibEntry::Map(map) => map
+                .iter()
+                .filter(|(_, v)| !std::path::Path::new(v.as_str()).is_absolute())
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect(),
+        }
+    }
+
     /// Resolve against an explicit *bundle target* triple rather than
     /// the host. `None` means "host" (current process), and behaves
     /// like [`resolve`]. `Some("wasm32")` / `Some("wasm32-*")` selects
@@ -481,6 +505,13 @@ fn canonical_arch_name(arch: &str) -> &str {
         "aarch64" => "arm64",
         other => other,
     }
+}
+
+/// Public re-export so the runtime's native-section extractor can
+/// score sections against the same canonical (`os`, `arch`) shape
+/// the manifest uses for native-lib map keys.
+pub fn canonical_arch_name_pub(arch: &str) -> &str {
+    canonical_arch_name(arch)
 }
 
 /// One named blob inside a hatch. Owns its payload; for very large
@@ -1591,39 +1622,110 @@ fn merge_path_dependencies(
 /// platform's entry and bundles that one. Cross-platform packaging
 /// (multi-platform sections side-by-side) is a follow-up.
 #[cfg(feature = "host")]
+/// Separator between a native-lib name and its platform tag in
+/// section names: `wlift_sqlite__macos-arm64`. Two underscores so a
+/// well-formed library name (Rust crate convention) doesn't collide.
+pub const NATIVE_LIB_PLATFORM_SEP: &str = "__";
+
 fn pack_bundled_native_libs(
     root: &Path,
     manifest: &mut Manifest,
     sections: &mut Vec<Section>,
     target: Option<&str>,
 ) -> Result<(), HatchError> {
-    let mut bundled: Vec<String> = Vec::new();
-    for (name, entry) in &manifest.native_libs {
-        let Some(path_str) = entry.resolve_for_target(target) else {
-            continue; // nothing declared for this target — skip
-        };
-        let path = Path::new(path_str);
-        if path.is_absolute() {
-            continue; // system ref — don't bundle
+    // For wasm-target bundles we only want the wasm variant — packing
+    // every native dylib alongside would balloon the wasm bundle with
+    // bytes that can't dlopen anyway.
+    let want_wasm_only = is_wasm_target(target);
+
+    let entries: Vec<(String, NativeLibEntry)> = manifest
+        .native_libs
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut bundled_keys: Vec<(String, String)> = Vec::new(); // (libname, platform-key)
+
+    for (name, entry) in &entries {
+        if want_wasm_only {
+            // Bundle only the wasm variant, keyed under the canonical
+            // `<libname>` (no platform suffix) so the wasm extractor
+            // — which currently ignores native_lib_paths anyway —
+            // still locates one section per name.
+            if let Some(rel) = entry.resolve_for_target(target) {
+                let path = Path::new(rel);
+                if !path.is_absolute() {
+                    let full = root.join(path);
+                    let bytes = std::fs::read(&full).map_err(|e| {
+                        HatchError::Encode(format!(
+                            "native lib '{}' declared at '{}' could not be read: {}",
+                            name,
+                            full.display(),
+                            e
+                        ))
+                    })?;
+                    sections.push(Section {
+                        kind: SectionKind::NativeLib,
+                        name: name.clone(),
+                        data: bytes,
+                    });
+                    bundled_keys.push((name.clone(), "wasm".to_string()));
+                }
+            }
+            continue;
         }
-        let full = root.join(path);
-        let bytes = std::fs::read(&full).map_err(|e| {
-            HatchError::Encode(format!(
-                "native lib '{}' declared at '{}' could not be read: {}",
-                name,
-                full.display(),
-                e
-            ))
-        })?;
-        sections.push(Section {
-            kind: SectionKind::NativeLib,
-            name: name.clone(),
-            data: bytes,
-        });
-        bundled.push(name.clone());
+
+        // Host-target bundle: embed EVERY platform variant declared in
+        // the entry. Section names get a `__<platform-key>` suffix so
+        // a Mac user installing a package that CI built on Linux still
+        // finds a Mach-O to dlopen — the runtime's extractor picks the
+        // matching section by `entry.resolve()` against the host.
+        //
+        // Missing platform files are silently skipped: a developer
+        // building locally usually has only their host's binary in
+        // `libs/`; CI's publish workflow stages every platform's
+        // build artefact before re-running `wlift build`, and that's
+        // where the all-platforms invariant should hold. Leaving the
+        // packer strict would break the dev loop — `hatch run` of a
+        // workspace that path-links a plugin-backed package would
+        // fail unless every CI matrix entry was reproduced locally.
+        for (key, rel) in entry.all_relative() {
+            let full = root.join(rel);
+            let bytes = match std::fs::read(&full) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(HatchError::Encode(format!(
+                        "native lib '{}' (platform '{}') declared at '{}' could not be read: {}",
+                        name,
+                        key,
+                        full.display(),
+                        e
+                    )));
+                }
+            };
+            sections.push(Section {
+                kind: SectionKind::NativeLib,
+                name: format!("{}{}{}", name, NATIVE_LIB_PLATFORM_SEP, key),
+                data: bytes,
+            });
+            bundled_keys.push((name.clone(), key.to_string()));
+        }
     }
-    for name in bundled {
-        manifest.native_libs.remove(&name);
+    // Strip every bundled key from the manifest so the published
+    // bundle's `[native_libs]` table doesn't redundantly list paths
+    // that now live as sections. The runtime's extractor already
+    // rebuilds `native_lib_paths` from the section set; carrying
+    // duplicates would invite drift.
+    for (name, key) in bundled_keys {
+        if let Some(NativeLibEntry::Map(map)) = manifest.native_libs.get_mut(&name) {
+            map.remove(&key);
+            if map.is_empty() {
+                manifest.native_libs.remove(&name);
+            }
+        } else {
+            // Path shorthand or absolute: strip wholesale.
+            manifest.native_libs.remove(&name);
+        }
     }
     Ok(())
 }
