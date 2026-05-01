@@ -1,0 +1,26 @@
+# Cross-rs container customisation for cargo cross-builds.
+#
+# `wlift_audio` depends on `cpal`, which on Linux pulls in
+# `alsa-sys` and needs `libasound2-dev` headers at compile time.
+# The default `cross-rs` image for `aarch64-unknown-linux-gnu`
+# ships without ALSA, so the build script panics with:
+#
+#   The system library `alsa` required by crate `alsa-sys`
+#   was not found. ... HINT: you may need to install a package
+#   such as alsa, alsa-dev or alsa-devel.
+#
+# `pre-build` runs inside the container before each cargo build,
+# adding the arm64 architecture and apt-installing the matching
+# `libasound2-dev:arm64` package. The host package brings the
+# `.pc` file pkg-config needs, the `:arm64` variant brings the
+# arm64 sysroot headers + lib stubs the cross compiler links
+# against.
+#
+# Cheap to keep around even when wlift_audio isn't being built —
+# `pre-build` only runs for the configured target.
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update && apt-get install --assume-yes pkg-config libasound2-dev libasound2-dev:arm64",
+]

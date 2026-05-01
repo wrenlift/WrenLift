@@ -1639,10 +1639,14 @@ fn merge_path_dependencies(
 /// This is host-platform-only for now: the resolver picks the current
 /// platform's entry and bundles that one. Cross-platform packaging
 /// (multi-platform sections side-by-side) is a follow-up.
-#[cfg(feature = "host")]
 /// Separator between a native-lib name and its platform tag in
 /// section names: `wlift_sqlite__macos-arm64`. Two underscores so a
 /// well-formed library name (Rust crate convention) doesn't collide.
+///
+/// Unconditional — wasm builds don't load native dylibs, but
+/// `pack_bundled_native_libs` is on the bundle path that wasm
+/// publishes still exercise (just to no-op the native-lib stage),
+/// so the const has to compile in every cfg.
 pub const NATIVE_LIB_PLATFORM_SEP: &str = "__";
 
 fn pack_bundled_native_libs(
