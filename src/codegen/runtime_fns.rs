@@ -2737,11 +2737,20 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     // Revalidate `jit_ptr` against the live `engine.jit_code` slot
     // before the transmute — a tier-up since this IC was installed
     // may have freed / relocated the code blob, and reading the
-    // stale pointer PAC-faults on arm64. On a miss we clear the IC
-    // and fall back to `Value::null()` so the caller's slow path
-    // repopulates on the next call. Same shape kind=6 already does
-    // (see `dispatch_call_rooted`).
+    // stale pointer PAC-faults on arm64.
+    //
+    // On a refresh hit (live exists but moved), update the IC's
+    // pointer in-place and call the new address — the IC's other
+    // fields (class, func_id, kind) are still valid because it's
+    // the same function, just relocated. Returning `Value::null()`
+    // here would be incorrect: the JIT'd caller has no way to tell
+    // a sentinel "miss" from a real null return, so it'd treat the
+    // sentinel as the call's result. That's the
+    // `Object does not implement 'split(_)'` flake we hit during
+    // navigation: a route handler called `path.split("/")`, the IC
+    // was stale, and the bogus `null` propagated as the receiver.
     if ic.kind == 1 {
+        let mut call_ptr = jit_ptr;
         if let Some(vm) = unsafe { vm_ref() } {
             let live = vm
                 .engine
@@ -2749,14 +2758,23 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
                 .get(ic.func_id as usize)
                 .copied()
                 .unwrap_or(std::ptr::null());
-            if live != jit_ptr {
+            if live.is_null() {
+                // Function genuinely lost its JIT code — sticky in
+                // tiered mode so this only fires under aggressive
+                // eviction or interpreter-mode runs. Clear the IC
+                // and fall back to dispatch_call so the next visit
+                // through the JIT IC stub goes via the slow path.
                 unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
                 return Value::null().to_bits();
+            }
+            if live != jit_ptr {
+                unsafe { (*ic_ptr).jit_ptr = live };
+                call_ptr = live;
             }
         }
         let args_val: smallvec::SmallVec<[Value; 5]> =
             args.iter().map(|&a| Value::from_bits(a)).collect();
-        return unsafe { call_jit_with_shadow_raw(jit_ptr, &args_val) };
+        return unsafe { call_jit_with_shadow_raw(call_ptr, &args_val) };
     }
     // Save and set context for the callee.
     let saved_ctx = read_jit_ctx();
