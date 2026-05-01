@@ -105,8 +105,9 @@ For runtime env-var traces (tier-up tracing, OSR tracing, Cranelift IR dumps, ki
 - [**Verification & debugging**](docs/verification.md) — how the runtime is tested for correctness across the compiler and GC.
 - [**Benchmarks**](https://wrenlift.com/benchmark/) — head-to-head numbers, refreshed on every commit.
 
-## Appreciation
-Special appreciation to Robert Nystrom and the Wren contributors for creating such a cozy scripting language. This project does not take away the hard work and care that the Wren contributors have poured into the standard [wren](wren.io) runtime project. 
+## Acknowledgement
+
+Wren — its syntax, semantics, and the taste behind every design choice — is the work of Robert Nystrom and the Wren contributors. The [reference runtime at wren.io](https://wren.io) is the canonical implementation: small, embeddable, and a model of how much you can do with how little. WrenLift is a complementary runtime, not a replacement; it explores what the same language looks like with a JIT pipeline and a first-class WebAssembly target. Everything that makes Wren a pleasure to write — the classes, the fibers, the lean standard library — is downstream of their work, and the gratitude is sincere.
 
 ## License
 
