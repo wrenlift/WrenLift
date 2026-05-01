@@ -1,15 +1,24 @@
-//! SQLite plugin for WrenLift. Built as a `cdylib`; the resulting
-//! `libwlift_sqlite.dylib` (or `.so` / `.dll`) is bundled into
-//! `@hatch:sqlite` as a `NativeLib` section. At install time the
-//! runtime extracts the dylib to a temp dir, `dlopen`s it, and
-//! binds each `foreign` method on `SqliteCore` to the matching
-//! symbol below.
+//! SQLite plugin for WrenLift. Built as a `cdylib` for native
+//! hosts (the runtime `dlopen`s it from `@hatch:sqlite`'s
+//! `NativeLib` section) and as an `rlib` for the wasm static-link
+//! path (linked into `wlift_wasm` so the browser playground can
+//! `import "@hatch:sqlite"` without a separate `.wasm` artifact).
 //!
-//! The plugin uses `wren_lift` as a path dependency, so Wren's
-//! `Value` and `VM` types are ABI-identical between the main
-//! binary and this dylib. Global state is the SQLite connection
-//! registry — private to this dylib and fine that way (no
-//! sharing across platform boundaries).
+//! Two backends sit behind a thin module-level switch:
+//!
+//!   * Native: [`backend_native`] uses `rusqlite` with bundled
+//!     libsqlite3. `Connection::open_with_flags`, prepared
+//!     statements, the `Statement::raw_*` family.
+//!
+//!   * Wasm: [`backend_wasm`] uses `sqlite-wasm-rs` — the official
+//!     SQLite-Wasm C build wrapped as `wasm32-unknown-unknown`
+//!     bindings. Drives `sqlite3_prepare_v2` / `sqlite3_step` /
+//!     `sqlite3_finalize` directly. Memory VFS only (the playground
+//!     doesn't need OPFS persistence yet).
+//!
+//! Both backends register the same `(connection_id, sql, params)`
+//! shape against the foreign-method registry, so the Wren-side
+//! `SqliteCore` class is target-independent.
 //!
 //! # Safety
 //!
@@ -21,15 +30,19 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-
-use rusqlite::{types::Value as SqlValue, types::ValueRef, Connection, OpenFlags};
-
 use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod backend_native;
+#[cfg(not(target_arch = "wasm32"))]
+use backend_native as backend;
+
+#[cfg(target_arch = "wasm32")]
+mod backend_wasm;
+#[cfg(target_arch = "wasm32")]
+use backend_wasm as backend;
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
 #[no_mangle]
@@ -37,16 +50,24 @@ pub extern "C" fn wlift_plugin_abi_version() -> u32 {
     wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
 }
 
-// --- Registry --------------------------------------------------
+// --- Backend-independent value model ---------------------------
 
-fn registry() -> &'static Mutex<HashMap<u64, Connection>> {
-    static REG: OnceLock<Mutex<HashMap<u64, Connection>>> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+/// Tagged-union mirror of the five SQLite storage classes. Owned
+/// strings / blobs so the backend's row buffers can be dropped
+/// before we walk the result back into Wren values.
+#[derive(Clone)]
+pub(crate) enum SqlValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
 }
 
-fn next_id() -> u64 {
-    static N: AtomicU64 = AtomicU64::new(1);
-    N.fetch_add(1, Ordering::SeqCst)
+pub(crate) enum Params {
+    None,
+    Positional(Vec<SqlValue>),
+    Named(Vec<(String, SqlValue)>),
 }
 
 // --- Slot helpers ----------------------------------------------
@@ -153,26 +174,17 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
     }
 }
 
-fn sql_to_wren(ctx: &mut dyn NativeContext, v: ValueRef<'_>) -> Value {
+fn sql_to_wren(ctx: &mut dyn NativeContext, v: SqlValue) -> Value {
     match v {
-        ValueRef::Null => Value::null(),
-        ValueRef::Integer(i) => Value::num(i as f64),
-        ValueRef::Real(f) => Value::num(f),
-        ValueRef::Text(bytes) => {
-            let s = String::from_utf8_lossy(bytes).into_owned();
-            ctx.alloc_string(s)
-        }
-        ValueRef::Blob(bytes) => {
-            let elements: Vec<Value> = bytes.iter().map(|&b| Value::num(b as f64)).collect();
-            ctx.alloc_list(elements)
+        SqlValue::Null => Value::null(),
+        SqlValue::Integer(i) => Value::num(i as f64),
+        SqlValue::Real(f) => Value::num(f),
+        SqlValue::Text(s) => ctx.alloc_string(s),
+        SqlValue::Blob(b) => {
+            let elems: Vec<Value> = b.iter().map(|&x| Value::num(x as f64)).collect();
+            ctx.alloc_list(elems)
         }
     }
-}
-
-enum Params {
-    None,
-    Positional(Vec<SqlValue>),
-    Named(Vec<(String, SqlValue)>),
 }
 
 fn collect_params(v: Value, label: &str) -> Result<Params, String> {
@@ -220,30 +232,11 @@ fn collect_params(v: Value, label: &str) -> Result<Params, String> {
     }
 }
 
-fn bind_params(stmt: &mut rusqlite::Statement<'_>, params: &Params) -> rusqlite::Result<()> {
-    match params {
-        Params::None => Ok(()),
-        Params::Positional(vals) => {
-            for (i, v) in vals.iter().enumerate() {
-                stmt.raw_bind_parameter(i + 1, v)?;
-            }
-            Ok(())
-        }
-        Params::Named(vals) => {
-            for (name, v) in vals {
-                match stmt.parameter_index(name)? {
-                    Some(idx) => stmt.raw_bind_parameter(idx, v)?,
-                    None => {
-                        return Err(rusqlite::Error::InvalidParameterName(name.clone()));
-                    }
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
 // --- Foreign C entry points ------------------------------------
+//
+// The runtime resolves these by name. Each one routes through the
+// `backend` alias above, so the same Wren-side `SqliteCore` class
+// works on host and wasm.
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wlift_sqlite_open(vm: *mut VM) {
@@ -257,20 +250,8 @@ pub unsafe extern "C" fn wlift_sqlite_open(vm: *mut VM) {
                 return;
             }
         };
-        let conn = if path == ":memory:" {
-            Connection::open_in_memory()
-        } else {
-            Connection::open_with_flags(
-                &path,
-                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-            )
-        };
-        match conn {
-            Ok(c) => {
-                let id = next_id();
-                registry().lock().unwrap().insert(id, c);
-                set_return(vm, Value::num(id as f64));
-            }
+        match backend::open(&path) {
+            Ok(id) => set_return(vm, Value::num(id as f64)),
             Err(e) => {
                 ctx(vm).runtime_error(format!("Sqlite.open: {}", e));
                 set_return(vm, Value::null());
@@ -287,7 +268,7 @@ pub unsafe extern "C" fn wlift_sqlite_close(vm: *mut VM) {
             set_return(vm, Value::null());
             return;
         };
-        registry().lock().unwrap().remove(&id);
+        backend::close(id);
         set_return(vm, Value::null());
     }
 }
@@ -318,26 +299,7 @@ pub unsafe extern "C" fn wlift_sqlite_execute(vm: *mut VM) {
                 return;
             }
         };
-        let mut reg = registry().lock().unwrap();
-        let Some(conn) = reg.get_mut(&id) else {
-            ctx(vm).runtime_error(format!("Sqlite.execute: unknown connection id {}.", id));
-            set_return(vm, Value::null());
-            return;
-        };
-        let mut stmt = match conn.prepare_cached(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Sqlite.execute: prepare: {}", e));
-                set_return(vm, Value::null());
-                return;
-            }
-        };
-        if let Err(e) = bind_params(&mut stmt, &params) {
-            ctx(vm).runtime_error(format!("Sqlite.execute: bind: {}", e));
-            set_return(vm, Value::null());
-            return;
-        }
-        match stmt.raw_execute() {
+        match backend::execute(id, &sql, &params) {
             Ok(rows) => set_return(vm, Value::num(rows as f64)),
             Err(e) => {
                 ctx(vm).runtime_error(format!("Sqlite.execute: {}", e));
@@ -374,51 +336,13 @@ pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
             }
         };
 
-        // Build up the row list by collecting rows into a Vec of
-        // (col_names, values) pairs FIRST, then walk it to alloc
-        // into Wren objects. This avoids holding the connection
-        // mutex while calling alloc_string / alloc_map, which
-        // might trigger a GC that reaches into wren_lift state.
-        let rows_result: Result<(Vec<String>, Vec<Vec<SqlValue>>), String> = (|| {
-            let mut reg = registry().lock().unwrap();
-            let conn = reg
-                .get_mut(&id)
-                .ok_or_else(|| format!("Sqlite.query: unknown connection id {}.", id))?;
-            let mut stmt = conn
-                .prepare_cached(&sql)
-                .map_err(|e| format!("Sqlite.query: prepare: {}", e))?;
-            bind_params(&mut stmt, &params).map_err(|e| format!("Sqlite.query: bind: {}", e))?;
-            let col_count = stmt.column_count();
-            let col_names: Vec<String> = (0..col_count)
-                .map(|i| stmt.column_name(i).unwrap_or("").to_string())
-                .collect();
-            let mut rows_out: Vec<Vec<SqlValue>> = Vec::new();
-            let mut rows = stmt.raw_query();
-            while let Some(row) = rows.next().map_err(|e| format!("Sqlite.query: {}", e))? {
-                let mut row_vals = Vec::with_capacity(col_count);
-                for i in 0..col_count {
-                    let vref = row.get_ref(i).map_err(|e| format!("Sqlite.query: {}", e))?;
-                    // Clone out of the borrow so we can drop the row.
-                    let v: SqlValue = match vref {
-                        ValueRef::Null => SqlValue::Null,
-                        ValueRef::Integer(i) => SqlValue::Integer(i),
-                        ValueRef::Real(f) => SqlValue::Real(f),
-                        ValueRef::Text(b) => {
-                            SqlValue::Text(String::from_utf8_lossy(b).into_owned())
-                        }
-                        ValueRef::Blob(b) => SqlValue::Blob(b.to_vec()),
-                    };
-                    row_vals.push(v);
-                }
-                rows_out.push(row_vals);
-            }
-            Ok((col_names, rows_out))
-        })();
-
-        let (col_names, rows) = match rows_result {
+        // Materialize rows BEFORE alloc_string / alloc_map so a
+        // GC inside the allocator can't reach into a borrowed
+        // backend statement.
+        let (col_names, rows) = match backend::query(id, &sql, &params) {
             Ok(r) => r,
             Err(e) => {
-                ctx(vm).runtime_error(e);
+                ctx(vm).runtime_error(format!("Sqlite.query: {}", e));
                 set_return(vm, Value::null());
                 return;
             }
@@ -431,19 +355,7 @@ pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
             let map_ptr = map.as_object().unwrap() as *mut ObjMap;
             for (i, val) in row_vals.into_iter().enumerate() {
                 let key = context.alloc_string(col_names[i].clone());
-                // `sql_to_wren` wants a ValueRef, but we've already
-                // cloned into owned SqlValue — inline the conversion.
-                let wv = match val {
-                    SqlValue::Null => Value::null(),
-                    SqlValue::Integer(i) => Value::num(i as f64),
-                    SqlValue::Real(f) => Value::num(f),
-                    SqlValue::Text(s) => context.alloc_string(s),
-                    SqlValue::Blob(b) => {
-                        let elems: Vec<Value> = b.iter().map(|&x| Value::num(x as f64)).collect();
-                        context.alloc_list(elems)
-                    }
-                };
-                let _ = sql_to_wren; // keep import live for future helpers
+                let wv = sql_to_wren(context, val);
                 (*map_ptr).set(key, wv);
             }
             out_values.push(map);
@@ -461,16 +373,16 @@ pub unsafe extern "C" fn wlift_sqlite_last_insert_rowid(vm: *mut VM) {
             set_return(vm, Value::null());
             return;
         };
-        let reg = registry().lock().unwrap();
-        let Some(conn) = reg.get(&id) else {
-            ctx(vm).runtime_error(format!(
-                "Sqlite.lastInsertRowid: unknown connection id {}.",
-                id
-            ));
-            set_return(vm, Value::null());
-            return;
-        };
-        set_return(vm, Value::num(conn.last_insert_rowid() as f64));
+        match backend::last_insert_rowid(id) {
+            Some(n) => set_return(vm, Value::num(n as f64)),
+            None => {
+                ctx(vm).runtime_error(format!(
+                    "Sqlite.lastInsertRowid: unknown connection id {}.",
+                    id
+                ));
+                set_return(vm, Value::null());
+            }
+        }
     }
 }
 
@@ -482,13 +394,13 @@ pub unsafe extern "C" fn wlift_sqlite_changes(vm: *mut VM) {
             set_return(vm, Value::null());
             return;
         };
-        let reg = registry().lock().unwrap();
-        let Some(conn) = reg.get(&id) else {
-            ctx(vm).runtime_error(format!("Sqlite.changes: unknown connection id {}.", id));
-            set_return(vm, Value::null());
-            return;
-        };
-        set_return(vm, Value::num(conn.changes() as f64));
+        match backend::changes(id) {
+            Some(n) => set_return(vm, Value::num(n as f64)),
+            None => {
+                ctx(vm).runtime_error(format!("Sqlite.changes: unknown connection id {}.", id));
+                set_return(vm, Value::null());
+            }
+        }
     }
 }
 
@@ -500,15 +412,36 @@ pub unsafe extern "C" fn wlift_sqlite_in_transaction(vm: *mut VM) {
             set_return(vm, Value::null());
             return;
         };
-        let reg = registry().lock().unwrap();
-        let Some(conn) = reg.get(&id) else {
-            ctx(vm).runtime_error(format!(
-                "Sqlite.inTransaction: unknown connection id {}.",
-                id
-            ));
-            set_return(vm, Value::null());
-            return;
-        };
-        set_return(vm, Value::bool(!conn.is_autocommit()));
+        match backend::in_transaction(id) {
+            Some(b) => set_return(vm, Value::bool(b)),
+            None => {
+                ctx(vm).runtime_error(format!(
+                    "Sqlite.inTransaction: unknown connection id {}.",
+                    id
+                ));
+                set_return(vm, Value::null());
+            }
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Static-link symbol registry (wasm only)
+//
+// On `wasm32-*`, plugins ship as Rust crates statically linked into
+// `wlift_wasm` rather than as separate `.wasm` cdylibs — the wasm
+// runtime has no `dlsym`, so foreign-method exports register
+// themselves into a static table at host-init.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "wasm32")]
+pub fn register_static_symbols() {
+    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_open",              wlift_sqlite_open);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_close",             wlift_sqlite_close);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_execute",           wlift_sqlite_execute);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_query",             wlift_sqlite_query);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_last_insert_rowid", wlift_sqlite_last_insert_rowid);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_changes",           wlift_sqlite_changes);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_in_transaction",    wlift_sqlite_in_transaction);
 }

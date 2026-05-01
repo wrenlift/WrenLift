@@ -738,6 +738,7 @@ pub fn _wasm_init() {
 pub fn register_static_plugins() {
     wlift_image::register_static_symbols();
     wlift_physics::register_static_symbols();
+    wlift_sqlite::register_static_symbols();
     browser::register_static_symbols();
     dom::register_static_symbols();
     storage::register_static_symbols();

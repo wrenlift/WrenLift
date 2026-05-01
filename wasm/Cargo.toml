@@ -35,6 +35,7 @@ toml = "0.8"
 # `libs/` directory.
 wlift_image   = { path = "../plugins/wlift_image",   default-features = false }
 wlift_physics = { path = "../plugins/wlift_physics", default-features = false }
+wlift_sqlite  = { path = "../plugins/wlift_sqlite",  default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browser-side panic visibility: any unhandled panic surfaces as a
