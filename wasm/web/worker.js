@@ -129,6 +129,9 @@ globalThis._wlift_dom_text = (handle, selector) => {
 globalThis._wlift_dom_set_text = (handle, selector, value) => {
   self.postMessage({ cmd: "dom-op", handle, op: "setText", args: [selector, value] });
 };
+globalThis._wlift_dom_set_html = (handle, selector, value) => {
+  self.postMessage({ cmd: "dom-op", handle, op: "setHTML", args: [selector, value] });
+};
 globalThis._wlift_dom_get_attribute = (handle, selector, name) => {
   self.postMessage({ cmd: "dom-op", handle, op: "getAttribute", args: [selector, name] });
 };

@@ -164,6 +164,12 @@ pub mod js {
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_set_text)]
         pub fn wlift_dom_set_text(handle: u32, selector: &str, value: &str);
 
+        /// Bridge mate for `Dom.setHTML`. Same shape as
+        /// `_wlift_dom_set_text`; the matching `dispatchDomOp`
+        /// case writes `el.innerHTML` instead of `el.textContent`.
+        #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_set_html)]
+        pub fn wlift_dom_set_html(handle: u32, selector: &str, value: &str);
+
         #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_dom_get_attribute)]
         pub fn wlift_dom_get_attribute(handle: u32, selector: &str, name: &str);
 
@@ -1615,6 +1621,8 @@ foreign class DomCore {
     foreign static textHandle(selector)
     #!symbol = "dom_set_text"
     foreign static setTextHandle(selector, value)
+    #!symbol = "dom_set_html"
+    foreign static setHTMLHandle(selector, value)
     #!symbol = "dom_get_attribute"
     foreign static getAttributeHandle(selector, name)
     #!symbol = "dom_set_attribute"
@@ -1700,6 +1708,7 @@ class Browser {
 class Dom {
     static text(selector)                  { Future.new_(DomCore.textHandle(selector)) }
     static setText(selector, value)        { Future.new_(DomCore.setTextHandle(selector, value)) }
+    static setHTML(selector, value)        { Future.new_(DomCore.setHTMLHandle(selector, value)) }
     static getAttribute(selector, name)    { Future.new_(DomCore.getAttributeHandle(selector, name)) }
     static setAttribute(selector, n, v)    { Future.new_(DomCore.setAttributeHandle(selector, n, v)) }
     static addClass(selector, name)        { Future.new_(DomCore.addClassHandle(selector, name)) }

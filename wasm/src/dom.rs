@@ -136,6 +136,38 @@ pub unsafe extern "C" fn dom_set_text(vm: *mut VM) {
     }
 }
 
+/// `Dom.setHTML(selector, value)` — assigns `innerHTML` on the
+/// first matching element. The host writes the string verbatim;
+/// the page already trusts the Wren source it's running, so
+/// callers are responsible for escaping any untrusted text they
+/// splice into the markup.
+///
+/// # Safety
+///
+/// Reads `selector`, `value` (Strings); writes the future handle.
+pub unsafe extern "C" fn dom_set_html(vm: *mut VM) {
+    unsafe {
+        let vm_ref = &mut *vm;
+        let Some(selector) = read_string_slot(vm_ref, 1, "Dom.setHTML", "selector") else {
+            return;
+        };
+        let Some(value) = read_string_slot(vm_ref, 2, "Dom.setHTML", "value") else {
+            return;
+        };
+        let handle = create_pending_future();
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            crate::js::wlift_dom_set_html(handle, &selector, &value);
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let _ = value;
+            resolve_future(handle, format!("MOCK_DOM_SET_HTML:{}", selector));
+        }
+        write_handle(vm_ref, handle);
+    }
+}
+
 /// `Dom.getAttribute(selector, name)` — reads an attribute on
 /// the first matching element. Resolves to `""` for missing.
 ///
@@ -296,6 +328,7 @@ pub fn register_static_symbols() {
         use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
         register_plugin_symbol_unsafe("dom", "dom_text", dom_text);
         register_plugin_symbol_unsafe("dom", "dom_set_text", dom_set_text);
+        register_plugin_symbol_unsafe("dom", "dom_set_html", dom_set_html);
         register_plugin_symbol_unsafe("dom", "dom_get_attribute", dom_get_attribute);
         register_plugin_symbol_unsafe("dom", "dom_set_attribute", dom_set_attribute);
         register_plugin_symbol_unsafe("dom", "dom_add_class", dom_add_class);

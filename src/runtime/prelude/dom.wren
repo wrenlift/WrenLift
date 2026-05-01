@@ -15,6 +15,18 @@ class Dom {
   /// new value (the host echoes back so failures are visible).
   static setText(selector, value) {}
 
+  /// Replace the inner HTML of the first match. Use for
+  /// programmatically building markup from Wren — tables,
+  /// lists, formatted output. The host writes the string
+  /// verbatim; the page already trusts the Wren source it's
+  /// running, so callers are responsible for escaping any
+  /// untrusted text they splice into the markup.
+  ///
+  /// ```wren
+  /// Dom.setHTML("#out", "<ul><li>one</li><li>two</li></ul>").await
+  /// ```
+  static setHTML(selector, value) {}
+
   /// Read an attribute. Resolves to the string value or null
   /// when the attribute is unset.
   static getAttribute(selector, name) {}

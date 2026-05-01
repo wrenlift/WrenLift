@@ -848,6 +848,7 @@ class MainWlift {
     };
     globalThis._wlift_dom_text          = (h, s)        => settleSync(h, "text", [s]);
     globalThis._wlift_dom_set_text      = (h, s, v)     => settleSync(h, "setText", [s, v]);
+    globalThis._wlift_dom_set_html      = (h, s, v)     => settleSync(h, "setHTML", [s, v]);
     globalThis._wlift_dom_get_attribute = (h, s, n)     => settleSync(h, "getAttribute", [s, n]);
     globalThis._wlift_dom_set_attribute = (h, s, n, v)  => settleSync(h, "setAttribute", [s, n, v]);
     globalThis._wlift_dom_add_class     = (h, s, n)     => settleSync(h, "addClass", [s, n]);
@@ -1501,6 +1502,12 @@ function dispatchDomOp(op, args) {
       const [selector, value] = args;
       const el = document.querySelector(selector);
       if (el) el.textContent = value;
+      return "";
+    }
+    case "setHTML": {
+      const [selector, value] = args;
+      const el = document.querySelector(selector);
+      if (el) el.innerHTML = value;
       return "";
     }
     case "getAttribute": {
