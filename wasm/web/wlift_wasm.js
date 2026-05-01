@@ -931,6 +931,9 @@ function __wbg_get_imports() {
         __wbg__wlift_dom_set_attribute_f37999638ed06f7e: function(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
             globalThis._wlift_dom_set_attribute(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4), getStringFromWasm0(arg5, arg6));
         },
+        __wbg__wlift_dom_set_html_543ab22a3e323b26: function(arg0, arg1, arg2, arg3, arg4) {
+            globalThis._wlift_dom_set_html(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
+        },
         __wbg__wlift_dom_set_text_a659bbf8d9719299: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_dom_set_text(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
@@ -1250,7 +1253,7 @@ function __wbg_get_imports() {
             globalThis.wliftDynamicPluginDispatch(arg0 >>> 0, arg1 >>> 0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 117, function: Function { arguments: [Externref], shim_idx: 118, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 118, function: Function { arguments: [Externref], shim_idx: 119, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_20bf61ce484b8279___closure__destroy___dyn_core_2b72ad5d24e5930c___ops__function__FnMut__wasm_bindgen_20bf61ce484b8279___JsValue____Output___core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___, wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_);
             return ret;
         },
