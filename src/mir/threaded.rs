@@ -362,17 +362,76 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
     let ic_idx = op.c as usize;
     let argc = (op.extra & 0xFF) as usize;
 
-    // IC fast path
+    // IC fast path — kind=1 (inline JIT-leaf direct dispatch).
+    //
+    // Revalidate `ic.jit_ptr` against the live `engine.jit_code` before
+    // transmuting: a tier-up since this IC was installed may have
+    // freed / relocated the code blob, and reading the stale pointer
+    // PAC-faults on arm64 (`KERN_INVALID_ADDRESS at 0x57…` in the
+    // wild). On a stale read, clear the IC and fall to the slow path
+    // — the next call repopulates with the new pointer. Same fix the
+    // kind=6 path does inline (see `dispatch_call_rooted`).
     let ic_table = unsafe { &*state.ic_table };
     if ic_idx < ic_table.len() {
-        let ic = &ic_table[ic_idx];
-        if ic.kind == 1 && recv.is_object() {
+        // Read the IC fields locally; any mutation is delayed until
+        // we've decided it's stale, at which point we re-acquire the
+        // slot as `&mut` and overwrite. Avoids holding `&` and `&mut`
+        // to the same slot at once.
+        let (ic_kind, ic_class, ic_func_id, ic_jit_ptr) = {
+            let ic = &ic_table[ic_idx];
+            (ic.kind, ic.class, ic.func_id, ic.jit_ptr)
+        };
+        if ic_kind == 1
+            && recv.is_object()
+            && crate::codegen::runtime_fns::ic_jit_kind1_enabled()
+        {
             let obj_ptr = unsafe { recv.as_object().unwrap_unchecked() };
             let recv_class =
                 unsafe { (*(obj_ptr as *const crate::runtime::object::ObjHeader)).class as usize };
-            if recv_class == ic.class {
-                let jit_ptr = ic.jit_ptr;
-                if !jit_ptr.is_null() {
+            if recv_class == ic_class {
+                // Two safety checks:
+                //
+                //   1. `jit_leaf` — only call into JIT code that the
+                //      module-level alloc-free pass proved can't fire
+                //      a GC. The threaded fast path passes recv + args
+                //      by raw u64 bits, with no JIT roots; a GC inside
+                //      a non-leaf callee would relocate live heap
+                //      objects and the stale arg pointers would tear.
+                //   2. `live_ptr` revalidation — the IC's `jit_ptr` was
+                //      captured when we last installed; a tier-up
+                //      since then may have freed / relocated the
+                //      code blob and reading the stale pointer
+                //      PAC-faults on arm64.
+                //
+                // Both bail to the slow path on a miss (which
+                // repopulates the IC with the current jit_code on the
+                // next call). Same shape kind=6's `dispatch_call_rooted`
+                // already does inline.
+                let (is_leaf, live_ptr) = if !state.vm.is_null() {
+                    let vm = unsafe { &*(state.vm as *const crate::runtime::vm::VM) };
+                    let leaf = vm
+                        .engine
+                        .jit_leaf
+                        .get(ic_func_id as usize)
+                        .copied()
+                        .unwrap_or(false);
+                    let live = vm
+                        .engine
+                        .jit_code
+                        .get(ic_func_id as usize)
+                        .copied()
+                        .unwrap_or(std::ptr::null());
+                    (leaf, live)
+                } else {
+                    (false, ic_jit_ptr)
+                };
+                let jit_ptr = ic_jit_ptr;
+                if !is_leaf || jit_ptr.is_null() || live_ptr != jit_ptr {
+                    // Stale or unsafe-without-roots: drop the IC and
+                    // let the slow path redecide on the next call.
+                    let ic_mut = unsafe { &mut (&mut *state.ic_table)[ic_idx] };
+                    *ic_mut = crate::mir::bytecode::CallSiteIC::default();
+                } else {
                     // Direct JIT call — no bytecode decode overhead
                     let recv_bits = recv.to_bits();
                     let result = unsafe {

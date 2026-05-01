@@ -1656,7 +1656,26 @@ impl VM {
                     .as_ref()
                     .and_then(|fn_| fn_(import_source, module_name))
                     .unwrap_or_else(|| import_source.clone());
-                if let Some(value) = self.find_imported_var_from(name, &canonical) {
+                let mut resolved = self.find_imported_var_from(name, &canonical);
+                // Bundle-installed modules register under bare names
+                // built from on-disk relative paths (`css`, `forms`,
+                // `lib.catalog`) but their importers' `var_sources`
+                // record the source-as-written form (`./css`,
+                // `./lib/catalog`). When no `resolve_module_fn`
+                // canonicalises this — the case for `hatch run` of a
+                // built workspace — fall back to stripping the leading
+                // `./` / `../` segments and rewriting `/` → `.` to
+                // match `pack_bundled_native_libs`'s `relative.join(".")`.
+                if resolved.is_none() && (canonical.starts_with("./") || canonical.starts_with("../")) {
+                    let stripped = canonical
+                        .trim_start_matches("./")
+                        .trim_start_matches("../")
+                        .replace('/', ".");
+                    if !stripped.is_empty() {
+                        resolved = self.find_imported_var_from(name, &stripped);
+                    }
+                }
+                if let Some(value) = resolved {
                     module_vars.push(value);
                 } else {
                     // Source module hasn't exported this name yet (e.g.

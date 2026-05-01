@@ -1166,7 +1166,20 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
         &bytes_owned
     };
 
-    let mut vm = VM::new_default();
+    // `WLIFT_MODE=interpreter` forces the VM out of the default tiered
+    // path. Useful as a quick safety valve when a JIT regression
+    // surfaces in a `hatch run` workspace; matches `wlift --mode
+    // interpreter`. Other values (or unset) leave the tiered default.
+    let mut vm = if std::env::var("WLIFT_MODE")
+        .map(|m| m == "interpreter" || m == "interp")
+        .unwrap_or(false)
+    {
+        let mut config = wren_lift::runtime::vm::VMConfig::default();
+        config.execution_mode = wren_lift::runtime::engine::ExecutionMode::Interpreter;
+        VM::new(config)
+    } else {
+        VM::new_default()
+    };
 
     // Preload dependency hatches in CLI order. Manifest-driven
     // resolution against a registry lands in later hatch-cli work.

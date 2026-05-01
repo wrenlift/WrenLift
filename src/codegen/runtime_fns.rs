@@ -524,6 +524,7 @@ fn populate_callsite_ic(
                 }
             } else if !jit_ptr.is_null()
                 && !jit_disabled()
+                && ic_jit_kind1_enabled()
                 && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
             {
                 crate::mir::bytecode::CallSiteIC {
@@ -641,7 +642,10 @@ fn maybe_upgrade_closure_ic_to_leaf(
             .unwrap_or(std::ptr::null());
     }
 
-    if jit_ptr.is_null() || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false) {
+    if jit_ptr.is_null()
+        || !ic_jit_kind1_enabled()
+        || !vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false)
+    {
         return false;
     }
 
@@ -1019,6 +1023,18 @@ pub fn set_jit_depth(depth: u32) {
 #[inline(always)]
 pub fn jit_disabled() -> bool {
     JIT_DISABLED.with(|d| d.get())
+}
+
+/// Whether the IC kind=1 inline-JIT fast path is enabled. Default ON.
+///
+/// `WLIFT_DISABLE_IC_JIT=1` turns it off — useful when chasing a
+/// PAC-fault / stale-arg miscompile (the kind=1 path transmutes
+/// `jit_ptr` back into a function pointer; without JIT stack maps
+/// register-passed args can be stale across GC).
+#[inline(always)]
+pub fn ic_jit_kind1_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WLIFT_DISABLE_IC_JIT").is_none())
 }
 
 #[inline(always)]
