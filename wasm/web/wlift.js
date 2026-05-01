@@ -67,6 +67,19 @@ export async function createWlift(opts = {}) {
   throw new Error(`createWlift: unknown mode '${mode}', expected 'worker' or 'main'`);
 }
 
+// DOM `MouseEvent.button` is a numeric index (0/1/2 → left/middle/
+// right). The native `wlift_window` plugin emits the winit string
+// names ("left" / "middle" / "right"), which is what `@hatch:game`
+// example code tests against (`g.input.mouseJustPressed("left")`).
+// Normalize to the same shape so a single Wren example runs on
+// both targets without a target-aware branch.
+function mouseButtonName(n) {
+  if (n === 0) return "left";
+  if (n === 1) return "middle";
+  if (n === 2) return "right";
+  return n; // pass anything else through verbatim
+}
+
 // Returns true iff SAB is available *and* the page is
 // crossOriginIsolated (i.e. served with COOP/COEP). The wasm
 // module still needs to be built with threading for the wasm
@@ -731,8 +744,8 @@ class WorkerWlift {
       if (!el) continue;
       const send = (event) =>
         this.worker.postMessage({ cmd: "dom-event", canvasId: id, event });
-      const onMouseDown = (e) => send({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
-      const onMouseUp   = (e) => send({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
+      const onMouseDown = (e) => send({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: mouseButtonName(e.button) });
+      const onMouseUp   = (e) => send({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: mouseButtonName(e.button) });
       const onMouseMove = (e) => send({ type: "mouseMoved", x: e.offsetX, y: e.offsetY });
       const onKeyDown   = (e) => send({ type: "keyDown", code: e.code, key: e.key });
       const onKeyUp     = (e) => send({ type: "keyUp",   code: e.code, key: e.key });
@@ -1025,8 +1038,8 @@ class MainWlift {
           // reads — `code` is `KeyboardEvent.code` (physical key,
           // matches `g.input.isDown("KeyA")`), and the move event
           // is `mouseMoved` (winit's name) not the DOM `mousemove`.
-          const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
-          const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
+          const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: mouseButtonName(e.button) });
+          const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: mouseButtonName(e.button) });
           const onMouseMove = (e) => queue.push({ type: "mouseMoved", x: e.offsetX, y: e.offsetY });
           const onKeyDown   = (e) => queue.push({ type: "keyDown", code: e.code, key: e.key });
           const onKeyUp     = (e) => queue.push({ type: "keyUp",   code: e.code, key: e.key });
@@ -1071,8 +1084,8 @@ class MainWlift {
           // reads — `code` is `KeyboardEvent.code` (physical key,
           // matches `g.input.isDown("KeyA")`), and the move event
           // is `mouseMoved` (winit's name) not the DOM `mousemove`.
-          const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: e.button });
-          const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: e.button });
+          const onMouseDown = (e) => queue.push({ type: "mouseDown", x: e.offsetX, y: e.offsetY, button: mouseButtonName(e.button) });
+          const onMouseUp   = (e) => queue.push({ type: "mouseUp",   x: e.offsetX, y: e.offsetY, button: mouseButtonName(e.button) });
           const onMouseMove = (e) => queue.push({ type: "mouseMoved", x: e.offsetX, y: e.offsetY });
           const onKeyDown   = (e) => queue.push({ type: "keyDown", code: e.code, key: e.key });
           const onKeyUp     = (e) => queue.push({ type: "keyUp",   code: e.code, key: e.key });
