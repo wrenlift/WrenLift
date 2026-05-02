@@ -235,15 +235,27 @@ pub fn load_library(
     }
 
     let candidates = library_candidates(name);
+    // Capture the most recent dlopen error so the LibraryNotFound
+    // surface includes the OS reason rather than just a list of
+    // paths. Silently swallowing the libloading::Error here is
+    // what made every "could not load" failure undebuggable
+    // (e.g. arch mismatch, missing transitive lib, bad signature).
+    let mut last_err: Option<String> = None;
 
     // Try each search path first (explicit locations win over ambient ones).
     for dir in search_paths {
         for cand in &candidates {
             let full = dir.join(cand);
             tried.push(full.display().to_string());
-            if let Ok(lib) = unsafe { Library::new(&full) } {
-                verify_plugin_abi(&lib, name)?;
-                return Ok(lib);
+            match unsafe { Library::new(&full) } {
+                Ok(lib) => {
+                    verify_plugin_abi(&lib, name)?;
+                    return Ok(lib);
+                }
+                Err(e) if full.exists() => {
+                    last_err = Some(format!("{}: {}", full.display(), e));
+                }
+                Err(_) => {} // file not present — not informative
             }
         }
     }
@@ -252,10 +264,18 @@ pub fn load_library(
     // paths. On unix this means the dyld / ld.so defaults.
     for cand in &candidates {
         tried.push(cand.clone());
-        if let Ok(lib) = unsafe { Library::new(cand) } {
-            verify_plugin_abi(&lib, name)?;
-            return Ok(lib);
+        match unsafe { Library::new(cand) } {
+            Ok(lib) => {
+                verify_plugin_abi(&lib, name)?;
+                return Ok(lib);
+            }
+            Err(e) => {
+                last_err = Some(format!("{}: {}", cand, e));
+            }
         }
+    }
+    if let Some(why) = last_err {
+        eprintln!("note: native lib '{}' failed to load: {}", name, why);
     }
 
     Err(ForeignLoadError::LibraryNotFound {
