@@ -85,6 +85,16 @@ pub struct PackageRecord {
     /// resolves against `git` via the host's raw-URL convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
+    /// Public URL for the package's `docs.json` artifact, hosted
+    /// on Supabase Storage. Populated by the publish flow:
+    /// `hatch publish` collects the docs JSON via
+    /// `crate::docs::collect_workspace_docs`, posts it to
+    /// `hatch-bot/docs-upload`, and the returned public URL
+    /// lands here. The site's `lib/api.wren` fetches via this
+    /// URL at request time. Nullable: legacy rows that
+    /// pre-date the upload pipeline render the empty placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
     /// Present in server responses, omitted on submission (the
     /// server sets it from the auth'd JWT).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -690,7 +700,7 @@ fn curl_get(url: &str, headers: &[&str]) -> Result<String, ServiceError> {
     run_curl(cmd)
 }
 
-fn curl_post(url: &str, headers: &[&str], body: &str) -> Result<String, ServiceError> {
+pub fn curl_post(url: &str, headers: &[&str], body: &str) -> Result<String, ServiceError> {
     let mut cmd = Command::new("curl");
     cmd.arg("-sS").arg("--fail-with-body").arg("-X").arg("POST");
     for h in headers {

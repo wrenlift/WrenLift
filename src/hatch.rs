@@ -897,24 +897,6 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
     build_from_source_tree_with_cache(root, None)
 }
 
-/// Variant that writes per-dep `Docs` JSON files into
-/// `emit_docs_dir` while the bundle is built. One file per
-/// transitively-merged dep, named `<short>.json` (e.g.
-/// `@hatch:web` → `web.json`). Used by the site Dockerfile so
-/// `hatch build` produces the bundle and the API JSON in one CLI
-/// call rather than a Docker-side install/walk dance.
-#[cfg(feature = "host")]
-pub fn build_from_source_tree_emit_docs(
-    root: &Path,
-    cache_dir: Option<&Path>,
-    emit_docs_dir: &Path,
-) -> Result<Vec<u8>, HatchError> {
-    let mut state = BuildState::default();
-    state.emit_docs_dir = Some(emit_docs_dir.to_path_buf());
-    let mut bytes = build_recursive(root, &mut state, cache_dir, None)?;
-    let _ = &mut bytes;
-    Ok(bytes)
-}
 
 /// Variant that lets callers override the registry cache directory
 /// `hatch build` consults when resolving version-pinned dependencies.
@@ -1050,12 +1032,6 @@ pub fn current_runtime_target() -> &'static str {
 struct BuildState {
     active: std::collections::HashSet<std::path::PathBuf>,
     cache: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
-    /// Optional output directory for per-dep `Docs` JSON files.
-    /// When set, `merge_path_dependencies` writes each transitively-
-    /// merged dep's docs to `<emit_docs_dir>/<short>.json` as the
-    /// build runs. The site's `lib/api.wren` reads these files at
-    /// request time, sidestepping a per-request shell-out.
-    emit_docs_dir: Option<std::path::PathBuf>,
 }
 
 /// Internal recursive variant. Distinguishes a true cycle (`a → b →
@@ -1155,27 +1131,15 @@ fn build_recursive(
         module_names.push(module_name.clone());
     }
 
-    // One Docs section per bundle. JSON-serialised list of
-    // every successfully-collected ModuleDoc; absent (or empty)
-    // when no module produced docs. Older runtimes / loaders
-    // skip unknown section kinds, so this is additive: pre-Docs
-    // hosts continue to install the bundle untouched.
-    if !module_docs.is_empty() {
-        match crate::docs::render_module_docs_json(&module_docs) {
-            Ok(json) => {
-                sections.push(Section {
-                    kind: SectionKind::Docs,
-                    name: "docs".to_string(),
-                    data: json.into_bytes(),
-                });
-            }
-            Err(_) => {
-                // Doc serialization failed — skip the section
-                // rather than failing the whole publish. Hover
-                // falls back to per-source parsing.
-            }
-        }
-    }
+    // Docs are no longer embedded in the bundle. Per-package docs
+    // JSON ships through Supabase Storage as a separate artifact —
+    // `hatch publish` collects + uploads, the catalog row's
+    // `docs_url` column points at the JSON, and the site fetches
+    // by URL at request time. The collection above still runs
+    // (callers like `hatch docs <workspace>` consume `module_docs`
+    // through `collect_workspace_docs`), but nothing rides along
+    // in the `.hatch` payload anymore.
+    let _ = &module_docs;
 
     // Manifest: `hatchfile` at project root, or synthesized.
     let mut manifest = match std::fs::read_to_string(root.join(HATCHFILE)) {
@@ -1553,40 +1517,6 @@ fn merge_path_dependencies(
             }
         };
         let dep_hatch = load(&dep_bytes)?;
-
-        // Emit this dep's `Docs` section as JSON under
-        // `<emit_docs_dir>/<short>.json` if the build was invoked
-        // with `--emit-docs-dir`. Each `.hatch` already carries
-        // its own per-package docs; we just need to extract them
-        // here, before module merging clobbers context. The file
-        // is `<short>.json` where `short` strips `@hatch:` from
-        // the dep's manifest name; non-hatch-namespaced packages
-        // use the manifest name verbatim with a slug fallback.
-        if let Some(out_dir) = state.emit_docs_dir.as_ref() {
-            if let Some(docs) = dep_hatch
-                .sections
-                .iter()
-                .find(|s| matches!(s.kind, SectionKind::Docs))
-            {
-                let manifest_name = &dep_hatch.manifest.name;
-                let short = manifest_name
-                    .strip_prefix("@hatch:")
-                    .unwrap_or(manifest_name)
-                    .replace(['/', ':', '@'], "_");
-                if !short.is_empty() {
-                    let _ = std::fs::create_dir_all(out_dir);
-                    let path = out_dir.join(format!("{}.json", short));
-                    if let Err(e) = std::fs::write(&path, &docs.data) {
-                        eprintln!(
-                            "warning: failed to write docs JSON for '{}' to {}: {}",
-                            manifest_name,
-                            path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
 
         // Prepend dep modules so they install before ours. A name
         // collision means EITHER a true collision (two unrelated

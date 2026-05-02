@@ -74,14 +74,6 @@ enum Command {
         /// Override the output path.
         #[arg(short, long, value_name = "OUT")]
         out: Option<PathBuf>,
-        /// Also extract each transitively-merged dependency's
-        /// `Docs` JSON into this directory, named `<short>.json`
-        /// (e.g. `@hatch:web` → `web.json`). Useful for static
-        /// sites that want the API docs side-by-side with the
-        /// bundle without running `hatch docs` per-package after
-        /// the build.
-        #[arg(long = "emit-docs-dir", value_name = "DIR")]
-        emit_docs_dir: Option<PathBuf>,
     },
     /// Print a hatch's manifest + section listing without running.
     Inspect {
@@ -102,14 +94,6 @@ enum Command {
         /// Optional output path; stdout when omitted.
         #[arg(short, long, value_name = "OUT")]
         out: Option<PathBuf>,
-        /// Walk every package in the live catalog (`index.toml`),
-        /// ensure each is cached, extract its `Docs` section, and
-        /// write `<short>.json` into `--out` (which must be a
-        /// directory in this mode). Same registry path
-        /// `hatch install` uses — no URL pattern duplication —
-        /// and emits in one CLI call.
-        #[arg(long = "catalog")]
-        catalog: bool,
     },
     /// Run a workspace or an already-built `.hatch`.
     ///
@@ -259,17 +243,9 @@ fn main() {
             WebCommand::Serve { dir } => cmd_dev(&dir),
             WebCommand::Generate { kind, name, dir } => cmd_web_generate(&kind, &name, &dir),
         },
-        Command::Build {
-            dir,
-            out,
-            emit_docs_dir,
-        } => cmd_build(&dir, out.as_deref(), emit_docs_dir.as_deref()),
+        Command::Build { dir, out } => cmd_build(&dir, out.as_deref()),
         Command::Inspect { path } => cmd_inspect(&path),
-        Command::Docs {
-            target,
-            out,
-            catalog,
-        } => cmd_docs(&target, out.as_deref(), catalog),
+        Command::Docs { target, out } => cmd_docs(&target, out.as_deref()),
         Command::Run { target, withs } => cmd_run(&target, &withs),
         Command::Add { name, version } => cmd_stub(&format!(
             "add {name}@{version} — resolver + registry lookups are planned; see the README roadmap"
@@ -631,7 +607,7 @@ fn default_package_name(dir: &Path) -> String {
 // build
 // ---------------------------------------------------------------------------
 
-fn cmd_build(dir: &Path, out: Option<&Path>, emit_docs_dir: Option<&Path>) {
+fn cmd_build(dir: &Path, out: Option<&Path>) {
     if !dir.is_dir() {
         eprintln!("error: '{}' is not a directory", dir.display());
         process::exit(1);
@@ -645,13 +621,7 @@ fn cmd_build(dir: &Path, out: Option<&Path>, emit_docs_dir: Option<&Path>) {
         process::exit(1);
     }
 
-    let build_result = match emit_docs_dir {
-        Some(docs_dir) => {
-            wren_lift::hatch::build_from_source_tree_emit_docs(dir, None, docs_dir)
-        }
-        None => wren_lift::hatch::build_from_source_tree(dir),
-    };
-    let bytes = match build_result {
+    let bytes = match wren_lift::hatch::build_from_source_tree(dir) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -699,10 +669,7 @@ fn cmd_build(dir: &Path, out: Option<&Path>, emit_docs_dir: Option<&Path>) {
 /// — collected via `hatch::collect_workspace_docs`) or an
 /// already-built `.hatch` (we extract the `Docs` section bytes
 /// verbatim, so the output matches whatever shipped at publish).
-fn cmd_docs(target: &Path, out: Option<&Path>, catalog: bool) {
-    if catalog {
-        return cmd_docs_catalog(out);
-    }
+fn cmd_docs(target: &Path, out: Option<&Path>) {
     let json = if target.is_dir() {
         match wren_lift::hatch::collect_workspace_docs(target) {
             Ok(s) => s,
@@ -757,180 +724,6 @@ fn cmd_docs(target: &Path, out: Option<&Path>, catalog: bool) {
     }
 }
 
-/// Catalog-walk variant of `hatch docs`: pulls the GitHub-hosted
-/// `index.toml`, picks the highest published version per package
-/// name, ensures each is cached via the same registry path
-/// `hatch install` uses, then extracts each cached bundle's
-/// `Docs` section into `<out_dir>/<short>.json`. Single CLI call
-/// — no Docker-side awk/curl/install loop.
-fn cmd_docs_catalog(out: Option<&Path>) {
-    let out_dir = match out {
-        Some(p) => p.to_path_buf(),
-        None => {
-            eprintln!("error: --catalog requires --out <DIR> for the JSON destination");
-            process::exit(1);
-        }
-    };
-    if let Err(e) = std::fs::create_dir_all(&out_dir) {
-        eprintln!("error: cannot create '{}': {}", out_dir.display(), e);
-        process::exit(1);
-    }
-
-    let registry = wren_lift::hatch_registry::registry_url();
-    let cache_dir = match wren_lift::hatch_registry::cache_root() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // Pull index.toml from the registry repo's main branch — same
-    // mirror the catalog page reads. `index_url` strips the `.git`
-    // suffix if present so the raw URL composes cleanly.
-    let index_url = format!(
-        "{}/raw/main/index.toml",
-        registry.trim_end_matches(".git").trim_end_matches('/')
-    );
-    let raw = match curl_get(&index_url) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot fetch '{}': {}", index_url, e);
-            process::exit(1);
-        }
-    };
-    let parsed: toml::Value = match toml::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: parsing index.toml: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // Pick the highest semver per name. Entries shape:
-    //   [packages."@hatch:foo-1.2.3"]
-    //   name = "@hatch:foo"
-    //   version = "1.2.3"
-    let mut latest: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    if let Some(packages) = parsed.get("packages").and_then(|v| v.as_table()) {
-        for (_key, entry) in packages {
-            let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let bump = match latest.get(name) {
-                None => true,
-                Some(existing) => semver_lt(existing, version),
-            };
-            if bump {
-                latest.insert(name.to_string(), version.to_string());
-            }
-        }
-    }
-
-    if latest.is_empty() {
-        eprintln!("error: no packages parsed from {}", index_url);
-        process::exit(1);
-    }
-
-    let mut written = 0usize;
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    for (name, version) in &latest {
-        // Same code path as `hatch install`: ensure_in_cache fetches
-        // the published `.hatch` if it isn't already on disk.
-        let bundle = match wren_lift::hatch_registry::ensure_in_cache_dir(
-            &cache_dir, &registry, name, version,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                skipped.push((name.clone(), format!("fetch: {}", e)));
-                continue;
-            }
-        };
-        let bytes = match std::fs::read(&bundle) {
-            Ok(b) => b,
-            Err(e) => {
-                skipped.push((name.clone(), format!("read: {}", e)));
-                continue;
-            }
-        };
-        let hatch = match wren_lift::hatch::load(&bytes) {
-            Ok(h) => h,
-            Err(e) => {
-                skipped.push((name.clone(), format!("load: {}", e)));
-                continue;
-            }
-        };
-        let docs_section = hatch
-            .sections
-            .iter()
-            .find(|s| matches!(s.kind, wren_lift::hatch::SectionKind::Docs));
-        let Some(s) = docs_section else {
-            skipped.push((name.clone(), "no Docs section".to_string()));
-            continue;
-        };
-        let short = name
-            .strip_prefix("@hatch:")
-            .unwrap_or(name)
-            .replace(['/', ':', '@'], "_");
-        if short.is_empty() {
-            continue;
-        }
-        let path = out_dir.join(format!("{}.json", short));
-        if let Err(e) = std::fs::write(&path, &s.data) {
-            skipped.push((name.clone(), format!("write: {}", e)));
-            continue;
-        }
-        written += 1;
-    }
-
-    println!(
-        "wrote {} JSON files to {} ({} skipped)",
-        written,
-        out_dir.display(),
-        skipped.len()
-    );
-    for (name, why) in &skipped {
-        println!("  - {}: {}", name, why);
-    }
-}
-
-/// Compare two dotted version strings as numeric tuples. Returns
-/// `true` when `a < b`. Non-numeric components are treated as 0
-/// so `0.1.0` and `0.1.0-rc1` order predictably without bringing
-/// in a full semver dep.
-fn semver_lt(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> (u64, u64, u64) {
-        let mut it = s.split('.').map(|x| {
-            x.split('-').next().unwrap_or("0").parse::<u64>().unwrap_or(0)
-        });
-        let major = it.next().unwrap_or(0);
-        let minor = it.next().unwrap_or(0);
-        let patch = it.next().unwrap_or(0);
-        (major, minor, patch)
-    };
-    parse(a) < parse(b)
-}
-
-/// Tiny GET helper for `cmd_docs_catalog`. Re-uses the curl
-/// shell-out pattern the rest of the binary relies on so we don't
-/// bring an HTTP client into the dep tree just for one fetch.
-fn curl_get(url: &str) -> Result<String, String> {
-    let output = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "30", url])
-        .output()
-        .map_err(|e| format!("spawn curl: {}", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "curl exit {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| format!("non-utf8 body: {}", e))
-}
 
 fn cmd_inspect(path: &Path) {
     let bytes = match std::fs::read(path) {
@@ -1537,6 +1330,21 @@ fn publish_workspace(
     let manifest: wren_lift::hatch::Manifest =
         toml::from_str(&text).map_err(|e| format!("cannot parse hatchfile: {}", e))?;
 
+    // Collect + upload the package's docs JSON to Supabase Storage
+    // before the catalog upsert. The upload returns a public URL
+    // we stamp into `docs_url`. A failure here is *not fatal* —
+    // the package still publishes without docs and the site
+    // renders the empty placeholder. Surface a warning so the
+    // publisher knows to retry.
+    let docs_url = match upload_workspace_docs(dir, &manifest, creds) {
+        Ok(Some(url)) => Some(url),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("warning: docs upload skipped — {}", e);
+            None
+        }
+    };
+
     let record = wren_lift::hatch_service::PackageRecord {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
@@ -1544,12 +1352,60 @@ fn publish_workspace(
         description: manifest.description.clone(),
         homepage: manifest.homepage.clone(),
         readme: manifest.readme.clone(),
+        docs_url,
         owner: None, // server sets from JWT
     };
 
     wren_lift::hatch_service::publish_package(cfg, creds, &record)
         .map_err(|e| format!("{}", e))?;
     Ok(record)
+}
+
+/// Collect the workspace's docs JSON via `crate::docs::collect_workspace_docs`
+/// and POST it to `<HATCH_BOT_URL>/docs-upload`. Returns the
+/// public URL on success, `Ok(None)` when there's no docs payload
+/// to upload, or an error describing what blocked.
+fn upload_workspace_docs(
+    dir: &Path,
+    manifest: &wren_lift::hatch::Manifest,
+    creds: &wren_lift::hatch_service::Credentials,
+) -> Result<Option<String>, String> {
+    let docs_json = wren_lift::hatch::collect_workspace_docs(dir)
+        .map_err(|e| format!("collect docs: {}", e))?;
+    if docs_json.trim() == "[]" || docs_json.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let bot_url = match std::env::var("HATCH_BOT_URL") {
+        Ok(u) => u,
+        Err(_) => return Err("HATCH_BOT_URL not set — docs upload requires the bot endpoint".into()),
+    };
+    let url = format!("{}/docs-upload", bot_url.trim_end_matches('/'));
+
+    // Body: {name, version, docs} where docs is the parsed JSON
+    // from `collect_workspace_docs`. We splice it in literally
+    // rather than re-parsing so float / map-order quirks don't
+    // round-trip differently.
+    let body = format!(
+        r#"{{"name":{},"version":{},"docs":{}}}"#,
+        serde_json::to_string(&manifest.name).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&manifest.version).unwrap_or_else(|_| "\"\"".into()),
+        docs_json,
+    );
+
+    let headers = [
+        format!("Authorization: Bearer {}", creds.access_token),
+        "Content-Type: application/json".to_string(),
+    ];
+    let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
+    let resp = wren_lift::hatch_service::curl_post(&url, &header_refs, &body)
+        .map_err(|e| format!("upload: {}", e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("decode upload response: {}", e))?;
+    match parsed.get("url").and_then(|v| v.as_str()) {
+        Some(u) => Ok(Some(u.to_string())),
+        None => Err(format!("upload response missing `url` field: {}", resp)),
+    }
 }
 
 /// Load the saved JWT and refresh it if near expiry. Exits the
