@@ -4643,9 +4643,23 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
                 let class = unsafe { &*(ptr as *const crate::runtime::object::ObjClass) };
                 vm.interner.resolve(class.name).to_string()
             }
+            // Catch-all for `Instance / Foreign / Module / Upvalue /
+            // TypedArray`. Tag the `ObjType` variant in the output and
+            // surface a null-class sentinel — `class_of` falls back to
+            // `object_class` when the value's `header.class` is null
+            // (uninitialized / partially-constructed object that
+            // escaped its allocator), and a bare "instance of Object"
+            // is indistinguishable from a legitimate root-Object
+            // toString. The variant tag + sentinel pinpoint that case
+            // when a stray instance lands in a response body.
             _ => {
-                let class_name = vm.class_name_of(value);
-                format!("instance of {}", class_name)
+                let cls = vm.class_of(value);
+                let class_name = if cls.is_null() {
+                    "<null-class>".to_string()
+                } else {
+                    unsafe { vm.interner.resolve((*cls).name).to_string() }
+                };
+                format!("instance of {} ({:?})", class_name, header.obj_type)
             }
         }
     } else {

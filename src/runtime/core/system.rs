@@ -86,7 +86,22 @@ fn format_object(ctx: &dyn NativeContext, value: Value) -> String {
                     let class = unsafe { &*(ptr as *const super::super::object::ObjClass) };
                     ctx.resolve_symbol(class.name).to_string()
                 }
-                _ => "instance".to_string(),
+                // Catch-all for `Instance / Foreign / Module / Upvalue
+                // / TypedArray`. Surface the class name and the
+                // `ObjType` variant — a bare `"instance"` collapses
+                // every unhandled object kind into the same opaque
+                // string, which makes a partially-constructed object
+                // surfacing through `System.print` indistinguishable
+                // from a legitimate user instance.
+                _ => {
+                    let class_ptr = ctx.get_class_of(value);
+                    let class_name = if class_ptr.is_null() {
+                        "<null-class>".to_string()
+                    } else {
+                        ctx.resolve_symbol(unsafe { (*class_ptr).name }).to_string()
+                    };
+                    format!("instance of {} ({:?})", class_name, header.obj_type)
+                }
             }
         }
     } else {

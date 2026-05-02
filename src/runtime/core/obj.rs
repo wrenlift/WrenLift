@@ -1,4 +1,4 @@
-use crate::runtime::object::{NativeContext, NativeFn, ObjClass};
+use crate::runtime::object::{NativeContext, NativeFn, ObjClass, ObjHeader};
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
@@ -34,8 +34,26 @@ fn is(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 fn to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let class_name = ctx.get_class_name_of(args[0]);
-    let result = format!("instance of {}", class_name);
+    let value = args[0];
+    let class_name = ctx.get_class_name_of(value);
+    // Diagnostic enrichment: when the formatted class is the bare
+    // `Object` root, append the underlying `ObjType` variant so a
+    // partially-constructed object surfacing through this primitive
+    // (the canonical Wren `.toString` fallback) is distinguishable
+    // from a legitimate `Object.new()` instance. The variant tag
+    // makes the case where `class_of` fell back to `object_class`
+    // because `header.class` was null visible in production logs
+    // instead of collapsing to the same opaque "instance of Object"
+    // string. User-defined classes (`instance of MyResponse`) are
+    // unchanged so any code that pattern-matches the standard format
+    // keeps working.
+    let result = if class_name == "Object" && value.is_object() {
+        let ptr = value.as_object().unwrap();
+        let obj_type = unsafe { (*(ptr as *const ObjHeader)).obj_type };
+        format!("instance of Object ({:?})", obj_type)
+    } else {
+        format!("instance of {}", class_name)
+    };
     ctx.alloc_string(result)
 }
 
