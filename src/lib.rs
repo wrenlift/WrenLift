@@ -16,6 +16,21 @@
     allow(dead_code, unused_imports, unused_variables, unreachable_patterns)
 )]
 
+// mimalloc as the global allocator on host targets. Replaces
+// glibc malloc on Linux x86_64, which was producing the
+// per-thread-arena pathology that drove our Fly OOM cycles
+// (~399mb anon-rss vs ~150-180mb on darwin's libmalloc on the
+// same workload). mimalloc keeps a unified allocator with
+// per-thread heap caches that avoid arena duplication, and
+// returns memory to the OS more aggressively than glibc.
+//
+// Wasm and other non-host builds keep the system allocator
+// (mimalloc isn't in `default-features = false`'s minimal
+// target set; gating on `host` keeps wasm32 targets unchanged).
+#[cfg(feature = "host")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod ast;
 pub mod capi;
 pub mod codegen;

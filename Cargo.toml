@@ -59,6 +59,7 @@ host = [
     "dep:libc",
     "dep:rand",
     "dep:rand_core",
+    "dep:mimalloc",
 ]
 cranelift = [
     "host",
@@ -112,6 +113,15 @@ rand = { version = "0.9", optional = true }
 rand_core = { version = "0.6", features = ["std"], optional = true }
 ureq = { version = "2", features = ["tls"], optional = true }
 cranelift-codegen = { version = "0.130", optional = true }
+# Host-only allocator override. mimalloc replaces the system
+# malloc as Rust's `#[global_allocator]` (declared in `lib.rs`),
+# yielding a tighter peak-RSS profile than glibc's per-thread
+# arenas — measured ~150-180mb vs glibc's 250-400mb on the same
+# server workload. `default-features = false` skips the secure
+# / debug builds; we just want the fast allocator. Wasm and
+# anything else that doesn't enable the `host` feature continues
+# to use the system allocator.
+mimalloc = { version = "0.1", default-features = false, optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }
 cranelift-jit = { version = "0.130", optional = true }
