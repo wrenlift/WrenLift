@@ -2631,6 +2631,49 @@ fn run_fiber_with_stop_depth(
                         None => {
                             let method_name = vm.interner.resolve(method).to_string();
                             let class_name = vm.class_name_of(recv_val);
+                            // When the receiver resolves to the bare
+                            // `Object` class, the value almost always
+                            // corrupted under us — either the heap
+                            // object's header was overwritten (GC bug)
+                            // or a JIT IC path returned a sentinel
+                            // that leaked into a register. Dump the
+                            // raw bits + class pointer to stderr so
+                            // the post-mortem has something to chew
+                            // on instead of a one-line message.
+                            // Gated behind `WLIFT_TRACE_OBJ=1` so
+                            // routine handler bugs in production don't
+                            // spam the log.
+                            if class_name == "Object"
+                                && std::env::var("WLIFT_TRACE_OBJ")
+                                    .map(|v| v == "1")
+                                    .unwrap_or(false)
+                            {
+                                let bits = recv_val.to_bits();
+                                let class_ptr = vm.class_of(recv_val);
+                                let hdr_class: *mut ObjClass = if recv_val.is_object() {
+                                    let p = recv_val.as_object().unwrap();
+                                    unsafe { (*(p as *const ObjHeader)).class }
+                                } else {
+                                    std::ptr::null_mut()
+                                };
+                                let obj_type_dbg = if recv_val.is_object() {
+                                    let p = recv_val.as_object().unwrap();
+                                    Some(unsafe { (*(p as *const ObjHeader)).obj_type })
+                                } else {
+                                    None
+                                };
+                                eprintln!(
+                                    "wren_method_miss: recv bits=0x{:x} is_object={} \
+                                     header.class=0x{:x} class_of=0x{:x} obj_type={:?} \
+                                     method='{}'",
+                                    bits,
+                                    recv_val.is_object(),
+                                    hdr_class as usize,
+                                    class_ptr as usize,
+                                    obj_type_dbg,
+                                    method_name
+                                );
+                            }
                             // Save `pc` into the frame before bailing so
                             // `extract_error_location` reads the actual
                             // failing-call PC. Without this the frame

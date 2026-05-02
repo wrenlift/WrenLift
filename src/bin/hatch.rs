@@ -1584,6 +1584,11 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
     // default.
     let mut config = wren_lift::runtime::vm::VMConfig::default();
     config.step_limit = 0;
+    // Long-running servers benefit from real frames in `Fiber.error`
+    // messages — without this `Fiber.stackTrace` returns a placeholder
+    // and a flaky route handler shows up in logs as a one-line
+    // "Object does not implement 'split(_)'" with no caller context.
+    config.fiber_stack_traces = true;
     if std::env::var("WLIFT_MODE")
         .map(|m| m == "interpreter" || m == "interp")
         .unwrap_or(false)
