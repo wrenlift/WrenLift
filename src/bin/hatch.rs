@@ -1568,20 +1568,29 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
         &bytes_owned
     };
 
-    // `WLIFT_MODE=interpreter` forces the VM out of the default tiered
-    // path. Useful as a quick safety valve when a JIT regression
-    // surfaces in a `hatch run` workspace; matches `wlift --mode
-    // interpreter`. Other values (or unset) leave the tiered default.
-    let mut vm = if std::env::var("WLIFT_MODE")
+    // `hatch run` is the long-running path — most workspaces here
+    // are HTTP servers, hot-reload watchers, or game loops. The
+    // default `step_limit` (1B Wren instructions) is meant for
+    // batch / unit-test runs that should fail closed if they
+    // appear to infinite-loop; a server running for a day or two
+    // crosses that threshold legitimately and aborts mid-tick
+    // with "step limit exceeded" deep inside @hatch:web's
+    // scheduler tick. Override to 0 (unlimited) so server
+    // workloads stay alive.
+    //
+    // `WLIFT_MODE=interpreter` is still honoured as the safety
+    // valve when a JIT regression surfaces; matches `wlift --mode
+    // interpreter`. Other values (or unset) leave the tiered
+    // default.
+    let mut config = wren_lift::runtime::vm::VMConfig::default();
+    config.step_limit = 0;
+    if std::env::var("WLIFT_MODE")
         .map(|m| m == "interpreter" || m == "interp")
         .unwrap_or(false)
     {
-        let mut config = wren_lift::runtime::vm::VMConfig::default();
         config.execution_mode = wren_lift::runtime::engine::ExecutionMode::Interpreter;
-        VM::new(config)
-    } else {
-        VM::new_default()
-    };
+    }
+    let mut vm = VM::new(config);
 
     // Preload dependency hatches in CLI order. Manifest-driven
     // resolution against a registry lands in later hatch-cli work.
