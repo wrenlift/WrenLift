@@ -1376,15 +1376,13 @@ fn upload_workspace_docs(
         return Ok(None);
     }
 
-    let bot_url = match std::env::var("HATCH_BOT_URL") {
-        Ok(u) => u,
-        Err(_) => return Err("HATCH_BOT_URL not set — docs upload requires the bot endpoint".into()),
-    };
+    let bot_url = std::env::var("HATCH_BOT_URL")
+        .map_err(|_| "HATCH_BOT_URL not set — docs upload requires the bot endpoint".to_string())?;
     // The existing GitHub Actions variable convention bakes
-    // `/publish` onto the end of HATCH_BOT_URL — it predates any
-    // sibling route on the function. Strip that suffix if it's
-    // there so we resolve to the function base, then append the
-    // route we actually want.
+    // `/publish` onto the end of HATCH_BOT_URL — it predates
+    // sibling routes on the function. Strip that suffix so we
+    // resolve to the function base (`/hatch-bot`) and append the
+    // sibling route we want.
     let trimmed = bot_url.trim_end_matches('/');
     let base = trimmed.strip_suffix("/publish").unwrap_or(trimmed);
     let url = format!("{}/docs-upload", base);
