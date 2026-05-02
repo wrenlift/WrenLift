@@ -20,6 +20,12 @@
 # `pre-build` only runs for the configured target.
 
 [target.aarch64-unknown-linux-gnu]
+# Pin to `:main` so the container is jammy (22.04) — the older
+# default cross images for this target are still xenial (16.04),
+# whose apt archives have been retired (`ports.ubuntu.com` 404s
+# on `apt-get update`). `:main` tracks current cross-rs and has
+# working apt sources, which is what `pre-build` below needs.
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 pre-build = [
     "dpkg --add-architecture arm64",
     "apt-get update && apt-get install --assume-yes pkg-config libasound2-dev libasound2-dev:arm64",
