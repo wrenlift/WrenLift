@@ -636,6 +636,60 @@ struct MayYieldCache {
     set: Option<Arc<std::collections::HashSet<crate::intern::SymbolId>>>,
 }
 
+// FuncId → "calls remaining before re-tier-up is allowed" map for
+// auto-deopted functions. When `vm_interp` detects a corruption
+// signal (receiver class resolves to bare `Object`) inside a JIT
+// frame and demotes via `note_deopt_to_baseline`, it also seeds an
+// entry here at `jit_threshold`. `record_call` decrements on every
+// subsequent invocation; once the entry hits zero, the call site
+// returns `true` (forcing a re-tier-up submission) and the entry
+// is cleared. This is what lets a function recover after a
+// transient JIT mis-compile — without it, the bead's monotonic
+// invocation counter has already passed the fire-once threshold,
+// so the regular tier-up path would never re-fire and the
+// function stays at the lower tier indefinitely.
+//
+// Lives in a thread_local so the engine struct layout doesn't
+// drift for already-loaded plugin cdylibs.
+thread_local! {
+    static AUTO_DEOPT_RETRY: std::cell::RefCell<std::collections::HashMap<u32, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Mark a function as eligible for re-tier-up after `delay`
+/// further invocations. Used by the auto-deopt path in
+/// `vm_interp` so a function demoted because of suspected JIT
+/// corruption gets a clean observation window before retrying
+/// JIT compilation.
+pub fn schedule_auto_deopt_retry(id: FuncId, delay: u32) {
+    AUTO_DEOPT_RETRY.with(|m| {
+        m.borrow_mut().insert(id.0, delay);
+    });
+}
+
+/// Tick the auto-deopt retry counter for `id`. Returns `true`
+/// once when the counter reaches zero, signalling that the
+/// caller should re-issue tier-up. The entry is cleared on the
+/// triggering call so subsequent calls don't keep re-firing.
+fn auto_deopt_retry_tick(id: FuncId) -> bool {
+    AUTO_DEOPT_RETRY.with(|m| {
+        let mut map = m.borrow_mut();
+        let Some(remaining) = map.get_mut(&id.0) else {
+            return false;
+        };
+        if *remaining == 0 {
+            map.remove(&id.0);
+            return true;
+        }
+        *remaining = remaining.saturating_sub(1);
+        if *remaining == 0 {
+            map.remove(&id.0);
+            return true;
+        }
+        false
+    })
+}
+
 /// Address range of a compiled function's native code.
 #[derive(Debug, Clone)]
 pub struct CodeRange {
@@ -1805,6 +1859,16 @@ impl ExecutionEngine {
     pub fn record_call(&mut self, id: FuncId) -> bool {
         if self.mode != ExecutionMode::Tiered {
             return false;
+        }
+        // Auto-deopt retry: if this function was demoted by the
+        // corruption-signal auto-deopt in `vm_interp` and has been
+        // observed for `jit_threshold` more calls in the lower
+        // tier, force a re-tier-up. This bypasses the bead's
+        // fire-once invocation counter so a function with a
+        // transient JIT mis-compile gets to retry rather than
+        // staying at the lower tier forever.
+        if auto_deopt_retry_tick(id) {
+            return true;
         }
         let idx = id.0 as usize;
         match self.functions.get_mut(idx) {

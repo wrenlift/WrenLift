@@ -2643,36 +2643,118 @@ fn run_fiber_with_stop_depth(
                             // Gated behind `WLIFT_TRACE_OBJ=1` so
                             // routine handler bugs in production don't
                             // spam the log.
-                            if class_name == "Object"
-                                && std::env::var("WLIFT_TRACE_OBJ")
+                            // Receiver-class corruption signal: the
+                            // value's class resolved to bare `Object`,
+                            // which means either the heap header was
+                            // zeroed (use-after-free) or a JIT-side
+                            // sentinel like `TAG_UNDEFINED` leaked
+                            // into a register. Either way, *some*
+                            // JIT'd frame on the active stack
+                            // produced bad output. Walk the JIT
+                            // frame list and demote the topmost
+                            // entry: future calls to that function
+                            // go through the lower tier (or the
+                            // interpreter), and after the configured
+                            // deopt budget it stops being JIT'd
+                            // altogether. The caller's current
+                            // request still aborts with the
+                            // "Object does not implement" error —
+                            // graceful per-request recovery would
+                            // need a real on-stack-replacement
+                            // unwinder — but the workload self-heals
+                            // across requests rather than thrashing.
+                            //
+                            // `WLIFT_TRACE_OBJ=1` keeps the verbose
+                            // dump too so we can post-mortem the
+                            // exact bits that triggered the deopt.
+                            if class_name == "Object" {
+                                let trace = std::env::var("WLIFT_TRACE_OBJ")
                                     .map(|v| v == "1")
-                                    .unwrap_or(false)
-                            {
-                                let bits = recv_val.to_bits();
-                                let class_ptr = vm.class_of(recv_val);
-                                let hdr_class: *mut ObjClass = if recv_val.is_object() {
-                                    let p = recv_val.as_object().unwrap();
-                                    unsafe { (*(p as *const ObjHeader)).class }
-                                } else {
-                                    std::ptr::null_mut()
-                                };
-                                let obj_type_dbg = if recv_val.is_object() {
-                                    let p = recv_val.as_object().unwrap();
-                                    Some(unsafe { (*(p as *const ObjHeader)).obj_type })
-                                } else {
-                                    None
-                                };
-                                eprintln!(
-                                    "wren_method_miss: recv bits=0x{:x} is_object={} \
-                                     header.class=0x{:x} class_of=0x{:x} obj_type={:?} \
-                                     method='{}'",
-                                    bits,
-                                    recv_val.is_object(),
-                                    hdr_class as usize,
-                                    class_ptr as usize,
-                                    obj_type_dbg,
-                                    method_name
-                                );
+                                    .unwrap_or(false);
+                                if trace {
+                                    let bits = recv_val.to_bits();
+                                    let class_ptr = vm.class_of(recv_val);
+                                    let hdr_class: *mut ObjClass = if recv_val.is_object() {
+                                        let p = recv_val.as_object().unwrap();
+                                        unsafe { (*(p as *const ObjHeader)).class }
+                                    } else {
+                                        std::ptr::null_mut()
+                                    };
+                                    let obj_type_dbg = if recv_val.is_object() {
+                                        let p = recv_val.as_object().unwrap();
+                                        Some(unsafe { (*(p as *const ObjHeader)).obj_type })
+                                    } else {
+                                        None
+                                    };
+                                    eprintln!(
+                                        "wren_method_miss: recv bits=0x{:x} is_object={} \
+                                         header.class=0x{:x} class_of=0x{:x} obj_type={:?} \
+                                         method='{}'",
+                                        bits,
+                                        recv_val.is_object(),
+                                        hdr_class as usize,
+                                        class_ptr as usize,
+                                        obj_type_dbg,
+                                        method_name
+                                    );
+                                }
+                                // Auto-deopt the topmost JIT'd frame.
+                                // `jit_frame_entries` is owned by
+                                // `runtime_fns`; we only consult the
+                                // most recent entry because that's
+                                // the function actively producing
+                                // the corrupt value. Older frames
+                                // are upstream callers whose output
+                                // is presumably fine.
+                                //
+                                // Intentionally NOT calling
+                                // `tier.record_bailout` — that path
+                                // charges the function's deopt
+                                // budget against the threshold
+                                // policy (default `ThresholdDeoptPolicy`
+                                // blacklists after 3 bailouts), and
+                                // these corruption-induced demotes
+                                // aren't real guard failures we want
+                                // counted. We just want the function
+                                // out of JIT *for now*; the next
+                                // observation period should give it
+                                // a fresh chance to re-tier-up at
+                                // its own pace.
+                                //
+                                // `note_deopt_to_baseline` flips
+                                // `tier_states[idx]` back to
+                                // BaselineNative/Interpreted and
+                                // syncs `jit_code[idx]` to the
+                                // active-tier cache, so the next
+                                // dispatch goes through the lower
+                                // tier instead of the busted
+                                // optimized blob.
+                                let jit_entries =
+                                    crate::codegen::runtime_fns::jit_frame_entries();
+                                if let Some(&(_fp, top_func_id, _ret)) = jit_entries.last() {
+                                    let id = crate::runtime::engine::FuncId(top_func_id);
+                                    vm.engine.note_deopt_to_baseline(id);
+                                    // Schedule a re-tier-up after
+                                    // `jit_threshold` more invocations
+                                    // in the lower tier. The bead's
+                                    // monotonic invocation counter
+                                    // already passed its fire-once
+                                    // tier-up trigger, so without
+                                    // this seed the function would
+                                    // stay at the lower tier forever.
+                                    crate::runtime::engine::schedule_auto_deopt_retry(
+                                        id,
+                                        vm.engine.jit_threshold,
+                                    );
+                                    if trace {
+                                        eprintln!(
+                                            "wren_auto_deopt: demoted FuncId({}) after \
+                                             receiver-class-corrupted dispatch failure on \
+                                             '{}' (retry in {} calls)",
+                                            top_func_id, method_name, vm.engine.jit_threshold
+                                        );
+                                    }
+                                }
                             }
                             // Save `pc` into the frame before bailing so
                             // `extract_error_location` reads the actual
