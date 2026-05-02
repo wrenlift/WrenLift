@@ -437,10 +437,34 @@ impl Parser {
         self.advance(); // consume `var`
         self.skip_newlines();
 
-        if !self.check(&Token::Ident) {
+        // Accept either a plain `Ident` or a `StaticField` (`__name`)
+        // token here. The lexer tags any leading-double-underscore
+        // identifier as `StaticField` because that's what it means
+        // inside a class body, but at module / function scope the
+        // same spelling is a regular variable name. Without this
+        // arm, `var __cache = ...` at module scope hit the
+        // `expected variable name` error path and the parser kept
+        // re-trying recovery against subsequent tokens — which read
+        // comments two and three lines down as code (`var x = 0` →
+        // … → `// Same shape as the routes use, broken out so the …`
+        // produced misleading "unexpected token '='" diagnostics
+        // that pointed at the comment, not the real cause). Now we
+        // accept either token type, intern the literal text, and
+        // let the rest of the var-declaration path proceed.
+        let is_ident = self.check(&Token::Ident);
+        let is_static = self.check(&Token::StaticField);
+        if !is_ident && !is_static {
             let span = self.current_span();
             self.errors
                 .push(Diagnostic::error("expected variable name").with_label(span, "here"));
+            // Advance past the offending token so the parser doesn't
+            // get stuck at the same position; otherwise statement-
+            // level recovery hands the next pass the same bad token
+            // and the cycle repeats with diagnostics that drift
+            // further into the file each iteration.
+            if !self.is_at_end() {
+                self.advance();
+            }
             return None;
         }
         self.advance();
