@@ -38,6 +38,14 @@ pub mod cl {
         pub osr_entries: Vec<crate::codegen::NativeOsrEntry>,
         /// Size of the generated code.
         pub code_size: usize,
+        /// Per-safepoint live-root metadata derived from Cranelift's
+        /// user stack maps. Populated for the main function body
+        /// (OSR entries are not yet covered). The runtime GC scanner
+        /// in [`crate::runtime::vm::VM::scan_native_stack_roots`]
+        /// keys off the safepoint `code_offset` (return address
+        /// minus function start) to find the live boxed slots in the
+        /// JIT frame.
+        pub native_meta: Option<crate::codegen::native_meta::NativeFrameMetadata>,
     }
 
     // SAFETY: The JITModule's memory is self-contained and the fn_ptr
@@ -62,9 +70,20 @@ pub mod cl {
             .set("is_pic", "false")
             .map_err(|e| e.to_string())?;
 
-        // Disable frame pointers for smaller/faster code
+        // Frame-pointer preservation is gated behind the same env
+        // var as the stack-map marking it supports — when marks are
+        // default-off, leave FP behaviour at Cranelift's default
+        // (no enforcement) so we don't perturb the JIT'd prologue
+        // shape that the existing naked `wren_call_N` stubs rely
+        // on. Flip both together with `WLIFT_ENABLE_STACK_MAPS=1`
+        // when iterating on the GC root work.
+        let pfp = if std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some() {
+            "true"
+        } else {
+            "false"
+        };
         flag_builder
-            .set("preserve_frame_pointers", "false")
+            .set("preserve_frame_pointers", pfp)
             .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
 
         // Disable probestack — macOS aarch64 inline probestack can cause
@@ -261,12 +280,15 @@ pub mod cl {
                 .map_err(|e| e.to_string())?;
             module.finalize_definitions().map_err(|e| e.to_string())?;
             let fn_ptr = module.get_finalized_function(func_id);
-            let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
+            let compiled_code = ctx.compiled_code().unwrap();
+            let code_size = compiled_code.code_info().total_size as usize;
+            let native_meta = native_meta_from_cranelift(compiled_code);
             return Ok(CraneliftCompiledCode {
                 _module: module,
                 fn_ptr,
                 osr_entries: Vec::new(),
                 code_size,
+                native_meta,
             });
         }
 
@@ -332,7 +354,9 @@ pub mod cl {
         module.finalize_definitions().map_err(|e| e.to_string())?;
 
         let fn_ptr = module.get_finalized_function(func_id);
-        let code_size = ctx.compiled_code().unwrap().code_info().total_size as usize;
+        let compiled_code = ctx.compiled_code().unwrap();
+        let code_size = compiled_code.code_info().total_size as usize;
+        let native_meta = native_meta_from_cranelift(compiled_code);
         let osr_entries = osr_defs
             .into_iter()
             .map(|def| crate::codegen::NativeOsrEntry {
@@ -347,6 +371,79 @@ pub mod cl {
             fn_ptr,
             osr_entries,
             code_size,
+            native_meta,
+        })
+    }
+
+    /// Translate Cranelift's user stack maps (SP-relative root offsets at
+    /// each call safepoint) into the GC scanner's `NativeFrameMetadata`
+    /// shape (FP-relative spill-slot offsets). Returns `None` if the
+    /// compiled code has no frame layout (shouldn't happen for normal
+    /// functions, but `frame_layout` is `Option`-typed so we guard
+    /// defensively rather than panic).
+    fn native_meta_from_cranelift(
+        compiled: &cranelift_codegen::CompiledCode,
+    ) -> Option<crate::codegen::native_meta::NativeFrameMetadata> {
+        use crate::codegen::native_meta::{
+            LiveRootMetadata, NativeFrameMetadata, RootLocation, SafepointKind, SafepointMetadata,
+        };
+
+        let layout = compiled.buffer.frame_layout()?;
+        // Cranelift's `frame_to_fp_offset` is the offset, in bytes,
+        // from the bottom of the frame (= SP at safepoint, after the
+        // prologue has dropped SP) up to FP. So at a safepoint:
+        //
+        //   FP = SP + frame_to_fp_offset
+        //
+        // and a root at `SP + entry_offset` lives at
+        //
+        //   FP - frame_to_fp_offset + entry_offset
+        //   = FP + (entry_offset as i64 - frame_to_fp_offset as i64)
+        //
+        // which is what the GC scanner ([`scan_native_stack_roots`])
+        // computes via `(jit_fp + spill_offset)`.
+        let fp_anchor = layout.frame_to_fp_offset as i64;
+
+        let mut safepoints = Vec::new();
+        let mut ordinal = 0u32;
+        for (code_offset, _span, map) in compiled.buffer.user_stack_maps() {
+            let mut live_roots: Vec<LiveRootMetadata> = Vec::new();
+            for (_ty, sp_offset) in map.entries() {
+                let fp_relative = sp_offset as i64 - fp_anchor;
+                // The runtime currently models spill offsets as i32.
+                // Stack frames > 2GB are nonsensical for our workload;
+                // out-of-range values would be a Cranelift miscompile,
+                // so we drop the root rather than mask it. Live roots
+                // we drop here become missed roots — the GC may free
+                // an object that's still in use. Logging would be
+                // nice but `eprintln!` from inside compile is noisy
+                // for normal operation.
+                let Ok(fp_relative_i32) = i32::try_from(fp_relative) else {
+                    continue;
+                };
+                live_roots.push(LiveRootMetadata {
+                    slot: live_roots.len() as u16,
+                    location: RootLocation::Spill(fp_relative_i32),
+                });
+            }
+            safepoints.push(SafepointMetadata {
+                ordinal,
+                inst_index: 0,
+                code_offset: *code_offset,
+                kind: SafepointKind::CallRuntime,
+                live_roots,
+            });
+            ordinal += 1;
+        }
+
+        if safepoints.is_empty() {
+            return None;
+        }
+
+        Some(NativeFrameMetadata {
+            boxed_values: Vec::new(),
+            safepoints,
+            spill_safe_nonleaf: true,
         })
     }
 
@@ -836,12 +933,59 @@ pub mod cl {
         // Map MIR values to Cranelift values.
         let mut val_map: HashMap<ValueId, Value> = HashMap::new();
 
+        // GC stack-map marking: when an SSA value holds a Wren `Value`
+        // (NaN-boxed pointer-or-scalar), we tell Cranelift to keep it
+        // on the stack across safepoints so the GC can find live
+        // heap pointers held in JIT frames. Without this, Cranelift's
+        // regalloc is free to keep a heap pointer in a callee-saved
+        // register across a call; if that call's callee allocates
+        // and triggers GC, the heap pointer is invisible and the
+        // object underneath it gets freed (mark-sweep) or moved
+        // (generational).
+        //
+        // The f64 inner function never carries Wren Values across
+        // calls — its parameters and locals are unboxed `f64`s, and
+        // the only outbound calls are recursive self-calls that take
+        // and return `f64`. Skip marking there.
+        //
+        // **Off by default.** A/B testing on @hatch:web showed that
+        // turning the marking on amplifies an unrelated UNDEF-leak
+        // somewhere in the JIT (a method call's receiver arrives as
+        // `TAG_UNDEFINED` instead of the value the source code
+        // assigned to it). With marks off the same flake still
+        // reproduces but the scheduler recovers between requests;
+        // with marks on the recovery path also breaks and a second,
+        // sibling flake (`Object does not implement 'readLine'`)
+        // appears. Force-spilling every Wren value across every
+        // safepoint is the most invasive thing the marking does, and
+        // it's plausibly interacting with whatever SSA / regalloc
+        // path is producing the UNDEF in the first place.
+        //
+        // Re-enable once the underlying init bug is found:
+        //   `WLIFT_ENABLE_STACK_MAPS=1 ../../target/release/hatch run`
+        let mark_stack_map = f64_self_id.is_none()
+            && std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some();
+        let value_types = if mark_stack_map {
+            infer_osr_value_types(mir)
+        } else {
+            Vec::new()
+        };
+        let is_wren_value = |vid: ValueId, value_types: &[MirType]| -> bool {
+            value_types
+                .get(vid.0 as usize)
+                .map(|ty| matches!(ty, MirType::Value))
+                .unwrap_or(false)
+        };
+
         if let Some(ref layout) = osr_entry {
             let osr_entry = builder.create_block();
             builder.switch_to_block(osr_entry);
             for vid in &layout.external_args {
                 let param = builder.append_block_param(osr_entry, types::I64);
                 val_map.insert(*vid, param);
+                if mark_stack_map && is_wren_value(*vid, &value_types) {
+                    builder.declare_value_needs_stack_map(param);
+                }
             }
             let target_block = &mir.blocks[layout.target_block.0 as usize];
             for (_, ty) in &target_block.params {
@@ -933,6 +1077,9 @@ pub mod cl {
                 };
                 let param = builder.append_block_param(cl_block, cl_type);
                 val_map.insert(*vid, param);
+                if mark_stack_map && matches!(ty, MirType::Value) {
+                    builder.declare_value_needs_stack_map(param);
+                }
             }
 
             // For the entry block (first in RPO = bb0), map BlockParam
@@ -979,6 +1126,9 @@ pub mod cl {
                             let idx = *idx as usize;
                             if idx < entry_params.len() {
                                 val_map.insert(vid, entry_params[idx]);
+                                if mark_stack_map && is_wren_value(vid, &value_types) {
+                                    builder.declare_value_needs_stack_map(entry_params[idx]);
+                                }
                             }
                         }
                     }
@@ -1014,6 +1164,9 @@ pub mod cl {
                     val_map.insert(vid, val);
                     if is_raw_bool {
                         raw_bools.insert(vid);
+                    }
+                    if mark_stack_map && is_wren_value(vid, &value_types) {
+                        builder.declare_value_needs_stack_map(val);
                     }
                 }
             }
@@ -1528,8 +1681,31 @@ pub mod cl {
                 // setup is needed. Emit: class check + load callee ptr
                 // + call_indirect. The JIT code slot address is stable
                 // because engine.jit_code doesn't reallocate post-load.
-                // Skip if we have a getter-inline hint — that path is cheaper.
-                if inline_getter_field.is_none()
+                //
+                // **Gated off by default**: this path emits a raw
+                // `call_indirect` and passes the receiver / args
+                // through CPU registers without rooting them or
+                // emitting Cranelift stack maps. If the callee
+                // allocates (and "pure leaf" means "no Wren-level
+                // calls", *not* "guaranteed alloc-free at the JIT
+                // level" — string concat, list grow, list-of-num
+                // alloc all happen inside the leaf JIT body), the
+                // GC scanner can't see the args and we hand the
+                // callee a stale Value on the next call. Symptom:
+                // `Object does not implement 'split(_)'` /
+                // `Object does not implement 'readLine'` flakes
+                // during heavy request flow on @hatch:web.
+                //
+                // Set `WLIFT_ENABLE_PURE_LEAF_DIRECT=1` to opt back
+                // in once Cranelift stack maps for the call_indirect
+                // args are wired up. Until then we fall through to
+                // the `wren_known_call_N_nocheck` helper, which
+                // pushes args into the JIT root set before
+                // dispatching.
+                let pure_leaf_enabled =
+                    std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some();
+                if pure_leaf_enabled
+                    && inline_getter_field.is_none()
                     && *pure_leaf
                     && *expected_class != 0
                     && args.len() <= 4

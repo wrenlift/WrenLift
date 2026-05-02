@@ -2216,17 +2216,27 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
             } else {
                 mir
             };
-            let compiled = cranelift_backend::cl::compile_mir(
+            let mut compiled = cranelift_backend::cl::compile_mir(
                 mir_ref,
                 interner,
                 callsite_ic_ptrs.as_deref(),
                 callsite_ic_live_ptrs.as_deref(),
                 jit_code_base,
             )?;
+            // Pull the GC root metadata out before we move `compiled`
+            // into the `CompiledFunction` wrapper. Cranelift's
+            // user-stack-map output, translated by
+            // `native_meta_from_cranelift`, gives the GC scanner the
+            // same per-safepoint live-spill view the in-tree backend
+            // already produces — without it, every Cranelift-compiled
+            // frame is invisible to the GC and any Wren `Value` held
+            // in a register or spill slot across a runtime-helper
+            // call goes stale on a collection.
+            let native_meta = compiled.native_meta.take().map(Arc::new);
             let code = CompiledFunction::CraneliftOwned(compiled);
             Ok(CompiledArtifact {
                 code,
-                native_meta: None,
+                native_meta,
                 needs_shadow_frame: false,
             })
         }
