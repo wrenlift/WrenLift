@@ -1380,7 +1380,14 @@ fn upload_workspace_docs(
         Ok(u) => u,
         Err(_) => return Err("HATCH_BOT_URL not set — docs upload requires the bot endpoint".into()),
     };
-    let url = format!("{}/docs-upload", bot_url.trim_end_matches('/'));
+    // The existing GitHub Actions variable convention bakes
+    // `/publish` onto the end of HATCH_BOT_URL — it predates any
+    // sibling route on the function. Strip that suffix if it's
+    // there so we resolve to the function base, then append the
+    // route we actually want.
+    let trimmed = bot_url.trim_end_matches('/');
+    let base = trimmed.strip_suffix("/publish").unwrap_or(trimmed);
+    let url = format!("{}/docs-upload", base);
 
     // Body: {name, version, docs} where docs is the parsed JSON
     // from `collect_workspace_docs`. We splice it in literally
