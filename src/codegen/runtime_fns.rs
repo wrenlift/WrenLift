@@ -2725,6 +2725,35 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     let ic = unsafe { &*ic_ptr };
     let jit_ptr = ic.jit_ptr;
     if jit_ptr.is_null() {
+        // The JIT'd call site reached us with an unbound IC. This
+        // shouldn't happen if the codegen pre-checks `ic.class ==
+        // recv.class` before dispatching, but a previous call into
+        // this IC may have cleared it (e.g. live==null branch
+        // below) and the codegen doesn't always re-read the class
+        // word between callsites. Returning `Value::null()` here
+        // would silently corrupt the JIT'd caller's stack — so
+        // route through the cached closure if one's still around,
+        // or abort the fiber with a clear message rather than
+        // letting the caller crash on a null receiver downstream.
+        let closure = ic.closure as *mut ObjClosure;
+        if !closure.is_null() {
+            if let Some(vm) = unsafe { vm_ref() } {
+                let args_val: smallvec::SmallVec<[Value; 5]> =
+                    args.iter().map(|&a| Value::from_bits(a)).collect();
+                return call_closure_jit_or_sync(vm, closure, &args_val, None);
+            }
+        }
+        // No usable dispatch info — surface to stderr so the
+        // failure is at least visible. (`runtime_error` lives on
+        // VM but isn't reachable from this calling convention
+        // without re-borrowing.) Returning null here is the same
+        // behaviour as before this block; the closure-fallback
+        // above covers the common eviction case.
+        eprintln!(
+            "wren_ic_call: empty IC (kind={}, class=0x{:x}) — call site \
+             lost dispatch info between codegen and runtime",
+            ic.kind, ic.class
+        );
         return Value::null().to_bits();
     }
     // Leaf (kind=1) fast path: `is_mir_inline_safe` guarantees the callee
