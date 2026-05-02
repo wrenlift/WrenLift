@@ -95,6 +95,16 @@ pub struct PackageRecord {
     /// pre-date the upload pipeline render the empty placeholder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs_url: Option<String>,
+    /// Public URL for the package's `README.md`, mirror of
+    /// `docs_url`. `hatch publish` reads `README.md` from the
+    /// workspace, posts it to `hatch-bot/readme-upload`, and the
+    /// returned URL lands here. The site's readme route reads
+    /// this URL first; legacy rows fall back to the existing
+    /// `git`-relative GitHub-raw resolution. Forge-agnostic:
+    /// GitLab / Bitbucket / self-hosted Forgejo packages get
+    /// READMEs without per-host raw-URL conventions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readme_url: Option<String>,
     /// Present in server responses, omitted on submission (the
     /// server sets it from the auth'd JWT).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1345,6 +1345,20 @@ fn publish_workspace(
         }
     };
 
+    // Same shape for the README — read `<workspace>/README.md`,
+    // post to `hatch-bot/readme-upload`, stamp the returned
+    // public URL into `readme_url`. Snapshot semantics: a typo
+    // fix on main without a republish doesn't show on the
+    // catalog; the docs page is locked to the published version.
+    let readme_url = match upload_workspace_readme(dir, &manifest, creds) {
+        Ok(Some(url)) => Some(url),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("warning: readme upload skipped — {}", e);
+            None
+        }
+    };
+
     let record = wren_lift::hatch_service::PackageRecord {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
@@ -1353,6 +1367,7 @@ fn publish_workspace(
         homepage: manifest.homepage.clone(),
         readme: manifest.readme.clone(),
         docs_url,
+        readme_url,
         owner: None, // server sets from JWT
     };
 
@@ -1362,9 +1377,9 @@ fn publish_workspace(
 }
 
 /// Collect the workspace's docs JSON via `crate::docs::collect_workspace_docs`
-/// and POST it to `<HATCH_BOT_URL>/docs-upload`. Returns the
-/// public URL on success, `Ok(None)` when there's no docs payload
-/// to upload, or an error describing what blocked.
+/// and POST it to `<hatch-bot>/docs-upload`. Returns the public
+/// URL on success, `Ok(None)` when there's no docs payload to
+/// upload, or an error describing what blocked.
 fn upload_workspace_docs(
     dir: &Path,
     manifest: &wren_lift::hatch::Manifest,
@@ -1375,35 +1390,84 @@ fn upload_workspace_docs(
     if docs_json.trim() == "[]" || docs_json.trim().is_empty() {
         return Ok(None);
     }
-
-    let bot_url = std::env::var("HATCH_BOT_URL")
-        .map_err(|_| "HATCH_BOT_URL not set — docs upload requires the bot endpoint".to_string())?;
-    // The existing GitHub Actions variable convention bakes
-    // `/publish` onto the end of HATCH_BOT_URL — it predates
-    // sibling routes on the function. Strip that suffix so we
-    // resolve to the function base (`/hatch-bot`) and append the
-    // sibling route we want.
-    let trimmed = bot_url.trim_end_matches('/');
-    let base = trimmed.strip_suffix("/publish").unwrap_or(trimmed);
-    let url = format!("{}/docs-upload", base);
-
     // Body: {name, version, docs} where docs is the parsed JSON
-    // from `collect_workspace_docs`. We splice it in literally
-    // rather than re-parsing so float / map-order quirks don't
-    // round-trip differently.
+    // from `collect_workspace_docs`. Splice in literally rather
+    // than re-parsing so float / map-order quirks don't round-
+    // trip differently.
     let body = format!(
         r#"{{"name":{},"version":{},"docs":{}}}"#,
         serde_json::to_string(&manifest.name).unwrap_or_else(|_| "\"\"".into()),
         serde_json::to_string(&manifest.version).unwrap_or_else(|_| "\"\"".into()),
         docs_json,
     );
+    post_to_hatch_bot("docs-upload", &body, creds)
+}
+
+/// Read `<dir>/README.md` and POST it to
+/// `<hatch-bot>/readme-upload`. Sibling of `upload_workspace_docs`
+/// — same auth, same response shape (returns the public URL).
+/// `Ok(None)` if the workspace has no README.
+fn upload_workspace_readme(
+    dir: &Path,
+    manifest: &wren_lift::hatch::Manifest,
+    creds: &wren_lift::hatch_service::Credentials,
+) -> Result<Option<String>, String> {
+    // Honour `manifest.readme` if it points at a different file
+    // (e.g. `readme = "doc/INTRO.md"`); default to `README.md` at
+    // the workspace root. Absolute URLs in the manifest are a
+    // legacy form — skip the upload, the site renders that URL
+    // directly without a Storage round-trip.
+    let rel = manifest
+        .readme
+        .clone()
+        .unwrap_or_else(|| "README.md".to_string());
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return Ok(None);
+    }
+    let path = dir.join(&rel);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let markdown = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    if markdown.trim().is_empty() {
+        return Ok(None);
+    }
+    let body = format!(
+        r#"{{"name":{},"version":{},"readme":{}}}"#,
+        serde_json::to_string(&manifest.name).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&manifest.version).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&markdown).unwrap_or_else(|_| "\"\"".into()),
+    );
+    post_to_hatch_bot("readme-upload", &body, creds)
+}
+
+/// Resolve `<hatch-bot-base>/<route>` from `HATCH_BOT_URL`,
+/// POST the body with bearer auth, parse the `url` field from
+/// the response. Shared between the docs + readme upload paths
+/// since the wire shape is identical.
+fn post_to_hatch_bot(
+    route: &str,
+    body: &str,
+    creds: &wren_lift::hatch_service::Credentials,
+) -> Result<Option<String>, String> {
+    let bot_url = std::env::var("HATCH_BOT_URL").map_err(|_| {
+        "HATCH_BOT_URL not set — uploads require the bot endpoint".to_string()
+    })?;
+    // The existing GitHub Actions variable convention bakes
+    // `/publish` onto the end of HATCH_BOT_URL — it predates
+    // sibling routes. Strip the suffix so we resolve to the
+    // function base, then append the route we want.
+    let trimmed = bot_url.trim_end_matches('/');
+    let base = trimmed.strip_suffix("/publish").unwrap_or(trimmed);
+    let url = format!("{}/{}", base, route);
 
     let headers = [
         format!("Authorization: Bearer {}", creds.access_token),
         "Content-Type: application/json".to_string(),
     ];
     let header_refs: Vec<&str> = headers.iter().map(String::as_str).collect();
-    let resp = wren_lift::hatch_service::curl_post(&url, &header_refs, &body)
+    let resp = wren_lift::hatch_service::curl_post(&url, &header_refs, body)
         .map_err(|e| format!("upload: {}", e))?;
     let parsed: serde_json::Value =
         serde_json::from_str(&resp).map_err(|e| format!("decode upload response: {}", e))?;
