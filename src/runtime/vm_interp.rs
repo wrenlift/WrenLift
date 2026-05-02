@@ -2746,14 +2746,29 @@ fn run_fiber_with_stop_depth(
                                         id,
                                         vm.engine.jit_threshold,
                                     );
-                                    if trace {
-                                        eprintln!(
-                                            "wren_auto_deopt: demoted FuncId({}) after \
-                                             receiver-class-corrupted dispatch failure on \
-                                             '{}' (retry in {} calls)",
-                                            top_func_id, method_name, vm.engine.jit_threshold
-                                        );
-                                    }
+                                    // Always log the demote with the
+                                    // function's resolved name so
+                                    // production logs surface which
+                                    // method is mis-compiling. Cheap
+                                    // (one-off per fire) and the
+                                    // signal is more valuable than
+                                    // the noise — the deopt only
+                                    // fires when an `instance of
+                                    // Object` corruption actually
+                                    // happened. The verbose
+                                    // bits/header dump above stays
+                                    // gated on `WLIFT_TRACE_OBJ`.
+                                    let func_label = vm
+                                        .engine
+                                        .get_mir(id)
+                                        .map(|m| vm.interner.resolve(m.name).to_string())
+                                        .unwrap_or_else(|| format!("FuncId({})", top_func_id));
+                                    eprintln!(
+                                        "wren_auto_deopt: demoted '{}' after \
+                                         receiver-class-corrupted dispatch failure \
+                                         on method '{}' (retry in {} calls)",
+                                        func_label, method_name, vm.engine.jit_threshold
+                                    );
                                 }
                             }
                             // Save `pc` into the frame before bailing so
