@@ -356,20 +356,46 @@ pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
             }
         };
 
+        // GC rooting: the previous implementation accumulated
+        // `Value`s in a plain `Vec<Value>` on the host stack —
+        // that Vec isn't a GC root, and any allocator call inside
+        // the loop (`alloc_map`, `alloc_string`, `sql_to_wren`)
+        // could trigger a collection that freed the partially-
+        // built maps before they were handed back to Wren. Symptom
+        // in production: catalog refresh allocates ~hundreds of
+        // Maps in a tight loop; the GC threshold trips mid-rebuild;
+        // a subsequent `byName` query lands on freed pointers and
+        // SIGSEGVs (`hatch run … [catalog] refreshed (39 packages)
+        // … zsh: segmentation fault`).
+        //
+        // Strategy: build the result list FIRST as the receiver/
+        // return slot (api_stack[0], scanned by the GC's root set
+        // — see `vm.rs` `roots.extend_from_slice(&self.api_stack)`)
+        // and append each freshly-allocated map to it BEFORE
+        // populating its fields. Once the map is reachable through
+        // the result list's element array, subsequent
+        // `alloc_string` / `sql_to_wren` calls can collect freely
+        // without freeing the in-progress map — the list's element
+        // array is itself reachable through the root, so the map
+        // is transitively rooted.
         let context = ctx(vm);
-        let mut out_values: Vec<Value> = Vec::with_capacity(rows.len());
+        let result = context.alloc_list(Vec::new());
+        set_return(vm, result);
+        let result_ptr = result.as_object().unwrap() as *mut ObjList;
+
         for row_vals in rows {
             let map = context.alloc_map();
             let map_ptr = map.as_object().unwrap() as *mut ObjMap;
+            // Root the map via the result list before populating
+            // its fields. `map` as a local Rust binding isn't a
+            // GC root; the list's element array is.
+            (*result_ptr).add(map);
             for (i, val) in row_vals.into_iter().enumerate() {
                 let key = context.alloc_string(col_names[i].clone());
                 let wv = sql_to_wren(context, val);
                 (*map_ptr).set(key, wv);
             }
-            out_values.push(map);
         }
-        let result = context.alloc_list(out_values);
-        set_return(vm, result);
     }
 }
 
