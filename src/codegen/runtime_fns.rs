@@ -2508,56 +2508,80 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
     };
     let fid = func_id as usize;
     let method_sym = crate::intern::SymbolId::from_raw(method_raw);
-    let recv = args.first().copied().unwrap_or(Value::null());
-
-    // Verify the receiver's actual method is FuncId(func_id).
-    // Devirtualization is speculative — for polymorphic call sites,
-    // the receiver class may differ from the one observed at compile
-    // time, so we must check before calling the pre-selected FuncId.
-    let class = vm.class_of(recv);
-    let actual_method = vm
-        .method_cache
-        .lookup(class, method_sym)
-        .or_else(|| unsafe { find_method_with_class(class, method_sym) });
-
-    let is_match = match actual_method {
-        Some((crate::runtime::object::Method::Closure(cp), _)) => unsafe {
-            (*(*cp).function).fn_id == func_id
-        },
-        _ => false,
+    // Same staleness window as `wren_ic_call_inner`: the JIT'd
+    // caller's args arrive in CPU registers and are invisible to
+    // the GC. Any allocation between here and the eventual
+    // `call_jit_with_shadow` (method_cache miss path can allocate;
+    // the callee freely allocates) can promote the underlying
+    // objects out from under us. Push every arg as a root, read
+    // them back fresh at each dispatch site.
+    let root_base = jit_roots_snapshot_len();
+    for &v in args {
+        push_jit_root(v);
+    }
+    let arg_count = args.len();
+    let load_args = || -> smallvec::SmallVec<[Value; 5]> {
+        (0..arg_count).map(|i| jit_root_at(root_base + i)).collect()
     };
+    let recv0 = || jit_root_at(root_base);
 
-    if !is_match {
-        // Polymorphic miss — fall back to full dispatch.
-        return dispatch_call(recv, method_sym.index() as u64, args);
-    }
+    let result = (|| {
+        // Verify the receiver's actual method is FuncId(func_id).
+        // Devirtualization is speculative — for polymorphic call
+        // sites, the receiver class may differ from the one
+        // observed at compile time, so we must check before
+        // calling the pre-selected FuncId.
+        let class = vm.class_of(recv0());
+        let actual_method = vm
+            .method_cache
+            .lookup(class, method_sym)
+            .or_else(|| unsafe { find_method_with_class(class, method_sym) });
 
-    let fid_obj = crate::runtime::engine::FuncId(func_id);
-    let jit_ptr = vm
-        .engine
-        .jit_code
-        .get(fid)
-        .copied()
-        .unwrap_or(std::ptr::null());
+        let is_match = match actual_method {
+            Some((crate::runtime::object::Method::Closure(cp), _)) => unsafe {
+                (*(*cp).function).fn_id == func_id
+            },
+            _ => false,
+        };
 
-    if !jit_ptr.is_null() && args.len() <= 4 {
-        let saved_ctx = read_jit_ctx();
-        mutate_jit_ctx(|ctx| {
-            ctx.current_func_id = func_id as u64;
-        });
-        let depth = jit_depth();
-        if depth < MAX_JIT_DEPTH {
-            set_jit_depth(depth + 1);
-            let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, args) };
-            set_jit_depth(depth);
-            set_jit_context(saved_ctx);
-            return result;
+        if !is_match {
+            // Polymorphic miss — fall back to full dispatch.
+            let collected = load_args();
+            return dispatch_call(recv0(), method_sym.index() as u64, &collected);
         }
-        set_jit_context(saved_ctx);
-    }
 
-    // Callee not JIT'd yet — full dispatch via method symbol.
-    dispatch_call(recv, method_sym.index() as u64, args)
+        let fid_obj = crate::runtime::engine::FuncId(func_id);
+        let jit_ptr = vm
+            .engine
+            .jit_code
+            .get(fid)
+            .copied()
+            .unwrap_or(std::ptr::null());
+
+        if !jit_ptr.is_null() && arg_count <= 4 {
+            let saved_ctx = read_jit_ctx();
+            mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = func_id as u64;
+            });
+            let depth = jit_depth();
+            if depth < MAX_JIT_DEPTH {
+                set_jit_depth(depth + 1);
+                let collected = load_args();
+                let result =
+                    unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
+                set_jit_depth(depth);
+                set_jit_context(saved_ctx);
+                return result;
+            }
+            set_jit_context(saved_ctx);
+        }
+
+        // Callee not JIT'd yet — full dispatch via method symbol.
+        let collected = load_args();
+        dispatch_call(recv0(), method_sym.index() as u64, &collected)
+    })();
+    jit_roots_restore_len(root_base);
+    result
 }
 
 /// Known call with 0 extra args: (func_id, recv) -> result
@@ -2585,47 +2609,71 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
         .get(fid)
         .copied()
         .unwrap_or(std::ptr::null());
+    // Root inbound args — same staleness issue as
+    // `wren_ic_call_inner` and `wren_known_call_inner`. Even
+    // for callees `jit_leaf` reports as alloc-free, the JIT'd
+    // body can still allocate transitively through helpers
+    // (string concat, list grow, etc.), and on a GC the
+    // register-passed receiver / args go stale.
+    let root_base = jit_roots_snapshot_len();
+    for &v in args {
+        push_jit_root(v);
+    }
+    let arg_count = args.len();
+    let load_args = || -> smallvec::SmallVec<[Value; 5]> {
+        (0..arg_count).map(|i| jit_root_at(root_base + i)).collect()
+    };
 
-    if !jit_ptr.is_null() && args.len() <= 4 {
-        // For leaf callees (no internal wren_call_N), we don't need to
-        // touch ctx.current_func_id at all — leaf functions don't look
-        // up IC tables. This saves ~40ns per call on method_call.
-        let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
-        if is_leaf {
-            let depth = jit_depth();
-            if depth < MAX_JIT_DEPTH {
-                set_jit_depth(depth + 1);
-                let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, args) };
-                set_jit_depth(depth);
-                return result;
-            }
-        } else {
-            // Non-leaf: save/restore current_func_id so the callee's
-            // internal wren_call_N reads from its own IC table.
-            let saved_func_id = read_jit_ctx().current_func_id;
-            mutate_jit_ctx(|ctx| {
-                ctx.current_func_id = func_id as u64;
-            });
-            let depth = jit_depth();
-            if depth < MAX_JIT_DEPTH {
-                set_jit_depth(depth + 1);
-                let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, args) };
-                set_jit_depth(depth);
+    let result = (|| {
+        if !jit_ptr.is_null() && arg_count <= 4 {
+            // For leaf callees (no internal wren_call_N), we don't
+            // need to touch ctx.current_func_id at all — leaf
+            // functions don't look up IC tables.
+            let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
+            if is_leaf {
+                let depth = jit_depth();
+                if depth < MAX_JIT_DEPTH {
+                    set_jit_depth(depth + 1);
+                    let collected = load_args();
+                    let result =
+                        unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
+                    set_jit_depth(depth);
+                    return result;
+                }
+            } else {
+                // Non-leaf: save/restore current_func_id so the
+                // callee's internal wren_call_N reads from its own
+                // IC table.
+                let saved_func_id = read_jit_ctx().current_func_id;
+                mutate_jit_ctx(|ctx| {
+                    ctx.current_func_id = func_id as u64;
+                });
+                let depth = jit_depth();
+                if depth < MAX_JIT_DEPTH {
+                    set_jit_depth(depth + 1);
+                    let collected = load_args();
+                    let result =
+                        unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
+                    set_jit_depth(depth);
+                    mutate_jit_ctx(|ctx| {
+                        ctx.current_func_id = saved_func_id;
+                    });
+                    return result;
+                }
                 mutate_jit_ctx(|ctx| {
                     ctx.current_func_id = saved_func_id;
                 });
-                return result;
             }
-            mutate_jit_ctx(|ctx| {
-                ctx.current_func_id = saved_func_id;
-            });
         }
-    }
 
-    // Callee not compiled yet → fall back to full dispatch.
-    let recv = args.first().copied().unwrap_or(Value::null());
-    let method_sym = crate::intern::SymbolId::from_raw(method_raw);
-    dispatch_call(recv, method_sym.index() as u64, args)
+        // Callee not compiled yet → fall back to full dispatch.
+        let collected = load_args();
+        let recv = collected.first().copied().unwrap_or(Value::null());
+        let method_sym = crate::intern::SymbolId::from_raw(method_raw);
+        dispatch_call(recv, method_sym.index() as u64, &collected)
+    })();
+    jit_roots_restore_len(root_base);
+    result
 }
 
 pub extern "C" fn wren_known_call_0_nocheck(packed: u64, recv: u64) -> u64 {
@@ -2724,6 +2772,34 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     let ic_ptr = ic_ptr_raw as *mut crate::mir::bytecode::CallSiteIC;
     let ic = unsafe { &*ic_ptr };
     let jit_ptr = ic.jit_ptr;
+    // Root every inbound arg before any dispatch. Args arrive in
+    // CPU registers from the JIT'd caller, which means the GC has
+    // no way to see them — if the callee allocates and triggers a
+    // collection, the underlying objects get freed / relocated and
+    // we hand the callee a stale Value. That stale Value is the
+    // origin of every "Object does not implement 'split(_)'" /
+    // "instance of Object" / "Right operand must be a string"
+    // flake we've chased: a heap-allocated receiver gets promoted
+    // out from under us mid-call, the post-promotion read pulls
+    // garbage, and dispatch surfaces it as bogus class info.
+    //
+    // `wren_call_N_inner` already does this for the non-IC path
+    // (see lines around 2129); the IC path was missing it because
+    // the original design assumed the callee was always inlined-
+    // safe (no allocs), which stopped being true once polymorphic
+    // ICs and closure-fallback paths landed.
+    let root_base = jit_roots_snapshot_len();
+    for &raw in args {
+        push_jit_root(Value::from_bits(raw));
+    }
+    // Helper: snapshot the current root-window's bits. Used at
+    // every "we're about to dispatch" point so callers see the
+    // GC-forwarded values, not the stale `args` slice we were
+    // handed by the JIT'd caller.
+    let collect_args = || -> smallvec::SmallVec<[Value; 5]> {
+        (0..args.len()).map(|i| jit_root_at(root_base + i)).collect()
+    };
+    let result = (|| {
     if jit_ptr.is_null() {
         // The JIT'd call site reached us with an unbound IC. This
         // shouldn't happen if the codegen pre-checks `ic.class ==
@@ -2738,9 +2814,7 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
         let closure = ic.closure as *mut ObjClosure;
         if !closure.is_null() {
             if let Some(vm) = unsafe { vm_ref() } {
-                let args_val: smallvec::SmallVec<[Value; 5]> =
-                    args.iter().map(|&a| Value::from_bits(a)).collect();
-                return call_closure_jit_or_sync(vm, closure, &args_val, None);
+                return call_closure_jit_or_sync(vm, closure, &collect_args(), None);
             }
         }
         // No usable dispatch info — surface to stderr so the
@@ -2811,15 +2885,16 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
             // call `call_closure_jit_or_sync`, which itself takes
             // `&mut vm`. Re-fetch the VM here.
             if let Some(vm) = unsafe { vm_ref() } {
-                let args_val: smallvec::SmallVec<[Value; 5]> =
-                    args.iter().map(|&a| Value::from_bits(a)).collect();
-                return call_closure_jit_or_sync(vm, closure_for_fallback, &args_val, None);
+                return call_closure_jit_or_sync(
+                    vm,
+                    closure_for_fallback,
+                    &collect_args(),
+                    None,
+                );
             }
             return Value::null().to_bits();
         }
-        let args_val: smallvec::SmallVec<[Value; 5]> =
-            args.iter().map(|&a| Value::from_bits(a)).collect();
-        return unsafe { call_jit_with_shadow_raw(call_ptr, &args_val) };
+        return unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
     }
     // Same revalidation as the kind=1 fast path — kind != 1 was
     // also using the cached `jit_ptr` without re-checking it
@@ -2854,9 +2929,7 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     }
     if !closure_for_fallback.is_null() {
         if let Some(vm) = unsafe { vm_ref() } {
-            let args_val: smallvec::SmallVec<[Value; 5]> =
-                args.iter().map(|&a| Value::from_bits(a)).collect();
-            return call_closure_jit_or_sync(vm, closure_for_fallback, &args_val, None);
+            return call_closure_jit_or_sync(vm, closure_for_fallback, &collect_args(), None);
         }
         return Value::null().to_bits();
     }
@@ -2868,11 +2941,12 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     });
     let depth = jit_depth();
     set_jit_depth(depth + 1);
-    let args_val: smallvec::SmallVec<[Value; 5]> =
-        args.iter().map(|&a| Value::from_bits(a)).collect();
-    let result = unsafe { call_jit_with_shadow_raw(call_ptr, &args_val) };
+    let result = unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
     set_jit_depth(depth);
     set_jit_context(saved_ctx);
+    result
+    })();
+    jit_roots_restore_len(root_base);
     result
 }
 
