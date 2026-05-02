@@ -35,7 +35,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::pump_events::EventLoopExtPumpEvents;
 use winit::window::{Window, WindowId};
 
-use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjMap, ObjString, ObjType};
+use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
@@ -487,13 +487,19 @@ pub unsafe extern "C" fn wlift_window_size(vm: *mut VM) {
                 .map(|wnd| (wnd.width, wnd.height))
                 .unwrap_or((0, 0))
         });
+        // GC rooting: see `wlift_image_decode` for the pattern.
+        // Set the map as the return slot before any subsequent
+        // alloc, write keys via direct `(*map_ptr).set` so each
+        // key string is committed to the map's hash table the
+        // moment after it's allocated.
         let context = ctx(vm);
         let map = context.alloc_map();
-        let kw = context.alloc_string("width".to_string());
-        let kh = context.alloc_string("height".to_string());
-        let _ = context.call_method_on(map, "[_]=(_)", &[kw, Value::num(w as f64)]);
-        let _ = context.call_method_on(map, "[_]=(_)", &[kh, Value::num(h as f64)]);
         set_return(vm, map);
+        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
+        let kw = context.alloc_string("width".to_string());
+        (*map_ptr).set(kw, Value::num(w as f64));
+        let kh = context.alloc_string("height".to_string());
+        (*map_ptr).set(kh, Value::num(h as f64));
     }
 }
 
@@ -527,66 +533,89 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut VM) {
                 .unwrap_or_default()
         });
 
+        // GC-rooted result list build. Same shape as
+        // `wlift_sqlite_query`'s rebuild — accumulating maps in a
+        // plain `Vec<Value>` was leaving them unrooted across the
+        // inner `alloc_string` calls, so a collection mid-loop
+        // would free partially-built event maps. Allocate the
+        // result list first, set it as slot 0 (GC-rooted via
+        // `api_stack`), append each fresh map to the list before
+        // populating fields. Switched per-field assignment from
+        // `call_method_on(_, "[_]=(_)", ...)` to direct
+        // `(*map_ptr).set` so key + value commit happens
+        // immediately after the key alloc, with no intervening
+        // method-dispatch path that could allocate.
         let context = ctx(vm);
-        let mut entries: Vec<Value> = Vec::with_capacity(events.len());
+        let result = context.alloc_list(Vec::new());
+        set_return(vm, result);
+        let result_ptr = result.as_object().unwrap() as *mut ObjList;
+
         for ev in events {
             let m = context.alloc_map();
+            let map_ptr = m.as_object().unwrap() as *mut ObjMap;
+            (*result_ptr).add(m);
             let key_type = context.alloc_string("type".to_string());
             match ev {
                 EventRecord::CloseRequested => {
                     let v = context.alloc_string("close".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
                 }
                 EventRecord::Resized { width, height } => {
                     let v = context.alloc_string("resize".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
                     let kw = context.alloc_string("width".to_string());
+                    (*map_ptr).set(kw, Value::num(width as f64));
                     let kh = context.alloc_string("height".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kw, Value::num(width as f64)]);
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kh, Value::num(height as f64)]);
+                    (*map_ptr).set(kh, Value::num(height as f64));
                 }
                 EventRecord::KeyDown { code } => {
                     let v = context.alloc_string("keyDown".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
+                    // Two-step: commit the key with a null value so
+                    // the map's hash table holds the key string
+                    // across the next `alloc_string`. Without this
+                    // intermediate set, allocating `cv` would
+                    // potentially GC `kc` (the key) since `kc` is
+                    // only a Rust local, not a GC root.
                     let kc = context.alloc_string("code".to_string());
+                    (*map_ptr).set(kc, Value::null());
                     let cv = context.alloc_string(code);
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kc, cv]);
+                    (*map_ptr).set(kc, cv);
                 }
                 EventRecord::KeyUp { code } => {
                     let v = context.alloc_string("keyUp".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
                     let kc = context.alloc_string("code".to_string());
+                    (*map_ptr).set(kc, Value::null());
                     let cv = context.alloc_string(code);
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kc, cv]);
+                    (*map_ptr).set(kc, cv);
                 }
                 EventRecord::MouseMoved { x, y } => {
                     let v = context.alloc_string("mouseMoved".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
                     let kx = context.alloc_string("x".to_string());
+                    (*map_ptr).set(kx, Value::num(x));
                     let ky = context.alloc_string("y".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kx, Value::num(x)]);
-                    let _ = context.call_method_on(m, "[_]=(_)", &[ky, Value::num(y)]);
+                    (*map_ptr).set(ky, Value::num(y));
                 }
                 EventRecord::MouseDown { button } => {
                     let v = context.alloc_string("mouseDown".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
                     let kb = context.alloc_string("button".to_string());
+                    (*map_ptr).set(kb, Value::null());
                     let bv = context.alloc_string(button);
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kb, bv]);
+                    (*map_ptr).set(kb, bv);
                 }
                 EventRecord::MouseUp { button } => {
                     let v = context.alloc_string("mouseUp".to_string());
-                    let _ = context.call_method_on(m, "[_]=(_)", &[key_type, v]);
+                    (*map_ptr).set(key_type, v);
                     let kb = context.alloc_string("button".to_string());
+                    (*map_ptr).set(kb, Value::null());
                     let bv = context.alloc_string(button);
-                    let _ = context.call_method_on(m, "[_]=(_)", &[kb, bv]);
+                    (*map_ptr).set(kb, bv);
                 }
             }
-            entries.push(m);
         }
-
-        let list = context.alloc_list(entries);
-        set_return(vm, list);
     }
 }
 
@@ -623,65 +652,67 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
             return;
         };
 
+        // Same GC-rooting pattern as the events list above.
+        // `set_return` lands the map in slot 0 (GC-rooted via
+        // api_stack). `key_platform` gets committed with a null
+        // placeholder right after allocation so the map's hash
+        // table holds the key string across the match arms below
+        // — without that, any `alloc_string` inside a match arm
+        // would race a GC that could free the unrooted key.
+        // Direct `(*map_ptr).set` instead of method-dispatch
+        // `call_method_on(_, "[_]=(_)", ...)` for the same
+        // reason: shorter window between key alloc and value
+        // commit.
         use raw_window_handle::RawWindowHandle;
         let context = ctx(vm);
         let map = context.alloc_map();
+        set_return(vm, map);
+        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
         let key_platform = context.alloc_string("platform".to_string());
+        (*map_ptr).set(key_platform, Value::null());
 
         match win {
             RawWindowHandle::AppKit(h) => {
                 let v = context.alloc_string("appkit".to_string());
-                let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
+                (*map_ptr).set(key_platform, v);
                 let kv = context.alloc_string("ns_view".to_string());
-                let val = Value::num(h.ns_view.as_ptr() as usize as f64);
-                let _ = context.call_method_on(map, "[_]=(_)", &[kv, val]);
+                (*map_ptr).set(kv, Value::num(h.ns_view.as_ptr() as usize as f64));
             }
             RawWindowHandle::UiKit(h) => {
                 let v = context.alloc_string("uikit".to_string());
-                let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
+                (*map_ptr).set(key_platform, v);
                 let kv = context.alloc_string("ui_view".to_string());
-                let val = Value::num(h.ui_view.as_ptr() as usize as f64);
-                let _ = context.call_method_on(map, "[_]=(_)", &[kv, val]);
+                (*map_ptr).set(kv, Value::num(h.ui_view.as_ptr() as usize as f64));
             }
             RawWindowHandle::Win32(h) => {
                 let v = context.alloc_string("win32".to_string());
-                let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
+                (*map_ptr).set(key_platform, v);
                 let kh = context.alloc_string("hwnd".to_string());
-                let _ =
-                    context.call_method_on(map, "[_]=(_)", &[kh, Value::num(h.hwnd.get() as f64)]);
+                (*map_ptr).set(kh, Value::num(h.hwnd.get() as f64));
                 if let Some(hi) = h.hinstance {
                     let key_hinstance = context.alloc_string("hinstance".to_string());
-                    let _ = context.call_method_on(
-                        map,
-                        "[_]=(_)",
-                        &[key_hinstance, Value::num(hi.get() as f64)],
-                    );
+                    (*map_ptr).set(key_hinstance, Value::num(hi.get() as f64));
                 }
             }
             RawWindowHandle::Xlib(h) => {
                 let v = context.alloc_string("xlib".to_string());
-                let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
+                (*map_ptr).set(key_platform, v);
                 let kw = context.alloc_string("window".to_string());
-                let _ = context.call_method_on(map, "[_]=(_)", &[kw, Value::num(h.window as f64)]);
+                (*map_ptr).set(kw, Value::num(h.window as f64));
                 if h.visual_id != 0 {
                     let kvi = context.alloc_string("visual_id".to_string());
-                    let _ = context.call_method_on(
-                        map,
-                        "[_]=(_)",
-                        &[kvi, Value::num(h.visual_id as f64)],
-                    );
+                    (*map_ptr).set(kvi, Value::num(h.visual_id as f64));
                 }
             }
             RawWindowHandle::Wayland(h) => {
                 let v = context.alloc_string("wayland".to_string());
-                let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
+                (*map_ptr).set(key_platform, v);
                 let ks = context.alloc_string("surface".to_string());
-                let val = Value::num(h.surface.as_ptr() as usize as f64);
-                let _ = context.call_method_on(map, "[_]=(_)", &[ks, val]);
+                (*map_ptr).set(ks, Value::num(h.surface.as_ptr() as usize as f64));
             }
             other => {
                 let v = context.alloc_string(format!("{:?}", other).to_lowercase());
-                let _ = context.call_method_on(map, "[_]=(_)", &[key_platform, v]);
+                (*map_ptr).set(key_platform, v);
             }
         }
 
@@ -697,28 +728,23 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
                         RawDisplayHandle::Xlib(d) => {
                             if let Some(p) = d.display {
                                 let key = context.alloc_string("display".to_string());
-                                let val = Value::num(p.as_ptr() as usize as f64);
-                                let _ = context.call_method_on(map, "[_]=(_)", &[key, val]);
+                                (*map_ptr).set(key, Value::num(p.as_ptr() as usize as f64));
                             }
                         }
                         RawDisplayHandle::Xcb(d) => {
                             if let Some(p) = d.connection {
                                 let key = context.alloc_string("connection".to_string());
-                                let val = Value::num(p.as_ptr() as usize as f64);
-                                let _ = context.call_method_on(map, "[_]=(_)", &[key, val]);
+                                (*map_ptr).set(key, Value::num(p.as_ptr() as usize as f64));
                             }
                         }
                         RawDisplayHandle::Wayland(d) => {
                             let key = context.alloc_string("display".to_string());
-                            let val = Value::num(d.display.as_ptr() as usize as f64);
-                            let _ = context.call_method_on(map, "[_]=(_)", &[key, val]);
+                            (*map_ptr).set(key, Value::num(d.display.as_ptr() as usize as f64));
                         }
                         _ => {}
                     }
                 }
             }
         });
-
-        set_return(vm, map);
     }
 }

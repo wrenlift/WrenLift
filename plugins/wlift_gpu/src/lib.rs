@@ -729,22 +729,34 @@ pub unsafe extern "C" fn wlift_gpu_device_info(vm: *mut VM) {
             rec.adapter.get_info()
         };
 
+        // GC rooting: alloc + commit each (key, value) pair
+        // back-to-back so no field stays unrooted across a
+        // subsequent allocator call. Map goes into slot 0 first
+        // (api_stack root). For pairs where both key and value
+        // are `alloc_string`, the key is committed with a null
+        // placeholder before the value is allocated, then
+        // overwritten — that way the key string is reachable
+        // through the map's hash table during the value's alloc
+        // window. See `wlift_sqlite_query` for the same pattern.
         let context = ctx(vm);
         let result = context.alloc_map();
-        let name = context.alloc_string(info.name.clone());
-        let backend = context.alloc_string(format!("{:?}", info.backend).to_lowercase());
-        let device_type = context.alloc_string(format!("{:?}", info.device_type).to_lowercase());
-
-        // Push values into the Map. ObjMap exposes a Wren-side
-        // `[k]=v` setter, but from Rust we go through the public
-        // `call_method_on` helper to drive it.
-        let key_name = context.alloc_string("name".to_string());
-        let key_backend = context.alloc_string("backend".to_string());
-        let key_device_type = context.alloc_string("deviceType".to_string());
-        let _ = context.call_method_on(result, "[_]=(_)", &[key_name, name]);
-        let _ = context.call_method_on(result, "[_]=(_)", &[key_backend, backend]);
-        let _ = context.call_method_on(result, "[_]=(_)", &[key_device_type, device_type]);
         set_return(vm, result);
+        let map_ptr = result.as_object().unwrap() as *mut ObjMap;
+
+        let key_name = context.alloc_string("name".to_string());
+        (*map_ptr).set(key_name, Value::null());
+        let name = context.alloc_string(info.name.clone());
+        (*map_ptr).set(key_name, name);
+
+        let key_backend = context.alloc_string("backend".to_string());
+        (*map_ptr).set(key_backend, Value::null());
+        let backend = context.alloc_string(format!("{:?}", info.backend).to_lowercase());
+        (*map_ptr).set(key_backend, backend);
+
+        let key_device_type = context.alloc_string("deviceType".to_string());
+        (*map_ptr).set(key_device_type, Value::null());
+        let device_type = context.alloc_string(format!("{:?}", info.device_type).to_lowercase());
+        (*map_ptr).set(key_device_type, device_type);
     }
 }
 
@@ -3582,13 +3594,15 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut VM) {
         // Return the post-clamp dimensions so the caller can size
         // its camera / depth attachment to match the actual surface
         // (which may have been clamped to `max_texture_dimension_2d`).
+        // GC-rooted single-Map build: see `wlift_image_decode`.
         let context = ctx(vm);
         let map = context.alloc_map();
-        let kw = context.alloc_string("width".to_string());
-        let kh = context.alloc_string("height".to_string());
-        let _ = context.call_method_on(map, "[_]=(_)", &[kw, Value::num(cw as f64)]);
-        let _ = context.call_method_on(map, "[_]=(_)", &[kh, Value::num(ch as f64)]);
         set_return(vm, map);
+        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
+        let kw = context.alloc_string("width".to_string());
+        (*map_ptr).set(kw, Value::num(cw as f64));
+        let kh = context.alloc_string("height".to_string());
+        (*map_ptr).set(kh, Value::num(ch as f64));
     }
 }
 
@@ -3645,15 +3659,15 @@ pub unsafe extern "C" fn wlift_gpu_surface_acquire(vm: *mut VM) {
         );
 
         // Return a Wren Map { "frame": frame_id, "view": view_id }.
+        // GC-rooted single-Map build.
         let context = ctx(vm);
         let map = context.alloc_map();
-        let key_frame = context.alloc_string("frame".to_string());
-        let key_view = context.alloc_string("view".to_string());
-        let frame_v = Value::num(frame_id as f64);
-        let view_v = Value::num(view_id as f64);
-        let _ = context.call_method_on(map, "[_]=(_)", &[key_frame, frame_v]);
-        let _ = context.call_method_on(map, "[_]=(_)", &[key_view, view_v]);
         set_return(vm, map);
+        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
+        let key_frame = context.alloc_string("frame".to_string());
+        (*map_ptr).set(key_frame, Value::num(frame_id as f64));
+        let key_view = context.alloc_string("view".to_string());
+        (*map_ptr).set(key_view, Value::num(view_id as f64));
     }
 }
 

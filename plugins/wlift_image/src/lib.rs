@@ -13,7 +13,7 @@
 use std::io::Cursor;
 
 use wren_lift::runtime::object::{
-    NativeContext, ObjHeader, ObjList, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
+    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
 };
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
@@ -161,14 +161,36 @@ pub unsafe extern "C" fn wlift_image_decode(vm: *mut VM) {
             }
         }
 
+        // GC rooting: alloc the map first and drop it into slot 0
+        // (the canonical return slot, scanned as a GC root via
+        // `vm.api_stack`). The pre-allocated `arr` ByteArray is
+        // unrooted in its local Rust binding, so we stash it on
+        // `api_stack` as a temp root before any further alloc —
+        // otherwise `alloc_string` for the keys could trigger a
+        // collection that frees `arr` before we install it into
+        // the map. Each key is `set` into the map immediately
+        // after allocation; the map's hash table holds the key
+        // string once written, so no separate roothold needed.
+        // Direct `(*map_ptr).set` instead of `call_method_on(_,
+        // "[_]=(_)", ...)` because method dispatch runs more
+        // allocator-touching code between key alloc and value
+        // commit.
+        (*vm).api_stack.push(arr);
+        let arr_slot = (*vm).api_stack.len() - 1;
         let map = context.alloc_map();
-        let kw = context.alloc_string("width".to_string());
-        let kh = context.alloc_string("height".to_string());
-        let kp = context.alloc_string("pixels".to_string());
-        let _ = context.call_method_on(map, "[_]=(_)", &[kw, Value::num(w as f64)]);
-        let _ = context.call_method_on(map, "[_]=(_)", &[kh, Value::num(h as f64)]);
-        let _ = context.call_method_on(map, "[_]=(_)", &[kp, arr]);
         set_return(vm, map);
+        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
+        let kw = context.alloc_string("width".to_string());
+        (*map_ptr).set(kw, Value::num(w as f64));
+        let kh = context.alloc_string("height".to_string());
+        (*map_ptr).set(kh, Value::num(h as f64));
+        let kp = context.alloc_string("pixels".to_string());
+        let arr_rooted = {
+            let stack = &(*vm).api_stack;
+            stack[arr_slot]
+        };
+        (*map_ptr).set(kp, arr_rooted);
+        (*vm).api_stack.pop();
     }
 }
 
