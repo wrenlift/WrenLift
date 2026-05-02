@@ -135,8 +135,14 @@ main() {
   sum_url="${archive_url}.sha256"
 
   tmpdir=$(mktemp -d)
-  # Clean the tmpdir when the script exits, success or not.
-  trap 'rm -rf "$tmpdir"' EXIT
+  # Clean the tmpdir when the script exits, success or not. The
+  # `${tmpdir:-}` expansion guards against `set -u`: by the time
+  # the EXIT trap fires, `tmpdir` is a function-local that's
+  # already gone out of scope, so a bare `$tmpdir` would error
+  # ("unbound variable") and propagate non-zero from a successful
+  # install — exactly the bug we hit on Fly's debian:bookworm-slim
+  # builder where `set -u` is in force.
+  trap 'rm -rf "${tmpdir:-}"' EXIT
 
   say "Downloading $archive_name…"
   curl -fsSL -o "$tmpdir/$archive_name" "$archive_url" \
