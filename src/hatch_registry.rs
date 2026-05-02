@@ -532,6 +532,8 @@ mod tests {
                 native_search_paths: Vec::new(),
                 plugin_source: None,
                 target: None,
+                homepage: None,
+                readme: None,
             },
             sections: Vec::new(),
         };

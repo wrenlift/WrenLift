@@ -833,6 +833,10 @@ mod tests {
             git: "https://github.com/wrenlift/hatch.git".into(),
             description: Some("JSON parsing".into()),
             owner: None,
+            homepage: None,
+            readme: None,
+            docs_url: None,
+            readme_url: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(
