@@ -358,22 +358,66 @@ fn mir_calls_jit_unsafe_fiber_method(
     mir: &MirFunction,
     interner: &crate::intern::Interner,
 ) -> bool {
+    direct_yield_method_names()
+        .iter()
+        .any(|n| mir_calls_method_named(mir, interner, n))
+}
+
+/// Method names that directly suspend the running fiber via
+/// `Fiber.yield` / `.suspend` / `.try` / `.transfer*`. The JIT can't
+/// currently unwind across these — the C-stack frame holding the
+/// JIT'd function's locals isn't part of the saved fiber state, so
+/// after the resume the spilled receiver register decays to the
+/// uninitialized-slot sentinel (`TAG_UNDEFINED`) and the next method
+/// call surfaces as `Object does not implement '...'`.
+///
+/// `call()` / `call(_)` is intentionally NOT here — see the doc
+/// comment on `mir_calls_jit_unsafe_fiber_method`.
+fn direct_yield_method_names() -> &'static [&'static str] {
+    &[
+        "yield()",
+        "yield(_)",
+        "suspend()",
+        "try()",
+        "try(_)",
+        "transfer()",
+        "transfer(_)",
+        "transferError(_)",
+    ]
+}
+
+fn mir_calls_method_named(
+    mir: &MirFunction,
+    interner: &crate::intern::Interner,
+    name: &str,
+) -> bool {
     use crate::mir::Instruction;
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             if let Instruction::Call { method, .. } = inst {
-                let name = interner.resolve(*method);
-                if matches!(
-                    name,
-                    "yield()"
-                        | "yield(_)"
-                        | "suspend()"
-                        | "try()"
-                        | "try(_)"
-                        | "transfer()"
-                        | "transfer(_)"
-                        | "transferError(_)"
-                ) {
+                if interner.resolve(*method) == name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Walk a single function's MIR and return true if it calls any
+/// method whose symbol appears in `tainted`. Used to extend the
+/// direct-yield refusal into a transitive one — if `f` calls
+/// `g.method`, and any function named `method` may itself yield, `f`
+/// is also unsafe to JIT.
+fn mir_calls_any_tainted_method(
+    mir: &MirFunction,
+    tainted: &std::collections::HashSet<crate::intern::SymbolId>,
+) -> bool {
+    use crate::mir::Instruction;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            if let Instruction::Call { method, .. } = inst {
+                if tainted.contains(method) {
                     return true;
                 }
             }
@@ -566,6 +610,30 @@ pub struct ExecutionEngine {
     /// O(1) lookup on the IC hot path. Both share the same
     /// invalidation key (`functions.len()`).
     cached_alloc_free_vec: Vec<bool>,
+}
+
+// Cache for the transitive may-yield method-name set. Held in a
+// thread_local rather than as an `ExecutionEngine` field because
+// plugins (cdylibs) are compiled against the host's published
+// `VM` / `ExecutionEngine` layout — adding fields would drift the
+// struct size and the next foreign call from a stale plugin would
+// SIGSEGV (see `project_plugin_feature_abi.md`).
+//
+// Invalidates when the `ExecutionEngine` whose pointer it last saw
+// changes, or when its function-table length grew. The pointer
+// guard handles process restarts that recreate the VM at the same
+// `functions.len()`; the length guard handles new functions being
+// registered after a previous compute.
+thread_local! {
+    static MAY_YIELD_CACHE: std::cell::RefCell<MayYieldCache> =
+        std::cell::RefCell::new(MayYieldCache::default());
+}
+
+#[derive(Default)]
+struct MayYieldCache {
+    last_engine: usize,
+    last_len: usize,
+    set: Option<Arc<std::collections::HashSet<crate::intern::SymbolId>>>,
 }
 
 /// Address range of a compiled function's native code.
@@ -1037,6 +1105,71 @@ impl ExecutionEngine {
         self.cached_purity_map = Some(purity);
         self.cached_alloc_free_map = Some(alloc_free);
         self.cached_purity_map_len = n;
+    }
+
+    /// Build (or refresh) the cached set of method-name symbols whose
+    /// implementation transitively touches a JIT-unsafe fiber control
+    /// method. Seeded with the direct names, then iterated to a
+    /// fixed point: a function `f` named `m` is added to the set
+    /// whenever its MIR contains a `Call` whose method is already
+    /// in the set. Cache lives in a thread_local so the
+    /// `ExecutionEngine` struct layout stays binary-compatible with
+    /// already-loaded native plugins (see `MAY_YIELD_CACHE`).
+    pub fn compute_may_yield_methods(
+        &self,
+        interner: &crate::intern::Interner,
+    ) -> Arc<std::collections::HashSet<crate::intern::SymbolId>> {
+        let engine_id = self as *const ExecutionEngine as usize;
+        let len = self.functions.len();
+        // Fast path: cache hit on both engine identity and table length.
+        if let Some(arc) = MAY_YIELD_CACHE.with(|cell| {
+            let c = cell.borrow();
+            if c.last_engine == engine_id && c.last_len == len {
+                c.set.as_ref().map(Arc::clone)
+            } else {
+                None
+            }
+        }) {
+            return arc;
+        }
+
+        use std::collections::HashSet;
+        let mut tainted: HashSet<crate::intern::SymbolId> = HashSet::new();
+        for n in direct_yield_method_names() {
+            if let Some(sym) = interner.lookup(n) {
+                tainted.insert(sym);
+            }
+        }
+        // Fixed-point iteration. Each pass marks any function whose
+        // body calls a tainted method as itself tainted (under its
+        // mir.name). Bound by the function count + 1 so we always
+        // terminate even if every iteration adds exactly one new
+        // entry.
+        let bound = len.saturating_add(1);
+        for _ in 0..bound {
+            let mut changed = false;
+            for body in &self.functions {
+                let name_sym = body.mir().name;
+                if tainted.contains(&name_sym) {
+                    continue;
+                }
+                if mir_calls_any_tainted_method(body.mir(), &tainted) {
+                    tainted.insert(name_sym);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let arc = Arc::new(tainted);
+        MAY_YIELD_CACHE.with(|cell| {
+            let mut c = cell.borrow_mut();
+            c.last_engine = engine_id;
+            c.last_len = len;
+            c.set = Some(Arc::clone(&arc));
+        });
+        arc
     }
 
     /// A "pure leaf" function has no internal method calls — Cranelift
@@ -1745,9 +1878,9 @@ impl ExecutionEngine {
         let Some(tier) = self.next_compile_tier(idx) else {
             return self.tier_state(id) != TierState::Interpreted;
         };
-        let Some(body) = self.functions.get(idx) else {
+        if idx >= self.functions.len() {
             return false;
-        };
+        }
         // Skip JIT for functions that directly call `Fiber.yield()` /
         // `Fiber.suspend()`. The JIT's `handle_jit_fiber_action`
         // Yield/Suspend branches are stubs that simply return the
@@ -1760,7 +1893,23 @@ impl ExecutionEngine {
         // to compile yielding functions and let the bytecode
         // interpreter (whose `handle_fiber_action_bc` does suspend
         // properly) handle them.
+        //
+        // Direct check first, then transitive: a function that calls
+        // a method whose implementation may itself yield is just as
+        // unsafe as one that yields directly. The taint propagates
+        // through the call graph (e.g. `Http_.readRequest` calls
+        // `buf.readLine` which calls `fill_()` which calls
+        // `Fiber.yield()` — readRequest is now correctly excluded).
+        // Compute the tainted set first (mutable borrow), then take
+        // an immutable borrow of `self.functions[idx]` for the
+        // checks — keeping these on separate lines avoids the
+        // borrow conflict.
+        let tainted = self.compute_may_yield_methods(interner);
+        let body = &self.functions[idx];
         if mir_calls_jit_unsafe_fiber_method(body.mir(), interner) {
+            return false;
+        }
+        if mir_calls_any_tainted_method(body.mir(), &tainted) {
             return false;
         }
         // Skip JIT compilation for functions named in WLIFT_SKIP_JIT env var
@@ -1851,8 +2000,20 @@ impl ExecutionEngine {
         let Some(tier) = self.next_compile_tier(idx) else {
             return;
         };
+        // Direct + transitive yield-method check — same shape as the
+        // gate in `should_request_compile`; both refuse the JIT for
+        // any function whose call graph reaches `Fiber.yield`.
+        let direct_unsafe = self
+            .functions
+            .get(idx)
+            .map(|body| mir_calls_jit_unsafe_fiber_method(body.mir(), interner))
+            .unwrap_or(false);
+        if direct_unsafe {
+            return;
+        }
+        let tainted = self.compute_may_yield_methods(interner);
         if let Some(body) = self.functions.get(idx) {
-            if mir_calls_jit_unsafe_fiber_method(body.mir(), interner) {
+            if mir_calls_any_tainted_method(body.mir(), &tainted) {
                 return;
             }
         }
