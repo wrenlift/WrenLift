@@ -30,7 +30,9 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
+use wren_lift::runtime::object::{
+    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
+};
 use wren_lift::runtime::value::Value;
 use wren_lift::runtime::vm::VM;
 
@@ -159,6 +161,27 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
             let s = ptr as *const ObjString;
             Ok(SqlValue::Text(unsafe { (*s).as_str().to_string() }))
         }
+        // ByteArray is the canonical blob carrier — `sql_to_wren`
+        // returns one for every BLOB column read, so a round-trip
+        // (`db.query(...)["b"]` → bind back) doesn't need a manual
+        // List<Num> conversion in Wren.
+        ObjType::TypedArray => {
+            let arr = ptr as *const ObjTypedArray;
+            if unsafe { (*arr).kind_tag() } != TypedArrayKind::U8 {
+                return Err(format!(
+                    "{}: BLOB parameter must be a ByteArray (got {:?}).",
+                    label,
+                    unsafe { (*arr).kind_tag() }
+                ));
+            }
+            let bytes = unsafe { (*arr).as_bytes() }.to_vec();
+            Ok(SqlValue::Blob(bytes))
+        }
+        // Backwards-compatible List<Num> path. Pre-ByteArray
+        // versions of `@hatch:sqlite` accepted blobs as a Wren
+        // List of integers in 0..=255; existing call sites
+        // (`db.execute("INSERT … blob = ?", [[0xde, 0xad]])`) keep
+        // working unchanged. New code should prefer ByteArray.
         ObjType::List => {
             let lst = ptr as *const ObjList;
             let (count, data) = unsafe { ((*lst).count as usize, (*lst).elements) };
@@ -188,9 +211,20 @@ fn sql_to_wren(ctx: &mut dyn NativeContext, v: SqlValue) -> Value {
         SqlValue::Integer(i) => Value::num(i as f64),
         SqlValue::Real(f) => Value::num(f),
         SqlValue::Text(s) => ctx.alloc_string(s),
+        // BLOB → ByteArray. Half the memory of a List<Num> per
+        // element (1 byte vs 8-byte boxed Value), zero per-element
+        // GC overhead, and a `Response.bytes(...)`-friendly shape
+        // for callers that want to forward the column verbatim.
+        // `wren_to_sql` accepts both ByteArray and the legacy
+        // List<Num> on the bind side so existing code that builds
+        // blobs as Wren lists keeps working.
         SqlValue::Blob(b) => {
-            let elems: Vec<Value> = b.iter().map(|&x| Value::num(x as f64)).collect();
-            ctx.alloc_list(elems)
+            let value = ctx.alloc_typed_array(b.len() as u32, TypedArrayKind::U8);
+            let arr_ptr = value.as_object().unwrap() as *mut ObjTypedArray;
+            if !b.is_empty() {
+                unsafe { (*arr_ptr).as_bytes_mut().copy_from_slice(&b) };
+            }
+            value
         }
     }
 }
