@@ -235,8 +235,21 @@ pub struct GcConfig {
 
 impl Default for GcConfig {
     fn default() -> Self {
+        // Default sized for typical webapp / CLI workloads (a few
+        // MB of live working set). The benchmark suite (e.g.
+        // `binary_trees` with N=21) needs roughly 512MB to avoid
+        // promoting into the major heap on every cycle, so the
+        // bench harness opts in via `WLIFT_GC_NURSERY_MB=512`.
+        // Webapps on small VMs (Fly's shared-cpu-1x, 256/512MB)
+        // can't even *allocate* a 512MB nursery upfront; the
+        // process aborts at init with "memory allocation of
+        // 536870912 bytes failed" before serving a request.
+        let nursery_mb = std::env::var("WLIFT_GC_NURSERY_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(64);
         Self {
-            nursery_size: 512 * 1024 * 1024, // 512 MB — fits binary_trees fully
+            nursery_size: nursery_mb * 1024 * 1024,
             initial_threshold: 256,
             heap_grow_factor: 2.0,
             major_gc_interval: 8,
