@@ -1,10 +1,11 @@
-# WrenLift runtime / compiler quirks
+# WrenLift runtime and tooling quirks
 
-Running list of places where WrenLift diverges from stock Wren. Open
-items track real divergence; the Fixed section keeps a one-paragraph
-record of why a previous bug existed. Anything that "no longer
-reproduces" without a known cause has been pruned — re-open if it
-surfaces again.
+User-facing divergence from stock Wren in the runtime (interpreter,
+JIT, GC, native bindings, fibers, parser surface) and the tooling
+around it (hatch CLI, LSP, playground). Open items track current
+divergence; Fixed keeps a one-paragraph record of past bugs so the
+git log retains the rationale. Forward-looking optimisation work
+lives elsewhere — this doc is for observed quirks only.
 
 ## Open
 
@@ -239,24 +240,3 @@ Fix: capture `stop_fiber` at run-loop entry; both `Op::Return`
 and `Op::ReturnNull` gate the depth check on
 `fiber == stop_fiber`. Regression test:
 `runtime::vm::tests::test_fiber_abort_through_closure_preserves_subsequent_calls`.
-
-## Roadmap
-
-Conservative-correct compromises we'd like to revisit once they
-pay off in observed benchmark / framework code.
-
-### Per-function memory-effect summaries for CSE / LICM / DCE
-
-Seed landed in commit ad6b4ed: a `pure_call: bool` flag on
-`Instruction::Call`, set at MIR-build time for known-pure builtins
-(Num arithmetic, comparisons, Math intrinsics, bitwise). CSE
-keeps its memory-read cache across pure calls.
-
-The full version walks the call graph, propagates a per-function
-effect summary (reads / writes / unknown) through call edges,
-and lets CSE keep the cache across user-defined leaf methods,
-LICM hoist a load past a provably-pure call, and DCE drop a
-call whose summary is "no observable effect" with unused result.
-Substantive work — needs an effect lattice on MIR, a worklist
-propagation pass, and care around foreign methods. Expand when
-a benchmark shows CSE losing on a specific user-defined leaf.
