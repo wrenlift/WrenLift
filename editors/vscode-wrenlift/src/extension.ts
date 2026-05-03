@@ -8,9 +8,28 @@ import {
 
 let client: LanguageClient | undefined;
 
+/// Resolve `${workspaceFolder}` and `${workspaceFolder:NAME}` in a
+/// user-supplied path. VS Code only substitutes these tokens for
+/// `launch.json` / `tasks.json` itself; arbitrary extension
+/// settings come back as literal strings, so we do it here.
+function resolveVariables(input: string): string {
+  return input
+    .replace(/\$\{workspaceFolder\}/g, () => {
+      const f = vscode.workspace.workspaceFolders?.[0];
+      return f ? f.uri.fsPath : "";
+    })
+    .replace(/\$\{workspaceFolder:([^}]+)\}/g, (_m, name) => {
+      const f = vscode.workspace.workspaceFolders?.find(
+        (w) => w.name === name,
+      );
+      return f ? f.uri.fsPath : "";
+    });
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const config = vscode.workspace.getConfiguration("wrenlift");
-  const command = config.get<string>("serverPath") || "wlift-lsp";
+  const rawCommand = config.get<string>("serverPath") || "wlift-lsp";
+  const command = resolveVariables(rawCommand);
 
   // The wlift-lsp binary is built from the same workspace as the
   // wlift runtime. The standard install script (install.sh) drops
