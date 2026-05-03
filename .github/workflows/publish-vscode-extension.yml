@@ -59,6 +59,15 @@ jobs:
       - name: Compile TypeScript
         run: npm run compile
 
+      # `vsce publish` packages whatever's in the working directory
+      # minus `.vscodeignore`. Compiling needed dev deps (typescript,
+      # @types/*), but the published .vsix should only carry runtime
+      # deps (`vscode-languageclient` + transitives). Prune now so
+      # the marketplace artifact stays small and dev-only modules
+      # don't ship.
+      - name: Prune to production deps
+        run: npm prune --omit=dev
+
       - name: Sanity-check version match
         shell: bash
         run: |

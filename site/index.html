@@ -399,9 +399,6 @@
   }
   .install-alt .pchip:hover { color: var(--ink); border-color: var(--ink); }
 
-  /* ---------- EDITOR SETUP ---------- */
-  #editor { padding: 56px 32px 24px; }
-
   /* ---------- TARGET PLATFORMS ---------- */
   #targets { padding: 64px 32px 24px; }
   .targets-grid {
@@ -709,6 +706,11 @@
 
   .embed-mode { display: none; }
   .embed-mode.active { display: block; }
+
+  /* ---------- EDITOR SETUP ---------- */
+  #editor { padding: 80px 32px 32px; }
+  .editor-mode { display: none; }
+  .editor-mode.active { display: block; }
   .codepanel.hidden { display: none; }
 
   /* ---------- DIAGNOSTICS ---------- */
@@ -879,11 +881,11 @@
   </a>
   <div class="nav-links">
     <a href="#install">Install</a>
-    <a href="#editor">Editor</a>
     <a href="#targets">Targets</a>
     <a href="#diagnostics">Diagnostics</a>
     <a href="#embed">Embed</a>
     <a href="#hatch">Packages</a>
+    <a href="#editor">Editor</a>
     <a href="benchmark/">Benchmarks</a>
     <a href="https://github.com/wrenlift">GitHub</a>
     <a class="nav-cta" href="https://github.com/wrenlift/WrenLift">
@@ -985,49 +987,6 @@
         <span>or build from source</span>
         <a class="pchip" href="https://github.com/wrenlift/WrenLift">cargo install --git github.com/wrenlift/WrenLift</a>
       </div>
-    </div>
-  </div>
-</section>
-
-<!-- EDITOR SETUP -->
-<section id="editor">
-  <div class="targets-grid">
-    <div class="targets-text">
-      <span class="tag"><svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg> editors</span>
-      <h2>Wire up your <em>editor</em>.</h2>
-      <p>Diagnostics, hover, goto-definition (cross-package), member completion after <code>.</code>, and a one-click <b>▶ Run</b> codelens — driven by <code>wlift-lsp</code>, the language server bundled with every release tarball.</p>
-    </div>
-
-    <div class="targets-cards">
-      <article class="target-card">
-        <header>
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 6 12 3 21 6 21 18 12 21 3 18 3 6"/><path d="M12 3v18"/><path d="M3 6l9 6 9-6"/><path d="M3 18l9-6 9 6"/></svg>
-          VS Code
-        </header>
-        <p class="lede">marketplace · one-click install</p>
-        <ul>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span>Diagnostics, hover, goto-definition (local + workspace + <code>@hatch:</code> deps)</span></li>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span>Member completion after <code>.</code></span></li>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span>Inline <b>▶ Run</b> codelens on <code>main.wren</code> and <code>*.spec.wren</code></span></li>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span>Auto-installs <code>wlift-lsp</code> if it's missing</span></li>
-        </ul>
-        <div class="install-alt">
-          <a class="pchip" href="https://marketplace.visualstudio.com/items?itemName=Wrenlift.vscode-wrenlift">marketplace.visualstudio.com/Wrenlift.vscode-wrenlift</a>
-        </div>
-      </article>
-
-      <article class="target-card">
-        <header>
-          <svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/><path d="M9 4v16"/></svg>
-          Any LSP editor
-        </header>
-        <p class="lede">helix · neovim · zed · sublime · …</p>
-        <ul>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span><code>wlift-lsp</code> ships in the install tarball — same binary the VS Code extension drives</span></li>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span>stdio transport — point your editor's LSP config at <code>wlift-lsp</code> for <code>*.wren</code></span></li>
-          <li><span class="ck"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="5 12 10 17 19 7"/></svg></span><span>Same diagnostics, hover, completion, and goto-definition surface</span></li>
-        </ul>
-      </article>
     </div>
   </div>
 </section>
@@ -1357,6 +1316,119 @@ entry   = <span class="str">"main"</span>
   </div>
 </section>
 
+<!-- EDITOR SETUP -->
+<section id="editor">
+  <div class="embed-grid">
+    <div class="embed-text">
+      <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+        <span class="tag"><svg class="ti" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg> editor setup</span>
+        <div class="lang-toggle" id="editorToggle" role="tablist">
+          <button class="active" data-editor="vscode">VS Code</button>
+          <button data-editor="lsp">Any LSP</button>
+        </div>
+      </div>
+
+      <div class="editor-mode active" data-mode="vscode">
+        <h2>Wire up your <em>editor</em>.</h2>
+        <p>One-click install from the VS Code marketplace. Diagnostics, hover, goto-definition (cross-package), member completion after <code>.</code>, and an inline <b>▶ Run</b> codelens — all driven by <code>wlift-lsp</code>, the language server bundled with every release.</p>
+        <ul class="embed-points">
+          <li><span class="ck">✓</span><span><b>Diagnostics + hover.</b> Inline errors, type-aware hover cards on identifiers and calls.</span></li>
+          <li><span class="ck">✓</span><span><b>Goto-definition.</b> Local, workspace, and <code>@hatch:</code> dep sources — bundled <code>.hatch</code> sources extracted on demand.</span></li>
+          <li><span class="ck">✓</span><span><b>Member completion after <code>.</code>.</b> Receiver-aware suggestions.</span></li>
+          <li><span class="ck">✓</span><span><b>Inline <b>▶ Run</b> codelens.</b> On <code>main.wren</code> and <code>*.spec.wren</code>; routes through <code>hatch run</code> when a hatchfile is in scope.</span></li>
+          <li><span class="ck">✓</span><span><b>Auto-installs <code>wlift-lsp</code>.</b> If the binary's missing, the extension offers a one-click <code>install.sh</code> and auto-restarts when the binary lands.</span></li>
+        </ul>
+      </div>
+
+      <div class="editor-mode" data-mode="lsp">
+        <h2>Or any <em>LSP-speaking</em> editor.</h2>
+        <p>The same <code>wlift-lsp</code> binary the VS Code extension drives ships in every install tarball — drop it on <code>PATH</code>, point your editor at it, get the same diagnostics, hover, completion, and goto-definition surface.</p>
+        <ul class="embed-points">
+          <li><span class="ck">✓</span><span><b>Bundled.</b> One <code>install.sh</code> drops <code>wlift</code>, <code>hatch</code>, and <code>wlift-lsp</code> on <code>~/.local/bin</code>.</span></li>
+          <li><span class="ck">✓</span><span><b>stdio transport.</b> No socket setup, no daemon — your editor spawns the binary per workspace.</span></li>
+          <li><span class="ck">✓</span><span><b>Editors.</b> Helix, Neovim (vim.lsp 0.10+), and Zed configs in the panel; Sublime, Emacs, and Kakoune work from the same shape.</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- VS Code panel -->
+    <div class="codepanel" id="editorPanelVscode">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-pane="vscode-cli"><span>install</span><span class="ext">CLI</span></button>
+        <button class="tab" data-pane="vscode-marketplace"><span>marketplace</span><span class="ext">URL</span></button>
+      </div>
+      <div class="panes">
+<pre class="active" data-pane="vscode-cli"><span class="cmt"># install from a terminal</span>
+<span class="pr">$</span> code --install-extension <span class="accent">Wrenlift.vscode-wrenlift</span>
+<span class="ok">  installed</span> <span class="em">wrenlift v0.1.2</span>
+
+<span class="cmt"># open a .wren file — the LSP starts on first open.</span>
+<span class="cmt"># missing the wlift-lsp binary? the extension offers</span>
+<span class="cmt"># a one-click install and auto-restarts.</span>
+<span class="pr">$</span> code hello.wren</pre>
+
+<pre data-pane="vscode-marketplace"><span class="cmt"># or install from the Extensions panel</span>
+<span class="cmt">  search </span><span class="accent">Wrenlift</span><span class="cmt"> · click Install</span>
+
+<span class="cmt"># direct marketplace URL</span>
+  <span class="accent">marketplace.visualstudio.com</span>
+    <span class="accent">/items?itemName=Wrenlift.vscode-wrenlift</span>
+
+<span class="cmt"># settings to override binary paths (optional):</span>
+  <span class="kw">wrenlift.serverPath</span>  <span class="cmt">// wlift-lsp</span>
+  <span class="kw">wrenlift.wliftPath</span>   <span class="cmt">// wlift</span>
+  <span class="kw">wrenlift.hatchPath</span>   <span class="cmt">// hatch</span></pre>
+      </div>
+    </div>
+
+    <!-- LSP panel -->
+    <div class="codepanel hidden" id="editorPanelLsp">
+      <div class="tabs" role="tablist">
+        <button class="tab active" data-pane="lsp-helix"><span>languages.toml</span><span class="ext">HELIX</span></button>
+        <button class="tab" data-pane="lsp-nvim"><span>init.lua</span><span class="ext">NEOVIM</span></button>
+        <button class="tab" data-pane="lsp-zed"><span>settings.json</span><span class="ext">ZED</span></button>
+      </div>
+      <div class="panes">
+<pre class="active" data-pane="lsp-helix"><span class="cmt"># ~/.config/helix/languages.toml</span>
+[[<span class="ty">language</span>]]
+<span class="kw">name</span>             = <span class="str">"wren"</span>
+<span class="kw">file-types</span>       = [<span class="str">"wren"</span>]
+<span class="kw">roots</span>            = [<span class="str">"hatchfile"</span>]
+<span class="kw">language-servers</span> = [<span class="str">"wlift-lsp"</span>]
+
+[<span class="ty">language-server</span>.<span class="fn">wlift-lsp</span>]
+<span class="kw">command</span> = <span class="str">"wlift-lsp"</span></pre>
+
+<pre data-pane="lsp-nvim"><span class="cmt">-- init.lua (vim.lsp.config, neovim 0.11+)</span>
+vim.<span class="fn">filetype</span>.<span class="fn">add</span>({
+  extension = { wren = <span class="str">"wren"</span> },
+})
+
+vim.lsp.config[<span class="str">"wlift_lsp"</span>] = {
+  cmd          = { <span class="str">"wlift-lsp"</span> },
+  filetypes    = { <span class="str">"wren"</span> },
+  root_markers = { <span class="str">"hatchfile"</span> },
+}
+vim.lsp.<span class="fn">enable</span>(<span class="str">"wlift_lsp"</span>)</pre>
+
+<pre data-pane="lsp-zed"><span class="cmt">// ~/.config/zed/settings.json</span>
+{
+  <span class="str">"languages"</span>: {
+    <span class="str">"Wren"</span>: {
+      <span class="str">"language_servers"</span>: [<span class="str">"wlift-lsp"</span>]
+    }
+  },
+  <span class="str">"lsp"</span>: {
+    <span class="str">"wlift-lsp"</span>: {
+      <span class="str">"binary"</span>: { <span class="str">"path"</span>: <span class="str">"wlift-lsp"</span> }
+    }
+  }
+}</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- FOOTER -->
 <footer>
   <div class="foot-inner">
@@ -1366,8 +1438,8 @@ entry   = <span class="str">"main"</span>
     <div class="foot-links">
       <a href="https://github.com/wrenlift">GitHub</a>
       <a href="#install">Install</a>
-      <a href="#editor">Editor</a>
       <a href="#embed">Embed</a>
+      <a href="#editor">Editor</a>
       <a href="benchmark/">Benchmarks</a>
       <a href="https://github.com/wrenlift/hatch">Hatch</a>
       <a href="https://wren.io" target="_blank" rel="noopener">Wren</a>
@@ -1399,6 +1471,24 @@ entry   = <span class="str">"main"</span>
         panelW.classList.toggle('hidden', lang !== 'web');
       });
     });
+
+    // Editor-section: VS Code <-> Any LSP toggle. Mirrors the
+    // embed-section toggle but scoped to the editor panels.
+    const editorToggle = document.getElementById('editorToggle');
+    const editorPanelVscode = document.getElementById('editorPanelVscode');
+    const editorPanelLsp = document.getElementById('editorPanelLsp');
+    const editorModes = document.querySelectorAll('.editor-mode');
+    if (editorToggle) {
+      editorToggle.querySelectorAll('button').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const editor = btn.dataset.editor;
+          editorToggle.querySelectorAll('button').forEach(b => b.classList.toggle('active', b === btn));
+          editorModes.forEach(m => m.classList.toggle('active', m.dataset.mode === editor));
+          editorPanelVscode.classList.toggle('hidden', editor !== 'vscode');
+          editorPanelLsp.classList.toggle('hidden', editor !== 'lsp');
+        });
+      });
+    }
 
     // tab switching within either panel
     document.querySelectorAll('.codepanel').forEach(panel => {

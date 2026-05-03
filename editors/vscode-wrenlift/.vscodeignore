@@ -8,5 +8,9 @@ sample/**
 **/.eslintrc.json
 **/*.map
 **/*.ts
-node_modules/**
 .git/**
+
+# Keep production node_modules in the .vsix — the extension requires
+# `vscode-languageclient/node` at runtime. CI prunes dev deps with
+# `npm prune --omit=dev` before `vsce publish`, so only the LSP
+# client and its transitives ship.
