@@ -4,18 +4,32 @@
 [WrenLift](https://github.com/wrenlift/WrenLift) runtime and its
 companion language server.
 
+![WrenLift extension demo](https://raw.githubusercontent.com/wrenlift/WrenLift/main/editors/vscode-wrenlift/vscode-ext-demo.gif)
+
 ## Features
 
-- **Syntax highlighting** for `.wren` files: keywords, classes,
-  fields (`_name` instance, `__name` static), strings with
-  `%(…)` interpolation, doc comments (`///`, `//!`), and Hatch
-  cross-target attributes (`#!native`, `#!wasm`).
-- **Diagnostics** as you type: parse errors with the same messages
-  the CLI emits.
-- **Hover** for identifiers: signature + rendered Markdown from
-  `///` doc comments.
-- **Goto-definition, completion, signature help** — landing in
-  upcoming versions.
+- **Syntax highlighting** for `.wren` files and `hatchfile`
+  manifests: keywords, classes, fields (`_name` instance,
+  `__name` static), strings with `%(…)` interpolation, doc
+  comments (`///`, `//!`), and Hatch cross-target attributes
+  (`#!native`, `#!wasm`).
+- **Diagnostics** as you type: parse errors with the same
+  messages the CLI emits.
+- **Hover** for identifiers: signature + rendered Markdown
+  from `///` doc comments. Walks the local module, every
+  cached `[dependencies]` package, and the runtime prelude.
+- **Goto-definition** across the workspace and into bundled
+  `@hatch:*` dependency source. F12 on a class or member
+  jumps straight to its declaration.
+- **Member completion** after `.` — class members from local
+  classes, imported `@hatch:*` packages, workspace files, or
+  the prelude.
+- **Run code lens** above `main.wren` and `*.spec.wren` —
+  click to execute through `hatch run` (when a hatchfile is
+  in scope) or `wlift <path>` directly.
+- **Status bar + editor toolbar** for the language server's
+  start / stop / restart and a one-shot `Show Toolchain
+  Versions` command.
 
 ## Requirements
 
@@ -42,6 +56,27 @@ binary in VS Code settings.
 | Command | Description |
 |---|---|
 | `WrenLift: Restart Server` | Stop and re-spawn the language server. |
+
+## Releasing
+
+Tagged push to `vscode-v<X.Y.Z>` triggers
+`.github/workflows/publish-vscode-extension.yml`, which
+runs `vsce publish` against the Visual Studio Marketplace.
+Version is independent from the runtime's `v0.1.X` tag
+namespace.
+
+Cut a release:
+
+```sh
+# Bump the version in package.json first, then:
+git tag vscode-v0.1.0
+git push origin vscode-v0.1.0
+```
+
+The workflow asserts `package.json` version matches the
+tag suffix. Required GitHub secret: `VSCE_PAT` (a
+[Marketplace PAT](https://dev.azure.com)) with
+`Marketplace > Manage` scope.
 
 ## Repository
 

@@ -1,0 +1,88 @@
+name: Publish vscode-wrenlift
+
+# Publishes the VS Code extension to the Visual Studio Marketplace.
+# The extension is versioned independently from the wlift runtime
+# (its own tag namespace) so a runtime release doesn't force an
+# extension republish, and vice versa.
+#
+# Triggers:
+#
+#   * Tag push matching `vscode-v*` (e.g. `vscode-v0.1.0`).
+#     Extension is built from the tag's tree, version field in
+#     package.json must match the tag suffix.
+#   * Manual `workflow_dispatch` for re-publishing without
+#     cutting a fresh tag (e.g. recovering from a marketplace
+#     reject).
+#
+# Required secrets:
+#
+#   * `VSCE_PAT` — Visual Studio Marketplace personal access
+#     token, scope `Marketplace > Manage`. Generate at
+#     https://dev.azure.com/<org>/_usersSettings/tokens.
+
+on:
+  push:
+    tags:
+      - "vscode-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (must already exist)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build + publish
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode-wrenlift
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode-wrenlift/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run compile
+
+      - name: Sanity-check version match
+        shell: bash
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME:-${{ inputs.tag }}}"
+          version_in_pkg=$(node -p "require('./package.json').version")
+          expected="vscode-v${version_in_pkg}"
+          if [ "$tag" != "$expected" ]; then
+            echo "::error::tag '$tag' doesn't match package.json version '$version_in_pkg' (expected '$expected'). Bump package.json before tagging." >&2
+            exit 1
+          fi
+
+      - name: Publish to Marketplace
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npx --yes @vscode/vsce publish --no-yarn
+
+      - name: Upload .vsix as workflow artifact
+        run: npx --yes @vscode/vsce package --no-yarn --out dist/
+        continue-on-error: true
+
+      - name: Attach .vsix to artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-wrenlift
+          path: editors/vscode-wrenlift/dist/*.vsix
+          if-no-files-found: warn

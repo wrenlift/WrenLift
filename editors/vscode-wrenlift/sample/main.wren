@@ -9,6 +9,7 @@ class App {
     System.print(Fmt.green("hello"))
     System.print(Fmt.bold(Fmt.red("FAIL")))
     System.print(Fmt.padLeft("3", 4))
+    System.print(Fmt.yellow("Hello wren!"))
   }
 }
 
