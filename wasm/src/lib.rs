@@ -1089,7 +1089,7 @@ pub fn complete_wren(source: &str, byte: usize) -> JsValue {
         let receiver_is_class = recv
             .chars()
             .next()
-            .map_or(false, |c| c.is_ascii_uppercase());
+            .is_some_and(|c| c.is_ascii_uppercase());
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for m in &pool {
             for class in &m.classes {
@@ -1992,7 +1992,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
         };
     }
     let t_user = perf_mark();
-    let mut result = match input {
+    let result = match input {
         RunInput::Source(source) => {
             let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
             vm.interpret("main", &combined)

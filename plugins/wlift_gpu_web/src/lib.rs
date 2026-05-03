@@ -36,6 +36,7 @@
 
 use core::ffi::c_void;
 
+#[allow(dead_code)]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
     // Wren C API passthrough — same set wlift_window_web uses.
@@ -46,6 +47,7 @@ unsafe extern "C" {
     fn wrenGetSlotBytes(vm: *mut c_void, slot: i32, length: *mut i32) -> *const u8;
 }
 
+#[allow(dead_code)]
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {
     // Slot bridges for descriptor JSON / WGSL passing. The host

@@ -64,8 +64,18 @@ extern "C" {
 /// The export name is what the loader looks up against the
 /// foreign-method registry; declared in the Wren wrapper as
 /// `#!symbol = "wlift_hello_greet"` on the foreign-method body.
+/// FFI entry: dispatched via the C ABI by the foreign-method
+/// registry, reads / writes slots through the host shims.
+///
+/// # Safety
+///
+/// `vm` must be a live `*mut VM` handed in by the runtime's
+/// foreign-method dispatcher. The function reads slot 1 as a
+/// string and writes slot 0 — both are valid by construction
+/// inside a foreign-method invocation, undefined behaviour to
+/// call with a dangling or null pointer.
 #[no_mangle]
-pub extern "C" fn wlift_hello_greet(vm: *mut c_void) {
+pub unsafe extern "C" fn wlift_hello_greet(vm: *mut c_void) {
     // Stack-allocated read buffer. 256 bytes is plenty for
     // demo names; longer strings get truncated, which is a
     // demo-grade limitation worth noting in the comments above
