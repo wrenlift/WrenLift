@@ -530,6 +530,7 @@ mod tests {
                 entry: "json".to_string(),
                 description: None,
                 modules: vec!["json".to_string()],
+                bundled_versions: std::collections::BTreeMap::new(),
                 dependencies: std::collections::BTreeMap::new(),
                 spec_dependencies: std::collections::BTreeMap::new(),
                 native_libs: std::collections::BTreeMap::new(),

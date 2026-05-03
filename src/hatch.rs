@@ -151,6 +151,15 @@ pub struct Manifest {
     /// dependency order; the loader does not topologically sort.
     #[serde(default)]
     pub modules: Vec<String>,
+    /// `(<scoped-name>, <version>)` for every transitive package this
+    /// hatch absorbed at build time. Populated when a sub-dep's
+    /// modules + sections are folded into the outer bundle, so the
+    /// outer-outer build can tell the difference between "two deps
+    /// bundle the same `@hatch:json@0.1.2`, dedupe is safe" and "two
+    /// deps bundle different `@hatch:json` versions, real conflict".
+    /// Empty for non-recursive bundles.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bundled_versions: BTreeMap<String, String>,
     /// `name → dependency` declaration list. Each entry is either a
     /// version string (advisory for now — no registry yet) or an
     /// inline table with a `path` key pointing at another workspace
@@ -1164,6 +1173,7 @@ fn build_recursive(
             homepage: None,
             readme: None,
             modules: module_names.clone(),
+            bundled_versions: BTreeMap::new(),
             dependencies: BTreeMap::new(),
             spec_dependencies: BTreeMap::new(),
             native_libs: BTreeMap::new(),
@@ -1519,12 +1529,25 @@ fn merge_path_dependencies(
         let dep_hatch = load(&dep_bytes)?;
 
         // Prepend dep modules so they install before ours. A name
-        // collision means EITHER a true collision (two unrelated
-        // packages chose the same module name — must error) OR a
-        // diamond dep where the same package appears via two paths
-        // and contributes byte-identical sections (silently dedupe).
-        // We tell them apart by checking the section bytes against
-        // what's already in `sections`.
+        // collision falls into one of three buckets:
+        //
+        //   1. Byte-identical sections — true diamond dep, the
+        //      same package arrived via two paths and bundled
+        //      the same code each time. Silently dedupe.
+        //   2. Same scoped package + same version, differing
+        //      bytes — both deps bundled e.g. `@hatch:json@0.1.2`
+        //      but their `.hatch` artefacts were produced at
+        //      different times against different `wlift` builds,
+        //      so the compiled bytecode drifts. The Wren API
+        //      surface is identical; keep the first-installed
+        //      copy. We tell same-version-different-bytes apart
+        //      from "two genuinely-different versions of the
+        //      same package" via `bundled_versions`, populated
+        //      at the time each dep was built.
+        //   3. Anything else — different versions of the same
+        //      scoped package, or two unrelated modules sharing
+        //      a name. That's a real ambiguity; surface it so
+        //      the publisher fixes the upstream pins.
         let mut new_modules: Vec<String> = Vec::new();
         for mod_name in &dep_hatch.manifest.modules {
             if manifest.modules.contains(mod_name) {
@@ -1536,10 +1559,31 @@ fn merge_path_dependencies(
                     matches!(s.kind, SectionKind::Wlbc | SectionKind::NativeLib)
                         && &s.name == mod_name
                 });
+                let dep_bundled_ver = dep_hatch.manifest.bundled_versions.get(mod_name);
+                let outer_bundled_ver = manifest.bundled_versions.get(mod_name);
+                let same_pkg_same_version =
+                    matches!((dep_bundled_ver, outer_bundled_ver), (Some(a), Some(b)) if a == b);
                 match (dep_section, existing) {
                     (Some(d), Some(e)) if d.kind == e.kind && d.data == e.data => {
-                        // Diamond — already bundled identically, skip.
                         continue;
+                    }
+                    (Some(_), Some(_)) if mod_name.starts_with('@') && same_pkg_same_version => {
+                        eprintln!(
+                            "hatch: dep '{}' bundled '{}'@{} with bytes that differ from another dep's copy — keeping the first-installed; rebuild upstream against a single wlift rev to silence",
+                            dep_name,
+                            mod_name,
+                            dep_bundled_ver.unwrap()
+                        );
+                        continue;
+                    }
+                    (Some(_), Some(_)) if mod_name.starts_with('@') => {
+                        return Err(HatchError::Encode(format!(
+                            "dependency '{}' carries module '{}' (version {}) that conflicts with version {} already bundled by another dep — pin both to the same version",
+                            dep_name,
+                            mod_name,
+                            dep_bundled_ver.map(String::as_str).unwrap_or("?"),
+                            outer_bundled_ver.map(String::as_str).unwrap_or("?")
+                        )));
                     }
                     _ => {
                         return Err(HatchError::Encode(format!(
@@ -1578,7 +1622,10 @@ fn merge_path_dependencies(
 
         // Carry over Wlbc / NativeLib / Source sections the dep
         // bundled. Diamond-dep sections (same name+kind+bytes) silently
-        // dedupe; genuine collisions still error.
+        // dedupe; same scoped-package + same version with byte
+        // drift drops the duplicate (first-wins, matching the
+        // scoped-module branch above); genuine collisions still
+        // error.
         for section in dep_hatch.sections {
             if matches!(
                 section.kind,
@@ -1591,6 +1638,13 @@ fn merge_path_dependencies(
                     if existing.data == section.data {
                         continue; // diamond dedupe
                     }
+                    if section.name.starts_with('@') {
+                        let dep_ver = dep_hatch.manifest.bundled_versions.get(&section.name);
+                        let outer_ver = manifest.bundled_versions.get(&section.name);
+                        if matches!((dep_ver, outer_ver), (Some(a), Some(b)) if a == b) {
+                            continue;
+                        }
+                    }
                     return Err(HatchError::Encode(format!(
                         "dependency '{}' carries section '{:?}/{}' that collides with the enclosing hatch",
                         dep_name, section.kind, section.name
@@ -1598,6 +1652,18 @@ fn merge_path_dependencies(
                 }
                 sections.push(section);
             }
+        }
+        // Record what the dep folded in so the next-level-out
+        // build can tell same-version-different-bytes apart from
+        // a real version conflict. The dep itself is the most-
+        // immediate transitive; its own `bundled_versions` (its
+        // grand-transitives) flows up too so each layer carries
+        // the full provenance of every scoped module it ships.
+        manifest
+            .bundled_versions
+            .insert(dep_name.clone(), dep_hatch.manifest.version.clone());
+        for (k, v) in dep_hatch.manifest.bundled_versions {
+            manifest.bundled_versions.entry(k).or_insert(v);
         }
         // Fold dep system refs + extra search paths into ours. Local
         // workspace path entries from the dep were already bundled
@@ -1836,6 +1902,7 @@ mod tests {
                 entry: "main".to_string(),
                 description: None,
                 modules: vec!["main".to_string(), "util".to_string()],
+                bundled_versions: BTreeMap::new(),
                 dependencies: BTreeMap::new(),
                 spec_dependencies: BTreeMap::new(),
                 native_libs: BTreeMap::new(),
