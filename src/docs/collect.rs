@@ -421,21 +421,13 @@ fn is_contiguous(prev_end: usize, next_start: usize, source: &str) -> bool {
 /// whitespace + at most one newline sit between them. We tolerate
 /// tabs / leading spaces but reject blank-line gaps.
 fn is_adjacent_to(comment_end: usize, decl_start: usize, source: &str) -> bool {
+    // Doc comment attaches to the next declaration as long as the
+    // bytes between are entirely whitespace. Blank lines are fine
+    // — that's the common Rust-doc / Wren style. Anything else
+    // (a statement, another non-doc comment, a stray identifier)
+    // breaks the bond.
     let between = &source.as_bytes()[comment_end..decl_start];
-    let mut newlines = 0;
-    for &b in between {
-        match b {
-            b'\n' => {
-                newlines += 1;
-                if newlines > 1 {
-                    return false;
-                }
-            }
-            b' ' | b'\t' | b'\r' => {}
-            _ => return false,
-        }
-    }
-    true
+    between.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,12 +684,24 @@ mod tests {
     }
 
     #[test]
-    fn blank_line_breaks_association() {
-        let src = "/// orphaned doc.\n\nclass Foo {}\n";
+    fn blank_line_does_not_break_association() {
+        // Rust-doc / Wren style: blank lines between the comment
+        // block and the declaration are fine; the comment still
+        // attaches.
+        let src = "/// associated doc.\n\nclass Foo {}\n";
+        let doc = collect(src);
+        assert_eq!(doc.classes[0].doc, "associated doc.");
+    }
+
+    #[test]
+    fn intervening_statement_breaks_association() {
+        // Anything non-whitespace between the doc and the class
+        // detaches.
+        let src = "/// orphaned doc.\nimport \"a\" for A\nclass Foo {}\n";
         let doc = collect(src);
         assert!(
             doc.classes[0].doc.is_empty(),
-            "blank line should detach the doc"
+            "statement between doc and class should detach"
         );
     }
 

@@ -2,3 +2,6 @@ name        = "vscode-sample"
 version     = "0.1.0"
 entry       = "main"
 description = "Sample workspace shipped with the VS Code extension to verify diagnostics + hover land against real Wren source."
+
+[dependencies]
+"@hatch:fmt" = "0.1.0"

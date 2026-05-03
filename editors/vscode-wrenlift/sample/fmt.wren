@@ -27,7 +27,6 @@
 ///
 /// Pair the flag with `@hatch:os`'s `Os.isatty` for automatic
 /// detection: `Fmt.enabled = Os.isatty(Os.STDOUT)`.
-
 class Fmt {
   /// -- Global toggle ------------------------------------------------------
 
@@ -41,7 +40,7 @@ class Fmt {
   ///
   /// `\x1b` is the single ESC byte; each code is `\x1b[<n>m`. `reset`
   /// clears all styling so the next character starts fresh.
-
+  
   static reset { "\x1b[0m" }
 
   /// Foreground colors.

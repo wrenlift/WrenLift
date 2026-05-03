@@ -31,6 +31,16 @@
           "light": "icons/wrenlift-icon.svg",
           "dark": "icons/wrenlift-icon.svg"
         }
+      },
+      {
+        "id": "hatchfile",
+        "aliases": ["Hatchfile", "hatch"],
+        "filenames": ["hatchfile"],
+        "configuration": "./language-configuration-hatchfile.json",
+        "icon": {
+          "light": "icons/hatch-icon.svg",
+          "dark": "icons/hatch-icon.svg"
+        }
       }
     ],
     "grammars": [
@@ -38,6 +48,11 @@
         "language": "wren",
         "scopeName": "source.wren",
         "path": "./syntaxes/wren.tmLanguage.json"
+      },
+      {
+        "language": "hatchfile",
+        "scopeName": "source.hatchfile",
+        "path": "./syntaxes/hatchfile.tmLanguage.json"
       }
     ],
     "commands": [

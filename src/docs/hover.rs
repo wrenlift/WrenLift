@@ -137,6 +137,20 @@ impl Analysis {
                     self.local_var_type(byte, *sym).unwrap_or(InferredType::Any)
                 }
             }
+            // Literal-receiver shapes get their type directly from
+            // the AST node — no per-expr table lookup needed.
+            // Sema only re-records these spans during a full pass
+            // through the receiver expr, which a hover cursor
+            // sitting on the method name doesn't always trigger
+            // (the receiver's span_start lands inside parens or
+            // bracket whitespace that sema doesn't index).
+            Expr::Num(_) => InferredType::Num,
+            Expr::Str(_) | Expr::Interpolation(_) => InferredType::String,
+            Expr::Bool(_) => InferredType::Bool,
+            Expr::ListLiteral(_) => InferredType::List,
+            Expr::MapLiteral(_) => InferredType::Map,
+            Expr::Range { .. } => InferredType::Range,
+            Expr::Closure { .. } => InferredType::Fn,
             _ => self.type_env.get_expr_type(recv.1.start).clone(),
         };
         ty.is_known().then_some(ty)
@@ -1483,6 +1497,42 @@ class Slicer {
         assert_eq!(
             inferred_to_class_name(&ty, &a.interner).as_deref(),
             Some("Sprite")
+        );
+    }
+}
+
+#[cfg(test)]
+mod literal_receiver_tests {
+    use super::*;
+
+    fn class_name_under(src: &str, pat: &str) -> Option<String> {
+        let byte = src.find(pat).unwrap() + 1;
+        let a = Analysis::run(src)?;
+        let ty = a.receiver_type_for_call_at(byte)?;
+        inferred_to_class_name(&ty, &a.interner)
+    }
+
+    #[test]
+    fn paren_num_literal_receiver_resolves_to_num() {
+        assert_eq!(
+            class_name_under("var x = (10).ceil\n", "ceil"),
+            Some("Num".into())
+        );
+    }
+
+    #[test]
+    fn list_literal_receiver_resolves_to_list() {
+        assert_eq!(
+            class_name_under("var x = [1, 2, 3].count\n", "count"),
+            Some("List".into())
+        );
+    }
+
+    #[test]
+    fn string_literal_receiver_resolves_to_string() {
+        assert_eq!(
+            class_name_under("var x = \"hi\".count\n", "count"),
+            Some("String".into())
         );
     }
 }

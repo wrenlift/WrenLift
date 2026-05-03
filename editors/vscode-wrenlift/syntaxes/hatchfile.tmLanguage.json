@@ -1,0 +1,117 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Hatchfile",
+  "scopeName": "source.hatchfile",
+  "fileTypes": ["hatchfile"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#sections" },
+    { "include": "#assignment" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#booleans" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.hatchfile",
+          "begin": "#",
+          "end": "$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.hatchfile" }
+          }
+        }
+      ]
+    },
+    "sections": {
+      "patterns": [
+        {
+          "name": "meta.section.array.hatchfile",
+          "match": "^\\s*(\\[\\[)\\s*([^\\]]+?)\\s*(\\]\\])",
+          "captures": {
+            "1": { "name": "punctuation.definition.section.hatchfile" },
+            "2": { "name": "entity.name.section.hatchfile" },
+            "3": { "name": "punctuation.definition.section.hatchfile" }
+          }
+        },
+        {
+          "name": "meta.section.hatchfile",
+          "match": "^\\s*(\\[)\\s*([^\\]]+?)\\s*(\\])",
+          "captures": {
+            "1": { "name": "punctuation.definition.section.hatchfile" },
+            "2": { "name": "entity.name.section.hatchfile" },
+            "3": { "name": "punctuation.definition.section.hatchfile" }
+          }
+        }
+      ]
+    },
+    "assignment": {
+      "patterns": [
+        {
+          "match": "^\\s*\"([^\"]+)\"\\s*(=)",
+          "captures": {
+            "1": { "name": "variable.other.key.scoped.hatchfile" },
+            "2": { "name": "punctuation.separator.key-value.hatchfile" }
+          }
+        },
+        {
+          "match": "^\\s*([A-Za-z_][A-Za-z0-9_-]*(?:\\.[A-Za-z_][A-Za-z0-9_-]*)*)\\s*(=)",
+          "captures": {
+            "1": { "name": "variable.other.key.hatchfile" },
+            "2": { "name": "punctuation.separator.key-value.hatchfile" }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.hatchfile",
+          "begin": "\"\"\"",
+          "end": "\"\"\""
+        },
+        {
+          "name": "string.quoted.double.hatchfile",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.hatchfile",
+              "match": "\\\\(['\"\\\\0abfnrtv]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.hatchfile",
+          "begin": "'",
+          "end": "'"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.hatchfile",
+          "match": "\\b0[xX][0-9A-Fa-f_]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.hatchfile",
+          "match": "\\b-?\\d+\\.\\d+([eE][+-]?\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.hatchfile",
+          "match": "\\b-?\\d+\\b"
+        }
+      ]
+    },
+    "booleans": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.hatchfile",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    }
+  }
+}
