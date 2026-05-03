@@ -179,13 +179,38 @@ impl Analysis {
     /// it. Walks the AST so the lookup is structure-aware
     /// (different `var x` in different methods don't collide).
     fn local_var_type(&self, byte: usize, sym: SymbolId) -> Option<InferredType> {
-        let mut found: Option<usize> = None;
+        let span = self.local_var_decl_span(byte, sym)?;
+        let ty = self.type_env.get_var_type(span.start).clone();
+        ty.is_known().then_some(ty)
+    }
+
+    /// Walk-shared helper that returns the span of the
+    /// nearest in-scope `var <sym>`, `for (<sym> in …)`, method
+    /// parameter, or closure parameter declaration. The span
+    /// covers just the binding name so goto-def lands the
+    /// cursor on the binder, not the surrounding statement.
+    fn local_var_decl_span(
+        &self,
+        byte: usize,
+        sym: SymbolId,
+    ) -> Option<std::ops::Range<usize>> {
+        let mut found: Option<std::ops::Range<usize>> = None;
         for stmt in &self.module {
             walk_stmt_for_var_decl(stmt, byte, sym, &mut found);
         }
-        let decl_span = found?;
-        let ty = self.type_env.get_var_type(decl_span).clone();
-        ty.is_known().then_some(ty)
+        found
+    }
+
+    /// Public goto-def hook. Returns the binder span for the
+    /// nearest in-scope local with name `name`, or `None` when
+    /// no such binding exists at `byte`.
+    pub fn local_var_decl_span_by_name(
+        &self,
+        byte: usize,
+        name: &str,
+    ) -> Option<std::ops::Range<usize>> {
+        let sym = self.interner.lookup(name)?;
+        self.local_var_decl_span(byte, sym)
     }
 
     /// Same as [`local_var_type`](Self::local_var_type) but takes
@@ -305,7 +330,7 @@ fn walk_stmt_for_var_decl(
     stmt: &Spanned<Stmt>,
     byte: usize,
     sym: SymbolId,
-    out: &mut Option<usize>,
+    out: &mut Option<std::ops::Range<usize>>,
 ) {
     match &stmt.0 {
         Stmt::Var {
@@ -316,7 +341,7 @@ fn walk_stmt_for_var_decl(
             // walk_stmt_for_var_decl handles by recursing into
             // Block / If / While / For below).
             if name.0 == sym && name.1.start <= byte {
-                *out = Some(name.1.start);
+                *out = Some(name.1.clone());
             }
             // Still descend into the initializer in case it
             // contains a closure with its own decls.
@@ -361,7 +386,7 @@ fn walk_stmt_for_var_decl(
             body,
         } => {
             if variable.0 == sym && variable.1.start <= byte {
-                *out = Some(variable.1.start);
+                *out = Some(variable.1.clone());
             }
             walk_expr_for_var_decl(iterator, byte, sym, out);
             walk_stmt_for_var_decl(body, byte, sym, out);
@@ -376,13 +401,13 @@ fn walk_expr_for_var_decl(
     expr: &Spanned<Expr>,
     byte: usize,
     sym: SymbolId,
-    out: &mut Option<usize>,
+    out: &mut Option<std::ops::Range<usize>>,
 ) {
     match &expr.0 {
         Expr::Closure { params, body } => {
             for p in params {
                 if p.0 == sym && p.1.start <= byte {
-                    *out = Some(p.1.start);
+                    *out = Some(p.1.clone());
                 }
             }
             walk_stmt_for_var_decl(body, byte, sym, out);
@@ -482,7 +507,7 @@ fn walk_method_sig_for_var_decl(
     sig: &crate::ast::MethodSig,
     sym: SymbolId,
     byte: usize,
-    out: &mut Option<usize>,
+    out: &mut Option<std::ops::Range<usize>>,
 ) {
     use crate::ast::MethodSig::*;
     let params: &[Spanned<SymbolId>] = match sig {
@@ -505,9 +530,14 @@ fn walk_method_sig_for_var_decl(
     }
 }
 
-fn walk_param(p: &Spanned<SymbolId>, sym: SymbolId, byte: usize, out: &mut Option<usize>) {
+fn walk_param(
+    p: &Spanned<SymbolId>,
+    sym: SymbolId,
+    byte: usize,
+    out: &mut Option<std::ops::Range<usize>>,
+) {
     if p.0 == sym && p.1.start <= byte {
-        *out = Some(p.1.start);
+        *out = Some(p.1.clone());
     }
 }
 

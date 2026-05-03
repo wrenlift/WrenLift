@@ -2,7 +2,7 @@
   "name": "vscode-wrenlift",
   "displayName": "WrenLift",
   "description": "Wren language support powered by WrenLift — syntax highlighting, diagnostics, hover, goto-definition, and member completion via the wlift-lsp language server, plus an inline ▶︎ Run codelens for main.wren and *.spec.wren.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "Wrenlift",
   "license": "MIT",
   "icon": "icons/wrenlift-icon.png",
@@ -91,6 +91,30 @@
         "command": "wrenlift.showVersions",
         "title": "Show Toolchain Versions",
         "category": "WrenLift"
+      },
+      {
+        "command": "wrenlift.newProject",
+        "title": "New Project…",
+        "category": "WrenLift",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "wrenlift.refreshSpecs",
+        "title": "Refresh Specs",
+        "category": "WrenLift",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "wrenlift.runSpecCase",
+        "title": "Run Spec Case",
+        "category": "WrenLift",
+        "icon": "$(play)"
+      },
+      {
+        "command": "wrenlift.viewSpecOutput",
+        "title": "View Spec Output",
+        "category": "WrenLift",
+        "icon": "$(output)"
       }
     ],
     "menus": {
@@ -111,6 +135,25 @@
           "submenu": "wrenlift.editor.submenu",
           "when": "editorLangId == wren",
           "group": "navigation@9"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "wrenlift.refreshSpecs",
+          "when": "view == wrenlift.runner",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "wrenlift.runSpecCase",
+          "when": "view == wrenlift.runner && viewItem =~ /^spec(Case|Group|File)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "wrenlift.viewSpecOutput",
+          "when": "view == wrenlift.runner && viewItem =~ /^spec(Case|Group|File)$/",
+          "group": "inline@2"
         }
       ],
       "wrenlift.editor.submenu": [
@@ -144,6 +187,36 @@
       {
         "id": "wrenlift.editor.submenu",
         "label": "WrenLift"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "wrenlift",
+          "title": "WrenLift",
+          "icon": "icons/wrenlift-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "wrenlift": [
+        {
+          "id": "wrenlift.runner",
+          "name": "WrenLift",
+          "icon": "icons/wrenlift-icon.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "wrenlift.runner",
+        "when": "wrenlift.workspaceEmpty",
+        "contents": "No Wren files in this workspace yet.\n\nCreate a new Hatch project to get started — the scaffolder drops a `hatchfile`, `main.wren`, and a sample spec.\n\n[Create new project](command:wrenlift.newProject)\n\nOr open a folder that already contains `.wren` files."
+      },
+      {
+        "view": "wrenlift.runner",
+        "when": "!wrenlift.workspaceEmpty && !wrenlift.specOpen",
+        "contents": "Open a `*.spec.wren` file to see its describe / it blocks listed here with run buttons."
       }
     ],
     "colors": [

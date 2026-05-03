@@ -15,6 +15,9 @@ companion language server.
   (`#!native`, `#!wasm`).
 - **Diagnostics** as you type: parse errors with the same
   messages the CLI emits.
+
+![Inline diagnostics popup showing 'unexpected character', 'expected newline after statement', and 'unexpected token' errors](https://raw.githubusercontent.com/wrenlift/WrenLift/main/editors/vscode-wrenlift/lint-error.png)
+
 - **Hover** for identifiers: signature + rendered Markdown
   from `///` doc comments. Walks the local module, every
   cached `[dependencies]` package, and the runtime prelude.
@@ -24,12 +27,28 @@ companion language server.
 - **Member completion** after `.` — class members from local
   classes, imported `@hatch:*` packages, workspace files, or
   the prelude.
+
+![Code completion + hover doc on System.print, with the Run main.wren code lens above the file](https://raw.githubusercontent.com/wrenlift/WrenLift/main/editors/vscode-wrenlift/code-completion.png)
+
 - **Run code lens** above `main.wren` and `*.spec.wren` —
   click to execute through `hatch run` (when a hatchfile is
-  in scope) or `wlift <path>` directly.
+  in scope) or `wlift <path>` directly. Spec files get an
+  extra `▶ Run` lens above each `Test.describe(...)` and
+  `Test.it(...)` block.
+- **Sidebar (Activity Bar)** with two contextual panels:
+  - **Project scaffolder** when the workspace is empty —
+    one-click "Create new project" runs `hatch init` against
+    a folder you pick, drops a hatchfile + `main.wren` +
+    sample `test.spec.wren` (with `@hatch:test` and
+    `@hatch:assert` pre-wired), and opens the new folder.
+  - **Spec runner** when a `*.spec.wren` is open — lists every
+    `Test.describe` / `Test.it` block with inline run / output
+    buttons. Clicking a node jumps the editor to the case.
 - **Status bar + editor toolbar** for the language server's
   start / stop / restart and a one-shot `Show Toolchain
   Versions` command.
+
+![Spec runner sidebar with describe/it tree, per-block codelenses, and inline run actions](https://raw.githubusercontent.com/wrenlift/WrenLift/main/editors/vscode-wrenlift/test-spec.wren.png)
 
 ## Requirements
 
@@ -49,13 +68,21 @@ binary in VS Code settings.
 | Setting | Default | Description |
 |---|---|---|
 | `wrenlift.serverPath` | `wlift-lsp` | Path to the language-server binary. |
+| `wrenlift.wliftPath`  | `wlift`     | Path to the `wlift` runtime. Used by the file runner when no hatchfile is in scope. |
+| `wrenlift.hatchPath`  | `hatch`     | Path to the `hatch` CLI. Used by the project scaffolder + the file runner when a hatchfile is in scope. |
 | `wrenlift.trace.server` | `off` | Trace LSP messages in the Output panel. |
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `WrenLift: Restart Server` | Stop and re-spawn the language server. |
+| `WrenLift: New Project…`            | Scaffold a fresh Hatch project (folder picker + `hatch init`). |
+| `WrenLift: Run Wren File`           | Run the active `.wren` file. Routes through `hatch run` for `main.wren` inside a hatch project, otherwise `wlift <file>`. |
+| `WrenLift: Run Spec Case`           | Run the spec case associated with the selected sidebar tree node. |
+| `WrenLift: View Spec Output`        | Focus the run-output terminal. |
+| `WrenLift: Refresh Specs`           | Re-parse the active spec file and rebuild the tree. |
+| `WrenLift: Start / Stop / Restart Language Server` | LSP lifecycle. |
+| `WrenLift: Show Toolchain Versions` | Probes `wlift`, `hatch`, `wlift-lsp` for `--version`. |
 
 ## Releasing
 

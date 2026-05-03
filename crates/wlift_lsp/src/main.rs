@@ -463,6 +463,25 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Local var / for-binding / parameter jump: cursor on a
+        // bare identifier that resolves to an in-scope `var`,
+        // `for (<x> in …)`, method param, or closure param.
+        // Walks the parsed AST from `Analysis::run` rather than
+        // the doc cache, since the doc cache only knows about
+        // class members and module-level shapes. Skips when the
+        // cursor sits on a method-name (already handled by the
+        // member-receiver path above).
+        if receiver_class.is_none() {
+            if let Some(a) = analysis.as_ref() {
+                if let Some(span_local) = a.local_var_decl_span_by_name(byte, ident) {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: uri.clone(),
+                        range: doc.byte_range_to_lsp(span_local),
+                    })));
+                }
+            }
+        }
+
         // Class-name jump: cursor on a class identifier itself.
         for class in &module.classes {
             if class.name == ident {
@@ -577,7 +596,9 @@ impl LanguageServer for Backend {
         }
 
         // Identify the receiver: the identifier immediately
-        // before the dot.
+        // before the dot, or — if there isn't one — a literal
+        // expression like `(10)`, `"foo"`, `[1, 2]`, `{}` that
+        // maps directly to a prelude class.
         let recv_end = dot_pos;
         let recv_start = doc.text[..recv_end]
             .char_indices()
@@ -586,12 +607,13 @@ impl LanguageServer for Backend {
             .last()
             .map(|(i, _)| i)
             .unwrap_or(recv_end);
-        if recv_start == recv_end {
-            return Ok(None);
-        }
-        let recv = &doc.text[recv_start..recv_end];
+        let recv = if recv_start == recv_end {
+            ""
+        } else {
+            &doc.text[recv_start..recv_end]
+        };
 
-        // Resolve the receiver to a class. Three sources, in
+        // Resolve the receiver to a class. Four sources, in
         // priority order:
         //   1. `Analysis::receiver_type_for_call_at` — the
         //      typed-receiver path that handles fields, locals,
@@ -600,17 +622,51 @@ impl LanguageServer for Backend {
         //      directly (covers `Fmt.<...>` even when sema
         //      didn't tag the cursor position because the
         //      partial member name doesn't parse yet).
-        //   3. None → no completions.
+        //   3. Literal shape directly before the dot — `(...)`,
+        //      `"..."`, `[...]`, `{...}`, bare numerics, the
+        //      `true`/`false`/`null` keywords. Primitives have
+        //      no identifier receiver, so they fall to this
+        //      arm.
+        //   4. None → no completions.
         let analysis = wren_lift::docs::hover::Analysis::run(&doc.text);
-        let mut class_name: Option<String> = analysis.as_ref().and_then(|a| {
-            // Position cursor on the receiver ident so
-            // receiver_type_for_call_at finds the call shape.
-            let probe = recv_start + 1;
-            a.receiver_type_for_call_at(probe)
-                .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
-        });
-        if class_name.is_none() && recv.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        let mut class_name: Option<String> = if !recv.is_empty() {
+            analysis.as_ref().and_then(|a| {
+                let probe = recv_start + 1;
+                a.receiver_type_for_call_at(probe)
+                    .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
+            })
+        } else {
+            None
+        };
+        // Fall back to a direct local-var lookup when the
+        // method-name span isn't yet parseable (the user is
+        // mid-type — `x.fl` with the cursor right after `fl`
+        // doesn't always produce a Call AST node, so the
+        // receiver-type-for-call-at walk misses it). The hover
+        // analysis still has the var's inferred type recorded
+        // from its declaration, so we can resolve `x` to `Num`,
+        // `String`, `List`, etc. directly. Only kick in for
+        // lowercase-led identifiers — uppercase already gets
+        // the bare-class-name shortcut below.
+        if class_name.is_none() && !recv.is_empty() {
+            if let (Some(a), Some(c)) = (
+                analysis.as_ref(),
+                recv.chars().next().filter(|c| c.is_ascii_lowercase() || *c == '_'),
+            ) {
+                let _ = c;
+                class_name = a
+                    .local_var_type_by_name(recv_start, recv)
+                    .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner));
+            }
+        }
+        if class_name.is_none()
+            && !recv.is_empty()
+            && recv.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        {
             class_name = Some(recv.to_string());
+        }
+        if class_name.is_none() {
+            class_name = infer_literal_receiver_class(&doc.text[..recv_end]);
         }
         let Some(class_name) = class_name else {
             return Ok(None);
@@ -702,24 +758,6 @@ impl LanguageServer for Backend {
         if !is_main && !is_spec {
             return Ok(None);
         }
-        // `▶︎` is the unicode "Black Right-Pointing Triangle"
-        // (U+25B6) with the variation selector U+FE0E that asks
-        // for the text-style presentation. rust-analyzer uses
-        // the same shape — rendering through the editor font
-        // makes it noticeably larger than codicon glyphs at
-        // the same codelens font size. Filename suffix mirrors
-        // rust-analyzer's "Run target_name" convention.
-        let _ = is_spec; // both lens shapes use the same title today
-        let title = format!("\u{25B6}\u{FE0E} Run {}", file_name);
-        // Anchor the lens to the first non-empty line of source
-        // (skipping leading blank lines). VS Code renders code
-        // lenses above their `range.start.line`; a degenerate
-        // 0..0 range can be silently dropped by some renderers.
-        // Using the first content line gives the lens something
-        // real to hover over and keeps the visual placement
-        // immediately above the file's first declaration —
-        // matching rust-analyzer's convention of putting the
-        // lens above `fn main`'s signature line.
         // Prefer the live document text (matches what's on
         // screen mid-edit); fall back to reading the file.
         let text = self
@@ -728,13 +766,24 @@ impl LanguageServer for Backend {
             .map(|d| d.text.clone())
             .or_else(|| std::fs::read_to_string(&path).ok())
             .unwrap_or_default();
+
+        let mut lenses: Vec<CodeLens> = Vec::new();
+
+        // File-level "Run <filename>" lens. Anchored to the first
+        // non-empty line of source — VS Code renders code lenses
+        // above `range.start.line`; a degenerate 0..0 range can be
+        // silently dropped by some renderers.
+        //
+        // `▶︎` is U+25B6 + U+FE0E (text-presentation variant) so it
+        // matches rust-analyzer's `▶ Run` shape and renders through
+        // the editor font rather than as a codicon glyph.
         let anchor_line = text
             .lines()
             .enumerate()
             .find(|(_, l)| !l.trim().is_empty())
             .map(|(i, l)| (i as u32, l.chars().count() as u32))
             .unwrap_or((0, 0));
-        let lens = CodeLens {
+        lenses.push(CodeLens {
             range: Range {
                 start: Position {
                     line: anchor_line.0,
@@ -746,14 +795,178 @@ impl LanguageServer for Backend {
                 },
             },
             command: Some(Command {
-                title,
+                title: format!("\u{25B6}\u{FE0E} Run {}", file_name),
                 command: "wrenlift.runFile".to_string(),
                 arguments: Some(vec![serde_json::json!(uri.to_string())]),
             }),
             data: None,
-        };
-        Ok(Some(vec![lens]))
+        });
+
+        // Per-block lenses inside spec files. Best-effort line scan
+        // — `Test.describe("name") {` and `Test.it("name") {` are
+        // the canonical shapes the runner exposes, with optional
+        // leading whitespace. We don't try to parse the full
+        // expression; a comment-stripped line check is enough for
+        // the run-button affordance. Each lens dispatches to the
+        // same `wrenlift.runFile` as the file-level lens — per-test
+        // filtering needs `@hatch:test` runtime support that
+        // doesn't exist yet, so v1 runs the whole file when a
+        // describe/it lens is clicked. Future filter support will
+        // pass the case label through as a second argument here.
+        if is_spec {
+            for (line_idx, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                let kind = if trimmed.starts_with("Test.describe(") {
+                    Some("describe")
+                } else if trimmed.starts_with("Test.it(") {
+                    Some("it")
+                } else {
+                    None
+                };
+                let Some(kind) = kind else { continue };
+                let case_name = extract_string_arg(trimmed);
+                let title = match (kind, case_name) {
+                    ("describe", Some(n)) => format!("\u{25B6}\u{FE0E} Run \"{}\"", n),
+                    ("it", Some(n)) => format!("\u{25B6}\u{FE0E} Run \"{}\"", n),
+                    _ => "\u{25B6}\u{FE0E} Run".to_string(),
+                };
+                let line_chars = line.chars().count() as u32;
+                lenses.push(CodeLens {
+                    range: Range {
+                        start: Position {
+                            line: line_idx as u32,
+                            character: 0,
+                        },
+                        end: Position {
+                            line: line_idx as u32,
+                            character: line_chars,
+                        },
+                    },
+                    command: Some(Command {
+                        title,
+                        command: "wrenlift.runFile".to_string(),
+                        arguments: Some(vec![serde_json::json!(uri.to_string())]),
+                    }),
+                    data: None,
+                });
+            }
+        }
+
+        Ok(Some(lenses))
     }
+}
+
+/// Extract the first string-literal argument from a line that
+/// Detect the prelude class for a literal receiver immediately
+/// before a `.` — handles `(10).`, `"foo".`, `[1, 2].`, `{}.`,
+/// bare numerics, and the `true`/`false`/`null` keywords.
+///
+/// `prefix` is the source text up to (but not including) the
+/// dot. Returns the prelude class name (`Num`, `String`, `List`,
+/// `Map`, `Bool`, `Null`) when the trailing token is an
+/// unambiguous literal shape; `None` otherwise. Conservative on
+/// purpose — when in doubt, fall through to the existing
+/// identifier-receiver path rather than risk wrong suggestions.
+fn infer_literal_receiver_class(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim_end();
+    let last = trimmed.chars().next_back()?;
+    match last {
+        ')' => match_paren_literal(trimmed),
+        '"' => Some("String".to_string()),
+        ']' => Some("List".to_string()),
+        '}' => Some("Map".to_string()),
+        c if c.is_ascii_digit() => Some("Num".to_string()),
+        // Trailing keyword: walk back over the identifier and
+        // check for the three Wren value-literals that aren't
+        // collection-shaped.
+        c if c.is_ascii_alphabetic() || c == '_' => {
+            let kw_start = trimmed
+                .char_indices()
+                .rev()
+                .take_while(|(_, ch)| ch.is_alphanumeric() || *ch == '_')
+                .last()
+                .map(|(i, _)| i)?;
+            match &trimmed[kw_start..] {
+                "true" | "false" => Some("Bool".to_string()),
+                "null" => Some("Null".to_string()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `(...)` receiver: walk back from the closing paren to the
+/// matching open paren (handling nested groups), then peek at
+/// the first non-whitespace character inside to classify the
+/// literal. `(10).<...>` → Num, `("hi").<...>` → String, etc.
+fn match_paren_literal(trimmed: &str) -> Option<String> {
+    let bytes = trimmed.as_bytes();
+    let mut depth = 0i32;
+    let mut open_idx = None;
+    for i in (0..bytes.len()).rev() {
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    open_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = open_idx?;
+    let inner = trimmed[open + 1..trimmed.len() - 1].trim();
+    let first = inner.chars().next()?;
+    match first {
+        '"' => Some("String".to_string()),
+        '[' => Some("List".to_string()),
+        '{' => Some("Map".to_string()),
+        c if c.is_ascii_digit() || c == '-' || c == '+' => Some("Num".to_string()),
+        _ => {
+            // Try keyword literals inside the parens.
+            match inner {
+                "true" | "false" => Some("Bool".to_string()),
+                "null" => Some("Null".to_string()),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// looks like `Test.describe("name") {` or `Test.it("name") {`.
+/// Returns `None` if the line doesn't open with a `"…"` literal
+/// after the call paren — keeps the caller's title clean instead
+/// of dumping a raw substring.
+fn extract_string_arg(trimmed: &str) -> Option<String> {
+    let open = trimmed.find('(')?;
+    let after_paren = trimmed[open + 1..].trim_start();
+    let bytes = after_paren.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    // Walk past the opening `"`, accumulating until the closing
+    // `"` — handle the common `\"` escape so titles like
+    // `Test.it("\"hello\"")` don't break early. Anything weirder
+    // (interpolation, multi-line strings) just falls through and
+    // the caller drops back to the bare `▶ Run` title.
+    let mut chars = after_paren[1..].chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        if c == '"' {
+            return Some(out);
+        }
+        out.push(c);
+    }
+    None
 }
 
 /// Translate a byte span into an LSP `Range` against a file we
@@ -1495,47 +1708,55 @@ impl Backend {
                 .collect()
         };
 
-        // Only run sema + collect docs when the parser produced a
-        // usable AST. If parse errored, sema would emit confused
-        // follow-on diagnostics that overwhelm the editor's
-        // problem list.
-        let mut module_docs: Option<wren_lift::docs::ModuleDoc> = None;
-        if pr.errors.is_empty() {
-            // Source the prelude name list from
-            // `wren_lift::sema::PRELUDE_NAMES` so the LSP's
-            // diagnostic surface and the playground's
-            // `lint_wren` can't drift apart again.
-            let mut interner = pr.interner;
-            let prelude: Vec<wren_lift::intern::SymbolId> = wren_lift::sema::PRELUDE_NAMES
-                .iter()
-                .map(|n| interner.intern(n))
-                .collect();
-            let sema = sema_resolve::resolve_with_prelude(&pr.module, &interner, &prelude);
-            // Restore the (possibly mutated) interner so the doc
-            // collector below sees the same identifier ids.
-            let pr_interner = interner;
-            {
-                let doc = self.docs.get(uri).unwrap();
-                for d in &sema.errors {
-                    diags.push(translate_diagnostic(&doc, d));
-                }
+        // Run sema unconditionally, even when the parser bailed:
+        // its recovery still places most surrounding statements
+        // into the AST, so undefined-name / scope checks light up
+        // on the unaffected regions of the file. The previous
+        // `if pr.errors.is_empty()` gate meant a single typo or
+        // half-typed call silenced the entire semantic surface,
+        // and users reported missing diagnostics for unknown
+        // identifiers sitting next to broken syntax.
+        //
+        // Source the prelude name list from
+        // `wren_lift::sema::PRELUDE_NAMES` so the LSP's
+        // diagnostic surface and the playground's `lint_wren`
+        // can't drift apart again.
+        let mut interner = pr.interner;
+        let prelude: Vec<wren_lift::intern::SymbolId> = wren_lift::sema::PRELUDE_NAMES
+            .iter()
+            .map(|n| interner.intern(n))
+            .collect();
+        let sema = sema_resolve::resolve_with_prelude(&pr.module, &interner, &prelude);
+        // Restore the (possibly mutated) interner so the doc
+        // collector below sees the same identifier ids.
+        let pr_interner = interner;
+        {
+            let doc = self.docs.get(uri).unwrap();
+            for d in &sema.errors {
+                diags.push(translate_diagnostic(&doc, d));
             }
-            // Build the doc model from the same parse — feeds the
-            // hover handler.
+        }
+        // Doc model — only worth building when parse was clean,
+        // since sema's view of partial ASTs misses doc-comment
+        // attachments and the hover handler degrades silently
+        // anyway when the cache is empty.
+        let module_docs: Option<wren_lift::docs::ModuleDoc> = if pr.errors.is_empty() {
             let module_name = uri
                 .path_segments()
                 .and_then(|mut s| s.next_back())
                 .unwrap_or("module")
                 .trim_end_matches(".wren")
                 .to_string();
-            module_docs = Some(wren_lift::docs::collect_module(
+            Some(wren_lift::docs::collect_module(
                 module_name,
                 &text,
                 &pr.module,
                 &pr.docs,
                 &pr_interner,
-            ));
-        }
+            ))
+        } else {
+            None
+        };
 
         // Write back the doc cache.
         if let Some(mut entry) = self.docs.get_mut(uri) {
@@ -1577,6 +1798,97 @@ fn map_severity(sev: WlSeverity) -> DiagnosticSeverity {
         WlSeverity::Error => DiagnosticSeverity::ERROR,
         WlSeverity::Warning => DiagnosticSeverity::WARNING,
         WlSeverity::Info => DiagnosticSeverity::INFORMATION,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_string_arg;
+
+    #[test]
+    fn extracts_basic_string_arg() {
+        assert_eq!(
+            extract_string_arg("Test.describe(\"equality\") {"),
+            Some("equality".to_string())
+        );
+        assert_eq!(
+            extract_string_arg("Test.it(\"toBe on primitives\") {"),
+            Some("toBe on primitives".to_string())
+        );
+    }
+
+    #[test]
+    fn handles_whitespace_inside_paren() {
+        assert_eq!(
+            extract_string_arg("Test.describe( \"spaces\" ) {"),
+            Some("spaces".to_string())
+        );
+    }
+
+    #[test]
+    fn handles_escaped_quotes() {
+        assert_eq!(
+            extract_string_arg("Test.it(\"foo \\\"bar\\\" baz\") {"),
+            Some("foo \"bar\" baz".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_first_arg_is_not_a_string() {
+        assert_eq!(extract_string_arg("Test.describe(name) {"), None);
+        assert_eq!(extract_string_arg("Test.it(varName) {"), None);
+    }
+
+    use super::infer_literal_receiver_class as infer;
+
+    #[test]
+    fn literal_receiver_paren_numeric() {
+        assert_eq!(infer("(10)"), Some("Num".to_string()));
+        assert_eq!(infer("(3.14)"), Some("Num".to_string()));
+        assert_eq!(infer("(-5)"), Some("Num".to_string()));
+        assert_eq!(infer("System.print((42)"), Some("Num".to_string())); // nested ok
+    }
+
+    #[test]
+    fn literal_receiver_paren_string() {
+        assert_eq!(infer("(\"hi\")"), Some("String".to_string()));
+    }
+
+    #[test]
+    fn literal_receiver_paren_list_map() {
+        assert_eq!(infer("([1, 2, 3])"), Some("List".to_string()));
+        assert_eq!(infer("({\"a\": 1})"), Some("Map".to_string()));
+    }
+
+    #[test]
+    fn literal_receiver_paren_keywords() {
+        assert_eq!(infer("(true)"), Some("Bool".to_string()));
+        assert_eq!(infer("(false)"), Some("Bool".to_string()));
+        assert_eq!(infer("(null)"), Some("Null".to_string()));
+    }
+
+    #[test]
+    fn literal_receiver_unparenthesized() {
+        assert_eq!(infer("\"hello\""), Some("String".to_string()));
+        assert_eq!(infer("[1, 2]"), Some("List".to_string()));
+        assert_eq!(infer("{\"k\":\"v\"}"), Some("Map".to_string()));
+        assert_eq!(infer("42"), Some("Num".to_string()));
+    }
+
+    #[test]
+    fn literal_receiver_keywords_unparenthesized() {
+        assert_eq!(infer("true"), Some("Bool".to_string()));
+        assert_eq!(infer("null"), Some("Null".to_string()));
+    }
+
+    #[test]
+    fn literal_receiver_falls_through_for_identifiers() {
+        // Identifier receivers should not be claimed by this
+        // detector — the caller already has a higher-priority
+        // path for them.
+        assert_eq!(infer("foo"), None);
+        assert_eq!(infer("System"), None);
+        assert_eq!(infer("var x"), None);
     }
 }
 

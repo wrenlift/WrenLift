@@ -441,6 +441,252 @@ async function restartServer(): Promise<void> {
   await startServer();
 }
 
+// ---------------------------------------------------------------
+// Spec runner sidebar
+// ---------------------------------------------------------------
+
+type SpecNode = SpecFileNode | SpecGroupNode | SpecCaseNode;
+
+interface SpecFileNode {
+  kind: "file";
+  uri: vscode.Uri;
+  label: string;
+}
+
+interface SpecGroupNode {
+  kind: "group";
+  uri: vscode.Uri;
+  line: number;
+  label: string;
+}
+
+interface SpecCaseNode {
+  kind: "case";
+  uri: vscode.Uri;
+  line: number;
+  group: string | null;
+  label: string;
+}
+
+interface ParsedSpecBlock {
+  kind: "describe" | "it";
+  name: string;
+  line: number;
+}
+
+/// Best-effort line scan for `Test.describe("name") {` and
+/// `Test.it("name") {` blocks. Mirrors the LSP-side scan in
+/// `wlift_lsp::code_lens` — both are cosmetic; clicking a
+/// codelens or a tree node still runs the whole spec file.
+/// Per-test filtering needs `@hatch:test` runtime support that
+/// hasn't landed yet (Wren has no env access without a plugin),
+/// so the granularity here is "we know the case exists, we know
+/// where it lives in the file" — not "we can run only this case
+/// and capture only its result."
+export function scanSpecBlocks(text: string): ParsedSpecBlock[] {
+  const out: ParsedSpecBlock[] = [];
+  const lines = text.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart();
+    let kind: "describe" | "it" | null = null;
+    if (trimmed.startsWith("Test.describe(")) kind = "describe";
+    else if (trimmed.startsWith("Test.it(")) kind = "it";
+    if (!kind) continue;
+    const name = extractFirstStringArg(trimmed) ?? "(unnamed)";
+    out.push({ kind, name, line: i });
+  }
+  return out;
+}
+
+/// Extract the first string-literal argument from a call line.
+/// Handles `\"` escapes inside the literal; falls back to `null`
+/// for non-string first args (variable names, expressions).
+export function extractFirstStringArg(s: string): string | null {
+  const open = s.indexOf("(");
+  if (open < 0) return null;
+  let i = open + 1;
+  while (i < s.length && /\s/.test(s[i])) i++;
+  if (s[i] !== '"') return null;
+  i++;
+  let out = "";
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "\\" && i + 1 < s.length) {
+      out += s[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === '"') return out;
+    out += c;
+    i++;
+  }
+  return null;
+}
+
+class SpecRunnerProvider implements vscode.TreeDataProvider<SpecNode> {
+  private readonly _onDidChange = new vscode.EventEmitter<SpecNode | undefined>();
+  readonly onDidChangeTreeData = this._onDidChange.event;
+  private currentUri: vscode.Uri | undefined;
+  /// Keyed by the Test.describe line number so getChildren on
+  /// a group can hand back its registered cases without
+  /// re-parsing. Rebuilt every refresh.
+  private groups = new Map<number, SpecCaseNode[]>();
+
+  refresh(uri?: vscode.Uri): void {
+    this.currentUri = uri ?? vscode.window.activeTextEditor?.document.uri;
+    if (this.currentUri && !this.currentUri.fsPath.endsWith(".spec.wren")) {
+      this.currentUri = undefined;
+    }
+    this._onDidChange.fire(undefined);
+  }
+
+  getTreeItem(node: SpecNode): vscode.TreeItem {
+    if (node.kind === "file") {
+      const item = new vscode.TreeItem(
+        node.label,
+        vscode.TreeItemCollapsibleState.Expanded,
+      );
+      item.iconPath = new vscode.ThemeIcon("file-code");
+      item.contextValue = "specFile";
+      item.tooltip = node.uri.fsPath;
+      return item;
+    }
+    if (node.kind === "group") {
+      const item = new vscode.TreeItem(
+        node.label,
+        vscode.TreeItemCollapsibleState.Expanded,
+      );
+      item.iconPath = new vscode.ThemeIcon("symbol-namespace");
+      item.contextValue = "specGroup";
+      item.command = {
+        command: "vscode.open",
+        title: "Open",
+        arguments: [
+          node.uri,
+          {
+            selection: new vscode.Range(node.line, 0, node.line, 0),
+            preserveFocus: true,
+          },
+        ],
+      };
+      return item;
+    }
+    const item = new vscode.TreeItem(
+      node.label,
+      vscode.TreeItemCollapsibleState.None,
+    );
+    item.iconPath = new vscode.ThemeIcon("symbol-method");
+    item.contextValue = "specCase";
+    item.tooltip = node.group ? `${node.group} > ${node.label}` : node.label;
+    item.command = {
+      command: "vscode.open",
+      title: "Open",
+      arguments: [
+        node.uri,
+        {
+          selection: new vscode.Range(node.line, 0, node.line, 0),
+          preserveFocus: true,
+        },
+      ],
+    };
+    return item;
+  }
+
+  async getChildren(parent?: SpecNode): Promise<SpecNode[]> {
+    if (!this.currentUri) return [];
+    const uri = this.currentUri;
+    if (!parent) {
+      const label = uri.fsPath.split(/[\\/]/).pop() || "";
+      return [{ kind: "file", uri, label }];
+    }
+    if (parent.kind === "file") {
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const text = Buffer.from(bytes).toString("utf8");
+      const blocks = scanSpecBlocks(text);
+      this.groups.clear();
+      const groupNodes: SpecGroupNode[] = [];
+      const orphanCases: SpecCaseNode[] = [];
+      let currentGroup: SpecGroupNode | null = null;
+      for (const b of blocks) {
+        if (b.kind === "describe") {
+          const g: SpecGroupNode = {
+            kind: "group",
+            uri,
+            line: b.line,
+            label: b.name,
+          };
+          groupNodes.push(g);
+          this.groups.set(b.line, []);
+          currentGroup = g;
+        } else {
+          const c: SpecCaseNode = {
+            kind: "case",
+            uri,
+            line: b.line,
+            group: currentGroup?.label ?? null,
+            label: b.name,
+          };
+          if (currentGroup) {
+            this.groups.get(currentGroup.line)!.push(c);
+          } else {
+            orphanCases.push(c);
+          }
+        }
+      }
+      return [...groupNodes, ...orphanCases];
+    }
+    if (parent.kind === "group") {
+      return this.groups.get(parent.line) ?? [];
+    }
+    return [];
+  }
+}
+
+/// Refresh the `wrenlift.workspaceEmpty` context flag. Drives the
+/// welcome-view visibility — the Activity Bar's WrenLift panel
+/// shows the scaffolding prompt when there's nothing Wren-shaped
+/// in the workspace, and the spec runner instead when the user
+/// already has a project. Excludes `.git`, `node_modules`,
+/// `target` so a Rust-host workspace with `wren_lift` as a dep
+/// doesn't trip "empty" -> "non-empty" on its own build artifacts.
+async function refreshWorkspaceEmptyContext(): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    await vscode.commands.executeCommand(
+      "setContext",
+      "wrenlift.workspaceEmpty",
+      true,
+    );
+    return;
+  }
+  const skip = "**/{node_modules,target,.git,out,.vscode-test}/**";
+  const wren = await vscode.workspace.findFiles("**/*.wren", skip, 1);
+  if (wren.length > 0) {
+    await vscode.commands.executeCommand(
+      "setContext",
+      "wrenlift.workspaceEmpty",
+      false,
+    );
+    return;
+  }
+  const hatch = await vscode.workspace.findFiles("**/hatchfile", skip, 1);
+  await vscode.commands.executeCommand(
+    "setContext",
+    "wrenlift.workspaceEmpty",
+    hatch.length === 0,
+  );
+}
+
+function refreshSpecOpenContext(): void {
+  const ed = vscode.window.activeTextEditor;
+  const isSpec = !!ed && ed.document.uri.fsPath.endsWith(".spec.wren");
+  void vscode.commands.executeCommand(
+    "setContext",
+    "wrenlift.specOpen",
+    isSpec,
+  );
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   // Status bar item: shows the server's lifecycle and acts as the
   // entry point for start / stop / restart via a quick-pick menu.
@@ -454,6 +700,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   statusItem.command = "wrenlift.showServerActions";
   context.subscriptions.push(statusItem);
   statusItem.show();
+
+  // Activity Bar: spec runner tree + welcome view. Visibility is
+  // gated by `wrenlift.specOpen` / `wrenlift.workspaceEmpty`
+  // contexts (see view contributions in package.json). The tree
+  // refreshes on active-editor change and on file save so editing
+  // a spec adds/removes blocks live.
+  const specProvider = new SpecRunnerProvider();
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("wrenlift.runner", specProvider),
+  );
+  specProvider.refresh();
+  refreshSpecOpenContext();
+  void refreshWorkspaceEmptyContext();
+
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      specProvider.refresh();
+      refreshSpecOpenContext();
+    }),
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      const active = vscode.window.activeTextEditor?.document.uri;
+      if (active && doc.uri.toString() === active.toString()) {
+        specProvider.refresh();
+      }
+    }),
+  );
+
+  // Workspace-empty context: refresh on workspace-folder change
+  // and when .wren / hatchfile content lands or disappears. The
+  // FileSystemWatcher fires on create/delete; rename surfaces as
+  // delete-then-create so it's covered.
+  const wrenWatcher = vscode.workspace.createFileSystemWatcher("**/*.wren");
+  const hatchWatcher = vscode.workspace.createFileSystemWatcher("**/hatchfile");
+  const onFsChange = () => {
+    void refreshWorkspaceEmptyContext();
+  };
+  context.subscriptions.push(
+    wrenWatcher,
+    hatchWatcher,
+    wrenWatcher.onDidCreate(onFsChange),
+    wrenWatcher.onDidDelete(onFsChange),
+    hatchWatcher.onDidCreate(onFsChange),
+    hatchWatcher.onDidDelete(onFsChange),
+    vscode.workspace.onDidChangeWorkspaceFolders(onFsChange),
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand("wrenlift.startServer", startServer),
@@ -499,17 +790,48 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return;
         }
         const filePath = target.fsPath;
+        const fileName = filePath.split(/[\\/]/).pop() || "";
+
+        // Refuse non-Wren targets up-front. Without the guard, the
+        // welcome view's "run the active file" link or a stale
+        // editor focus could fire `wlift <hatchfile>` and the
+        // parser would mis-attribute the syntax error to the
+        // user's source. The two file shapes WrenLift knows how
+        // to run are `*.wren` (any) and the workspace manifest's
+        // canonical `main.wren` entry point.
+        if (fileName === "hatchfile") {
+          vscode.window.showWarningMessage(
+            "WrenLift: the hatchfile is the workspace manifest, not Wren source. Open main.wren or a *.spec.wren and run that.",
+          );
+          return;
+        }
+        if (!fileName.endsWith(".wren")) {
+          vscode.window.showWarningMessage(
+            `WrenLift: '${fileName}' isn't a .wren file.`,
+          );
+          return;
+        }
+
         const cfg = vscode.workspace.getConfiguration("wrenlift");
         const wliftCmd = resolveBinary("wlift", cfg.get<string>("wliftPath"), "wlift");
         const hatchCmd = resolveBinary("hatch", cfg.get<string>("hatchPath"), "hatch");
 
-        // Pick `hatch run` when a hatchfile sits in or above
-        // the file's directory and the file is `main.wren`
-        // (the conventional entry point) — that gets `hatch`'s
-        // dep-resolution + bundle path. Otherwise spawn
-        // `wlift <file>` directly. Both cases are overridable
-        // via `wrenlift.wliftPath` / `wrenlift.hatchPath`.
-        const fileName = filePath.split(/[\\/]/).pop() || "";
+        // Dispatch policy:
+        //
+        //   * `main.wren` inside a hatch project → `hatch run <root>`.
+        //     Hatch builds + dep-resolves through its bundler, which
+        //     is the canonical "run the app" path.
+        //   * any other `*.wren` (specs, helper modules, scripts) →
+        //     `wlift <file>` directly. wlift's loader walks up from
+        //     the file's directory looking for a hatchfile, so
+        //     `@hatch:foo` imports still resolve when one is in
+        //     scope. This matches what `hatch test` does for spec
+        //     files internally.
+        //   * `*.wren` with no hatchfile in scope → `wlift <file>`
+        //     from the file's dir, no project context.
+        //
+        // Both binary paths are overridable via
+        // `wrenlift.wliftPath` / `wrenlift.hatchPath`.
         const hatchRoot = findHatchfileRoot(filePath);
         const useHatch = !!hatchRoot && fileName === "main.wren";
 
@@ -530,6 +852,135 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       },
     ),
+    vscode.commands.registerCommand("wrenlift.refreshSpecs", () => {
+      specProvider.refresh();
+    }),
+    vscode.commands.registerCommand(
+      "wrenlift.runSpecCase",
+      async (node: SpecNode | undefined) => {
+        // V1 dispatches the whole-file run. Per-case filtering is
+        // a follow-up that needs `@hatch:test` filter support; the
+        // tree node is already wired so the upgrade is local.
+        const target = node?.uri ?? vscode.window.activeTextEditor?.document.uri;
+        if (!target) {
+          vscode.window.showWarningMessage(
+            "WrenLift: open a *.spec.wren file to run.",
+          );
+          return;
+        }
+        await vscode.commands.executeCommand(
+          "wrenlift.runFile",
+          target.toString(),
+        );
+      },
+    ),
+    vscode.commands.registerCommand(
+      "wrenlift.viewSpecOutput",
+      async (_node: SpecNode | undefined) => {
+        // The whole-file run dumps into the shared "WrenLift Run"
+        // terminal. Until per-case filtering lands, "View output"
+        // just focuses that terminal.
+        const term = vscode.window.terminals.find(
+          (t) => t.name === "WrenLift Run",
+        );
+        if (term) {
+          term.show(false);
+        } else {
+          vscode.window.showInformationMessage(
+            "No spec output yet — click ▶ to run a case first.",
+          );
+        }
+      },
+    ),
+    vscode.commands.registerCommand("wrenlift.newProject", async () => {
+      const name = await vscode.window.showInputBox({
+        prompt: "Project name",
+        placeHolder: "my-app",
+        validateInput: (v) => {
+          const t = v.trim();
+          if (!t) return "Required.";
+          if (!/^[a-zA-Z0-9_-]+$/.test(t)) {
+            return "Use letters, numbers, dashes, or underscores only.";
+          }
+          return null;
+        },
+      });
+      if (!name) return;
+      const trimmed = name.trim();
+
+      // Folder picker for the parent location. Defaults to the
+      // currently-open workspace if there is one, otherwise the
+      // home directory — works whether the user invoked this
+      // from a fresh `code` instance with no folder, from inside
+      // an existing project, or from the welcome view.
+      const cwdFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        defaultUri: cwdFolder,
+        openLabel: "Create here",
+        title: `Choose where '${trimmed}' should live`,
+      });
+      if (!picked || picked.length === 0) return;
+      const parent = picked[0];
+      const projectUri = vscode.Uri.joinPath(parent, trimmed);
+
+      // Refuse upfront if the target subdirectory already exists
+      // — `hatch init` would also bail, but surfacing it here
+      // gives a cleaner message than a terminal stderr line.
+      try {
+        const stat = await vscode.workspace.fs.stat(projectUri);
+        if (stat) {
+          vscode.window.showErrorMessage(
+            `'${projectUri.fsPath}' already exists. Pick a different name or location.`,
+          );
+          return;
+        }
+      } catch {
+        // ENOENT — good, we can scaffold here.
+      }
+
+      const cfg = vscode.workspace.getConfiguration("wrenlift");
+      const hatchCmd = resolveBinary("hatch", cfg.get<string>("hatchPath"), "hatch");
+
+      // Exec `hatch init <name>` directly so we can await
+      // completion and open the resulting folder. A terminal
+      // makes the flow feel async + manual; this is fast (no
+      // network, just file ops) so a synchronous spawn is fine.
+      const cp = require("child_process") as typeof import("child_process");
+      try {
+        await new Promise<void>((resolve, reject) => {
+          cp.execFile(
+            hatchCmd,
+            ["init", trimmed],
+            { cwd: parent.fsPath, timeout: 15000 },
+            (err, _stdout, stderr) => {
+              if (err) {
+                reject(new Error(stderr?.toString().trim() || err.message));
+                return;
+              }
+              resolve();
+            },
+          );
+        });
+      } catch (e) {
+        vscode.window.showErrorMessage(`hatch init failed: ${(e as Error).message}`);
+        return;
+      }
+
+      // Open the new project. If a workspace is already open we
+      // route to a new window so the user doesn't lose their
+      // current context; on a fresh `code` instance with no
+      // folder, reuse the current window. The `vscode.openFolder`
+      // command takes a URI and an `forceNewWindow` boolean.
+      const forceNewWindow = !!cwdFolder;
+      await vscode.commands.executeCommand(
+        "vscode.openFolder",
+        projectUri,
+        forceNewWindow,
+      );
+    }),
     vscode.commands.registerCommand("wrenlift.showServerActions", async () => {
       const running = client?.state === State.Running;
       const items: (vscode.QuickPickItem & { id: string })[] = [

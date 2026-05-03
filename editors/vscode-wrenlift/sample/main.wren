@@ -10,6 +10,9 @@ class App {
     System.print(Fmt.bold(Fmt.red("FAIL")))
     System.print(Fmt.padLeft("3", 4))
     System.print(Fmt.yellow("Hello wren!"))
+
+    var num = 42.8
+    System.print("%(Fmt.blue("num: "))" + "%(Fmt.bold(num))!")
   }
 }
 

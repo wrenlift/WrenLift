@@ -492,18 +492,63 @@ entry = "main"
 # every .wren it discovers here automatically if this field is empty.
 modules = ["main"]
 
-# [dependencies]
-# libfoo = "0.2"
+[dependencies]
+"@hatch:test"   = "0.1.1"
+"@hatch:assert" = "0.2.2"
 "#
     );
     write_or_die(&hatchfile_path, &hatchfile_contents);
 
     let main_path = dir.join("main.wren");
     if !main_path.exists() {
-        let stub = format!(
-            "// Entry point for package '{name}'. `hatch run` executes this file.\nSystem.print(\"hello from {name}\")\n"
-        );
+        let stub = "// Entry point. `hatch run` executes this file.\nSystem.print(\"Hello wren!\")\n".to_string();
         write_or_die(&main_path, &stub);
+    }
+
+    let spec_path = dir.join("test.spec.wren");
+    if !spec_path.exists() {
+        // Sample spec — exercises the @hatch:assert matchers a
+        // newcomer is most likely to reach for and shows the
+        // `Test.describe` / `Test.it` shape the editor's spec
+        // runner / codelens surface uses.
+        let spec = r#"// Sample spec. `hatch test` (or the WrenLift sidebar) runs this.
+import "@hatch:test" for Test
+import "@hatch:assert" for Expect
+
+Test.describe("arithmetic") {
+  Test.it("adds two numbers") {
+    Expect.that(1 + 1).toBe(2)
+  }
+  Test.it("multiplies and divides") {
+    Expect.that(6 * 7).toBe(42)
+    Expect.that(10 / 2).toBe(5)
+  }
+}
+
+Test.describe("strings") {
+  Test.it("concatenates with %()") {
+    var name = "wren"
+    Expect.that("hello, %(name)").toBe("hello, wren")
+  }
+  Test.it("contains substring") {
+    Expect.that("kingfisher").toContain("fish")
+  }
+}
+
+Test.describe("collections") {
+  Test.it("structural list equality") {
+    Expect.that([1, 2, 3]).toEqual([1, 2, 3])
+  }
+  Test.it("map lookup") {
+    var m = {"a": 1, "b": 2}
+    Expect.that(m["a"]).toBe(1)
+    Expect.that(m["missing"]).toBeNull()
+  }
+}
+
+Test.run()
+"#;
+        write_or_die(&spec_path, spec);
     }
 }
 

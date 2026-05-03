@@ -5,3 +5,5 @@ description = "Sample workspace shipped with the VS Code extension to verify dia
 
 [dependencies]
 "@hatch:fmt" = "0.1.1"
+"@hatch:test" = "0.1.0"
+"@hatch:assert" = "0.2.2"
