@@ -9,6 +9,14 @@ import {
 
 let client: LanguageClient | undefined;
 let statusItem: vscode.StatusBarItem | undefined;
+/// Re-entrancy guard for `startServer`. The post-install poll
+/// fires `startServer` from a setTimeout chain while the dialog
+/// path may still be awaiting `client.start()` (or holding the
+/// user inside `offerLspInstall`). Two starts in flight collide
+/// on the language client's internal state machine and produce
+/// silent failures — the second `start()` resolves immediately
+/// against a half-initialised client and never reaches running.
+let starting = false;
 
 /// Resolve `${workspaceFolder}` and `${workspaceFolder:NAME}` in a
 /// user-supplied path. VS Code only substitutes these tokens for
@@ -138,6 +146,15 @@ function quoteShell(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+/// Read `client.state` through a function so TypeScript's
+/// control-flow narrowing doesn't carry an early-exit check
+/// past an `await` boundary inside the post-install poller.
+/// The poller calls `startServer` mid-loop, which can rebuild
+/// `client` entirely — TS can't see across that mutation.
+function clientIsRunning(): boolean {
+  return client?.state === State.Running;
+}
+
 function refreshStatus(): void {
   if (!statusItem) return;
   if (!client) {
@@ -172,26 +189,123 @@ function refreshStatus(): void {
 }
 
 async function startServer(): Promise<void> {
-  if (client && client.state !== State.Stopped) {
+  if (starting) return;
+  if (client && client.state === State.Running) {
     return;
   }
-  if (!client) {
+  starting = true;
+  try {
+    // Always build a fresh client so `resolveBinary` re-runs
+    // — if the user just installed the LSP via the dialog,
+    // the path needs to be re-resolved against the current
+    // filesystem state. Reusing a previously-failed client
+    // also lands the runtime in a non-restartable state in
+    // some vscode-languageclient versions.
+    if (client) {
+      try {
+        await client.stop();
+      } catch {
+        // Ignore — a never-started client may throw on stop.
+      }
+      client = undefined;
+    }
     client = buildClient();
     client.onDidChangeState(refreshStatus);
+    refreshStatus();
+    try {
+      await client.start();
+    } catch (err) {
+      const config = vscode.workspace.getConfiguration("wrenlift");
+      const cmd = resolveBinary(
+        "wlift-lsp",
+        config.get<string>("serverPath"),
+        "wlift-lsp",
+      );
+      await offerLspInstall(cmd, String(err));
+    }
+    refreshStatus();
+  } finally {
+    starting = false;
   }
-  refreshStatus();
-  try {
-    await client.start();
-  } catch (err) {
-    const config = vscode.workspace.getConfiguration("wrenlift");
-    const cmd = resolveBinary(
-      "wlift-lsp",
-      config.get<string>("serverPath"),
-      "wlift-lsp",
-    );
-    await offerLspInstall(cmd, String(err));
-  }
-  refreshStatus();
+}
+
+/// Poll for the install.sh-default binary path (`~/.local/bin/
+/// wlift-lsp`) — that's where the curl-piped installer drops
+/// it regardless of the user's configured `serverPath`. Once
+/// the binary lands AND is executable, clear any stale
+/// absolute-path `serverPath` override so `resolveBinary`'s
+/// fall-through picks the fresh install up; then start the
+/// server.
+///
+/// Race window: install.sh runs `mv` then `chmod +x` as two
+/// separate steps. Between them, `existsSync` returns true but
+/// the file may not yet be executable, so spawning produces an
+/// EACCES that surfaces as a silent client.start() rejection.
+/// We gate on `accessSync(X_OK)` instead, plus a brief settle
+/// delay, and we keep polling until either the client reaches
+/// `Running` or the timeout expires — a single `start()`
+/// failure no longer terminates the loop.
+function pollForBinaryAndRestart(): void {
+  const fs = require("fs") as typeof import("fs");
+  const os = require("os") as typeof import("os");
+  const path = require("path") as typeof import("path");
+  const installTarget = path.join(os.homedir(), ".local", "bin", "wlift-lsp");
+  const start = Date.now();
+  const TIMEOUT_MS = 60000;
+  const POLL_MS = 1000;
+  const SETTLE_MS = 250;
+  let pathReset = false;
+
+  const isReady = (): boolean => {
+    try {
+      fs.accessSync(installTarget, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const tick = async () => {
+    if (Date.now() - start > TIMEOUT_MS) return;
+    if (clientIsRunning()) return;
+
+    if (!isReady()) {
+      setTimeout(tick, POLL_MS);
+      return;
+    }
+
+    // Reset a stale absolute `serverPath` once — only when the
+    // configured override points somewhere the binary never
+    // landed (a deleted debug build, a tarball path that no
+    // longer exists). A healthy override that resolves to the
+    // freshly-installed binary stays put.
+    if (!pathReset) {
+      pathReset = true;
+      const cfg = vscode.workspace.getConfiguration("wrenlift");
+      const configured = cfg.get<string>("serverPath");
+      if (
+        configured &&
+        configured !== "wlift-lsp" &&
+        resolveVariables(configured) !== installTarget &&
+        !fs.existsSync(resolveVariables(configured))
+      ) {
+        const target =
+          vscode.workspace.workspaceFolders &&
+          vscode.workspace.workspaceFolders.length > 0
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global;
+        await cfg.update("serverPath", "wlift-lsp", target);
+      }
+      // Give chmod / fs a beat to settle before the first spawn.
+      await new Promise((r) => setTimeout(r, SETTLE_MS));
+    }
+
+    await startServer();
+    if (!clientIsRunning()) {
+      setTimeout(tick, POLL_MS);
+    }
+  };
+  setTimeout(tick, POLL_MS);
 }
 
 /// Actionable failure dialog when the LSP binary can't be
@@ -244,9 +358,25 @@ async function offerLspInstall(cmd: string, err: string): Promise<void> {
     }
     terminal.show(true);
     terminal.sendText(`curl -fsSL ${INSTALL_URL} | bash`);
-    vscode.window.showInformationMessage(
-      "Once the install finishes in the terminal, run 'WrenLift: Restart Language Server' to retry.",
-    );
+    // Auto-detect when the install finishes by polling for
+    // the binary at its install path. install.sh writes
+    // atomically, so the moment `existsSync` returns true the
+    // file is fully laid down. 60s window covers a slow
+    // network on a modern connection (binary is ~10-20 MB);
+    // beyond that the user can hit "Restart Server" by hand
+    // — surface that fallback explicitly via the action
+    // button below.
+    pollForBinaryAndRestart();
+    void vscode.window
+      .showInformationMessage(
+        "Wait for the install to finish in the terminal, then restart the language server. WrenLift will also auto-restart for the next 60 seconds once the binary lands on disk.",
+        "Restart server now",
+      )
+      .then((choice) => {
+        if (choice === "Restart server now") {
+          void restartServer();
+        }
+      });
   } else if (choice === "Browse to binary…") {
     const picked = await vscode.window.showOpenDialog({
       canSelectFiles: true,
