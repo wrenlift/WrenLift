@@ -28,6 +28,39 @@ pub mod cl {
     // Note: QNAN | 3 = TAG_UNDEFINED (not null!)
     const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
+    // ---------------------------------------------------------------------
+    // Cached process-wide env flags for the JIT compile path
+    // ---------------------------------------------------------------------
+    //
+    // The Cranelift lowering reads several `WLIFT_*` flags every time it
+    // emits a call site (`WLIFT_ENABLE_JIT_CALLSITE_IC`,
+    // `WLIFT_ENABLE_PURE_LEAF_DIRECT`) or a function (`WLIFT_ENABLE_STACK_MAPS`).
+    // `std::env::var_os` acquires a global mutex on every call — fine for
+    // one-shot startup probes, but the broker thread compiles dozens of
+    // functions during warmup with hundreds of call sites between them.
+    // Cache once into a `OnceLock<bool>`.
+
+    #[inline]
+    fn env_jit_callsite_ic() -> bool {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some())
+    }
+
+    #[inline]
+    fn env_pure_leaf_direct() -> bool {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some())
+    }
+
+    #[inline]
+    fn env_stack_maps() -> bool {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some())
+    }
+
     /// Compiled output from the Cranelift backend.
     pub struct CraneliftCompiledCode {
         /// The JIT module (keeps executable memory alive).
@@ -77,7 +110,7 @@ pub mod cl {
         // shape that the existing naked `wren_call_N` stubs rely
         // on. Flip both together with `WLIFT_ENABLE_STACK_MAPS=1`
         // when iterating on the GC root work.
-        let pfp = if std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some() {
+        let pfp = if env_stack_maps() {
             "true"
         } else {
             "false"
@@ -953,7 +986,7 @@ pub mod cl {
         // currently amplifies an unrelated UNDEF-leak in the JIT;
         // re-enable once that init bug is fixed.
         let mark_stack_map =
-            f64_self_id.is_none() && std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some();
+            f64_self_id.is_none() && env_stack_maps();
         let value_types = if mark_stack_map {
             infer_osr_value_types(mir)
         } else {
@@ -1375,9 +1408,38 @@ pub mod cl {
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::Neg(a) => {
+                // Inline numeric fast path: if `a` is a number, fneg
+                // and bitcast back; otherwise dispatch the user's
+                // prefix `-` operator via the runtime helper.
+                let la = get(a);
+                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                let fast_block = builder.create_block();
+                let slow_block = builder.create_block();
+                let merge_block = builder.create_block();
+                builder.append_block_param(merge_block, types::I64);
+
+                let masked = builder.ins().band(la, qnan);
+                let is_nan_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                builder
+                    .ins()
+                    .brif(is_nan_box, slow_block, &[], fast_block, &[]);
+
+                builder.switch_to_block(fast_block);
+                let fa = builder.ins().bitcast(types::F64, MemFlags::new(), la);
+                let fneg = builder.ins().fneg(fa);
+                let ineg = builder.ins().bitcast(types::I64, MemFlags::new(), fneg);
+                builder.ins().jump(merge_block, &[BlockArg::Value(ineg)]);
+
+                builder.switch_to_block(slow_block);
                 let f = get_runtime_fn(module, builder, "wren_num_neg", 1)?;
-                let result = builder.ins().call(f, &[get(a)]);
-                Ok(Some(builder.inst_results(result)[0]))
+                let call = builder.ins().call(f, &[la]);
+                let slow_result = builder.inst_results(call)[0];
+                builder
+                    .ins()
+                    .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                builder.switch_to_block(merge_block);
+                Ok(Some(builder.block_params(merge_block)[0]))
             }
 
             // === Boxed comparisons → inline fast path + runtime slow path ===
@@ -1434,14 +1496,35 @@ pub mod cl {
                 )
             }
             Instruction::CmpEq(a, b) => {
-                let f = get_runtime_fn(module, builder, "wren_cmp_eq", 2)?;
-                let result = builder.ins().call(f, &[get(a), get(b)]);
-                Ok(Some(builder.inst_results(result)[0]))
+                // Inline numeric fast path: when both operands are nums,
+                // f64-compare directly. `FloatCC::Equal` is ordered, so
+                // NaN != NaN as IEEE / Wren both expect. Slow path
+                // (wren_cmp_eq) handles object content equality (notably
+                // String content compare) and operator overloads.
+                let la = get(a);
+                let lb = get(b);
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Cmp(FloatCC::Equal),
+                    "wren_cmp_eq",
+                )
             }
             Instruction::CmpNe(a, b) => {
-                let f = get_runtime_fn(module, builder, "wren_cmp_ne", 2)?;
-                let result = builder.ins().call(f, &[get(a), get(b)]);
-                Ok(Some(builder.inst_results(result)[0]))
+                let la = get(a);
+                let lb = get(b);
+                emit_inline_boxed_binop(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    la,
+                    lb,
+                    InlineBinOp::Cmp(FloatCC::NotEqual),
+                    "wren_cmp_ne",
+                )
             }
 
             // === Logical ===
@@ -1593,7 +1676,7 @@ pub mod cl {
                         // Slow path: full dispatch via wren_call_N
                         builder.switch_to_block(slow_block);
                         let mut method_bits = method.index() as u64;
-                        if std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some() {
+                        if env_jit_callsite_ic() {
                             method_bits |= ((ic_idx as u64) + 1) << 32;
                         }
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
@@ -1624,7 +1707,7 @@ pub mod cl {
 
                 // No IC or unsupported IC kind: full dispatch
                 let mut method_bits = method.index() as u64;
-                if std::env::var_os("WLIFT_ENABLE_JIT_CALLSITE_IC").is_some() {
+                if env_jit_callsite_ic() {
                     method_bits |= ((ic_idx as u64) + 1) << 32;
                 }
                 let method_val = builder.ins().iconst(types::I64, method_bits as i64);
@@ -1682,7 +1765,7 @@ pub mod cl {
                 // stack maps for the call_indirect args are wired up;
                 // until then fall through to `wren_known_call_N_nocheck`,
                 // which roots args before dispatching.
-                let pure_leaf_enabled = std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some();
+                let pure_leaf_enabled = env_pure_leaf_direct();
                 if pure_leaf_enabled
                     && inline_getter_field.is_none()
                     && *pure_leaf
