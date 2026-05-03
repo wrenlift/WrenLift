@@ -1,6 +1,6 @@
 [package]
 name = "wlift_wasm"
-version = "0.1.16"
+version = "0.1.18"
 edition = "2021"
 description = "wasm-bindgen entry shim for the WrenLift runtime — compile + run Wren code in browser / wasi hosts."
 
