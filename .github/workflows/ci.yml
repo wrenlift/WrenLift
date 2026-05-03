@@ -56,7 +56,16 @@ jobs:
       # unused_imports, unused_variables, unreachable_patterns)`
       # under `cfg(not(feature = "host"))` keeps the gated paths
       # from drowning real warnings in the rest.
+      #
+      # Linux-only: `wlift_sqlite`'s wasm path pulls
+      # `sqlite-wasm-rs`, whose build script invokes
+      # `clang --target=wasm32-unknown-unknown` against the host
+      # clang. macOS runners ship Apple's `/usr/bin/clang`, which
+      # lacks the wasm32 LLVM backend, so the build script aborts
+      # before clippy ever runs. The wasm output is
+      # host-independent — Linux coverage is sufficient.
       - name: Clippy (wasm32-unknown-unknown)
+        if: runner.os == 'Linux'
         run: |
           cargo clippy --lib --target wasm32-unknown-unknown \
             --no-default-features -- -D warnings
@@ -68,7 +77,9 @@ jobs:
         # runs it via the embedded `wasmtime` crate, and asserts
         # the captured Wren output. Catches the kind of wasm
         # regression `cargo clippy` doesn't see (panicking
-        # `Instant::now`, missing trampolines, runtime UB).
+        # `Instant::now`, missing trampolines, runtime UB). Same
+        # macOS-clang constraint as the wasm clippy step above.
+        if: runner.os == 'Linux'
         run: cargo test --release --test wasm_smoke -- --nocapture
 
       - name: Format check

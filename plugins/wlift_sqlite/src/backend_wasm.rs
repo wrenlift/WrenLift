@@ -137,7 +137,7 @@ unsafe fn read_column(stmt: *mut ffi::sqlite3_stmt, i: c_int) -> SqlValue {
         ffi::SQLITE_FLOAT => SqlValue::Real(unsafe { ffi::sqlite3_column_double(stmt, i) }),
         ffi::SQLITE_TEXT => {
             let bytes = unsafe { ffi::sqlite3_column_bytes(stmt, i) };
-            let ptr = unsafe { ffi::sqlite3_column_text(stmt, i) } as *const u8;
+            let ptr = unsafe { ffi::sqlite3_column_text(stmt, i) };
             if ptr.is_null() || bytes <= 0 {
                 SqlValue::Text(String::new())
             } else {
