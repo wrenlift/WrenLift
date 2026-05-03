@@ -27,18 +27,23 @@ every `(name, version)` pair, route `Dependency::Version` through
 Cargo's `semver` crate, and have the resolver pick the highest
 matching version per entry.
 
-### Playground autocomplete pops inside comments
+### LSP completions don't classify cursor context
 
-`wrenCompletionSource` in `wasm/web/index.html` matches `\w*`
-against the line and forwards the result to `completeWren`. It
-doesn't classify the cursor context — string and comment runs
-look like ordinary text to the regex.
+The runtime's `complete_wren` returns matches for any byte
+offset the caller passes in — it doesn't classify whether the
+cursor sits inside code, a string literal, or a `//` / `///`
+comment. The LSP currently ships diagnostic-only, so this isn't
+visible yet, but the playground (which already calls the
+function from `wasm/web/index.html`) demonstrates the symptom:
+every word-shape prefix triggers a completion, including inside
+comments and strings.
 
-Fix sketch: expose a wasm helper that returns whether a byte is
-inside a string or comment lex token (the lexer already knows);
-`wrenCompletionSource` bails when it is. Eventually distinguish
-`///` doc-comments so future cross-ref completions
-(`[ClassName]`, `[Class.method]`) can fire there.
+Fix sketch: add a wasm helper that returns the lex-token kind
+covering a byte (string / line-comment / doc-comment / code) so
+both the LSP and the playground can bail uniformly. `///` is
+the doc-comment context — it should stay open as a future
+hook for cross-ref completions (`[ClassName]`,
+`[Class.method]`) without leaking through to plain `//`.
 
 ### Hover doesn't propagate superclass `///` docs to subclass overrides
 
