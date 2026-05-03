@@ -151,35 +151,6 @@ impl Document {
     }
 }
 
-/// Trim a class / member's full Markdown doc body to a hover-
-/// sized summary. VS Code hover panels grow to fit the widest
-/// fixed-width code block, so a doc with multi-line examples
-/// (`Fmt.green("ok")` style) blows the hover out to fill the
-/// screen. Keep the first prose paragraph; drop code blocks
-/// and everything after the first blank line.
-fn summarize_doc(doc: &str) -> String {
-    let mut lines: Vec<&str> = Vec::new();
-    let mut in_code = false;
-    for line in doc.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code {
-            continue;
-        }
-        if trimmed.is_empty() {
-            if !lines.is_empty() {
-                break;
-            }
-            continue;
-        }
-        lines.push(line);
-    }
-    lines.join("\n")
-}
-
 fn compute_line_starts(text: &str) -> Vec<usize> {
     let mut out = Vec::with_capacity(64);
     out.push(0);
@@ -660,7 +631,7 @@ fn identifier_hover(
                         "```wren\nclass {}\n```{}{}",
                         class.name,
                         if class.doc.is_empty() { "" } else { "\n\n" },
-                        summarize_doc(&class.doc),
+                        class.doc,
                     );
                     return Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -683,7 +654,7 @@ fn identifier_hover(
                         "```wren\n{}\n```{}{}",
                         wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                         if member.doc.is_empty() { "" } else { "\n\n" },
-                        summarize_doc(&member.doc),
+                        member.doc,
                     );
                     return Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -726,7 +697,7 @@ fn identifier_hover(
                                 &member.signature
                             ),
                             if member.doc.is_empty() { "" } else { "\n\n" },
-                            summarize_doc(&member.doc),
+                            member.doc,
                         );
                         return Some(Hover {
                             contents: HoverContents::Markup(MarkupContent {
@@ -759,7 +730,7 @@ fn identifier_hover(
                                         &member.signature
                                     ),
                                     if member.doc.is_empty() { "" } else { "\n\n" },
-                                    summarize_doc(&member.doc),
+                                    member.doc,
                                 );
                                 return Some(Hover {
                                     contents: HoverContents::Markup(MarkupContent {
@@ -828,7 +799,7 @@ fn prelude_hover(doc: &Document, byte: usize) -> Option<Hover> {
                     "```wren\nclass {}\n```{}{}",
                     class.name,
                     if class.doc.is_empty() { "" } else { "\n\n" },
-                    summarize_doc(&class.doc),
+                    class.doc,
                 );
                 return Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
@@ -844,7 +815,7 @@ fn prelude_hover(doc: &Document, byte: usize) -> Option<Hover> {
                         "```wren\n{}\n```{}{}",
                         wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
                         if member.doc.is_empty() { "" } else { "\n\n" },
-                        summarize_doc(&member.doc),
+                        member.doc,
                     );
                     return Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
