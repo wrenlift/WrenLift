@@ -4,5 +4,7 @@
   "workbench.colorCustomizations": {
     "editorCodeLens.foreground": "#FDBE3C",
     "editorCodeLens.activeForeground": "#FDD169"
-  }
+  },
+  "editor.codeLensFontSize": 11
+
 }

@@ -716,13 +716,15 @@ impl LanguageServer for Backend {
         if !is_main && !is_spec {
             return Ok(None);
         }
-        // `$(triangle-right)` is the filled play glyph (the
-        // bare `$(play)` is the outlined variant). Filename
-        // suffix matches rust-analyzer's "Run target_name"
-        // convention so workspaces with multiple specs can
-        // tell which lens belongs to which file at a glance.
+        // `▶︎` is the unicode "Black Right-Pointing Triangle"
+        // (U+25B6) with the variation selector U+FE0E that asks
+        // for the text-style presentation. rust-analyzer uses
+        // the same shape — rendering through the editor font
+        // makes it noticeably larger than codicon glyphs at
+        // the same codelens font size. Filename suffix mirrors
+        // rust-analyzer's "Run target_name" convention.
         let _ = is_spec; // both lens shapes use the same title today
-        let title = format!("$(triangle-right) Run {}", file_name);
+        let title = format!("\u{25B6}\u{FE0E} Run {}", file_name);
         // Anchor the lens to the first non-empty line of source
         // (skipping leading blank lines). VS Code renders code
         // lenses above their `range.start.line`; a degenerate
