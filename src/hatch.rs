@@ -114,7 +114,7 @@ impl SectionKind {
 /// loader reads are listed here with `#[serde(default)]` where they're
 /// optional so older / newer hatch versions round-trip through unknown
 /// producers without breaking.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
     /// Package name. Required.
     pub name: String,

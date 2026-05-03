@@ -305,6 +305,17 @@ fn make_module_io(
     let load_source = {
         let dirs = Rc::clone(&dirs);
         let root_dir = running_file_dir.clone();
+        // Wrap raw file reads through `cfg::apply` so `#!native` /
+        // `#!wasm` attribute lines on imports get filtered out at
+        // load time, the same way `hatch build` filters them at
+        // bundle time. Without this, running `wlift pkg.spec.wren`
+        // directly hits a parser error on any package source that
+        // gates imports per-target — which is the canonical shape
+        // for cross-target packages (e.g. @hatch:assets, @hatch:gpu).
+        // `None` selects the host arm (drop `#!wasm`, keep `#!native`).
+        let host_filter = |text: String| -> String {
+            wren_lift::parse::cfg::apply(&text, None)
+        };
         Box::new(move |name: &str, from: &str| -> Option<String> {
             // The VM passes the canonical name back here for
             // relative imports (resolver returned an absolute
@@ -316,7 +327,7 @@ fn make_module_io(
                     dirs.borrow_mut()
                         .insert(name.to_string(), parent.to_path_buf());
                 }
-                return Some(text);
+                return Some(host_filter(text));
             }
 
             // Otherwise resolve against the importer's directory
@@ -334,7 +345,7 @@ fn make_module_io(
                     dirs.borrow_mut()
                         .insert(name.to_string(), parent.to_path_buf());
                 }
-                return Some(text);
+                return Some(host_filter(text));
             }
             // Bare names (no scope chars) — sibling file in the
             // same dir as the importer.
@@ -348,7 +359,7 @@ fn make_module_io(
                 dirs.borrow_mut()
                     .insert(name.to_string(), parent.to_path_buf());
             }
-            Some(text)
+            Some(host_filter(text))
         }) as Box<dyn Fn(&str, &str) -> Option<String>>
     };
 
