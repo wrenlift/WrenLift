@@ -1,6 +1,6 @@
 [package]
 name = "wlift_lsp"
-version = "0.1.0"
+version = "0.1.13"
 edition = "2021"
 description = "Language Server Protocol implementation for Wren projects compiled through WrenLift. Reuses the parser + semantic analyzer; surfaces parse / sema errors as LSP diagnostics, with hover + goto-def + completion + rename arriving in later phases."
 

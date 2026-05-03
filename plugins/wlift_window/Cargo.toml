@@ -1,6 +1,6 @@
 [package]
 name = "wlift_window"
-version = "0.1.0"
+version = "0.2.8"
 edition = "2021"
 description = "Default window provider for the WrenLift apps — a winit-backed cdylib bundled into @hatch:window. Exposes a polled event loop and a raw-window-handle Map that @hatch:gpu's Device.createSurface accepts."
 

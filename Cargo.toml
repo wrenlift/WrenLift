@@ -17,8 +17,8 @@ resolver = "2"
 
 [package]
 name = "wren_lift"
-version = "0.1.0"
-authors = ["Damilare Akinlaja <damilare@zenturi.co>"]
+version = "0.1.13"
+authors = ["Damilare Akinlaja <dami@wrenlift.com>"]
 edition = "2021"
 
 [lib]
