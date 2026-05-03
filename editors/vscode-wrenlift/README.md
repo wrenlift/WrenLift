@@ -48,3 +48,25 @@ binary in VS Code settings.
 Source lives at
 [wrenlift/WrenLift](https://github.com/wrenlift/WrenLift) under
 `editors/vscode-wrenlift/`. Bug reports and pull requests welcome.
+
+## Local development
+
+```sh
+cd editors/vscode-wrenlift
+npm install
+npm run compile
+```
+
+Open the folder in VS Code and press **F5**. A second VS Code
+window opens with the sample workspace under `sample/`
+(`hatchfile`, `main.wren`, a copy of `@hatch:fmt`'s source).
+Diagnostics + hover should fire on the real `.wren` files.
+
+The sample window picks up `wlift-lsp` from `$PATH`. To test
+against a local debug build, set `wrenlift.serverPath` in the
+sample window's settings.json to your build output, e.g.
+`/Users/you/.../wren_lift/target/release/wlift-lsp`.
+
+`npm run watch` keeps the TS compiler running in the
+background; the Extension Development Host picks up the
+recompiled bundle on the next `Developer: Reload Window`.
