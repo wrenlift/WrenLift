@@ -54,11 +54,23 @@ pub mod cl {
         *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some())
     }
 
+    /// Stack maps are now ON by default. JIT-compiled Wren methods
+    /// keep boxed `Value`s in CPU registers across calls, but only
+    /// the args passed *into* `wren_call_N` get pushed as JIT roots
+    /// — the caller's other live values are register-resident and
+    /// invisible to the GC scanner. Without stack maps, any minor GC
+    /// triggered by a callee's allocation strands those pointers in
+    /// freed/reused nursery memory, and the next use produces
+    /// "instance of Object" miscompiles or segfaults. The hatch site's
+    /// template parser hit this within ~10 requests under live load.
+    ///
+    /// `WLIFT_DISABLE_STACK_MAPS=1` is preserved as a kill switch so
+    /// a regression here can be bisected without a rebuild.
     #[inline]
     fn env_stack_maps() -> bool {
         use std::sync::OnceLock;
         static CACHED: OnceLock<bool> = OnceLock::new();
-        *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some())
+        *CACHED.get_or_init(|| std::env::var_os("WLIFT_DISABLE_STACK_MAPS").is_none())
     }
 
     /// Compiled output from the Cranelift backend.
