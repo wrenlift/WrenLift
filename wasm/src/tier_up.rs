@@ -624,9 +624,9 @@ fn wren_call_1_inner(vm: &mut wren_lift::runtime::vm::VM, root_base: usize, meth
 ///
 /// **Hardcoded module: `"main"`.** Only user-source vars are
 /// reachable; the prelude module isn't. Acceptable because the
-/// prelude classes always reject for other reasons (Call arity
-/// > 1, MakeList, etc.) so their MIR never compiles to wasm.
-/// User-source MIR is always in module `"main"` (see
+/// prelude classes always reject for other reasons (Call arity >
+/// 1, MakeList, etc.) so their MIR never compiles to wasm. User-
+/// source MIR is always in module `"main"` (see
 /// `vm.interpret("main", &combined)` in `lib.rs::run`).
 // Cache of the "main" module pointer keyed by VM pointer so the
 // per-call HashMap<String,_>::get fallback falls away. Each

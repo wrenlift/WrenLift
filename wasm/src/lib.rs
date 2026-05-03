@@ -826,15 +826,12 @@ pub fn wlift_extract_wasm_plugins(bytes: &[u8]) -> js_sys::Array {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn wlift_host_alloc(len: u32) -> u32 {
-    let mut buf = Vec::<u8>::with_capacity(len as usize);
-    // SAFETY: `with_capacity(n)` reserves `n` bytes; setting
-    // length to `n` exposes uninitialised bytes which the caller
-    // immediately overwrites via JS-side memory copy. The Vec
-    // is intentionally leaked — `wlift_host_free` reconstructs
-    // and drops it.
-    unsafe {
-        buf.set_len(len as usize);
-    }
+    // Zero-initialised so the buffer is well-formed before the JS
+    // copy overwrites it; the alloc shape (capacity == length)
+    // matches the `Vec::from_raw_parts` reconstruction in
+    // `wlift_host_free`. The memset is a no-op compared to the
+    // `js -> linear memory` copy that immediately follows.
+    let mut buf = vec![0u8; len as usize];
     let ptr = buf.as_mut_ptr();
     std::mem::forget(buf);
     ptr as u32
