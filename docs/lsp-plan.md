@@ -143,25 +143,35 @@ highlighting because LSP doesn't carry tokens.
 
 ## Phasing
 
-### v0 — diagnostic-only server
+### v0 — diagnostic-only server (DONE)
 
-1. `wlift_lsp` crate: tower-lsp wrapper around parse+sema.
-2. `textDocument/{didOpen,didChange,didSave,didClose}` plumbing.
-3. `textDocument/diagnostic` (or push diagnostics) reflecting parse
-   errors.
-4. VSCode extension shell — installs the binary, starts it, surfaces
-   diagnostics.
+1. `wlift_lsp` crate: tower-lsp wrapper around parse+sema. ✓
+2. `textDocument/{didOpen,didChange,didSave,didClose}` plumbing. ✓
+3. `textDocument/diagnostic` (push diagnostics) reflecting parse
+   errors. ✓
 
-Deliverable: editing a `.wren` file in VSCode shows red squigglies on
-syntax errors with the same messages the CLI emits.
+### v0.5 — VSCode extension shell
+
+Split out from v0 because the server side landed first and the
+extension is independently versioned and shipped through the
+marketplace. Bundles the LSP client (spawns `wlift_lsp` from
+PATH), a TextMate grammar (`syntaxes/wren.tmLanguage.json`) for
+syntax highlighting since LSP doesn't carry tokens, and a
+language configuration (brackets, comments, indent rules).
+
+Deliverable: editing a `.wren` file in VSCode shows red
+squigglies on syntax errors with the same messages the CLI
+emits, plus syntax highlighting on every `.wren` file.
 
 ### v1 — semantic + hover
 
-5. Sema pass wired into the diagnostic stream.
-6. Span → symbol table: every identifier carries its resolved binding
-   (decl site, type).
-7. `textDocument/hover` showing signature + (when present) doc
-   Markdown extracted from the user's local `///` comments.
+4. Sema pass wired into the diagnostic stream. ✓ (parse path
+   live; sema-warning attribution still pending)
+5. Span → symbol table: every identifier carries its resolved
+   binding (decl site, type). ✓ (via `Analysis` in
+   `src/docs/hover.rs`)
+6. `textDocument/hover` showing signature + (when present) doc
+   Markdown extracted from the user's local `///` comments. ✓
 
 ### v2 — goto-def + references
 

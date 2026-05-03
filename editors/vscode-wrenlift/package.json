@@ -1,0 +1,90 @@
+{
+  "name": "vscode-wrenlift",
+  "displayName": "WrenLift",
+  "description": "Wren language support powered by WrenLift — diagnostics, hover, and (soon) goto-def + completion via the wlift-lsp language server.",
+  "version": "0.1.0",
+  "publisher": "wrenlift",
+  "license": "MIT",
+  "icon": "icons/wrenlift-icon.png",
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "wren",
+    "wrenlift",
+    "hatch",
+    "lsp"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "wren",
+        "aliases": ["Wren", "wren"],
+        "extensions": [".wren"],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "icons/wrenlift-icon.svg",
+          "dark": "icons/wrenlift-icon.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wren",
+        "scopeName": "source.wren",
+        "path": "./syntaxes/wren.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "wrenlift.restartServer",
+        "title": "WrenLift: Restart Server",
+        "category": "WrenLift"
+      }
+    ],
+    "configuration": {
+      "title": "WrenLift",
+      "properties": {
+        "wrenlift.serverPath": {
+          "type": "string",
+          "default": "wlift-lsp",
+          "description": "Path to the wlift-lsp binary. Defaults to looking it up on $PATH; absolute paths bypass PATH."
+        },
+        "wrenlift.trace.server": {
+          "scope": "window",
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Trace LSP messages in the Output panel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.84.0",
+    "typescript": "^5.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wrenlift/WrenLift.git",
+    "directory": "editors/vscode-wrenlift"
+  },
+  "bugs": {
+    "url": "https://github.com/wrenlift/WrenLift/issues"
+  },
+  "homepage": "https://wrenlift.com"
+}

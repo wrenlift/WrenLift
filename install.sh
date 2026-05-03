@@ -5,9 +5,10 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh | bash
 #
-# Fetches the `wlift` + `hatch` binaries from the latest GitHub
-# Release (or the tag in WLIFT_VERSION), verifies the SHA256,
-# and drops them in INSTALL_DIR (default `$HOME/.local/bin`).
+# Fetches the `wlift` + `hatch` + `wlift-lsp` binaries from the
+# latest GitHub Release (or the tag in WLIFT_VERSION), verifies
+# the SHA256, and drops them in INSTALL_DIR (default
+# `$HOME/.local/bin`).
 #
 # Environment knobs
 #   WLIFT_VERSION  — pin a tag instead of picking latest. `v0.1.0`.
@@ -160,10 +161,17 @@ main() {
   say "Extracting…"
   tar -xzf "$tmpdir/$archive_name" -C "$tmpdir"
 
-  # Extracted layout: `wlift-<tag>-<triple>/{wlift,hatch,README.txt}`
+  # Extracted layout: `wlift-<tag>-<triple>/{wlift,hatch,wlift-lsp,README.txt}`
   local staged="$tmpdir/wlift-${tag}-${triple}"
   [ -f "$staged/wlift" ] || die "archive didn't contain wlift — did the release format change?"
   [ -f "$staged/hatch" ] || die "archive didn't contain hatch"
+  # `wlift-lsp` ships in releases v0.1.13+. Older tarballs pre-date
+  # the LSP binary; treat absence as a soft warning so an explicit
+  # downgrade to an older tag still installs the runtime + CLI.
+  has_lsp=0
+  if [ -f "$staged/wlift-lsp" ]; then
+    has_lsp=1
+  fi
 
   mkdir -p "$INSTALL_DIR"
   # Install with mv (fast, atomic-ish) then chmod so we're not
@@ -171,6 +179,10 @@ main() {
   mv "$staged/wlift" "$INSTALL_DIR/wlift"
   mv "$staged/hatch" "$INSTALL_DIR/hatch"
   chmod +x "$INSTALL_DIR/wlift" "$INSTALL_DIR/hatch"
+  if [ "$has_lsp" = "1" ]; then
+    mv "$staged/wlift-lsp" "$INSTALL_DIR/wlift-lsp"
+    chmod +x "$INSTALL_DIR/wlift-lsp"
+  fi
 
   printf "\n"
   printf "%sInstalled %s%s to %s%s%s\n" "$GREEN" "$BOLD" "$tag" "$BOLD" "$INSTALL_DIR" "$RESET"
@@ -191,6 +203,12 @@ main() {
   printf "%sVerify:%s\n" "$DIM" "$RESET"
   printf "  wlift --version\n"
   printf "  hatch --help\n"
+  if [ "$has_lsp" = "1" ]; then
+    printf "\n"
+    printf "%swlift-lsp%s is the language server. Editors invoke it; you don't run it directly.\n" "$DIM" "$RESET"
+    printf "  VS Code:  install %sWrenLift%s from the marketplace.\n" "$BOLD" "$RESET"
+    printf "  Other:    %shttps://github.com/wrenlift/WrenLift/tree/main/editors%s\n" "$DIM" "$RESET"
+  fi
 }
 
 main "$@"

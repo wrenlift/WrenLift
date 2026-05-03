@@ -112,6 +112,18 @@ jobs:
         if: matrix.use_cross == true
         run: cross build --release --bin wlift --bin hatch --target ${{ matrix.target }}
 
+      # `-p wlift_lsp` needs its own invocation: cargo's `--bin`
+      # only sees bins from the package selected by `-p`, so we
+      # can't combine the wren_lift bins with the wlift_lsp bin
+      # in a single command.
+      - name: Build wlift-lsp (native)
+        if: matrix.use_cross != true
+        run: cargo build --release -p wlift_lsp --target ${{ matrix.target }}
+
+      - name: Build wlift-lsp (cross)
+        if: matrix.use_cross == true
+        run: cross build --release -p wlift_lsp --target ${{ matrix.target }}
+
       - name: Package tarball + checksum
         shell: bash
         run: |
@@ -124,12 +136,14 @@ jobs:
           mkdir -p "dist/${stage}"
           cp "${bin_dir}/wlift" "dist/${stage}/"
           cp "${bin_dir}/hatch" "dist/${stage}/"
+          cp "${bin_dir}/wlift-lsp" "dist/${stage}/"
           # Convenience: include a minimal README next to the
           # binaries so recipients know what they are + where to
           # find docs. Keeps the tarball self-explanatory.
           cat > "dist/${stage}/README.txt" <<EOF
-          wlift ${tag} — Wren runtime (JIT + interpreter)
-          hatch ${tag} — Package + build tool for Wren
+          wlift ${tag}     — Wren runtime (JIT + interpreter)
+          hatch ${tag}     — Package + build tool for Wren
+          wlift-lsp ${tag} — Language server (LSP) for editors
 
           Add this dir to your PATH to use the binaries directly.
           Docs: https://github.com/wrenlift/WrenLift
