@@ -1,4 +1,8 @@
 {
   "wrenlift.serverPath": "${workspaceFolder}/../../../target/release/wlift-lsp",
-  "wrenlift.trace.server": "verbose"
+  "wrenlift.trace.server": "verbose",
+  "workbench.colorCustomizations": {
+    "editorCodeLens.foreground": "#FDBE3C",
+    "editorCodeLens.activeForeground": "#FDD169"
+  }
 }

@@ -716,13 +716,13 @@ impl LanguageServer for Backend {
         if !is_main && !is_spec {
             return Ok(None);
         }
-        // `$(play)` renders as a codicon in VS Code; the
-        // filename suffix matches the convention rust-analyzer
-        // uses ("▶︎ Run|Debug" annotated by target name) so
-        // workspaces with multiple specs can tell which lens
-        // belongs to which file at a glance.
+        // `$(triangle-right)` is the filled play glyph (the
+        // bare `$(play)` is the outlined variant). Filename
+        // suffix matches rust-analyzer's "Run target_name"
+        // convention so workspaces with multiple specs can
+        // tell which lens belongs to which file at a glance.
         let _ = is_spec; // both lens shapes use the same title today
-        let title = format!("$(play) Run {}", file_name);
+        let title = format!("$(triangle-right) Run {}", file_name);
         // Anchor the lens to the first non-empty line of source
         // (skipping leading blank lines). VS Code renders code
         // lenses above their `range.start.line`; a degenerate
