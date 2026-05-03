@@ -30,8 +30,11 @@ function resolveVariables(input: string): string {
 
 function buildClient(): LanguageClient {
   const config = vscode.workspace.getConfiguration("wrenlift");
-  const rawCommand = config.get<string>("serverPath") || "wlift-lsp";
-  const command = resolveVariables(rawCommand);
+  const command = resolveBinary(
+    "wlift-lsp",
+    config.get<string>("serverPath"),
+    "wlift-lsp",
+  );
 
   // The wlift-lsp binary is built from the same workspace as the
   // wlift runtime. The standard install script (install.sh) drops
@@ -102,6 +105,32 @@ function findHatchfileRoot(filePath: string): string | undefined {
   }
 }
 
+/// Resolve a toolchain binary name to a usable command. The
+/// `install.sh` script drops `wlift`, `hatch`, and `wlift-lsp`
+/// into `$HOME/.local/bin` by default, which isn't always on
+/// PATH (zsh on macOS, sandboxed shells, fresh installs that
+/// haven't sourced their rc yet). Probing that directory first
+/// means a curl-installed user gets hits without any extra
+/// configuration. Explicit overrides win — when the user has
+/// pinned `wrenlift.<name>Path`, we honour it verbatim.
+function resolveBinary(
+  binaryName: string,
+  configured: string | undefined,
+  defaultName: string,
+): string {
+  if (configured && configured !== defaultName) {
+    return resolveVariables(configured);
+  }
+  const os = require("os") as typeof import("os");
+  const path = require("path") as typeof import("path");
+  const fs = require("fs") as typeof import("fs");
+  const localBin = path.join(os.homedir(), ".local", "bin", binaryName);
+  if (fs.existsSync(localBin)) {
+    return localBin;
+  }
+  return binaryName;
+}
+
 function quoteShell(s: string): string {
   // Single-quote and escape any embedded single quotes so paths
   // with spaces / weird chars survive the shell. Keeps the
@@ -155,7 +184,11 @@ async function startServer(): Promise<void> {
     await client.start();
   } catch (err) {
     const config = vscode.workspace.getConfiguration("wrenlift");
-    const cmd = resolveVariables(config.get<string>("serverPath") || "wlift-lsp");
+    const cmd = resolveBinary(
+      "wlift-lsp",
+      config.get<string>("serverPath"),
+      "wlift-lsp",
+    );
     vscode.window.showErrorMessage(
       `Failed to start wlift-lsp at "${cmd}": ${err}. ` +
         `Install via curl -fsSL https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh | bash, ` +
@@ -196,10 +229,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("wrenlift.restartServer", restartServer),
     vscode.commands.registerCommand("wrenlift.showVersions", async () => {
       const cfg = vscode.workspace.getConfiguration("wrenlift");
-      const wliftCmd = resolveVariables(cfg.get<string>("wliftPath") || "wlift");
-      const hatchCmd = resolveVariables(cfg.get<string>("hatchPath") || "hatch");
-      const lspCmd = resolveVariables(
-        cfg.get<string>("serverPath") || "wlift-lsp",
+      const wliftCmd = resolveBinary("wlift", cfg.get<string>("wliftPath"), "wlift");
+      const hatchCmd = resolveBinary("hatch", cfg.get<string>("hatchPath"), "hatch");
+      const lspCmd = resolveBinary(
+        "wlift-lsp",
+        cfg.get<string>("serverPath"),
+        "wlift-lsp",
       );
       const lines = await Promise.all(
         [
@@ -233,8 +268,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         const filePath = target.fsPath;
         const cfg = vscode.workspace.getConfiguration("wrenlift");
-        const wliftCmd = resolveVariables(cfg.get<string>("wliftPath") || "wlift");
-        const hatchCmd = resolveVariables(cfg.get<string>("hatchPath") || "hatch");
+        const wliftCmd = resolveBinary("wlift", cfg.get<string>("wliftPath"), "wlift");
+        const hatchCmd = resolveBinary("hatch", cfg.get<string>("hatchPath"), "hatch");
 
         // Pick `hatch run` when a hatchfile sits in or above
         // the file's directory and the file is `main.wren`

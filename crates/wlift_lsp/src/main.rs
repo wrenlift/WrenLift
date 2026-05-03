@@ -697,9 +697,10 @@ impl LanguageServer for Backend {
     /// Inline run-action lens at the top of files that are
     /// directly executable: `main.wren` (the conventional
     /// hatch entry point) and `*.spec.wren` (test specs the
-    /// `wlift` runtime can drive directly). The lens runs
-    /// `wrenlift.runFile` on the editor side, which the
-    /// extension wires to a terminal invocation.
+    /// `wlift` runtime can drive directly). Mirrors
+    /// rust-analyzer's `▶ Run` lens above `fn main` — both
+    /// dispatch through an extension-side command that opens
+    /// a terminal and spawns the appropriate binary.
     async fn code_lens(&self, p: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         let uri = p.text_document.uri;
         let path = match uri.to_file_path() {
@@ -720,10 +721,33 @@ impl LanguageServer for Backend {
         } else {
             "▶ Run".to_string()
         };
+        // Anchor the lens to the first non-empty line of source
+        // (skipping leading blank lines). VS Code renders code
+        // lenses above their `range.start.line`; a degenerate
+        // 0..0 range can be silently dropped by some renderers.
+        // Using the first content line gives the lens something
+        // real to hover over and keeps the visual placement
+        // immediately above the file's first declaration —
+        // matching rust-analyzer's convention of putting the
+        // lens above `fn main`'s signature line.
+        // Prefer the live document text (matches what's on
+        // screen mid-edit); fall back to reading the file.
+        let text = self
+            .docs
+            .get(&uri)
+            .map(|d| d.text.clone())
+            .or_else(|| std::fs::read_to_string(&path).ok())
+            .unwrap_or_default();
+        let anchor_line = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| !l.trim().is_empty())
+            .map(|(i, l)| (i as u32, l.chars().count() as u32))
+            .unwrap_or((0, 0));
         let lens = CodeLens {
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
+                start: Position { line: anchor_line.0, character: 0 },
+                end: Position { line: anchor_line.0, character: anchor_line.1 },
             },
             command: Some(Command {
                 title,

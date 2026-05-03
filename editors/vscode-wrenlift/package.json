@@ -152,17 +152,17 @@
         "wrenlift.serverPath": {
           "type": "string",
           "default": "wlift-lsp",
-          "description": "Path to the wlift-lsp binary. Defaults to looking it up on $PATH; absolute paths bypass PATH. Supports ${workspaceFolder} substitution."
+          "description": "Path to the wlift-lsp binary. Empty / default falls back to ~/.local/bin/wlift-lsp (install.sh's default), then $PATH. Absolute paths bypass both. Supports ${workspaceFolder} substitution."
         },
         "wrenlift.wliftPath": {
           "type": "string",
           "default": "wlift",
-          "description": "Path to the wlift runtime binary used by 'WrenLift: Run Wren File' for single-file invocations. Supports ${workspaceFolder} substitution."
+          "description": "Path to the wlift runtime binary used by 'WrenLift: Run Wren File' for single-file invocations. Empty / default falls back to ~/.local/bin/wlift, then $PATH. Supports ${workspaceFolder} substitution."
         },
         "wrenlift.hatchPath": {
           "type": "string",
           "default": "hatch",
-          "description": "Path to the hatch CLI binary used by 'WrenLift: Run Wren File' when a hatchfile sits at or above the file's directory. Supports ${workspaceFolder} substitution."
+          "description": "Path to the hatch CLI binary used by 'WrenLift: Run Wren File' when a hatchfile sits at or above the file's directory. Empty / default falls back to ~/.local/bin/hatch, then $PATH. Supports ${workspaceFolder} substitution."
         },
         "wrenlift.trace.server": {
           "scope": "window",
