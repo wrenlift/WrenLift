@@ -48,10 +48,26 @@ enum Command {
         template: String,
     },
     /// Run every *.spec.wren in the workspace and aggregate results.
+    ///
+    /// `--filter` is a substring matched against each case's
+    /// `<group> > <name>` label; only matching cases run.
+    /// `--json` flips `@hatch:test` into JSON-Lines reporter mode
+    /// so the output can be consumed by editors / CI tooling.
+    /// Both flags work together — the editor's spec runner uses
+    /// both at once to drive the per-row ▶ Run button.
     Test {
         /// Workspace root. Defaults to the current directory.
         #[arg(value_name = "DIR", default_value = ".")]
         dir: PathBuf,
+        /// Substring filter matched against `<group> > <name>`.
+        /// Non-matching cases are skipped per spec file.
+        #[arg(long, value_name = "SUBSTR")]
+        filter: Option<String>,
+        /// Emit one JSON object per case-start / pass / fail /
+        /// skip plus a trailing summary, instead of the
+        /// human-readable text reporter.
+        #[arg(long)]
+        json: bool,
     },
     /// @hatch:web framework commands — serve, generate, etc.
     ///
@@ -238,7 +254,7 @@ fn main() {
             name,
             template,
         } => cmd_init(&dir, name.as_deref(), &template),
-        Command::Test { dir } => cmd_test(&dir),
+        Command::Test { dir, filter, json } => cmd_test(&dir, filter.as_deref(), json),
         Command::Web { command } => match command {
             WebCommand::Serve { dir } => cmd_dev(&dir),
             WebCommand::Generate { kind, name, dir } => cmd_web_generate(&kind, &name, &dir),
@@ -1904,7 +1920,7 @@ mod ansi_tests {
 // test — discover and run *.spec.wren
 // ---------------------------------------------------------------------------
 
-fn cmd_test(dir: &Path) {
+fn cmd_test(dir: &Path, filter: Option<&str>, json: bool) {
     if !dir.is_dir() {
         eprintln!("error: '{}' is not a directory", dir.display());
         process::exit(1);
@@ -1925,6 +1941,19 @@ fn cmd_test(dir: &Path) {
     }
     specs.sort();
 
+    // When the caller wants per-case filtering or JSON-Lines
+    // output we can't just spawn `wlift <spec>` — both knobs
+    // belong to `@hatch:test`'s static state and have to be set
+    // before the spec's trailing `Test.run()` fires. Approach:
+    // copy the spec into a tmp file in the same directory,
+    // prepend the `Test.filter = …` / `Test.reporter = …`
+    // lines, and run wlift against the tmp. The spec's own
+    // `import "@hatch:test" for Test` registers `Test` during
+    // import processing, so the prepended assignment runs in
+    // source order during the subsequent body pass — well
+    // before the spec's `Test.run()` at the bottom.
+    let needs_wrapper = filter.is_some() || json;
+
     eprintln!("hatch test: {} spec file(s)", specs.len());
     let mut total_pass = 0u32;
     let mut total_fail = 0u32;
@@ -1932,10 +1961,29 @@ fn cmd_test(dir: &Path) {
     for spec in &specs {
         eprintln!("  · {}", spec.display());
         let parent = spec.parent().unwrap_or(dir);
+
+        let runner = if needs_wrapper {
+            match write_test_runner(spec, parent, filter, json) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    eprintln!("    error preparing runner: {}", e);
+                    failed_files.push(spec.clone());
+                    total_fail += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let target_arg: PathBuf = match &runner {
+            Some(tmp) => tmp.path().file_name().unwrap().into(),
+            None => spec.file_name().unwrap().into(),
+        };
+
         let output = std::process::Command::new(&wlift)
             .arg("--mode")
             .arg("interpreter")
-            .arg(spec.file_name().unwrap())
+            .arg(&target_arg)
             .current_dir(parent)
             .output();
         let output = match output {
@@ -1948,19 +1996,61 @@ fn cmd_test(dir: &Path) {
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Last "ok: N/M passed" line wins. The `@hatch:test`
-        // text reporter wraps the "ok:" prefix in ANSI colour
-        // escapes and tacks an `(Xms)` timing suffix; strip
-        // both before matching so the parser stays robust to
-        // formatting drift.
+
+        if json {
+            // Stream the JSON-Lines events through to our stdout
+            // so an editor consumer sees per-case progress live;
+            // tap the trailing `summary` event for the per-spec
+            // pass / fail counts. Non-JSON lines (rare — would
+            // mean a runtime panic before `Test.run()` started)
+            // get echoed verbatim to stderr so the user can
+            // still see them without poisoning the JSON stream.
+            let mut summary: Option<(u32, u32)> = None;
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(v) => {
+                        if v.get("event").and_then(|e| e.as_str()) == Some("summary") {
+                            let p = v.get("passed").and_then(|x| x.as_u64()).unwrap_or(0);
+                            let f = v.get("failed").and_then(|x| x.as_u64()).unwrap_or(0);
+                            summary = Some((p as u32, f as u32));
+                        }
+                        println!("{}", trimmed);
+                    }
+                    Err(_) => {
+                        eprintln!("{}", trimmed);
+                    }
+                }
+            }
+            match summary {
+                Some((p, f)) => {
+                    total_pass += p;
+                    total_fail += f;
+                    if f > 0 {
+                        failed_files.push(spec.clone());
+                    }
+                }
+                None if output.status.success() => total_pass += 1,
+                None => {
+                    failed_files.push(spec.clone());
+                    total_fail += 1;
+                }
+            }
+            continue;
+        }
+
+        // Text reporter — same parser as before. ANSI- and
+        // timing-suffix-tolerant; last `ok: N/M passed` line
+        // wins (the runner emits one per `Test.run()` call).
         let mut last_ok: Option<(u32, u32)> = None;
         for line in stdout.lines() {
             let line = strip_ansi(line.trim());
             let Some(rest) = line.strip_prefix("ok: ") else {
                 continue;
             };
-            // Drop the trailing `(Xms)` timing suffix (and
-            // anything else past it) before splitting.
             let rest = rest.split('(').next().unwrap_or(rest).trim();
             let Some((p, m)) = rest.split_once('/') else {
                 continue;
@@ -1970,6 +2060,12 @@ fn cmd_test(dir: &Path) {
                 last_ok = Some((p, m));
             }
         }
+        // Pass the runner's own colourised per-case lines
+        // through to our stdout so users see them whether or
+        // not we're in wrapper mode.
+        for line in stdout.lines() {
+            println!("{}", line);
+        }
         match last_ok {
             Some((p, m)) => {
                 total_pass += p;
@@ -1978,10 +2074,7 @@ fn cmd_test(dir: &Path) {
                     failed_files.push(spec.clone());
                 }
             }
-            None if output.status.success() => {
-                // No spec-style output but exited OK — treat as a pass.
-                total_pass += 1;
-            }
+            None if output.status.success() => total_pass += 1,
             None => {
                 failed_files.push(spec.clone());
                 total_fail += 1;
@@ -2002,6 +2095,56 @@ fn cmd_test(dir: &Path) {
         }
         process::exit(1);
     }
+}
+
+/// Build the per-spec runner file for `--filter` / `--json`.
+/// The file lives in the spec's parent directory (so the spec's
+/// own relative imports resolve unchanged), prepends the
+/// `Test.filter = …` / `Test.reporter = …` setters, then inlines
+/// the spec source verbatim. `Test` is bound by the spec's own
+/// `import "@hatch:test" for Test` during the import pass, so
+/// the prepended assignment runs in source order during the
+/// body pass — well before the spec's trailing `Test.run()`.
+///
+/// `tempfile::NamedTempFile` cleans the file up on drop even
+/// when wlift exits non-zero.
+fn write_test_runner(
+    spec: &Path,
+    parent: &Path,
+    filter: Option<&str>,
+    json: bool,
+) -> Result<tempfile::NamedTempFile, String> {
+    use std::io::Write;
+
+    let spec_src = std::fs::read_to_string(spec)
+        .map_err(|e| format!("read {}: {}", spec.display(), e))?;
+
+    let mut prelude = String::new();
+    if let Some(f) = filter {
+        // Wren's string lexer accepts the same `\\` and `\"`
+        // escapes JSON does, plus `\%(` to neutralise the
+        // interpolation hook. The filter substring is plain
+        // user input so we escape conservatively.
+        let esc = f
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace("%(", "\\%(");
+        prelude.push_str(&format!("Test.filter = \"{}\"\n", esc));
+    }
+    if json {
+        prelude.push_str("Test.reporter = \"json\"\n");
+    }
+
+    let combined = format!("{}{}", prelude, spec_src);
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix("__wlift_runner_")
+        .suffix(".wren")
+        .tempfile_in(parent)
+        .map_err(|e| format!("create runner: {}", e))?;
+    tmp.write_all(combined.as_bytes())
+        .map_err(|e| format!("write runner: {}", e))?;
+    Ok(tmp)
 }
 
 fn walk_specs(dir: &Path, out: &mut Vec<PathBuf>) {

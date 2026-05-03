@@ -233,6 +233,71 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 // Module loader + spec-dep pre-installer
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod resolver_tests {
+    use super::with_wren_suffix;
+    use std::path::PathBuf;
+
+    #[test]
+    fn appends_wren_when_missing() {
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/foo")),
+            PathBuf::from("/tmp/foo.wren")
+        );
+    }
+
+    #[test]
+    fn preserves_spec_basename() {
+        // The bug: `Path::with_extension("wren")` would strip
+        // `.spec` and produce `/tmp/assert.wren`, redirecting
+        // every `import "./<name>.spec"` to a same-stem sibling.
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/assert.spec")),
+            PathBuf::from("/tmp/assert.spec.wren")
+        );
+    }
+
+    #[test]
+    fn idempotent_when_already_wren() {
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/foo.wren")),
+            PathBuf::from("/tmp/foo.wren")
+        );
+    }
+
+    #[test]
+    fn preserves_multi_dot_basenames() {
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/foo.bar.baz")),
+            PathBuf::from("/tmp/foo.bar.baz.wren")
+        );
+    }
+}
+
+/// Append `.wren` to a relative-import candidate path **without
+/// stripping any existing extension**.
+///
+/// `Path::with_extension("wren")` *replaces* the trailing `.X`
+/// segment, so `import "./foo.spec"` would canonicalise to
+/// `foo.wren` instead of `foo.spec.wren`. That blocks the
+/// `hatch test` per-test wrapper pattern (a runner file imports
+/// `./<spec basename>` to drive a `*.spec.wren` source) and
+/// silently redirects loads onto a same-stem sibling file.
+///
+/// Behaviour:
+/// - Path already ends in `.wren` → leave untouched.
+/// - Anything else (no extension, `.spec`, `.foo.bar`, …) →
+///   append `.wren` so `foo` → `foo.wren` and `foo.spec` →
+///   `foo.spec.wren`.
+fn with_wren_suffix(path: PathBuf) -> PathBuf {
+    if path.extension().and_then(|e| e.to_str()) == Some("wren") {
+        return path;
+    }
+    let mut s = path.into_os_string();
+    s.push(".wren");
+    PathBuf::from(s)
+}
+
 /// Build the loader + resolver pair that the VM's import flow uses.
 ///
 /// The resolver canonicalises relative imports (`./foo`, `../foo`)
@@ -287,7 +352,7 @@ fn make_module_io(
                 .cloned()
                 .unwrap_or_else(|| root_dir.clone());
             let rel = Path::new(name);
-            let candidate = base_dir.join(rel).with_extension("wren");
+            let candidate = with_wren_suffix(base_dir.join(rel));
             // Try fs::canonicalize for a normalised absolute path
             // (resolves `..` segments and symlinks). Fall back to
             // `candidate.to_string_lossy()` if the file doesn't
@@ -336,7 +401,7 @@ fn make_module_io(
                 .unwrap_or_else(|| root_dir.clone());
 
             if name.starts_with("./") || name.starts_with("../") {
-                let candidate = base_dir.join(name).with_extension("wren");
+                let candidate = with_wren_suffix(base_dir.join(name));
                 let text = fs::read_to_string(&candidate).ok()?;
                 if let Some(parent) = candidate.parent() {
                     dirs.borrow_mut()
