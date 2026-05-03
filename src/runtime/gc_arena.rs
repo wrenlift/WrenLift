@@ -147,8 +147,11 @@ impl GcAllocator for ArenaGc {
         ptr
     }
 
+    #[inline(always)]
     fn write_barrier(&mut self, _source: *mut ObjHeader, _value: Value) {
         // No-op: arena GC doesn't collect, so no barriers needed.
+        // `#[inline(always)]` so the `GcImpl::write_barrier` arm
+        // calling this folds to nothing.
     }
 
     fn collect(&mut self, _roots: &mut [Value]) {

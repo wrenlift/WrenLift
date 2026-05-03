@@ -26,6 +26,39 @@ use crate::runtime::value::Value;
 use crate::runtime::vm::{FiberAction, VM};
 
 // ---------------------------------------------------------------------------
+// Cached process-wide env flags
+// ---------------------------------------------------------------------------
+//
+// The interpreter's hot path was reading several `WLIFT_*` env vars
+// per invocation via `std::env::var_os(...)`. That call acquires a
+// global mutex on every read — fine for one-shot startup probes,
+// catastrophic when it's gated against every method dispatch or OSR
+// eligibility check. These flags don't change after process start,
+// so each helper resolves once into a `OnceLock<bool>` and the rest
+// of the run reads the cached answer.
+
+#[inline]
+fn env_method_osr_disabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("WLIFT_DISABLE_METHOD_OSR").is_some())
+}
+
+#[inline]
+fn env_nested_osr_disabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("WLIFT_DISABLE_NESTED_OSR").is_some())
+}
+
+#[inline]
+fn env_ic_jit_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some())
+}
+
+// ---------------------------------------------------------------------------
 // Global inline method cache
 // ---------------------------------------------------------------------------
 
@@ -116,6 +149,20 @@ fn call_native_with_frame_sync(
     func: NativeFn,
     args: &[Value],
 ) -> Value {
+    // Save frame state (pc + values) onto the fiber. Required so the
+    // native can re-enter the VM (allocations, nested `vm.call_*`,
+    // GC scans the saved register file).
+    //
+    // First-party natives are expected NOT to panic: they signal
+    // user-visible errors by calling `ctx.runtime_error("…")`, which
+    // sets `vm.has_error` — the dispatch loop checks that flag
+    // immediately after every native call (see the post-call
+    // `vm.has_error` arm) and routes through the fiber's normal
+    // error path, including `Fiber.try` semantics. A genuine Rust
+    // panic in a first-party native is a bug, treated like any other
+    // bug in the VM. Foreign C / dynamic plugins go through
+    // `call_foreign_*_with_frame_sync`, which keeps a `catch_unwind`
+    // because that code lives across an untrusted ABI boundary.
     unsafe {
         if let Some(frame) = (*fiber).mir_frames.last_mut() {
             frame.values = std::mem::take(values);
@@ -123,20 +170,7 @@ fn call_native_with_frame_sync(
         }
     }
 
-    // Catch panics so a native-code crash surfaces as a
-    // fiber-catchable runtime error instead of aborting the
-    // whole process. Wren is a library runtime — a bug in a
-    // third-party crate called from a Wren script shouldn't
-    // take down the host.
-    let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| func(vm, args))) {
-        Ok(v) => v,
-        Err(panic) => {
-            let msg = panic_message(&panic);
-            vm.has_error = true;
-            vm.last_error = Some(format!("native panic: {}", msg));
-            Value::null()
-        }
-    };
+    let result = func(vm, args);
 
     unsafe {
         if let Some(frame) = (*fiber).mir_frames.last_mut() {
@@ -186,6 +220,9 @@ fn call_foreign_dynamic_with_frame_sync(
             frame.pc = pc;
         }
     }
+    // Dynamic plugins are loaded from third-party `.so`/`.dylib`s, so
+    // the panic guard stays here. First-party natives report errors
+    // via `ctx.runtime_error` → `vm.has_error` and don't need this.
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::runtime::foreign::dispatch_dynamic(vm, idx, args)
     })) {
@@ -220,8 +257,9 @@ fn call_foreign_c_with_frame_sync(
         }
     }
 
-    // Foreign code is even less trustworthy than first-party
-    // natives — the same panic protection applies.
+    // Foreign C is third-party trust boundary — keep the panic guard.
+    // First-party natives go through `call_native_with_frame_sync`,
+    // which trusts panics to be bugs (report errors via `ctx.runtime_error`).
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::runtime::foreign::dispatch_foreign_c(vm, func, args)
     })) {
@@ -379,9 +417,7 @@ fn try_enter_loop_osr(
     }
     // Method/closure OSR is on by default. `WLIFT_DISABLE_METHOD_OSR` exists
     // as a fast opt-out for production deployments if a regression surfaces.
-    if (closure.is_some() || defining_class.is_some())
-        && std::env::var_os("WLIFT_DISABLE_METHOD_OSR").is_some()
-    {
+    if (closure.is_some() || defining_class.is_some()) && env_method_osr_disabled() {
         return Ok(OsrTransfer::NotEntered);
     }
 
@@ -423,7 +459,7 @@ fn try_enter_loop_osr(
     // native dispatch — JIT context, roots, and depth are all snapshotted
     // before the call and restored after. A kill switch keeps a quick opt-
     // out while we finish deopt/fiber-action coverage.
-    if jit_depth > 0 && std::env::var_os("WLIFT_DISABLE_NESTED_OSR").is_some() {
+    if jit_depth > 0 && env_nested_osr_disabled() {
         return Ok(OsrTransfer::NotEntered);
     }
 
@@ -650,13 +686,18 @@ fn get_reg(values: &[Value], idx: u16) -> Value {
 #[inline(always)]
 fn set_reg(values: &mut Vec<Value>, idx: u16, val: Value) {
     let i = idx as usize;
-    if i < values.len() {
-        unsafe {
-            *values.get_unchecked_mut(i) = val;
-        }
-    } else {
-        values.resize(i + 1, UNDEF);
-        values[i] = val;
+    // Frames are pre-sized to `bc.register_count` (= `mir.next_value`) at
+    // every push site, and `idx` is a ValueId emitted by the same MIR. The
+    // resize branch the older code carried fired only on miscompiled
+    // bytecode. Trust the invariant in release; debug_assert catches drift.
+    debug_assert!(
+        i < values.len(),
+        "set_reg out of bounds: idx={} len={}",
+        i,
+        values.len()
+    );
+    unsafe {
+        *values.get_unchecked_mut(i) = val;
     }
 }
 
@@ -705,28 +746,30 @@ macro_rules! bc_boxed_binop {
         let rhs_reg = read_u16(code, $pc);
         let a = get_reg($values, lhs_reg);
         let b = get_reg($values, rhs_reg);
-        match (a.as_num(), b.as_num()) {
-            (Some(x), Some(y)) => {
-                let f: fn(f64, f64) -> f64 = $op;
-                set_reg($values, dst, Value::num(f(x, y)));
-                false
-            }
-            _ => {
-                let recv = a;
-                let arg = b;
-                try_operator_dispatch(
-                    $vm,
-                    $fiber,
-                    recv,
-                    $method,
-                    &[arg],
-                    $pc,
-                    $values,
-                    dst,
-                    $module_name,
-                    $bc_ptr,
-                )?
-            }
+        // Hot path: both operands are f64. Avoid `as_num()`'s `Option<f64>`
+        // (16-byte stack-spilled return) — branch on `is_num` then extract
+        // via the unchecked accessor. LLVM folds the redundant tag check.
+        if a.is_num() && b.is_num() {
+            let x = unsafe { a.as_num_unchecked() };
+            let y = unsafe { b.as_num_unchecked() };
+            let f: fn(f64, f64) -> f64 = $op;
+            set_reg($values, dst, Value::num(f(x, y)));
+            false
+        } else {
+            let recv = a;
+            let arg = b;
+            try_operator_dispatch(
+                $vm,
+                $fiber,
+                recv,
+                $method,
+                &[arg],
+                $pc,
+                $values,
+                dst,
+                $module_name,
+                $bc_ptr,
+            )?
         }
     }};
 }
@@ -738,12 +781,13 @@ macro_rules! bc_f64_binop {
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
-        let a = get_reg($values, lhs_reg)
-            .as_num()
-            .ok_or(RuntimeError::GuardFailed("num"))?;
-        let b = get_reg($values, rhs_reg)
-            .as_num()
-            .ok_or(RuntimeError::GuardFailed("num"))?;
+        let av = get_reg($values, lhs_reg);
+        let bv = get_reg($values, rhs_reg);
+        if !av.is_num() || !bv.is_num() {
+            return Err(RuntimeError::GuardFailed("num"));
+        }
+        let a = unsafe { av.as_num_unchecked() };
+        let b = unsafe { bv.as_num_unchecked() };
         let f: fn(f64, f64) -> f64 = $op;
         set_reg($values, dst, Value::num(f(a, b)));
     }};
@@ -759,28 +803,27 @@ macro_rules! bc_boxed_cmp {
         let rhs_reg = read_u16(code, $pc);
         let a = get_reg($values, lhs_reg);
         let b = get_reg($values, rhs_reg);
-        match (a.as_num(), b.as_num()) {
-            (Some(x), Some(y)) => {
-                let f: fn(f64, f64) -> bool = $op;
-                set_reg($values, dst, Value::bool(f(x, y)));
-                false
-            }
-            _ => {
-                let recv = a;
-                let arg = b;
-                try_operator_dispatch(
-                    $vm,
-                    $fiber,
-                    recv,
-                    $method,
-                    &[arg],
-                    $pc,
-                    $values,
-                    dst,
-                    $module_name,
-                    $bc_ptr,
-                )?
-            }
+        if a.is_num() && b.is_num() {
+            let x = unsafe { a.as_num_unchecked() };
+            let y = unsafe { b.as_num_unchecked() };
+            let f: fn(f64, f64) -> bool = $op;
+            set_reg($values, dst, Value::bool(f(x, y)));
+            false
+        } else {
+            let recv = a;
+            let arg = b;
+            try_operator_dispatch(
+                $vm,
+                $fiber,
+                recv,
+                $method,
+                &[arg],
+                $pc,
+                $values,
+                dst,
+                $module_name,
+                $bc_ptr,
+            )?
         }
     }};
 }
@@ -792,12 +835,13 @@ macro_rules! bc_f64_cmp {
         let dst = read_u16(code, $pc);
         let lhs_reg = read_u16(code, $pc);
         let rhs_reg = read_u16(code, $pc);
-        let a = get_reg($values, lhs_reg)
-            .as_num()
-            .ok_or(RuntimeError::GuardFailed("num"))?;
-        let b = get_reg($values, rhs_reg)
-            .as_num()
-            .ok_or(RuntimeError::GuardFailed("num"))?;
+        let av = get_reg($values, lhs_reg);
+        let bv = get_reg($values, rhs_reg);
+        if !av.is_num() || !bv.is_num() {
+            return Err(RuntimeError::GuardFailed("num"));
+        }
+        let a = unsafe { av.as_num_unchecked() };
+        let b = unsafe { bv.as_num_unchecked() };
         let f: fn(f64, f64) -> bool = $op;
         set_reg($values, dst, Value::bool(f(a, b)));
     }};
@@ -813,28 +857,27 @@ macro_rules! bc_bitwise_binop {
         let rhs_reg = read_u16(code, $pc);
         let a = get_reg($values, lhs_reg);
         let b = get_reg($values, rhs_reg);
-        match (a.as_num(), b.as_num()) {
-            (Some(x), Some(y)) => {
-                let f: fn(i32, i32) -> i32 = $op;
-                set_reg($values, dst, Value::num(f(x as i32, y as i32) as f64));
-                false
-            }
-            _ => {
-                let recv = a;
-                let arg = b;
-                try_operator_dispatch(
-                    $vm,
-                    $fiber,
-                    recv,
-                    $method,
-                    &[arg],
-                    $pc,
-                    $values,
-                    dst,
-                    $module_name,
-                    $bc_ptr,
-                )?
-            }
+        if a.is_num() && b.is_num() {
+            let x = unsafe { a.as_num_unchecked() };
+            let y = unsafe { b.as_num_unchecked() };
+            let f: fn(i32, i32) -> i32 = $op;
+            set_reg($values, dst, Value::num(f(x as i32, y as i32) as f64));
+            false
+        } else {
+            let recv = a;
+            let arg = b;
+            try_operator_dispatch(
+                $vm,
+                $fiber,
+                recv,
+                $method,
+                &[arg],
+                $pc,
+                $values,
+                dst,
+                $module_name,
+                $bc_ptr,
+            )?
         }
     }};
 }
@@ -961,6 +1004,17 @@ fn run_fiber_with_stop_depth(
         // SAFETY: bc_ptr is stable — bytecode is never freed once compiled.
         let mut bc = unsafe { &*bc_ptr };
         let mut code: &[u8] = &bc.code;
+
+        // Size the register file on first entry to a fiber whose frame
+        // was set up with an empty values vec (`setup_fiber_from_closure`
+        // can't size it because the closure's bytecode isn't compiled
+        // yet at fiber creation time). Every other frame-push site
+        // already pre-sizes; this guard is a one-shot lazy init.
+        // Branch is consistently false after the first iteration, which
+        // the predictor handles for free.
+        if values.is_empty() {
+            values.resize(bc.register_count as usize, UNDEF);
+        }
 
         // Cache raw pointer to module vars — eliminates HashMap lookup per
         // GetModuleVar/SetModuleVar (was 42% of runtime in method_call).
@@ -1148,18 +1202,20 @@ fn run_fiber_with_stop_depth(
             }
             steps += 1;
 
-            let func_name = vm
-                .engine
-                .get_mir(func_id)
-                .map(|m| vm.interner.resolve(m.name).to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
+            // The pc/code-len assert message used to interpolate the
+            // function name, which forced a `vm.interner.resolve(...)
+            // .to_string()` heap allocation on EVERY opcode in release
+            // builds — the `let` binding lived outside the
+            // `debug_assert!` so it ran even though release elides
+            // the assert itself. Now the assert closes over the lazy
+            // arg path through the macro and only resolves the name
+            // when the assertion actually fails (debug builds only).
             debug_assert!(
                 (pc as usize) < code.len(),
-                "pc {} out of bounds for code len {} in func {:?} ({}) module {}",
+                "pc {} out of bounds for code len {} in func {:?} module {}",
                 pc,
                 code.len(),
                 func_id,
-                func_name,
                 module_name
             );
             let op = unsafe { *code.get_unchecked(pc as usize) };
@@ -1893,7 +1949,13 @@ fn run_fiber_with_stop_depth(
                     // No tier-up profiling, no IC re-validation, no stats.
                     // Tier-up happens via slow path + back-edge counting.
                     let ic_table = unsafe { &*bc.ic_table.get() };
-                    if ic_idx < ic_table.len() {
+                    // Short-circuit on the opt-in flag first: when
+                    // `WLIFT_ENABLE_IC_JIT` isn't set (the default),
+                    // none of the IC kind=1 work below executes — and
+                    // the cached `env_ic_jit_enabled()` reduces to a
+                    // single load + branch the predictor pins as
+                    // never-taken.
+                    if env_ic_jit_enabled() && ic_idx < ic_table.len() {
                         let ic = &ic_table[ic_idx];
                         if ic.kind == 1 && recv_val.is_object() {
                             let obj_ptr = unsafe { recv_val.as_object().unwrap_unchecked() };
@@ -1928,8 +1990,7 @@ fn run_fiber_with_stop_depth(
                             // submissions, and a stale read could
                             // route a not-actually-alloc-free callee
                             // into the IC fast path.
-                            let force_on = std::env::var_os("WLIFT_ENABLE_IC_JIT").is_some();
-                            if recv_class == ic.class && is_leaf && force_on {
+                            if recv_class == ic.class && is_leaf {
                                 if std::env::var_os("WLIFT_TRACE_IC_JIT").is_some() {
                                     let fn_idx_ic = ic.func_id as usize;
                                     let name = vm
@@ -4070,7 +4131,7 @@ fn dispatch_closure_bc_inner(
         .unwrap_or(std::ptr::null())
         .is_null();
     let threaded_bypasses_osr = if vm.engine.mode == ExecutionMode::Tiered
-        && std::env::var_os("WLIFT_DISABLE_METHOD_OSR").is_none()
+        && !env_method_osr_disabled()
     {
         vm.engine
             .ensure_bytecode(target_func_id)

@@ -1285,9 +1285,15 @@ pub fn threaded_depth_ok() -> bool {
 
 /// Env-gated kill switch for threaded dispatch. Set WLIFT_DISABLE_THREADED=1
 /// to force the bytecode interpreter, which preserves OSR safepoints.
+///
+/// The env value is read once on first call and cached for the lifetime
+/// of the process — `std::env::var_os` acquires a global mutex on every
+/// call, which is far too expensive for a per-dispatch eligibility check.
 #[inline]
 pub fn threaded_enabled() -> bool {
-    std::env::var_os("WLIFT_DISABLE_THREADED").is_none()
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("WLIFT_DISABLE_THREADED").is_none())
 }
 
 /// Execute threaded code and return the result + the register file for reuse.

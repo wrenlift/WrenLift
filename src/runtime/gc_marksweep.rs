@@ -373,8 +373,13 @@ impl GcAllocator for MarkSweepGc {
         ptr
     }
 
+    #[inline(always)]
     fn write_barrier(&mut self, _source: *mut ObjHeader, _value: Value) {
         // No-op: non-generational GC doesn't need write barriers.
+        // `#[inline(always)]` so this fully vanishes through the
+        // `GcImpl::write_barrier` dispatch and doesn't leave a real
+        // function call on every `Op::SetField` / `SetUpvalue` /
+        // `SetStaticField` in the bytecode interpreter.
     }
 
     fn collect(&mut self, roots: &mut [Value]) {

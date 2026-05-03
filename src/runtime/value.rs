@@ -155,6 +155,20 @@ impl Value {
         }
     }
 
+    /// Reinterpret the bits as `f64` without checking the tag.
+    ///
+    /// # Safety
+    /// The caller must have already verified `is_num()` returns true. On a
+    /// tagged value the result is one of our QNAN bit patterns — still a
+    /// valid `f64` but compares unequal to itself and propagates silently
+    /// through arithmetic. Use this only in hot dispatch paths where the
+    /// tag check sits next to the extraction so LLVM folds the redundant
+    /// branch out of `is_num` + `as_num_unchecked`.
+    #[inline(always)]
+    pub unsafe fn as_num_unchecked(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
     /// Extract the boolean if this is a bool.
     #[inline(always)]
     pub fn as_bool(self) -> Option<bool> {

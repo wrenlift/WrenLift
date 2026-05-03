@@ -995,9 +995,12 @@ pub fn read_u32(code: &[u8], pc: &mut u32) -> u32 {
 }
 
 /// Read a single byte from `code` at `pc` and advance `pc`.
+/// SAFETY: caller must ensure `pc < code.len()`. Mirrors `read_u16` /
+/// `read_u32`'s contract; bytecode is encoder-validated so the bounds
+/// check `code[pc as usize]` would do is redundant in the dispatch loop.
 #[inline(always)]
 pub fn read_u8(code: &[u8], pc: &mut u32) -> u8 {
-    let v = code[*pc as usize];
+    let v = unsafe { *code.get_unchecked(*pc as usize) };
     *pc += 1;
     v
 }

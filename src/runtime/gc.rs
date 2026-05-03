@@ -677,17 +677,24 @@ impl Gc {
     // -- Write barrier ------------------------------------------------------
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    #[inline]
     pub fn write_barrier(&mut self, source: *mut ObjHeader, value: Value) {
-        if source.is_null() {
+        // Reordered guards so the predictor's hottest case — writing a
+        // primitive (Num/Bool/null) into any field — exits before we
+        // ever touch `*source`. Previously the impl loaded
+        // `source.generation` first; that's a memory dereference for
+        // every store, even when no inter-gen pointer is being created.
+        if !value.is_object() || source.is_null() {
             return;
         }
         unsafe {
-            if (*source).generation == GEN_OLD && value.is_object() {
-                if let Some(obj_ptr) = value.as_object() {
-                    let target = obj_ptr as *mut ObjHeader;
-                    if !target.is_null() && (*target).generation == GEN_YOUNG {
-                        self.remembered_set.push(source);
-                    }
+            if (*source).generation != GEN_OLD {
+                return;
+            }
+            if let Some(obj_ptr) = value.as_object() {
+                let target = obj_ptr as *mut ObjHeader;
+                if !target.is_null() && (*target).generation == GEN_YOUNG {
+                    self.remembered_set.push(source);
                 }
             }
         }
