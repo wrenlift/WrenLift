@@ -57,9 +57,57 @@
     ],
     "commands": [
       {
-        "command": "wrenlift.restartServer",
-        "title": "WrenLift: Restart Server",
+        "command": "wrenlift.startServer",
+        "title": "Start Language Server",
         "category": "WrenLift"
+      },
+      {
+        "command": "wrenlift.stopServer",
+        "title": "Stop Language Server",
+        "category": "WrenLift"
+      },
+      {
+        "command": "wrenlift.restartServer",
+        "title": "Restart Language Server",
+        "category": "WrenLift"
+      },
+      {
+        "command": "wrenlift.showServerActions",
+        "title": "Server Actions…",
+        "category": "WrenLift"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "wrenlift.editor.submenu",
+          "when": "editorLangId == wren",
+          "group": "navigation@9"
+        }
+      ],
+      "wrenlift.editor.submenu": [
+        {
+          "command": "wrenlift.startServer",
+          "group": "1_lifecycle@1"
+        },
+        {
+          "command": "wrenlift.stopServer",
+          "group": "1_lifecycle@2"
+        },
+        {
+          "command": "wrenlift.restartServer",
+          "group": "1_lifecycle@3"
+        },
+        {
+          "command": "wrenlift.showServerActions",
+          "group": "1_lifecycle@4"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "wrenlift.editor.submenu",
+        "label": "WrenLift"
       }
     ],
     "configuration": {

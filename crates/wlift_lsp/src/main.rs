@@ -218,6 +218,7 @@ impl LanguageServer for Backend {
                     },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
         })
@@ -309,6 +310,91 @@ impl LanguageServer for Backend {
         // Span-based fallback for hovers on the keyword itself
         // (e.g. on the `class` token) or whitespace.
         Ok(hover_at(module, byte, &doc))
+    }
+
+    async fn goto_definition(
+        &self,
+        p: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = p.text_document_position_params.text_document.uri;
+        let pos = p.text_document_position_params.position;
+        let Some(doc) = self.docs.get(&uri) else {
+            return Ok(None);
+        };
+        let byte = doc.position_to_byte(pos);
+
+        // Cursor inside an `import "..."` string → resolve the
+        // path and return the imported file's location. Handles
+        // both relative paths (`./fmt`, `../bar/baz`) and absolute
+        // module names (which we can't resolve from the file
+        // system today; left for v3 of the LSP plan).
+        if let Some(loc) = Self::goto_import_at(&uri, &doc, byte) {
+            return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+        }
+
+        let Some(module) = doc.docs.as_ref() else {
+            return Ok(None);
+        };
+
+        // Identifier under cursor.
+        let Some(span) = wren_lift::docs::hover::identifier_at(&doc.text, byte) else {
+            return Ok(None);
+        };
+        let Some(ident) = doc.text.get(span.clone()) else {
+            return Ok(None);
+        };
+
+        // Receiver-scoped member lookup: when the cursor sits on
+        // `<recv>.<member>` we look up only that receiver class's
+        // member table, not every class in the module.
+        let analysis = wren_lift::docs::hover::Analysis::run(&doc.text);
+        let receiver_class: Option<String> = analysis.as_ref().and_then(|a| {
+            a.receiver_type_for_call_at(byte)
+                .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
+        });
+
+        if let Some(recv) = &receiver_class {
+            for class in &module.classes {
+                if class.name != *recv {
+                    continue;
+                }
+                for member in &class.members {
+                    if member.name == ident {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: uri.clone(),
+                            range: doc.byte_range_to_lsp(member.span.clone()),
+                        })));
+                    }
+                }
+            }
+        }
+
+        // Class-name jump: cursor on a class identifier itself.
+        for class in &module.classes {
+            if class.name == ident {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: uri.clone(),
+                    range: doc.byte_range_to_lsp(class.span.clone()),
+                })));
+            }
+        }
+
+        // Last resort: any same-named member anywhere in the
+        // module. Less precise than the receiver-scoped path but
+        // covers bare references in doc bodies and prelude-style
+        // free functions sitting inside a single class.
+        for class in &module.classes {
+            for member in &class.members {
+                if member.name == ident {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: uri.clone(),
+                        range: doc.byte_range_to_lsp(member.span.clone()),
+                    })));
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -617,6 +703,36 @@ impl Backend {
                 value: markdown,
             }),
             range: Some(doc.byte_range_to_lsp(span)),
+        })
+    }
+
+    /// Resolve `import "..."` cursors to the imported file's
+    /// location. Relative paths (`./fmt`, `../bar/baz`) resolve
+    /// against the importing file's directory; scoped names
+    /// (`@hatch:foo`) need dep-source URIs we don't have for
+    /// `.hatch`-bundled sources, so they return `None` for now.
+    fn goto_import_at(uri: &Url, doc: &Document, byte: usize) -> Option<Location> {
+        let span = find_import_string(&doc.text, byte)?;
+        let imported = doc.text.get(span)?;
+        if !imported.starts_with("./") && !imported.starts_with("../") {
+            return None;
+        }
+        let importer_path = uri.to_file_path().ok()?;
+        let parent = importer_path.parent()?;
+        let mut target = parent.join(imported);
+        if target.extension().is_none() {
+            target.set_extension("wren");
+        }
+        if !target.exists() {
+            return None;
+        }
+        let target_uri = Url::from_file_path(&target).ok()?;
+        Some(Location {
+            uri: target_uri,
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
         })
     }
 }
