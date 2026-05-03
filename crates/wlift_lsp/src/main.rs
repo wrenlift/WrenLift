@@ -36,19 +36,36 @@ struct Backend {
     /// support lives in v2 of the LSP plan.
     workspace: RwLock<Workspace>,
     /// Doc models for every `[dependencies]` package the workspace
-    /// pulls in. Populated by `resolve_dep_docs` after `initialize`
-    /// reads the manifest. Hover walks this alongside the prelude
-    /// when an `import "@hatch:foo" for X` resolves locally to a
-    /// dep symbol.
-    dep_docs: RwLock<Vec<wren_lift::docs::ModuleDoc>>,
+    /// pulls in, paired with the on-disk URI of the extracted
+    /// `Source` section so goto-definition can jump into the
+    /// dep's actual code. Populated by `resolve_dep_docs` after
+    /// `initialize` reads the manifest.
+    dep_docs: RwLock<Vec<DepModule>>,
     /// Doc models for every `*.wren` file under the workspace
     /// root, indexed by file URI. Populated at init by a
-    /// shallow walk of the workspace tree, refreshed on
-    /// `did_change` for each open document. Goto-definition
+    /// shallow walk of the workspace tree. Goto-definition
     /// uses it to jump from a `Fmt` use in `main.wren` to
     /// `fmt.wren`'s `class Fmt` even when `fmt.wren` isn't
     /// already open in the editor.
     workspace_modules: RwLock<std::collections::HashMap<Url, wren_lift::docs::ModuleDoc>>,
+}
+
+#[derive(Debug, Clone)]
+struct DepModule {
+    /// Package name as declared in `[dependencies]`, e.g.
+    /// `@hatch:fmt`. Used to scope goto-definition: a
+    /// `Fmt` use imported from `@hatch:fmt` must land in
+    /// `@hatch:fmt`'s own bundled source, not in some
+    /// coincidentally same-named class elsewhere.
+    package: String,
+    /// Parsed doc model from the bundled `Source` section.
+    doc: wren_lift::docs::ModuleDoc,
+    /// On-disk URI for the extracted source. `resolve_dep_docs`
+    /// writes each section to
+    /// `<cache>/sources/<flat-name>-<ver>/<module>.wren`. The
+    /// file is read-only in spirit — edits don't propagate
+    /// back into the `.hatch` artefact.
+    source_uri: Url,
 }
 
 #[derive(Debug, Default)]
@@ -313,12 +330,14 @@ impl LanguageServer for Backend {
         // name (Renderer2D.new, System.print) we should show
         // *that* class's docs, not the docs of the method we
         // happen to be inside.
-        let dep_docs_snapshot: Vec<wren_lift::docs::ModuleDoc> = self
+        let dep_docs_snapshot: Vec<DepModule> = self
             .dep_docs
             .read()
             .map(|v| v.clone())
             .unwrap_or_default();
-        if let Some(h) = identifier_hover(module, &dep_docs_snapshot, &doc, byte) {
+        let dep_docs_only: Vec<wren_lift::docs::ModuleDoc> =
+            dep_docs_snapshot.iter().map(|d| d.doc.clone()).collect();
+        if let Some(h) = identifier_hover(module, &dep_docs_only, &doc, byte) {
             return Ok(Some(h));
         }
         if let Some(h) = prelude_hover(&doc, byte) {
@@ -369,6 +388,65 @@ impl LanguageServer for Backend {
             a.receiver_type_for_call_at(byte)
                 .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
         });
+
+        // If the receiver class (or the bare ident) was brought
+        // in via a scoped import, the answer lives inside that
+        // dep's bundled source — *not* a coincidentally
+        // same-named class elsewhere in the workspace. Resolve
+        // through `dep_docs` first.
+        let dep_docs_snapshot: Vec<DepModule> = self
+            .dep_docs
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let scoped_import = analysis.as_ref().and_then(|a| {
+            let target = receiver_class.as_deref().unwrap_or(ident);
+            wren_lift::docs::hover::imported_from(&a.module, &a.interner, target)
+                .filter(|src| src.starts_with('@'))
+        });
+        if let Some(pkg) = &scoped_import {
+            // Walk the dep's bundled modules. Member match for a
+            // typed receiver scopes against the receiver class;
+            // otherwise it's a bare class-name jump.
+            for dep in &dep_docs_snapshot {
+                if dep.package != *pkg {
+                    continue;
+                }
+                if let Some(recv) = &receiver_class {
+                    for class in &dep.doc.classes {
+                        if class.name != *recv {
+                            continue;
+                        }
+                        for member in &class.members {
+                            if member.name == ident {
+                                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                    uri: dep.source_uri.clone(),
+                                    range: byte_range_to_lsp(
+                                        &dep.source_uri,
+                                        member.span.clone(),
+                                    ),
+                                })));
+                            }
+                        }
+                    }
+                }
+                for class in &dep.doc.classes {
+                    if class.name == ident {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: dep.source_uri.clone(),
+                            range: byte_range_to_lsp(&dep.source_uri, class.span.clone()),
+                        })));
+                    }
+                }
+            }
+            // Scoped import resolved to a package whose source
+            // we couldn't consult (network failure, decode
+            // skip). Don't fall through to the workspace
+            // name-match — that would land on a coincidentally
+            // same-named class. Better to return nothing and
+            // let the user know via the absence of a jump.
+            return Ok(None);
+        }
 
         if let Some(recv) = &receiver_class {
             for class in &module.classes {
@@ -1064,11 +1142,19 @@ impl Backend {
             return;
         }
 
-        let mut collected: Vec<wren_lift::docs::ModuleDoc> = Vec::new();
+        // Extract Source sections to disk so goto-definition has
+        // a real file URI to jump to. `<cache>/sources/<dir>-<ver>/`
+        // is parallel to the `<cache>/<dir>-<ver>.hatch` artefact;
+        // re-extracting on every workspace open is cheap (writes
+        // are bounded by total dep .wren bytes) and keeps the
+        // mirror in sync with the cached bundle without any
+        // staleness logic.
+        let sources_root = cache.join("sources");
+
+        let mut collected: Vec<DepModule> = Vec::new();
         for (name, dep) in &manifest.dependencies {
             // Only registry-style version pins resolve here. `path`
-            // / `git` / `url` deps are out of scope for v3 — those
-            // need workspace-relative source loading.
+            // / `git` / `url` deps need their own loaders, deferred.
             let version = match dep {
                 Dependency::Version(v) => v.clone(),
                 _ => continue,
@@ -1117,6 +1203,15 @@ impl Backend {
                     continue;
                 }
             };
+
+            // Per-dep source mirror lives next to the bundle's
+            // cache filename. Use the same dir-flattened form
+            // (`@hatch:fmt` → `hatch-fmt`) so the layout
+            // mirrors `<cache>/<flat>-<ver>.hatch`.
+            let flat = hatch_registry::scoped_name_to_dir(name);
+            let dep_src_dir = sources_root.join(format!("{flat}-{version}"));
+            let _ = std::fs::create_dir_all(&dep_src_dir);
+
             for section in &bundle.sections {
                 if !matches!(section.kind, SectionKind::Source) {
                     continue;
@@ -1135,7 +1230,27 @@ impl Backend {
                     &pr.docs,
                     &pr.interner,
                 );
-                collected.push(module);
+
+                // Section name is the module identifier — sometimes
+                // a scoped form (`@hatch:fmt:fmt`); flatten the
+                // separators so the on-disk filename is portable.
+                let safe_name = section
+                    .name
+                    .replace([':', '@', '/', '\\'], "-")
+                    .trim_start_matches('-')
+                    .to_string();
+                let target = dep_src_dir.join(format!("{safe_name}.wren"));
+                if std::fs::write(&target, &section.data).is_err() {
+                    continue;
+                }
+                let Ok(source_uri) = Url::from_file_path(&target) else {
+                    continue;
+                };
+                collected.push(DepModule {
+                    package: name.clone(),
+                    doc: module,
+                    source_uri,
+                });
             }
         }
 

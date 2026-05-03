@@ -227,7 +227,7 @@ fn span_contains(span: &Range<usize>, byte: usize) -> bool {
 /// @hatch:gpu"* instead of the generic "workspace hasn't loaded"
 /// when the class is sitting in a dep that just hasn't finished
 /// fetching.
-fn imported_from(module: &Module, interner: &Interner, name: &str) -> Option<String> {
+pub fn imported_from(module: &Module, interner: &Interner, name: &str) -> Option<String> {
     let sym = interner.lookup(name)?;
     for stmt in module {
         if let Stmt::Import { module: src, names } = &stmt.0 {
