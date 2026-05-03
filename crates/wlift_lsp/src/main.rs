@@ -1803,6 +1803,21 @@ fn map_severity(sev: WlSeverity) -> DiagnosticSeverity {
     }
 }
 
+#[tokio::main]
+async fn main() {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let (service, socket) = LspService::new(|client| Backend {
+        client,
+        docs: DashMap::new(),
+        workspace: RwLock::new(Workspace::default()),
+        dep_docs: RwLock::new(Vec::new()),
+        workspace_modules: RwLock::new(std::collections::HashMap::new()),
+    });
+    Server::new(stdin, stdout, socket).serve(service).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::extract_string_arg;
@@ -1892,19 +1907,4 @@ mod tests {
         assert_eq!(infer("System"), None);
         assert_eq!(infer("var x"), None);
     }
-}
-
-#[tokio::main]
-async fn main() {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-
-    let (service, socket) = LspService::new(|client| Backend {
-        client,
-        docs: DashMap::new(),
-        workspace: RwLock::new(Workspace::default()),
-        dep_docs: RwLock::new(Vec::new()),
-        workspace_modules: RwLock::new(std::collections::HashMap::new()),
-    });
-    Server::new(stdin, stdout, socket).serve(service).await;
 }
