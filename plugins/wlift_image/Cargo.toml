@@ -1,6 +1,6 @@
 [package]
 name = "wlift_image"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Image encode / decode / resize / convert for WrenLift. Backed by the `image` crate; bundled into @hatch:image as a cdylib so games + tools share the same RGBA8 pipeline."
 

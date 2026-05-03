@@ -6476,7 +6476,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_audio"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cpal",
  "hound",
@@ -6485,7 +6485,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_gpu"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "bytemuck",
  "log",
@@ -6497,7 +6497,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_gpu_web"
-version = "0.2.10"
+version = "0.2.11"
 
 [[package]]
 name = "wlift_hello"
@@ -6505,7 +6505,7 @@ version = "0.1.16"
 
 [[package]]
 name = "wlift_image"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "image",
  "wren_lift",
@@ -6525,7 +6525,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_physics"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "rapier2d",
  "rapier3d",
@@ -6534,7 +6534,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_sqlite"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rusqlite",
  "sqlite-wasm-rs",
@@ -6561,7 +6561,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_window"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "raw-window-handle",
  "winit",
@@ -6570,11 +6570,11 @@ dependencies = [
 
 [[package]]
 name = "wlift_window_web"
-version = "0.2.8"
+version = "0.2.9"
 
 [[package]]
 name = "wren_lift"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "aes-gcm",
  "argon2",

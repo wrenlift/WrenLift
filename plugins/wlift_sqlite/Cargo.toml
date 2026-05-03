@@ -1,6 +1,6 @@
 [package]
 name = "wlift_sqlite"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "SQLite plugin for the WrenLift runtime — distributed as a dylib bundled into @hatch:sqlite."
 

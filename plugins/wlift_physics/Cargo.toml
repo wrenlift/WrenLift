@@ -1,6 +1,6 @@
 [package]
 name = "wlift_physics"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Rapier-backed physics for the WrenLift game framework. One cdylib bundles rapier2d + rapier3d so @hatch:physics can expose World2D and World3D from a single import."
 
