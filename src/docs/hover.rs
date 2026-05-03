@@ -25,6 +25,16 @@ pub struct Analysis {
     pub module: Module,
     pub interner: Interner,
     pub type_env: TypeEnv,
+    /// Names that resolve to a class in this analysis: every
+    /// local `class Foo {}` decl, every `import for X` binding,
+    /// plus any extra class names the caller supplied. Cached
+    /// alongside `type_env` because a method-call's `Expr::Call`
+    /// shares its `span.start` with its receiver, and sema's
+    /// `infer_expr` clobbers the receiver's recorded type with
+    /// the Call's (usually `Any`) return type. Receiver hover
+    /// and goto can't trust the per-expr table for
+    /// class-receiver idents and consult this set instead.
+    pub known_classes: std::collections::HashSet<SymbolId>,
 }
 
 impl Analysis {
@@ -64,11 +74,12 @@ impl Analysis {
         // per-expression type map. Single-pass left field
         // references as `Any` because the field hadn't been
         // recorded yet when the use site was visited.
-        let type_env = infer_types_with_classes(&pr.module, known_classes, new_symbol);
+        let type_env = infer_types_with_classes(&pr.module, known_classes.clone(), new_symbol);
         Some(Analysis {
             module: pr.module,
             interner: pr.interner,
             type_env,
+            known_classes,
         })
     }
 
@@ -125,16 +136,23 @@ impl Analysis {
             }
             Expr::This => InferredType::Class(self.enclosing_class(byte)?),
             Expr::Ident(sym) => {
-                // Try sema's per-expr type first; fall back to
-                // the var-decl table when sema didn't connect
-                // the use to its declaration. Keys: sema records
-                // var types by *decl name span*, but Ident uses
-                // are at a different span.
-                let direct = self.type_env.get_expr_type(recv.1.start).clone();
-                if direct.is_known() {
-                    direct
+                // Class-shaped idents (local class decls, scoped
+                // imports, prelude) come straight from the
+                // cached `known_classes` set — sema's per-expr
+                // table can't be trusted for these because a
+                // method-call's `Expr::Call` shares its
+                // `span.start` with the receiver and overwrites
+                // the receiver's `Class(sym)` with the Call's
+                // `Any` return.
+                if self.known_classes.contains(sym) {
+                    InferredType::Class(*sym)
                 } else {
-                    self.local_var_type(byte, *sym).unwrap_or(InferredType::Any)
+                    let direct = self.type_env.get_expr_type(recv.1.start).clone();
+                    if direct.is_known() {
+                        direct
+                    } else {
+                        self.local_var_type(byte, *sym).unwrap_or(InferredType::Any)
+                    }
                 }
             }
             // Literal-receiver shapes get their type directly from
@@ -186,7 +204,7 @@ impl Analysis {
     /// reference into the analysed module so the caller can
     /// inspect the AST node directly (the receiver might be a
     /// field, `this`, a chained call, etc.).
-    fn find_call_receiver_at(&self, byte: usize) -> Option<&Spanned<Expr>> {
+    pub fn find_call_receiver_at(&self, byte: usize) -> Option<&Spanned<Expr>> {
         let mut found: Option<&Spanned<Expr>> = None;
         for stmt in &self.module {
             walk_stmt_for_call(stmt, byte, &mut found);
@@ -1498,6 +1516,30 @@ class Slicer {
             inferred_to_class_name(&ty, &a.interner).as_deref(),
             Some("Sprite")
         );
+    }
+}
+
+#[cfg(test)]
+mod imported_class_receiver_tests {
+    use super::*;
+
+    fn class_name_under(src: &str, pat: &str) -> Option<String> {
+        let byte = src.find(pat).unwrap() + 1;
+        let a = Analysis::run(src)?;
+        let ty = a.receiver_type_for_call_at(byte)?;
+        inferred_to_class_name(&ty, &a.interner)
+    }
+
+    #[test]
+    fn imported_class_static_method_receiver_resolves() {
+        let src = r#"import "@hatch:fmt" for Fmt
+class App {
+  static run() {
+    System.print(Fmt.green("hello"))
+  }
+}
+"#;
+        assert_eq!(class_name_under(src, "green"), Some("Fmt".into()));
     }
 }
 
