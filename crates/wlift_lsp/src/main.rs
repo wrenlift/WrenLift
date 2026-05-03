@@ -1513,9 +1513,17 @@ impl Backend {
             // Match the runtime's prelude — same names sema's
             // resolve sees in the wasm `run()` path. Without
             // this, every `System.print` / `Fiber.new` shows
-            // up as "undefined".
+            // up as "undefined". The browser-bridge names
+            // (`Future`, `Browser`, `WebSocket`, `Dom`,
+            // `LocalStorage`, `SessionStorage`) only exist in
+            // the wasm runtime, but the LSP can't tell if the
+            // user's code targets browser or host — include
+            // them anyway so a `@hatch:web` workspace doesn't
+            // light up with spurious "undefined" diagnostics.
+            // Mirrors the prelude `lint_wren` ships in
+            // `wasm/src/lib.rs`.
             let mut interner = pr.interner;
-            let prelude_names: [&str; 16] = [
+            let prelude_names: [&str; 22] = [
                 "Object",
                 "Class",
                 "Bool",
@@ -1532,6 +1540,12 @@ impl Backend {
                 "ByteArray",
                 "Float32Array",
                 "Float64Array",
+                "Future",
+                "Browser",
+                "WebSocket",
+                "Dom",
+                "LocalStorage",
+                "SessionStorage",
             ];
             let prelude: Vec<wren_lift::intern::SymbolId> =
                 prelude_names.iter().map(|n| interner.intern(n)).collect();

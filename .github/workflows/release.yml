@@ -15,7 +15,12 @@ name: Release binaries
 on:
   push:
     tags:
-      - 'v*'
+      # Runtime tags only — `v0.1.x`. Without the digit anchor
+      # the glob matches `vscode-v*` (extension releases) and
+      # any other workstream that prefixes with `v`, which
+      # produced spurious runtime-shaped GitHub releases that
+      # confused `install.sh`'s `releases/latest` resolver.
+      - 'v[0-9]*'
   workflow_dispatch:
     inputs:
       tag:
