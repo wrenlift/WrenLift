@@ -189,13 +189,90 @@ async function startServer(): Promise<void> {
       config.get<string>("serverPath"),
       "wlift-lsp",
     );
-    vscode.window.showErrorMessage(
-      `Failed to start wlift-lsp at "${cmd}": ${err}. ` +
-        `Install via curl -fsSL https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh | bash, ` +
-        `or set "wrenlift.serverPath" to an absolute path.`,
-    );
+    await offerLspInstall(cmd, String(err));
   }
   refreshStatus();
+}
+
+/// Actionable failure dialog when the LSP binary can't be
+/// found or fails to spawn. The default install path drops
+/// `wlift`, `hatch`, and `wlift-lsp` into `$HOME/.local/bin`,
+/// but a fresh user pulled in via the marketplace won't have
+/// run anything yet — surface a one-click "Install" that runs
+/// the same curl-pipe-bash the README documents, so the
+/// happy path is "click button → server starts on next
+/// retry". `Configure path` opens the relevant setting for
+/// people who already have a custom build at hand. Dismiss
+/// is the third button so the user can opt out without
+/// closing every modal.
+async function offerLspInstall(cmd: string, err: string): Promise<void> {
+  const INSTALL_URL =
+    "https://raw.githubusercontent.com/wrenlift/WrenLift/main/install.sh";
+  const choice = await vscode.window.showErrorMessage(
+    `WrenLift can't reach the language server at "${cmd}".\n\n${err}`,
+    { modal: false },
+    "Install via install.sh",
+    "Browse to binary…",
+    "Open settings",
+  );
+  if (!choice) return;
+  if (choice === "Install via install.sh") {
+    if (process.platform === "win32") {
+      // install.sh is POSIX bash; PowerShell / cmd users
+      // need to grab a binary from the GitHub Releases page
+      // by hand. Direct them there instead of typing a
+      // command that won't run.
+      await vscode.env.openExternal(
+        vscode.Uri.parse("https://github.com/wrenlift/WrenLift/releases/latest"),
+      );
+      vscode.window.showInformationMessage(
+        "Windows users: download the matching tarball from the Releases page, drop wlift-lsp on PATH, then run 'WrenLift: Restart Language Server'.",
+      );
+      return;
+    }
+    const TERM_NAME = "WrenLift Install";
+    let terminal = vscode.window.terminals.find((t) => t.name === TERM_NAME);
+    if (!terminal) {
+      // No `shellPath` override — VS Code uses the user's
+      // configured default integrated-terminal profile (zsh
+      // on most macOS, bash/fish on Linux). The curl line
+      // explicitly pipes to `bash`, so the host shell only
+      // needs to be POSIX-ish to handle the pipe; the
+      // installer body runs under bash regardless of what's
+      // hosting the terminal.
+      terminal = vscode.window.createTerminal({ name: TERM_NAME });
+    }
+    terminal.show(true);
+    terminal.sendText(`curl -fsSL ${INSTALL_URL} | bash`);
+    vscode.window.showInformationMessage(
+      "Once the install finishes in the terminal, run 'WrenLift: Restart Language Server' to retry.",
+    );
+  } else if (choice === "Browse to binary…") {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      openLabel: "Use this binary",
+      title: "Select wlift-lsp binary",
+    });
+    if (picked && picked[0]) {
+      const target =
+        vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+          ? vscode.ConfigurationTarget.Workspace
+          : vscode.ConfigurationTarget.Global;
+      await vscode.workspace
+        .getConfiguration("wrenlift")
+        .update("serverPath", picked[0].fsPath, target);
+      vscode.window.showInformationMessage(
+        `wrenlift.serverPath set to ${picked[0].fsPath}. Run 'WrenLift: Restart Language Server' to retry.`,
+      );
+    }
+  } else if (choice === "Open settings") {
+    await vscode.commands.executeCommand(
+      "workbench.action.openSettings",
+      "wrenlift.serverPath",
+    );
+  }
 }
 
 async function stopServer(): Promise<void> {

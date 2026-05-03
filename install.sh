@@ -86,15 +86,19 @@ detect_platform() {
 
 # -- Version resolution -----------------------------------------
 
-# Resolve the empty VERSION → latest release tag, without needing
-# `gh` or `jq`. Parses the HTTP redirect on `/releases/latest`.
+# Resolve the empty VERSION → latest runtime-release tag.
+# Filters to tags matching `v<digit>...` so non-runtime tags
+# co-located in the same repo (e.g. extension releases tagged
+# `vscode-v0.1.0`, plugin tags `publish/...`) don't get
+# picked. No `gh` / `jq` dependency — grep over the JSON.
 resolve_latest() {
-  local redirect
-  redirect=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-    "https://github.com/$REPO/releases/latest") \
-    || die "couldn't reach https://github.com/$REPO/releases/latest"
-  # Redirect URL ends in `.../tag/v0.1.0`.
-  echo "${redirect##*/}"
+  local body
+  body=$(curl -fsSL "https://api.github.com/repos/$REPO/releases" 2>/dev/null) \
+    || die "couldn't reach https://api.github.com/repos/$REPO/releases"
+  printf '%s' "$body" \
+    | grep -oE '"tag_name":[[:space:]]*"v[0-9][^"]*"' \
+    | head -1 \
+    | sed -E 's/.*"(v[0-9][^"]*)".*/\1/'
 }
 
 # -- SHA256 verification ----------------------------------------
@@ -145,7 +149,7 @@ main() {
   # builder where `set -u` is in force.
   trap 'rm -rf "${tmpdir:-}"' EXIT
 
-  say "Downloading $archive_name…"
+  say "Downloading ${archive_name}…"
   curl -fsSL -o "$tmpdir/$archive_name" "$archive_url" \
     || die "download failed: $archive_url
 
