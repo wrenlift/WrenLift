@@ -157,6 +157,13 @@
         }
       }
     ],
+    "configurationDefaults": {
+      "workbench.colorCustomizations": {
+        "editorCodeLens.foreground": "#FDBE3C95",
+        "editorCodeLens.activeForeground": "#FDD169"
+      },
+      "editor.codeLensFontSize": 11
+    },
     "configuration": {
       "title": "WrenLift",
       "properties": {
