@@ -1852,6 +1852,54 @@ fn locate_wlift() -> Option<PathBuf> {
     None
 }
 
+/// Strip CSI escape sequences (`\x1b[…m`-style) so a colourised
+/// log line can be parsed against literal byte prefixes. Cheap
+/// hand-rolled state machine — no regex dep needed for the
+/// `@hatch:fmt` shape (CSI introducer + parameter bytes ending
+/// in a letter). Anything that isn't an SGR/colour escape passes
+/// through untouched, so the parser still bails the same way it
+/// always did on unrelated noise.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume `[`
+            // Drain parameter bytes until we hit a letter (the
+            // CSI final byte). Cap the inner loop so a malformed
+            // sequence can't run away.
+            for _ in 0..32 {
+                match chars.next() {
+                    Some(c) if c.is_ascii_alphabetic() => break,
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_colour_escapes() {
+        assert_eq!(
+            strip_ansi("\u{1b}[32mok:\u{1b}[0m 2/2 passed"),
+            "ok: 2/2 passed"
+        );
+    }
+
+    #[test]
+    fn passthrough_for_plain_text() {
+        assert_eq!(strip_ansi("ok: 2/2 passed"), "ok: 2/2 passed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // test — discover and run *.spec.wren
 // ---------------------------------------------------------------------------
@@ -1900,17 +1948,26 @@ fn cmd_test(dir: &Path) {
             }
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Last "ok: N/M passed" line wins.
+        // Last "ok: N/M passed" line wins. The `@hatch:test`
+        // text reporter wraps the "ok:" prefix in ANSI colour
+        // escapes and tacks an `(Xms)` timing suffix; strip
+        // both before matching so the parser stays robust to
+        // formatting drift.
         let mut last_ok: Option<(u32, u32)> = None;
         for line in stdout.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("ok: ") {
-                if let Some((p, m)) = rest.split_once('/') {
-                    let m = m.trim_end_matches(" passed");
-                    if let (Ok(p), Ok(m)) = (p.parse::<u32>(), m.parse::<u32>()) {
-                        last_ok = Some((p, m));
-                    }
-                }
+            let line = strip_ansi(line.trim());
+            let Some(rest) = line.strip_prefix("ok: ") else {
+                continue;
+            };
+            // Drop the trailing `(Xms)` timing suffix (and
+            // anything else past it) before splitting.
+            let rest = rest.split('(').next().unwrap_or(rest).trim();
+            let Some((p, m)) = rest.split_once('/') else {
+                continue;
+            };
+            let m = m.trim_end_matches(" passed").trim();
+            if let (Ok(p), Ok(m)) = (p.parse::<u32>(), m.parse::<u32>()) {
+                last_ok = Some((p, m));
             }
         }
         match last_ok {

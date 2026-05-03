@@ -21,13 +21,12 @@ symbols (outline view), inlay hints, and a manual
 
 ### Docs generator
 
-JSON doc model produced by `wren_lift::docs::collect_module`
-from `///` comments, consumed by the LSP hover handler and
-shipped inside every `.hatch` bundle's `Source` section so
-downstream tools (LSP across dep boundaries, future docs
-website renderer) see the same shape. Today's coverage is
-the model + LSP integration; the docs-website renderer is
-the next addition.
+JSON doc model walked from `///` comments, consumed by the
+LSP hover handler and shipped inside every `.hatch` bundle's
+source section so downstream tools (LSP across dep
+boundaries, future docs website renderer) see the same
+shape. Today's coverage is the model + LSP integration; the
+docs-website renderer is the next addition.
 
 ### AOT distribution
 
@@ -35,8 +34,8 @@ Compile a hatch project (or a standalone `.wren` file) to a
 self-contained deployment artifact: native executable for
 desktop / server / edge, or `.wasm` module for browser /
 WASI / serverless. Reuses parser → sema → MIR; the only
-structural change is at the codegen split — Cranelift
-`ObjectModule` for native, the existing `codegen::wasm`
+structural change is at the codegen split — Cranelift's
+object-file mode for native, the existing wasm codegen
 emitter driven whole-program for wasm. Two host profiles on
 the wasm side: `--profile=browser` (links the existing
 browser bridges + emits ES-module JS glue) and
@@ -67,9 +66,9 @@ These don't carry a dedicated treatment but track real gaps.
   a method that's neither a local nor a known class member
   is rewritten as `this.<name>` rather than diagnosed. See
   [QUIRKS.md](../QUIRKS.md#implicit-this-swallows-typos-inside-method-bodies).
-- **Resolver semver ranges** — `Dependency::Version(String)`
-  is a literal pin today; needs a registry index file plus
-  Cargo's `semver` crate. See
+- **Resolver semver ranges** — the version field in
+  hatchfiles is parsed as a literal pin today; needs a
+  registry index file plus a real semver matcher. See
   [QUIRKS.md](../QUIRKS.md#resolver-doesnt-accept-version-ranges-or-wildcards).
 - **Path drift between `~/.local/bin` and `~/.cargo/bin`** —
   the extension's binary resolver picks the older one when
