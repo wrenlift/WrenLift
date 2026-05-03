@@ -17,9 +17,10 @@ multi-phase plan yet.
 - **Docs generator** — [hatch-docs-generator-plan.md](hatch-docs-generator-plan.md).
 - **AOT distribution** — [aot-plan.md](aot-plan.md). Compile
   a hatch project / standalone `.wren` file to a self-
-  contained native executable, no runtime dep at the
-  consumption site. Phase 1 (Cranelift `.o` emit) starts
-  next; rest of the phases are sketched.
+  contained deployment artifact: native executable for
+  desktop / server / edge, or `.wasm` module for browser /
+  WASI / serverless. Phase 1 (Cranelift `.o` emit) starts
+  next; native phases 2–6, wasm phases 7–8 are sketched.
 - **First-party `hatch test` integration** —
   [hatch-test-plan.md](hatch-test-plan.md). Wire `@hatch:test`
   into the `hatch` CLI as a built-in verb (vs. today's
