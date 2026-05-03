@@ -9,11 +9,13 @@ name = "wlift-lsp"
 path = "src/main.rs"
 
 [dependencies]
-# Compiler frontend — parser + AST + sema. `default-features` on
-# wren_lift includes the JIT and plugin dlopen, neither of which
-# the LSP needs. Disable defaults; we only consume parse + sema +
-# the docs model, all portable.
-wren_lift = { path = "../..", default-features = false }
+# Compiler frontend — parser + AST + sema, plus the registry +
+# hatch-bundle decode path so the LSP can pull `[dependencies]`
+# from `~/.hatch/cache` and surface dep `///` docs in hover.
+# `default-features` on wren_lift includes the JIT and plugin
+# dlopen, neither of which the LSP needs; opt into `host`
+# explicitly for the registry + hatch::load surface.
+wren_lift = { path = "../..", default-features = false, features = ["host"] }
 
 # LSP plumbing.
 tower-lsp = "0.20"

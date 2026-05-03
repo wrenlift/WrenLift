@@ -18,7 +18,8 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use wren_lift::diagnostics::{Diagnostic as WlDiagnostic, Severity as WlSeverity};
-use wren_lift::hatch::{Dependency, Manifest};
+use wren_lift::hatch::{self, Dependency, Manifest, SectionKind};
+use wren_lift::hatch_registry;
 use wren_lift::parse::parser::parse;
 use wren_lift::sema::resolve as sema_resolve;
 
@@ -34,6 +35,12 @@ struct Backend {
     /// manifest. Single workspace per server for now; multi-root
     /// support lives in v2 of the LSP plan.
     workspace: RwLock<Workspace>,
+    /// Doc models for every `[dependencies]` package the workspace
+    /// pulls in. Populated by `resolve_dep_docs` after `initialize`
+    /// reads the manifest. Hover walks this alongside the prelude
+    /// when an `import "@hatch:foo" for X` resolves locally to a
+    /// dep symbol the user is hovering on.
+    dep_docs: RwLock<Vec<wren_lift::docs::ModuleDoc>>,
 }
 
 #[derive(Debug, Default)]
@@ -183,6 +190,15 @@ impl LanguageServer for Backend {
             )
             .await;
 
+        // Kick off dep resolution synchronously during init so the
+        // first hover after the editor finishes opening can see the
+        // dep docs. The walk hits the local hatch cache when warm
+        // and only falls back to the registry CDN on cache miss,
+        // so a returning user pays no network latency.
+        if manifest_loaded {
+            self.resolve_dep_docs().await;
+        }
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "wlift-lsp".into(),
@@ -279,7 +295,12 @@ impl LanguageServer for Backend {
         // name (Renderer2D.new, System.print) we should show
         // *that* class's docs, not the docs of the method we
         // happen to be inside.
-        if let Some(h) = identifier_hover(module, &doc, byte) {
+        let dep_docs_snapshot: Vec<wren_lift::docs::ModuleDoc> = self
+            .dep_docs
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        if let Some(h) = identifier_hover(module, &dep_docs_snapshot, &doc, byte) {
             return Ok(Some(h));
         }
         if let Some(h) = prelude_hover(&doc, byte) {
@@ -303,6 +324,7 @@ impl LanguageServer for Backend {
 /// class.
 fn identifier_hover(
     module: &wren_lift::docs::ModuleDoc,
+    dep_docs: &[wren_lift::docs::ModuleDoc],
     doc: &Document,
     byte: usize,
 ) -> Option<Hover> {
@@ -325,6 +347,13 @@ fn identifier_hover(
 
     let mut all: Vec<&wren_lift::docs::ModuleDoc> =
         wren_lift::docs::prelude_docs().iter().collect();
+    // Order: local module first (shadows everything), then deps,
+    // then the prelude. A user-defined `Fmt` in the open file
+    // wins over `@hatch:fmt`'s `Fmt`, which in turn wins over
+    // any prelude class with the same name.
+    for d in dep_docs {
+        all.insert(0, d);
+    }
     all.insert(0, module);
 
     // Class-name hover (cursor on the class identifier itself).
@@ -705,6 +734,134 @@ fn member_hover(
 }
 
 impl Backend {
+    /// Walk the workspace's `[dependencies]`, fetch each one's
+    /// `.hatch` bundle through the registry cache, decode the
+    /// `Source` sections, and run `docs::collect::collect_module`
+    /// on each so hover can resolve `@hatch:foo`-imported
+    /// symbols against the dep's actual `///` blocks. Best-effort:
+    /// individual failures (network, parse, missing source) are
+    /// logged and skipped so a broken dep doesn't take the whole
+    /// workspace's hover off.
+    async fn resolve_dep_docs(&self) {
+        let manifest = match self.workspace.read() {
+            Ok(ws) => ws.manifest.clone(),
+            Err(_) => return,
+        };
+        let Some(manifest) = manifest else { return };
+
+        let registry = hatch_registry::registry_url();
+        let cache = match hatch_registry::cache_root() {
+            Ok(c) => c,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("wlift-lsp: cache_root unavailable: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        if let Err(e) = std::fs::create_dir_all(&cache) {
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!(
+                        "wlift-lsp: couldn't create cache dir {}: {e}",
+                        cache.display()
+                    ),
+                )
+                .await;
+            return;
+        }
+
+        let mut collected: Vec<wren_lift::docs::ModuleDoc> = Vec::new();
+        for (name, dep) in &manifest.dependencies {
+            // Only registry-style version pins resolve here. `path`
+            // / `git` / `url` deps are out of scope for v3 — those
+            // need workspace-relative source loading.
+            let version = match dep {
+                Dependency::Version(v) => v.clone(),
+                _ => continue,
+            };
+            let path = match hatch_registry::ensure_in_cache_dir(
+                &cache, &registry, name, &version,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!("wlift-lsp: skipping {name}@{version}: {e}"),
+                        )
+                        .await;
+                    continue;
+                }
+            };
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "wlift-lsp: read {} failed: {e}",
+                                path.display()
+                            ),
+                        )
+                        .await;
+                    continue;
+                }
+            };
+            let bundle = match hatch::load(&bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    self.client
+                        .log_message(
+                            MessageType::INFO,
+                            format!(
+                                "wlift-lsp: decode {} failed: {e}",
+                                path.display()
+                            ),
+                        )
+                        .await;
+                    continue;
+                }
+            };
+            for section in &bundle.sections {
+                if !matches!(section.kind, SectionKind::Source) {
+                    continue;
+                }
+                let Ok(source) = std::str::from_utf8(&section.data) else {
+                    continue;
+                };
+                let pr = parse(source);
+                if !pr.errors.is_empty() {
+                    continue;
+                }
+                let module = wren_lift::docs::collect::collect_module(
+                    &section.name,
+                    source,
+                    &pr.module,
+                    &pr.docs,
+                    &pr.interner,
+                );
+                collected.push(module);
+            }
+        }
+
+        let count = collected.len();
+        if let Ok(mut slot) = self.dep_docs.write() {
+            *slot = collected;
+        }
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("wlift-lsp: resolved {count} dep module(s)"),
+            )
+            .await;
+    }
+
     async fn publish_diagnostics(&self, uri: &Url) {
         // Snapshot the source text + clear any prior cached doc
         // before re-running the pipeline. The collected ModuleDoc
@@ -835,6 +992,7 @@ async fn main() {
         client,
         docs: DashMap::new(),
         workspace: RwLock::new(Workspace::default()),
+        dep_docs: RwLock::new(Vec::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
