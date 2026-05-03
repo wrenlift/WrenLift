@@ -338,11 +338,8 @@ impl LanguageServer for Backend {
         // name (Renderer2D.new, System.print) we should show
         // *that* class's docs, not the docs of the method we
         // happen to be inside.
-        let dep_docs_snapshot: Vec<DepModule> = self
-            .dep_docs
-            .read()
-            .map(|v| v.clone())
-            .unwrap_or_default();
+        let dep_docs_snapshot: Vec<DepModule> =
+            self.dep_docs.read().map(|v| v.clone()).unwrap_or_default();
         let dep_docs_only: Vec<wren_lift::docs::ModuleDoc> =
             dep_docs_snapshot.iter().map(|d| d.doc.clone()).collect();
         if let Some(h) = identifier_hover(module, &dep_docs_only, &doc, byte) {
@@ -402,11 +399,8 @@ impl LanguageServer for Backend {
         // dep's bundled source — *not* a coincidentally
         // same-named class elsewhere in the workspace. Resolve
         // through `dep_docs` first.
-        let dep_docs_snapshot: Vec<DepModule> = self
-            .dep_docs
-            .read()
-            .map(|v| v.clone())
-            .unwrap_or_default();
+        let dep_docs_snapshot: Vec<DepModule> =
+            self.dep_docs.read().map(|v| v.clone()).unwrap_or_default();
         let scoped_import = analysis.as_ref().and_then(|a| {
             let target = receiver_class.as_deref().unwrap_or(ident);
             wren_lift::docs::hover::imported_from(&a.module, &a.interner, target)
@@ -429,10 +423,7 @@ impl LanguageServer for Backend {
                             if member.name == ident {
                                 return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                                     uri: dep.source_uri.clone(),
-                                    range: byte_range_to_lsp(
-                                        &dep.source_uri,
-                                        member.span.clone(),
-                                    ),
+                                    range: byte_range_to_lsp(&dep.source_uri, member.span.clone()),
                                 })));
                             }
                         }
@@ -618,9 +609,7 @@ impl LanguageServer for Backend {
             a.receiver_type_for_call_at(probe)
                 .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
         });
-        if class_name.is_none()
-            && recv.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        {
+        if class_name.is_none() && recv.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             class_name = Some(recv.to_string());
         }
         let Some(class_name) = class_name else {
@@ -707,10 +696,7 @@ impl LanguageServer for Backend {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let is_main = file_name == "main.wren";
         let is_spec = file_name.ends_with(".spec.wren");
         if !is_main && !is_spec {
@@ -750,8 +736,14 @@ impl LanguageServer for Backend {
             .unwrap_or((0, 0));
         let lens = CodeLens {
             range: Range {
-                start: Position { line: anchor_line.0, character: 0 },
-                end: Position { line: anchor_line.0, character: anchor_line.1 },
+                start: Position {
+                    line: anchor_line.0,
+                    character: 0,
+                },
+                end: Position {
+                    line: anchor_line.0,
+                    character: anchor_line.1,
+                },
             },
             command: Some(Command {
                 title,
@@ -1128,8 +1120,14 @@ impl Backend {
         Some(Location {
             uri: target_uri,
             range: Range {
-                start: Position { line: 0, character: 0 },
-                end: Position { line: 0, character: 0 },
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
             },
         })
     }
@@ -1377,9 +1375,8 @@ impl Backend {
                 Dependency::Version(v) => v.clone(),
                 _ => continue,
             };
-            let path = match hatch_registry::ensure_in_cache_dir(
-                &cache, &registry, name, &version,
-            ) {
+            let path = match hatch_registry::ensure_in_cache_dir(&cache, &registry, name, &version)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     self.client
@@ -1397,10 +1394,7 @@ impl Backend {
                     self.client
                         .log_message(
                             MessageType::INFO,
-                            format!(
-                                "wlift-lsp: read {} failed: {e}",
-                                path.display()
-                            ),
+                            format!("wlift-lsp: read {} failed: {e}", path.display()),
                         )
                         .await;
                     continue;
@@ -1412,10 +1406,7 @@ impl Backend {
                     self.client
                         .log_message(
                             MessageType::INFO,
-                            format!(
-                                "wlift-lsp: decode {} failed: {e}",
-                                path.display()
-                            ),
+                            format!("wlift-lsp: decode {} failed: {e}", path.display()),
                         )
                         .await;
                     continue;

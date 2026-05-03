@@ -427,7 +427,9 @@ fn is_adjacent_to(comment_end: usize, decl_start: usize, source: &str) -> bool {
     // (a statement, another non-doc comment, a stray identifier)
     // breaks the bond.
     let between = &source.as_bytes()[comment_end..decl_start];
-    between.iter().all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    between
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
 }
 
 // ---------------------------------------------------------------------------
