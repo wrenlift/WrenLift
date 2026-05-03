@@ -1081,10 +1081,7 @@ pub fn complete_wren(source: &str, byte: usize) -> JsValue {
         // jumble of duplicates (`Fn.call`, `List.call`-shaped
         // overloads, etc.). Each class+member pair contributes
         // at most one entry (the first signature seen).
-        let receiver_is_class = recv
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase());
+        let receiver_is_class = recv.chars().next().is_some_and(|c| c.is_ascii_uppercase());
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for m in &pool {
             for class in &m.classes {
@@ -2150,7 +2147,7 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
                     // aborted: …")` was a flat one-liner that
                     // looked like a green log line in the page,
                     // not an error.
-                    let loc = vm.extract_error_location(entry.fiber);
+                    let loc = unsafe { vm.extract_error_location(entry.fiber) };
                     vm.report_runtime_error(&e, loc.as_ref(), entry.fiber);
                     // Mark the run as failed so the page paints the
                     // console pane red and the runtime pill flips
