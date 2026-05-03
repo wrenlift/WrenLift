@@ -73,10 +73,156 @@ JSDoc-style `@param {Type}` annotations from the docs collector,
 plus a hover post-pass that copies framework-declared param types
 onto user spans when a signature matches a known override.
 
+### Implicit-this swallows typos inside method bodies
+
+A bare identifier inside a method that doesn't resolve as a
+local, parameter, field, or module-level name is rewritten to
+`this.<name>` rather than diagnosed. That's correct Wren
+semantics — dynamic dispatch through inheritance can't be
+proven at compile time — but it means common typos like `sed`
+inside `static run() { ... sed ... }` don't surface as
+"undefined variable" the way the same identifier at module
+scope does.
+
+Fix sketch: track each class's declared methods / getters /
+setters during sema's class walk; on `ImplicitThis(name)`
+lookup, check the enclosing class's member set (and walk the
+superclass chain when resolvable), and emit a soft "unknown
+member on `<class>`" diagnostic when the name isn't there.
+Be lenient when the parent class lives behind an unresolvable
+import so legitimate framework-method-override patterns don't
+false-positive.
+
+### Spec runner's per-test "Run" button executes the whole file
+
+The VS Code extension's spec runner sidebar (and the per-block
+codelenses on `Test.describe(...)` / `Test.it(...)`) all
+dispatch `wrenlift.runFile <uri>`, which spawns `wlift <spec>`
+and runs every registered case. There's no per-case filter at
+runtime: `@hatch:test` doesn't expose a setter, and Wren has no
+env access without a plugin so the extension can't slip a
+filter in via `WLIFT_TEST_FILTER` or similar.
+
+Fix sketch: add a static `Test.filter=` setter to
+`@hatch:test`'s `test.wren`; have `Test.run()` skip cases whose
+`<group> > <name>` label doesn't contain the filter substring.
+The extension writes a tmp wrapper file (`/tmp/__wlift_runner_<uuid>.wren`)
+that imports `@hatch:test`, sets `Test.filter`, then imports
+the spec by absolute path (Wren's loader accepts absolute
+paths), and runs `wlift <wrapper>`. The codelens command
+dispatch already takes the case label as an argument; the
+upgrade is local once the runtime setter ships.
+
+### `cargo install` and `install.sh` ship to different `~/bin` paths and can drift
+
+`install.sh` writes to `~/.local/bin/{wlift,hatch,wlift-lsp}`;
+`cargo install` writes to `~/.cargo/bin/...`. The VS Code
+extension's `resolveBinary` probes `~/.local/bin` first when
+the configured `serverPath` is the default, so a developer who
+rebuilds via `cargo install` updates `~/.cargo/bin/wlift-lsp`
+but the extension keeps spawning the older
+`~/.local/bin/wlift-lsp`. Symptom: new LSP features (codelens,
+goto-def expansions, completion improvements) don't appear in
+the editor even though the binary on `$PATH` is up to date.
+
+Fix sketch: `resolveBinary` could compare mtimes between the
+two paths and prefer the newer one, OR the extension's "Show
+Toolchain Versions" command could surface the drift as a
+warning when the two binaries differ in version. For now: copy
+manually after rebuild, or set `wrenlift.serverPath` to the
+absolute path you want.
+
 ## Fixed
 
 Each entry is a single-paragraph record of what was wrong. Commit
 references stay so the git log retains the full investigation.
+
+### LSP rejected `#!native` / `#!wasm` cfg attributes on imports (commit 5e15aa4, 2026-05-03)
+
+Cross-target imports — the canonical shape for any package
+that ships separate native / wasm backends — surfaced as
+"attributes cannot attach to import statements" in the editor.
+Root cause: `parse::cfg::apply` strips bare cfg lines as a
+pre-parse pass, but the LSP feeds raw source straight to
+`parser`, so the `#!native` token reached `parse_decl_or_stmt`
+and `reject_attributes_on` flagged it. Fix: filter the two
+known cfg names (`wasm`, `native`) out of
+`reject_attributes_on`'s rejection loop, scoped to bare
+hashbang flags. Other `#!foo` attrs still flag so unknown
+gates don't sneak through silently.
+
+### `cargo install` on macOS produced SIGKILL'd binaries (commit 54aa607, 2026-05-03)
+
+Cargo strips Rust binaries by default in some toolchain
+versions; the strip invalidates the linker-generated adhoc
+codesignature, and macOS's kernel SIGKILLs binaries whose
+embedded signature no longer matches the file. Symptom in VS
+Code: `spawn ENOENT`-style failures even though the binary is
+on disk. Symptom in a terminal: exit 137 with no output. Fix:
+pin `strip = "none"` in `[profile.release]` so cargo install
+respects the unstripped layout. Workaround for already-broken
+installs: `codesign --force --sign - ~/.cargo/bin/{wlift,hatch,wlift-lsp}`.
+
+### `cargo install --git` skipped `wlift_lsp` (commit 1e1d66b, 2026-05-03)
+
+The site's "build from source" chip ran
+`cargo install --git github.com/wrenlift/WrenLift`, which only
+installs the root crate's bins (`wlift` + `hatch`). `wlift_lsp`
+lives in `crates/wlift_lsp/` as a separate workspace member,
+so users following the build-from-source path got a runtime +
+hatch CLI but no language server. Fix: chip now passes both
+package names — `cargo install --git URL wren_lift wlift_lsp`.
+
+### vscode-wrenlift 0.1.2 shipped without `node_modules` (commit 106d599, 2026-05-03)
+
+Marketplace install activated the extension but the LSP client
+never started, the status bar didn't show, and the install
+dialog never fired. Only the static contributions (grammar,
+icons) worked. Root cause: `.vscodeignore` excluded
+`node_modules/**`, so `vscode-languageclient` was missing from
+the published `.vsix` and `require("vscode-languageclient/node")`
+threw at activate time. Fix: drop the exclusion and add a
+`npm prune --omit=dev` step before `vsce publish` in CI so
+only production deps ship. Removed the `vscode:prepublish`
+hook so vsce doesn't try to re-tsc against the pruned tree.
+
+### vscode-wrenlift restart hung after the LSP crashed 5+ times (commit f336c83, 2026-05-03)
+
+vscode-languageclient gives up auto-restart after 5 crashes in
+3 minutes. The user-driven Restart command then hung because
+`await client.stop()` waited indefinitely for a shutdown ack
+from a process that no longer existed. Fix: cap `client.stop()`
+at 2s and skip it entirely when the client is in
+Stopped/Crashed state — restart now reliably tears the dead
+client down and spawns a fresh one. Drop the redundant
+`stopServer`-then-`startServer` sequence in `restartServer`;
+`startServer`'s prelude does the same teardown without
+double-stopping.
+
+### Auto-install poll spawned the LSP before `chmod +x` finished (commit 808c9d2, 2026-05-03)
+
+`install.sh` runs `mv` then `chmod +x` as separate steps; the
+extension's post-install poll watched `existsSync` and triggered
+the spawn between the two, catching EACCES that surfaced as a
+silent client.start() rejection. Fix: gate on
+`accessSync(X_OK)` instead, add a 250 ms settle delay before
+the first attempt, and keep polling until the client reaches
+Running or the 60 s window expires. Add a `starting` re-entrancy
+guard so the poll can't race a still-pending start triggered
+from the dialog path.
+
+### `install.sh` picked `vscode-v0.1.1` as the latest runtime release (commit 253d4f3, 2026-05-03)
+
+`resolve_latest` followed the `releases/latest` redirect, which
+GitHub computes across the entire tag namespace. The VS Code
+extension is versioned independently with `vscode-v*` tags, so
+a freshly-cut extension tag was preferred over the most recent
+runtime tag, and the installer downloaded a tarball that
+didn't exist for `wlift`. Fix: `resolve_latest` now hits
+`/releases` (plural), filters `tag_name` to `^v[0-9]`, and
+picks the first match. The release workflow's `v*` glob also
+tightened to `v[0-9]*` so it doesn't fire on the extension
+namespace.
 
 ### Constructor JIT SIGSEGV under GC pressure (2026-04-26)
 

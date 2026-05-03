@@ -176,46 +176,74 @@ emits, plus syntax highlighting on every `.wren` file.
 ### v2 — goto-def + references
 
 8. Workspace symbol index. Cross-file references inside the user's
-   package.
-9. `textDocument/definition`, `textDocument/references`.
+   package. ✓ (`workspace_modules` in `wlift_lsp::main`; rebuilt
+   on file create / delete)
+9. `textDocument/definition`. ✓ — covers class names, member
+   calls (typed receiver), scoped imports into bundled
+   `@hatch:*` source, workspace cross-file class/member matches,
+   and bare local references (`var`, `for` binding, method
+   parameter, closure parameter).
+   `textDocument/references` still pending.
 10. `textDocument/documentSymbol` for the editor's outline view.
 
 ### v3 — hatch deps + prelude
 
-11. Fetch + cache `@hatch:*` bundles using the existing dep walker.
-12. Surface dep symbols in hover/goto-def — every cached bundle's
-    `Source` sections feed `wren_lift::docs::collect_module`; the
-    resulting `ModuleDoc`s sit in a workspace-level `HashMap<pkg,
-    ModuleDoc>` keyed by package name. The hover handler walks
-    *that* table when the receiver of a `.method` access binds to
-    an imported name (e.g. hovering on `.toBe` inside an
-    `Expect.that(x).toBe(y)` call falls through to
-    `@hatch:assert`'s docs).
-13. Prelude docs. The runtime's core classes (Num / String / List
-    / Map / Fiber / System / Browser / Dom / …) are Rust-defined
-    so the generator can't see them today. Ship Rust-side
-    `///`-doc-only Wren stubs at `src/runtime/prelude/*.wren`,
-    collect them at build time into a static `prelude_doc_model`,
-    and prepend it to the workspace lookup table. Same blob
-    embedded into `wlift_wasm` so the playground hover /
-    completion gets prelude docs without a network round-trip.
-14. Completion across hatch deps after `import "@hatch:foo" for `.
-15. `workspace/executeCommand`: `wlift-lsp.reloadDeps`.
+11. Fetch + cache `@hatch:*` bundles using the existing dep walker. ✓
+12. Surface dep symbols in hover/goto-def. ✓ — every cached
+    bundle's `Source` sections feed `wren_lift::docs::collect_module`;
+    the resulting `ModuleDoc`s sit in a workspace-level vector
+    (`dep_docs` in `wlift_lsp::main`). Hover, goto-def, and
+    completion all walk that table for imported scoped names.
+13. Prelude docs. ✓ — `///`-doc-only Wren stubs at
+    `src/runtime/prelude/*.wren` (Object, Class, Bool, Null,
+    System, Num, String, Range, Sequence, List, Map, Fiber, Fn,
+    TypedArrays, Browser, Dom, Future, WebSocket, Storage)
+    collected lazily by `wren_lift::docs::prelude::prelude_docs`.
+    The same blob is embedded into `wlift_wasm`.
+14. Completion across hatch deps after `import "@hatch:foo" for `. ✓
+15. `workspace/executeCommand`: `wlift-lsp.reloadDeps` — pending.
+    Today deps refresh on workspace boot (or whenever the
+    extension restarts the server).
 
 ### v4 — completion + rename + inlay
 
-15. General-purpose completion (members, locals, scoped imports).
-16. `textDocument/rename` — workspace-wide identifier rename, scoped
-    to the user's package (won't rewrite hatch deps).
-17. Optional inlay hints for inferred types (`var foo = ...` →
-    `: Class`).
+15. General-purpose completion. ✓ partial — members on a typed
+    receiver (sema-resolved local var, field, method param,
+    `this`, class name, or bundled-dep ident), literal receivers
+    (`(10).`, `"foo".`, `[1,2].`, `{}.`, `true.`, `null.`), and
+    bare class names from local + workspace + dep + prelude
+    sources. General locals + module decls outside a `.` trigger
+    are still pending.
+16. `textDocument/rename` — workspace-wide identifier rename,
+    scoped to the user's package. Pending.
+17. Optional inlay hints for inferred types — pending.
 
-### v5 — performance
+### v5 — codelens + project surface (shipped, unplanned in v0)
 
-18. Incremental re-parse using ropes + dirty-region tracking.
-19. Salsa-style memoization keyed on (file_id, content_hash) for sema
+18. `textDocument/codeLens` ✓ — file-level `▶ Run <filename>`
+    above `main.wren` and `*.spec.wren`, plus per-block `▶ Run
+    "<name>"` lenses on every `Test.describe(...)` / `Test.it(...)`
+    line in spec files. Lenses dispatch the
+    `wrenlift.runFile` command in the VS Code extension.
+19. Activity Bar surface ✓ (extension-side). One `wrenlift.runner`
+    view container with two contextual welcome states: a
+    project scaffolder ("Create new project" → folder picker +
+    `hatch init`) when the workspace has no `.wren` /
+    `hatchfile`, and a tree of describe/it blocks parsed from
+    the active spec file when one is open. Tree nodes carry
+    inline ▶ Run / 📄 View output buttons. Per-test filtering
+    needs `@hatch:test` runtime support that doesn't exist yet
+    (Wren has no env access without a plugin), so today's run
+    button executes the whole spec file. The tree node wiring
+    is already in place; the upgrade is local once the
+    `Test.filter` setter lands.
+
+### v6 — performance
+
+20. Incremental re-parse using ropes + dirty-region tracking.
+21. Salsa-style memoization keyed on (file_id, content_hash) for sema
     pass.
-20. Multi-file projects of ~500 files should respond to keystrokes in
+22. Multi-file projects of ~500 files should respond to keystrokes in
     < 50 ms p95.
 
 ## Crate layout
@@ -254,10 +282,13 @@ Re-exports `wren_lift::parse` and `wren_lift::sema`. Depends on
   workspaces with separate hatchfiles need one server instance per
   hatchfile (handled by spawning a child server, or by namespacing
   workspaces in one server). Decide in v2.
-- Can sema run safely on partial / mid-edit source? It currently
-  asserts well-formed AST. Need a "best-effort" mode that returns
-  Ok with diagnostics instead of panicking on malformed input. v0
-  blocker for the diagnostic pass.
+- Can sema run safely on partial / mid-edit source? **Resolved.**
+  Sema runs unconditionally now (`pr.errors.is_empty()` gate
+  removed in `publish_diagnostics`); the parser's recovery
+  preserves enough of the AST that undefined-name checks still
+  light up on unaffected regions of the file when an unrelated
+  parse error sits elsewhere. The `module_docs` build (hover
+  cache) still gates on a clean parse.
 
 ## Dependencies on the docs plan
 
