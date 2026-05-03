@@ -253,6 +253,14 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         })
@@ -543,6 +551,188 @@ impl LanguageServer for Backend {
         }
 
         Ok(None)
+    }
+
+    /// Member completion after `.` on a typed receiver. Walks
+    /// the local module, dep_docs, workspace modules, and the
+    /// prelude in that order; returns whichever class's member
+    /// list matches the receiver's resolved type. The trigger
+    /// is `.`, so we only fire when the user has just typed it.
+    async fn completion(&self, p: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = p.text_document_position.text_document.uri;
+        let pos = p.text_document_position.position;
+        let Some(doc) = self.docs.get(&uri) else {
+            return Ok(None);
+        };
+        let byte = doc.position_to_byte(pos);
+
+        // Walk back from the cursor to find a `<receiver>.`
+        // shape. Receiver may be a class name, a `_field`, or
+        // an arbitrary identifier resolvable through sema.
+        let prefix = &doc.text[..byte];
+        let dot_pos = match prefix.rfind('.') {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        // Everything between the dot and the cursor is the
+        // partial member name the user is typing. We don't
+        // filter on it ourselves — VS Code does the prefix
+        // match against the returned items.
+        if prefix[dot_pos + 1..]
+            .chars()
+            .any(|c| !c.is_alphanumeric() && c != '_')
+        {
+            return Ok(None);
+        }
+
+        // Identify the receiver: the identifier immediately
+        // before the dot.
+        let recv_end = dot_pos;
+        let recv_start = doc.text[..recv_end]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(recv_end);
+        if recv_start == recv_end {
+            return Ok(None);
+        }
+        let recv = &doc.text[recv_start..recv_end];
+
+        // Resolve the receiver to a class. Three sources, in
+        // priority order:
+        //   1. `Analysis::receiver_type_for_call_at` — the
+        //      typed-receiver path that handles fields, locals,
+        //      `this`, and class-name idents.
+        //   2. Bare class name — match against any known class
+        //      directly (covers `Fmt.<...>` even when sema
+        //      didn't tag the cursor position because the
+        //      partial member name doesn't parse yet).
+        //   3. None → no completions.
+        let analysis = wren_lift::docs::hover::Analysis::run(&doc.text);
+        let mut class_name: Option<String> = analysis.as_ref().and_then(|a| {
+            // Position cursor on the receiver ident so
+            // receiver_type_for_call_at finds the call shape.
+            let probe = recv_start + 1;
+            a.receiver_type_for_call_at(probe)
+                .and_then(|t| wren_lift::docs::hover::inferred_to_class_name(&t, &a.interner))
+        });
+        if class_name.is_none()
+            && recv.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        {
+            class_name = Some(recv.to_string());
+        }
+        let Some(class_name) = class_name else {
+            return Ok(None);
+        };
+
+        // Collect candidate ModuleDocs we can search for the
+        // matching class. Local module first (shadows), then
+        // deps, then workspace, then the prelude.
+        let mut sources: Vec<wren_lift::docs::ModuleDoc> = Vec::new();
+        if let Some(d) = doc.docs.as_ref() {
+            sources.push(d.clone());
+        }
+        if let Ok(deps) = self.dep_docs.read() {
+            sources.extend(deps.iter().map(|d| d.doc.clone()));
+        }
+        if let Ok(ws) = self.workspace_modules.read() {
+            sources.extend(ws.values().cloned());
+        }
+        sources.extend(wren_lift::docs::prelude_docs().iter().cloned());
+
+        let mut items: Vec<CompletionItem> = Vec::new();
+        for module in &sources {
+            for class in &module.classes {
+                if class.name != class_name {
+                    continue;
+                }
+                for member in &class.members {
+                    let kind = match member.kind {
+                        wren_lift::docs::MemberKind::Method
+                        | wren_lift::docs::MemberKind::StaticMethod => {
+                            Some(CompletionItemKind::METHOD)
+                        }
+                        wren_lift::docs::MemberKind::Getter => Some(CompletionItemKind::PROPERTY),
+                        wren_lift::docs::MemberKind::Setter => Some(CompletionItemKind::PROPERTY),
+                        wren_lift::docs::MemberKind::Constructor => {
+                            Some(CompletionItemKind::CONSTRUCTOR)
+                        }
+                        wren_lift::docs::MemberKind::Field => Some(CompletionItemKind::FIELD),
+                    };
+                    items.push(CompletionItem {
+                        label: member.name.clone(),
+                        kind,
+                        detail: Some(wren_lift::docs::hover::format_member_sig(
+                            &class.name,
+                            &member.signature,
+                        )),
+                        documentation: if member.doc.is_empty() {
+                            None
+                        } else {
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: member.doc.clone(),
+                            }))
+                        },
+                        ..Default::default()
+                    });
+                }
+                // Once a class with this name was found in a
+                // higher-priority source, don't double-list its
+                // members from the prelude shadow (Num, etc.).
+                if !items.is_empty() {
+                    return Ok(Some(CompletionResponse::Array(items)));
+                }
+            }
+        }
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(CompletionResponse::Array(items)))
+        }
+    }
+
+    /// Inline run-action lens at the top of files that are
+    /// directly executable: `main.wren` (the conventional
+    /// hatch entry point) and `*.spec.wren` (test specs the
+    /// `wlift` runtime can drive directly). The lens runs
+    /// `wrenlift.runFile` on the editor side, which the
+    /// extension wires to a terminal invocation.
+    async fn code_lens(&self, p: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri = p.text_document.uri;
+        let path = match uri.to_file_path() {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let is_main = file_name == "main.wren";
+        let is_spec = file_name.ends_with(".spec.wren");
+        if !is_main && !is_spec {
+            return Ok(None);
+        }
+        let title = if is_spec {
+            "▶ Run spec".to_string()
+        } else {
+            "▶ Run".to_string()
+        };
+        let lens = CodeLens {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            command: Some(Command {
+                title,
+                command: "wrenlift.runFile".to_string(),
+                arguments: Some(vec![serde_json::json!(uri.to_string())]),
+            }),
+            data: None,
+        };
+        Ok(Some(vec![lens]))
     }
 }
 

@@ -80,6 +80,17 @@
           "light": "icons/wrenlift-icon.svg",
           "dark": "icons/wrenlift-icon.svg"
         }
+      },
+      {
+        "command": "wrenlift.runFile",
+        "title": "Run Wren File",
+        "category": "WrenLift",
+        "icon": "$(play)"
+      },
+      {
+        "command": "wrenlift.showVersions",
+        "title": "Show Toolchain Versions",
+        "category": "WrenLift"
       }
     ],
     "menus": {
@@ -104,6 +115,10 @@
       ],
       "wrenlift.editor.submenu": [
         {
+          "command": "wrenlift.runFile",
+          "group": "0_run@1"
+        },
+        {
           "command": "wrenlift.startServer",
           "group": "1_lifecycle@1"
         },
@@ -118,6 +133,10 @@
         {
           "command": "wrenlift.showServerActions",
           "group": "1_lifecycle@4"
+        },
+        {
+          "command": "wrenlift.showVersions",
+          "group": "2_info@1"
         }
       ]
     },
@@ -133,7 +152,17 @@
         "wrenlift.serverPath": {
           "type": "string",
           "default": "wlift-lsp",
-          "description": "Path to the wlift-lsp binary. Defaults to looking it up on $PATH; absolute paths bypass PATH."
+          "description": "Path to the wlift-lsp binary. Defaults to looking it up on $PATH; absolute paths bypass PATH. Supports ${workspaceFolder} substitution."
+        },
+        "wrenlift.wliftPath": {
+          "type": "string",
+          "default": "wlift",
+          "description": "Path to the wlift runtime binary used by 'WrenLift: Run Wren File' for single-file invocations. Supports ${workspaceFolder} substitution."
+        },
+        "wrenlift.hatchPath": {
+          "type": "string",
+          "default": "hatch",
+          "description": "Path to the hatch CLI binary used by 'WrenLift: Run Wren File' when a hatchfile sits at or above the file's directory. Supports ${workspaceFolder} substitution."
         },
         "wrenlift.trace.server": {
           "scope": "window",

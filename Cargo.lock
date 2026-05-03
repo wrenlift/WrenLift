@@ -6516,6 +6516,7 @@ name = "wlift_lsp"
 version = "0.1.14"
 dependencies = [
  "dashmap 6.1.0",
+ "serde_json",
  "tokio",
  "toml",
  "tower-lsp",
