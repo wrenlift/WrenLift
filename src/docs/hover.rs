@@ -1219,10 +1219,7 @@ fn find_for_binding(source: &str, ident: &str, scope_start: usize) -> Option<(us
         return None;
     }
     let after_for = trimmed["for".len()..].trim_start();
-    let after_paren = match after_for.strip_prefix('(') {
-        Some(s) => s.trim_start(),
-        None => return None,
-    };
+    let after_paren = after_for.strip_prefix('(')?.trim_start();
     if let Some(tail) = after_paren.strip_prefix(ident) {
         if tail.starts_with(' ') || tail.starts_with('\t') || tail.starts_with("in") {
             let line_no = source[..line_start].matches('\n').count() + 1;
