@@ -1,6 +1,6 @@
 [package]
 name = "wlift_hello"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "Trivial demo plugin that exists to exercise the on-demand wasm plugin-loader pipeline. Compiles to wasm32-unknown-unknown only — no native dylib build."
 

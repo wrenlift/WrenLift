@@ -1992,7 +1992,8 @@ async fn run_inner(input: RunInput<'_>) -> RunResult {
         };
     }
     let t_user = perf_mark();
-    let result = match input {
+    #[allow(unused_mut)]
+    let mut result = match input {
         RunInput::Source(source) => {
             let combined = format!("{}\n{}", PRELUDE_IMPORT, source);
             vm.interpret("main", &combined)

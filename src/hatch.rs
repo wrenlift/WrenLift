@@ -1561,22 +1561,23 @@ fn merge_path_dependencies(
                 });
                 let dep_bundled_ver = dep_hatch.manifest.bundled_versions.get(mod_name);
                 let outer_bundled_ver = manifest.bundled_versions.get(mod_name);
-                let same_pkg_same_version =
-                    matches!((dep_bundled_ver, outer_bundled_ver), (Some(a), Some(b)) if a == b);
+                // Versions are KNOWN to differ only when both
+                // sides have populated `bundled_versions` AND
+                // disagree. Pre-fix `.hatch` artefacts on the
+                // registry don't carry this metadata yet, so a
+                // missing entry on either side falls into the
+                // "be permissive, dedupe with a warning" bucket
+                // rather than tripping a hard error against
+                // information we can't actually verify.
+                let known_version_conflict = matches!(
+                    (dep_bundled_ver, outer_bundled_ver),
+                    (Some(a), Some(b)) if a != b
+                );
                 match (dep_section, existing) {
                     (Some(d), Some(e)) if d.kind == e.kind && d.data == e.data => {
                         continue;
                     }
-                    (Some(_), Some(_)) if mod_name.starts_with('@') && same_pkg_same_version => {
-                        eprintln!(
-                            "hatch: dep '{}' bundled '{}'@{} with bytes that differ from another dep's copy — keeping the first-installed; rebuild upstream against a single wlift rev to silence",
-                            dep_name,
-                            mod_name,
-                            dep_bundled_ver.unwrap()
-                        );
-                        continue;
-                    }
-                    (Some(_), Some(_)) if mod_name.starts_with('@') => {
+                    (Some(_), Some(_)) if mod_name.starts_with('@') && known_version_conflict => {
                         return Err(HatchError::Encode(format!(
                             "dependency '{}' carries module '{}' (version {}) that conflicts with version {} already bundled by another dep — pin both to the same version",
                             dep_name,
@@ -1584,6 +1585,14 @@ fn merge_path_dependencies(
                             dep_bundled_ver.map(String::as_str).unwrap_or("?"),
                             outer_bundled_ver.map(String::as_str).unwrap_or("?")
                         )));
+                    }
+                    (Some(_), Some(_)) if mod_name.starts_with('@') => {
+                        let dep_label = dep_bundled_ver.map(String::as_str).unwrap_or("unknown");
+                        eprintln!(
+                            "hatch: dep '{}' bundled '{}'@{} with bytes that differ from another dep's copy — keeping the first-installed; rebuild upstream against a single wlift rev to silence",
+                            dep_name, mod_name, dep_label
+                        );
+                        continue;
                     }
                     _ => {
                         return Err(HatchError::Encode(format!(
@@ -1641,7 +1650,16 @@ fn merge_path_dependencies(
                     if section.name.starts_with('@') {
                         let dep_ver = dep_hatch.manifest.bundled_versions.get(&section.name);
                         let outer_ver = manifest.bundled_versions.get(&section.name);
-                        if matches!((dep_ver, outer_ver), (Some(a), Some(b)) if a == b) {
+                        // Mirror the module-gather logic: only
+                        // bail on KNOWN-different versions; if
+                        // either side is missing metadata (pre-
+                        // fix bundles), drop the duplicate
+                        // permissively.
+                        let known_conflict = matches!(
+                            (dep_ver, outer_ver),
+                            (Some(a), Some(b)) if a != b
+                        );
+                        if !known_conflict {
                             continue;
                         }
                     }

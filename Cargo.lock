@@ -6501,7 +6501,7 @@ version = "0.2.10"
 
 [[package]]
 name = "wlift_hello"
-version = "0.1.13"
+version = "0.1.14"
 
 [[package]]
 name = "wlift_image"
@@ -6513,7 +6513,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_lsp"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "dashmap 6.1.0",
  "tokio",
@@ -6542,7 +6542,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_wasm"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -6573,7 +6573,7 @@ version = "0.2.8"
 
 [[package]]
 name = "wren_lift"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "argon2",
