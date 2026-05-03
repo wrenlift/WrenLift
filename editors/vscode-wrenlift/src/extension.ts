@@ -202,10 +202,23 @@ async function startServer(): Promise<void> {
     // also lands the runtime in a non-restartable state in
     // some vscode-languageclient versions.
     if (client) {
-      try {
-        await client.stop();
-      } catch {
-        // Ignore — a never-started client may throw on stop.
+      // Only call stop() when there's actually a live process
+      // to talk to. After a crash loop, vscode-languageclient
+      // disposes the connection but `client.stop()` still tries
+      // to handshake a shutdown with the dead process and hangs
+      // until manually killed. The 2s ceiling is a belt-and-
+      // braces guard for the live case where shutdown ack
+      // genuinely takes a moment.
+      if (
+        client.state === State.Running ||
+        client.state === State.Starting
+      ) {
+        try {
+          await client.stop(2000);
+        } catch {
+          // Stop timeouts surface as rejection — fine, we're
+          // about to drop the client reference anyway.
+        }
       }
       client = undefined;
     }
@@ -407,12 +420,24 @@ async function offerLspInstall(cmd: string, err: string): Promise<void> {
 
 async function stopServer(): Promise<void> {
   if (!client) return;
-  await client.stop();
+  // Cap the stop call: a crashed server's `stop()` can hang
+  // forever waiting for an ack from a process that's gone.
+  try {
+    await client.stop(2000);
+  } catch {
+    // Timeout / rejection is fine — caller wanted the server
+    // gone and we're about to reflect that in the UI anyway.
+  }
   refreshStatus();
 }
 
 async function restartServer(): Promise<void> {
-  await stopServer();
+  // Don't go through stopServer here — startServer's own prelude
+  // tears the old client down with the same timeout-bounded
+  // shutdown, AND skips the stop entirely when the client is
+  // already in a Stopped/Crashed state. That path is what
+  // unblocks restart-after-crash, which the simpler stop+start
+  // sequence used to deadlock on.
   await startServer();
 }
 
