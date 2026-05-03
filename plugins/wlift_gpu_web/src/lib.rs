@@ -121,11 +121,7 @@ unsafe extern "C" {
     /// Begin a render pass. `desc_slot` carries an optional JSON
     /// descriptor; pass `-1` to use defaults (clear to opaque
     /// black, single color attachment from the frame texture).
-    fn host_gpu_render_pass_begin(
-        vm: *mut c_void,
-        frame_handle: u32,
-        desc_slot: i32,
-    ) -> u32;
+    fn host_gpu_render_pass_begin(vm: *mut c_void, frame_handle: u32, desc_slot: i32) -> u32;
     fn host_gpu_render_pass_set_pipeline(pass: u32, pipeline: u32);
     fn host_gpu_render_pass_set_bind_group(pass: u32, group_index: u32, bg: u32);
     fn host_gpu_render_pass_set_vertex_buffer(pass: u32, slot: u32, buffer: u32);
@@ -154,11 +150,7 @@ unsafe extern "C" {
     fn host_gpu_create_texture(vm: *mut c_void, slot: i32) -> u32;
     /// Build a `GPUTextureView`. `desc_slot` is optional — pass
     /// `-1` for the default view (covers the whole texture).
-    fn host_gpu_create_texture_view(
-        vm: *mut c_void,
-        texture_handle: u32,
-        desc_slot: i32,
-    ) -> u32;
+    fn host_gpu_create_texture_view(vm: *mut c_void, texture_handle: u32, desc_slot: i32) -> u32;
     /// Upload pixel bytes via `device.queue.writeTexture`.
     /// `bytes_slot` carries a Wren String/Bytes; `desc_slot`
     /// carries the layout / origin descriptor JSON.
@@ -419,7 +411,15 @@ pub unsafe extern "C" fn wlift_gpu_render_pass_draw(vm: *mut c_void) {
     let instance_count = unsafe { wrenGetSlotDouble(vm, 3) } as u32;
     let first_vertex = unsafe { wrenGetSlotDouble(vm, 4) } as u32;
     let first_instance = unsafe { wrenGetSlotDouble(vm, 5) } as u32;
-    unsafe { host_gpu_render_pass_draw(pass, vertex_count, instance_count, first_vertex, first_instance) };
+    unsafe {
+        host_gpu_render_pass_draw(
+            pass,
+            vertex_count,
+            instance_count,
+            first_vertex,
+            first_instance,
+        )
+    };
     unsafe { wrenSetSlotNull(vm, 0) };
 }
 

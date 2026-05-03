@@ -29,30 +29,36 @@ const STUBS: &[(&str, &str)] = &[
     // lookup matches more than one — putting `Object` first
     // means generic methods like `toString` / `==` resolve to
     // their root-class definitions.
-    ("Object",       include_str!("../runtime/prelude/object.wren")),
-    ("Class",        include_str!("../runtime/prelude/class.wren")),
-    ("Bool",         include_str!("../runtime/prelude/bool.wren")),
-    ("Null",         include_str!("../runtime/prelude/null.wren")),
-    ("System",       include_str!("../runtime/prelude/system.wren")),
-    ("Num",          include_str!("../runtime/prelude/num.wren")),
-    ("String",       include_str!("../runtime/prelude/string.wren")),
-    ("Range",        include_str!("../runtime/prelude/range.wren")),
-    ("Sequence",     include_str!("../runtime/prelude/sequence.wren")),
-    ("List",         include_str!("../runtime/prelude/list.wren")),
-    ("Map",          include_str!("../runtime/prelude/map.wren")),
-    ("Fiber",        include_str!("../runtime/prelude/fiber.wren")),
-    ("Fn",           include_str!("../runtime/prelude/fn.wren")),
-    ("TypedArrays",  include_str!("../runtime/prelude/typed_arrays.wren")),
+    ("Object", include_str!("../runtime/prelude/object.wren")),
+    ("Class", include_str!("../runtime/prelude/class.wren")),
+    ("Bool", include_str!("../runtime/prelude/bool.wren")),
+    ("Null", include_str!("../runtime/prelude/null.wren")),
+    ("System", include_str!("../runtime/prelude/system.wren")),
+    ("Num", include_str!("../runtime/prelude/num.wren")),
+    ("String", include_str!("../runtime/prelude/string.wren")),
+    ("Range", include_str!("../runtime/prelude/range.wren")),
+    ("Sequence", include_str!("../runtime/prelude/sequence.wren")),
+    ("List", include_str!("../runtime/prelude/list.wren")),
+    ("Map", include_str!("../runtime/prelude/map.wren")),
+    ("Fiber", include_str!("../runtime/prelude/fiber.wren")),
+    ("Fn", include_str!("../runtime/prelude/fn.wren")),
+    (
+        "TypedArrays",
+        include_str!("../runtime/prelude/typed_arrays.wren"),
+    ),
     // Wasm-runtime prelude — the BROWSER_PRELUDE classes the
     // runtime auto-imports into every wasm `run()` invocation.
     // On native these aren't present; surfacing their docs in
     // the host LSP is harmless (the user won't reach them at
     // runtime there).
-    ("Browser",      include_str!("../runtime/prelude/browser.wren")),
-    ("Dom",          include_str!("../runtime/prelude/dom.wren")),
-    ("Future",       include_str!("../runtime/prelude/future.wren")),
-    ("WebSocket",    include_str!("../runtime/prelude/websocket.wren")),
-    ("Storage",      include_str!("../runtime/prelude/storage.wren")),
+    ("Browser", include_str!("../runtime/prelude/browser.wren")),
+    ("Dom", include_str!("../runtime/prelude/dom.wren")),
+    ("Future", include_str!("../runtime/prelude/future.wren")),
+    (
+        "WebSocket",
+        include_str!("../runtime/prelude/websocket.wren"),
+    ),
+    ("Storage", include_str!("../runtime/prelude/storage.wren")),
 ];
 
 /// Lazily-parsed prelude doc model. First access pays the parse
@@ -97,9 +103,6 @@ mod tests {
             .iter()
             .find(|m| m.name == "print")
             .expect("System.print stub present");
-        assert!(
-            print_doc.doc.contains("Print"),
-            "System.print docs missing"
-        );
+        assert!(print_doc.doc.contains("Print"), "System.print docs missing");
     }
 }

@@ -134,12 +134,14 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
     /// Where this package's README lives. Two shapes:
-    ///   * Absolute URL — used verbatim by the docs renderer
-    ///     (`https://raw.githubusercontent.com/.../README.md`,
-    ///     a custom CDN, …).
-    ///   * Relative path — resolved against the `git` URL using
-    ///     the host's `raw` URL convention (GitHub:
-    ///     `<git>/raw/main/<path>`).
+    ///
+    /// * Absolute URL — used verbatim by the docs renderer
+    ///   (`https://raw.githubusercontent.com/.../README.md`,
+    ///   a custom CDN, …).
+    /// * Relative path — resolved against the `git` URL using
+    ///   the host's `raw` URL convention (GitHub:
+    ///   `<git>/raw/main/<path>`).
+    ///
     /// Defaults to `"README.md"` at the repo root when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
@@ -897,7 +899,6 @@ pub fn build_from_source_tree(root: &Path) -> Result<Vec<u8>, HatchError> {
     build_from_source_tree_with_cache(root, None)
 }
 
-
 /// Variant that lets callers override the registry cache directory
 /// `hatch build` consults when resolving version-pinned dependencies.
 /// `None` falls back to the ambient `cache_root()` — `HATCH_CACHE_DIR`
@@ -1331,9 +1332,8 @@ fn resolve_version_cached_or_fetch(
         // Cache miss — fetch + populate. Surface the install
         // so a `hatch build` that walks 20 deps reads as
         // progress instead of silent stalls during downloads.
-        let url = crate::hatch_registry::release_url_for_target(
-            &registry, dep_name, version, target,
-        );
+        let url =
+            crate::hatch_registry::release_url_for_target(&registry, dep_name, version, target);
         eprintln!("hatch: installing {}@{} from {}", dep_name, version, url);
         let dest = match cache_dir {
             Some(dir) => crate::hatch_registry::ensure_in_cache_dir_for_target(
@@ -2162,12 +2162,15 @@ libssl = "/usr/lib/libssl.dylib"
         let bytes = build_from_source_tree(root).expect("build");
         let hatch = load(&bytes).expect("reload");
 
-        // Relative entry was bundled: one NativeLib section named
-        // "libfoo" whose bytes match what was on disk.
+        // Relative entry was bundled: one NativeLib section keyed
+        // under `libfoo__<platform>` (the per-platform suffix the
+        // multi-target packer adds so cross-OS bundles can hold
+        // every variant). For a bare-Path shorthand the platform
+        // key is `any`. Bytes match what was on disk.
         let lib_section = hatch
             .sections
             .iter()
-            .find(|s| matches!(s.kind, SectionKind::NativeLib) && s.name == "libfoo")
+            .find(|s| matches!(s.kind, SectionKind::NativeLib) && s.name.starts_with("libfoo"))
             .expect("libfoo NativeLib section");
         assert_eq!(lib_section.data, b"native-bytes");
 
@@ -2548,7 +2551,14 @@ ghost = "9.9.9"
     }
 
     #[test]
-    fn build_errors_when_declared_native_lib_missing() {
+    fn build_skips_missing_native_libs_silently() {
+        // `pack_bundled_native_libs` deliberately treats `NotFound`
+        // as "platform variant not built locally" rather than a
+        // hard error — see the comment block in that function.
+        // Strict checking broke the dev loop (path-linked plugin-
+        // backed packages whose dylib isn't compiled yet). The
+        // test pins the relaxed behaviour so the design intent
+        // can't silently regress.
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         std::fs::write(root.join("main.wren"), "1").unwrap();
@@ -2562,8 +2572,12 @@ ghost = "libs/missing.bin"
 "#;
         std::fs::write(root.join("hatchfile"), hatchfile).unwrap();
 
-        let result = build_from_source_tree(root);
-        assert!(matches!(result, Err(HatchError::Encode(_))));
+        let bytes = build_from_source_tree(root).expect("build should succeed");
+        let hatch = load(&bytes).expect("load");
+        // The declared `ghost` entry is preserved on the manifest
+        // even when no NativeLib section bundled — runtime resolves
+        // it via the on-disk path at install time.
+        assert!(hatch.manifest.native_libs.contains_key("ghost"));
     }
 
     #[test]

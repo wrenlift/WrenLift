@@ -2123,7 +2123,11 @@ fn run_fiber_with_stop_depth(
                         };
 
                     match method_entry {
-                        Some(m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_))) => {
+                        Some(
+                            m @ (Method::Native(_)
+                            | Method::ForeignC(_)
+                            | Method::ForeignCDynamic(_)),
+                        ) => {
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
                                     vm,
@@ -2141,14 +2145,16 @@ fn run_fiber_with_stop_depth(
                                     func,
                                     &arg_vals,
                                 ),
-                                Method::ForeignCDynamic(idx) => call_foreign_dynamic_with_frame_sync(
-                                    vm,
-                                    fiber,
-                                    pc,
-                                    &mut values,
-                                    idx,
-                                    &arg_vals,
-                                ),
+                                Method::ForeignCDynamic(idx) => {
+                                    call_foreign_dynamic_with_frame_sync(
+                                        vm,
+                                        fiber,
+                                        pc,
+                                        &mut values,
+                                        idx,
+                                        &arg_vals,
+                                    )
+                                }
                                 _ => unreachable!(),
                             };
                             if vm.has_error {
@@ -2729,8 +2735,7 @@ fn run_fiber_with_stop_depth(
                                 // dispatch goes through the lower
                                 // tier instead of the busted
                                 // optimized blob.
-                                let jit_entries =
-                                    crate::codegen::runtime_fns::jit_frame_entries();
+                                let jit_entries = crate::codegen::runtime_fns::jit_frame_entries();
                                 if let Some(&(_fp, top_func_id, _ret)) = jit_entries.last() {
                                     let id = crate::runtime::engine::FuncId(top_func_id);
                                     vm.engine.note_deopt_to_baseline(id);
@@ -2879,7 +2884,11 @@ fn run_fiber_with_stop_depth(
                             }
                         };
                         match method_entry {
-                            Some(m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_))) => {
+                            Some(
+                                m @ (Method::Native(_)
+                                | Method::ForeignC(_)
+                                | Method::ForeignCDynamic(_)),
+                            ) => {
                                 let result = match m {
                                     Method::Native(func) => call_native_with_frame_sync(
                                         vm,
@@ -2897,14 +2906,16 @@ fn run_fiber_with_stop_depth(
                                         func,
                                         &arg_vals,
                                     ),
-                                    Method::ForeignCDynamic(idx) => call_foreign_dynamic_with_frame_sync(
-                                        vm,
-                                        fiber,
-                                        pc,
-                                        &mut values,
-                                        idx,
-                                        &arg_vals,
-                                    ),
+                                    Method::ForeignCDynamic(idx) => {
+                                        call_foreign_dynamic_with_frame_sync(
+                                            vm,
+                                            fiber,
+                                            pc,
+                                            &mut values,
+                                            idx,
+                                            &arg_vals,
+                                        )
+                                    }
                                     _ => unreachable!(),
                                 };
                                 set_reg(&mut values, dst, result);
@@ -2993,7 +3004,11 @@ fn run_fiber_with_stop_depth(
                     let class = vm.class_of(recv);
                     let sym = subscript_get_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
-                        Some(m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_))) => {
+                        Some(
+                            m @ (Method::Native(_)
+                            | Method::ForeignC(_)
+                            | Method::ForeignCDynamic(_)),
+                        ) => {
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
                                     vm,
@@ -3011,14 +3026,16 @@ fn run_fiber_with_stop_depth(
                                     func,
                                     &all_args,
                                 ),
-                                Method::ForeignCDynamic(idx) => call_foreign_dynamic_with_frame_sync(
-                                    vm,
-                                    fiber,
-                                    pc,
-                                    &mut values,
-                                    idx,
-                                    &all_args,
-                                ),
+                                Method::ForeignCDynamic(idx) => {
+                                    call_foreign_dynamic_with_frame_sync(
+                                        vm,
+                                        fiber,
+                                        pc,
+                                        &mut values,
+                                        idx,
+                                        &all_args,
+                                    )
+                                }
                                 _ => unreachable!(),
                             };
                             set_reg(&mut values, dst, result);
@@ -3062,7 +3079,11 @@ fn run_fiber_with_stop_depth(
                     let class = vm.class_of(recv);
                     let sym = subscript_set_sym(vm, argc);
                     match unsafe { (*class).find_method(sym).cloned() } {
-                        Some(m @ (Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_))) => {
+                        Some(
+                            m @ (Method::Native(_)
+                            | Method::ForeignC(_)
+                            | Method::ForeignCDynamic(_)),
+                        ) => {
                             let result = match m {
                                 Method::Native(func) => call_native_with_frame_sync(
                                     vm,
@@ -3080,14 +3101,16 @@ fn run_fiber_with_stop_depth(
                                     func,
                                     &all_args,
                                 ),
-                                Method::ForeignCDynamic(idx) => call_foreign_dynamic_with_frame_sync(
-                                    vm,
-                                    fiber,
-                                    pc,
-                                    &mut values,
-                                    idx,
-                                    &all_args,
-                                ),
+                                Method::ForeignCDynamic(idx) => {
+                                    call_foreign_dynamic_with_frame_sync(
+                                        vm,
+                                        fiber,
+                                        pc,
+                                        &mut values,
+                                        idx,
+                                        &all_args,
+                                    )
+                                }
                                 _ => unreachable!(),
                             };
                             set_reg(&mut values, dst, result);
@@ -4993,19 +5016,31 @@ mod tests {
             b.terminator = Terminator::Return(v_result);
         }
 
+        // Tier-up runs on Beadie's background broker thread; under
+        // CI parallelism that thread can be starved and miss the
+        // first invocation's compile window. Replay the loop a few
+        // times until OSR fires (with a hard ceiling to avoid hangs
+        // on a real regression). Each replay re-arms back-edge
+        // counters against the now-installed compiled function.
         let mut vars = vec![];
-        let result = eval_in_vm(&mut vm, &f, &mut vars).unwrap();
-        assert_eq!(result.as_num().unwrap(), 100_000.0);
-
-        let osr_entries: u64 = vm
-            .engine
-            .tier_stats
-            .iter()
-            .map(|stats| stats.osr_entries)
-            .sum();
+        let mut osr_entries: u64 = 0;
+        for _ in 0..16 {
+            let result = eval_in_vm(&mut vm, &f, &mut vars).unwrap();
+            assert_eq!(result.as_num().unwrap(), 100_000.0);
+            osr_entries = vm
+                .engine
+                .tier_stats
+                .iter()
+                .map(|stats| stats.osr_entries)
+                .sum();
+            if osr_entries > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(
             osr_entries > 0,
-            "expected the conditional back-edge loop to enter OSR"
+            "expected the conditional back-edge loop to enter OSR within 16 replays"
         );
     }
 

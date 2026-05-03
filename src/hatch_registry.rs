@@ -189,7 +189,11 @@ pub fn release_url_for_target(
     target: Option<&str>,
 ) -> String {
     let dir = scoped_name_to_dir(name);
-    let suffix = if is_wasm_target(target) { "-wasm32" } else { "" };
+    let suffix = if is_wasm_target(target) {
+        "-wasm32"
+    } else {
+        ""
+    };
     format!(
         "{}/releases/download/publish/{}%40{}/{}-{}{}.hatch",
         registry_base.trim_end_matches('/'),

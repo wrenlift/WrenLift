@@ -250,9 +250,7 @@ impl LanguageServer for Backend {
         // Per protocol, clear diagnostics for files we no longer
         // own — otherwise stale red squigglies stay in the
         // editor's problem list.
-        self.client
-            .publish_diagnostics(uri, Vec::new(), None)
-            .await;
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn hover(&self, p: HoverParams) -> Result<Option<Hover>> {
@@ -399,7 +397,10 @@ fn identifier_hover(
                     if member.name == ident {
                         let body = format!(
                             "```wren\n{}\n```{}{}",
-                            wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                            wren_lift::docs::hover::format_member_sig(
+                                &class.name,
+                                &member.signature
+                            ),
                             if member.doc.is_empty() { "" } else { "\n\n" },
                             member.doc,
                         );
@@ -429,7 +430,10 @@ fn identifier_hover(
                             if member.name == ident {
                                 let body = format!(
                                     "```wren\n{}\n```{}{}",
-                                    wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                                    wren_lift::docs::hover::format_member_sig(
+                                        &class.name,
+                                        &member.signature
+                                    ),
                                     if member.doc.is_empty() { "" } else { "\n\n" },
                                     member.doc,
                                 );
@@ -483,7 +487,6 @@ fn identifier_hover(
         range: Some(doc.byte_range_to_lsp(span)),
     })
 }
-
 
 /// Identifier-under-cursor lookup against the runtime prelude
 /// stubs. Mirrors `hover_wren`'s prelude path so the desktop LSP
@@ -553,7 +556,11 @@ impl Backend {
                 markdown.push_str(&format!("{{ path = \"{path}\" }}\n```"));
             }
             Dependency::Git {
-                git, tag, rev, branch, ..
+                git,
+                tag,
+                rev,
+                branch,
+                ..
             } => {
                 let mut parts = vec![format!("git = \"{git}\"")];
                 if let Some(t) = tag {
@@ -639,11 +646,7 @@ fn find_import_string(src: &str, byte: usize) -> Option<std::ops::Range<usize>> 
 /// Find the smallest declaration whose span contains `byte` and
 /// build an LSP `Hover` for it. Returns `None` when the cursor
 /// isn't on any documented decl.
-fn hover_at(
-    module: &wren_lift::docs::ModuleDoc,
-    byte: usize,
-    doc: &Document,
-) -> Option<Hover> {
+fn hover_at(module: &wren_lift::docs::ModuleDoc, byte: usize, doc: &Document) -> Option<Hover> {
     for class in &module.classes {
         if !contains(&class.span, byte) {
             continue;
@@ -734,14 +737,25 @@ impl Backend {
             // up as "undefined".
             let mut interner = pr.interner;
             let prelude_names: [&str; 16] = [
-                "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range",
-                "Null", "Fn", "Fiber", "System", "Sequence", "ByteArray",
-                "Float32Array", "Float64Array",
+                "Object",
+                "Class",
+                "Bool",
+                "Num",
+                "String",
+                "List",
+                "Map",
+                "Range",
+                "Null",
+                "Fn",
+                "Fiber",
+                "System",
+                "Sequence",
+                "ByteArray",
+                "Float32Array",
+                "Float64Array",
             ];
-            let prelude: Vec<wren_lift::intern::SymbolId> = prelude_names
-                .iter()
-                .map(|n| interner.intern(n))
-                .collect();
+            let prelude: Vec<wren_lift::intern::SymbolId> =
+                prelude_names.iter().map(|n| interner.intern(n)).collect();
             let sema = sema_resolve::resolve_with_prelude(&pr.module, &interner, &prelude);
             // Restore the (possibly mutated) interner so the doc
             // collector below sees the same identifier ids.

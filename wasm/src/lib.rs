@@ -952,22 +952,37 @@ pub fn lint_wren(source: &str) -> JsValue {
         // `System.print` / `Fiber.new` shows up as "undefined".
         let prelude_names: [&str; 22] = [
             // Core classes (vm.rs:528)
-            "Object", "Class", "Bool", "Num", "String", "List", "Map", "Range",
-            "Null", "Fn", "Fiber", "System", "Sequence", "ByteArray",
-            "Float32Array", "Float64Array",
+            "Object",
+            "Class",
+            "Bool",
+            "Num",
+            "String",
+            "List",
+            "Map",
+            "Range",
+            "Null",
+            "Fn",
+            "Fiber",
+            "System",
+            "Sequence",
+            "ByteArray",
+            "Float32Array",
+            "Float64Array",
             // Browser bridges injected by the wasm runtime's
             // PRELUDE_IMPORT.
-            "Future", "Browser", "WebSocket", "Dom", "LocalStorage", "SessionStorage",
+            "Future",
+            "Browser",
+            "WebSocket",
+            "Dom",
+            "LocalStorage",
+            "SessionStorage",
         ];
         let prelude: Vec<wren_lift::intern::SymbolId> = prelude_names
             .iter()
             .map(|n| pr.interner.intern(n))
             .collect();
-        let sema = wren_lift::sema::resolve::resolve_with_prelude(
-            &pr.module,
-            &pr.interner,
-            &prelude,
-        );
+        let sema =
+            wren_lift::sema::resolve::resolve_with_prelude(&pr.module, &pr.interner, &prelude);
         out.extend(sema.errors.iter().map(diag_to_lint));
     }
     out.serialize(&json_serializer())
@@ -1071,7 +1086,10 @@ pub fn complete_wren(source: &str, byte: usize) -> JsValue {
         // jumble of duplicates (`Fn.call`, `List.call`-shaped
         // overloads, etc.). Each class+member pair contributes
         // at most one entry (the first signature seen).
-        let receiver_is_class = recv.chars().next().map_or(false, |c| c.is_ascii_uppercase());
+        let receiver_is_class = recv
+            .chars()
+            .next()
+            .map_or(false, |c| c.is_ascii_uppercase());
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for m in &pool {
             for class in &m.classes {
@@ -1128,10 +1146,12 @@ pub fn complete_wren(source: &str, byte: usize) -> JsValue {
 /// Keyed by package name (`"@hatch:gpu"` etc.) so re-registering
 /// the same package overwrites the previous entry instead of
 /// stacking duplicates.
-fn dep_docs() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<wren_lift::docs::ModuleDoc>>> {
+fn dep_docs(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<wren_lift::docs::ModuleDoc>>> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Vec<wren_lift::docs::ModuleDoc>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<String, Vec<wren_lift::docs::ModuleDoc>>>,
+    > = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1243,13 +1263,8 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         // silent until the parser is happy.
         return JsValue::NULL;
     }
-    let module = wren_lift::docs::collect_module(
-        "module",
-        source,
-        &pr.module,
-        &pr.docs,
-        &pr.interner,
-    );
+    let module =
+        wren_lift::docs::collect_module("module", source, &pr.module, &pr.docs, &pr.interner);
     // Typed AST + sema's TypeEnv for the same source. This is
     // what drives field/local type splices in the signature and
     // restricts `<recv>.<member>` lookups to the receiver's
@@ -1340,7 +1355,10 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                 for member in &class.members {
                     if member.name == ident {
                         return hover_out(
-                            &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                            &wren_lift::docs::hover::format_member_sig(
+                                &class.name,
+                                &member.signature,
+                            ),
                             &member.doc,
                             ident_span.start,
                             ident_span.end,
@@ -1375,7 +1393,10 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                     for member in &class.members {
                         if member.name == ident {
                             return hover_out(
-                                &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                                &wren_lift::docs::hover::format_member_sig(
+                                    &class.name,
+                                    &member.signature,
+                                ),
                                 &member.doc,
                                 ident_span.start,
                                 ident_span.end,
@@ -1403,7 +1424,10 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
                             for member in &class.members {
                                 if member.name == ident {
                                     return hover_out(
-                                        &wren_lift::docs::hover::format_member_sig(&class.name, &member.signature),
+                                        &wren_lift::docs::hover::format_member_sig(
+                                            &class.name,
+                                            &member.signature,
+                                        ),
                                         &member.doc,
                                         ident_span.start,
                                         ident_span.end,
@@ -1472,7 +1496,6 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
 
     JsValue::NULL
 }
-
 
 /// Build a `HoverOut` JSON value with the given signature + body
 /// and span range.

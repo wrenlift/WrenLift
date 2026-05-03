@@ -313,9 +313,7 @@ fn make_module_io(
         // gates imports per-target — which is the canonical shape
         // for cross-target packages (e.g. @hatch:assets, @hatch:gpu).
         // `None` selects the host arm (drop `#!wasm`, keep `#!native`).
-        let host_filter = |text: String| -> String {
-            wren_lift::parse::cfg::apply(&text, None)
-        };
+        let host_filter = |text: String| -> String { wren_lift::parse::cfg::apply(&text, None) };
         Box::new(move |name: &str, from: &str| -> Option<String> {
             // The VM passes the canonical name back here for
             // relative imports (resolver returned an absolute
@@ -897,7 +895,10 @@ fn generate_docs_from_hatch(bytes: &[u8], out_path: &std::path::Path) {
         let source = match std::str::from_utf8(&section.data) {
             Ok(s) => s,
             Err(_) => {
-                eprintln!("warning: skipping non-UTF-8 source section '{}'", section.name);
+                eprintln!(
+                    "warning: skipping non-UTF-8 source section '{}'",
+                    section.name
+                );
                 continue;
             }
         };
@@ -916,14 +917,9 @@ fn generate_docs_from_hatch(bytes: &[u8], out_path: &std::path::Path) {
 /// Parse a single source string, run the doc collector, and write
 /// `<out>/<name>.json`. Returns the collected `ModuleDoc` so the
 /// caller can also write the package-level manifest.
-fn emit_module(
-    name: &str,
-    source: &str,
-    out_path: &std::path::Path,
-) -> wren_lift::docs::ModuleDoc {
+fn emit_module(name: &str, source: &str, out_path: &std::path::Path) -> wren_lift::docs::ModuleDoc {
     let pr = wren_lift::parse::parser::parse(source);
-    let module =
-        wren_lift::docs::collect_module(name, source, &pr.module, &pr.docs, &pr.interner);
+    let module = wren_lift::docs::collect_module(name, source, &pr.module, &pr.docs, &pr.interner);
     let json = wren_lift::docs::render_module_json(&module);
     let json_path = out_path.join(format!("{}.json", name));
     if let Err(e) = fs::write(&json_path, json) {

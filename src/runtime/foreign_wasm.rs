@@ -55,8 +55,7 @@ pub enum ResolvedSymbol {
 /// install time, consulted by [`load_library`] /
 /// [`resolve_symbol`] at every foreign-class install.
 fn registry() -> &'static Mutex<HashMap<String, HashMap<String, ResolvedSymbol>>> {
-    static REG: OnceLock<Mutex<HashMap<String, HashMap<String, ResolvedSymbol>>>> =
-        OnceLock::new();
+    static REG: OnceLock<Mutex<HashMap<String, HashMap<String, ResolvedSymbol>>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -320,7 +319,10 @@ pub fn dispatch_dynamic(vm: &mut VM, idx: u32, args: &[Value]) -> Value {
     vm.api_stack.clear();
     vm.api_stack.extend_from_slice(args);
     #[cfg(target_arch = "wasm32")]
-    unsafe {
+    {
+        // wasm-bindgen-generated import: the JS host shim is safe
+        // by construction (it only validates and forwards), so no
+        // `unsafe` block needed.
         wlift_dispatch_dynamic_plugin(idx, vm_ptr);
     }
     #[cfg(not(target_arch = "wasm32"))]

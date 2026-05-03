@@ -94,14 +94,18 @@ class Toy {
         let pr = crate::parse::parser::parse(src);
         assert!(pr.errors.is_empty(), "parse errors: {:?}", pr.errors);
         let m = collect_module("toy", src, &pr.module, &pr.docs, &pr.interner);
-        let json = render_module_docs_json(&[m.clone()]).expect("encode");
+        let json = render_module_docs_json(std::slice::from_ref(&m)).expect("encode");
         let back = parse_module_docs_json(json.as_bytes()).expect("decode");
         assert_eq!(back.len(), 1);
         let r = &back[0];
         assert_eq!(r.name, "toy");
         assert_eq!(r.classes.len(), 1);
         assert_eq!(r.classes[0].name, "Toy");
-        let g = r.classes[0].members.iter().find(|mb| mb.name == "greet").unwrap();
+        let g = r.classes[0]
+            .members
+            .iter()
+            .find(|mb| mb.name == "greet")
+            .unwrap();
         assert_eq!(g.signature, "greet(who: String) → String");
         assert_eq!(g.return_type.as_deref(), Some("String"));
         assert!(!g.doc.is_empty());

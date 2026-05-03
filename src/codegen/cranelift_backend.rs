@@ -963,8 +963,8 @@ pub mod cl {
         //
         // Re-enable once the underlying init bug is found:
         //   `WLIFT_ENABLE_STACK_MAPS=1 ../../target/release/hatch run`
-        let mark_stack_map = f64_self_id.is_none()
-            && std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some();
+        let mark_stack_map =
+            f64_self_id.is_none() && std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some();
         let value_types = if mark_stack_map {
             infer_osr_value_types(mir)
         } else {
@@ -1702,8 +1702,7 @@ pub mod cl {
                 // the `wren_known_call_N_nocheck` helper, which
                 // pushes args into the JIT root set before
                 // dispatching.
-                let pure_leaf_enabled =
-                    std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some();
+                let pure_leaf_enabled = std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some();
                 if pure_leaf_enabled
                     && inline_getter_field.is_none()
                     && *pure_leaf

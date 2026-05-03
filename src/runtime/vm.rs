@@ -1666,7 +1666,9 @@ impl VM {
                 // built workspace — fall back to stripping the leading
                 // `./` / `../` segments and rewriting `/` → `.` to
                 // match `pack_bundled_native_libs`'s `relative.join(".")`.
-                if resolved.is_none() && (canonical.starts_with("./") || canonical.starts_with("../")) {
+                if resolved.is_none()
+                    && (canonical.starts_with("./") || canonical.starts_with("../"))
+                {
                     let stripped = canonical
                         .trim_start_matches("./")
                         .trim_start_matches("../")
@@ -1897,10 +1899,14 @@ impl VM {
                                     }
                                     unsafe {
                                         match resolved {
-                                            crate::runtime::foreign::ResolvedSymbol::Static(func) => {
+                                            crate::runtime::foreign::ResolvedSymbol::Static(
+                                                func,
+                                            ) => {
                                                 (*class_ptr).bind_foreign_c(bind_sym, func);
                                             }
-                                            crate::runtime::foreign::ResolvedSymbol::Dynamic(idx) => {
+                                            crate::runtime::foreign::ResolvedSymbol::Dynamic(
+                                                idx,
+                                            ) => {
                                                 (*class_ptr).bind_foreign_c_dynamic(bind_sym, idx);
                                             }
                                         }
@@ -2002,7 +2008,7 @@ impl VM {
             Err(e) => {
                 // Save the error fiber for post-mortem inspection before restoring
                 self.error_fiber = fiber;
-                let loc = self.extract_error_location(fiber);
+                let loc = unsafe { self.extract_error_location(fiber) };
                 self.report_runtime_error(&e, loc.as_ref(), fiber);
                 self.fiber = prev_fiber;
                 InterpretResult::RuntimeError
@@ -2013,7 +2019,15 @@ impl VM {
     }
 
     /// Extract source location from a fiber's current MIR frame for error reporting.
-    pub fn extract_error_location(
+    ///
+    /// # Safety
+    ///
+    /// `fiber` must point to a live `ObjFiber` whose `mir_frames` slice
+    /// is still valid (the GC mustn't have collected it). Callers
+    /// already uphold this invariant by passing the engine's current
+    /// fiber pointer; the function is `unsafe` only to satisfy the
+    /// pointer-deref lint.
+    pub unsafe fn extract_error_location(
         &self,
         fiber: *mut ObjFiber,
     ) -> Option<super::vm_interp::SourceLoc> {
@@ -2546,11 +2560,7 @@ impl VM {
     /// harness) get the rendered ariadne header in the same buffer
     /// as `System.print` output; the host CLI keeps its colourful
     /// stderr render.
-    pub(crate) fn report_diagnostic(
-        &self,
-        diag: &crate::diagnostics::Diagnostic,
-        source: &str,
-    ) {
+    pub(crate) fn report_diagnostic(&self, diag: &crate::diagnostics::Diagnostic, source: &str) {
         if self.config.error_fn.is_some() {
             self.report_error(&diag.render_to_string(source));
         } else {
@@ -5815,7 +5825,7 @@ System.print(B.make(99).val)
             !fiber.is_null(),
             "error_fiber should be saved on runtime error"
         );
-        let loc = vm.extract_error_location(fiber);
+        let loc = unsafe { vm.extract_error_location(fiber) };
         assert!(
             loc.is_some(),
             "extract_error_location should return Some for runtime error"

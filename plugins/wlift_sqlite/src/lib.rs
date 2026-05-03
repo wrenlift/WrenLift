@@ -505,11 +505,19 @@ pub unsafe extern "C" fn wlift_sqlite_in_transaction(vm: *mut VM) {
 #[cfg(target_arch = "wasm32")]
 pub fn register_static_symbols() {
     use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_open",              wlift_sqlite_open);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_close",             wlift_sqlite_close);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_execute",           wlift_sqlite_execute);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_query",             wlift_sqlite_query);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_last_insert_rowid", wlift_sqlite_last_insert_rowid);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_changes",           wlift_sqlite_changes);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_in_transaction",    wlift_sqlite_in_transaction);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_open", wlift_sqlite_open);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_close", wlift_sqlite_close);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_execute", wlift_sqlite_execute);
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_query", wlift_sqlite_query);
+    register_plugin_symbol_unsafe(
+        "wlift_sqlite",
+        "wlift_sqlite_last_insert_rowid",
+        wlift_sqlite_last_insert_rowid,
+    );
+    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_changes", wlift_sqlite_changes);
+    register_plugin_symbol_unsafe(
+        "wlift_sqlite",
+        "wlift_sqlite_in_transaction",
+        wlift_sqlite_in_transaction,
+    );
 }

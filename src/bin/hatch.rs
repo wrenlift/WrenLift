@@ -724,7 +724,6 @@ fn cmd_docs(target: &Path, out: Option<&Path>) {
     }
 }
 
-
 fn cmd_inspect(path: &Path) {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -1176,12 +1175,7 @@ fn cmd_publish(dir: &Path, git_override: Option<&str>) {
 /// publish flow against each. Per-package errors are logged and
 /// (by default) abort; `--keep-going` flips that to "log and
 /// continue, exit non-zero at the end if anything failed".
-fn cmd_publish_all(
-    root: &Path,
-    git_override: Option<&str>,
-    skip: Option<&str>,
-    keep_going: bool,
-) {
+fn cmd_publish_all(root: &Path, git_override: Option<&str>, skip: Option<&str>, keep_going: bool) {
     if !root.is_dir() {
         eprintln!("error: '{}' is not a directory", root.display());
         process::exit(1);
@@ -1250,7 +1244,9 @@ fn cmd_publish_all(
         {
             Some(m) => m.name,
             None => {
-                let dirname = ws.file_name().map(|s| s.to_string_lossy().to_string())
+                let dirname = ws
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| ws.display().to_string());
                 eprintln!("[skip] {}: cannot parse hatchfile", dirname);
                 skipped.push(dirname);
@@ -1295,7 +1291,9 @@ fn cmd_publish_all(
                 eprintln!("[fail] {}: {}", name_for_log, e);
                 failed.push((name_for_log, e.clone()));
                 if !keep_going {
-                    eprintln!("\nstopping at first failure (pass --keep-going to continue past errors)");
+                    eprintln!(
+                        "\nstopping at first failure (pass --keep-going to continue past errors)"
+                    );
                     break;
                 }
             }
@@ -1371,8 +1369,7 @@ fn publish_workspace(
         owner: None, // server sets from JWT
     };
 
-    wren_lift::hatch_service::publish_package(cfg, creds, &record)
-        .map_err(|e| format!("{}", e))?;
+    wren_lift::hatch_service::publish_package(cfg, creds, &record).map_err(|e| format!("{}", e))?;
     Ok(record)
 }
 
@@ -1428,8 +1425,8 @@ fn upload_workspace_readme(
     if !path.is_file() {
         return Ok(None);
     }
-    let markdown = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let markdown =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     if markdown.trim().is_empty() {
         return Ok(None);
     }
@@ -1451,9 +1448,8 @@ fn post_to_hatch_bot(
     body: &str,
     creds: &wren_lift::hatch_service::Credentials,
 ) -> Result<Option<String>, String> {
-    let bot_url = std::env::var("HATCH_BOT_URL").map_err(|_| {
-        "HATCH_BOT_URL not set — uploads require the bot endpoint".to_string()
-    })?;
+    let bot_url = std::env::var("HATCH_BOT_URL")
+        .map_err(|_| "HATCH_BOT_URL not set — uploads require the bot endpoint".to_string())?;
     // The existing GitHub Actions variable convention bakes
     // `/publish` onto the end of HATCH_BOT_URL — it predates
     // sibling routes. Strip the suffix so we resolve to the
@@ -1582,13 +1578,16 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
     // valve when a JIT regression surfaces; matches `wlift --mode
     // interpreter`. Other values (or unset) leave the tiered
     // default.
-    let mut config = wren_lift::runtime::vm::VMConfig::default();
-    config.step_limit = 0;
     // Long-running servers benefit from real frames in `Fiber.error`
-    // messages — without this `Fiber.stackTrace` returns a placeholder
-    // and a flaky route handler shows up in logs as a one-line
-    // "Object does not implement 'split(_)'" with no caller context.
-    config.fiber_stack_traces = true;
+    // messages — without `fiber_stack_traces` enabled,
+    // `Fiber.stackTrace` returns a placeholder and a flaky route
+    // handler shows up in logs as a one-line "Object does not
+    // implement 'split(_)'" with no caller context.
+    let mut config = wren_lift::runtime::vm::VMConfig {
+        step_limit: 0,
+        fiber_stack_traces: true,
+        ..Default::default()
+    };
     if std::env::var("WLIFT_MODE")
         .map(|m| m == "interpreter" || m == "interp")
         .unwrap_or(false)

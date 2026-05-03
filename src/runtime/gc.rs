@@ -479,7 +479,9 @@ impl Gc {
                             Method::Closure(ptr) | Method::Constructor(ptr) => {
                                 check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
                             }
-                            Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_) => {}
+                            Method::Native(_)
+                            | Method::ForeignC(_)
+                            | Method::ForeignCDynamic(_) => {}
                         }
                     }
                 }
@@ -1038,7 +1040,9 @@ impl Gc {
                             Method::Closure(ptr) | Method::Constructor(ptr) => {
                                 check_raw(*ptr as *const u8, &format!("class.method[{}]", i));
                             }
-                            Method::Native(_) | Method::ForeignC(_) | Method::ForeignCDynamic(_) => {}
+                            Method::Native(_)
+                            | Method::ForeignC(_)
+                            | Method::ForeignCDynamic(_) => {}
                         }
                     }
                 }

@@ -1986,8 +1986,7 @@ fn dispatch_method(
         Method::ForeignCDynamic(idx) => {
             vm.engine
                 .note_runtime_call_stats(|s| s.dispatch_method_native += 1);
-            let result =
-                crate::runtime::foreign::dispatch_dynamic(vm, idx, args).to_bits();
+            let result = crate::runtime::foreign::dispatch_dynamic(vm, idx, args).to_bits();
             if let Some(action) = vm.pending_fiber_action.take() {
                 return handle_jit_fiber_action(vm, action);
             }
@@ -2567,8 +2566,7 @@ fn wren_known_call_inner(packed: u64, args: &[Value]) -> u64 {
             if depth < MAX_JIT_DEPTH {
                 set_jit_depth(depth + 1);
                 let collected = load_args();
-                let result =
-                    unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
+                let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
                 set_jit_depth(depth);
                 set_jit_context(saved_ctx);
                 return result;
@@ -2635,8 +2633,7 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
                 if depth < MAX_JIT_DEPTH {
                     set_jit_depth(depth + 1);
                     let collected = load_args();
-                    let result =
-                        unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
+                    let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
                     set_jit_depth(depth);
                     return result;
                 }
@@ -2652,8 +2649,7 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
                 if depth < MAX_JIT_DEPTH {
                     set_jit_depth(depth + 1);
                     let collected = load_args();
-                    let result =
-                        unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
+                    let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
                     set_jit_depth(depth);
                     mutate_jit_ctx(|ctx| {
                         ctx.current_func_id = saved_func_id;
@@ -2797,62 +2793,121 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     // GC-forwarded values, not the stale `args` slice we were
     // handed by the JIT'd caller.
     let collect_args = || -> smallvec::SmallVec<[Value; 5]> {
-        (0..args.len()).map(|i| jit_root_at(root_base + i)).collect()
+        (0..args.len())
+            .map(|i| jit_root_at(root_base + i))
+            .collect()
     };
     let result = (|| {
-    if jit_ptr.is_null() {
-        // The JIT'd call site reached us with an unbound IC. This
-        // shouldn't happen if the codegen pre-checks `ic.class ==
-        // recv.class` before dispatching, but a previous call into
-        // this IC may have cleared it (e.g. live==null branch
-        // below) and the codegen doesn't always re-read the class
-        // word between callsites. Returning `Value::null()` here
-        // would silently corrupt the JIT'd caller's stack — so
-        // route through the cached closure if one's still around,
-        // or abort the fiber with a clear message rather than
-        // letting the caller crash on a null receiver downstream.
-        let closure = ic.closure as *mut ObjClosure;
-        if !closure.is_null() {
-            if let Some(vm) = unsafe { vm_ref() } {
-                return call_closure_jit_or_sync(vm, closure, &collect_args(), None);
+        if jit_ptr.is_null() {
+            // The JIT'd call site reached us with an unbound IC. This
+            // shouldn't happen if the codegen pre-checks `ic.class ==
+            // recv.class` before dispatching, but a previous call into
+            // this IC may have cleared it (e.g. live==null branch
+            // below) and the codegen doesn't always re-read the class
+            // word between callsites. Returning `Value::null()` here
+            // would silently corrupt the JIT'd caller's stack — so
+            // route through the cached closure if one's still around,
+            // or abort the fiber with a clear message rather than
+            // letting the caller crash on a null receiver downstream.
+            let closure = ic.closure as *mut ObjClosure;
+            if !closure.is_null() {
+                if let Some(vm) = unsafe { vm_ref() } {
+                    return call_closure_jit_or_sync(vm, closure, &collect_args(), None);
+                }
             }
-        }
-        // No usable dispatch info — surface to stderr so the
-        // failure is at least visible. (`runtime_error` lives on
-        // VM but isn't reachable from this calling convention
-        // without re-borrowing.) Returning null here is the same
-        // behaviour as before this block; the closure-fallback
-        // above covers the common eviction case.
-        eprintln!(
-            "wren_ic_call: empty IC (kind={}, class=0x{:x}) — call site \
+            // No usable dispatch info — surface to stderr so the
+            // failure is at least visible. (`runtime_error` lives on
+            // VM but isn't reachable from this calling convention
+            // without re-borrowing.) Returning null here is the same
+            // behaviour as before this block; the closure-fallback
+            // above covers the common eviction case.
+            eprintln!(
+                "wren_ic_call: empty IC (kind={}, class=0x{:x}) — call site \
              lost dispatch info between codegen and runtime",
-            ic.kind, ic.class
-        );
-        return Value::null().to_bits();
-    }
-    // Leaf (kind=1) fast path: `is_mir_inline_safe` guarantees the callee
-    // makes no outbound calls, touches no upvalues and never reads
-    // current_func_id / closure / defining_class. The caller's ctx.vm /
-    // module_vars / jit_code_base are already correct, so we can skip the
-    // full save/restore and jit_depth bump — for tight dispatch loops this
-    // removes ~6 TLS roundtrips and a 48-byte copy per call.
-    //
-    // Revalidate `jit_ptr` against the live `engine.jit_code` slot
-    // before the transmute — a tier-up since this IC was installed
-    // may have freed / relocated the code blob, and reading the
-    // stale pointer PAC-faults on arm64.
-    //
-    // On a refresh hit (live exists but moved), update the IC's
-    // pointer in-place and call the new address — the IC's other
-    // fields (class, func_id, kind) are still valid because it's
-    // the same function, just relocated. Returning `Value::null()`
-    // here would be incorrect: the JIT'd caller has no way to tell
-    // a sentinel "miss" from a real null return, so it'd treat the
-    // sentinel as the call's result. That's the
-    // `Object does not implement 'split(_)'` flake we hit during
-    // navigation: a route handler called `path.split("/")`, the IC
-    // was stale, and the bogus `null` propagated as the receiver.
-    if ic.kind == 1 {
+                ic.kind, ic.class
+            );
+            return Value::null().to_bits();
+        }
+        // Leaf (kind=1) fast path: `is_mir_inline_safe` guarantees the callee
+        // makes no outbound calls, touches no upvalues and never reads
+        // current_func_id / closure / defining_class. The caller's ctx.vm /
+        // module_vars / jit_code_base are already correct, so we can skip the
+        // full save/restore and jit_depth bump — for tight dispatch loops this
+        // removes ~6 TLS roundtrips and a 48-byte copy per call.
+        //
+        // Revalidate `jit_ptr` against the live `engine.jit_code` slot
+        // before the transmute — a tier-up since this IC was installed
+        // may have freed / relocated the code blob, and reading the
+        // stale pointer PAC-faults on arm64.
+        //
+        // On a refresh hit (live exists but moved), update the IC's
+        // pointer in-place and call the new address — the IC's other
+        // fields (class, func_id, kind) are still valid because it's
+        // the same function, just relocated. Returning `Value::null()`
+        // here would be incorrect: the JIT'd caller has no way to tell
+        // a sentinel "miss" from a real null return, so it'd treat the
+        // sentinel as the call's result. That's the
+        // `Object does not implement 'split(_)'` flake we hit during
+        // navigation: a route handler called `path.split("/")`, the IC
+        // was stale, and the bogus `null` propagated as the receiver.
+        if ic.kind == 1 {
+            let mut call_ptr = jit_ptr;
+            let mut closure_for_fallback: *mut ObjClosure = std::ptr::null_mut();
+            if let Some(vm) = unsafe { vm_ref() } {
+                let live = vm
+                    .engine
+                    .jit_code
+                    .get(ic.func_id as usize)
+                    .copied()
+                    .unwrap_or(std::ptr::null());
+                if live.is_null() {
+                    // Function genuinely lost its JIT code (eviction or
+                    // interpreter-mode run). The kind=1 IC still has the
+                    // closure pointer, so dispatch through
+                    // `call_closure_jit_or_sync` — that's the canonical
+                    // path that picks the right backend (re-JIT if
+                    // re-tiered, bytecode interpret otherwise). Clear
+                    // the kind=1 entry first so subsequent visits go
+                    // through the slow path on the JIT side too. We
+                    // reset the closure_for_fallback pointer outside the
+                    // borrow so we don't double-borrow `vm` on the call.
+                    closure_for_fallback = ic.closure as *mut ObjClosure;
+                    unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
+                } else if live != jit_ptr {
+                    unsafe { (*ic_ptr).jit_ptr = live };
+                    call_ptr = live;
+                }
+            }
+            if !closure_for_fallback.is_null() {
+                // Outside the `if let Some(vm)` borrow above so we can
+                // call `call_closure_jit_or_sync`, which itself takes
+                // `&mut vm`. Re-fetch the VM here.
+                if let Some(vm) = unsafe { vm_ref() } {
+                    return call_closure_jit_or_sync(
+                        vm,
+                        closure_for_fallback,
+                        &collect_args(),
+                        None,
+                    );
+                }
+                return Value::null().to_bits();
+            }
+            return unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
+        }
+        // Same revalidation as the kind=1 fast path — kind != 1 was
+        // also using the cached `jit_ptr` without re-checking it
+        // against `engine.jit_code`, so a tier-up after IC install
+        // could relocate the code blob and the cached pointer would
+        // PAC-fault on dereference (or worse, point at unrelated
+        // bytes and produce silent miscompiles surfacing as
+        // null-leaks downstream — the "instance of Object" /
+        // "Right operand must be a string" flakes during navigation).
+        //
+        // On `live == null` (function lost its JIT code entirely)
+        // dispatch through `call_closure_jit_or_sync` with the
+        // cached closure — same closure-fallback shape kind=1 uses.
+        // On `live != jit_ptr` refresh the IC and call the new
+        // address.
         let mut call_ptr = jit_ptr;
         let mut closure_for_fallback: *mut ObjClosure = std::ptr::null_mut();
         if let Some(vm) = unsafe { vm_ref() } {
@@ -2863,16 +2918,6 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
                 .copied()
                 .unwrap_or(std::ptr::null());
             if live.is_null() {
-                // Function genuinely lost its JIT code (eviction or
-                // interpreter-mode run). The kind=1 IC still has the
-                // closure pointer, so dispatch through
-                // `call_closure_jit_or_sync` — that's the canonical
-                // path that picks the right backend (re-JIT if
-                // re-tiered, bytecode interpret otherwise). Clear
-                // the kind=1 entry first so subsequent visits go
-                // through the slow path on the JIT side too. We
-                // reset the closure_for_fallback pointer outside the
-                // borrow so we don't double-borrow `vm` on the call.
                 closure_for_fallback = ic.closure as *mut ObjClosure;
                 unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
             } else if live != jit_ptr {
@@ -2881,70 +2926,23 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
             }
         }
         if !closure_for_fallback.is_null() {
-            // Outside the `if let Some(vm)` borrow above so we can
-            // call `call_closure_jit_or_sync`, which itself takes
-            // `&mut vm`. Re-fetch the VM here.
             if let Some(vm) = unsafe { vm_ref() } {
-                return call_closure_jit_or_sync(
-                    vm,
-                    closure_for_fallback,
-                    &collect_args(),
-                    None,
-                );
+                return call_closure_jit_or_sync(vm, closure_for_fallback, &collect_args(), None);
             }
             return Value::null().to_bits();
         }
-        return unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
-    }
-    // Same revalidation as the kind=1 fast path — kind != 1 was
-    // also using the cached `jit_ptr` without re-checking it
-    // against `engine.jit_code`, so a tier-up after IC install
-    // could relocate the code blob and the cached pointer would
-    // PAC-fault on dereference (or worse, point at unrelated
-    // bytes and produce silent miscompiles surfacing as
-    // null-leaks downstream — the "instance of Object" /
-    // "Right operand must be a string" flakes during navigation).
-    //
-    // On `live == null` (function lost its JIT code entirely)
-    // dispatch through `call_closure_jit_or_sync` with the
-    // cached closure — same closure-fallback shape kind=1 uses.
-    // On `live != jit_ptr` refresh the IC and call the new
-    // address.
-    let mut call_ptr = jit_ptr;
-    let mut closure_for_fallback: *mut ObjClosure = std::ptr::null_mut();
-    if let Some(vm) = unsafe { vm_ref() } {
-        let live = vm
-            .engine
-            .jit_code
-            .get(ic.func_id as usize)
-            .copied()
-            .unwrap_or(std::ptr::null());
-        if live.is_null() {
-            closure_for_fallback = ic.closure as *mut ObjClosure;
-            unsafe { *ic_ptr = crate::mir::bytecode::CallSiteIC::default() };
-        } else if live != jit_ptr {
-            unsafe { (*ic_ptr).jit_ptr = live };
-            call_ptr = live;
-        }
-    }
-    if !closure_for_fallback.is_null() {
-        if let Some(vm) = unsafe { vm_ref() } {
-            return call_closure_jit_or_sync(vm, closure_for_fallback, &collect_args(), None);
-        }
-        return Value::null().to_bits();
-    }
-    // Save and set context for the callee.
-    let saved_ctx = read_jit_ctx();
-    mutate_jit_ctx(|ctx| {
-        ctx.current_func_id = ic.func_id;
-        ctx.closure = ic.closure as *mut u8;
-    });
-    let depth = jit_depth();
-    set_jit_depth(depth + 1);
-    let result = unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
-    set_jit_depth(depth);
-    set_jit_context(saved_ctx);
-    result
+        // Save and set context for the callee.
+        let saved_ctx = read_jit_ctx();
+        mutate_jit_ctx(|ctx| {
+            ctx.current_func_id = ic.func_id;
+            ctx.closure = ic.closure as *mut u8;
+        });
+        let depth = jit_depth();
+        set_jit_depth(depth + 1);
+        let result = unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
+        set_jit_depth(depth);
+        set_jit_context(saved_ctx);
+        result
     })();
     jit_roots_restore_len(root_base);
     result

@@ -281,9 +281,7 @@ pub fn lex(
             // Order matters: check the four-character `////` case
             // first so we don't classify a horizontal-rule comment
             // (e.g. `////////////`) as a doc comment.
-            let kind = if pos + 3 < source.len()
-                && bytes[pos + 2] == b'/'
-                && bytes[pos + 3] != b'/'
+            let kind = if pos + 3 < source.len() && bytes[pos + 2] == b'/' && bytes[pos + 3] != b'/'
             {
                 Some(DocKind::Decl)
             } else if pos + 2 < source.len() && bytes[pos + 2] == b'!' {
@@ -300,12 +298,10 @@ pub fn lex(
             };
             // `///` and `//!` consume three marker chars; bare `//`
             // (whether code-comment or promoted-module-doc) only two.
-            let marker_len = if pos + 3 < source.len()
-                && bytes[pos + 2] == b'/'
-                && bytes[pos + 3] != b'/'
-            {
-                3
-            } else if pos + 2 < source.len() && bytes[pos + 2] == b'!' {
+            let is_triple_slash =
+                pos + 3 < source.len() && bytes[pos + 2] == b'/' && bytes[pos + 3] != b'/';
+            let is_module_doc = pos + 2 < source.len() && bytes[pos + 2] == b'!';
+            let marker_len = if is_triple_slash || is_module_doc {
                 3
             } else {
                 2

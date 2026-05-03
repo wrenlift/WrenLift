@@ -381,10 +381,7 @@ fn op_call(state: &mut ThreadedState, op: &ThreadedOp) -> usize {
             let ic = &ic_table[ic_idx];
             (ic.kind, ic.class, ic.func_id, ic.jit_ptr)
         };
-        if ic_kind == 1
-            && recv.is_object()
-            && crate::codegen::runtime_fns::ic_jit_kind1_enabled()
-        {
+        if ic_kind == 1 && recv.is_object() && crate::codegen::runtime_fns::ic_jit_kind1_enabled() {
             let obj_ptr = unsafe { recv.as_object().unwrap_unchecked() };
             let recv_class =
                 unsafe { (*(obj_ptr as *const crate::runtime::object::ObjHeader)).class as usize };

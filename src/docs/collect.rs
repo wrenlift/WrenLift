@@ -94,7 +94,9 @@ fn collect_class(
 
     let mut members = Vec::with_capacity(class.methods.len());
     for spanned in &class.methods {
-        members.push(collect_member(&spanned.0, &spanned.1, source, docs, interner));
+        members.push(collect_member(
+            &spanned.0, &spanned.1, source, docs, interner,
+        ));
     }
 
     ClassDoc {
@@ -239,11 +241,11 @@ fn parse_one_param(rest: &str) -> Option<crate::docs::ParamTypeInfo> {
     // Description: everything past the name, after stripping
     // leading punctuation (`—`, `-`, `:`).
     let tail = after[name_end..]
-        .trim_start_matches(|c: char| c == ']' || c == '=' || c.is_ascii_alphanumeric() || c == '"' || c == '_')
+        .trim_start_matches(|c: char| {
+            c == ']' || c == '=' || c.is_ascii_alphanumeric() || c == '"' || c == '_'
+        })
         .trim();
-    let tail = tail
-        .trim_start_matches(|c: char| c == '—' || c == '-' || c == ':')
-        .trim();
+    let tail = tail.trim_start_matches(['—', '-', ':']).trim();
     let description = if tail.is_empty() {
         None
     } else {
@@ -268,11 +270,7 @@ fn parse_returns(rest: &str) -> Option<String> {
     }
 }
 
-fn signature_text(
-    sig: &MethodSig,
-    is_static: bool,
-    interner: &Interner,
-) -> (String, String) {
+fn signature_text(sig: &MethodSig, is_static: bool, interner: &Interner) -> (String, String) {
     let prefix = if is_static { "static " } else { "" };
     match sig {
         MethodSig::Named { name, params } => {
@@ -526,7 +524,10 @@ fn resolve_one(text: &str, symbols: &SymbolTable) -> RefTarget {
         //   `@hatch:foo Symbol`    — symbol inside package
         let mut parts = rest.splitn(2, char::is_whitespace);
         let package = parts.next().unwrap_or("").to_string();
-        let symbol = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let symbol = parts
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if !package.is_empty() {
             return RefTarget::External { package, symbol };
         }
@@ -641,7 +642,8 @@ mod tests {
         // `class X {}` has no `///` of its own. Hovering on `X`
         // used to show a bare `class X` line; the fallback now
         // surfaces the module description.
-        let src = "//! Cooperative coroutines.\n//! Build with `Fiber.new {...}`.\n\nclass Fiber {}\n";
+        let src =
+            "//! Cooperative coroutines.\n//! Build with `Fiber.new {...}`.\n\nclass Fiber {}\n";
         let doc = collect(src);
         assert_eq!(doc.classes.len(), 1);
         assert_eq!(doc.classes[0].name, "Fiber");
@@ -653,8 +655,7 @@ mod tests {
     fn class_doc_wins_over_module_doc_when_both_present() {
         // When the author wrote both a `//!` block and a `///`
         // block, the `///` is more specific — keep it.
-        let src =
-            "//! Module-level prose.\n\n/// Class-level prose.\nclass Foo {}\n";
+        let src = "//! Module-level prose.\n\n/// Class-level prose.\nclass Foo {}\n";
         let doc = collect(src);
         assert_eq!(doc.classes[0].doc, "Class-level prose.");
         assert_eq!(doc.doc, "Module-level prose.");
@@ -694,7 +695,10 @@ mod tests {
     fn blank_line_breaks_association() {
         let src = "/// orphaned doc.\n\nclass Foo {}\n";
         let doc = collect(src);
-        assert!(doc.classes[0].doc.is_empty(), "blank line should detach the doc");
+        assert!(
+            doc.classes[0].doc.is_empty(),
+            "blank line should detach the doc"
+        );
     }
 
     #[test]

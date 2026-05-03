@@ -24,7 +24,7 @@
 //!
 //! * `#!wasm`   — keep only when bundle target is `wasm32-*`.
 //! * `#!native` — keep only when bundle target is anything else
-//!                 (host build, no `--bundle-target` flag).
+//!   (host build, no `--bundle-target` flag).
 //!
 //! Adding new ones (`#!macos`, `#!arm64`, ...) is a matter of
 //! extending [`AttrKind`]; the rest of the pipeline composes.

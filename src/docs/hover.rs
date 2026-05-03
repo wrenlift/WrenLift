@@ -134,8 +134,7 @@ impl Analysis {
                 if direct.is_known() {
                     direct
                 } else {
-                    self.local_var_type(byte, *sym)
-                        .unwrap_or(InferredType::Any)
+                    self.local_var_type(byte, *sym).unwrap_or(InferredType::Any)
                 }
             }
             _ => self.type_env.get_expr_type(recv.1.start).clone(),
@@ -277,7 +276,9 @@ fn walk_stmt_for_var_decl(
     out: &mut Option<usize>,
 ) {
     match &stmt.0 {
-        Stmt::Var { name, initializer, .. } => {
+        Stmt::Var {
+            name, initializer, ..
+        } => {
             // Var must be declared *before* the cursor and at
             // module level (or in an enclosing block — which
             // walk_stmt_for_var_decl handles by recursing into
@@ -355,7 +356,10 @@ fn walk_expr_for_var_decl(
             walk_stmt_for_var_decl(body, byte, sym, out);
         }
         Expr::Call {
-            receiver, args, block_arg, ..
+            receiver,
+            args,
+            block_arg,
+            ..
         } => {
             if let Some(r) = receiver {
                 walk_expr_for_var_decl(r, byte, sym, out);
@@ -529,9 +533,7 @@ fn walk_stmt_for_call<'a>(
                 walk_stmt_for_call(body, byte, out);
             }
         }
-        Stmt::For {
-            iterator, body, ..
-        } => {
+        Stmt::For { iterator, body, .. } => {
             walk_expr_for_call(iterator, byte, out);
             if out.is_none() {
                 walk_stmt_for_call(body, byte, out);
@@ -826,14 +828,26 @@ pub fn identifier_kind_hint(
         return None;
     }
     if ident.starts_with("__") {
-        let sig = field_signature("static field", ident, ident.trim_start_matches('_'), byte, analysis);
+        let sig = field_signature(
+            "static field",
+            ident,
+            ident.trim_start_matches('_'),
+            byte,
+            analysis,
+        );
         return Some((sig, String::new()));
     }
     if ident.starts_with('_') {
-        let sig = field_signature("instance field", ident, ident.trim_start_matches('_'), byte, analysis);
+        let sig = field_signature(
+            "instance field",
+            ident,
+            ident.trim_start_matches('_'),
+            byte,
+            analysis,
+        );
         return Some((sig, String::new()));
     }
-    if ident.chars().next().map_or(false, |c| c.is_ascii_uppercase()) {
+    if ident.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
         // Class-shaped name we couldn't match against any class
         // in the local module, dep_docs, or the prelude. Tailor
         // the body to whether the source actually imports it:
@@ -937,7 +951,7 @@ pub fn infer_rhs_type(rhs: &str, prelude: &[ModuleDoc]) -> Option<String> {
         '[' => return Some("List".into()),
         '{' => return Some("Map".into()),
         '0'..='9' => return Some("Num".into()),
-        '-' if r.chars().nth(1).map_or(false, |c| c.is_ascii_digit()) => {
+        '-' if r.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) => {
             return Some("Num".into());
         }
         _ => {}
@@ -1086,11 +1100,7 @@ pub fn find_var_decl_line(source: &str, ident: &str, byte: usize) -> Option<(usi
         if !line_matches_var_decl(line, ident) {
             continue;
         }
-        let line_start = source
-            .lines()
-            .take(idx)
-            .map(|l| l.len() + 1)
-            .sum::<usize>();
+        let line_start = source.lines().take(idx).map(|l| l.len() + 1).sum::<usize>();
         if line_start < scope_start || line_start >= scope_end {
             continue;
         }
@@ -1113,10 +1123,7 @@ fn line_matches_var_decl(line: &str, ident: &str) -> bool {
         return false;
     }
     let tail = &after[ident.len()..];
-    tail.is_empty()
-        || tail.starts_with('=')
-        || tail.starts_with(',')
-        || tail.starts_with(' ')
+    tail.is_empty() || tail.starts_with('=') || tail.starts_with(',') || tail.starts_with(' ')
 }
 
 fn enclosing_block_range(source: &str, byte: usize) -> Option<Range<usize>> {
@@ -1194,11 +1201,7 @@ fn mask_strings_and_comments(source: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| source.to_string())
 }
 
-fn find_for_binding(
-    source: &str,
-    ident: &str,
-    scope_start: usize,
-) -> Option<(usize, String)> {
+fn find_for_binding(source: &str, ident: &str, scope_start: usize) -> Option<(usize, String)> {
     if scope_start == 0 {
         return None;
     }
@@ -1220,8 +1223,7 @@ fn find_for_binding(
         Some(s) => s.trim_start(),
         None => return None,
     };
-    if after_paren.starts_with(ident) {
-        let tail = &after_paren[ident.len()..];
+    if let Some(tail) = after_paren.strip_prefix(ident) {
         if tail.starts_with(' ') || tail.starts_with('\t') || tail.starts_with("in") {
             let line_no = source[..line_start].matches('\n').count() + 1;
             return Some((line_no, line.to_string()));
@@ -1278,9 +1280,27 @@ mod tests {
         // intentionally — drift between this test and the lexer
         // is the signal the keyword-guard is broken.
         let keywords = [
-            "as", "break", "class", "construct", "continue", "else", "false", "for", "foreign",
-            "if", "import", "in", "is", "null", "return", "static", "super", "this", "true",
-            "var", "while",
+            "as",
+            "break",
+            "class",
+            "construct",
+            "continue",
+            "else",
+            "false",
+            "for",
+            "foreign",
+            "if",
+            "import",
+            "in",
+            "is",
+            "null",
+            "return",
+            "static",
+            "super",
+            "this",
+            "true",
+            "var",
+            "while",
         ];
         for kw in keywords {
             assert!(is_keyword(kw), "expected `{kw}` to be a keyword");
@@ -1416,7 +1436,9 @@ class Slicer {
 "#;
         let a = Analysis::run(src).expect("parse + sema");
         let cursor = src.find("quad = _quad").unwrap() + 1;
-        let ty = a.local_var_type_by_name(cursor, "quad").expect("local typed");
+        let ty = a
+            .local_var_type_by_name(cursor, "quad")
+            .expect("local typed");
         assert_eq!(
             inferred_to_class_name(&ty, &a.interner).as_deref(),
             Some("Sprite")
@@ -1471,7 +1493,6 @@ class Slicer {
 
 #[cfg(test)]
 mod gpu_smoke {
-    use super::Analysis;
     #[test]
     #[ignore]
     fn parses_published_gpu_source() {
@@ -1503,9 +1524,17 @@ mod gpu_bundle_smoke {
     fn camera2d_in_collected_module_doc() {
         let src = std::fs::read_to_string("hatch/packages/hatch-gpu/gpu_web.wren").unwrap();
         let pr = crate::parse::parser::parse(&src);
-        assert!(pr.errors.is_empty(), "gpu_web.wren has parse errors: {}", pr.errors.len());
+        assert!(
+            pr.errors.is_empty(),
+            "gpu_web.wren has parse errors: {}",
+            pr.errors.len()
+        );
         let m = crate::docs::collect::collect_module(
-            "gpu_web", &src, &pr.module, &pr.docs, &pr.interner,
+            "gpu_web",
+            &src,
+            &pr.module,
+            &pr.docs,
+            &pr.interner,
         );
         let class_names: Vec<&str> = m.classes.iter().map(|c| c.name.as_str()).collect();
         eprintln!("collected classes: {:?}", class_names);
@@ -1535,9 +1564,8 @@ mod gpu_bundle_smoke {
             eprintln!("parse err: {:?}", e);
         }
         assert!(pr.errors.is_empty(), "{} parse errors", pr.errors.len());
-        let m = crate::docs::collect::collect_module(
-            "game", &src, &pr.module, &pr.docs, &pr.interner,
-        );
+        let m =
+            crate::docs::collect::collect_module("game", &src, &pr.module, &pr.docs, &pr.interner);
         let input = m
             .classes
             .iter()

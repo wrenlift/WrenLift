@@ -56,13 +56,7 @@ unsafe fn prepare(db: *mut ffi::sqlite3, sql: &str) -> Result<*mut ffi::sqlite3_
     let cs = CString::new(sql).map_err(|_| "sql contains an interior NUL byte".to_string())?;
     let mut stmt: *mut ffi::sqlite3_stmt = ptr::null_mut();
     let rc = unsafe {
-        ffi::sqlite3_prepare_v2(
-            db,
-            cs.as_ptr(),
-            -1,
-            &mut stmt as *mut _,
-            ptr::null_mut(),
-        )
+        ffi::sqlite3_prepare_v2(db, cs.as_ptr(), -1, &mut stmt as *mut _, ptr::null_mut())
     };
     if rc != ffi::SQLITE_OK {
         return Err(format!("prepare: {}", unsafe { err_msg(db) }));
@@ -78,11 +72,7 @@ fn sqlite_transient() -> ffi::sqlite3_destructor_type {
     Some(unsafe { std::mem::transmute::<isize, unsafe extern "C" fn(*mut c_void)>(-1) })
 }
 
-unsafe fn bind_one(
-    stmt: *mut ffi::sqlite3_stmt,
-    idx: c_int,
-    v: &SqlValue,
-) -> Result<(), String> {
+unsafe fn bind_one(stmt: *mut ffi::sqlite3_stmt, idx: c_int, v: &SqlValue) -> Result<(), String> {
     let rc = match v {
         SqlValue::Null => unsafe { ffi::sqlite3_bind_null(stmt, idx) },
         SqlValue::Integer(i) => unsafe { ffi::sqlite3_bind_int64(stmt, idx, *i) },

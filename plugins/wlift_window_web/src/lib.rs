@@ -222,8 +222,8 @@ pub unsafe extern "C" fn wlift_window_create(vm: *mut c_void) {
         // browser's CSS owns size; we don't override width/height.
         unsafe { wlift_dom_attach_canvas(id.as_ptr(), id.len() as i32) }
     } else {
-        let parent = unsafe { map_string_into(vm, 1, "parent", &mut parent_buf) }
-            .unwrap_or(b"stage");
+        let parent =
+            unsafe { map_string_into(vm, 1, "parent", &mut parent_buf) }.unwrap_or(b"stage");
         let width = unsafe { map_num(vm, 1, "width", 800.0) } as u32;
         let height = unsafe { map_num(vm, 1, "height", 600.0) } as u32;
         let _resizable = unsafe { map_bool(vm, 1, "resizable", true) };
