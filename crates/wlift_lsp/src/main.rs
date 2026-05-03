@@ -1,13 +1,13 @@
 //! `wlift-lsp` — Language Server for Wren / WrenLift / Hatch.
 //!
-//! v0: diagnostic-only. Server reads stdin, accepts open / change /
-//! save / close notifications, re-parses on every edit, and pushes
-//! parse + lex errors back to the editor as LSP diagnostics.
+//! Server reads stdin, accepts open / change / save / close
+//! notifications, re-parses on every edit, and pushes parse +
+//! sema diagnostics back to the editor. Beyond diagnostics the
+//! handlers cover hover, goto-definition, member completion,
+//! and run-action codelenses on `main.wren` / `*.spec.wren`.
 //!
-//! Hover / goto-def / completion / rename land in later phases per
-//! the [LSP plan](../../../docs/lsp-plan.md). The JSON doc model
-//! from `wren_lift::docs` is the same model the hover handler will
-//! consume — no second source of truth.
+//! The JSON doc model from `wren_lift::docs` is the same model
+//! the hover handler consumes — no second source of truth.
 
 use std::path::PathBuf;
 use std::sync::RwLock;

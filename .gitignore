@@ -18,3 +18,8 @@ site/install.sh
 
 # Local-only state from /loop's wakeup scheduler — never tracked.
 .claude/
+
+# Plans are internal working docs, not part of the public surface.
+# Roadmap stays — that one's public. Specific plan files live on
+# disk for reference but never get committed.
+docs/*-plan.md
