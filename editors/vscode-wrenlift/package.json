@@ -2,7 +2,7 @@
   "name": "vscode-wrenlift",
   "displayName": "WrenLift",
   "description": "Wren language support powered by WrenLift — syntax highlighting, diagnostics, hover, goto-definition, and member completion via the wlift-lsp language server, plus an inline ▶︎ Run codelens for main.wren and *.spec.wren.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "Wrenlift",
   "license": "MIT",
   "icon": "icons/wrenlift-icon.png",

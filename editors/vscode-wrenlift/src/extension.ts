@@ -858,9 +858,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand(
       "wrenlift.runSpecCase",
       async (node: SpecNode | undefined) => {
-        // V1 dispatches the whole-file run. Per-case filtering is
-        // a follow-up that needs `@hatch:test` filter support; the
-        // tree node is already wired so the upgrade is local.
         const target = node?.uri ?? vscode.window.activeTextEditor?.document.uri;
         if (!target) {
           vscode.window.showWarningMessage(
@@ -868,10 +865,60 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
           return;
         }
-        await vscode.commands.executeCommand(
-          "wrenlift.runFile",
-          target.toString(),
+        const filePath = target.fsPath;
+        const fileName = filePath.split(/[\\/]/).pop() || "";
+        if (!fileName.endsWith(".spec.wren")) {
+          // Fall back to the whole-file runner when the user
+          // triggered this against something that isn't a spec
+          // (active editor focus drift, command-palette
+          // invocation outside the sidebar).
+          await vscode.commands.executeCommand(
+            "wrenlift.runFile",
+            target.toString(),
+          );
+          return;
+        }
+
+        // Build the `<group> > <name>` filter from the tree
+        // node. File / group nodes pass an empty filter when
+        // there's no nesting context — `hatch test --filter ""`
+        // is a no-op (matches everything) so falling back to
+        // the whole-file shape is fine. `case` nodes always
+        // have a fully-qualified label.
+        const filter =
+          node?.kind === "case"
+            ? node.group
+              ? `${node.group} > ${node.label}`
+              : node.label
+            : node?.kind === "group"
+              ? node.label
+              : "";
+
+        const cfg = vscode.workspace.getConfiguration("wrenlift");
+        const hatchCmd = resolveBinary("hatch", cfg.get<string>("hatchPath"), "hatch");
+
+        const TERM_NAME = "WrenLift Run";
+        let terminal = vscode.window.terminals.find(
+          (t) => t.name === TERM_NAME,
         );
+        if (!terminal) {
+          terminal = vscode.window.createTerminal(TERM_NAME);
+        }
+        terminal.show(true);
+        // `hatch test <spec>` accepts a single *.spec.wren
+        // file and writes a per-spec runner that prepends the
+        // `Test.filter = ...` setter ahead of the spec source —
+        // shared module, ordered before the spec's trailing
+        // `Test.run()` so only the matching case actually runs.
+        if (filter) {
+          terminal.sendText(
+            `${quoteShell(hatchCmd)} test ${quoteShell(filePath)} --filter ${quoteShell(filter)}`,
+          );
+        } else {
+          terminal.sendText(
+            `${quoteShell(hatchCmd)} test ${quoteShell(filePath)}`,
+          );
+        }
       },
     ),
     vscode.commands.registerCommand(

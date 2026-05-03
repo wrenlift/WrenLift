@@ -49,6 +49,8 @@ enum Command {
     },
     /// Run every *.spec.wren in the workspace and aggregate results.
     ///
+    /// Target may be either a directory (walks every
+    /// `*.spec.wren` under it) or a single `*.spec.wren` file.
     /// `--filter` is a substring matched against each case's
     /// `<group> > <name>` label; only matching cases run.
     /// `--json` flips `@hatch:test` into JSON-Lines reporter mode
@@ -56,8 +58,9 @@ enum Command {
     /// Both flags work together — the editor's spec runner uses
     /// both at once to drive the per-row ▶ Run button.
     Test {
-        /// Workspace root. Defaults to the current directory.
-        #[arg(value_name = "DIR", default_value = ".")]
+        /// Workspace root or a single `*.spec.wren` file.
+        /// Defaults to the current directory.
+        #[arg(value_name = "PATH", default_value = ".")]
         dir: PathBuf,
         /// Substring filter matched against `<group> > <name>`.
         /// Non-matching cases are skipped per spec file.
@@ -517,7 +520,9 @@ modules = ["main"]
 
     let main_path = dir.join("main.wren");
     if !main_path.exists() {
-        let stub = "// Entry point. `hatch run` executes this file.\nSystem.print(\"Hello wren!\")\n".to_string();
+        let stub =
+            "// Entry point. `hatch run` executes this file.\nSystem.print(\"Hello wren!\")\n"
+                .to_string();
         write_or_die(&main_path, &stub);
     }
 
@@ -1881,9 +1886,9 @@ fn strip_ansi(s: &str) -> String {
     while let Some(c) = chars.next() {
         if c == '\x1b' && chars.peek() == Some(&'[') {
             chars.next(); // consume `[`
-            // Drain parameter bytes until we hit a letter (the
-            // CSI final byte). Cap the inner loop so a malformed
-            // sequence can't run away.
+                          // Drain parameter bytes until we hit a letter (the
+                          // CSI final byte). Cap the inner loop so a malformed
+                          // sequence can't run away.
             for _ in 0..32 {
                 match chars.next() {
                     Some(c) if c.is_ascii_alphabetic() => break,
@@ -1898,48 +1903,47 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod ansi_tests {
-    use super::strip_ansi;
-
-    #[test]
-    fn strips_colour_escapes() {
-        assert_eq!(
-            strip_ansi("\u{1b}[32mok:\u{1b}[0m 2/2 passed"),
-            "ok: 2/2 passed"
-        );
-    }
-
-    #[test]
-    fn passthrough_for_plain_text() {
-        assert_eq!(strip_ansi("ok: 2/2 passed"), "ok: 2/2 passed");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // test — discover and run *.spec.wren
 // ---------------------------------------------------------------------------
 
-fn cmd_test(dir: &Path, filter: Option<&str>, json: bool) {
-    if !dir.is_dir() {
-        eprintln!("error: '{}' is not a directory", dir.display());
-        process::exit(1);
-    }
+fn cmd_test(target: &Path, filter: Option<&str>, json: bool) {
     let wlift = locate_wlift().unwrap_or_else(|| {
         eprintln!("error: cannot locate `wlift` binary");
         process::exit(1);
     });
 
+    // Single-file or directory mode. The editor's per-case run
+    // path passes a single `<file>.spec.wren` so we don't parse
+    // every spec in the dir just to register cases the filter
+    // ignores; CI / batch runs pass a directory.
     let mut specs = Vec::new();
-    walk_specs(dir, &mut specs);
-    if specs.is_empty() {
-        eprintln!(
-            "hatch test: no *.spec.wren files found under {}",
-            dir.display()
-        );
-        return;
+    if target.is_file() {
+        let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".spec.wren") {
+            eprintln!("error: '{}' is not a *.spec.wren file", target.display());
+            process::exit(1);
+        }
+        specs.push(target.to_path_buf());
+    } else if target.is_dir() {
+        walk_specs(target, &mut specs);
+        if specs.is_empty() {
+            eprintln!(
+                "hatch test: no *.spec.wren files found under {}",
+                target.display()
+            );
+            return;
+        }
+        specs.sort();
+    } else {
+        eprintln!("error: '{}' is not a file or directory", target.display());
+        process::exit(1);
     }
-    specs.sort();
+    let dir: &Path = if target.is_dir() {
+        target
+    } else {
+        target.parent().unwrap_or(Path::new("."))
+    };
 
     // When the caller wants per-case filtering or JSON-Lines
     // output we can't just spawn `wlift <spec>` — both knobs
@@ -2116,8 +2120,8 @@ fn write_test_runner(
 ) -> Result<tempfile::NamedTempFile, String> {
     use std::io::Write;
 
-    let spec_src = std::fs::read_to_string(spec)
-        .map_err(|e| format!("read {}: {}", spec.display(), e))?;
+    let spec_src =
+        std::fs::read_to_string(spec).map_err(|e| format!("read {}: {}", spec.display(), e))?;
 
     let mut prelude = String::new();
     if let Some(f) = filter {
@@ -2172,5 +2176,23 @@ fn walk_specs(dir: &Path, out: &mut Vec<PathBuf>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hatch_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_colour_escapes() {
+        assert_eq!(
+            strip_ansi("\u{1b}[32mok:\u{1b}[0m 2/2 passed"),
+            "ok: 2/2 passed"
+        );
+    }
+
+    #[test]
+    fn passthrough_for_plain_text() {
+        assert_eq!(strip_ansi("ok: 2/2 passed"), "ok: 2/2 passed");
     }
 }

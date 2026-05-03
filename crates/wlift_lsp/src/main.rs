@@ -651,7 +651,9 @@ impl LanguageServer for Backend {
         if class_name.is_none() && !recv.is_empty() {
             if let (Some(a), Some(c)) = (
                 analysis.as_ref(),
-                recv.chars().next().filter(|c| c.is_ascii_lowercase() || *c == '_'),
+                recv.chars()
+                    .next()
+                    .filter(|c| c.is_ascii_lowercase() || *c == '_'),
             ) {
                 let _ = c;
                 class_name = a

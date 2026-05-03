@@ -189,11 +189,7 @@ impl Analysis {
     /// parameter, or closure parameter declaration. The span
     /// covers just the binding name so goto-def lands the
     /// cursor on the binder, not the surrounding statement.
-    fn local_var_decl_span(
-        &self,
-        byte: usize,
-        sym: SymbolId,
-    ) -> Option<std::ops::Range<usize>> {
+    fn local_var_decl_span(&self, byte: usize, sym: SymbolId) -> Option<std::ops::Range<usize>> {
         let mut found: Option<std::ops::Range<usize>> = None;
         for stmt in &self.module {
             walk_stmt_for_var_decl(stmt, byte, sym, &mut found);

@@ -684,7 +684,7 @@ fn get_reg(values: &[Value], idx: u16) -> Value {
 }
 
 #[inline(always)]
-fn set_reg(values: &mut Vec<Value>, idx: u16, val: Value) {
+fn set_reg(values: &mut [Value], idx: u16, val: Value) {
     let i = idx as usize;
     // Frames are pre-sized to `bc.register_count` (= `mir.next_value`) at
     // every push site, and `idx` is a ValueId emitted by the same MIR. The
@@ -4130,19 +4130,18 @@ fn dispatch_closure_bc_inner(
         .copied()
         .unwrap_or(std::ptr::null())
         .is_null();
-    let threaded_bypasses_osr = if vm.engine.mode == ExecutionMode::Tiered
-        && !env_method_osr_disabled()
-    {
-        vm.engine
-            .ensure_bytecode(target_func_id)
-            .map(|bc_ptr| unsafe {
-                let bc = &*bc_ptr;
-                !bc.osr_points.is_empty()
-            })
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let threaded_bypasses_osr =
+        if vm.engine.mode == ExecutionMode::Tiered && !env_method_osr_disabled() {
+            vm.engine
+                .ensure_bytecode(target_func_id)
+                .map(|bc_ptr| unsafe {
+                    let bc = &*bc_ptr;
+                    !bc.osr_points.is_empty()
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
     #[cfg(feature = "host")]
     if allow_threaded
         && !fn_has_jit

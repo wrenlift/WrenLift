@@ -122,11 +122,7 @@ pub mod cl {
         // shape that the existing naked `wren_call_N` stubs rely
         // on. Flip both together with `WLIFT_ENABLE_STACK_MAPS=1`
         // when iterating on the GC root work.
-        let pfp = if env_stack_maps() {
-            "true"
-        } else {
-            "false"
-        };
+        let pfp = if env_stack_maps() { "true" } else { "false" };
         flag_builder
             .set("preserve_frame_pointers", pfp)
             .map_err(|e| format!("Failed to set preserve_frame_pointers: {}", e))?;
@@ -997,8 +993,7 @@ pub mod cl {
         // Force-spilling every Wren value across every safepoint
         // currently amplifies an unrelated UNDEF-leak in the JIT;
         // re-enable once that init bug is fixed.
-        let mark_stack_map =
-            f64_self_id.is_none() && env_stack_maps();
+        let mark_stack_map = f64_self_id.is_none() && env_stack_maps();
         let value_types = if mark_stack_map {
             infer_osr_value_types(mir)
         } else {

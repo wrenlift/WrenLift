@@ -233,47 +233,6 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 // Module loader + spec-dep pre-installer
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod resolver_tests {
-    use super::with_wren_suffix;
-    use std::path::PathBuf;
-
-    #[test]
-    fn appends_wren_when_missing() {
-        assert_eq!(
-            with_wren_suffix(PathBuf::from("/tmp/foo")),
-            PathBuf::from("/tmp/foo.wren")
-        );
-    }
-
-    #[test]
-    fn preserves_spec_basename() {
-        // The bug: `Path::with_extension("wren")` would strip
-        // `.spec` and produce `/tmp/assert.wren`, redirecting
-        // every `import "./<name>.spec"` to a same-stem sibling.
-        assert_eq!(
-            with_wren_suffix(PathBuf::from("/tmp/assert.spec")),
-            PathBuf::from("/tmp/assert.spec.wren")
-        );
-    }
-
-    #[test]
-    fn idempotent_when_already_wren() {
-        assert_eq!(
-            with_wren_suffix(PathBuf::from("/tmp/foo.wren")),
-            PathBuf::from("/tmp/foo.wren")
-        );
-    }
-
-    #[test]
-    fn preserves_multi_dot_basenames() {
-        assert_eq!(
-            with_wren_suffix(PathBuf::from("/tmp/foo.bar.baz")),
-            PathBuf::from("/tmp/foo.bar.baz.wren")
-        );
-    }
-}
-
 /// Append `.wren` to a relative-import candidate path **without
 /// stripping any existing extension**.
 ///
@@ -1222,5 +1181,46 @@ fn main() {
             }
             run_repl();
         }
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::with_wren_suffix;
+    use std::path::PathBuf;
+
+    #[test]
+    fn appends_wren_when_missing() {
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/foo")),
+            PathBuf::from("/tmp/foo.wren")
+        );
+    }
+
+    #[test]
+    fn preserves_spec_basename() {
+        // The bug: `Path::with_extension("wren")` would strip
+        // `.spec` and produce `/tmp/assert.wren`, redirecting
+        // every `import "./<name>.spec"` to a same-stem sibling.
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/assert.spec")),
+            PathBuf::from("/tmp/assert.spec.wren")
+        );
+    }
+
+    #[test]
+    fn idempotent_when_already_wren() {
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/foo.wren")),
+            PathBuf::from("/tmp/foo.wren")
+        );
+    }
+
+    #[test]
+    fn preserves_multi_dot_basenames() {
+        assert_eq!(
+            with_wren_suffix(PathBuf::from("/tmp/foo.bar.baz")),
+            PathBuf::from("/tmp/foo.bar.baz.wren")
+        );
     }
 }
