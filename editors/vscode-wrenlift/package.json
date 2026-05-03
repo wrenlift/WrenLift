@@ -146,6 +146,17 @@
         "label": "WrenLift"
       }
     ],
+    "colors": [
+      {
+        "id": "wrenlift.codeLens.accent",
+        "description": "Accent color used by WrenLift's run-action code lens. Override via `workbench.colorCustomizations.editorCodeLens.foreground` to apply globally.",
+        "defaults": {
+          "dark": "#FDD169",
+          "light": "#B8860B",
+          "highContrast": "#FDD169"
+        }
+      }
+    ],
     "configuration": {
       "title": "WrenLift",
       "properties": {
