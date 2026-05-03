@@ -3,7 +3,7 @@
   "displayName": "WrenLift",
   "description": "Wren language support powered by WrenLift — diagnostics, hover, and (soon) goto-def + completion via the wlift-lsp language server.",
   "version": "0.1.0",
-  "publisher": "wrenlift",
+  "publisher": "Wrenlift",
   "license": "MIT",
   "icon": "icons/wrenlift-icon.png",
   "engines": {
