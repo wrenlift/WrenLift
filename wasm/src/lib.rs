@@ -941,38 +941,11 @@ pub fn lint_wren(source: &str) -> JsValue {
     let mut pr = wren_lift::parse::parser::parse(source);
     let mut out: Vec<LintDiag> = pr.errors.iter().map(diag_to_lint).collect();
     if pr.errors.is_empty() {
-        // Match the runtime's prelude — same names the wasm `run()`
-        // path pre-installs as module vars before sema sees the
-        // user source. Without this, every `Browser.fetch` /
-        // `System.print` / `Fiber.new` shows up as "undefined".
-        let prelude_names: [&str; 22] = [
-            // Core classes (vm.rs:528)
-            "Object",
-            "Class",
-            "Bool",
-            "Num",
-            "String",
-            "List",
-            "Map",
-            "Range",
-            "Null",
-            "Fn",
-            "Fiber",
-            "System",
-            "Sequence",
-            "ByteArray",
-            "Float32Array",
-            "Float64Array",
-            // Browser bridges injected by the wasm runtime's
-            // PRELUDE_IMPORT.
-            "Future",
-            "Browser",
-            "WebSocket",
-            "Dom",
-            "LocalStorage",
-            "SessionStorage",
-        ];
-        let prelude: Vec<wren_lift::intern::SymbolId> = prelude_names
+        // Source the prelude from `wren_lift::sema::PRELUDE_NAMES`
+        // so the playground and the desktop LSP can't drift apart
+        // — both surface diagnostics by piping sema through the
+        // same name set.
+        let prelude: Vec<wren_lift::intern::SymbolId> = wren_lift::sema::PRELUDE_NAMES
             .iter()
             .map(|n| pr.interner.intern(n))
             .collect();

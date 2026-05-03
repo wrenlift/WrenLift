@@ -1510,45 +1510,15 @@ impl Backend {
         // problem list.
         let mut module_docs: Option<wren_lift::docs::ModuleDoc> = None;
         if pr.errors.is_empty() {
-            // Match the runtime's prelude — same names sema's
-            // resolve sees in the wasm `run()` path. Without
-            // this, every `System.print` / `Fiber.new` shows
-            // up as "undefined". The browser-bridge names
-            // (`Future`, `Browser`, `WebSocket`, `Dom`,
-            // `LocalStorage`, `SessionStorage`) only exist in
-            // the wasm runtime, but the LSP can't tell if the
-            // user's code targets browser or host — include
-            // them anyway so a `@hatch:web` workspace doesn't
-            // light up with spurious "undefined" diagnostics.
-            // Mirrors the prelude `lint_wren` ships in
-            // `wasm/src/lib.rs`.
+            // Source the prelude name list from
+            // `wren_lift::sema::PRELUDE_NAMES` so the LSP's
+            // diagnostic surface and the playground's
+            // `lint_wren` can't drift apart again.
             let mut interner = pr.interner;
-            let prelude_names: [&str; 22] = [
-                "Object",
-                "Class",
-                "Bool",
-                "Num",
-                "String",
-                "List",
-                "Map",
-                "Range",
-                "Null",
-                "Fn",
-                "Fiber",
-                "System",
-                "Sequence",
-                "ByteArray",
-                "Float32Array",
-                "Float64Array",
-                "Future",
-                "Browser",
-                "WebSocket",
-                "Dom",
-                "LocalStorage",
-                "SessionStorage",
-            ];
-            let prelude: Vec<wren_lift::intern::SymbolId> =
-                prelude_names.iter().map(|n| interner.intern(n)).collect();
+            let prelude: Vec<wren_lift::intern::SymbolId> = wren_lift::sema::PRELUDE_NAMES
+                .iter()
+                .map(|n| interner.intern(n))
+                .collect();
             let sema = sema_resolve::resolve_with_prelude(&pr.module, &interner, &prelude);
             // Restore the (possibly mutated) interner so the doc
             // collector below sees the same identifier ids.
