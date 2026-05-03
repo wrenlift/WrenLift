@@ -418,6 +418,19 @@ impl Parser {
     /// to its span, explaining that attributes can't attach here.
     fn reject_attributes_on(&mut self, attributes: &[crate::ast::Attribute], target: &str) {
         for attr in attributes {
+            // `#!wasm` / `#!native` are bare cross-target cfg gates
+            // handled by `parse::cfg`'s pre-parse strip. The strip
+            // happens in the build path; the LSP and other tools that
+            // parse raw source pass the attributes straight through,
+            // so the parser must not reject them on imports (or any
+            // other declaration type they're valid on). Filter them
+            // out before emitting the "attributes cannot attach" lint.
+            if !attr.is_runtime && matches!(attr.body, crate::ast::AttributeBody::Flag) {
+                let name = self.interner.resolve(attr.name.0);
+                if matches!(name, "wasm" | "native") {
+                    continue;
+                }
+            }
             self.errors.push(
                 Diagnostic::error(format!("attributes cannot attach to {}", target))
                     .with_label(attr.span.clone(), "attribute here"),
@@ -2694,6 +2707,35 @@ mod tests {
         assert!(
             !result.errors.is_empty(),
             "expected a diagnostic for attribute on import"
+        );
+    }
+
+    #[test]
+    fn test_parse_accepts_cross_target_cfg_on_import() {
+        // `#!wasm` / `#!native` are cross-target gates handled by
+        // `parse::cfg`'s pre-strip. The LSP and other tools that
+        // parse raw source feed them straight through, so the
+        // parser must not flag them as "attributes cannot attach
+        // to import statements". Regression test for the false
+        // negative that surfaced in the LSP on cross-target
+        // import blocks.
+        for src in [
+            "#!wasm\nimport \"foo\" for X",
+            "#!native\nimport \"foo\" for X",
+        ] {
+            let result = parse(src);
+            assert!(
+                result.errors.is_empty(),
+                "expected no diagnostic for cfg attr on import, got: {:?}",
+                result.errors
+            );
+        }
+        // Custom `#!whatever` bare attribute is still rejected —
+        // the relaxation is scoped to the two known cfg names.
+        let result = parse("#!pinned\nimport \"foo\"");
+        assert!(
+            !result.errors.is_empty(),
+            "non-cfg `#!` attribute on import should still error"
         );
     }
 
