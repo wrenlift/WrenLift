@@ -158,3 +158,13 @@ wasmtime = "31"
 wasmtime-wasi = "31"
 wasmprinter = "0.226"
 wasmparser = "0.226"
+
+# `cargo install` honours these. `strip = "none"` is explicit
+# because the linker-generated adhoc codesignature on macOS only
+# matches the unstripped binary — stripping invalidates the cs
+# and the kernel SIGKILLs on spawn (no dialog, just exit 137).
+# Linux / Windows builds don't care about codesignature, but the
+# binary stays larger; that's an acceptable tradeoff for a build-
+# from-source path.
+[profile.release]
+strip = "none"
