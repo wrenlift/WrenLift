@@ -189,15 +189,13 @@ pub struct TypeInferrer {
     /// Symbols the caller has flagged as class names (local class
     /// decls, `import for X` aliases, prelude / dep classes whose
     /// names exist in this interner). Bare references to these
-    /// resolve to `Class(sym)` instead of `Any`, so
-    /// `Renderer2D.new(...)` infers as `Renderer2D`. Empty set
-    /// means "infer locally only" — sufficient for the original
-    /// callers (MIR, lints) that don't care about class identity
-    /// of imported names.
+    /// resolve to `Class(sym)` instead of `Any`. Empty set means
+    /// "infer locally only" — sufficient for callers that don't
+    /// care about class identity of imported names.
     known_classes: HashSet<SymbolId>,
     /// Symbol id of the `new` method, used to short-circuit
     /// `<Class>.new(args)` to `Class(sym)`. `None` disables the
-    /// constructor convention (matches the original behaviour).
+    /// constructor convention.
     new_symbol: Option<SymbolId>,
 }
 
@@ -496,14 +494,10 @@ impl TypeInferrer {
                 if let Some(block) = block_arg {
                     self.infer_expr(block);
                 }
-                // `<Class>.new(args)` is the constructor
-                // convention in Wren — it returns an instance
-                // of the class. Treat this as a primitive so
-                // imported classes (whose method return types
-                // sema can't have recorded) still resolve. This
-                // is the lever that fires for
-                // `_renderer = Renderer2D.new(...)` →
-                // `_renderer: Renderer2D`.
+                // `<Class>.new(args)` is the constructor convention
+                // in Wren — short-circuit it to `Class(sym)` so
+                // imported classes (whose method return types sema
+                // can't have recorded) still resolve as instances.
                 if let InferredType::Class(class_sym) = &recv_ty {
                     if self.is_new_method(method.0) {
                         return InferredType::Class(*class_sym);
@@ -665,11 +659,10 @@ pub fn infer_types(module: &Module) -> TypeEnv {
 /// is the interner id of the `new` method (used to short-circuit
 /// `<Class>.new(args)` to `Class(sym)`).
 ///
-/// Hover / LSP uses this with the union of local class decls,
+/// Hover / LSP feeds this the union of local class decls,
 /// `import for X` aliases, prelude class names, and registered
-/// dep-package class names — that's what makes
-/// `_renderer = Renderer2D.new(...)` resolve as `Renderer2D`
-/// when sema otherwise has no idea what `Renderer2D` is.
+/// dep-package class names so cross-module constructor calls
+/// resolve to the imported class.
 pub fn infer_types_with_classes(
     module: &Module,
     known_classes: HashSet<SymbolId>,

@@ -16,13 +16,13 @@ impl MirPass for Sra {
     }
 
     fn run(&self, func: &mut MirFunction) -> bool {
-        // Step 1: Escape analysis.
+        // Escape analysis.
         let non_escaping = super::escape::analyze(func);
         if non_escaping.is_empty() {
             return false;
         }
 
-        // Step 2: Collect MakeList elements and constants.
+        // Collect MakeList elements and constants.
         let mut list_elements: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
         let mut const_nums: HashMap<ValueId, f64> = HashMap::new();
 
@@ -49,7 +49,7 @@ impl MirPass for Sra {
             return false;
         }
 
-        // Step 3: Block lists with non-constant index accesses.
+        // Block lists with non-constant index accesses.
         let mut blocked = Vec::new();
         for block in &func.blocks {
             for (_, inst) in &block.instructions {
@@ -73,7 +73,7 @@ impl MirPass for Sra {
             return false;
         }
 
-        // Step 4: Replace SubscriptGet with Move of the element.
+        // Replace SubscriptGet with Move of the element.
         let mut changed = false;
         let current_elements = list_elements.clone();
 

@@ -1162,10 +1162,9 @@ impl VM {
                     }
                 }
 
-                // Copy imported names from the imported module's vars to this module's
-                // resolve_result.module_vars. We'll look them up by name after MIR
-                // compilation when building the module var storage (step 8).
-                // For now, just ensure the imported module exists.
+                // Imported names are resolved by name after MIR compilation
+                // when building the module var storage; here we only ensure
+                // the imported module exists.
             }
         }
 
@@ -1925,8 +1924,8 @@ impl VM {
                     }
                 }
             } else if !class_mir.foreign_methods.is_empty() {
-                // Phase 3b does not yet route through bind_foreign_method_fn
-                // when #!native is absent. Surface a diagnostic so silent
+                // Without `#!native`, foreign methods don't route through
+                // bind_foreign_method_fn. Surface a diagnostic so silent
                 // "method not found" errors aren't mysterious.
                 let class_name = self.interner.resolve(class_mir.name).to_string();
                 crate::diagnostics::Diagnostic::warning(format!(
@@ -2979,8 +2978,6 @@ impl VM {
         (Vec::new(), 0, 0)
     }
 
-    // scan_native_stack_roots is now enabled for all platforms (not just aarch64)
-
     pub fn collect_garbage(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
 
@@ -3901,11 +3898,9 @@ impl VM {
         // 5. Patch + register nested closures before the top-level so
         // `MakeClosure` ops inside the compiled source resolve to the
         // engine FuncIds we actually assigned. Without this the local
-        // 0-based closure slots are taken literally, which maps to
-        // whatever function happens to sit at that engine FuncId
-        // (often the `Meta.compile` top-level itself — hence the
-        // infinite-recursion stack overflow we used to see when
-        // calling the returned Fn).
+        // 0-based closure slots are taken literally and map to whatever
+        // function happens to sit at that engine FuncId (often the
+        // `Meta.compile` top-level itself — infinite recursion on call).
         //
         // The compiled code was resolved against a core-only prelude,
         // so it expects module vars laid out in that order. Build a

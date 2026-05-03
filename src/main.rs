@@ -245,10 +245,9 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
 /// The loader returns the source text for the canonical module
 /// name. Both share an internal `dirs` registry so that an import
 /// from inside an already-loaded module resolves against THAT
-/// module's directory, not the root entry's. (Pre-2026-04-25 the
-/// loader pinned everything to the root entry's directory, which
-/// broke `examples/foo.wren → ../web → ./css` because `./css`
-/// would look in `examples/` rather than next to `web.wren`.)
+/// module's directory, not the root entry's — pinning everything to
+/// the root would break chains like `examples/foo.wren → ../web →
+/// ./css`, where `./css` must look next to `web.wren`.
 ///
 /// Scoped names (`@hatch:foo`) and missing files leave the
 /// canonical name unchanged — the engine falls back to its

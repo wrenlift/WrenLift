@@ -609,8 +609,8 @@ pub const BROWSER_WREN: &str = r#"
 // awaits a Future; the JS side eventually flips the handle's
 // state via `wlift_wasm.resolve_future(handle, value)`.
 //
-//   var data = Browser.fetch("...").await    // Phase 1.2+
-//   Browser.setTimeout(50).await             // works today
+//   var data = Browser.fetch("...").await
+//   Browser.setTimeout(50).await
 
 #!native = "browser"
 foreign class BrowserCore {

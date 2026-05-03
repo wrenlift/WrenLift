@@ -588,10 +588,7 @@ pub struct ExecutionEngine {
     /// `Some(Some(tc))` = eligible, threaded code ready.
     #[cfg(feature = "host")]
     pub threaded_code: Vec<Option<Option<crate::mir::threaded::ThreadedCode>>>,
-    /// Tier-up promotion broker. Phase 2 wires this up in shadow mode
-    /// alongside the existing call_count / compile_queue machinery — it
-    /// ticks on every recorded call but doesn't yet drive any tier
-    /// decision. Later phases will retire the legacy path in its favour.
+    /// Tier-up promotion broker.
     pub tier: super::tier::TierManager,
     /// Cached per-callee purity map. Recomputed only when the
     /// function table changes — JIT submissions can fire 70+ times
@@ -617,7 +614,9 @@ pub struct ExecutionEngine {
 // plugins (cdylibs) are compiled against the host's published
 // `VM` / `ExecutionEngine` layout — adding fields would drift the
 // struct size and the next foreign call from a stale plugin would
-// SIGSEGV (see `project_plugin_feature_abi.md`).
+// SIGSEGV. Plugins must enable the `wren_lift/host` feature to keep the
+// `VM` / `ExecutionEngine` struct layout in sync with the runtime they
+// load against.
 //
 // Invalidates when the `ExecutionEngine` whose pointer it last saw
 // changes, or when its function-table length grew. The pointer
@@ -811,11 +810,9 @@ impl ExecutionEngine {
         #[cfg(feature = "host")]
         self.threaded_code.push(None); // None = not yet checked
         self.type_profiles.push(None);
-        // Shadow-mode registration. The core pointer stays null for now —
-        // we don't need round-trip-to-Wren-fn yet. The bead exists purely
-        // to track per-function state transitions in parallel with the
-        // legacy call_count field. Phase 3 will hand the compile closure
-        // real context and start driving tier decisions through this.
+        // Register the bead with a null core pointer; tier decisions
+        // are driven entirely from Rust state, beadie just tracks
+        // per-function transitions.
         self.tier.register(id, std::ptr::null_mut());
         id
     }

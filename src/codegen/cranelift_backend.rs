@@ -948,21 +948,10 @@ pub mod cl {
         // the only outbound calls are recursive self-calls that take
         // and return `f64`. Skip marking there.
         //
-        // **Off by default.** A/B testing on @hatch:web showed that
-        // turning the marking on amplifies an unrelated UNDEF-leak
-        // somewhere in the JIT (a method call's receiver arrives as
-        // `TAG_UNDEFINED` instead of the value the source code
-        // assigned to it). With marks off the same flake still
-        // reproduces but the scheduler recovers between requests;
-        // with marks on the recovery path also breaks and a second,
-        // sibling flake (`Object does not implement 'readLine'`)
-        // appears. Force-spilling every Wren value across every
-        // safepoint is the most invasive thing the marking does, and
-        // it's plausibly interacting with whatever SSA / regalloc
-        // path is producing the UNDEF in the first place.
-        //
-        // Re-enable once the underlying init bug is found:
-        //   `WLIFT_ENABLE_STACK_MAPS=1 ../../target/release/hatch run`
+        // Off by default — opt in via `WLIFT_ENABLE_STACK_MAPS=1`.
+        // Force-spilling every Wren value across every safepoint
+        // currently amplifies an unrelated UNDEF-leak in the JIT;
+        // re-enable once that init bug is fixed.
         let mark_stack_map =
             f64_self_id.is_none() && std::env::var_os("WLIFT_ENABLE_STACK_MAPS").is_some();
         let value_types = if mark_stack_map {
@@ -1682,26 +1671,17 @@ pub mod cl {
                 // + call_indirect. The JIT code slot address is stable
                 // because engine.jit_code doesn't reallocate post-load.
                 //
-                // **Gated off by default**: this path emits a raw
-                // `call_indirect` and passes the receiver / args
-                // through CPU registers without rooting them or
-                // emitting Cranelift stack maps. If the callee
-                // allocates (and "pure leaf" means "no Wren-level
-                // calls", *not* "guaranteed alloc-free at the JIT
-                // level" — string concat, list grow, list-of-num
-                // alloc all happen inside the leaf JIT body), the
-                // GC scanner can't see the args and we hand the
-                // callee a stale Value on the next call. Symptom:
-                // `Object does not implement 'split(_)'` /
-                // `Object does not implement 'readLine'` flakes
-                // during heavy request flow on @hatch:web.
-                //
-                // Set `WLIFT_ENABLE_PURE_LEAF_DIRECT=1` to opt back
-                // in once Cranelift stack maps for the call_indirect
-                // args are wired up. Until then we fall through to
-                // the `wren_known_call_N_nocheck` helper, which
-                // pushes args into the JIT root set before
-                // dispatching.
+                // Gated off by default: this path emits a raw
+                // `call_indirect` and passes args through CPU registers
+                // without rooting them or emitting Cranelift stack
+                // maps. "Pure leaf" means "no Wren-level calls" — the
+                // body can still allocate (string concat, list grow,
+                // list-of-num alloc), and without rooting the GC
+                // scanner can't see the args. Set
+                // `WLIFT_ENABLE_PURE_LEAF_DIRECT=1` once Cranelift
+                // stack maps for the call_indirect args are wired up;
+                // until then fall through to `wren_known_call_N_nocheck`,
+                // which roots args before dispatching.
                 let pure_leaf_enabled = std::env::var_os("WLIFT_ENABLE_PURE_LEAF_DIRECT").is_some();
                 if pure_leaf_enabled
                     && inline_getter_field.is_none()

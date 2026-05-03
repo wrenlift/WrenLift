@@ -70,10 +70,10 @@ impl<'a> MirPass for Devirt<'a> {
     fn run(&self, func: &mut MirFunction) -> bool {
         let mut changed = false;
 
-        // Phase 1: Collect known types for values across all blocks.
+        // Collect known types for values across all blocks.
         let known_types = self.collect_known_types(func);
 
-        // Phase 2: Apply transformations.
+        // Apply transformations.
         for block_idx in 0..func.blocks.len() {
             let block = &func.blocks[block_idx];
             let mut replacements: Vec<(usize, ValueId, Instruction)> = Vec::new();

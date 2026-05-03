@@ -53,7 +53,7 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 ///   pins (was lost on the wlbc round-trip, breaking dispatcher
 ///   re-export modules where two siblings export the same class).
 /// - v5 (2026-04-26): `Instruction::Call::pure_call` field added
-///   for the Phase 6 effect-summary seed.
+///   to seed the effect-summary pass.
 /// - v4: prior; first version this constant gained a written-down
 ///   bump policy.
 pub const VERSION: u32 = 6;

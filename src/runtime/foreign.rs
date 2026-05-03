@@ -37,10 +37,6 @@ use crate::runtime::vm::VM;
 /// from the host's compiled-in version. A missing symbol is
 /// treated as v0 so older plugins fail loudly rather than
 /// silently SIGSEGV under a vtable mismatch.
-///
-/// History:
-/// - v1 (2026-04-26): introduced. Marker for the current
-///   `NativeContext` trait surface as of commit `955235d`.
 pub const WLIFT_PLUGIN_ABI_VERSION: u32 = 1;
 
 /// Symbol name plugins export to advertise their ABI version.
@@ -156,8 +152,7 @@ pub fn library_candidates(name: &str) -> Vec<String> {
 /// for wiring foreign methods against symbols linked into the host
 /// executable.
 /// Read the plugin's advertised ABI version. Plugins that don't
-/// export the symbol are treated as v0 — same as a stale dylib
-/// built before the version-stamp landed; the caller's
+/// export the symbol are treated as v0; the caller's
 /// `verify_plugin_abi` then surfaces an explicit `AbiMismatch`
 /// rather than letting the plugin's vtable run with stale offsets.
 fn read_plugin_abi(library: &Library) -> u32 {

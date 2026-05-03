@@ -10,12 +10,10 @@
 //!   * `resolve_future` / `reject_future` — host-side handle store
 //!     for the Promise ↔ `Fiber.yield` bridge. JS Promise callbacks
 //!     flip a handle's state; the awaiting fiber wakes on its next
-//!     yield-loop iteration. See
-//!     `project_wasm_promise_fiber_bridge.md` for the full design.
+//!     yield-loop iteration.
 //!
-//! No JIT, no plugin loading, no fs / sockets. Future phases grow
-//! the surface (incremental compile, multi-module install,
-//! browser-API foreign classes); this is the minimal demo.
+//! No JIT, no plugin loading, no fs / sockets — this is the minimal
+//! browser demo surface.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -239,7 +237,7 @@ pub mod js {
 }
 
 // ---------------------------------------------------------------------------
-// Promise ↔ Fiber.yield handle store (Phase 1.1 scaffolding)
+// Promise ↔ Fiber.yield handle store
 // ---------------------------------------------------------------------------
 //
 // Foreign methods that call browser async APIs (`fetch`,
@@ -250,11 +248,9 @@ pub mod js {
 // `Future.await` method polls `peek_state` in a `Fiber.yield`
 // loop until the handle flips out of `Pending`.
 //
-// The store is a global Mutex<HashMap> for now. Multi-VM hosts
-// (server-side wasi running multiple wlift instances) eventually
-// want a per-VM store, but that's a refactor with no consumers
-// in Phase 1.1 — defer until at least one host ships multiple
-// concurrent VMs.
+// The store is a global Mutex<HashMap>. Multi-VM hosts (server-side
+// wasi running multiple wlift instances) will want a per-VM store
+// once more than one concurrent VM is in flight.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[wasm_bindgen]
@@ -292,8 +288,7 @@ fn next_future_handle() -> u32 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Internal — Phase 1.1+ foreign methods call this to mint a
-/// handle and pre-stash a `Pending` slot. Public so the future
+/// Mint a handle and pre-stash a `Pending` slot. Public so the
 /// `core::browser` foreign-method registry (lives in this crate
 /// for now) can call it directly without going through the JS
 /// host.
@@ -313,7 +308,7 @@ pub fn create_pending_future() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Parked fiber store (Phase 1.3 — top-level await scheduler)
+// Parked fiber store — top-level await scheduler
 // ---------------------------------------------------------------------------
 //
 // `Future.await` calls `BrowserCore.parkSelf(handle)` before each
@@ -358,8 +353,8 @@ fn parked_fibers() -> &'static Mutex<Vec<ParkedFiber>> {
     PARKED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Internal — `browser_park_self` calls this. Pushes the current
-/// fiber + the handle it's awaiting onto the parked list.
+/// `browser_park_self` calls this — pushes the current fiber +
+/// the handle it's awaiting onto the parked list.
 pub fn park_fiber(fiber: *mut ObjFiber, handle: u32) {
     parked_fibers()
         .lock()
@@ -523,7 +518,7 @@ pub fn future_store_take_bytes(handle: u32) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket handle store (Phase 1.2)
+// WebSocket handle store
 // ---------------------------------------------------------------------------
 //
 // `Browser.connect(url)` mints a *connection* handle here (not a
@@ -1292,11 +1287,11 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         class_pool.iter().map(String::as_str),
     );
 
-    // Step 1: identifier-under-cursor lookup. The cursor is most
-    // likely on a *use* of a name (`Renderer2D.new`, `System.print`,
-    // etc.) rather than a declaration site, so identifier-match
-    // wins over enclosing-span before we fall back to "show the
-    // method I'm inside".
+    // Identifier-under-cursor lookup. The cursor is most likely on
+    // a *use* of a name (`Renderer2D.new`, `System.print`, etc.)
+    // rather than a declaration site, so identifier-match wins
+    // over enclosing-span before we fall back to "show the method
+    // I'm inside".
     if let Some(ident_span) = wren_lift::docs::hover::identifier_at(source, byte) {
         let ident = &source[ident_span.clone()];
         if wren_lift::docs::hover::is_keyword(ident) {
@@ -1453,10 +1448,9 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
             }
         }
 
-        // Pass 3: identifier-kind classification. Locals,
-        // parameters, and fields don't appear in the docs
-        // model — sema's TypeEnv splices the inferred type
-        // into the signature here.
+        // Identifier-kind classification. Locals, parameters, and
+        // fields don't appear in the docs model — sema's TypeEnv
+        // splices the inferred type into the signature here.
         if let Some((signature, body)) = wren_lift::docs::hover::identifier_kind_hint(
             source,
             ident,
@@ -1468,10 +1462,10 @@ pub fn hover_wren(source: &str, byte: usize) -> JsValue {
         }
     }
 
-    // Step 2: span-based fallback. When the cursor isn't on a
-    // recognisable identifier — e.g. the user hovers on the
-    // `class` keyword itself, or whitespace inside a method body
-    // — show the enclosing decl's docs instead of nothing.
+    // Span-based fallback. When the cursor isn't on a recognisable
+    // identifier — e.g. the user hovers on the `class` keyword
+    // itself, or whitespace inside a method body — show the
+    // enclosing decl's docs instead of nothing.
     for class in &module.classes {
         if class.span.start > byte || byte >= class.span.end {
             continue;

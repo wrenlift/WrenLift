@@ -867,10 +867,9 @@ pub fn identifier_kind_hint(
     if let Some((line_no, line)) = find_var_decl_line(source, ident, byte) {
         // Prefer the typed AST: walk to the var's *name* span
         // (sema records var types there, not at `var`'s span)
-        // and look up the recorded type. The hand-rolled
-        // `var_at = line_byte + indent` previously pointed at
-        // the `v` of `var`, so the type lookup always missed —
-        // hence `local quad` instead of `local quad: Sprite`.
+        // and look up the recorded type. Pointing at `v` of
+        // `var` would miss every lookup and degrade to
+        // `local quad` instead of `local quad: Sprite`.
         let typed = analysis
             .and_then(|a| a.local_var_type_by_name(byte, ident))
             .and_then(|t| analysis.and_then(|a| inferred_to_class_name(&t, &a.interner)));

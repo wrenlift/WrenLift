@@ -109,21 +109,19 @@ struct MirWasmEmitter<'a> {
     runtime_imports: HashMap<&'static str, u32>,
     /// Ordered import list: (name, param types, result types).
     import_list: Vec<(&'static str, Vec<ValType>, Vec<ValType>)>,
-    /// Phase 5: shared scratch i32 local used by Call sites to
-    /// hold the table slot during `call_indirect` setup. Allocated
-    /// up-front (in `scan_locals`) so the per-instruction emitter
-    /// can stay `&self`.
+    /// Shared scratch i32 local used by Call sites to hold the
+    /// table slot during `call_indirect` setup. Allocated up-front
+    /// (in `scan_locals`) so the per-instruction emitter can stay
+    /// `&self`.
     call_slot_local: Option<u32>,
-    /// Phase 5b: module-var idx → cached `slot + 1` i32 local.
-    /// For Call sites whose receiver is the result of
-    /// `GetModuleVar(idx)`, the function prologue computes the
-    /// JIT slot once at entry and stores it here; the Call site
-    /// then skips `wren_jit_slot_plus_one` entirely. Eliminates
-    /// the per-recursion cross-instance hop on the hot path
-    /// (fib(20): ~22k slot lookups → 1).
+    /// Module-var idx → cached `slot + 1` i32 local. For Call
+    /// sites whose receiver is the result of `GetModuleVar(idx)`,
+    /// the function prologue computes the JIT slot once at entry
+    /// and stores it here; the Call site then skips
+    /// `wren_jit_slot_plus_one` entirely.
     module_var_slot_locals: HashMap<u16, u32>,
-    /// Phase 5b: ValueId → defining `GetModuleVar(idx)`. Used at
-    /// Call lowering time to decide whether the cached slot in
+    /// ValueId → defining `GetModuleVar(idx)`. Used at Call
+    /// lowering time to decide whether the cached slot in
     /// `module_var_slot_locals` applies.
     value_to_module_var: HashMap<ValueId, u16>,
 }
@@ -144,11 +142,11 @@ impl<'a> MirWasmEmitter<'a> {
     }
 
     fn emit(&mut self) -> Result<WasmModule, String> {
-        // Phase 1: Scan MIR to discover locals and runtime imports.
+        // Scan MIR to discover locals and runtime imports.
         self.scan_locals();
         self.scan_imports();
 
-        // Phase 2: Build WASM module.
+        // Build WASM module.
         let mut module = Module::new();
 
         // Type section: import types + compiled function type.
@@ -175,12 +173,11 @@ impl<'a> MirWasmEmitter<'a> {
         for (i, (name, _, _)) in self.import_list.iter().enumerate() {
             imports.import("wren", name, EntityType::Function(i as u32));
         }
-        // Phase 5 — shared funcref table for inter-fn JIT
-        // dispatch. Imported only when the function emits a Call
-        // (i.e. needs `call_indirect`); otherwise we leave the
-        // table out so leaf-only modules instantiate cleanly in
-        // hosts that don't provide one (the wasmtime test harness
-        // passes no imports).
+        // Shared funcref table for inter-fn JIT dispatch. Imported
+        // only when the function emits a Call (i.e. needs
+        // `call_indirect`); otherwise we leave the table out so
+        // leaf-only modules instantiate cleanly in hosts that don't
+        // provide one (the wasmtime test harness passes no imports).
         if self.call_slot_local.is_some() {
             imports.import(
                 "wren",
@@ -240,10 +237,10 @@ impl<'a> MirWasmEmitter<'a> {
                 self.ensure_local(*val, wasm_ty);
             }
         }
-        // Phase 5: if the function has any Call sites, reserve a
-        // single shared i32 scratch local for the call_indirect
-        // slot. Each Call site overwrites it ephemerally so one
-        // local is enough — keeping `emit_instruction` `&self`.
+        // If the function has any Call sites, reserve a single
+        // shared i32 scratch local for the call_indirect slot. Each
+        // Call site overwrites it ephemerally so one local is
+        // enough — keeping `emit_instruction` `&self`.
         let has_call = self
             .mir
             .blocks
@@ -257,13 +254,13 @@ impl<'a> MirWasmEmitter<'a> {
             self.call_slot_local = Some(idx);
         }
 
-        // Phase 5b — hoist slot lookups for module-var receivers.
-        // Build a `ValueId → idx` map for `GetModuleVar` results,
-        // then for every Call whose receiver was defined that way,
-        // reserve a cached-slot local keyed on the idx. The
-        // function prologue (in `emit_function`) populates each
-        // local once per outer call; the Call lowering reuses it
-        // and skips the per-Call `wren_jit_slot_plus_one` hop.
+        // Hoist slot lookups for module-var receivers. Build a
+        // `ValueId → idx` map for `GetModuleVar` results, then for
+        // every Call whose receiver was defined that way, reserve
+        // a cached-slot local keyed on the idx. The function
+        // prologue (in `emit_function`) populates each local once
+        // per outer call; the Call lowering reuses it and skips the
+        // per-Call `wren_jit_slot_plus_one` hop.
         for block in &self.mir.blocks {
             for (val, inst) in &block.instructions {
                 if let Instruction::GetModuleVar(idx) = inst {
@@ -359,17 +356,15 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_not", &[ValType::I64], &[ValType::I64])
                     }
                     Instruction::Call { args, .. } => {
-                        // Phase 5 — JIT-to-JIT inter-fn calls go
-                        // through a slot lookup + call_indirect on
-                        // a shared funcref table. The lookup
-                        // returns `slot + 1` (so 0 means "no JIT,
-                        // take the slow path"), and the slow-path
-                        // helper handles non-JIT'd targets +
-                        // generic method dispatch. Single
-                        // wasm-to-wasm call per Call site for the
-                        // hot path (no JS hop), versus the old
-                        // `wren_call_N` design which routed every
-                        // call through JS.
+                        // JIT-to-JIT inter-fn calls go through a
+                        // slot lookup + call_indirect on a shared
+                        // funcref table. The lookup returns
+                        // `slot + 1` (so 0 means "no JIT, take the
+                        // slow path"), and the slow-path helper
+                        // handles non-JIT'd targets + generic
+                        // method dispatch. Single wasm-to-wasm call
+                        // per Call site for the hot path (no JS
+                        // hop).
                         //
                         // Both helpers stay arity-specific because
                         // the slow-path helper takes the args
@@ -380,19 +375,6 @@ impl<'a> MirWasmEmitter<'a> {
                             &[ValType::I64],
                             &[ValType::I32],
                         );
-                        // Phase 4 step 4b future hook — when the
-                        // `mir_needs_unsupported_helpers` filter
-                        // is relaxed to admit heap-touching MIR,
-                        // this is where to register
-                        // `wren_jit_roots_snapshot_len` /
-                        // `wren_jit_root_push` /
-                        // `wren_jit_roots_restore_len`. The
-                        // wasm-bindgen exports already exist
-                        // (Phase 4 step 4a); only the
-                        // import-registration + Call-body emit
-                        // are missing. See
-                        // `project_wasm_jit_root_emit_followup.md`
-                        // for the design.
                         let slow_name = match args.len() {
                             1 => "wren_call_1_slow",
                             // Higher arities don't have slow-path
@@ -531,11 +513,11 @@ impl<'a> MirWasmEmitter<'a> {
                 self.register_import("wren_is_truthy", &[ValType::I64], &[ValType::I32]);
             }
         }
-        // Phase 5d prologue — if any module-var slot locals were
-        // reserved in `scan_locals`, the prologue calls
+        // If any module-var slot locals were reserved in
+        // `scan_locals`, the prologue calls
         // `wren_jit_slot_for_module_var(idx) -> i32` once per
-        // unique idx. Single combined helper to keep the
-        // prologue's cross-instance count low.
+        // unique idx. Single combined helper to keep the prologue's
+        // cross-instance count low.
         if !self.module_var_slot_locals.is_empty() {
             self.register_import(
                 "wren_jit_slot_for_module_var",
@@ -581,16 +563,13 @@ impl<'a> MirWasmEmitter<'a> {
             .collect();
         let mut func = Function::new(body_locals);
 
-        // Phase 5b prologue — for each module-var idx that's used
-        // as a Call receiver, look up the JIT slot once at entry
-        // and stash it in the cached local. The Call lowering
-        // then reads from this local directly, skipping the
-        // `wren_jit_slot_plus_one` cross-instance hop on the hot
-        // path. fib(20)'s ~22k recursive Calls go from one slot
-        // lookup per Call to one per outer call (a 22k → 1 drop
-        // since the module var doesn't change between iterations).
-        // Iterate in idx order so the wasm output is deterministic
-        // regardless of HashMap iteration order.
+        // For each module-var idx that's used as a Call receiver,
+        // look up the JIT slot once at entry and stash it in the
+        // cached local. The Call lowering then reads from this
+        // local directly, skipping the `wren_jit_slot_plus_one`
+        // cross-instance hop on the hot path. Iterate in idx order
+        // so the wasm output is deterministic regardless of HashMap
+        // iteration order.
         let mut prologue_pairs: Vec<(u16, u32)> = self
             .module_var_slot_locals
             .iter()
@@ -1032,8 +1011,8 @@ impl<'a> MirWasmEmitter<'a> {
                 args,
                 pure_call: _,
             } => {
-                // Phase 5 lowering — slot lookup → branch →
-                // call_indirect (fast) | wren_call_<n>_slow (slow).
+                // Slot lookup → branch → call_indirect (fast) |
+                // wren_call_<n>_slow (slow).
                 //
                 // Wasm pseudocode:
                 //
@@ -1064,7 +1043,7 @@ impl<'a> MirWasmEmitter<'a> {
                 let scratch_slot_local = self
                     .call_slot_local
                     .expect("scan_locals should have reserved a call_slot_local");
-                // Phase 5b — if the receiver came from a hoisted
+                // If the receiver came from a hoisted
                 // `GetModuleVar(idx)`, use the cached slot local
                 // computed in the function prologue. Skips the
                 // per-Call `wren_jit_slot_plus_one` cross-instance

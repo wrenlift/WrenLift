@@ -6,11 +6,10 @@
 //!
 //! # Why release artifacts, not a source clone
 //!
-//! An earlier design tried a sparse/blobless git clone of a monorepo.
-//! That still has to walk the upstream tree on every first install —
-//! fine today, punishing as the catalog grows. Release artifacts
-//! decouple the two: one small `.hatch` download per `hatch install`,
-//! no cumulative metadata, easy to cache on a CDN.
+//! Release artifacts give one small `.hatch` download per
+//! `hatch install`, with no cumulative repo metadata to walk and an
+//! easy CDN cache path. A sparse/blobless monorepo clone would scale
+//! poorly as the catalog grows.
 //!
 //! # URL layout
 //!

@@ -24,7 +24,6 @@
 //!   for each section:
 //!     kind        u8                  — 0 = manifest, 1 = wlbc,
 //!                                        2 = resource, 3 = native lib
-//!                                        (3 deferred to commit 3b)
 //!     name_len    u16 LE
 //!     name        utf-8 bytes         e.g. "hatch.toml", "util.wlbc"
 //!     data_len    u32 LE
@@ -72,9 +71,9 @@ pub enum SectionKind {
     /// can surface them to application code via a future
     /// `wlift.resource(...)` API.
     Resource = 2,
-    /// Native dynamic library (per-target variant). Added in commit 3b;
-    /// rejected by the loader today so forward-compat hatches don't
-    /// silently run on a build that can't honor them.
+    /// Native dynamic library (per-target variant). Rejected by the
+    /// loader today so forward-compat hatches don't silently run on a
+    /// build that can't honor them.
     NativeLib = 3,
     /// UTF-8 source text for a Wren module. Section name matches the
     /// module's compiled Wlbc name. Carried so runtime errors that
@@ -642,18 +641,14 @@ impl From<std::io::Error> for HatchError {
 // Encoder
 // ---------------------------------------------------------------------------
 
-/// Serialize a `Hatch` to bytes. Emits the manifest as the first
-/// section (kind = Manifest) with name `"hatch.toml"`, followed by the
-/// caller-supplied sections in the order given. The payload is always
-/// zstd-compressed in this build; loaders that see the flag clear on a
-/// future hatch get an uncompressed payload instead.
-/// Encode a `Hatch` into the on-disk byte stream. Compresses
-/// the payload with zstd when the `host` feature is enabled
-/// (the only build that links zstd); on `feature = "host"` off
-/// builds (i.e. wasm), falls back to an uncompressed payload
-/// with `FLAG_ZSTD` cleared. `load()` handles both shapes, so a
-/// host-built hatch round-trips through a wasm runtime as long
-/// as it was built uncompressed (use `--bundle-target wasm32`).
+/// Encode a `Hatch` into the on-disk byte stream. The manifest
+/// goes first as a `Manifest` section named `"hatch.toml"`, followed
+/// by the caller-supplied sections in order. Compresses the payload
+/// with zstd when the `host` feature is enabled; on wasm (no zstd
+/// dep) falls back to an uncompressed payload with `FLAG_ZSTD`
+/// cleared. `load()` handles both shapes, so a host-built hatch
+/// round-trips through a wasm runtime if it was built uncompressed
+/// (use `--bundle-target wasm32`).
 pub fn emit(hatch: &Hatch) -> Result<Vec<u8>, HatchError> {
     emit_with_options(hatch, EmitOptions::default())
 }
@@ -668,12 +663,10 @@ pub struct EmitOptions {
     pub compress: bool,
 }
 
-// Compress by default on host; on non-host builds (wasm) the
-// zstd dep isn't linked, so the compressed branch wouldn't
-// compile — flip the default off there. clippy flags this as
-// derivable, but `#[derive(Default)]` would default `bool` to
-// `false` on every target; we *want* the cfg-conditional, so
-// suppress the lint.
+// Compress by default on host; on wasm the zstd dep isn't
+// linked, so the default has to be cfg-conditional. clippy flags
+// this as derivable, but `#[derive(Default)]` would default to
+// `false` on every target — suppress the lint.
 #[allow(clippy::derivable_impls)]
 impl Default for EmitOptions {
     fn default() -> Self {
@@ -1104,20 +1097,18 @@ fn build_recursive(
             name: module_name.clone(),
             data: blob,
         });
-        // Collect publish-time docs *before* the Source section
+        // Collect publish-time docs before the Source section
         // is pushed (which consumes `source` via `into_bytes`).
-        // The fresh parse here is deliberate —
-        // `compile_source_to_blob` consumes its own parser pass,
-        // and the `///` doc-comment side-channel travels with
-        // that parse.
+        // The fresh parse is required because
+        // `compile_source_to_blob` consumes its own parser pass and
+        // the `///` doc-comment side-channel travels with it.
         //
-        // Parse against the *cfg-stripped* source so platform-
-        // gated lines (`#!wasm` on `import "wlift_prelude" for
-        // Browser`, `#!native` on dlopen helpers) elide cleanly
-        // — the parser rejects attributes in those positions
-        // when applied verbatim. Spans in the resulting docs are
-        // relative to the cfg-stripped source, which is also
-        // what ships in the `Source` section.
+        // Parse against the cfg-stripped source so platform-gated
+        // lines (`#!wasm` on imports, `#!native` on dlopen helpers)
+        // elide cleanly — the parser rejects those attributes in
+        // import positions when applied verbatim. Spans in the
+        // resulting docs are relative to the cfg-stripped source,
+        // matching what ships in the `Source` section.
         let pr = crate::parse::parser::parse(&source);
         if pr.errors.is_empty() {
             module_docs.push(crate::docs::collect_module(
@@ -1141,14 +1132,11 @@ fn build_recursive(
         module_names.push(module_name.clone());
     }
 
-    // Docs are no longer embedded in the bundle. Per-package docs
-    // JSON ships through Supabase Storage as a separate artifact —
-    // `hatch publish` collects + uploads, the catalog row's
-    // `docs_url` column points at the JSON, and the site fetches
-    // by URL at request time. The collection above still runs
-    // (callers like `hatch docs <workspace>` consume `module_docs`
-    // through `collect_workspace_docs`), but nothing rides along
-    // in the `.hatch` payload anymore.
+    // Docs aren't embedded in the bundle. Per-package docs JSON
+    // ships separately via Supabase Storage — `hatch publish`
+    // collects + uploads and the catalog row's `docs_url` column
+    // points at the JSON. The collection above still feeds
+    // `collect_workspace_docs` callers (e.g. `hatch docs`).
     let _ = &module_docs;
 
     // Manifest: `hatchfile` at project root, or synthesized.
@@ -1605,18 +1593,17 @@ fn merge_path_dependencies(
             new_modules.push(mod_name.clone());
         }
 
-        // Push the dep's own entry to the end of *its* slice so it
+        // Push the dep's own entry to the end of its slice so it
         // installs after the modules it imports from. The dep's
         // entry is usually a target-conditional re-export dispatcher
-        // (e.g. `@hatch:window` does `#!wasm import "window_web"
-        // for Window`). When the dep ships standalone, the runtime's
-        // `install_hatch_sections` pulls the entry to the end so
-        // the dispatcher's imports resolve. Once the dep is folded
-        // into a parent with a different entry, that entry-pull no
-        // longer protects this dispatcher — without this reordering
-        // the dispatcher installs first, its `import` resolves to
-        // null, and consumers see `Null does not implement create`
-        // when they call e.g. `Window.create({...})`.
+        // (`#!wasm import "window_web" for Window`). When the dep
+        // ships standalone, `install_hatch_sections` pulls the entry
+        // to the end so the dispatcher's imports resolve; once the
+        // dep is folded into a parent with a different entry, that
+        // entry-pull no longer covers this dispatcher. Without this
+        // reorder the dispatcher would install first, its `import`
+        // would resolve to null, and callers would hit
+        // `Null does not implement create`.
         let dep_entry = &dep_hatch.manifest.entry;
         if new_modules.iter().any(|m| m == dep_entry)
             && new_modules.last().map(String::as_str) != Some(dep_entry.as_str())
@@ -1771,18 +1758,17 @@ fn pack_bundled_native_libs(
 
         // Host-target bundle: embed EVERY platform variant declared in
         // the entry. Section names get a `__<platform-key>` suffix so
-        // a Mac user installing a package that CI built on Linux still
-        // finds a Mach-O to dlopen — the runtime's extractor picks the
-        // matching section by `entry.resolve()` against the host.
+        // a Mac user installing a package CI built on Linux still
+        // finds a Mach-O to dlopen — the runtime's extractor picks
+        // the matching section by `entry.resolve()` against the host.
         //
-        // Missing platform files are silently skipped: a developer
-        // building locally usually has only their host's binary in
-        // `libs/`; CI's publish workflow stages every platform's
-        // build artefact before re-running `wlift build`, and that's
-        // where the all-platforms invariant should hold. Leaving the
-        // packer strict would break the dev loop — `hatch run` of a
-        // workspace that path-links a plugin-backed package would
-        // fail unless every CI matrix entry was reproduced locally.
+        // Missing platform files are silently skipped. The
+        // all-platforms invariant only has to hold in CI's publish
+        // workflow (which stages every matrix entry's artefact before
+        // re-running `wlift build`); strict checking here would break
+        // the dev loop, since a local `hatch run` of a workspace that
+        // path-links a plugin-backed package wouldn't have every CI
+        // matrix entry reproduced locally.
         for (key, rel) in entry.all_relative() {
             let full = root.join(rel);
             let bytes = match std::fs::read(&full) {

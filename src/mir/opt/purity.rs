@@ -1,4 +1,4 @@
-/// Per-function effect summary — Phase 6 step 2.
+/// Per-function effect summary.
 ///
 /// A function is **pure** if its body has no observable side effects:
 /// no field / module / static / upvalue / subscript writes, no

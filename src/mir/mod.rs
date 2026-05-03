@@ -333,11 +333,6 @@ pub enum Instruction {
         /// flushing on every method dispatch. Defaults to false; the
         /// MIR builder sets it at lowering time when the method
         /// symbol matches a built-in pure operator.
-        ///
-        /// This is the seed of the per-function effect-summary
-        /// system documented in the Phase 6 roadmap — start with
-        /// builtins that are demonstrably side-effect-free, grow the
-        /// set as the call-graph analysis matures.
         pure_call: bool,
     },
     /// Direct call to a known function by FuncId. Emitted by speculative
@@ -690,9 +685,9 @@ pub struct ClassMir {
     #[serde(default)]
     pub native_library: Option<String>,
     /// One entry per `foreign` method declared inside this class. These
-    /// have no Wren body; at class install time Phase 3b will look up
+    /// have no Wren body; at class install time the runtime looks up
     /// each `symbol` inside `native_library` (falling back to
-    /// `bind_foreign_method_fn`) and bind a `WrenForeignMethodFn`
+    /// `bind_foreign_method_fn`) and binds a `WrenForeignMethodFn`
     /// trampoline.
     #[serde(default)]
     pub foreign_methods: Vec<ForeignMethodMir>,
@@ -711,10 +706,10 @@ pub struct MethodMir {
     pub attributes: Vec<AttrEntry>,
 }
 
-/// Stub record for a `foreign` method. Carries only what Phase 3b needs
-/// to resolve it at install time — no MIR body exists because the
-/// implementation lives in an external shared library (or the host's
-/// `bind_foreign_method_fn` callback).
+/// Stub record for a `foreign` method. Carries only what the
+/// runtime needs to resolve it at install time — no MIR body exists
+/// because the implementation lives in an external shared library
+/// (or the host's `bind_foreign_method_fn` callback).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ForeignMethodMir {
     /// Wren method signature (e.g. "open(_)"). Used both for method-

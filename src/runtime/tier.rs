@@ -1,35 +1,12 @@
 //! Tier-up promotion manager — thin wrapper over the `beadie` crate.
 //!
-//! WrenLift's tiered mode used to carry its own per-function call-count
-//! fields (`FuncBody::Interpreted { call_count }` / `FuncBody::Native
-//! { opt_call_count }`), a `Vec<FuncId>` compile queue, and a synchronous
-//! `tier_up` path scattered through `engine.rs`. `TierManager` consolidates
-//! that into a typed, observable state machine:
+//! `TierManager` is a typed, observable state machine:
 //!
 //! ```text
 //!   Interpreted ──tick──► Queued ──broker──► Compiling ──install──► Compiled
 //!        ▲                                                             │
 //!        └────────── invalidate / deopt ──────────────────────────────┘
 //! ```
-//!
-//! ## Migration status
-//!
-//! The cutover ran in phases. What's live now:
-//!
-//! - **Phase 1** — adapter module added, shadow-only unit tests.
-//! - **Phase 2** — `TierManager` field on `ExecutionEngine`; bead
-//!   ticks on every `record_call` alongside the legacy counter.
-//! - **Phase 3** — `FuncBody::Interpreted.call_count` removed;
-//!   baseline tier-up drives off `should_promote_on_tick`.
-//! - **Phase 4** — install sites notify the bead via
-//!   `install_or_swap` so `BeadState` matches engine `TierState`.
-//! - **Phase 5** — `WLIFT_TIER_TRACE` prints both views side by side;
-//!   `TierManager::snapshot()` for end-of-run dumps.
-//! - **Phase 6** — `FuncBody::Native.opt_call_count` removed; both
-//!   tiers share the single bead counter using absolute thresholds.
-//! - **Phase 7** — `request_tier_up`'s `std::thread::spawn` swapped
-//!   for `Beadie::submit`; the broker's bounded channel replaces the
-//!   ad-hoc `compile_queue: Vec<FuncId>` plus `compile_handle`.
 //!
 //! ## What stays custom
 //!
@@ -163,9 +140,6 @@ impl TierManager {
 
     /// Shadow-mode tick: bump the bead's invocation counter without
     /// running the promotion policy or submitting a compile closure.
-    /// Used by Phase 2 to run the bead state machine alongside the
-    /// engine's existing `record_call` counter so the two can be
-    /// compared before the interpreter is switched over.
     pub fn tick(&self, id: FuncId) {
         if let Some(Some(bead)) = self.beads.get(id.0 as usize) {
             let _ = bead.tick();

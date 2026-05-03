@@ -140,12 +140,9 @@ impl Diagnostic {
 
     /// Render to stderr for system-level diagnostics that don't tie
     /// back to a Wren source span — FFI load failures, ABI version
-    /// mismatches, missing native libs, etc. Same colored Error /
-    /// Warning header + notes as the labelled variant, but without
-    /// a code-snippet rendering pass that would have nothing to
-    /// show. Use this anywhere the codebase used to call
-    /// `eprintln!("wrenlift: ...")` so every error and warning that
-    /// reaches the user travels through the same formatter.
+    /// mismatches, missing native libs, etc. Same colored header +
+    /// notes as the labelled variant, but without a code-snippet
+    /// rendering pass that would have nothing to show.
     pub fn eprint_no_source(&self) {
         self.eprint("")
     }

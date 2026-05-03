@@ -66,7 +66,7 @@ impl Cfg {
             };
         }
 
-        // Phase 1: Identify block start positions.
+        // Identify block start positions.
         //
         // A new block starts at:
         //   - Index 0 (implicit entry)
@@ -95,7 +95,7 @@ impl Cfg {
         starts.sort_unstable();
         starts.dedup();
 
-        // Phase 2: Create CfgBlock entries.
+        // Create CfgBlock entries.
         let mut blocks = Vec::with_capacity(starts.len());
         let mut label_to_block: HashMap<Label, usize> = HashMap::new();
 
@@ -116,7 +116,7 @@ impl Cfg {
             });
         }
 
-        // Phase 3: Compute edges from branch instructions.
+        // Compute edges from branch instructions.
         let num_blocks = blocks.len();
         for (i, block) in blocks.iter_mut().enumerate().take(num_blocks) {
             let (start, end) = (block.start, block.end);

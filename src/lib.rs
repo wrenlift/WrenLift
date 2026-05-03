@@ -16,27 +16,18 @@
     allow(dead_code, unused_imports, unused_variables, unreachable_patterns)
 )]
 
-// `mimalloc` as a `#[global_allocator]` was declared here in
-// commit ac97d2e to address Linux x86_64 OOM cycles caused by
-// glibc's per-thread arena pathology (~399mb anon-rss vs
-// ~150-180mb on darwin's libmalloc). Reverted because
-// cdylib plugins under `plugins/wlift_*` enable
-// `wren_lift/host` for `VM` struct layout compatibility, and
-// `dep:mimalloc` rode along through `host` — every plugin's
-// link unit then carried its own static `mimalloc` instance.
-// Each cdylib + the binary held independent heaps, and any
-// cross-FFI buffer growth (e.g. `(*result_ptr).add(map)` from
-// plugin code allocating an `ObjList::elements` buffer that
-// the host's GC sweep later frees) corrupted on the
-// dealloc → silent SIGSEGV / abort under load. Production
-// keeps `MALLOC_ARENA_MAX=2` + a 768mb VM budget on Fly to
-// bound the per-arena commit instead. A future allocator
-// swap needs to avoid the dual-static problem — either the
-// `mimalloc/override` feature (libc symbol interposition,
-// which broke macOS dev builds when last attempted) or
-// shipping mimalloc as a shared library that the binary
-// dynamically links and plugins resolve through the dynamic
-// linker.
+// No `#[global_allocator]` override here: cdylib plugins enable
+// `wren_lift/host` for `VM` struct layout compatibility, so any
+// allocator pulled in via `host` would be statically linked into
+// every plugin as well. Each cdylib + the binary would then hold
+// independent heaps, and cross-FFI buffer growth (e.g. plugin
+// code allocating an `ObjList::elements` that the host's GC
+// later frees) would corrupt on dealloc. Linux production keeps
+// `MALLOC_ARENA_MAX=2` + a 768mb VM budget to bound glibc's
+// per-thread arena commit instead. A future allocator swap needs
+// to avoid the dual-static problem — either libc symbol
+// interposition or a shared-library allocator that the binary
+// and plugins resolve through the dynamic linker.
 
 pub mod ast;
 pub mod capi;

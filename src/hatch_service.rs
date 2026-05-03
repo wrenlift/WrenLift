@@ -303,11 +303,10 @@ pub fn find_package(
 ///
 /// 2. **`HATCH_BOT_URL` override** — POST to a custom endpoint
 ///    (the hatch-bot Edge Function is the canonical one). The
-///    function owns its own auth via a shared-secret bearer, and
+///    function owns its own auth via a shared-secret bearer and
 ///    writes to the same `packages` table from inside Supabase's
-///    trust domain. Used by CI pipelines where the legacy JWT
-///    flow isn't viable (e.g. projects migrated to asymmetric
-///    JWT signing keys where no HS256-signed CI tokens exist).
+///    trust domain. Used by CI pipelines that can't mint a
+///    user JWT (e.g. projects on asymmetric signing keys).
 ///
 /// When `HATCH_BOT_URL` is set, the `access_token` is sent as
 /// `Authorization: Bearer <token>` directly — no PostgREST-
@@ -503,11 +502,10 @@ pub fn ensure_fresh_credentials(
 ) -> Result<Credentials, ServiceError> {
     let needs_refresh = match creds.expires_at {
         Some(t) => now_unix() + EXPIRY_SKEW_SECS >= t,
-        // Unknown expiry — can't tell whether to refresh. If we
-        // have a refresh token we could optimistically refresh
-        // every call, but that hammers the auth endpoint for
-        // legacy --token logins where refresh isn't possible
-        // anyway. Leave it alone and let the request itself 401.
+        // Unknown expiry — can't tell whether to refresh.
+        // Optimistic refresh would hammer the auth endpoint for
+        // `--token` logins (no refresh path). Leave it alone and
+        // let the request itself 401.
         None => false,
     };
     if !needs_refresh {

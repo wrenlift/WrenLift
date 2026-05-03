@@ -377,9 +377,8 @@ fn try_enter_loop_osr(
     if vm.engine.mode != ExecutionMode::Tiered || crate::codegen::runtime_fns::jit_disabled() {
         return Ok(OsrTransfer::NotEntered);
     }
-    // Phase 4: allow method/closure OSR when an env-gated kill switch is not
-    // set. Keep a fast opt-out so production deployments can disable this path
-    // if a regression surfaces before we build GC/deopt coverage.
+    // Method/closure OSR is on by default. `WLIFT_DISABLE_METHOD_OSR` exists
+    // as a fast opt-out for production deployments if a regression surfaces.
     if (closure.is_some() || defining_class.is_some())
         && std::env::var_os("WLIFT_DISABLE_METHOD_OSR").is_some()
     {
@@ -3826,9 +3825,6 @@ fn dispatch_closure_bc_inner(
     //
     // Capped at args.len() <= 3 (receiver + 2 positional) today
     // because the JS call shims only support up to 2 args.
-    // Phase 4 swaps `tier::dispatch` for a shared funcref table
-    // + `call_indirect`, eliminating the per-arity cap and the
-    // JS-roundtrip cost on inter-fn calls.
     #[cfg(target_arch = "wasm32")]
     if arg_vals.len() <= 2 {
         crate::runtime::tier::bump_dispatch_hook_hits();
@@ -3839,8 +3835,6 @@ fn dispatch_closure_bc_inner(
             // `Op::Call`). So `arg_vals` is exactly the
             // positional args; pass through as-is.
             let args_bits: Vec<u64> = arg_vals.iter().map(|v| v.to_bits()).collect();
-            // Export name only matters for Phase 4's table
-            // multiplexing; per-instance dispatch ignores it.
             let result_bits = crate::runtime::tier::dispatch(slot, "", &args_bits);
             let result_val = Value::from_bits(result_bits);
             set_reg(&mut values, return_dst.0 as u16, result_val);

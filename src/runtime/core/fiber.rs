@@ -31,9 +31,7 @@ unsafe fn as_closure(val: Value) -> Option<*mut ObjClosure> {
 
 /// Set up a fiber's initial MIR frame from a closure. `module_name`
 /// inherits from the caller so module-scope identifiers (classes,
-/// top-level vars) remain reachable inside the fiber's closure — a
-/// hardcoded "main" used to silently return null for references
-/// defined in any other module.
+/// top-level vars) remain reachable inside the fiber's closure.
 unsafe fn setup_fiber_from_closure(
     fiber: *mut ObjFiber,
     closure: *mut ObjClosure,

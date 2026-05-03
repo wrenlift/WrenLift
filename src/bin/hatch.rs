@@ -1016,24 +1016,20 @@ fn record_in_hatchfile(doc: &mut toml_edit::DocumentMut, name: &str, version: &s
 // ---------------------------------------------------------------------------
 
 /// Store a JWT so subsequent `hatch publish` calls can authenticate.
-/// Full interactive GitHub OAuth device flow lands in a follow-up;
-/// for now we accept a token directly from `--token` so early
-/// adopters / CI jobs can exercise the pipeline.
+/// Interactive login is the default; `--token` accepts a pre-minted
+/// JWT directly for CI jobs and scripted flows.
 fn cmd_login(token: Option<&str>) {
     let cfg = wren_lift::hatch_service::ServiceConfig::from_env();
 
     let creds = match token {
         Some(jwt) => {
-            // Escape hatch for CI / scripted flows: skip the browser
-            // dance entirely and trust a pre-minted token. No
+            // Skip the browser dance and trust a pre-minted token. No
             // refresh token + no known expiry — the request itself
-            // will 401 when the JWT expires and the user will need
-            // to re-run this command.
+            // 401s when the JWT expires and the user re-runs this.
             //
-            // `--token -` reads from stdin. Common Unix convention
-            // for secret-ish inputs so the token never appears in
-            // argv (visible via `ps`), and lets shell pipelines
-            // hand tokens off without intermediate files.
+            // `--token -` reads from stdin so the token never appears
+            // in argv (`ps`-visible), and shell pipelines can hand
+            // tokens off without intermediate files.
             let resolved = if jwt == "-" {
                 use std::io::Read as _;
                 let mut buf = String::new();
@@ -1411,9 +1407,8 @@ fn upload_workspace_readme(
 ) -> Result<Option<String>, String> {
     // Honour `manifest.readme` if it points at a different file
     // (e.g. `readme = "doc/INTRO.md"`); default to `README.md` at
-    // the workspace root. Absolute URLs in the manifest are a
-    // legacy form — skip the upload, the site renders that URL
-    // directly without a Storage round-trip.
+    // the workspace root. Absolute URLs skip the upload — the site
+    // renders them directly without a Storage round-trip.
     let rel = manifest
         .readme
         .clone()
@@ -1450,10 +1445,9 @@ fn post_to_hatch_bot(
 ) -> Result<Option<String>, String> {
     let bot_url = std::env::var("HATCH_BOT_URL")
         .map_err(|_| "HATCH_BOT_URL not set — uploads require the bot endpoint".to_string())?;
-    // The existing GitHub Actions variable convention bakes
-    // `/publish` onto the end of HATCH_BOT_URL — it predates
-    // sibling routes. Strip the suffix so we resolve to the
-    // function base, then append the route we want.
+    // The GitHub Actions variable convention bakes `/publish` onto
+    // the end of HATCH_BOT_URL. Strip the suffix so we resolve to
+    // the function base, then append the route we want.
     let trimmed = bot_url.trim_end_matches('/');
     let base = trimmed.strip_suffix("/publish").unwrap_or(trimmed);
     let url = format!("{}/{}", base, route);
@@ -1564,25 +1558,19 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
         &bytes_owned
     };
 
-    // `hatch run` is the long-running path — most workspaces here
-    // are HTTP servers, hot-reload watchers, or game loops. The
-    // default `step_limit` (1B Wren instructions) is meant for
-    // batch / unit-test runs that should fail closed if they
-    // appear to infinite-loop; a server running for a day or two
-    // crosses that threshold legitimately and aborts mid-tick
-    // with "step limit exceeded" deep inside @hatch:web's
-    // scheduler tick. Override to 0 (unlimited) so server
-    // workloads stay alive.
+    // `hatch run` is the long-running path — HTTP servers, hot-reload
+    // watchers, game loops. The default 1B-step limit is meant to
+    // fail-closed on apparent infinite loops in batch / unit-test
+    // runs; a long-running server crosses it legitimately. Override
+    // to 0 (unlimited) so server workloads stay alive.
     //
-    // `WLIFT_MODE=interpreter` is still honoured as the safety
-    // valve when a JIT regression surfaces; matches `wlift --mode
-    // interpreter`. Other values (or unset) leave the tiered
-    // default.
-    // Long-running servers benefit from real frames in `Fiber.error`
-    // messages — without `fiber_stack_traces` enabled,
-    // `Fiber.stackTrace` returns a placeholder and a flaky route
-    // handler shows up in logs as a one-line "Object does not
-    // implement 'split(_)'" with no caller context.
+    // `WLIFT_MODE=interpreter` is honoured as the safety valve when
+    // a JIT regression surfaces (matches `wlift --mode interpreter`).
+    //
+    // `fiber_stack_traces` keeps real frames in `Fiber.error`
+    // messages so a flaky route handler doesn't show up in logs as
+    // a one-line "Object does not implement 'split(_)'" with no
+    // caller context.
     let mut config = wren_lift::runtime::vm::VMConfig {
         step_limit: 0,
         fiber_stack_traces: true,

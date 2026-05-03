@@ -5,7 +5,7 @@
 //! nor `std::thread::spawn` works on `wasm32-unknown-unknown`,
 //! so the wasm path runs the broker inline.
 //!
-//! ## Tier-up to wasm (Phase 3+)
+//! ## Tier-up to wasm
 //!
 //! Hot Wren methods get lowered to wasm via
 //! `codegen::wasm::emit_mir`, instantiated by the JS host
@@ -41,7 +41,7 @@ use crate::mir::MirFunction;
 use crate::runtime::engine::FuncId;
 
 // ---------------------------------------------------------------------------
-// Callback hooks (Phase 3a)
+// Callback hooks
 // ---------------------------------------------------------------------------
 //
 // `OnceLock` lets the host register exactly once at module init.
@@ -97,7 +97,7 @@ pub fn dispatch(slot: u32, fn_export_name: &str, args: &[u64]) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Thread-local current VM (Phase 4 foundation)
+// Thread-local current VM
 // ---------------------------------------------------------------------------
 //
 // JIT'd wasm functions need to call back into the runtime —

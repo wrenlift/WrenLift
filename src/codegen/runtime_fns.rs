@@ -1382,7 +1382,8 @@ pub fn allow_nonleaf_native(
 ) -> bool {
     // With Cranelift, all non-leaf JIT functions are safe to call —
     // Cranelift handles register allocation and stack frames correctly.
-    // The old backend needed shadow-stack/spill-slot safety checks.
+    // The non-cranelift fallback still needs shadow-stack/spill-slot
+    // safety checks.
     #[cfg(feature = "cranelift")]
     {
         let _ = (vm, func_id);
@@ -2027,8 +2028,8 @@ fn dispatch_method(
                     .unwrap_or(std::ptr::null());
                 // With Cranelift, allow non-leaf JIT dispatch — Cranelift
                 // handles register allocation and call conventions correctly.
-                // The old backend required is_leaf to avoid spill-slot bugs,
-                // so the non-cranelift fallback still gates on it.
+                // The non-cranelift fallback still gates on is_leaf to avoid
+                // spill-slot bugs.
                 #[cfg(feature = "cranelift")]
                 let allow_jit = !fn_ptr.is_null();
                 #[cfg(not(feature = "cranelift"))]
@@ -2772,18 +2773,8 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
     // CPU registers from the JIT'd caller, which means the GC has
     // no way to see them — if the callee allocates and triggers a
     // collection, the underlying objects get freed / relocated and
-    // we hand the callee a stale Value. That stale Value is the
-    // origin of every "Object does not implement 'split(_)'" /
-    // "instance of Object" / "Right operand must be a string"
-    // flake we've chased: a heap-allocated receiver gets promoted
-    // out from under us mid-call, the post-promotion read pulls
-    // garbage, and dispatch surfaces it as bogus class info.
-    //
-    // `wren_call_N_inner` already does this for the non-IC path
-    // (see lines around 2129); the IC path was missing it because
-    // the original design assumed the callee was always inlined-
-    // safe (no allocs), which stopped being true once polymorphic
-    // ICs and closure-fallback paths landed.
+    // we hand the callee a stale Value. `wren_call_N_inner` already
+    // does this for the non-IC path; mirror it here.
     let root_base = jit_roots_snapshot_len();
     for &raw in args {
         push_jit_root(Value::from_bits(raw));
@@ -2818,9 +2809,7 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
             // No usable dispatch info — surface to stderr so the
             // failure is at least visible. (`runtime_error` lives on
             // VM but isn't reachable from this calling convention
-            // without re-borrowing.) Returning null here is the same
-            // behaviour as before this block; the closure-fallback
-            // above covers the common eviction case.
+            // without re-borrowing.)
             eprintln!(
                 "wren_ic_call: empty IC (kind={}, class=0x{:x}) — call site \
              lost dispatch info between codegen and runtime",
@@ -2846,10 +2835,7 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
         // the same function, just relocated. Returning `Value::null()`
         // here would be incorrect: the JIT'd caller has no way to tell
         // a sentinel "miss" from a real null return, so it'd treat the
-        // sentinel as the call's result. That's the
-        // `Object does not implement 'split(_)'` flake we hit during
-        // navigation: a route handler called `path.split("/")`, the IC
-        // was stale, and the bogus `null` propagated as the receiver.
+        // sentinel as the call's result.
         if ic.kind == 1 {
             let mut call_ptr = jit_ptr;
             let mut closure_for_fallback: *mut ObjClosure = std::ptr::null_mut();
@@ -2894,20 +2880,15 @@ fn wren_ic_call_inner(ic_ptr_raw: u64, args: &[u64]) -> u64 {
             }
             return unsafe { call_jit_with_shadow_raw(call_ptr, &collect_args()) };
         }
-        // Same revalidation as the kind=1 fast path — kind != 1 was
-        // also using the cached `jit_ptr` without re-checking it
-        // against `engine.jit_code`, so a tier-up after IC install
-        // could relocate the code blob and the cached pointer would
-        // PAC-fault on dereference (or worse, point at unrelated
-        // bytes and produce silent miscompiles surfacing as
-        // null-leaks downstream — the "instance of Object" /
-        // "Right operand must be a string" flakes during navigation).
+        // Same revalidation as the kind=1 fast path — a tier-up after
+        // IC install could relocate the code blob and the cached
+        // pointer would PAC-fault on dereference (or point at
+        // unrelated bytes and produce silent miscompiles).
         //
         // On `live == null` (function lost its JIT code entirely)
         // dispatch through `call_closure_jit_or_sync` with the
-        // cached closure — same closure-fallback shape kind=1 uses.
-        // On `live != jit_ptr` refresh the IC and call the new
-        // address.
+        // cached closure. On `live != jit_ptr` refresh the IC and
+        // call the new address.
         let mut call_ptr = jit_ptr;
         let mut closure_for_fallback: *mut ObjClosure = std::ptr::null_mut();
         if let Some(vm) = unsafe { vm_ref() } {
@@ -3865,16 +3846,9 @@ pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
 
 /// Common path for arithmetic-operator slow paths: if the receiver
 /// is a Num, run the f64 op; otherwise dispatch the user-defined
-/// operator method (e.g. `Mat4 * Mat4` → `Mat4.* (o)`).
-///
-/// This is what `Op::Mul` / `Op::Sub` / etc. do in the bytecode
-/// interpreter via `bc_boxed_binop!` + `try_operator_dispatch`.
-/// Before this helper landed, the JIT slow paths ignored
-/// non-Num receivers and reinterpreted the NaN-box bits as f64,
-/// returning NaN garbage that on aarch64 silently fell through
-/// as the first operand's bits — i.e. `bob * spin` quietly
-/// returned `bob`, and the cube-3d model matrix collapsed to
-/// `bob`'s identity-shaped contents after JIT compile fired.
+/// operator method (e.g. `Mat4 * Mat4` → `Mat4.* (o)`). Mirrors
+/// what `Op::Mul` / `Op::Sub` / etc. do in the bytecode interpreter
+/// via `bc_boxed_binop!` + `try_operator_dispatch`.
 #[inline]
 fn wren_arith_dispatch(
     a: u64,
@@ -4959,7 +4933,7 @@ fn resolve_parallel_copy(moves: &[(u32, u32)], scratch: u32) -> Vec<(u32, u32)> 
 
     let mut result = Vec::new();
 
-    // Phase 1: Emit moves whose destination is NOT a source of any other move.
+    // Emit moves whose destination is NOT a source of any other move.
     // These are safe because writing the destination won't clobber anything.
     let mut changed = true;
     while changed {
@@ -4980,7 +4954,7 @@ fn resolve_parallel_copy(moves: &[(u32, u32)], scratch: u32) -> Vec<(u32, u32)> 
         }
     }
 
-    // Phase 2: Only cycles remain. Break each cycle using the scratch register.
+    // Only cycles remain. Break each cycle using the scratch register.
     while !remaining.is_empty() {
         let (first_src, first_dst) = remaining.remove(0);
         // Save first source to scratch so its register can be overwritten.
