@@ -69,15 +69,32 @@
       {
         "command": "wrenlift.restartServer",
         "title": "Restart Language Server",
-        "category": "WrenLift"
+        "category": "WrenLift",
+        "icon": "$(refresh)"
       },
       {
         "command": "wrenlift.showServerActions",
         "title": "Server Actions…",
-        "category": "WrenLift"
+        "category": "WrenLift",
+        "icon": {
+          "light": "icons/wrenlift-icon.svg",
+          "dark": "icons/wrenlift-icon.svg"
+        }
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "wrenlift.showServerActions",
+          "when": "editorLangId == wren",
+          "group": "navigation@1"
+        },
+        {
+          "command": "wrenlift.restartServer",
+          "when": "editorLangId == wren",
+          "group": "navigation@2"
+        }
+      ],
       "editor/context": [
         {
           "submenu": "wrenlift.editor.submenu",

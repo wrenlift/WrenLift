@@ -2,7 +2,7 @@
 // hover, and (once the LSP gains them) goto-def + completion in
 // action.
 
-import "@hatch:fmt" for Fmt
+import "./fmt" for Fmt
 
 class App {
   static run() {

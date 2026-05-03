@@ -39,8 +39,16 @@ struct Backend {
     /// pulls in. Populated by `resolve_dep_docs` after `initialize`
     /// reads the manifest. Hover walks this alongside the prelude
     /// when an `import "@hatch:foo" for X` resolves locally to a
-    /// dep symbol the user is hovering on.
+    /// dep symbol.
     dep_docs: RwLock<Vec<wren_lift::docs::ModuleDoc>>,
+    /// Doc models for every `*.wren` file under the workspace
+    /// root, indexed by file URI. Populated at init by a
+    /// shallow walk of the workspace tree, refreshed on
+    /// `did_change` for each open document. Goto-definition
+    /// uses it to jump from a `Fmt` use in `main.wren` to
+    /// `fmt.wren`'s `class Fmt` even when `fmt.wren` isn't
+    /// already open in the editor.
+    workspace_modules: RwLock<std::collections::HashMap<Url, wren_lift::docs::ModuleDoc>>,
 }
 
 #[derive(Debug, Default)]
@@ -197,6 +205,15 @@ impl LanguageServer for Backend {
         // so a returning user pays no network latency.
         if manifest_loaded {
             self.resolve_dep_docs().await;
+        }
+
+        // Index every `*.wren` file under the workspace so
+        // goto-definition can jump into files the user hasn't
+        // opened yet. Bounded depth keeps the scan cheap on
+        // large checkouts; rare nested layouts open the file
+        // first and fall through to the live `did_open` path.
+        if let Some(ref root_path) = root {
+            self.scan_workspace_modules(root_path).await;
         }
 
         Ok(InitializeResult {
@@ -394,7 +411,92 @@ impl LanguageServer for Backend {
             }
         }
 
+        // Cross-file lookup against every other indexed `.wren`
+        // in the workspace. Class match wins over member match
+        // (jumping to a class definition is more useful than
+        // landing inside one of its methods that happens to
+        // share a name with the cursor).
+        let workspace_index = self
+            .workspace_modules
+            .read()
+            .ok()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        if let Some(recv) = &receiver_class {
+            for (other_uri, other_module) in &workspace_index {
+                if other_uri == &uri {
+                    continue;
+                }
+                for class in &other_module.classes {
+                    if class.name != *recv {
+                        continue;
+                    }
+                    for member in &class.members {
+                        if member.name == ident {
+                            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                uri: other_uri.clone(),
+                                range: byte_range_to_lsp(other_uri, member.span.clone()),
+                            })));
+                        }
+                    }
+                }
+            }
+        }
+        for (other_uri, other_module) in &workspace_index {
+            if other_uri == &uri {
+                continue;
+            }
+            for class in &other_module.classes {
+                if class.name == ident {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: other_uri.clone(),
+                        range: byte_range_to_lsp(other_uri, class.span.clone()),
+                    })));
+                }
+                for member in &class.members {
+                    if member.name == ident {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: other_uri.clone(),
+                            range: byte_range_to_lsp(other_uri, member.span.clone()),
+                        })));
+                    }
+                }
+            }
+        }
+
         Ok(None)
+    }
+}
+
+/// Translate a byte span into an LSP `Range` against a file we
+/// don't have an open `Document` for. Reads the file fresh and
+/// computes line starts; cheap enough at goto-def time and
+/// avoids carrying a parallel cache for every workspace .wren.
+fn byte_range_to_lsp(uri: &Url, span: std::ops::Range<usize>) -> Range {
+    let path = match uri.to_file_path() {
+        Ok(p) => p,
+        Err(_) => return Range::default(),
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Range::default(),
+    };
+    let line_starts = compute_line_starts(&text);
+    let to_pos = |byte: usize| {
+        let byte = byte.min(text.len());
+        let line = match line_starts.binary_search(&byte) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        let col = text[line_starts[line]..byte].encode_utf16().count() as u32;
+        Position {
+            line: line as u32,
+            character: col,
+        }
+    };
+    Range {
+        start: to_pos(span.start),
+        end: to_pos(span.end),
     }
 }
 
@@ -850,6 +952,77 @@ fn member_hover(
 }
 
 impl Backend {
+    /// Recursively walk the workspace tree, parse every `*.wren`
+    /// file, and stash its `ModuleDoc` in `workspace_modules`
+    /// keyed by file URI. Skips `target/`, `node_modules/`,
+    /// `.git/`, and `out/` to keep large repos cheap. Files
+    /// the user has open as live documents take precedence at
+    /// lookup time — those re-parse on every keystroke.
+    async fn scan_workspace_modules(&self, root: &std::path::Path) {
+        let mut indexed: std::collections::HashMap<Url, wren_lift::docs::ModuleDoc> =
+            std::collections::HashMap::new();
+        let mut stack: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
+        const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "out", ".vscode-test"];
+        while let Some(dir) = stack.pop() {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_dir() {
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| SKIP_DIRS.contains(&n) || n.starts_with('.'))
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if file_type.is_file()
+                    && path.extension().and_then(|e| e.to_str()) == Some("wren")
+                {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let pr = parse(&text);
+                    if !pr.errors.is_empty() {
+                        continue;
+                    }
+                    let module_name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let module = wren_lift::docs::collect::collect_module(
+                        &module_name,
+                        &text,
+                        &pr.module,
+                        &pr.docs,
+                        &pr.interner,
+                    );
+                    if let Ok(uri) = Url::from_file_path(&path) {
+                        indexed.insert(uri, module);
+                    }
+                }
+            }
+        }
+        let count = indexed.len();
+        if let Ok(mut slot) = self.workspace_modules.write() {
+            *slot = indexed;
+        }
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("wlift-lsp: indexed {count} workspace .wren file(s)"),
+            )
+            .await;
+    }
+
     /// Walk the workspace's `[dependencies]`, fetch each one's
     /// `.hatch` bundle through the registry cache, decode the
     /// `Source` sections, and run `docs::collect::collect_module`
@@ -1109,6 +1282,7 @@ async fn main() {
         docs: DashMap::new(),
         workspace: RwLock::new(Workspace::default()),
         dep_docs: RwLock::new(Vec::new()),
+        workspace_modules: RwLock::new(std::collections::HashMap::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
