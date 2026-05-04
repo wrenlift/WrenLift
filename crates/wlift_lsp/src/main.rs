@@ -809,13 +809,17 @@ impl LanguageServer for Backend {
         // the canonical shapes the runner exposes, with optional
         // leading whitespace. We don't try to parse the full
         // expression; a comment-stripped line check is enough for
-        // the run-button affordance. Each lens dispatches to the
-        // same `wrenlift.runFile` as the file-level lens — per-test
-        // filtering needs `@hatch:test` runtime support that
-        // doesn't exist yet, so v1 runs the whole file when a
-        // describe/it lens is clicked. Future filter support will
-        // pass the case label through as a second argument here.
+        // the run-button affordance.
+        //
+        // Each lens dispatches `wrenlift.runSpecCase` with a
+        // `<group> > <name>` filter label as the second argument
+        // so the extension can route through `hatch test
+        // <spec> --filter "<label>"` and only the matching case
+        // runs. The current describe-group is tracked across the
+        // line scan with a "most recent describe wins" rule —
+        // mirrors the sidebar tree's grouping semantics.
         if is_spec {
+            let mut current_group: Option<String> = None;
             for (line_idx, line) in text.lines().enumerate() {
                 let trimmed = line.trim_start();
                 let kind = if trimmed.starts_with("Test.describe(") {
@@ -827,12 +831,39 @@ impl LanguageServer for Backend {
                 };
                 let Some(kind) = kind else { continue };
                 let case_name = extract_string_arg(trimmed);
-                let title = match (kind, case_name) {
-                    ("describe", Some(n)) => format!("\u{25B6}\u{FE0E} Run \"{}\"", n),
-                    ("it", Some(n)) => format!("\u{25B6}\u{FE0E} Run \"{}\"", n),
-                    _ => "\u{25B6}\u{FE0E} Run".to_string(),
+                if kind == "describe" {
+                    current_group = case_name.clone();
+                }
+                let filter_label: String = match (kind, &case_name, &current_group) {
+                    ("describe", Some(name), _) => name.clone(),
+                    ("it", Some(name), Some(group)) => format!("{} > {}", group, name),
+                    ("it", Some(name), None) => name.clone(),
+                    _ => String::new(),
+                };
+                let title = match &case_name {
+                    Some(n) => format!("\u{25B6}\u{FE0E} Run \"{}\"", n),
+                    None => "\u{25B6}\u{FE0E} Run".to_string(),
                 };
                 let line_chars = line.chars().count() as u32;
+                let command = if filter_label.is_empty() {
+                    // Couldn't extract a name from the call — fall
+                    // back to the whole-file runner so the lens
+                    // still does something useful.
+                    Command {
+                        title,
+                        command: "wrenlift.runFile".to_string(),
+                        arguments: Some(vec![serde_json::json!(uri.to_string())]),
+                    }
+                } else {
+                    Command {
+                        title,
+                        command: "wrenlift.runSpecCase".to_string(),
+                        arguments: Some(vec![
+                            serde_json::json!(uri.to_string()),
+                            serde_json::json!(filter_label),
+                        ]),
+                    }
+                };
                 lenses.push(CodeLens {
                     range: Range {
                         start: Position {
@@ -844,11 +875,7 @@ impl LanguageServer for Backend {
                             character: line_chars,
                         },
                     },
-                    command: Some(Command {
-                        title,
-                        command: "wrenlift.runFile".to_string(),
-                        arguments: Some(vec![serde_json::json!(uri.to_string())]),
-                    }),
+                    command: Some(command),
                     data: None,
                 });
             }

@@ -5,5 +5,9 @@ description = "Sample workspace shipped with the VS Code extension to verify dia
 
 [dependencies]
 "@hatch:fmt" = "0.1.1"
-"@hatch:test" = "0.1.0"
+# Path-linked while @hatch:test 0.2.0 (with `Test.filter=` /
+# `Test.reporter=` setters) is in the hatch repo but not yet
+# published to the registry. Switch to a version pin once
+# `hatch publish` against `hatch/packages/hatch-test` lands.
+"@hatch:test" = { path = "../../../hatch/packages/hatch-test" }
 "@hatch:assert" = "0.2.2"

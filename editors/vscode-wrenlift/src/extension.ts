@@ -857,8 +857,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand(
       "wrenlift.runSpecCase",
-      async (node: SpecNode | undefined) => {
-        const target = node?.uri ?? vscode.window.activeTextEditor?.document.uri;
+      // Two callers feed different argument shapes:
+      //   * Sidebar tree click → first arg is a `SpecNode`,
+      //     second arg unset.
+      //   * LSP per-block codelens → first arg is the spec
+      //     URI as a string, second arg is the
+      //     `<group> > <name>` filter label.
+      // Resolve both into a `target` URI plus a `filter`
+      // substring before the dispatch.
+      async (
+        arg1: SpecNode | string | undefined,
+        arg2: string | undefined,
+      ) => {
+        let target: vscode.Uri | undefined;
+        let filter = "";
+        if (typeof arg1 === "string") {
+          try {
+            target = vscode.Uri.parse(arg1);
+          } catch {
+            target = undefined;
+          }
+          filter = arg2 ?? "";
+        } else if (arg1 && typeof arg1 === "object" && "uri" in arg1) {
+          target = arg1.uri;
+          filter =
+            arg1.kind === "case"
+              ? arg1.group
+                ? `${arg1.group} > ${arg1.label}`
+                : arg1.label
+              : arg1.kind === "group"
+                ? arg1.label
+                : "";
+        } else {
+          target = vscode.window.activeTextEditor?.document.uri;
+        }
+
         if (!target) {
           vscode.window.showWarningMessage(
             "WrenLift: open a *.spec.wren file to run.",
@@ -878,21 +911,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           );
           return;
         }
-
-        // Build the `<group> > <name>` filter from the tree
-        // node. File / group nodes pass an empty filter when
-        // there's no nesting context — `hatch test --filter ""`
-        // is a no-op (matches everything) so falling back to
-        // the whole-file shape is fine. `case` nodes always
-        // have a fully-qualified label.
-        const filter =
-          node?.kind === "case"
-            ? node.group
-              ? `${node.group} > ${node.label}`
-              : node.label
-            : node?.kind === "group"
-              ? node.label
-              : "";
 
         const cfg = vscode.workspace.getConfiguration("wrenlift");
         const hatchCmd = resolveBinary("hatch", cfg.get<string>("hatchPath"), "hatch");
