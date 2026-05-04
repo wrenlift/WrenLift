@@ -376,13 +376,19 @@ fn emit_aot_function(
 ///
 /// The `__` separator keeps them grep-friendly inside `nm` output
 /// and avoids colliding with whatever names the source itself uses.
+struct EmitAotResult {
+    const_texts: Vec<String>,
+    symbol_names: Vec<String>,
+}
+
 fn emit_aot_module(
     module: &mut ObjectModule,
     aot_mod: &AotModule,
     fn_symbol: &str,
     modvars_symbol: &str,
     consts_symbol: &str,
-) -> Result<Vec<String>, AotError> {
+    symbols_symbol: &str,
+) -> Result<EmitAotResult, AotError> {
     // Per-module .bss for module vars. `var_count == 0` is rare
     // (a module that defines no top-level names — pure imports
     // wouldn't emit any GetModuleVar / SetModuleVar) but the
@@ -405,10 +411,18 @@ fn emit_aot_module(
         .declare_data(consts_symbol, Linkage::Export, true, false)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
+    // Per-module symbol-remap slot table. Same shape — declared
+    // up front, sized + defined post-lowering.
+    let symbols_data = module
+        .declare_data(symbols_symbol, Linkage::Export, true, false)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+
     let aot_cfg = AotLoweringConfig {
         modvars_data,
         consts_data,
         const_strings: std::cell::RefCell::new(Vec::new()),
+        symbols_data,
+        symbol_remap: std::cell::RefCell::new(Vec::new()),
     };
 
     // Top-level body — the entry point Phase 7's init pass calls
@@ -445,10 +459,9 @@ fn emit_aot_module(
         emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym)?;
     }
 
-    // Define the consts slot array now that we know how many
-    // entries the bodies actually use. Zero-fill — step 7's
-    // per-module init pass populates each slot via
-    // `wlift_aot_alloc_const_string` before user code runs.
+    // Define the consts + symbols slot arrays now that we know
+    // how many entries each holds. Zero-fill — populated at
+    // startup by the per-module init pass.
     let const_strings = aot_cfg.const_strings.into_inner();
     let const_count = const_strings.len();
     let const_bytes = const_count.saturating_mul(8).max(8);
@@ -458,7 +471,19 @@ fn emit_aot_module(
         .define_data(consts_data, &consts_desc)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
-    Ok(const_strings.into_iter().map(|(_, t)| t).collect())
+    let symbol_remap = aot_cfg.symbol_remap.into_inner();
+    let sym_count = symbol_remap.len();
+    let sym_bytes = sym_count.saturating_mul(8).max(8);
+    let mut sym_desc = DataDescription::new();
+    sym_desc.define_zeroinit(sym_bytes);
+    module
+        .define_data(symbols_data, &sym_desc)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+
+    Ok(EmitAotResult {
+        const_texts: const_strings.into_iter().map(|(_, t)| t).collect(),
+        symbol_names: symbol_remap.into_iter().map(|(_, t)| t).collect(),
+    })
 }
 
 /// Run an `AotModule` straight from a single in-memory source —
@@ -524,6 +549,7 @@ pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
         "wlift_aot_main",
         "wlift_modvars_main",
         "wlift_consts_main",
+        "wlift_symbols_main",
     )?;
     let product = module.finish();
     let bytes = product
@@ -577,6 +603,15 @@ pub struct AotManifest {
     pub modvars_count: usize,
     pub consts_symbol: String,
     pub const_texts: Vec<String>,
+    /// Symbol-remap slot table — `wlift_symbols_<n>`. The
+    /// bootstrap re-interns each name in the VM's interner at
+    /// startup, writing the resulting `u32`-padded `SymbolId`
+    /// into slot `i`. Lowering issues `load symbols[slot]`
+    /// instead of a baked `iconst sym_idx` for every site that
+    /// passes a SymbolId to a runtime helper (Call's method,
+    /// is-type's class symbol, …).
+    pub symbols_symbol: String,
+    pub symbol_names: Vec<String>,
     pub module_name: String,
 }
 
@@ -611,32 +646,37 @@ pub fn compile_modules_to_object_with_manifest(
     let last_idx = modules.len() - 1;
     let mut manifests: Vec<AotManifest> = Vec::with_capacity(modules.len());
     for (idx, aot_mod) in modules.iter().enumerate() {
-        let (fn_symbol, modvars_symbol, consts_symbol) = if idx == last_idx {
+        let (fn_symbol, modvars_symbol, consts_symbol, symbols_symbol) = if idx == last_idx {
             (
                 "wlift_aot_main".to_string(),
                 "wlift_modvars_main".to_string(),
                 "wlift_consts_main".to_string(),
+                "wlift_symbols_main".to_string(),
             )
         } else {
             (
                 format!("wlift_aot_mod_{}", idx),
                 format!("wlift_modvars_{}", idx),
                 format!("wlift_consts_{}", idx),
+                format!("wlift_symbols_{}", idx),
             )
         };
-        let const_texts = emit_aot_module(
+        let emitted = emit_aot_module(
             &mut module,
             aot_mod,
             &fn_symbol,
             &modvars_symbol,
             &consts_symbol,
+            &symbols_symbol,
         )?;
         manifests.push(AotManifest {
             fn_symbol,
             modvars_symbol,
             modvars_count: aot_mod.module_var_count,
             consts_symbol,
-            const_texts,
+            const_texts: emitted.const_texts,
+            symbols_symbol,
+            symbol_names: emitted.symbol_names,
             module_name: aot_mod.request_name.clone(),
         });
     }
@@ -713,6 +753,12 @@ fn emit_aot_bootstrap_main(
         &[ptr_ty, ptr_ty, ptr_ty],
         Some(types::I64),
     )?;
+    let intern_symbol = declare_import(
+        module,
+        "wlift_aot_intern_symbol",
+        &[ptr_ty, ptr_ty, ptr_ty],
+        Some(types::I64),
+    )?;
     let enter_ctx = declare_import(
         module,
         "wlift_aot_enter",
@@ -746,11 +792,14 @@ fn emit_aot_bootstrap_main(
         fn_id: cranelift_module::FuncId,
         modvars_id: cranelift_module::DataId,
         consts_id: cranelift_module::DataId,
+        symbols_id: cranelift_module::DataId,
         name_id: cranelift_module::DataId,
         const_text_ids: Vec<cranelift_module::DataId>,
+        symbol_name_ids: Vec<cranelift_module::DataId>,
         modvars_count: usize,
         name_len: usize,
         const_lens: Vec<usize>,
+        symbol_lens: Vec<usize>,
     }
     let mut per_module: Vec<ManifestData> = Vec::with_capacity(manifests.len());
     for (i, m) in manifests.iter().enumerate() {
@@ -760,13 +809,16 @@ fn emit_aot_bootstrap_main(
             .declare_function(&m.fn_symbol, Linkage::Import, &fn_sig)
             .map_err(|e| AotError::Module(e.to_string()))?;
         // declare_data is idempotent — Cranelift hands back the
-        // existing DataId for the modvars/consts symbols already
-        // defined by emit_aot_module.
+        // existing DataId for the modvars/consts/symbols symbols
+        // already defined by emit_aot_module.
         let modvars_id = module
             .declare_data(&m.modvars_symbol, Linkage::Export, true, false)
             .map_err(|e| AotError::Module(e.to_string()))?;
         let consts_id = module
             .declare_data(&m.consts_symbol, Linkage::Export, true, false)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        let symbols_id = module
+            .declare_data(&m.symbols_symbol, Linkage::Export, true, false)
             .map_err(|e| AotError::Module(e.to_string()))?;
         let name_id = define_bytes(
             module,
@@ -784,15 +836,29 @@ fn emit_aot_bootstrap_main(
             const_text_ids.push(id);
             const_lens.push(text.len());
         }
+        let mut symbol_name_ids = Vec::with_capacity(m.symbol_names.len());
+        let mut symbol_lens = Vec::with_capacity(m.symbol_names.len());
+        for (k, name) in m.symbol_names.iter().enumerate() {
+            let id = define_bytes(
+                module,
+                &format!("wlift_symname_{}_{}", i, k),
+                name.as_bytes(),
+            )?;
+            symbol_name_ids.push(id);
+            symbol_lens.push(name.len());
+        }
         per_module.push(ManifestData {
             fn_id,
             modvars_id,
             consts_id,
+            symbols_id,
             name_id,
             const_text_ids,
+            symbol_name_ids,
             modvars_count: m.modvars_count,
             name_len: m.module_name.len(),
             const_lens,
+            symbol_lens,
         });
     }
 
@@ -830,6 +896,7 @@ fn emit_aot_bootstrap_main(
         let free_vm_ref = module.declare_func_in_func(wren_free_vm, builder.func);
         let init_prelude_ref = module.declare_func_in_func(init_prelude, builder.func);
         let alloc_const_ref = module.declare_func_in_func(alloc_const, builder.func);
+        let intern_symbol_ref = module.declare_func_in_func(intern_symbol, builder.func);
         let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
 
@@ -853,10 +920,12 @@ fn emit_aot_bootstrap_main(
         for m in &per_module {
             let modvars_gv = module.declare_data_in_func(m.modvars_id, builder.func);
             let consts_gv = module.declare_data_in_func(m.consts_id, builder.func);
+            let symbols_gv = module.declare_data_in_func(m.symbols_id, builder.func);
             let name_gv = module.declare_data_in_func(m.name_id, builder.func);
 
             let modvars_addr = builder.ins().global_value(ptr_ty, modvars_gv);
             let consts_addr = builder.ins().global_value(ptr_ty, consts_gv);
+            let symbols_addr = builder.ins().global_value(ptr_ty, symbols_gv);
             let name_addr = builder.ins().global_value(ptr_ty, name_gv);
 
             let modvars_count = builder.ins().iconst(ptr_ty, m.modvars_count as i64);
@@ -873,6 +942,19 @@ fn emit_aot_bootstrap_main(
                 builder
                     .ins()
                     .store(MemFlags::trusted(), str_val, consts_addr, (k as i32) * 8);
+            }
+
+            for (k, name_id) in m.symbol_name_ids.iter().enumerate() {
+                let sym_name_gv = module.declare_data_in_func(*name_id, builder.func);
+                let sym_name_addr = builder.ins().global_value(ptr_ty, sym_name_gv);
+                let len = builder.ins().iconst(ptr_ty, m.symbol_lens[k] as i64);
+                let intern_call = builder
+                    .ins()
+                    .call(intern_symbol_ref, &[vm, sym_name_addr, len]);
+                let sym_val = builder.inst_results(intern_call)[0];
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), sym_val, symbols_addr, (k as i32) * 8);
             }
 
             let name_len = builder.ins().iconst(ptr_ty, m.name_len as i64);

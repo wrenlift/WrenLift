@@ -958,6 +958,25 @@ pub mod cl {
         /// truth for "how many slots does this module need" in
         /// the same pass that emits the loads against them.
         pub const_strings: std::cell::RefCell<Vec<(u32, String)>>,
+
+        /// `DataId` for this module's symbol-remap table
+        /// (`wlift_symbols_<n>`). Each slot is a `u64`-padded
+        /// `SymbolId` re-interned in the VM's interner at
+        /// startup — necessary because the MIR's SymbolIds are
+        /// indices into the source's per-parse interner, but
+        /// runtime helpers (`wren_call_*`, `wren_is_type`, …)
+        /// expect VM-interner indices.
+        ///
+        /// Lowering replaces every `iconst <method_sym>` against
+        /// a runtime-helper arg with `load symbols_data[slot]`,
+        /// where `slot` comes from `symbol_remap` keyed by the
+        /// source SymbolId.
+        pub symbols_data: cranelift_module::DataId,
+        /// Dedup table for symbol-remap slot allocation. Same
+        /// shape as `const_strings`; the strings get re-interned
+        /// in the VM's interner at startup, populating the slot
+        /// array.
+        pub symbol_remap: std::cell::RefCell<Vec<(u32, String)>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1364,6 +1383,23 @@ pub mod cl {
         Ok(Some(builder.block_params(merge_block)[0]))
     }
 
+    /// Look up a SymbolId in the per-module symbol-remap dedup
+    /// table (or push a fresh entry) and return its slot index
+    /// inside `wlift_symbols_<n>`. The bootstrap re-interns each
+    /// stored name in the VM's interner at startup so the slot
+    /// reads back the right VM-side SymbolId at runtime.
+    fn aot_intern_symbol(cfg: &AotLoweringConfig, sym_id: u32, interner: &Interner) -> usize {
+        let mut tbl = cfg.symbol_remap.borrow_mut();
+        if let Some(idx) = tbl.iter().position(|(s, _)| *s == sym_id) {
+            return idx;
+        }
+        let text = interner
+            .resolve(crate::intern::SymbolId::from_raw(sym_id))
+            .to_string();
+        tbl.push((sym_id, text));
+        tbl.len() - 1
+    }
+
     /// Lower a single MIR instruction to Cranelift IR.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // Instruction lowering threads builder/module/val-map/IC/JIT-code-base — wide by design.
     fn lower_instruction(
@@ -1737,6 +1773,12 @@ pub mod cl {
                 let ic = callsite_ic_ptrs.and_then(|ics| ics.get(ic_idx));
                 let _live_ptr = callsite_ic_live_ptrs.and_then(|ptrs| ptrs.get(ic_idx).copied());
 
+                // AOT mode: ICs are JIT-only (mutable code memory).
+                // Skip the kind=5 inline-getter fast path entirely
+                // and use the slow path so the symbol-remap table
+                // indirection emits cleanly.
+                let ic = if aot_config.is_some() { None } else { ic };
+
                 if let Some(ic) = ic {
                     // Only emit IC fast path for kind=5 (getter inline).
                     // Kind=1 uses the slow path with IC index encoding so
@@ -1815,12 +1857,34 @@ pub mod cl {
                     }
                 }
 
-                // No IC or unsupported IC kind: full dispatch
-                let mut method_bits = method.index() as u64;
-                if env_jit_callsite_ic() {
-                    method_bits |= ((ic_idx as u64) + 1) << 32;
-                }
-                let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                // No IC or unsupported IC kind: full dispatch.
+                //
+                // AOT mode: re-key the method symbol through the
+                // per-module symbol-remap table — `method.index()`
+                // is an index into the source's per-parse interner;
+                // the runtime helper expects a VM-interner index.
+                // The bootstrap populates `wlift_symbols_<n>` at
+                // startup via `wlift_aot_intern_symbols`, so the
+                // remap is just a `load` here.
+                //
+                // JIT mode: bake the source SymbolId directly —
+                // `install_module_mir_*` already remaps the MIR's
+                // symbols into the VM's interner before the JIT
+                // ever sees them.
+                let method_val = if let Some(cfg) = aot_config {
+                    let slot = aot_intern_symbol(cfg, method.index(), interner);
+                    let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
+                } else {
+                    let mut method_bits = method.index() as u64;
+                    if env_jit_callsite_ic() {
+                        method_bits |= ((ic_idx as u64) + 1) << 32;
+                    }
+                    builder.ins().iconst(types::I64, method_bits as i64)
+                };
                 let call_name = match args.len() {
                     0 => "wren_call_0",
                     1 => "wren_call_1",

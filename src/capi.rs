@@ -469,6 +469,42 @@ pub unsafe extern "C" fn wlift_aot_enter(
     set_jit_context(new_ctx);
 }
 
+/// Intern `name` in the VM's interner and return the resulting
+/// `SymbolId` (zero-extended to `u64`). The AOT bootstrap calls
+/// this once per symbol referenced by the module's body, stashing
+/// the result in `wlift_symbols_<n>[slot]`. Lowering issues
+/// `load wlift_symbols_<n>[slot]` everywhere it'd otherwise bake a
+/// raw source-interner `SymbolId` immediate (Call's method, …) —
+/// without this remap the AOT'd code passes the wrong indices to
+/// runtime helpers that expect VM-interner indices.
+///
+/// Returns `u64::MAX` on null/invalid input — the bootstrap can
+/// treat that as a hard abort signal if it cared, but typical
+/// flow is to trust the descriptor data the codegen emitted.
+///
+/// # Safety
+///
+/// `name` must be a valid pointer to `len` UTF-8 bytes. The
+/// bootstrap embeds the bytes via Cranelift `Data` symbols so
+/// the contract holds by construction.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_intern_symbol(
+    vm: *mut WrenVM,
+    name: *const c_char,
+    len: usize,
+) -> u64 {
+    if vm.is_null() || name.is_null() {
+        return u64::MAX;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(name as *const u8, len) };
+    let s = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+    let vm_ref = unsafe { &mut *vm };
+    vm_ref.interner.intern(s).index() as u64
+}
+
 /// Restore the `JitContext` saved by a matching `wlift_aot_enter`.
 /// Pass the same `saved` pointer the enter call wrote into.
 ///
