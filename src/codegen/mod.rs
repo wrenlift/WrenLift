@@ -17,6 +17,8 @@
 // for track 2).
 #[cfg(all(target_arch = "aarch64", feature = "host"))]
 pub mod aarch64;
+#[cfg(feature = "aot")]
+pub mod aot;
 pub mod cfg;
 #[cfg(feature = "cranelift")]
 pub mod cranelift_backend;

@@ -69,6 +69,17 @@ cranelift = [
     "dep:cranelift-jit",
     "dep:cranelift-native",
 ]
+# AOT object emission. Layered on top of `cranelift` — same
+# IR + same passes, but the `Module` trait impl swaps from
+# `JITModule` (memory-resident codegen) to `ObjectModule`
+# (writes a `.o` to disk). Off by default so the production
+# JIT path stays untouched; flip on with `--features aot`
+# when driving `wlift build hello.wren -o hello`.
+aot = [
+    "cranelift",
+    "dep:cranelift-object",
+    "dep:target-lexicon",
+]
 
 [dependencies]
 # Pure-Rust deps that compile on every target wasm32-unknown-unknown
@@ -126,6 +137,13 @@ cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }
 cranelift-jit = { version = "0.130", optional = true }
 cranelift-native = { version = "0.130", optional = true }
+# AOT object emission — pinned to the same 0.130 series as the
+# rest of cranelift so the `Module` trait impls stay ABI-aligned.
+cranelift-object = { version = "0.130", optional = true }
+# `target-lexicon` is a transitive of cranelift-codegen, but the
+# AOT entry point parses target triples at the top of the build
+# pipeline so we depend on it directly behind the `aot` feature.
+target-lexicon = { version = "0.13", optional = true }
 # Tier-up / promotion broker. Pinned to 0.3 — version 0.3 brought in
 # the OsrEntry / swap_compiled_with_osr APIs that `src/runtime/tier.rs`
 # relies on for OSR-aware installs. Pulls in `std::thread` so it sits
@@ -158,6 +176,11 @@ wasmtime = "31"
 wasmtime-wasi = "31"
 wasmprinter = "0.226"
 wasmparser = "0.226"
+# AOT phase-1 test re-parses the emitted `.o` to verify the
+# symbol table; pinned alongside cranelift-object's transitive
+# version so the parser handles whatever container shape the
+# emitter produced (ELF / Mach-O / PE).
+object = { version = "0.36", default-features = false, features = ["read"] }
 
 # `cargo install` honours these. `strip = "none"` is explicit
 # because the linker-generated adhoc codesignature on macOS only

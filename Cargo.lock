@@ -1213,6 +1213,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-object"
+version = "0.130.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9809d2d419cd18f17377f4ce64a7ad22eeda0d042c08833d3796657f1ddebc82"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen 0.130.0",
+ "cranelift-control 0.130.0",
+ "cranelift-module",
+ "log",
+ "object 0.38.1",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cranelift-srcgen"
 version = "0.130.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3395,6 +3410,18 @@ version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.38.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "271638cd5fa9cca89c4c304675ca658efc4e64a66c716b7cfe1afb4b9611dbbc"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.16.1",
+ "indexmap",
  "memchr",
 ]
 
@@ -6589,6 +6616,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native 0.130.0",
+ "cranelift-object",
  "dynasm",
  "dynasmrt",
  "ed25519-dalek",
@@ -6599,6 +6627,7 @@ dependencies = [
  "logos",
  "md-5",
  "mimalloc",
+ "object 0.36.7",
  "password-hash",
  "rand 0.9.4",
  "rand_core 0.6.4",
@@ -6608,6 +6637,7 @@ dependencies = [
  "sha1",
  "sha2",
  "smallvec",
+ "target-lexicon",
  "tempfile",
  "toml",
  "toml_edit 0.22.27",
