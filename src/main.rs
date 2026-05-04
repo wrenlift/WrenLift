@@ -89,6 +89,23 @@ struct Cli {
     #[arg(long, value_name = "OUT_PATH")]
     bundle: Option<String>,
 
+    /// Compile the input `.wren` source tree into a self-contained
+    /// native executable at the given path and exit. Produces an AOT
+    /// object via the Cranelift `ObjectModule` pipeline (every
+    /// reachable module's top-level lowered into one `.o`), then
+    /// invokes the system `cc` to link it with the WrenLift runtime
+    /// staticlib. The resulting binary embeds the program source and
+    /// runs it through the bundled interpreter — the AOT'd native
+    /// code is included in the binary's symbol table for forthcoming
+    /// dispatch.
+    ///
+    /// Requires the `aot` cargo feature at WrenLift build time. The
+    /// runtime staticlib path is read from `WLIFT_STATICLIB`, or
+    /// auto-discovered next to the running `wlift` binary
+    /// (`<exe_dir>/libwren_lift.a` / `target/<profile>/libwren_lift.a`).
+    #[arg(long, value_name = "OUT_PATH")]
+    aot: Option<String>,
+
     /// Target triple for `--bundle`. Defaults to host-family
     /// (recorded as `target = "native"` in the manifest). Pass
     /// `wasm32` (family marker) or a concrete `wasm32-*` triple
@@ -780,6 +797,262 @@ fn build_bytecode_cache(source: &str, filename: &str, out_path: &str, cli: &Cli)
 
 /// Walk a source tree, compile every `.wren` file, write the result
 /// as a `.hatch` package. `root` is the positional `file` argument.
+/// AOT build driver: emit the input's import-graph as a single
+/// object via Cranelift, then link it with the WrenLift runtime
+/// staticlib + a generated C bootstrap into a self-contained
+/// executable.
+///
+/// Bootstrap shape: a tiny `main()` that calls
+/// `wlift_run_embedded(NULL, WLIFT_AOT_SOURCE)` — the runtime
+/// helper takes care of VM construction, interpretation, and
+/// exit-code mapping. The program source is embedded as a
+/// `static const char[]` with literal byte values, so any source
+/// content survives the C-string escape rules.
+///
+/// Locates the runtime staticlib via the `WLIFT_STATICLIB` env
+/// var first; falls back to `<wlift's exe dir>/libwren_lift.a`
+/// and then `target/{release,debug}/libwren_lift.a` relative to
+/// the current working directory. Documents both options in the
+/// error path so a fresh `cargo install`-installed user knows how
+/// to point at one.
+#[cfg(feature = "aot")]
+fn aot_build_executable(input: &str, out_path: &str) {
+    use std::process::Command;
+
+    let entry_path = std::path::PathBuf::from(input);
+    if !entry_path.is_file() {
+        eprintln!(
+            "error: --aot expects the positional argument to be a `.wren` file (got '{}')",
+            input
+        );
+        process::exit(1);
+    }
+
+    // Walk imports up front so the same dependency-first list
+    // drives both the object emit (one CLIF function per module)
+    // and the bootstrap shim (embeds each module's source bytes
+    // under its as-written `import "..."` name).
+    let modules = match wren_lift::codegen::aot::walk_imports(&entry_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: AOT import walk failed: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let staticlib_path = match locate_wren_lift_staticlib() {
+        Some(p) => p,
+        None => {
+            eprintln!("error: could not locate libwren_lift.a — set WLIFT_STATICLIB to its");
+            eprintln!("       full path, or run `wlift --aot` from a checkout where");
+            eprintln!("       `cargo build --release --features aot` has been executed.");
+            process::exit(1);
+        }
+    };
+
+    let work_dir = match tempfile::Builder::new().prefix("wlift_aot_").tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: tempdir: {}", e);
+            process::exit(1);
+        }
+    };
+    let obj_path = work_dir.path().join("program.o");
+    let bootstrap_path = work_dir.path().join("bootstrap.c");
+
+    if let Err(e) = wren_lift::codegen::aot::compile_modules_to_object(&modules, &obj_path) {
+        eprintln!("error: AOT object emit failed: {}", e);
+        process::exit(1);
+    }
+    // Debug: copy the intermediate .o next to the requested output if
+    // WLIFT_AOT_KEEP_OBJ is set. Lets `nm` inspect the unresolved
+    // externs before the linker pulls in the staticlib.
+    if std::env::var_os("WLIFT_AOT_KEEP_OBJ").is_some() {
+        let keep = std::path::PathBuf::from(format!("{}.o", out_path));
+        let _ = std::fs::copy(&obj_path, &keep);
+        eprintln!("wlift: kept object at {}", keep.display());
+    }
+
+    let bootstrap = generate_aot_bootstrap_c(&modules);
+    if let Err(e) = std::fs::write(&bootstrap_path, &bootstrap) {
+        eprintln!("error: writing bootstrap C source: {}", e);
+        process::exit(1);
+    }
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let mut cmd = Command::new(&cc);
+    cmd.arg(&bootstrap_path)
+        .arg(&obj_path)
+        .arg(&staticlib_path)
+        .arg("-o")
+        .arg(out_path);
+    // System libraries the runtime staticlib pulls in (pthread,
+    // dl, math, libc++ runtime). macOS frameworks live behind
+    // `-framework`. Windows would land later — `wlift build`
+    // there needs lib.exe / link.exe, separate driver story.
+    if cfg!(target_os = "macos") {
+        cmd.arg("-lpthread")
+            .arg("-ldl")
+            .arg("-lm")
+            .arg("-framework")
+            .arg("CoreFoundation")
+            .arg("-framework")
+            .arg("Security");
+    } else if cfg!(target_os = "linux") {
+        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+    }
+
+    let status = match cmd.status() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: invoking `{}`: {}", cc, e);
+            eprintln!(
+                "       Set CC to a compiler binary (e.g. `gcc`, `clang`) if `cc` isn't on PATH."
+            );
+            process::exit(1);
+        }
+    };
+    if !status.success() {
+        eprintln!("error: linker exited with {}", status);
+        process::exit(1);
+    }
+    eprintln!("wlift: produced {}", out_path);
+}
+
+#[cfg(not(feature = "aot"))]
+fn aot_build_executable(_input: &str, _out_path: &str) {
+    eprintln!(
+        "error: --aot requires `wlift` to be built with `--features aot`. \
+         Rebuild via `cargo install --features aot wren_lift` or a source checkout \
+         that ships the AOT pipeline."
+    );
+    process::exit(1);
+}
+
+/// Walk a small set of well-known locations for the WrenLift
+/// runtime staticlib (`libwren_lift.a`). Returns the first
+/// existing file. Order: `WLIFT_STATICLIB` env var (explicit
+/// override) → next to `wlift` itself → `target/release/...` →
+/// `target/debug/...` from CWD.
+#[cfg(feature = "aot")]
+fn locate_wren_lift_staticlib() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("WLIFT_STATICLIB") {
+        let path = std::path::PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let staticlib_name = if cfg!(target_os = "windows") {
+        "wren_lift.lib"
+    } else {
+        "libwren_lift.a"
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(staticlib_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for profile in ["release", "debug"] {
+        let candidate = std::path::PathBuf::from("target")
+            .join(profile)
+            .join(staticlib_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Generate the C bootstrap that ships with every AOT-built
+/// binary. Every walked module's source bytes get embedded as a
+/// `static const char[]` (literal byte values + trailing null —
+/// robust against any byte content), tagged with the as-written
+/// `import "..."` path the runtime install call will register
+/// it under. The dependency-first walker order is preserved so
+/// each module's own imports are already installed by the time
+/// the runtime evaluates it.
+///
+/// `modules` must come from `walk_imports` (entry last). The
+/// produced `main()` calls `wlift_run_aot_program` with the
+/// entry split out + the dependencies as parallel arrays.
+#[cfg(feature = "aot")]
+fn generate_aot_bootstrap_c(modules: &[wren_lift::codegen::aot::AotModule]) -> String {
+    use std::fmt::Write;
+
+    let mut buf = String::new();
+    buf.push_str("/* generated by `wlift --aot` — do not edit */\n\n");
+    buf.push_str("#include <stddef.h>\n\n");
+    buf.push_str("extern int wlift_run_aot_program(\n");
+    buf.push_str("    const char* entry_name,\n");
+    buf.push_str("    const char* entry_source,\n");
+    buf.push_str("    size_t extras_count,\n");
+    buf.push_str("    const char* const* extras_names,\n");
+    buf.push_str("    const char* const* extras_sources);\n\n");
+
+    let emit_byte_array = |buf: &mut String, name: &str, bytes: &[u8]| {
+        let _ = write!(buf, "static const char {}[] = {{", name);
+        for (i, byte) in bytes.iter().enumerate() {
+            if i % 16 == 0 {
+                buf.push_str("\n    ");
+            }
+            let _ = write!(buf, "0x{:02x}, ", byte);
+        }
+        if !bytes.len().is_multiple_of(16) {
+            buf.push_str("\n    ");
+        }
+        buf.push_str("0x00\n};\n\n");
+    };
+
+    let entry_idx = modules.len() - 1;
+    for (i, m) in modules.iter().enumerate() {
+        emit_byte_array(&mut buf, &format!("WLIFT_SOURCE_{}", i), &m.source);
+        emit_byte_array(
+            &mut buf,
+            &format!("WLIFT_NAME_{}", i),
+            m.request_name.as_bytes(),
+        );
+    }
+
+    let extras_count = entry_idx;
+    if extras_count > 0 {
+        buf.push_str("static const char* const WLIFT_EXTRAS_NAMES[] = {\n");
+        for i in 0..extras_count {
+            let _ = writeln!(buf, "    WLIFT_NAME_{},", i);
+        }
+        buf.push_str("};\n\n");
+        buf.push_str("static const char* const WLIFT_EXTRAS_SOURCES[] = {\n");
+        for i in 0..extras_count {
+            let _ = writeln!(buf, "    WLIFT_SOURCE_{},", i);
+        }
+        buf.push_str("};\n\n");
+    }
+
+    buf.push_str("int main(int argc, char** argv) {\n");
+    buf.push_str("    (void)argc; (void)argv;\n");
+    if extras_count > 0 {
+        let _ = writeln!(
+            buf,
+            "    return wlift_run_aot_program(WLIFT_NAME_{e}, WLIFT_SOURCE_{e}, {n}, WLIFT_EXTRAS_NAMES, WLIFT_EXTRAS_SOURCES);",
+            e = entry_idx,
+            n = extras_count
+        );
+    } else {
+        let _ = writeln!(
+            buf,
+            "    return wlift_run_aot_program(WLIFT_NAME_{e}, WLIFT_SOURCE_{e}, 0, 0, 0);",
+            e = entry_idx
+        );
+    }
+    buf.push_str("}\n");
+    buf
+}
+
 /// `target` (when `Some`) is stamped into the manifest's `target`
 /// field and gates wasm-specific build behavior (skip packing
 /// host `.dylib`/`.so` bytes); `None` preserves legacy behavior
@@ -1119,6 +1392,17 @@ fn main() {
             // file-read path below.
             if let Some(out_path) = &cli.bundle {
                 build_hatch_package(filename, out_path, cli.bundle_target.as_deref());
+                return;
+            }
+
+            // `--aot` walks the import graph rooted at `filename`,
+            // emits a single object via Cranelift, and links it
+            // with the runtime staticlib into a self-contained
+            // executable. Reads the source through the same path
+            // run_file does (UTF-8) so non-text files surface a
+            // sensible error before the AOT pipeline starts.
+            if let Some(out_path) = &cli.aot {
+                aot_build_executable(filename, out_path);
                 return;
             }
 

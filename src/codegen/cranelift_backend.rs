@@ -240,6 +240,7 @@ pub mod cl {
                     None, // no jit_code_base for inner
                     Some(inner_id),
                     None,
+                    None, // f64 inner is JIT-only
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -562,6 +563,7 @@ pub mod cl {
                     jit_code_base,
                     None,
                     Some(layout.clone()),
+                    None, // OSR-entry path is JIT-only
                 );
                 if result.is_ok() {
                     builder.seal_all_blocks();
@@ -924,12 +926,51 @@ pub mod cl {
         Ok(func_ref)
     }
 
+    /// Per-module data the AOT lowering needs at every emit site
+    /// that today calls a TLS-routed runtime helper. Passing this
+    /// switches the lowering off the JIT-shaped fast/slow paths
+    /// onto direct data-section addressing — the produced object
+    /// stops needing a runtime to resolve module-var slots, string
+    /// constants, etc. `None` keeps JIT semantics unchanged.
+    pub struct AotLoweringConfig {
+        /// `cranelift_module::DataId` for this module's per-module
+        /// var array (`wlift_modvars_<n>`). The lowering replaces
+        /// `wren_get_module_var(slot)` / `wren_set_module_var(slot,
+        /// val)` with a `global_value` + load/store at offset
+        /// `slot * 8`, killing both helper calls and the TLS read.
+        pub modvars_data: cranelift_module::DataId,
+
+        /// `DataId` for this module's string-constant slot array
+        /// (`wlift_consts_<n>`). The body addresses
+        /// `slots[dedup[sym_idx]]` to load a `*mut ObjString` —
+        /// the slot itself is populated once at startup by the
+        /// per-module init pass (step 7). Lowering pushes new
+        /// `(sym_idx → slot, text)` entries into `const_strings`
+        /// the first time it sees a given symbol; the AOT driver
+        /// reads back the populated map after lowering to size +
+        /// describe the slot array's data section.
+        pub consts_data: cranelift_module::DataId,
+        /// Dedup table for `Instruction::ConstString` lowering.
+        /// Keyed by the SymbolId (`u32`) the MIR carries; the
+        /// stored value is the slot index assigned the first time
+        /// the lowering encountered that symbol. Driving the slot
+        /// numbering through the lowering keeps the source-of-
+        /// truth for "how many slots does this module need" in
+        /// the same pass that emits the loads against them.
+        pub const_strings: std::cell::RefCell<Vec<(u32, String)>>,
+    }
+
     /// AOT entry point — populate `builder.func` with the CLIF
     /// translation of `mir`, against any `cranelift_module::Module`
     /// impl. The JIT path drives the same code via
     /// `lower_mir_to_cranelift` below; AOT's
     /// `codegen::aot::compile_to_object` calls this directly with
     /// an `ObjectModule`.
+    ///
+    /// `aot_config = None` keeps the JIT-shaped lowering — emits
+    /// runtime helpers for TLS-routed state. `Some(&cfg)` flips
+    /// the lowering to direct data-section addressing per the
+    /// fields on [`AotLoweringConfig`].
     ///
     /// IC pointers, code-base, and OSR layout are JIT-only signals
     /// (runtime self-call patching, on-stack replacement entries,
@@ -941,8 +982,11 @@ pub mod cl {
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,
+        aot_config: Option<&AotLoweringConfig>,
     ) -> Result<(), String> {
-        lower_mir_impl(mir, interner, builder, module, None, None, None, None, None)
+        lower_mir_impl(
+            mir, interner, builder, module, None, None, None, None, None, aot_config,
+        )
     }
 
     /// Lower a MIR function into Cranelift IR using the FunctionBuilder.
@@ -965,6 +1009,7 @@ pub mod cl {
             jit_code_base,
             None,
             None,
+            None,
         )
     }
 
@@ -973,7 +1018,7 @@ pub mod cl {
     /// - BlockParam types are f64 (not i64)
     /// - Unbox/Box of params/returns are no-ops
     /// - CallStaticSelf calls the inner function directly with f64 args
-    #[allow(clippy::too_many_arguments)] // Lowering context is inherently wide (IC, OSR, f64 inner, ...).
+    #[allow(clippy::too_many_arguments)] // Lowering context is inherently wide (IC, OSR, f64 inner, AOT mode, ...).
     fn lower_mir_impl(
         mir: &MirFunction,
         interner: &Interner,
@@ -984,6 +1029,7 @@ pub mod cl {
         jit_code_base: Option<*const *const u8>,
         f64_self_id: Option<cranelift_module::FuncId>,
         osr_entry: Option<OsrEntryLayout>,
+        aot_config: Option<&AotLoweringConfig>,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
@@ -1209,6 +1255,7 @@ pub mod cl {
                     &mut call_site_idx,
                     f64_self_id,
                     receiver_val,
+                    aot_config,
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -1322,7 +1369,7 @@ pub mod cl {
     fn lower_instruction(
         inst: &Instruction,
         _mir: &MirFunction,
-        _interner: &Interner,
+        interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,
         val_map: &HashMap<ValueId, Value>,
@@ -1338,6 +1385,7 @@ pub mod cl {
         call_site_idx: &mut usize,
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
+        aot_config: Option<&AotLoweringConfig>,
     ) -> Result<Option<Value>, String> {
         // Investigation mode — convert undefined-value to a graceful
         // Err so the broker thread survives, letting other functions
@@ -1612,17 +1660,51 @@ pub mod cl {
             }
 
             // === Module variables ===
+            //
+            // AOT mode: each module owns a `wlift_modvars_<n>`
+            // data symbol — a `[u64; var_count]` in `.bss` —
+            // declared by the AOT driver and threaded through
+            // here as a `DataId`. Get/Set become a `global_value`
+            // load + offset, killing the runtime helper entirely.
+            //
+            // JIT mode keeps the `wren_get/set_module_var` dispatch
+            // — those helpers consult the TLS `JitContext` which
+            // is patched per-frame by the install path.
             Instruction::GetModuleVar(idx) => {
-                let f = get_runtime_fn(module, builder, "wren_get_module_var", 1)?;
-                let idx_val = builder.ins().iconst(types::I64, *idx as i64);
-                let result = builder.ins().call(f, &[idx_val]);
-                Ok(Some(builder.inst_results(result)[0]))
+                if let Some(cfg) = aot_config {
+                    let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    let result = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        base,
+                        (*idx as i32) * 8,
+                    );
+                    Ok(Some(result))
+                } else {
+                    let f = get_runtime_fn(module, builder, "wren_get_module_var", 1)?;
+                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                    let result = builder.ins().call(f, &[idx_val]);
+                    Ok(Some(builder.inst_results(result)[0]))
+                }
             }
             Instruction::SetModuleVar(idx, val) => {
-                let f = get_runtime_fn(module, builder, "wren_set_module_var", 2)?;
-                let idx_val = builder.ins().iconst(types::I64, *idx as i64);
-                let result = builder.ins().call(f, &[idx_val, get(val)]);
-                Ok(Some(builder.inst_results(result)[0]))
+                if let Some(cfg) = aot_config {
+                    let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    let store_val = get(val);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), store_val, base, (*idx as i32) * 8);
+                    // SetModuleVar's MIR contract: result is the
+                    // stored value (mirrors the helper's return).
+                    Ok(Some(store_val))
+                } else {
+                    let f = get_runtime_fn(module, builder, "wren_set_module_var", 2)?;
+                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                    let result = builder.ins().call(f, &[idx_val, get(val)]);
+                    Ok(Some(builder.inst_results(result)[0]))
+                }
             }
 
             // === Method calls — inline IC fast path + wren_call_N slow path ===
@@ -2724,11 +2806,48 @@ pub mod cl {
             }
 
             // === Constant strings ===
+            //
+            // AOT mode: dedup against the per-module string table
+            // and emit a `load` against `wlift_consts_<n>[slot]` —
+            // the slot's `*mut ObjString` is populated once by the
+            // per-module init pass at startup, so the body's use
+            // site is a single load, no helper call.
+            //
+            // JIT mode keeps `wren_const_string(sym)` — the helper
+            // resolves through the live VM's interner + GC and
+            // caches the resulting `ObjString` per call. Cheaper
+            // for the JIT, which can't pre-bake a per-module
+            // table without ahead-of-time knowledge of the program.
             Instruction::ConstString(idx) => {
-                let f = get_runtime_fn(module, builder, "wren_const_string", 1)?;
-                let idx_val = builder.ins().iconst(types::I64, *idx as i64);
-                let result = builder.ins().call(f, &[idx_val]);
-                Ok(Some(builder.inst_results(result)[0]))
+                if let Some(cfg) = aot_config {
+                    let slot = {
+                        let mut tbl = cfg.const_strings.borrow_mut();
+                        match tbl.iter().position(|(s, _)| *s == *idx) {
+                            Some(s) => s,
+                            None => {
+                                let text = interner
+                                    .resolve(crate::intern::SymbolId::from_raw(*idx))
+                                    .to_string();
+                                tbl.push((*idx, text));
+                                tbl.len() - 1
+                            }
+                        }
+                    };
+                    let gv = module.declare_data_in_func(cfg.consts_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    let result = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        base,
+                        (slot as i32) * 8,
+                    );
+                    Ok(Some(result))
+                } else {
+                    let f = get_runtime_fn(module, builder, "wren_const_string", 1)?;
+                    let idx_val = builder.ins().iconst(types::I64, *idx as i64);
+                    let result = builder.ins().call(f, &[idx_val]);
+                    Ok(Some(builder.inst_results(result)[0]))
+                }
             }
 
             // === Static self-calls ===
