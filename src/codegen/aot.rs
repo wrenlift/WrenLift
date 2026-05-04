@@ -465,9 +465,14 @@ fn emit_aot_module(
     let mut classes_manifest: Vec<AotClassManifest> = Vec::with_capacity(aot_mod.mir.classes.len());
     for (class_idx, class) in aot_mod.mir.classes.iter().enumerate() {
         let class_name = aot_mod.interner.resolve(class.name).to_string();
-        let parent_name = class
-            .superclass
-            .map(|sym| aot_mod.interner.resolve(sym).to_string());
+        let parent_slot = class.superclass.and_then(|sym| {
+            let parent_name = aot_mod.interner.resolve(sym);
+            aot_mod
+                .module_var_names
+                .iter()
+                .position(|n| n == parent_name)
+                .map(|s| s as u32)
+        });
         let slot = aot_mod
             .module_var_names
             .iter()
@@ -490,7 +495,7 @@ fn emit_aot_module(
         if slot != usize::MAX {
             classes_manifest.push(AotClassManifest {
                 name: class_name,
-                parent_name,
+                parent_slot,
                 num_fields: class.num_fields,
                 slot: slot as u32,
                 methods: methods_manifest,
@@ -674,7 +679,14 @@ pub struct AotMethodManifest {
 #[derive(Debug, Clone)]
 pub struct AotClassManifest {
     pub name: String,
-    pub parent_name: Option<String>,
+    /// Module-var slot of the parent class. Resolved at AOT-build
+    /// time against this module's own var list — every class the
+    /// resolver knows about (core prelude classes + imported user
+    /// classes + same-module user classes) has a slot, so the
+    /// install path just loads `modvars[parent_slot]` for the
+    /// parent pointer. `None` means no superclass declared
+    /// (defaults to `Object` at install time).
+    pub parent_slot: Option<u32>,
     pub num_fields: u16,
     /// Module-var slot the bootstrap writes the installed class
     /// pointer into so AOT bodies' `GetModuleVar(slot)` reads
@@ -899,16 +911,15 @@ fn emit_aot_bootstrap_main(
         module,
         "wlift_aot_install_class",
         &[
-            ptr_ty,
-            ptr_ty,
-            ptr_ty,
-            ptr_ty,
-            ptr_ty,
-            ptr_ty,
-            ptr_ty,
-            types::I32,
-            ptr_ty,
-            ptr_ty,
+            ptr_ty,     // vm
+            ptr_ty,     // modvars
+            ptr_ty,     // slot
+            ptr_ty,     // name
+            ptr_ty,     // name_len
+            ptr_ty,     // parent_slot
+            types::I32, // num_fields
+            ptr_ty,     // methods desc
+            ptr_ty,     // methods count
         ],
         Some(types::I32),
     )?;
@@ -944,8 +955,12 @@ fn emit_aot_bootstrap_main(
     struct ClassData {
         name_id: cranelift_module::DataId,
         name_len: usize,
-        parent_id: Option<cranelift_module::DataId>,
-        parent_len: usize,
+        // `usize::MAX` sentinel = no superclass declared (defaults
+        // to Object). Otherwise an index into this module's
+        // modvars; install reads `modvars[parent_slot]` for the
+        // superclass pointer, populated earlier by `init_prelude`
+        // (core classes) or the import-copy step (cross-module).
+        parent_slot: usize,
         slot: u32,
         num_fields: u16,
         // Per-method: (sig DataId, sig_len, body FuncId, arity, flags).
@@ -1035,17 +1050,7 @@ fn emit_aot_bootstrap_main(
                 &format!("wlift_classname_{}_{}", i, c_idx),
                 class.name.as_bytes(),
             )?;
-            let (parent_id, parent_len) = match &class.parent_name {
-                Some(p) => {
-                    let id = define_bytes(
-                        module,
-                        &format!("wlift_classparent_{}_{}", i, c_idx),
-                        p.as_bytes(),
-                    )?;
-                    (Some(id), p.len())
-                }
-                None => (None, 0),
-            };
+            let parent_slot = class.parent_slot.map(|s| s as usize).unwrap_or(usize::MAX);
             let mut methods = Vec::with_capacity(class.methods.len());
             for (m_idx, method) in class.methods.iter().enumerate() {
                 let sig_id = define_bytes(
@@ -1073,8 +1078,7 @@ fn emit_aot_bootstrap_main(
             classes.push(ClassData {
                 name_id,
                 name_len: class.name.len(),
-                parent_id,
-                parent_len,
+                parent_slot,
                 slot: class.slot,
                 num_fields: class.num_fields,
                 methods,
@@ -1273,16 +1277,9 @@ fn emit_aot_bootstrap_main(
 
                 let class_name_gv = module.declare_data_in_func(class.name_id, builder.func);
                 let class_name_addr = builder.ins().global_value(ptr_ty, class_name_gv);
-                let parent_addr = match class.parent_id {
-                    Some(id) => {
-                        let pgv = module.declare_data_in_func(id, builder.func);
-                        builder.ins().global_value(ptr_ty, pgv)
-                    }
-                    None => builder.ins().iconst(ptr_ty, 0),
-                };
+                let parent_slot_val = builder.ins().iconst(ptr_ty, class.parent_slot as i64);
                 let slot_val = builder.ins().iconst(ptr_ty, class.slot as i64);
                 let class_name_len = builder.ins().iconst(ptr_ty, class.name_len as i64);
-                let parent_name_len = builder.ins().iconst(ptr_ty, class.parent_len as i64);
                 let num_fields_val = builder.ins().iconst(types::I32, class.num_fields as i64);
                 let methods_count = builder.ins().iconst(ptr_ty, class.methods.len() as i64);
 
@@ -1294,8 +1291,7 @@ fn emit_aot_bootstrap_main(
                         slot_val,
                         class_name_addr,
                         class_name_len,
-                        parent_addr,
-                        parent_name_len,
+                        parent_slot_val,
                         num_fields_val,
                         descs_addr,
                         methods_count,

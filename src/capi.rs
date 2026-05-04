@@ -513,8 +513,7 @@ pub unsafe extern "C" fn wlift_aot_install_class(
     slot: usize,
     name: *const c_char,
     name_len: usize,
-    parent: *const c_char,
-    parent_len: usize,
+    parent_slot: usize,
     num_fields: u16,
     methods: *const WliftAotMethodDesc,
     methods_count: usize,
@@ -532,21 +531,21 @@ pub unsafe extern "C" fn wlift_aot_install_class(
 
     let vm_ref = unsafe { &mut *vm };
 
-    // Resolve superclass: core class by name, else scan modvars
-    // for a previously-installed user class with this name. Falls
-    // back to Object — matches the JIT install path.
+    // Resolve superclass via this module's modvars — every class
+    // the resolver knew about (core prelude, imported user class,
+    // same-module class defined earlier) has a slot, populated by
+    // `init_prelude` / the import-copy step / a prior install
+    // call. `usize::MAX` means "no superclass declared" → defaults
+    // to `Object`, matching Wren's default class hierarchy.
     let mut superclass: *mut crate::runtime::object::ObjClass = std::ptr::null_mut();
-    if !parent.is_null() && parent_len > 0 {
-        let parent_bytes = unsafe { std::slice::from_raw_parts(parent as *const u8, parent_len) };
-        if let Ok(parent_name) = std::str::from_utf8(parent_bytes) {
-            if let Some(value) = vm_ref.core_class_value(parent_name) {
-                if let Some(p) = value.as_object() {
-                    superclass = p as *mut crate::runtime::object::ObjClass;
-                }
+    if parent_slot != usize::MAX {
+        let parent_bits = unsafe { *modvars.add(parent_slot) };
+        let parent_val = crate::runtime::value::Value::from_bits(parent_bits);
+        if let Some(p) = parent_val.as_object() {
+            let header = p as *const ObjHeader;
+            if unsafe { (*header).obj_type } == ObjType::Class {
+                superclass = p as *mut crate::runtime::object::ObjClass;
             }
-            // No core class match — for now leave null. User-defined
-            // parents need a separate lookup table; lands when
-            // multi-class hierarchies stress this path.
         }
     }
     if superclass.is_null() {

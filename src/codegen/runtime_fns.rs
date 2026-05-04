@@ -3150,16 +3150,34 @@ fn dispatch_super_call_rooted(
             call_closure_jit_or_sync(vm, closure_ptr, args, Some(dc))
         }
         Some((Method::Constructor(closure_ptr), dc)) => {
-            // Super constructor calls are correct: args[0] is already 'this' (the
-            // newly allocated instance), not the class. Use call_closure_sync to
-            // avoid GC-unsafe JIT dispatch with potentially stale 'this' pointer.
-            // args[0] = this (instance), args[1..] = user constructor args.
+            // Super-constructor: args[0] is already 'this' (the
+            // newly allocated instance), not the class. The
+            // legacy JIT-IC stale-pointer hazard that motivated
+            // forcing call_closure_sync here doesn't fire when
+            // the callee's jit_code slot is set by AOT (no IC
+            // patching, no concurrent tier-up). When it is set,
+            // route through call_closure_jit_or_sync so the AOT
+            // body actually runs — call_closure_sync would walk
+            // the stub MIR `register_aot_function` left and
+            // panic on `mir.blocks[0]`.
             if args.is_empty() {
                 return Value::null().to_bits();
             }
-            vm.call_closure_sync(closure_ptr, args, Some(dc))
-                .map(|v| v.to_bits())
-                .unwrap_or(args[0].to_bits())
+            let func_id = unsafe { (*(*closure_ptr).function).fn_id } as usize;
+            let has_aot_body = vm
+                .engine
+                .jit_code
+                .get(func_id)
+                .copied()
+                .map(|p| !p.is_null())
+                .unwrap_or(false);
+            if has_aot_body {
+                call_closure_jit_or_sync(vm, closure_ptr, args, Some(dc))
+            } else {
+                vm.call_closure_sync(closure_ptr, args, Some(dc))
+                    .map(|v| v.to_bits())
+                    .unwrap_or(args[0].to_bits())
+            }
         }
         None => Value::null().to_bits(),
     }

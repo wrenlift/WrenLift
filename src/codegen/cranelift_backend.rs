@@ -1922,6 +1922,41 @@ pub mod cl {
                 }
                 let r = get(receiver);
 
+                // AOT mode: short-circuit every JIT-specific fast
+                // path (pure-leaf direct, inline getter, baked-class
+                // IC, jit_code_base lookups) to the standard
+                // wren_call_N slow path with the symbol remapped
+                // through the per-module table. Those fast paths
+                // depend on `expected_class` being a JIT-allocated
+                // class pointer and `jit_code_base` being live —
+                // neither holds for static-linked AOT output.
+                if let Some(cfg) = aot_config {
+                    let slot = aot_intern_symbol(cfg, method.index(), interner);
+                    let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    let method_val = builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        base,
+                        (slot as i32) * 8,
+                    );
+                    let call_name = match args.len() {
+                        0 => "wren_call_0",
+                        1 => "wren_call_1",
+                        2 => "wren_call_2",
+                        3 => "wren_call_3",
+                        _ => "wren_call_4",
+                    };
+                    let arg_count = 2 + args.len().min(4);
+                    let f = get_runtime_fn(module, builder, call_name, arg_count)?;
+                    let mut call_args = vec![r, method_val];
+                    for a in args.iter().take(4) {
+                        call_args.push(get(a));
+                    }
+                    let result = builder.ins().call(f, &call_args);
+                    return Ok(Some(builder.inst_results(result)[0]));
+                }
+
                 // === Pure-leaf direct call (ZERO FFI) ===
                 // Callee has no internal method calls, so no context
                 // setup is needed. Emit: class check + load callee ptr
@@ -2208,7 +2243,21 @@ pub mod cl {
                         args.len()
                     ));
                 }
-                let method_val = builder.ins().iconst(types::I64, method.index() as i64);
+                // AOT mode: re-key the method symbol through the
+                // per-module symbol-remap table — same fix Call's
+                // slow path does. Without this, super dispatch
+                // hits whatever VM-interner symbol happens to
+                // match the source-interner index.
+                let method_val = if let Some(cfg) = aot_config {
+                    let slot = aot_intern_symbol(cfg, method.index(), interner);
+                    let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
+                } else {
+                    builder.ins().iconst(types::I64, method.index() as i64)
+                };
                 let call_name = match args.len() {
                     0 => "wren_super_call_0",
                     1 => "wren_super_call_1",
