@@ -336,6 +336,158 @@ pub unsafe extern "C" fn wlift_run_aot_program(
 }
 
 // ---------------------------------------------------------------------------
+// AOT runtime entries — the bootstrap shim wires these together to
+// drive an AOT-compiled program directly, no `vm.interpret` round-trip.
+// ---------------------------------------------------------------------------
+
+/// Populate the first slots of a per-module `wlift_modvars_<n>`
+/// array with the VM's core class values, in the same order
+/// `sema::PRELUDE_NAMES` lists. Each module's MIR was compiled
+/// against that list, so the slot-to-class mapping is stable.
+///
+/// `modvars_count` is the slot capacity from the AOT codegen
+/// (`AotModule::module_var_count`); the function fills up to
+/// `min(prelude.len(), modvars_count)` slots and leaves the rest
+/// untouched (top-level body initialises user vars itself).
+///
+/// # Safety
+///
+/// `modvars` must point at a writable `[u64; modvars_count]` array
+/// living for at least the lifetime of `vm`. The bootstrap embeds
+/// the symbol via `extern void* wlift_modvars_<n>[]` so this
+/// contract holds by construction.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_init_prelude(
+    vm: *mut WrenVM,
+    modvars: *mut u64,
+    modvars_count: usize,
+) -> c_int {
+    if vm.is_null() || modvars.is_null() {
+        return 70;
+    }
+    let vm_ref = unsafe { &*vm };
+    for (i, name) in crate::sema::PRELUDE_NAMES.iter().enumerate() {
+        if i >= modvars_count {
+            break;
+        }
+        if let Some(value) = vm_ref.core_class_value(name) {
+            unsafe {
+                *modvars.add(i) = value.to_bits();
+            }
+        }
+    }
+    0
+}
+
+/// Allocate a fresh `ObjString` carrying the given UTF-8 byte
+/// range and return its NaN-boxed `Value` representation. The
+/// bootstrap calls this once per string constant during init,
+/// stashing the result in a `wlift_consts_<n>[i]` slot for the
+/// AOT body to load via direct addressing — no per-use-site
+/// helper call.
+///
+/// Returns `Value::null()` on null inputs; runtime errors during
+/// allocation surface as panics from inside the GC, matching the
+/// existing `vm.new_string` contract.
+///
+/// # Safety
+///
+/// `text` must be a valid pointer to `len` UTF-8 bytes. The
+/// bootstrap embeds these via `static const char[]` literals so
+/// the constraint holds by construction.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_alloc_const_string(
+    vm: *mut WrenVM,
+    text: *const c_char,
+    len: usize,
+) -> u64 {
+    if vm.is_null() || text.is_null() {
+        return crate::runtime::value::Value::null().to_bits();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
+    let s = match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return crate::runtime::value::Value::null().to_bits(),
+    };
+    let vm_ref = unsafe { &mut *vm };
+    vm_ref.new_string(s).to_bits()
+}
+
+/// Set the per-thread `JitContext` to point at this module's
+/// `vm` + `modvars` + `name` before calling an AOT-emitted body.
+/// Returns the previous context bytes packed into an opaque
+/// `[u64; 6]` that `wlift_aot_exit` restores — same save/restore
+/// shape the JIT uses when one helper recurses into another.
+///
+/// The runtime helpers that survived the AOT lowering rewrite
+/// (`wren_call_*`, `wren_make_*`, `wren_write_barrier`, etc.)
+/// consult this context via `with_context` — without setting it
+/// up first, they'd see a null `vm` and short-circuit to a no-op
+/// or null return, manifesting as silent failures inside AOT'd
+/// code paths.
+///
+/// # Safety
+///
+/// All pointers must remain valid for the duration of the AOT
+/// body's execution. `name` is a UTF-8 C string; `out_saved`
+/// must point at a writable 48-byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_enter(
+    vm: *mut WrenVM,
+    modvars: *mut u64,
+    modvars_count: usize,
+    name: *const c_char,
+    name_len: usize,
+    out_saved: *mut u64,
+) {
+    use crate::codegen::runtime_fns::{read_jit_ctx, set_jit_context, JitContext};
+
+    if !out_saved.is_null() {
+        // Stash the current context — same shape used by
+        // `restore_rooted_jit_context` so re-entrance works if
+        // an AOT body calls another AOT body via runtime
+        // dispatch.
+        let prev = read_jit_ctx();
+        let ptr = out_saved as *mut JitContext;
+        unsafe {
+            *ptr = prev;
+        }
+    }
+
+    let new_ctx = JitContext {
+        module_vars: modvars,
+        module_var_count: modvars_count as u32,
+        vm: vm as *mut u8,
+        module_name: name as *const u8,
+        module_name_len: name_len as u32,
+        current_func_id: u32::MAX as u64,
+        closure: std::ptr::null_mut(),
+        defining_class: std::ptr::null_mut(),
+        jit_code_base: std::ptr::null(),
+        jit_code_len: 0,
+    };
+    set_jit_context(new_ctx);
+}
+
+/// Restore the `JitContext` saved by a matching `wlift_aot_enter`.
+/// Pass the same `saved` pointer the enter call wrote into.
+///
+/// # Safety
+///
+/// `saved` must point at a 48-byte buffer previously populated
+/// by `wlift_aot_enter`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
+    use crate::codegen::runtime_fns::{set_jit_context, JitContext};
+    if saved.is_null() {
+        return;
+    }
+    let ptr = saved as *const JitContext;
+    let prev = unsafe { *ptr };
+    set_jit_context(prev);
+}
+
+// ---------------------------------------------------------------------------
 // Call handles
 // ---------------------------------------------------------------------------
 

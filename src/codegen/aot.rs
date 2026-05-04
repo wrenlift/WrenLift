@@ -382,7 +382,7 @@ fn emit_aot_module(
     fn_symbol: &str,
     modvars_symbol: &str,
     consts_symbol: &str,
-) -> Result<(), AotError> {
+) -> Result<Vec<String>, AotError> {
     // Per-module .bss for module vars. `var_count == 0` is rare
     // (a module that defines no top-level names — pure imports
     // wouldn't emit any GetModuleVar / SetModuleVar) but the
@@ -446,11 +446,11 @@ fn emit_aot_module(
     }
 
     // Define the consts slot array now that we know how many
-    // entries the bodies actually use. Zero-fill — step 7 wires a
-    // per-module init pass that walks a sibling `.rodata`
-    // descriptor table to allocate `ObjString`s into these slots
-    // before user code runs.
-    let const_count = aot_cfg.const_strings.borrow().len();
+    // entries the bodies actually use. Zero-fill — step 7's
+    // per-module init pass populates each slot via
+    // `wlift_aot_alloc_const_string` before user code runs.
+    let const_strings = aot_cfg.const_strings.into_inner();
+    let const_count = const_strings.len();
     let const_bytes = const_count.saturating_mul(8).max(8);
     let mut consts_desc = DataDescription::new();
     consts_desc.define_zeroinit(const_bytes);
@@ -458,7 +458,7 @@ fn emit_aot_module(
         .define_data(consts_data, &consts_desc)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
-    Ok(())
+    Ok(const_strings.into_iter().map(|(_, t)| t).collect())
 }
 
 /// Run an `AotModule` straight from a single in-memory source —
@@ -556,23 +556,60 @@ pub fn compile_path_to_object(entry_path: &Path, output: &Path) -> Result<(), Ao
     compile_modules_to_object(&modules, output)
 }
 
+/// Per-module shape the bootstrap generator needs to wire each
+/// AOT-emitted module into the runtime at startup. Returned from
+/// [`compile_modules_to_object_with_manifest`] alongside the
+/// produced `.o` so the driver can emit a C shim that:
+///
+/// 1. Calls `wlift_aot_init_prelude` against `modvars_symbol` +
+///    `modvars_count` (populates the prelude class slots).
+/// 2. For each entry in `const_texts`, allocates an `ObjString`
+///    via `wlift_aot_alloc_const_string` and writes the result
+///    into `consts_symbol[i]`.
+/// 3. Sets `JitContext` via `wlift_aot_enter` with this
+///    manifest's `module_name` + modvars pointer.
+/// 4. Calls `fn_symbol()` (the AOT-lowered top-level body).
+/// 5. Restores via `wlift_aot_exit`.
+#[derive(Debug, Clone)]
+pub struct AotManifest {
+    pub fn_symbol: String,
+    pub modvars_symbol: String,
+    pub modvars_count: usize,
+    pub consts_symbol: String,
+    pub const_texts: Vec<String>,
+    pub module_name: String,
+}
+
 /// Lower a pre-walked list of modules into one native object file
-/// at `output`. Same emit shape as [`compile_path_to_object`] —
-/// extracted so the AOT build driver can hold onto the walker
-/// output (sources, request names) for the bootstrap shim while
-/// the same list drives the object emit.
+/// at `output`. Convenience wrapper over
+/// [`compile_modules_to_object_with_manifest`] for callers that
+/// only need the `.o`.
+pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result<(), AotError> {
+    compile_modules_to_object_with_manifest(modules, output).map(|_| ())
+}
+
+/// Lower a pre-walked list of modules into one native object file
+/// at `output`, returning a per-module manifest. The same `.o`
+/// also carries a Cranelift-emitted `main` function that
+/// orchestrates startup — runtime entry imports, per-module init
+/// data, AOT body dispatch — so the produced object links
+/// directly with `libwren_lift.a` into a runnable executable
+/// without any C bootstrap source.
 ///
 /// Modules must already be in dependency-first order; the entry
-/// is the last element. Symbol naming matches
-/// [`compile_path_to_object`]: entry → `wlift_aot_main`,
+/// is the last element. Symbol naming: entry → `wlift_aot_main`,
 /// dependencies → `wlift_aot_mod_<n>`.
-pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result<(), AotError> {
+pub fn compile_modules_to_object_with_manifest(
+    modules: &[AotModule],
+    output: &Path,
+) -> Result<Vec<AotManifest>, AotError> {
     if modules.is_empty() {
         return Err(AotError::Frontend("no modules to emit".into()));
     }
 
     let mut module = make_object_module()?;
     let last_idx = modules.len() - 1;
+    let mut manifests: Vec<AotManifest> = Vec::with_capacity(modules.len());
     for (idx, aot_mod) in modules.iter().enumerate() {
         let (fn_symbol, modvars_symbol, consts_symbol) = if idx == last_idx {
             (
@@ -587,20 +624,293 @@ pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result
                 format!("wlift_consts_{}", idx),
             )
         };
-        emit_aot_module(
+        let const_texts = emit_aot_module(
             &mut module,
             aot_mod,
             &fn_symbol,
             &modvars_symbol,
             &consts_symbol,
         )?;
+        manifests.push(AotManifest {
+            fn_symbol,
+            modvars_symbol,
+            modvars_count: aot_mod.module_var_count,
+            consts_symbol,
+            const_texts,
+            module_name: aot_mod.request_name.clone(),
+        });
     }
+
+    emit_aot_bootstrap_main(&mut module, &manifests)?;
 
     let product = module.finish();
     let bytes = product
         .emit()
         .map_err(|e| AotError::Module(e.to_string()))?;
     std::fs::write(output, &bytes).map_err(AotError::Io)?;
+    Ok(manifests)
+}
+
+/// Emit the program entry — `main(argc, argv)` — directly into
+/// the AOT object via Cranelift, alongside the per-module name
+/// strings and const-text bytes the entry references. The
+/// produced `.o` then links with `libwren_lift.a` in a single
+/// system-linker call, no C bootstrap source involved.
+///
+/// Shape of the emitted body, per manifest entry:
+///
+/// 1. `wlift_aot_init_prelude(vm, modvars_<i>, count_<i>)` —
+///    populates the prelude class slots so the AOT body can
+///    `GetModuleVar` for `System` / `Num` / etc. as direct
+///    `.bss` loads.
+/// 2. For each const text: `consts_<i>[k] = wlift_aot_alloc_const_string(...)`.
+/// 3. `wlift_aot_enter(vm, modvars_<i>, count_<i>, name_<i>, len, &saved)`.
+/// 4. `wlift_aot_<symbol>()` — runs the module's top-level.
+/// 5. `wlift_aot_exit(&saved)`.
+///
+/// `saved` is a 128-byte stack slot (`JitContext` is 80 bytes
+/// today; the headroom keeps the bootstrap stable across
+/// runtime additions).
+fn emit_aot_bootstrap_main(
+    module: &mut ObjectModule,
+    manifests: &[AotManifest],
+) -> Result<(), AotError> {
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind};
+    use cranelift_module::DataDescription;
+
+    let ptr_ty = module.target_config().pointer_type();
+    let cc = module.target_config().default_call_conv;
+
+    let declare_import = |module: &mut ObjectModule,
+                          name: &str,
+                          params: &[types::Type],
+                          ret: Option<types::Type>|
+     -> Result<cranelift_module::FuncId, AotError> {
+        let mut sig = Signature::new(cc);
+        for p in params {
+            sig.params.push(AbiParam::new(*p));
+        }
+        if let Some(r) = ret {
+            sig.returns.push(AbiParam::new(r));
+        }
+        module
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| AotError::Module(e.to_string()))
+    };
+
+    let wren_new_vm = declare_import(module, "wrenNewVM", &[ptr_ty], Some(ptr_ty))?;
+    let wren_free_vm = declare_import(module, "wrenFreeVM", &[ptr_ty], None)?;
+    let init_prelude = declare_import(
+        module,
+        "wlift_aot_init_prelude",
+        &[ptr_ty, ptr_ty, ptr_ty],
+        Some(types::I32),
+    )?;
+    let alloc_const = declare_import(
+        module,
+        "wlift_aot_alloc_const_string",
+        &[ptr_ty, ptr_ty, ptr_ty],
+        Some(types::I64),
+    )?;
+    let enter_ctx = declare_import(
+        module,
+        "wlift_aot_enter",
+        &[ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+        None,
+    )?;
+    let exit_ctx = declare_import(module, "wlift_aot_exit", &[ptr_ty], None)?;
+
+    // Emit per-module name + per-const text byte arrays as Data
+    // symbols. Each gets a trailing 0 so it's also valid as a
+    // C-string pointer if any future helper wants one.
+    let define_bytes = |module: &mut ObjectModule,
+                        name: &str,
+                        bytes: &[u8]|
+     -> Result<cranelift_module::DataId, AotError> {
+        let id = module
+            .declare_data(name, Linkage::Local, false, false)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        let mut desc = DataDescription::new();
+        let mut payload = bytes.to_vec();
+        payload.push(0);
+        desc.define(payload.into_boxed_slice());
+        module
+            .define_data(id, &desc)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        Ok(id)
+    };
+
+    // Per-manifest fn-import declarations + name/text data.
+    struct ManifestData {
+        fn_id: cranelift_module::FuncId,
+        modvars_id: cranelift_module::DataId,
+        consts_id: cranelift_module::DataId,
+        name_id: cranelift_module::DataId,
+        const_text_ids: Vec<cranelift_module::DataId>,
+        modvars_count: usize,
+        name_len: usize,
+        const_lens: Vec<usize>,
+    }
+    let mut per_module: Vec<ManifestData> = Vec::with_capacity(manifests.len());
+    for (i, m) in manifests.iter().enumerate() {
+        let mut fn_sig = Signature::new(cc);
+        fn_sig.returns.push(AbiParam::new(types::I64));
+        let fn_id = module
+            .declare_function(&m.fn_symbol, Linkage::Import, &fn_sig)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        // declare_data is idempotent — Cranelift hands back the
+        // existing DataId for the modvars/consts symbols already
+        // defined by emit_aot_module.
+        let modvars_id = module
+            .declare_data(&m.modvars_symbol, Linkage::Export, true, false)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        let consts_id = module
+            .declare_data(&m.consts_symbol, Linkage::Export, true, false)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        let name_id = define_bytes(
+            module,
+            &format!("wlift_modname_{}", i),
+            m.module_name.as_bytes(),
+        )?;
+        let mut const_text_ids = Vec::with_capacity(m.const_texts.len());
+        let mut const_lens = Vec::with_capacity(m.const_texts.len());
+        for (k, text) in m.const_texts.iter().enumerate() {
+            let id = define_bytes(
+                module,
+                &format!("wlift_const_text_{}_{}", i, k),
+                text.as_bytes(),
+            )?;
+            const_text_ids.push(id);
+            const_lens.push(text.len());
+        }
+        per_module.push(ManifestData {
+            fn_id,
+            modvars_id,
+            consts_id,
+            name_id,
+            const_text_ids,
+            modvars_count: m.modvars_count,
+            name_len: m.module_name.len(),
+            const_lens,
+        });
+    }
+
+    // ── main(argc, argv) -> i32 ──
+    let mut main_sig = Signature::new(cc);
+    main_sig.params.push(AbiParam::new(types::I32)); // argc
+    main_sig.params.push(AbiParam::new(ptr_ty)); // argv
+    main_sig.returns.push(AbiParam::new(types::I32));
+    let main_id = module
+        .declare_function("main", Linkage::Export, &main_sig)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+
+    let mut ctx = module.make_context();
+    ctx.func = Function::with_name_signature(UserFuncName::user(0, main_id.as_u32()), main_sig);
+    {
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry_block = builder.create_block();
+        let body_block = builder.create_block();
+        let exit_err_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+
+        // Stack slot for the JitContext save buffer (128 bytes —
+        // JitContext is 80 today, the headroom keeps the
+        // bootstrap stable across runtime additions).
+        let saved_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            128,
+            3, // 8-byte alignment (log2)
+        ));
+
+        // Resolve runtime imports inside main's scope.
+        let new_vm_ref = module.declare_func_in_func(wren_new_vm, builder.func);
+        let free_vm_ref = module.declare_func_in_func(wren_free_vm, builder.func);
+        let init_prelude_ref = module.declare_func_in_func(init_prelude, builder.func);
+        let alloc_const_ref = module.declare_func_in_func(alloc_const, builder.func);
+        let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
+        let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
+
+        // entry: vm = wrenNewVM(NULL); brif vm == 0 → err else body.
+        builder.switch_to_block(entry_block);
+        let null_cfg = builder.ins().iconst(ptr_ty, 0);
+        let vm_call = builder.ins().call(new_vm_ref, &[null_cfg]);
+        let vm = builder.inst_results(vm_call)[0];
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        let is_null = builder.ins().icmp(IntCC::Equal, vm, zero);
+        builder
+            .ins()
+            .brif(is_null, exit_err_block, &[], body_block, &[vm.into()]);
+
+        // body: per-module init + dispatch loop, then free + return 0.
+        builder.append_block_param(body_block, ptr_ty);
+        builder.switch_to_block(body_block);
+        let vm = builder.block_params(body_block)[0];
+        let saved_addr = builder.ins().stack_addr(ptr_ty, saved_slot, 0);
+
+        for m in &per_module {
+            let modvars_gv = module.declare_data_in_func(m.modvars_id, builder.func);
+            let consts_gv = module.declare_data_in_func(m.consts_id, builder.func);
+            let name_gv = module.declare_data_in_func(m.name_id, builder.func);
+
+            let modvars_addr = builder.ins().global_value(ptr_ty, modvars_gv);
+            let consts_addr = builder.ins().global_value(ptr_ty, consts_gv);
+            let name_addr = builder.ins().global_value(ptr_ty, name_gv);
+
+            let modvars_count = builder.ins().iconst(ptr_ty, m.modvars_count as i64);
+            let _ = builder
+                .ins()
+                .call(init_prelude_ref, &[vm, modvars_addr, modvars_count]);
+
+            for (k, text_id) in m.const_text_ids.iter().enumerate() {
+                let text_gv = module.declare_data_in_func(*text_id, builder.func);
+                let text_addr = builder.ins().global_value(ptr_ty, text_gv);
+                let len = builder.ins().iconst(ptr_ty, m.const_lens[k] as i64);
+                let alloc_call = builder.ins().call(alloc_const_ref, &[vm, text_addr, len]);
+                let str_val = builder.inst_results(alloc_call)[0];
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), str_val, consts_addr, (k as i32) * 8);
+            }
+
+            let name_len = builder.ins().iconst(ptr_ty, m.name_len as i64);
+            let _ = builder.ins().call(
+                enter_ref,
+                &[
+                    vm,
+                    modvars_addr,
+                    modvars_count,
+                    name_addr,
+                    name_len,
+                    saved_addr,
+                ],
+            );
+
+            let fn_ref = module.declare_func_in_func(m.fn_id, builder.func);
+            let _ = builder.ins().call(fn_ref, &[]);
+
+            let _ = builder.ins().call(exit_ref, &[saved_addr]);
+        }
+
+        let _ = builder.ins().call(free_vm_ref, &[vm]);
+        let zero_ret = builder.ins().iconst(types::I32, 0);
+        builder.ins().return_(&[zero_ret]);
+
+        // err: return 70 (RuntimeError exit code).
+        builder.switch_to_block(exit_err_block);
+        let err_val = builder.ins().iconst(types::I32, 70);
+        builder.ins().return_(&[err_val]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+
+    module
+        .define_function(main_id, &mut ctx)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+    module.clear_context(&mut ctx);
     Ok(())
 }
 
