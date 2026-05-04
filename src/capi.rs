@@ -635,6 +635,40 @@ pub unsafe extern "C" fn wlift_aot_install_class(
     0
 }
 
+/// Register an AOT-compiled closure body with the engine and
+/// return its assigned `FuncId` (zero-extended to `u64`). The
+/// AOT bootstrap calls this once per closure at startup,
+/// stashing the result in `wlift_closures_<n>[i]`. AOT-lowered
+/// `MakeClosure` then reads the slot to pass a valid runtime
+/// FuncId to `wren_make_closure_*`.
+///
+/// # Safety
+///
+/// `fn_ptr` must be a valid AOT-compiled closure body matching
+/// the standard `(receiver: u64, ...args: u64) -> u64` calling
+/// convention. The bootstrap takes the pointer from a
+/// `Linkage::Import` Cranelift FuncId, so the contract holds by
+/// construction.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_register_closure(
+    vm: *mut WrenVM,
+    arity: u8,
+    fn_ptr: *const u8,
+) -> u64 {
+    if vm.is_null() || fn_ptr.is_null() {
+        return u64::MAX;
+    }
+    let vm_ref = unsafe { &mut *vm };
+    // Closure bodies don't need a meaningful name in the engine —
+    // they're never looked up by name, only by FuncId. Reuse the
+    // interner's "<aot-closure>" sentinel.
+    let name_sym = vm_ref.interner.intern("<aot-closure>");
+    let func_id = vm_ref
+        .engine
+        .register_aot_function(name_sym, arity, fn_ptr, None);
+    func_id.0 as u64
+}
+
 /// Intern `name` in the VM's interner and return the resulting
 /// `SymbolId` (zero-extended to `u64`). The AOT bootstrap calls
 /// this once per symbol referenced by the module's body, stashing

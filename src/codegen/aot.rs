@@ -400,6 +400,13 @@ struct EmitAotResult {
     const_texts: Vec<String>,
     symbol_names: Vec<String>,
     classes: Vec<AotClassManifest>,
+    closures: Vec<AotClosureManifest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AotClosureManifest {
+    pub fn_symbol: String,
+    pub arity: u8,
 }
 
 fn emit_aot_module(
@@ -438,12 +445,21 @@ fn emit_aot_module(
         .declare_data(symbols_symbol, Linkage::Export, true, false)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
+    // Per-module closure FuncId slot table. One slot per closure
+    // in `aot_mod.mir.closures`, populated at startup by
+    // `wlift_aot_register_closure` calls.
+    let closures_symbol = format!("{}__closures_data", fn_symbol);
+    let closures_data = module
+        .declare_data(&closures_symbol, Linkage::Export, true, false)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+
     let aot_cfg = AotLoweringConfig {
         modvars_data,
         consts_data,
         const_strings: std::cell::RefCell::new(Vec::new()),
         symbols_data,
         symbol_remap: std::cell::RefCell::new(Vec::new()),
+        closures_data,
     };
 
     // Top-level body — the entry point Phase 7's init pass calls
@@ -503,19 +519,24 @@ fn emit_aot_module(
         }
     }
 
-    // Closure bodies — heap-allocated at runtime, so their
-    // upvalue access still calls `wren_get/set_upvalue` against
-    // the closure pointer threaded via TLS today. Step 4 changes
-    // the ABI to take the closure as a hidden first arg; until
-    // then those helpers stay as imports.
+    // Closure bodies — heap-allocated at runtime; the bootstrap
+    // registers each one via `wlift_aot_register_closure` to
+    // claim a runtime FuncId, populating the per-module slot
+    // table the AOT body's MakeClosure reads against.
+    let mut closure_manifest: Vec<AotClosureManifest> =
+        Vec::with_capacity(aot_mod.mir.closures.len());
     for (closure_idx, closure_mir) in aot_mod.mir.closures.iter().enumerate() {
         let sym = format!("{}__closure_{}", fn_symbol, closure_idx);
         emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym)?;
+        closure_manifest.push(AotClosureManifest {
+            fn_symbol: sym,
+            arity: closure_mir.arity,
+        });
     }
 
-    // Define the consts + symbols slot arrays now that we know
-    // how many entries each holds. Zero-fill — populated at
-    // startup by the per-module init pass.
+    // Define the consts + symbols + closures slot arrays now that
+    // we know how many entries each holds. Zero-fill — populated
+    // at startup by the per-module init pass.
     let const_strings = aot_cfg.const_strings.into_inner();
     let const_count = const_strings.len();
     let const_bytes = const_count.saturating_mul(8).max(8);
@@ -534,10 +555,19 @@ fn emit_aot_module(
         .define_data(symbols_data, &sym_desc)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
+    let closures_count = closure_manifest.len();
+    let closures_bytes = closures_count.saturating_mul(8).max(8);
+    let mut closures_desc = DataDescription::new();
+    closures_desc.define_zeroinit(closures_bytes);
+    module
+        .define_data(closures_data, &closures_desc)
+        .map_err(|e| AotError::Module(e.to_string()))?;
+
     Ok(EmitAotResult {
         const_texts: const_strings.into_iter().map(|(_, t)| t).collect(),
         symbol_names: symbol_remap.into_iter().map(|(_, t)| t).collect(),
         classes: classes_manifest,
+        closures: closure_manifest,
     })
 }
 
@@ -720,6 +750,14 @@ pub struct AotManifest {
     /// JIT install loop's cross-module value-resolution pass
     /// without dragging in the engine's `find_imported_var`.
     pub imports: Vec<AotImportBinding>,
+    /// Closure bodies (one per `MakeClosure` target in this
+    /// module's MIR). The bootstrap calls
+    /// `wlift_aot_register_closure` per entry at startup,
+    /// writing the resulting FuncId into the closure slot
+    /// table the AOT body's `MakeClosure` reads against.
+    pub closures: Vec<AotClosureManifest>,
+    /// Symbol of the `wlift_closures_<n>` slot table.
+    pub closures_symbol: String,
 }
 
 #[derive(Debug, Clone)]
@@ -783,6 +821,7 @@ pub fn compile_modules_to_object_with_manifest(
             &consts_symbol,
             &symbols_symbol,
         )?;
+        let closures_symbol = format!("{}__closures_data", fn_symbol);
         manifests.push(AotManifest {
             fn_symbol,
             modvars_symbol,
@@ -794,6 +833,8 @@ pub fn compile_modules_to_object_with_manifest(
             module_name: aot_mod.request_name.clone(),
             classes: emitted.classes,
             imports: Vec::new(),
+            closures: emitted.closures,
+            closures_symbol,
         });
     }
 
@@ -907,6 +948,12 @@ fn emit_aot_bootstrap_main(
         &[ptr_ty, ptr_ty, ptr_ty],
         Some(types::I64),
     )?;
+    let register_closure = declare_import(
+        module,
+        "wlift_aot_register_closure",
+        &[ptr_ty, types::I8, ptr_ty],
+        Some(types::I64),
+    )?;
     let install_class = declare_import(
         module,
         "wlift_aot_install_class",
@@ -990,6 +1037,12 @@ fn emit_aot_bootstrap_main(
         classes: Vec<ClassData>,
         // Per-import: (target_slot, source modvars DataId, source_slot).
         imports: Vec<(u32, cranelift_module::DataId, u32)>,
+        // Per-closure: (body FuncId import, arity). Bootstrap
+        // resolves each FuncId's address and registers via
+        // `wlift_aot_register_closure`, writing the returned
+        // engine FuncId into `closures_data[i]`.
+        closures_data_id: cranelift_module::DataId,
+        closures: Vec<(cranelift_module::FuncId, u8)>,
     }
     let mut per_module: Vec<ManifestData> = Vec::with_capacity(manifests.len());
     for (i, m) in manifests.iter().enumerate() {
@@ -1096,6 +1149,23 @@ fn emit_aot_bootstrap_main(
             imports.push((binding.target_slot, src_id, binding.source_slot));
         }
 
+        // Per-closure: declare each body fn import + carry arity.
+        let closures_data_id = module
+            .declare_data(&m.closures_symbol, Linkage::Export, true, false)
+            .map_err(|e| AotError::Module(e.to_string()))?;
+        let mut closures = Vec::with_capacity(m.closures.len());
+        for closure in &m.closures {
+            let mut sig = Signature::new(cc);
+            for _ in 0..(closure.arity as usize) {
+                sig.params.push(AbiParam::new(types::I64));
+            }
+            sig.returns.push(AbiParam::new(types::I64));
+            let body_id = module
+                .declare_function(&closure.fn_symbol, Linkage::Import, &sig)
+                .map_err(|e| AotError::Module(e.to_string()))?;
+            closures.push((body_id, closure.arity));
+        }
+
         per_module.push(ManifestData {
             fn_id,
             modvars_id,
@@ -1110,6 +1180,8 @@ fn emit_aot_bootstrap_main(
             symbol_lens,
             classes,
             imports,
+            closures_data_id,
+            closures,
         });
     }
 
@@ -1148,6 +1220,7 @@ fn emit_aot_bootstrap_main(
         let init_prelude_ref = module.declare_func_in_func(init_prelude, builder.func);
         let alloc_const_ref = module.declare_func_in_func(alloc_const, builder.func);
         let intern_symbol_ref = module.declare_func_in_func(intern_symbol, builder.func);
+        let register_closure_ref = module.declare_func_in_func(register_closure, builder.func);
         let install_class_ref = module.declare_func_in_func(install_class, builder.func);
         let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
@@ -1207,6 +1280,28 @@ fn emit_aot_bootstrap_main(
                 builder
                     .ins()
                     .store(MemFlags::trusted(), sym_val, symbols_addr, (k as i32) * 8);
+            }
+
+            // Register each closure body — `wren_make_closure_*`
+            // expects a runtime FuncId; AOT bakes a build-time
+            // index into `MakeClosure`, then loads the FuncId
+            // from this slot table at run time.
+            let closures_gv = module.declare_data_in_func(m.closures_data_id, builder.func);
+            let closures_addr = builder.ins().global_value(ptr_ty, closures_gv);
+            for (k, (body_id, arity)) in m.closures.iter().enumerate() {
+                let body_ref = module.declare_func_in_func(*body_id, builder.func);
+                let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
+                let arity_val = builder.ins().iconst(types::I8, *arity as i64);
+                let reg_call = builder
+                    .ins()
+                    .call(register_closure_ref, &[vm, arity_val, body_addr]);
+                let func_id_val = builder.inst_results(reg_call)[0];
+                builder.ins().store(
+                    MemFlags::trusted(),
+                    func_id_val,
+                    closures_addr,
+                    (k as i32) * 8,
+                );
             }
 
             // Cross-module import copies. Earlier manifest loop

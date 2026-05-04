@@ -977,6 +977,17 @@ pub mod cl {
         /// in the VM's interner at startup, populating the slot
         /// array.
         pub symbol_remap: std::cell::RefCell<Vec<(u32, String)>>,
+
+        /// `DataId` for this module's closure FuncId slot
+        /// table (`wlift_closures_<n>`). MIR's
+        /// `Instruction::MakeClosure { fn_id, .. }` carries a
+        /// build-time-relative index into `ModuleMir::closures`
+        /// — the JIT path patches these to engine FuncIds at
+        /// install time (`patch_closure_ids` in vm.rs); AOT
+        /// can't bake real FuncIds, so it loads them from this
+        /// slot array, populated at startup by
+        /// `wlift_aot_register_closure`.
+        pub closures_data: cranelift_module::DataId,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -2374,6 +2385,15 @@ pub mod cl {
             }
 
             // === Closures ===
+            //
+            // AOT mode: MIR's `fn_id` is a build-time-relative
+            // index into `ModuleMir::closures` (the JIT path
+            // patches these into engine FuncIds at install time
+            // via `patch_closure_ids`; AOT skips that pass).
+            // Read the runtime FuncId from
+            // `wlift_closures_<n>[fn_id]` — the bootstrap calls
+            // `wlift_aot_register_closure` once per closure at
+            // startup, populating the slot.
             Instruction::MakeClosure { fn_id, upvalues } => {
                 let name = match upvalues.len() {
                     0 => "wren_make_closure_0",
@@ -2383,7 +2403,15 @@ pub mod cl {
                     _ => "wren_make_closure_4",
                 };
                 let f = get_runtime_fn(module, builder, name, 1 + upvalues.len().min(4))?;
-                let fn_id_val = builder.ins().iconst(types::I64, *fn_id as i64);
+                let fn_id_val = if let Some(cfg) = aot_config {
+                    let gv = module.declare_data_in_func(cfg.closures_data, builder.func);
+                    let base = builder.ins().global_value(types::I64, gv);
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), base, (*fn_id as i32) * 8)
+                } else {
+                    builder.ins().iconst(types::I64, *fn_id as i64)
+                };
                 let mut args = vec![fn_id_val];
                 for uv in upvalues.iter().take(4) {
                     args.push(get(uv));
