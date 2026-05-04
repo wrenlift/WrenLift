@@ -827,6 +827,25 @@ impl ExecutionEngine {
             .and_then(|m| m.as_ref())
     }
 
+    /// Register an AOT-compiled function — claim a `FuncId` and pre-fill
+    /// `jit_code[id]` with the native pointer so the existing JIT
+    /// dispatch path drives the call without ever walking MIR. The
+    /// stub `MirFunction` keeps the engine's per-function vectors
+    /// (tier_states, jit_metadata, …) in lock-step; runtime helpers
+    /// consult the slot via fn_id but never read the empty body.
+    pub fn register_aot_function(
+        &mut self,
+        name: SymbolId,
+        arity: u8,
+        fn_ptr: *const u8,
+        module: Option<Rc<String>>,
+    ) -> FuncId {
+        let mir = MirFunction::new(name, arity);
+        let id = self.register_function_in(mir, module);
+        self.jit_code[id.0 as usize] = fn_ptr;
+        id
+    }
+
     /// Install a wasm-tier-up dispatch slot for `id`. Stored as
     /// `slot + 1` internally so `0` means "not compiled" and we
     /// can use a plain `Vec<u32>` instead of `Vec<Option<u32>>`.

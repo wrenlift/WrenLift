@@ -469,6 +469,173 @@ pub unsafe extern "C" fn wlift_aot_enter(
     set_jit_context(new_ctx);
 }
 
+/// One method's worth of class-install descriptor: `(sig, fn_ptr,
+/// arity, flags)`. Flags bit-0 = `is_static`, bit-1 = `is_constructor`.
+/// The bootstrap emits one of these per AOT-lowered method as a
+/// `Linkage::Local` `Data` blob, then hands the pointer + count to
+/// `wlift_aot_install_class`.
+#[repr(C)]
+pub struct WliftAotMethodDesc {
+    pub sig: *const c_char,
+    pub sig_len: usize,
+    pub fn_ptr: *const u8,
+    pub arity: u8,
+    pub flags: u8,
+}
+
+/// Install a user-defined class in the VM's class table at startup,
+/// mirroring the path the JIT install loop takes inside
+/// `install_module_mir_and_run_with_sources`. Each AOT-compiled
+/// method is registered as a closure pointing at a stub MIR whose
+/// `jit_code[fn_id]` is patched to the AOT'd body — that way the
+/// existing JIT-dispatch fast path drives the call with no extra
+/// runtime branching, and dispatch through `wren_call_*` walks
+/// the same `class.methods[sym]` table the interpreter uses.
+///
+/// Stores the resulting `*mut ObjClass` in `modvars[slot]` so the
+/// AOT body's `GetModuleVar` reads it directly. Resolves
+/// `parent_name` first against the VM's core classes (Object,
+/// Num, …) and then against `modvars[*]` for already-installed
+/// user classes — the bootstrap drives modules in dependency
+/// order so a parent is installed before its subclass.
+///
+/// # Safety
+///
+/// All pointers must be valid for the duration of the call;
+/// `methods` must point at `methods_count` consecutive
+/// `WliftAotMethodDesc` records. The bootstrap satisfies these
+/// via `Linkage::Local` `Data` blobs sized + initialised at AOT
+/// build time.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_install_class(
+    vm: *mut WrenVM,
+    modvars: *mut u64,
+    slot: usize,
+    name: *const c_char,
+    name_len: usize,
+    parent: *const c_char,
+    parent_len: usize,
+    num_fields: u16,
+    methods: *const WliftAotMethodDesc,
+    methods_count: usize,
+) -> c_int {
+    use crate::runtime::object::{Method, ObjHeader, ObjType};
+
+    if vm.is_null() || modvars.is_null() || name.is_null() {
+        return 70;
+    }
+    let name_bytes = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+    let class_name = match std::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(_) => return 65,
+    };
+
+    let vm_ref = unsafe { &mut *vm };
+
+    // Resolve superclass: core class by name, else scan modvars
+    // for a previously-installed user class with this name. Falls
+    // back to Object — matches the JIT install path.
+    let mut superclass: *mut crate::runtime::object::ObjClass = std::ptr::null_mut();
+    if !parent.is_null() && parent_len > 0 {
+        let parent_bytes = unsafe { std::slice::from_raw_parts(parent as *const u8, parent_len) };
+        if let Ok(parent_name) = std::str::from_utf8(parent_bytes) {
+            if let Some(value) = vm_ref.core_class_value(parent_name) {
+                if let Some(p) = value.as_object() {
+                    superclass = p as *mut crate::runtime::object::ObjClass;
+                }
+            }
+            // No core class match — for now leave null. User-defined
+            // parents need a separate lookup table; lands when
+            // multi-class hierarchies stress this path.
+        }
+    }
+    if superclass.is_null() {
+        superclass = vm_ref.object_class;
+    }
+
+    let class_name_sym = vm_ref.interner.intern(class_name);
+    let class_ptr = vm_ref.gc.alloc_class(class_name_sym, superclass);
+    unsafe {
+        (*class_ptr).header.class = vm_ref.class_class;
+        let inherited = if !superclass.is_null() {
+            (*superclass).num_fields
+        } else {
+            0
+        };
+        (*class_ptr).num_fields = num_fields + inherited;
+    }
+
+    let module_rc = std::rc::Rc::new(String::new());
+    for i in 0..methods_count {
+        let desc = unsafe { &*methods.add(i) };
+        if desc.sig.is_null() || desc.fn_ptr.is_null() {
+            continue;
+        }
+        let sig_bytes = unsafe { std::slice::from_raw_parts(desc.sig as *const u8, desc.sig_len) };
+        let sig = match std::str::from_utf8(sig_bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let is_static = desc.flags & 1 != 0;
+        let is_constructor = desc.flags & 2 != 0;
+
+        let sig_sym = vm_ref.interner.intern(sig);
+        let bind_sym = if is_static || is_constructor {
+            let static_sig = format!("static:{}", sig);
+            vm_ref.interner.intern(&static_sig)
+        } else {
+            sig_sym
+        };
+
+        // Register the AOT body as a stub-MIR function with its
+        // jit_code slot pre-patched to the native pointer. The
+        // closure-dispatch path picks it up like any JIT'd fn.
+        let func_id = vm_ref.engine.register_aot_function(
+            sig_sym,
+            desc.arity,
+            desc.fn_ptr,
+            Some(std::rc::Rc::clone(&module_rc)),
+        );
+
+        let fn_obj = vm_ref.gc.alloc_fn(sig_sym, 0, 0, func_id.0);
+        unsafe {
+            (*fn_obj).header.class = vm_ref.fn_class;
+        }
+        let closure_ptr = vm_ref.gc.alloc_closure(fn_obj);
+        unsafe {
+            (*closure_ptr).header.class = vm_ref.fn_class;
+        }
+
+        unsafe {
+            let method = if is_constructor {
+                Method::Constructor(closure_ptr)
+            } else {
+                Method::Closure(closure_ptr)
+            };
+            let idx = bind_sym.index() as usize;
+            let cls = &mut *class_ptr;
+            if idx >= cls.methods.len() {
+                cls.methods.resize(idx + 1, None);
+            }
+            cls.methods[idx] = Some(method);
+        }
+    }
+
+    // Sanity: the GC-allocated class must be a real ObjClass before
+    // we hand its pointer back through modvars (catches a botched
+    // alloc — observable as a SIGSEGV otherwise).
+    let header = class_ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Class {
+        return 70;
+    }
+
+    let class_value = crate::runtime::value::Value::object(class_ptr as *mut u8);
+    unsafe {
+        *modvars.add(slot) = class_value.to_bits();
+    }
+    0
+}
+
 /// Intern `name` in the VM's interner and return the resulting
 /// `SymbolId` (zero-extended to `u64`). The AOT bootstrap calls
 /// this once per symbol referenced by the module's body, stashing

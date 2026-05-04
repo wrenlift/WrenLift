@@ -118,6 +118,18 @@ pub struct AotModule {
     /// AOT emitter has to declare it `module_var_count * 8` bytes
     /// wide.
     pub module_var_count: usize,
+    /// Resolved name per module-var slot. Position in the vec =
+    /// slot index in `wlift_modvars_<n>`. The class-install pass
+    /// looks up each class's `name` here to find which slot the
+    /// installed `*mut ObjClass` should land in.
+    pub module_var_names: Vec<String>,
+    /// Per-slot import source — `Some(path)` when the slot was
+    /// declared via `import "<path>" for <name>`, `None` for
+    /// locally-defined or prelude vars. The bootstrap reads this
+    /// to know which dependency's modvars to copy from at
+    /// startup, replicating the cross-module class-binding the
+    /// JIT install loop does inline.
+    pub module_var_sources: Vec<Option<String>>,
     pub mir: ModuleMir,
     pub interner: Interner,
 }
@@ -256,6 +268,12 @@ fn walk_module(
     }
 
     let module_var_count = resolved.module_vars.len();
+    let module_var_names: Vec<String> = resolved
+        .module_vars
+        .iter()
+        .map(|sym| interner.resolve(*sym).to_string())
+        .collect();
+    let module_var_sources = resolved.module_var_sources.clone();
     let (module_mir, new_layouts) =
         lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, field_layouts);
     for (k, v) in new_layouts {
@@ -267,6 +285,8 @@ fn walk_module(
         request_name: request_name.to_string(),
         source: source_bytes.to_vec(),
         module_var_count,
+        module_var_names,
+        module_var_sources,
         mir: module_mir,
         interner,
     });
@@ -379,6 +399,7 @@ fn emit_aot_function(
 struct EmitAotResult {
     const_texts: Vec<String>,
     symbol_names: Vec<String>,
+    classes: Vec<AotClassManifest>,
 }
 
 fn emit_aot_module(
@@ -436,16 +457,44 @@ fn emit_aot_module(
     )?;
 
     // Each class's methods. Methods share the module's `modvars`
-    // and `consts` symbols, but their bodies will additionally
-    // need static-field addressing (step 4) and a static class
-    // metadata pointer (step 6). For now, any `wren_get_static_*`
-    // or `wren_call_*` site falls through to the runtime helper
-    // import — those externs persist in the produced `.o` until
-    // the corresponding step lands.
+    // and `consts` symbols. Per-method symbols flow back into
+    // the class manifest the bootstrap consumes to install the
+    // class via `wlift_aot_install_class` — same FuncId-shaped
+    // dispatch as the JIT install path, but the method bodies
+    // are AOT-emitted symbols instead of JIT-tier-up MIR.
+    let mut classes_manifest: Vec<AotClassManifest> = Vec::with_capacity(aot_mod.mir.classes.len());
     for (class_idx, class) in aot_mod.mir.classes.iter().enumerate() {
+        let class_name = aot_mod.interner.resolve(class.name).to_string();
+        let parent_name = class
+            .superclass
+            .map(|sym| aot_mod.interner.resolve(sym).to_string());
+        let slot = aot_mod
+            .module_var_names
+            .iter()
+            .position(|n| n == &class_name)
+            .unwrap_or(usize::MAX);
+
+        let mut methods_manifest: Vec<AotMethodManifest> = Vec::with_capacity(class.methods.len());
         for (method_idx, method) in class.methods.iter().enumerate() {
             let sym = format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx);
             emit_aot_function(module, &aot_mod.interner, &method.mir, &aot_cfg, &sym)?;
+            methods_manifest.push(AotMethodManifest {
+                signature: method.signature.clone(),
+                fn_symbol: sym,
+                arity: method.mir.arity,
+                is_static: method.is_static,
+                is_constructor: method.is_constructor,
+            });
+        }
+
+        if slot != usize::MAX {
+            classes_manifest.push(AotClassManifest {
+                name: class_name,
+                parent_name,
+                num_fields: class.num_fields,
+                slot: slot as u32,
+                methods: methods_manifest,
+            });
         }
     }
 
@@ -483,6 +532,7 @@ fn emit_aot_module(
     Ok(EmitAotResult {
         const_texts: const_strings.into_iter().map(|(_, t)| t).collect(),
         symbol_names: symbol_remap.into_iter().map(|(_, t)| t).collect(),
+        classes: classes_manifest,
     })
 }
 
@@ -524,11 +574,19 @@ fn build_single_aot_module(source: &str, name: &str) -> Result<AotModule, AotErr
     let (module_mir, _new_layouts) =
         lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, &field_layouts);
 
+    let module_var_names: Vec<String> = resolved
+        .module_vars
+        .iter()
+        .map(|sym| interner.resolve(*sym).to_string())
+        .collect();
+    let module_var_sources = resolved.module_var_sources.clone();
     Ok(AotModule {
         name: name.to_string(),
         request_name: name.to_string(),
         source: source.as_bytes().to_vec(),
         module_var_count: resolved.module_vars.len(),
+        module_var_names,
+        module_var_sources,
         mir: module_mir,
         interner,
     })
@@ -597,6 +655,35 @@ pub fn compile_path_to_object(entry_path: &Path, output: &Path) -> Result<(), Ao
 /// 4. Calls `fn_symbol()` (the AOT-lowered top-level body).
 /// 5. Restores via `wlift_aot_exit`.
 #[derive(Debug, Clone)]
+pub struct AotMethodManifest {
+    /// Wren method signature (e.g. `"greet(_)"`, `"value"`).
+    pub signature: String,
+    /// AOT-emitted symbol the bootstrap hands to
+    /// `wlift_aot_install_class` as the method body's function
+    /// pointer.
+    pub fn_symbol: String,
+    /// Wren-visible parameter count (excludes the implicit
+    /// receiver). The dispatch helper passes args as positional
+    /// `u64`s; the AOT body's signature is
+    /// `(receiver, arg0, …, arg_{arity-1}) -> u64`.
+    pub arity: u8,
+    pub is_static: bool,
+    pub is_constructor: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AotClassManifest {
+    pub name: String,
+    pub parent_name: Option<String>,
+    pub num_fields: u16,
+    /// Module-var slot the bootstrap writes the installed class
+    /// pointer into so AOT bodies' `GetModuleVar(slot)` reads
+    /// the right `*mut ObjClass` at the use site.
+    pub slot: u32,
+    pub methods: Vec<AotMethodManifest>,
+}
+
+#[derive(Debug, Clone)]
 pub struct AotManifest {
     pub fn_symbol: String,
     pub modvars_symbol: String,
@@ -613,6 +700,21 @@ pub struct AotManifest {
     pub symbols_symbol: String,
     pub symbol_names: Vec<String>,
     pub module_name: String,
+    pub classes: Vec<AotClassManifest>,
+    /// Cross-module import bindings — each entry directs the
+    /// bootstrap to copy `source_modvars[source_slot]` into
+    /// this module's `modvars[target_slot]` after the source
+    /// module's classes have been installed. Replicates the
+    /// JIT install loop's cross-module value-resolution pass
+    /// without dragging in the engine's `find_imported_var`.
+    pub imports: Vec<AotImportBinding>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AotImportBinding {
+    pub target_slot: u32,
+    pub source_modvars_symbol: String,
+    pub source_slot: u32,
 }
 
 /// Lower a pre-walked list of modules into one native object file
@@ -678,7 +780,41 @@ pub fn compile_modules_to_object_with_manifest(
             symbols_symbol,
             symbol_names: emitted.symbol_names,
             module_name: aot_mod.request_name.clone(),
+            classes: emitted.classes,
+            imports: Vec::new(),
         });
+    }
+
+    // Resolve cross-module imports: each module's resolver gave us
+    // a per-slot `Option<source_path>`. Walk those once we have
+    // every manifest in hand so a `Some(path)` can resolve to the
+    // dependency's modvars symbol + slot, and the bootstrap emits
+    // a direct copy without any runtime name lookup.
+    for (idx, aot_mod) in modules.iter().enumerate() {
+        let mut bindings: Vec<AotImportBinding> = Vec::new();
+        for (slot, source) in aot_mod.module_var_sources.iter().enumerate() {
+            let Some(source_path) = source else { continue };
+            let var_name = &aot_mod.module_var_names[slot];
+
+            // Match against any earlier-installed module sharing
+            // the import path. Dependency-first walker order
+            // guarantees the source has been emitted by the time
+            // we get here.
+            let matched = manifests
+                .iter()
+                .take(idx)
+                .find(|src| &src.module_name == source_path);
+            if let Some(src) = matched {
+                if let Some(src_class) = src.classes.iter().find(|c| &c.name == var_name) {
+                    bindings.push(AotImportBinding {
+                        target_slot: slot as u32,
+                        source_modvars_symbol: src.modvars_symbol.clone(),
+                        source_slot: src_class.slot,
+                    });
+                }
+            }
+        }
+        manifests[idx].imports = bindings;
     }
 
     emit_aot_bootstrap_main(&mut module, &manifests)?;
@@ -759,6 +895,23 @@ fn emit_aot_bootstrap_main(
         &[ptr_ty, ptr_ty, ptr_ty],
         Some(types::I64),
     )?;
+    let install_class = declare_import(
+        module,
+        "wlift_aot_install_class",
+        &[
+            ptr_ty,
+            ptr_ty,
+            ptr_ty,
+            ptr_ty,
+            ptr_ty,
+            ptr_ty,
+            ptr_ty,
+            types::I32,
+            ptr_ty,
+            ptr_ty,
+        ],
+        Some(types::I32),
+    )?;
     let enter_ctx = declare_import(
         module,
         "wlift_aot_enter",
@@ -788,6 +941,25 @@ fn emit_aot_bootstrap_main(
     };
 
     // Per-manifest fn-import declarations + name/text data.
+    struct ClassData {
+        name_id: cranelift_module::DataId,
+        name_len: usize,
+        parent_id: Option<cranelift_module::DataId>,
+        parent_len: usize,
+        slot: u32,
+        num_fields: u16,
+        // Per-method: (sig DataId, sig_len, body FuncId, arity, flags).
+        // The bootstrap stack-allocates an array of `WliftAotMethodDesc`s
+        // and fills it from these references, then hands the array to
+        // `wlift_aot_install_class`.
+        methods: Vec<(
+            cranelift_module::DataId,
+            usize,
+            cranelift_module::FuncId,
+            u8,
+            u8,
+        )>,
+    }
     struct ManifestData {
         fn_id: cranelift_module::FuncId,
         modvars_id: cranelift_module::DataId,
@@ -800,6 +972,9 @@ fn emit_aot_bootstrap_main(
         name_len: usize,
         const_lens: Vec<usize>,
         symbol_lens: Vec<usize>,
+        classes: Vec<ClassData>,
+        // Per-import: (target_slot, source modvars DataId, source_slot).
+        imports: Vec<(u32, cranelift_module::DataId, u32)>,
     }
     let mut per_module: Vec<ManifestData> = Vec::with_capacity(manifests.len());
     for (i, m) in manifests.iter().enumerate() {
@@ -847,6 +1022,76 @@ fn emit_aot_bootstrap_main(
             symbol_name_ids.push(id);
             symbol_lens.push(name.len());
         }
+
+        // Per-class metadata: class name, parent name, method
+        // signatures + body function ids. The bootstrap builds
+        // per-class descriptor arrays on the stack at startup
+        // (each `WliftAotMethodDesc` is 32 bytes) and hands the
+        // pointer to `wlift_aot_install_class`.
+        let mut classes = Vec::with_capacity(m.classes.len());
+        for (c_idx, class) in m.classes.iter().enumerate() {
+            let name_id = define_bytes(
+                module,
+                &format!("wlift_classname_{}_{}", i, c_idx),
+                class.name.as_bytes(),
+            )?;
+            let (parent_id, parent_len) = match &class.parent_name {
+                Some(p) => {
+                    let id = define_bytes(
+                        module,
+                        &format!("wlift_classparent_{}_{}", i, c_idx),
+                        p.as_bytes(),
+                    )?;
+                    (Some(id), p.len())
+                }
+                None => (None, 0),
+            };
+            let mut methods = Vec::with_capacity(class.methods.len());
+            for (m_idx, method) in class.methods.iter().enumerate() {
+                let sig_id = define_bytes(
+                    module,
+                    &format!("wlift_methodsig_{}_{}_{}", i, c_idx, m_idx),
+                    method.signature.as_bytes(),
+                )?;
+                let mut body_sig = Signature::new(cc);
+                for _ in 0..(method.arity as usize) {
+                    body_sig.params.push(AbiParam::new(types::I64));
+                }
+                body_sig.returns.push(AbiParam::new(types::I64));
+                let body_id = module
+                    .declare_function(&method.fn_symbol, Linkage::Import, &body_sig)
+                    .map_err(|e| AotError::Module(e.to_string()))?;
+                let mut flags: u8 = 0;
+                if method.is_static {
+                    flags |= 1;
+                }
+                if method.is_constructor {
+                    flags |= 2;
+                }
+                methods.push((sig_id, method.signature.len(), body_id, method.arity, flags));
+            }
+            classes.push(ClassData {
+                name_id,
+                name_len: class.name.len(),
+                parent_id,
+                parent_len,
+                slot: class.slot,
+                num_fields: class.num_fields,
+                methods,
+            });
+        }
+        // Per-import: resolve each binding's source modvars
+        // symbol back to a `DataId` for `declare_data_in_func`
+        // inside main(). `declare_data` is idempotent — we reuse
+        // the existing entry rather than redefining.
+        let mut imports = Vec::with_capacity(m.imports.len());
+        for binding in &m.imports {
+            let src_id = module
+                .declare_data(&binding.source_modvars_symbol, Linkage::Export, true, false)
+                .map_err(|e| AotError::Module(e.to_string()))?;
+            imports.push((binding.target_slot, src_id, binding.source_slot));
+        }
+
         per_module.push(ManifestData {
             fn_id,
             modvars_id,
@@ -859,6 +1104,8 @@ fn emit_aot_bootstrap_main(
             name_len: m.module_name.len(),
             const_lens,
             symbol_lens,
+            classes,
+            imports,
         });
     }
 
@@ -897,6 +1144,7 @@ fn emit_aot_bootstrap_main(
         let init_prelude_ref = module.declare_func_in_func(init_prelude, builder.func);
         let alloc_const_ref = module.declare_func_in_func(alloc_const, builder.func);
         let intern_symbol_ref = module.declare_func_in_func(intern_symbol, builder.func);
+        let install_class_ref = module.declare_func_in_func(install_class, builder.func);
         let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
 
@@ -955,6 +1203,104 @@ fn emit_aot_bootstrap_main(
                 builder
                     .ins()
                     .store(MemFlags::trusted(), sym_val, symbols_addr, (k as i32) * 8);
+            }
+
+            // Cross-module import copies. Earlier manifest loop
+            // order means the source module's classes are already
+            // installed in its modvars by the time this runs; we
+            // just pull each pointer across by slot.
+            for (target_slot, src_id, source_slot) in &m.imports {
+                let src_gv = module.declare_data_in_func(*src_id, builder.func);
+                let src_addr = builder.ins().global_value(ptr_ty, src_gv);
+                let val = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    src_addr,
+                    (*source_slot as i32) * 8,
+                );
+                builder.ins().store(
+                    MemFlags::trusted(),
+                    val,
+                    modvars_addr,
+                    (*target_slot as i32) * 8,
+                );
+            }
+
+            // Install user classes — each gets a stack-allocated
+            // descriptor array (32 bytes per method) the bootstrap
+            // hands to `wlift_aot_install_class`. The runtime
+            // builds the `*mut ObjClass`, registers each method
+            // body via `register_aot_function`, and writes the
+            // class pointer into modvars[slot] so AOT bodies'
+            // `GetModuleVar` reads it directly.
+            for class in &m.classes {
+                let descs_size = (class.methods.len() * 32).max(8) as u32;
+                let descs_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    descs_size,
+                    3,
+                ));
+                let descs_addr = builder.ins().stack_addr(ptr_ty, descs_slot, 0);
+
+                for (m_idx, (sig_id, sig_len, body_id, arity, flags)) in
+                    class.methods.iter().enumerate()
+                {
+                    let sig_gv = module.declare_data_in_func(*sig_id, builder.func);
+                    let sig_addr = builder.ins().global_value(ptr_ty, sig_gv);
+                    let body_ref = module.declare_func_in_func(*body_id, builder.func);
+                    let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
+
+                    let off = (m_idx * 32) as i32;
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), sig_addr, descs_addr, off);
+                    let len_val = builder.ins().iconst(ptr_ty, *sig_len as i64);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), len_val, descs_addr, off + 8);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), body_addr, descs_addr, off + 16);
+                    let arity_val = builder.ins().iconst(types::I8, *arity as i64);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), arity_val, descs_addr, off + 24);
+                    let flags_val = builder.ins().iconst(types::I8, *flags as i64);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), flags_val, descs_addr, off + 25);
+                }
+
+                let class_name_gv = module.declare_data_in_func(class.name_id, builder.func);
+                let class_name_addr = builder.ins().global_value(ptr_ty, class_name_gv);
+                let parent_addr = match class.parent_id {
+                    Some(id) => {
+                        let pgv = module.declare_data_in_func(id, builder.func);
+                        builder.ins().global_value(ptr_ty, pgv)
+                    }
+                    None => builder.ins().iconst(ptr_ty, 0),
+                };
+                let slot_val = builder.ins().iconst(ptr_ty, class.slot as i64);
+                let class_name_len = builder.ins().iconst(ptr_ty, class.name_len as i64);
+                let parent_name_len = builder.ins().iconst(ptr_ty, class.parent_len as i64);
+                let num_fields_val = builder.ins().iconst(types::I32, class.num_fields as i64);
+                let methods_count = builder.ins().iconst(ptr_ty, class.methods.len() as i64);
+
+                let _ = builder.ins().call(
+                    install_class_ref,
+                    &[
+                        vm,
+                        modvars_addr,
+                        slot_val,
+                        class_name_addr,
+                        class_name_len,
+                        parent_addr,
+                        parent_name_len,
+                        num_fields_val,
+                        descs_addr,
+                        methods_count,
+                    ],
+                );
             }
 
             let name_len = builder.ins().iconst(ptr_ty, m.name_len as i64);
