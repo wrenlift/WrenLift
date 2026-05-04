@@ -1,27 +1,28 @@
 //! AOT object-file emission — Cranelift's `ObjectModule` swap-in
 //! for the production JIT path.
 //!
-//! Phase 1 of the AOT plan: prove the object pipeline lights up
-//! end-to-end. Compile a single trivial Wren function to a
-//! native `.o` file (no linker yet, no whole-module graph yet,
-//! no runtime statically linked) and confirm the mangled symbol
-//! lands on disk where `nm` can see it.
+//! Drives the same parser → sema → MIR → CLIF translator the JIT
+//! uses, but hands the lowered function to a `cranelift_object::
+//! ObjectModule` (writes a `.o` to disk) instead of the
+//! `cranelift_jit::JITModule` (mutates executable memory in
+//! place). The shared translator lives in
+//! `cranelift_backend::cl::lower_mir_to_module` — see Phase-2 of
+//! the AOT plan: `cranelift_module::Module` is dyn-safe, so JIT
+//! and AOT share the per-instruction lowering as a `&mut dyn
+//! Module` parameter without cloning the codegen.
 //!
-//! Later phases generalise the same pipeline over the entire
-//! parsed module + ship a linked executable. The Cranelift IR
-//! emitted here is intentionally minimal: a single
-//! `wlift_aot_main_<hash>` function returning a hardcoded `i64`,
-//! which is enough to sanity-check that
+//! Today's surface compiles ONE function — the entry point of
+//! the parsed Wren source. Phase 3 walks the whole import graph
+//! and links every reachable module's lowered MIR into a single
+//! object file. Phase 4 hands the object to a system linker
+//! alongside the runtime `staticlib` to land a self-contained
+//! executable.
 //!
-//! - the `cranelift-object` dep links into the workspace,
-//! - the host triple resolves to a backend Cranelift can target,
-//! - the resulting object file's symbol table contains the
-//!   exported function.
-//!
-//! Once the whole-module Cranelift translator path lands (Phase 2
-//! deliverable), the body fill-in here is replaced by the same
-//! MIR-to-CLIF code the JIT uses; only the `Module` trait impl
-//! differs.
+//! IC pointers, code-base, and OSR-entry signals are JIT-only —
+//! they patch self-call sites, on-stack replacement entries, and
+//! inline-cache snapshots into mutable JIT memory. AOT outputs
+//! go through a static linker, so we pass `None` for all three
+//! and emit a clean object instead.
 //!
 //! Behind `feature = "aot"` so the production crate stays
 //! untouched. Pulled in via `cargo build --features aot` or by
@@ -29,12 +30,18 @@
 
 use std::path::Path;
 
-use cranelift_codegen::ir::{types, AbiParam, Function, InstBuilder, Signature, UserFuncName};
+use cranelift_codegen::ir::{types, AbiParam, Function, Signature, UserFuncName};
 use cranelift_codegen::isa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+
+use crate::codegen::cranelift_backend::cl::lower_mir_to_module;
+use crate::intern::Interner;
+use crate::mir::builder::lower_module_with_known_classes;
+use crate::parse::parser::parse;
+use crate::sema::resolve::resolve_with_prelude;
 
 /// Errors the AOT pipeline can surface up to the CLI.
 #[derive(Debug)]
@@ -51,6 +58,11 @@ pub enum AotError {
     Module(String),
     /// `std::fs::write` couldn't write the object bytes.
     Io(std::io::Error),
+    /// Wren parse / sema / MIR-build error chain. Joined into a
+    /// single string at the AOT boundary so the CLI's
+    /// error-reporting path doesn't need to crack open each
+    /// frontend's diagnostic shape.
+    Frontend(String),
 }
 
 impl std::fmt::Display for AotError {
@@ -60,27 +72,72 @@ impl std::fmt::Display for AotError {
             AotError::Isa(m) => write!(f, "cranelift ISA setup failed: {}", m),
             AotError::Module(m) => write!(f, "cranelift module operation failed: {}", m),
             AotError::Io(e) => write!(f, "writing object file: {}", e),
+            AotError::Frontend(m) => write!(f, "wren frontend: {}", m),
         }
     }
 }
 
 impl std::error::Error for AotError {}
 
-/// Compile a stub Wren snippet to a native object file at
-/// `output`. Phase-1 stub: emits a single function named
-/// `wlift_aot_main` that returns the literal `42` so the host
-/// process can `nm` the result and confirm the symbol exists.
+/// Compile Wren `source` to a native object file at `output`.
 ///
-/// The `_source` argument is held for shape parity with the
-/// future full-pipeline entry point; today's body is hardcoded.
-/// Replace the body fill-in with the existing MIR-to-CLIF
-/// translator once we've shared codegen across JIT + AOT
-/// (Phase 2).
-pub fn compile_to_object(_source: &str, output: &Path) -> Result<(), AotError> {
+/// Pipeline:
+///
+/// 1. Parse + sema + MIR-build the source through the same
+///    crate-level entry points the JIT path uses.
+/// 2. Pick the module's top-level function as the AOT entry
+///    point (`wlift_aot_main`) — the body that runs every
+///    statement at the top of a `.wren` file. Phase 3 generalises
+///    to every reachable function in the module graph.
+/// 3. Spin up an `ObjectModule` for the host triple, declare the
+///    entry function as `Linkage::Export`, and call the shared
+///    JIT/AOT translator (`cranelift_backend::cl::lower_mir_to_module`)
+///    with the same `&mut dyn Module` plumbing the JIT uses.
+/// 4. Finalise the module, emit the object bytes, write to
+///    `output`.
+pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
+    // -- 1. Frontend: parse → sema → MIR --------------------------
+    let parsed = parse(source);
+    if !parsed.errors.is_empty() {
+        return Err(AotError::Frontend(
+            parsed
+                .errors
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    // Sema with the standard prelude name set so `System.print`
+    // and friends resolve before MIR-build.
+    let mut interner: Interner = parsed.interner;
+    let prelude_syms: Vec<crate::intern::SymbolId> = crate::sema::PRELUDE_NAMES
+        .iter()
+        .map(|n| interner.intern(n))
+        .collect();
+    let resolved = resolve_with_prelude(&parsed.module, &interner, &prelude_syms);
+    if !resolved.errors.is_empty() {
+        return Err(AotError::Frontend(
+            resolved
+                .errors
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let field_layouts = std::collections::HashMap::new();
+    let (module_mir, _new_layouts) =
+        lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, &field_layouts);
+
+    // -- 2. Cranelift ISA + ObjectModule --------------------------
+    //
     // Resolve the host target triple. Cross-target builds will
-    // pass `--target=<triple>` explicitly later; Phase 1 sticks
-    // to the host so the test can `nm` the result without
-    // installing a sysroot.
+    // pass `--target=<triple>` explicitly later; today we stick
+    // to the host so a Phase-2 test can re-parse the result
+    // without installing a sysroot for another triple.
     let triple = target_lexicon::Triple::host();
 
     // ISA: pessimistic settings flags — `is_pic` so the resulting
@@ -113,28 +170,32 @@ pub fn compile_to_object(_source: &str, output: &Path) -> Result<(), AotError> {
     .map_err(|e| AotError::Module(e.to_string()))?;
     let mut module = ObjectModule::new(object_builder);
 
-    // Declare a single externally-visible function returning i64.
-    // Cranelift's call-conv selection matches the host ABI by
-    // default — fine for Phase 1 since the test driver just
-    // asserts the symbol is present, not that it's callable.
+    // -- 3. Declare + lower the entry function --------------------
+    //
+    // Top-level fn: every Wren value is NaN-boxed as a `u64` —
+    // signature is `() -> i64`. The shared lowering builds the
+    // CLIF body directly; runtime calls are emitted as imports
+    // and the system linker resolves them against the runtime
+    // staticlib at link time (Phase 4 work).
+    let entry_mir = &module_mir.top_level;
     let mut sig = Signature::new(module.target_config().default_call_conv);
+    let arity = entry_mir.arity as usize;
+    for _ in 0..arity {
+        sig.params.push(AbiParam::new(types::I64));
+    }
     sig.returns.push(AbiParam::new(types::I64));
     let func_id = module
         .declare_function("wlift_aot_main", Linkage::Export, &sig)
         .map_err(|e| AotError::Module(e.to_string()))?;
 
-    // Emit the trivial CLIF body. `iconst.i64 42; return r0`.
     let mut ctx = module.make_context();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
     {
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        let block = builder.create_block();
-        builder.append_block_params_for_function_params(block);
-        builder.switch_to_block(block);
-        builder.seal_block(block);
-        let v = builder.ins().iconst(types::I64, 42);
-        builder.ins().return_(&[v]);
+        lower_mir_to_module(entry_mir, &interner, &mut builder, &mut module)
+            .map_err(AotError::Module)?;
+        builder.seal_all_blocks();
         builder.finalize();
     }
 

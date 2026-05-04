@@ -517,7 +517,7 @@ pub mod cl {
     fn compile_osr_entries(
         mir: &MirFunction,
         interner: &Interner,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         safe_name: &str,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
@@ -906,7 +906,7 @@ pub mod cl {
 
     /// Declare a runtime function in the Cranelift module and return its FuncRef.
     fn declare_runtime_fn(
-        module: &mut JITModule,
+        module: &mut dyn Module,
         builder: &mut FunctionBuilder,
         name: &str,
         param_count: usize,
@@ -924,12 +924,33 @@ pub mod cl {
         Ok(func_ref)
     }
 
+    /// AOT entry point — populate `builder.func` with the CLIF
+    /// translation of `mir`, against any `cranelift_module::Module`
+    /// impl. The JIT path drives the same code via
+    /// `lower_mir_to_cranelift` below; AOT's
+    /// `codegen::aot::compile_to_object` calls this directly with
+    /// an `ObjectModule`.
+    ///
+    /// IC pointers, code-base, and OSR layout are JIT-only signals
+    /// (runtime self-call patching, on-stack replacement entries,
+    /// inline-cache snapshots) — pass `None` for all three from
+    /// AOT, since `ObjectModule` outputs go through a static
+    /// linker rather than the JIT's mutate-in-place finalisation.
+    pub fn lower_mir_to_module(
+        mir: &MirFunction,
+        interner: &Interner,
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+    ) -> Result<(), String> {
+        lower_mir_impl(mir, interner, builder, module, None, None, None, None, None)
+    }
+
     /// Lower a MIR function into Cranelift IR using the FunctionBuilder.
     fn lower_mir_to_cranelift(
         mir: &MirFunction,
         interner: &Interner,
         builder: &mut FunctionBuilder,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
@@ -957,7 +978,7 @@ pub mod cl {
         mir: &MirFunction,
         interner: &Interner,
         builder: &mut FunctionBuilder,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
@@ -1066,7 +1087,7 @@ pub mod cl {
             }
         }
         // Helper to get or declare a runtime function
-        let mut get_runtime_fn = |module: &mut JITModule,
+        let mut get_runtime_fn = |module: &mut dyn Module,
                                   builder: &mut FunctionBuilder,
                                   name: &str,
                                   param_count: usize|
@@ -1223,9 +1244,9 @@ pub mod cl {
     #[allow(clippy::type_complexity)] // Runtime-fn resolver closure: one-shot type used only here.
     fn emit_inline_boxed_binop(
         builder: &mut FunctionBuilder,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         get_runtime_fn: &mut dyn FnMut(
-            &mut JITModule,
+            &mut dyn Module,
             &mut FunctionBuilder,
             &str,
             usize,
@@ -1303,10 +1324,10 @@ pub mod cl {
         _mir: &MirFunction,
         _interner: &Interner,
         builder: &mut FunctionBuilder,
-        module: &mut JITModule,
+        module: &mut dyn Module,
         val_map: &HashMap<ValueId, Value>,
         get_runtime_fn: &mut dyn FnMut(
-            &mut JITModule,
+            &mut dyn Module,
             &mut FunctionBuilder,
             &str,
             usize,
