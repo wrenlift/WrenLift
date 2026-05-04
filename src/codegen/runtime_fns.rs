@@ -4064,19 +4064,45 @@ fn wren_cmp_dispatch(
 
 #[no_mangle]
 pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
-    // Must honour Wren's equality semantics — which for Strings is
-    // CONTENT equality, not pointer identity. A bitwise `a == b`
-    // test is a trap: every `s[i]` subscript allocates a fresh
-    // ObjString, so `s[i] == ":"` (JIT-compiled) would return false
-    // even on a direct match. Delegate to `Value::equals`, which
-    // short-circuits on equal bits, handles NaN, and falls through
-    // to string content compare.
-    Value::bool(Value::from_bits(a).equals(Value::from_bits(b))).to_bits()
+    // Wren's `==` is overloadable per class. Mirror the
+    // interpreter's `Op::CmpEq` handler: when the LHS is a
+    // non-primitive object (i.e. user class instance — not a
+    // String, Num, Bool, or Null), dispatch through the user's
+    // `==(_)` method via the standard call helper. Otherwise
+    // fall back to `Value::equals`, which short-circuits on equal
+    // bits + handles NaN + does string content compare.
+    let lhs = Value::from_bits(a);
+    let rhs = Value::from_bits(b);
+    if lhs.is_object()
+        && !lhs.is_string_object()
+        && !rhs.is_null()
+        && !rhs.is_bool()
+        && !rhs.is_num()
+    {
+        if let Some(vm) = unsafe { vm_ref() } {
+            let sym = vm.interner.intern("==(_)");
+            return dispatch_call(lhs, sym.index() as u64, &[lhs, rhs]);
+        }
+    }
+    Value::bool(lhs.equals(rhs)).to_bits()
 }
 
 #[no_mangle]
 pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
-    Value::bool(!Value::from_bits(a).equals(Value::from_bits(b))).to_bits()
+    let lhs = Value::from_bits(a);
+    let rhs = Value::from_bits(b);
+    if lhs.is_object()
+        && !lhs.is_string_object()
+        && !rhs.is_null()
+        && !rhs.is_bool()
+        && !rhs.is_num()
+    {
+        if let Some(vm) = unsafe { vm_ref() } {
+            let sym = vm.interner.intern("!=(_)");
+            return dispatch_call(lhs, sym.index() as u64, &[lhs, rhs]);
+        }
+    }
+    Value::bool(!lhs.equals(rhs)).to_bits()
 }
 
 // ---------------------------------------------------------------------------

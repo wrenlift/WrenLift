@@ -953,6 +953,55 @@ fn run_fiber_with_stop_depth(
             )
         };
 
+        // AOT-stub fast path: a function registered via
+        // `engine.register_aot_function` has empty MIR + a non-null
+        // `jit_code[fn_id]` pointing at the AOT-emitted body.
+        // Walking the empty MIR would either bail out silently or
+        // panic on `mir.blocks[0]`; route through the native body
+        // instead, capture its return, pop the frame, and resume
+        // the caller (or finish the fiber). Same shape the
+        // bytecode-end fall-through uses.
+        if pc == 0 {
+            let aot_fn = vm
+                .engine
+                .jit_code
+                .get(func_id.0 as usize)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            let mir_empty = vm
+                .engine
+                .get_mir(func_id)
+                .map(|m| m.blocks.is_empty())
+                .unwrap_or(false);
+            if !aot_fn.is_null() && mir_empty {
+                let return_val = unsafe {
+                    let f: extern "C" fn(u64) -> u64 = std::mem::transmute(aot_fn);
+                    let recv_bits = closure
+                        .map(|c| Value::object(c as *mut u8).to_bits())
+                        .unwrap_or_else(|| Value::null().to_bits());
+                    Value::from_bits(f(recv_bits))
+                };
+                fiber = vm.fiber;
+                unsafe {
+                    (*fiber).mir_frames.pop();
+                    (*fiber).state = FiberState::Done;
+                }
+                values.clear();
+                if vm.register_pool.len() < 128 {
+                    vm.register_pool.push(values);
+                }
+                let caller = unsafe { (*fiber).caller };
+                if !caller.is_null() {
+                    unsafe {
+                        (*fiber).caller = std::ptr::null_mut();
+                    }
+                    resume_caller(vm, caller, return_val);
+                    continue 'fiber_loop;
+                }
+                return Ok(return_val);
+            }
+        }
+
         if pc == 0 && closure.is_none() && return_dst.is_none() {
             if let Some(return_val) = try_run_root_frame_native(vm, fiber, func_id, &module_name)? {
                 fiber = vm.fiber;
