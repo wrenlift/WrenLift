@@ -164,7 +164,16 @@ fn with_wren_suffix(path: PathBuf) -> PathBuf {
 /// recurse into. Phase 4's link step decides whether to bundle
 /// them, surface them as object-file imports, or assume the
 /// runtime staticlib provides them.
-pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
+/// Walk-phase output: every reachable module's MIR plus the
+/// bundle-level metadata the bootstrap needs (native search
+/// paths, bundled native lib payloads). Driver hands both to
+/// `compile_modules_to_object_with_manifest_and_meta`.
+pub struct AotWalkResult {
+    pub modules: Vec<AotModule>,
+    pub bundle: AotBundleMeta,
+}
+
+pub fn walk_imports(entry_path: &Path) -> Result<AotWalkResult, AotError> {
     // `.hatch` archive: every `Source` section becomes an
     // `AotModule`, ordered by the manifest's `modules` list with
     // `entry` last. Source-only — `Wlbc`-only modules need wlbc-
@@ -200,7 +209,92 @@ pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
         &mut field_layouts,
         &scoped_resolver,
     )?;
-    Ok(out)
+
+    // Native-lib search paths: collect from the entry's hatchfile
+    // and every path-linked dep's hatchfile. Resolved against the
+    // hatchfile's own directory so a dep declaring
+    // `native_search_paths = ["libs"]` lands as
+    // `<dep_dir>/libs`.
+    let bundle = AotBundleMeta {
+        native_search_paths: collect_native_search_paths(entry_path),
+        native_libs: Vec::new(),
+    };
+    Ok(AotWalkResult {
+        modules: out,
+        bundle,
+    })
+}
+
+fn collect_native_search_paths(entry_path: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let entry_dir = entry_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    // Find the entry's hatchfile (walk up).
+    let hatchfile = {
+        let mut cursor = Some(entry_dir.clone());
+        loop {
+            match cursor {
+                Some(d) => {
+                    let candidate = d.join("hatchfile");
+                    if candidate.exists() {
+                        break Some(candidate);
+                    }
+                    cursor = d.parent().map(Path::to_path_buf);
+                }
+                None => break None,
+            }
+        }
+    };
+
+    let push_resolved = |out: &mut Vec<String>, root: &Path, rel: &str| {
+        let p = if Path::new(rel).is_absolute() {
+            std::path::PathBuf::from(rel)
+        } else {
+            root.join(rel)
+        };
+        if let Some(s) = p.to_str() {
+            if !out.iter().any(|existing| existing == s) {
+                out.push(s.to_string());
+            }
+        }
+    };
+
+    let Some(hatchfile) = hatchfile else {
+        return out;
+    };
+    let workspace_root = hatchfile.parent().unwrap_or(Path::new("."));
+
+    if let Ok(text) = std::fs::read_to_string(&hatchfile) {
+        if let Ok(manifest) = toml::from_str::<crate::hatch::Manifest>(&text) {
+            for path in &manifest.native_search_paths {
+                push_resolved(&mut out, workspace_root, path);
+            }
+            // Recurse into path-link deps' hatchfiles to pull
+            // their `native_search_paths` too — mirrors the
+            // runtime's `apply_hatch_native_manifest_rooted` walk.
+            for dep in manifest
+                .dependencies
+                .values()
+                .chain(manifest.spec_dependencies.values())
+            {
+                let crate::hatch::Dependency::Path { path, .. } = dep else {
+                    continue;
+                };
+                let dep_dir = workspace_root.join(path);
+                let dep_hatchfile = dep_dir.join("hatchfile");
+                let Ok(dep_text) = std::fs::read_to_string(&dep_hatchfile) else {
+                    continue;
+                };
+                let Ok(dep_manifest) = toml::from_str::<crate::hatch::Manifest>(&dep_text) else {
+                    continue;
+                };
+                for sp in &dep_manifest.native_search_paths {
+                    push_resolved(&mut out, &dep_dir, sp);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Walk a `.hatch` archive: parse via `hatch::load`, take every
@@ -212,11 +306,20 @@ pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
 /// deserialisation is a separate codepath; the archive is only
 /// AOT-compilable when it includes `Source` sections (the default
 /// `hatch build`-produced shape).
-fn walk_hatch_archive(bytes: &[u8]) -> Result<Vec<AotModule>, AotError> {
+fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
     use std::collections::HashMap as Map;
 
     let hatch = crate::hatch::load(bytes)
         .map_err(|e| AotError::Frontend(format!("loading hatch archive: {}", e)))?;
+
+    // Collect bundled native libs (NativeLib sections) — bytes
+    // get extracted to a temp file at startup by the bootstrap.
+    let mut native_libs: Vec<(String, Vec<u8>)> = Vec::new();
+    for section in &hatch.sections {
+        if matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
+            native_libs.push((section.name.clone(), section.data.clone()));
+        }
+    }
 
     // Build a name → source map from Source sections so manifest
     // order can drive the walk.
@@ -268,7 +371,13 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<Vec<AotModule>, AotError> {
             &mut field_layouts,
         )?);
     }
-    Ok(out)
+    Ok(AotWalkResult {
+        modules: out,
+        bundle: AotBundleMeta {
+            native_search_paths: hatch.manifest.native_search_paths.clone(),
+            native_libs,
+        },
+    })
 }
 
 /// Parse → sema → MIR-build a single in-memory source. Same
@@ -533,16 +642,48 @@ fn walk_module(
 fn make_object_module() -> Result<ObjectModule, AotError> {
     let triple = target_lexicon::Triple::host();
 
-    // ISA: pessimistic settings flags — `is_pic` so the resulting
-    // object can be linked into a shared library or PIE without
-    // relocation issues; opt level "speed" matches the JIT path
-    // (minus the JIT-only legacy register-pressure heuristics).
+    // ISA settings.
+    //
+    // `is_pic = true` so the produced object can be linked into a
+    // shared library or PIE without runtime relocation issues —
+    // distribution-friendly default.
+    //
+    // `opt_level = "speed"` runs Cranelift's full optimisation
+    // pipeline (alternatives: `none`/`speed_and_size`).
+    //
+    // `enable_alias_analysis = true` keeps load/store dedup
+    // working — currently the default, called out so a future
+    // Cranelift change can't silently regress it.
+    //
+    // `enable_probestack = false` mirrors the JIT path — macOS
+    // aarch64's inline probestack fires false SIGSEGVs on
+    // legitimately-deep stacks.
+    //
+    // `enable_verifier = true` is cheap on AOT (single-shot
+    // codegen, not a hot loop) and catches a class of CLIF bugs
+    // before they ship as miscompiles.
+    //
+    // `unwind_info = true` so the linker emits .eh_frame /
+    // compact-unwind sections — backtraces from inside AOT'd
+    // code show real frames instead of stopping at `_main`.
     let mut flag_builder = settings::builder();
     flag_builder
         .set("is_pic", "true")
         .map_err(|e| AotError::Isa(e.to_string()))?;
     flag_builder
         .set("opt_level", "speed")
+        .map_err(|e| AotError::Isa(e.to_string()))?;
+    flag_builder
+        .set("enable_alias_analysis", "true")
+        .map_err(|e| AotError::Isa(e.to_string()))?;
+    flag_builder
+        .set("enable_probestack", "false")
+        .map_err(|e| AotError::Isa(e.to_string()))?;
+    flag_builder
+        .set("enable_verifier", "true")
+        .map_err(|e| AotError::Isa(e.to_string()))?;
+    flag_builder
+        .set("unwind_info", "true")
         .map_err(|e| AotError::Isa(e.to_string()))?;
     let flags = settings::Flags::new(flag_builder);
 
@@ -742,6 +883,16 @@ fn emit_aot_module(
             });
         }
 
+        let foreign_methods: Vec<AotForeignMethodManifest> = class
+            .foreign_methods
+            .iter()
+            .map(|fm| AotForeignMethodManifest {
+                signature: fm.signature.clone(),
+                symbol: fm.symbol.clone(),
+                is_static: fm.is_static,
+            })
+            .collect();
+
         if slot != usize::MAX {
             classes_manifest.push(AotClassManifest {
                 name: class_name,
@@ -749,6 +900,8 @@ fn emit_aot_module(
                 num_fields: class.num_fields,
                 slot: slot as u32,
                 methods: methods_manifest,
+                foreign_library: class.native_library.clone(),
+                foreign_methods,
             });
         }
     }
@@ -905,8 +1058,8 @@ pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
 /// imported modules are initialised before the importer's body
 /// runs — matching the runtime's `interpret` recursion order.
 pub fn compile_path_to_object(entry_path: &Path, output: &Path) -> Result<(), AotError> {
-    let modules = walk_imports(entry_path)?;
-    compile_modules_to_object(&modules, output)
+    let result = walk_imports(entry_path)?;
+    compile_modules_to_object(&result.modules, output)
 }
 
 /// Per-module shape the bootstrap generator needs to wire each
@@ -957,6 +1110,25 @@ pub struct AotClassManifest {
     /// the right `*mut ObjClass` at the use site.
     pub slot: u32,
     pub methods: Vec<AotMethodManifest>,
+    /// Value of `#!native = "<libname>"` on a `foreign class`.
+    /// `None` for pure-Wren classes. Bootstrap calls
+    /// `wlift_aot_bind_foreign_class` after `install_class` to
+    /// dlopen the library + bind every entry in `foreign_methods`.
+    pub foreign_library: Option<String>,
+    /// Stub records for `foreign` methods declared inside a
+    /// `foreign class`. The runtime resolves each via dlsym at
+    /// install time and binds the resulting `extern "C"` fn
+    /// pointer into the class method table.
+    pub foreign_methods: Vec<AotForeignMethodManifest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AotForeignMethodManifest {
+    pub signature: String,
+    /// `#!symbol = "..."` override. `None` falls back to the
+    /// signature's base name (Wren's default convention).
+    pub symbol: Option<String>,
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -994,6 +1166,25 @@ pub struct AotManifest {
     pub closures_symbol: String,
 }
 
+/// Top-level AOT bundle metadata that doesn't fit per-module:
+/// native-library search paths (where `foreign class
+/// #!native = "<lib>"` looks for dlopen targets) and bundled
+/// `.hatch` `NativeLib`-section payloads. The bootstrap drains
+/// these once at startup, before any class install.
+#[derive(Debug, Clone, Default)]
+pub struct AotBundleMeta {
+    /// Absolute paths the foreign loader's `library_candidates`
+    /// search ought to try ahead of the OS ambient search.
+    /// Resolved at AOT-build time from each path-linked dep's
+    /// `manifest.native_search_paths` (workspace-rooted).
+    pub native_search_paths: Vec<String>,
+    /// Bundled dynamic-library payloads from `.hatch` `NativeLib`
+    /// sections. The bootstrap writes each to a temp path and
+    /// registers `(name, path)` with `vm.native_lib_paths` so
+    /// the foreign loader picks up the bundled copy.
+    pub native_libs: Vec<(String, Vec<u8>)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AotImportBinding {
     pub target_slot: u32,
@@ -1022,6 +1213,18 @@ pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result
 /// dependencies → `wlift_aot_mod_<n>`.
 pub fn compile_modules_to_object_with_manifest(
     modules: &[AotModule],
+    output: &Path,
+) -> Result<Vec<AotManifest>, AotError> {
+    compile_walk_to_object_with_manifest(modules, &AotBundleMeta::default(), output)
+}
+
+/// Like [`compile_modules_to_object_with_manifest`] but threads
+/// bundle-level metadata (native search paths + bundled lib
+/// payloads) into the bootstrap so foreign-class binding works
+/// at runtime.
+pub fn compile_walk_to_object_with_manifest(
+    modules: &[AotModule],
+    bundle: &AotBundleMeta,
     output: &Path,
 ) -> Result<Vec<AotManifest>, AotError> {
     if modules.is_empty() {
@@ -1104,7 +1307,7 @@ pub fn compile_modules_to_object_with_manifest(
         manifests[idx].imports = bindings;
     }
 
-    emit_aot_bootstrap_main(&mut module, &manifests)?;
+    emit_aot_bootstrap_main(&mut module, &manifests, bundle)?;
 
     let product = module.finish();
     let bytes = product
@@ -1137,6 +1340,7 @@ pub fn compile_modules_to_object_with_manifest(
 fn emit_aot_bootstrap_main(
     module: &mut ObjectModule,
     manifests: &[AotManifest],
+    bundle: &AotBundleMeta,
 ) -> Result<(), AotError> {
     use cranelift_codegen::ir::condcodes::IntCC;
     use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind};
@@ -1204,6 +1408,32 @@ fn emit_aot_bootstrap_main(
         ],
         Some(types::I32),
     )?;
+    let bind_foreign_class = declare_import(
+        module,
+        "wlift_aot_bind_foreign_class",
+        &[
+            ptr_ty, // vm
+            ptr_ty, // modvars
+            ptr_ty, // slot
+            ptr_ty, // lib_name
+            ptr_ty, // lib_name_len
+            ptr_ty, // methods desc
+            ptr_ty, // methods count
+        ],
+        Some(types::I32),
+    )?;
+    let add_native_search_path = declare_import(
+        module,
+        "wlift_aot_add_native_search_path",
+        &[ptr_ty, ptr_ty, ptr_ty],
+        Some(types::I32),
+    )?;
+    let install_native_lib = declare_import(
+        module,
+        "wlift_aot_install_native_lib",
+        &[ptr_ty, ptr_ty, ptr_ty, ptr_ty, ptr_ty],
+        Some(types::I32),
+    )?;
     let enter_ctx = declare_import(
         module,
         "wlift_aot_enter",
@@ -1253,6 +1483,29 @@ fn emit_aot_bootstrap_main(
             usize,
             cranelift_module::FuncId,
             u8,
+            u8,
+        )>,
+        /// Foreign-class binding info, present iff the class
+        /// declared `#!native = "..."`. Bootstrap calls
+        /// `wlift_aot_bind_foreign_class` after install with the
+        /// dlopen library name + each `foreign` method's dlsym
+        /// descriptor.
+        foreign: Option<ClassForeignData>,
+    }
+
+    struct ClassForeignData {
+        lib_id: cranelift_module::DataId,
+        lib_len: usize,
+        /// Per `foreign` method: (sig DataId, sig_len, optional
+        /// `#!symbol` override DataId, sym_len, flags). `flags`
+        /// bit-0 = is_static. The bootstrap stack-allocates an
+        /// array of `WliftAotForeignMethodDesc`s and writes
+        /// these fields in.
+        methods: Vec<(
+            cranelift_module::DataId,
+            usize,
+            Option<cranelift_module::DataId>,
+            usize,
             u8,
         )>,
     }
@@ -1362,6 +1615,47 @@ fn emit_aot_bootstrap_main(
                 }
                 methods.push((sig_id, method.signature.len(), body_id, method.arity, flags));
             }
+
+            // Foreign-class binding data — only populated when
+            // the class declared `#!native = "..."`. The bootstrap
+            // calls `wlift_aot_bind_foreign_class` after the
+            // standard `install_class` so `modvars[slot]` already
+            // points at the freshly-allocated `*mut ObjClass`.
+            let foreign = if let Some(lib_name) = &class.foreign_library {
+                let lib_id = define_bytes(
+                    module,
+                    &format!("wlift_classnative_{}_{}", i, c_idx),
+                    lib_name.as_bytes(),
+                )?;
+                let mut fmethods = Vec::with_capacity(class.foreign_methods.len());
+                for (f_idx, fm) in class.foreign_methods.iter().enumerate() {
+                    let sig_id = define_bytes(
+                        module,
+                        &format!("wlift_fsig_{}_{}_{}", i, c_idx, f_idx),
+                        fm.signature.as_bytes(),
+                    )?;
+                    let (sym_id, sym_len) = if let Some(sym) = &fm.symbol {
+                        let id = define_bytes(
+                            module,
+                            &format!("wlift_fsym_{}_{}_{}", i, c_idx, f_idx),
+                            sym.as_bytes(),
+                        )?;
+                        (Some(id), sym.len())
+                    } else {
+                        (None, 0)
+                    };
+                    let flags: u8 = if fm.is_static { 1 } else { 0 };
+                    fmethods.push((sig_id, fm.signature.len(), sym_id, sym_len, flags));
+                }
+                Some(ClassForeignData {
+                    lib_id,
+                    lib_len: lib_name.len(),
+                    methods: fmethods,
+                })
+            } else {
+                None
+            };
+
             classes.push(ClassData {
                 name_id,
                 name_len: class.name.len(),
@@ -1369,6 +1663,7 @@ fn emit_aot_bootstrap_main(
                 slot: class.slot,
                 num_fields: class.num_fields,
                 methods,
+                foreign,
             });
         }
         // Per-import: resolve each binding's source modvars
@@ -1419,6 +1714,31 @@ fn emit_aot_bootstrap_main(
         });
     }
 
+    // Bundle-level data: per-search-path name + per-bundled-lib
+    // payload. Declared up-front so main() can address them via
+    // `declare_data_in_func`.
+    let mut search_path_ids: Vec<(cranelift_module::DataId, usize)> =
+        Vec::with_capacity(bundle.native_search_paths.len());
+    for (k, p) in bundle.native_search_paths.iter().enumerate() {
+        let id = define_bytes(module, &format!("wlift_searchpath_{}", k), p.as_bytes())?;
+        search_path_ids.push((id, p.len()));
+    }
+    let mut native_lib_ids: Vec<(
+        cranelift_module::DataId,
+        usize,
+        cranelift_module::DataId,
+        usize,
+    )> = Vec::with_capacity(bundle.native_libs.len());
+    for (k, (name, payload)) in bundle.native_libs.iter().enumerate() {
+        let name_id = define_bytes(
+            module,
+            &format!("wlift_nativelib_name_{}", k),
+            name.as_bytes(),
+        )?;
+        let payload_id = define_bytes(module, &format!("wlift_nativelib_data_{}", k), payload)?;
+        native_lib_ids.push((name_id, name.len(), payload_id, payload.len()));
+    }
+
     // ── main(argc, argv) -> i32 ──
     let mut main_sig = Signature::new(cc);
     main_sig.params.push(AbiParam::new(types::I32)); // argc
@@ -1456,6 +1776,10 @@ fn emit_aot_bootstrap_main(
         let intern_symbol_ref = module.declare_func_in_func(intern_symbol, builder.func);
         let register_closure_ref = module.declare_func_in_func(register_closure, builder.func);
         let install_class_ref = module.declare_func_in_func(install_class, builder.func);
+        let bind_foreign_class_ref = module.declare_func_in_func(bind_foreign_class, builder.func);
+        let add_native_search_path_ref =
+            module.declare_func_in_func(add_native_search_path, builder.func);
+        let install_native_lib_ref = module.declare_func_in_func(install_native_lib, builder.func);
         let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
 
@@ -1475,6 +1799,30 @@ fn emit_aot_bootstrap_main(
         builder.switch_to_block(body_block);
         let vm = builder.block_params(body_block)[0];
         let saved_addr = builder.ins().stack_addr(ptr_ty, saved_slot, 0);
+
+        // Bundle-level init (search paths + bundled native libs).
+        // Runs before any class install so foreign-binding's
+        // dlopen sees the right candidate dirs.
+        for (path_id, path_len) in &search_path_ids {
+            let gv = module.declare_data_in_func(*path_id, builder.func);
+            let addr = builder.ins().global_value(ptr_ty, gv);
+            let len = builder.ins().iconst(ptr_ty, *path_len as i64);
+            let _ = builder
+                .ins()
+                .call(add_native_search_path_ref, &[vm, addr, len]);
+        }
+        for (name_id, name_len, payload_id, payload_len) in &native_lib_ids {
+            let name_gv = module.declare_data_in_func(*name_id, builder.func);
+            let payload_gv = module.declare_data_in_func(*payload_id, builder.func);
+            let name_addr = builder.ins().global_value(ptr_ty, name_gv);
+            let payload_addr = builder.ins().global_value(ptr_ty, payload_gv);
+            let name_len_v = builder.ins().iconst(ptr_ty, *name_len as i64);
+            let payload_len_v = builder.ins().iconst(ptr_ty, *payload_len as i64);
+            let _ = builder.ins().call(
+                install_native_lib_ref,
+                &[vm, name_addr, name_len_v, payload_addr, payload_len_v],
+            );
+        }
 
         for m in &per_module {
             let modvars_gv = module.declare_data_in_func(m.modvars_id, builder.func);
@@ -1626,6 +1974,75 @@ fn emit_aot_bootstrap_main(
                         methods_count,
                     ],
                 );
+
+                // Foreign-class binding — only emitted when the
+                // class declared `#!native = "..."`. Builds a
+                // descriptor array on the stack (24 bytes per
+                // method: sig*8 + sig_len*8 + symbol*8 +
+                // sym_len*8 + flags*1 padded to 32) and hands it
+                // to `wlift_aot_bind_foreign_class`.
+                if let Some(foreign) = &class.foreign {
+                    // `WliftAotForeignMethodDesc` is repr(C) — 5
+                    // 8-byte fields (sig*, sig_len, symbol*,
+                    // symbol_len, flags-padded-to-8) = 40 bytes.
+                    let f_size = (foreign.methods.len() * 40).max(8) as u32;
+                    let f_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        f_size,
+                        3,
+                    ));
+                    let f_addr = builder.ins().stack_addr(ptr_ty, f_slot, 0);
+
+                    for (k, (sig_id, sig_len, sym_opt, sym_len, flags)) in
+                        foreign.methods.iter().enumerate()
+                    {
+                        let sig_gv = module.declare_data_in_func(*sig_id, builder.func);
+                        let sig_addr = builder.ins().global_value(ptr_ty, sig_gv);
+                        let sym_addr = match sym_opt {
+                            Some(id) => {
+                                let sgv = module.declare_data_in_func(*id, builder.func);
+                                builder.ins().global_value(ptr_ty, sgv)
+                            }
+                            None => builder.ins().iconst(ptr_ty, 0),
+                        };
+                        let off = (k * 40) as i32;
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), sig_addr, f_addr, off);
+                        let len_v = builder.ins().iconst(ptr_ty, *sig_len as i64);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), len_v, f_addr, off + 8);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), sym_addr, f_addr, off + 16);
+                        let sym_len_v = builder.ins().iconst(ptr_ty, *sym_len as i64);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), sym_len_v, f_addr, off + 24);
+                        let flags_v = builder.ins().iconst(types::I8, *flags as i64);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), flags_v, f_addr, off + 32);
+                    }
+
+                    let lib_gv = module.declare_data_in_func(foreign.lib_id, builder.func);
+                    let lib_addr = builder.ins().global_value(ptr_ty, lib_gv);
+                    let lib_len_v = builder.ins().iconst(ptr_ty, foreign.lib_len as i64);
+                    let f_count = builder.ins().iconst(ptr_ty, foreign.methods.len() as i64);
+                    let _ = builder.ins().call(
+                        bind_foreign_class_ref,
+                        &[
+                            vm,
+                            modvars_addr,
+                            slot_val,
+                            lib_addr,
+                            lib_len_v,
+                            f_addr,
+                            f_count,
+                        ],
+                    );
+                }
             }
 
             let name_len = builder.ins().iconst(ptr_ty, m.name_len as i64);
@@ -1736,7 +2153,7 @@ mod tests {
             .and_then(|mut f| f.write_all(b"import \"./helper\"\nvar x = 1\n"))
             .expect("write entry");
 
-        let modules = walk_imports(&entry_path).expect("walk_imports");
+        let modules = walk_imports(&entry_path).expect("walk_imports").modules;
         assert_eq!(
             modules.len(),
             2,
@@ -1788,7 +2205,7 @@ mod tests {
             .and_then(|mut f| f.write_all(b"import \"./shared\"\nimport \"./a\"\nvar e = 1\n"))
             .expect("write entry");
 
-        let modules = walk_imports(&entry).expect("walk_imports");
+        let modules = walk_imports(&entry).expect("walk_imports").modules;
         let names: Vec<&String> = modules.iter().map(|m| &m.name).collect();
         let shared_canonical = std::fs::canonicalize(&shared)
             .unwrap()

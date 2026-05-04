@@ -669,6 +669,247 @@ pub unsafe extern "C" fn wlift_aot_register_closure(
     func_id.0 as u64
 }
 
+/// One foreign-method install descriptor: signature + the
+/// `#!symbol = "..."` override (or null to fall back to the
+/// signature's base name) + static/instance flag. Bootstrap
+/// emits one per `foreign` method declared inside a `foreign
+/// class`. Sister to [`WliftAotMethodDesc`] but for the
+/// dlopen/dlsym path.
+#[repr(C)]
+pub struct WliftAotForeignMethodDesc {
+    pub sig: *const c_char,
+    pub sig_len: usize,
+    /// `#!symbol = "..."` override; `null` means fall back to the
+    /// method's base name (Wren convention — `open(_)` looks up
+    /// `open` if `#!symbol` isn't set).
+    pub symbol: *const c_char,
+    pub symbol_len: usize,
+    /// Bit 0 = is_static. Constructors aren't allowed to be
+    /// `foreign` in Wren — no constructor flag needed.
+    pub flags: u8,
+}
+
+/// Bind a `foreign class`'s native methods at startup. Loads the
+/// library named by `lib_name` via the VM's normal foreign loader
+/// (search paths + name overrides set by
+/// `vm.apply_hatch_native_manifest_rooted` or
+/// `wlift_aot_install_native_lib`), then resolves each method's
+/// symbol and binds it into the class method table the way the
+/// JIT install loop does in `install_module_mir_and_run_with_sources`.
+///
+/// `slot` indexes into `modvars` to locate the previously-installed
+/// `*mut ObjClass` (so the bootstrap calls this *after*
+/// `wlift_aot_install_class` for the same class). Errors during
+/// library load or symbol resolution surface as `vm.report_error`
+/// and return non-zero — the bootstrap currently ignores the
+/// failure code and continues, matching the JIT's "soft" foreign-
+/// resolution behaviour (calls to unbound foreign methods surface
+/// as runtime "method not found" errors at use site).
+///
+/// # Safety
+///
+/// All pointers must be valid for the duration of the call;
+/// `methods` must point at `methods_count` consecutive
+/// `WliftAotForeignMethodDesc` records. The bootstrap satisfies
+/// these via Cranelift `Linkage::Local` `Data` blobs.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_bind_foreign_class(
+    vm: *mut WrenVM,
+    modvars: *const u64,
+    slot: usize,
+    lib_name: *const c_char,
+    lib_name_len: usize,
+    methods: *const WliftAotForeignMethodDesc,
+    methods_count: usize,
+) -> c_int {
+    use crate::runtime::object::{ObjClass, ObjHeader, ObjType};
+
+    if vm.is_null() || modvars.is_null() || lib_name.is_null() {
+        return 70;
+    }
+
+    let lib_bytes = unsafe { std::slice::from_raw_parts(lib_name as *const u8, lib_name_len) };
+    let lib_str = match std::str::from_utf8(lib_bytes) {
+        Ok(s) => s,
+        Err(_) => return 65,
+    };
+
+    // Resolve the receiving class through modvars[slot].
+    let class_bits = unsafe { *modvars.add(slot) };
+    let class_val = crate::runtime::value::Value::from_bits(class_bits);
+    let class_ptr = match class_val.as_object() {
+        Some(p) => p as *mut ObjClass,
+        None => return 70,
+    };
+    let header = class_ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Class {
+        return 70;
+    }
+
+    let vm_ref = unsafe { &mut *vm };
+    let library = match crate::runtime::foreign::load_library(
+        lib_str,
+        &vm_ref.native_search_paths,
+        &vm_ref.native_lib_paths,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            vm_ref.report_error(&e.to_string());
+            return 70;
+        }
+    };
+
+    // Mark the class foreign so the dispatch path takes the
+    // ForeignC branch (matches the JIT install loop).
+    unsafe {
+        (*class_ptr).is_foreign = true;
+    }
+
+    for i in 0..methods_count {
+        let desc = unsafe { &*methods.add(i) };
+        if desc.sig.is_null() {
+            continue;
+        }
+        let sig_bytes = unsafe { std::slice::from_raw_parts(desc.sig as *const u8, desc.sig_len) };
+        let sig = match std::str::from_utf8(sig_bytes) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let symbol_owned: String = if desc.symbol.is_null() {
+            crate::runtime::foreign::base_name_of_signature(sig).to_string()
+        } else {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(desc.symbol as *const u8, desc.symbol_len) };
+            match std::str::from_utf8(bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => continue,
+            }
+        };
+
+        let resolved =
+            match crate::runtime::foreign::resolve_symbol(&library, lib_str, &symbol_owned) {
+                Ok(r) => r,
+                Err(e) => {
+                    vm_ref.report_error(&e.to_string());
+                    continue;
+                }
+            };
+
+        // Foreign methods register under "static:<sig>" or
+        // "<sig>" depending on the static flag. Wren calls into
+        // `Hello.greet(_)` as `static:greet(_)` on the metaclass,
+        // and into `inst.greet(_)` as `greet(_)` on the class —
+        // matching the JIT install path's binding shape.
+        let is_static = desc.flags & 1 != 0;
+        let bind_name = if is_static {
+            format!("static:{}", sig)
+        } else {
+            sig.to_string()
+        };
+        let bind_sym = vm_ref.interner.intern(&bind_name);
+
+        unsafe {
+            match resolved {
+                crate::runtime::foreign::ResolvedSymbol::Static(func) => {
+                    (*class_ptr).bind_foreign_c(bind_sym, func);
+                }
+                crate::runtime::foreign::ResolvedSymbol::Dynamic(idx) => {
+                    (*class_ptr).bind_foreign_c_dynamic(bind_sym, idx);
+                }
+            }
+        }
+    }
+
+    // Keep the library alive for the program's lifetime —
+    // `class_ptr` now holds raw fn pointers into its address
+    // space.
+    vm_ref.native_libs.push(library);
+    0
+}
+
+/// Push an absolute directory onto the VM's foreign loader
+/// search paths so subsequent `wlift_aot_bind_foreign_class`
+/// calls find the dylibs that path-linked hatch deps ship in
+/// their `libs/` directory. Mirrors what
+/// `vm.apply_hatch_native_manifest_rooted` does at install time
+/// for the interpreter path.
+///
+/// # Safety
+///
+/// `path` must be a valid pointer to `len` UTF-8 bytes for the
+/// duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_add_native_search_path(
+    vm: *mut WrenVM,
+    path: *const c_char,
+    len: usize,
+) -> c_int {
+    if vm.is_null() || path.is_null() {
+        return 70;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(path as *const u8, len) };
+    let s = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return 65,
+    };
+    let vm_ref = unsafe { &mut *vm };
+    vm_ref.native_search_paths.push(std::path::PathBuf::from(s));
+    0
+}
+
+/// Extract a bundled native library to a temp path and tell the
+/// VM's foreign loader to find it there. Mirrors the
+/// `install_hatch_modules` NativeLib-section handling: write the
+/// bytes to `<tmp>/<name>` (with the platform-appropriate
+/// extension), then push `(name, path)` into `vm.native_lib_paths`.
+///
+/// `wlift_aot_bind_foreign_class` consults that map first, so a
+/// `.hatch`-bundled plugin overrides any system-installed library
+/// with the same name — same precedence the runtime applies.
+///
+/// # Safety
+///
+/// `name`/`bytes` must be valid for the duration of the call.
+/// The temp path leaks for the lifetime of the process, matching
+/// the runtime's behaviour (libraries can't be unmapped while
+/// foreign methods may dispatch into them).
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_install_native_lib(
+    vm: *mut WrenVM,
+    name: *const c_char,
+    name_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+) -> c_int {
+    if vm.is_null() || name.is_null() || bytes.is_null() {
+        return 70;
+    }
+    let name_bytes = unsafe { std::slice::from_raw_parts(name as *const u8, name_len) };
+    let lib_name = match std::str::from_utf8(name_bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => return 65,
+    };
+    let payload = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
+
+    let filename = crate::runtime::foreign::default_native_lib_filename(&lib_name);
+    let tmp_dir = std::env::temp_dir().join("wlift_aot_native_libs");
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.report_error(&format!("creating native-lib temp dir: {}", e));
+        return 70;
+    }
+    let path = tmp_dir.join(&filename);
+    if let Err(e) = std::fs::write(&path, payload) {
+        let vm_ref = unsafe { &mut *vm };
+        vm_ref.report_error(&format!("writing native lib '{}': {}", lib_name, e));
+        return 70;
+    }
+
+    let vm_ref = unsafe { &mut *vm };
+    vm_ref.native_lib_paths.insert(lib_name, path);
+    0
+}
+
 /// Intern `name` in the VM's interner and return the resulting
 /// `SymbolId` (zero-extended to `u64`). The AOT bootstrap calls
 /// this once per symbol referenced by the module's body, stashing

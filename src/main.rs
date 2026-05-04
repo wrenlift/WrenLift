@@ -832,8 +832,8 @@ fn aot_build_executable(input: &str, out_path: &str) {
     // drives both the object emit (one CLIF function per module)
     // and the bootstrap shim (embeds each module's source bytes
     // under its as-written `import "..."` name).
-    let modules = match wren_lift::codegen::aot::walk_imports(&entry_path) {
-        Ok(m) => m,
+    let walk_result = match wren_lift::codegen::aot::walk_imports(&entry_path) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("error: AOT import walk failed: {}", e);
             process::exit(1);
@@ -864,15 +864,17 @@ fn aot_build_executable(input: &str, out_path: &str) {
     // that drives runtime init + dispatch — into one object.
     // The link step is a pure linker call against the runtime
     // staticlib; no C bootstrap source involved.
-    let _manifests =
-        match wren_lift::codegen::aot::compile_modules_to_object_with_manifest(&modules, &obj_path)
-        {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("error: AOT object emit failed: {}", e);
-                process::exit(1);
-            }
-        };
+    let _manifests = match wren_lift::codegen::aot::compile_walk_to_object_with_manifest(
+        &walk_result.modules,
+        &walk_result.bundle,
+        &obj_path,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: AOT object emit failed: {}", e);
+            process::exit(1);
+        }
+    };
     if std::env::var_os("WLIFT_AOT_KEEP_OBJ").is_some() {
         let keep = std::path::PathBuf::from(format!("{}.o", out_path));
         let _ = std::fs::copy(&obj_path, &keep);
