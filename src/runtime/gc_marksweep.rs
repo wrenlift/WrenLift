@@ -398,7 +398,7 @@ impl GcAllocator for MarkSweepGc {
         }
 
         // Sweep intern table: remove dead entries before sweeping objects.
-        for (_, ptrs) in self.intern_table.iter_mut() {
+        for ptrs in self.intern_table.values_mut() {
             ptrs.retain(|&ptr| unsafe { (*(ptr as *mut ObjHeader)).gc_mark == BLACK });
         }
         self.intern_table.retain(|_, ptrs| !ptrs.is_empty());
