@@ -822,7 +822,7 @@ fn aot_build_executable(input: &str, out_path: &str) {
     let entry_path = std::path::PathBuf::from(input);
     if !entry_path.is_file() {
         eprintln!(
-            "error: --aot expects the positional argument to be a `.wren` file (got '{}')",
+            "error: --aot expects a `.wren` source file or `.hatch` archive (got '{}')",
             input
         );
         process::exit(1);

@@ -165,6 +165,15 @@ fn with_wren_suffix(path: PathBuf) -> PathBuf {
 /// them, surface them as object-file imports, or assume the
 /// runtime staticlib provides them.
 pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
+    // `.hatch` archive: every `Source` section becomes an
+    // `AotModule`, ordered by the manifest's `modules` list with
+    // `entry` last. Source-only — `Wlbc`-only modules need wlbc-
+    // to-MIR deserialisation, which lands separately.
+    let raw_bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
+    if crate::hatch::looks_like_hatch(&raw_bytes) {
+        return walk_hatch_archive(&raw_bytes);
+    }
+
     let mut visited: HashSet<String> = HashSet::new();
     let mut out: Vec<AotModule> = Vec::new();
     let mut field_layouts: HashMap<String, Vec<String>> = HashMap::new();
@@ -173,7 +182,7 @@ pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
         .map_err(AotError::Io)?
         .to_string_lossy()
         .into_owned();
-    let entry_source_bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
+    let entry_source_bytes = raw_bytes;
 
     // Build a scoped-import resolver from the entry's hatchfile
     // (if any). Each entry maps an import name like
@@ -192,6 +201,139 @@ pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
         &scoped_resolver,
     )?;
     Ok(out)
+}
+
+/// Walk a `.hatch` archive: parse via `hatch::load`, take every
+/// `SectionKind::Source` payload, parse + sema + MIR-build each
+/// in `manifest.modules` order (entry last), and return the
+/// resulting `AotModule` list ready for `compile_modules_to_object`.
+///
+/// `Wlbc`-only modules in the archive are skipped — wlbc-to-MIR
+/// deserialisation is a separate codepath; the archive is only
+/// AOT-compilable when it includes `Source` sections (the default
+/// `hatch build`-produced shape).
+fn walk_hatch_archive(bytes: &[u8]) -> Result<Vec<AotModule>, AotError> {
+    use std::collections::HashMap as Map;
+
+    let hatch = crate::hatch::load(bytes)
+        .map_err(|e| AotError::Frontend(format!("loading hatch archive: {}", e)))?;
+
+    // Build a name → source map from Source sections so manifest
+    // order can drive the walk.
+    let mut sources: Map<String, &[u8]> = Map::new();
+    for section in &hatch.sections {
+        if matches!(section.kind, crate::hatch::SectionKind::Source) {
+            sources.insert(section.name.clone(), section.data.as_slice());
+        }
+    }
+
+    if sources.is_empty() {
+        return Err(AotError::Frontend(format!(
+            "hatch archive '{}' has no Source sections (Wlbc-only \
+             archives need wlbc-to-MIR deserialisation, not yet wired \
+             into AOT)",
+            hatch.manifest.name
+        )));
+    }
+
+    // Order: dependency-first via `manifest.modules`, with the
+    // archive's `entry` module appearing last so the bootstrap
+    // dispatches it last (matches the .wren walker convention).
+    let mut order: Vec<String> = hatch
+        .manifest
+        .modules
+        .iter()
+        .filter(|n| sources.contains_key(*n))
+        .cloned()
+        .collect();
+    if order.is_empty() {
+        // Manifest didn't list modules — fall back to alphabetical.
+        order.extend(sources.keys().cloned());
+    }
+    let entry = hatch.manifest.entry.clone();
+    order.retain(|n| n != &entry);
+    if sources.contains_key(&entry) {
+        order.push(entry);
+    }
+
+    let mut out: Vec<AotModule> = Vec::with_capacity(order.len());
+    let mut field_layouts: HashMap<String, Vec<String>> = HashMap::new();
+    for name in &order {
+        let Some(source_bytes) = sources.get(name) else {
+            continue;
+        };
+        out.push(build_aot_module_from_source(
+            name,
+            source_bytes,
+            &mut field_layouts,
+        )?);
+    }
+    Ok(out)
+}
+
+/// Parse → sema → MIR-build a single in-memory source. Same
+/// pipeline `walk_module` runs per `.wren` file, factored out so
+/// the `.hatch`-archive walker can reuse it without recursing
+/// into relative imports.
+fn build_aot_module_from_source(
+    request_name: &str,
+    source_bytes: &[u8],
+    field_layouts: &mut HashMap<String, Vec<String>>,
+) -> Result<AotModule, AotError> {
+    let source = std::str::from_utf8(source_bytes)
+        .map_err(|e| AotError::Frontend(format!("{} is not valid UTF-8: {}", request_name, e)))?;
+    let parsed = parse(source);
+    if !parsed.errors.is_empty() {
+        return Err(AotError::Frontend(
+            parsed
+                .errors
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let mut interner: Interner = parsed.interner;
+    let prelude_syms: Vec<crate::intern::SymbolId> = crate::sema::PRELUDE_NAMES
+        .iter()
+        .map(|n| interner.intern(n))
+        .collect();
+    let resolved = resolve_with_prelude(&parsed.module, &interner, &prelude_syms);
+    if !resolved.errors.is_empty() {
+        return Err(AotError::Frontend(
+            resolved
+                .errors
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
+    let module_var_count = resolved.module_vars.len();
+    let module_var_names: Vec<String> = resolved
+        .module_vars
+        .iter()
+        .map(|sym| interner.resolve(*sym).to_string())
+        .collect();
+    let module_var_sources = resolved.module_var_sources.clone();
+    let (module_mir, new_layouts) =
+        lower_module_with_known_classes(&parsed.module, &mut interner, &resolved, field_layouts);
+    for (k, v) in new_layouts {
+        field_layouts.insert(k, v);
+    }
+
+    Ok(AotModule {
+        name: request_name.to_string(),
+        request_name: request_name.to_string(),
+        source: source_bytes.to_vec(),
+        module_var_count,
+        module_var_names,
+        module_var_sources,
+        mir: module_mir,
+        interner,
+    })
 }
 
 /// Map from scoped import name (e.g. `"@hatch:fmt"`) to the
