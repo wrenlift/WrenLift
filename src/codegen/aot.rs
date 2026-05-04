@@ -175,6 +175,13 @@ pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
         .into_owned();
     let entry_source_bytes = std::fs::read(entry_path).map_err(AotError::Io)?;
 
+    // Build a scoped-import resolver from the entry's hatchfile
+    // (if any). Each entry maps an import name like
+    // `"@hatch:fmt"` to the absolute path of the dep's entry
+    // `.wren` file. Path-linked deps only — registry / git
+    // archive deps need `.hatch` cracking, which lands later.
+    let scoped_resolver = build_scoped_resolver(entry_path);
+
     walk_module(
         &entry_canonical,
         "main",
@@ -182,8 +189,80 @@ pub fn walk_imports(entry_path: &Path) -> Result<Vec<AotModule>, AotError> {
         &mut visited,
         &mut out,
         &mut field_layouts,
+        &scoped_resolver,
     )?;
     Ok(out)
+}
+
+/// Map from scoped import name (e.g. `"@hatch:fmt"`) to the
+/// absolute path of the dep's entry `.wren` file. Built once at
+/// walk start from the entry's hatchfile.
+type ScopedResolver = HashMap<String, PathBuf>;
+
+fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
+    let mut map = HashMap::new();
+    let entry_dir = entry_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    // Walk up from the entry's dir looking for a hatchfile.
+    let mut cursor = Some(entry_dir);
+    let hatchfile = loop {
+        match cursor {
+            Some(d) => {
+                let candidate = d.join("hatchfile");
+                if candidate.exists() {
+                    break Some(candidate);
+                }
+                cursor = d.parent().map(Path::to_path_buf);
+            }
+            None => break None,
+        }
+    };
+
+    let Some(hatchfile) = hatchfile else {
+        return map;
+    };
+    let workspace_root = match hatchfile.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return map,
+    };
+
+    let text = match std::fs::read_to_string(&hatchfile) {
+        Ok(t) => t,
+        Err(_) => return map,
+    };
+    let manifest: crate::hatch::Manifest = match toml::from_str(&text) {
+        Ok(m) => m,
+        Err(_) => return map,
+    };
+
+    // For every path-linked dep, read its own hatchfile to find
+    // its `[package].entry` module name → resolve to a `.wren`
+    // file under the dep's directory.
+    for (name, dep) in manifest
+        .dependencies
+        .iter()
+        .chain(manifest.spec_dependencies.iter())
+    {
+        let crate::hatch::Dependency::Path { path, .. } = dep else {
+            continue;
+        };
+        let dep_dir = workspace_root.join(path);
+        let dep_hatchfile = dep_dir.join("hatchfile");
+        let Ok(dep_text) = std::fs::read_to_string(&dep_hatchfile) else {
+            continue;
+        };
+        let dep_manifest: crate::hatch::Manifest = match toml::from_str(&dep_text) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        // `entry` is a module name (e.g. `"fmt"`). The `.wren`
+        // file lives at `<dep_dir>/<entry>.wren`.
+        let entry_file = dep_dir.join(format!("{}.wren", dep_manifest.entry));
+        if entry_file.exists() {
+            map.insert(name.clone(), entry_file);
+        }
+    }
+    map
 }
 
 fn walk_module(
@@ -193,6 +272,7 @@ fn walk_module(
     visited: &mut HashSet<String>,
     out: &mut Vec<AotModule>,
     field_layouts: &mut HashMap<String, Vec<String>>,
+    scoped_resolver: &ScopedResolver,
 ) -> Result<(), AotError> {
     if !visited.insert(canonical_name.to_string()) {
         return Ok(());
@@ -242,13 +322,24 @@ fn walk_module(
             continue;
         };
         let req = &spanned.0;
-        if !(req.starts_with("./") || req.starts_with("../")) {
-            continue;
-        }
-        let Some(base_dir) = module_dir.as_ref() else {
+        let candidate: PathBuf = if req.starts_with("./") || req.starts_with("../") {
+            // Relative import: resolve against the importer's
+            // directory, fall through to the read+walk below.
+            let Some(base_dir) = module_dir.as_ref() else {
+                continue;
+            };
+            with_wren_suffix(base_dir.join(Path::new(req)))
+        } else if let Some(scoped_path) = scoped_resolver.get(req) {
+            // Scoped import (`@hatch:foo`) resolved via the
+            // entry's hatchfile [dependencies] table.
+            scoped_path.clone()
+        } else {
+            // Unresolved scoped/bare import — leaves the slot
+            // null and the AOT body will surface the error at
+            // first use. Same behaviour as the runtime when an
+            // import goes unresolved.
             continue;
         };
-        let candidate = with_wren_suffix(base_dir.join(Path::new(req)));
         let imported_canonical = std::fs::canonicalize(&candidate)
             .map_err(AotError::Io)?
             .to_string_lossy()
@@ -264,6 +355,7 @@ fn walk_module(
             visited,
             out,
             field_layouts,
+            scoped_resolver,
         )?;
     }
 
