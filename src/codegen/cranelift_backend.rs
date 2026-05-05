@@ -3039,12 +3039,7 @@ pub mod cl {
                 if let Some(cfg) = aot_config {
                     if let Some(defining) = cfg.current_defining_class.borrow().as_ref() {
                         let class_data_id = module
-                            .declare_data(
-                                &defining.modvars_symbol,
-                                Linkage::Export,
-                                true,
-                                false,
-                            )
+                            .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
                             .map_err(|e| e.to_string())?;
                         let gv = module.declare_data_in_func(class_data_id, builder.func);
                         let modvars_addr = builder.ins().global_value(types::I64, gv);
@@ -3054,8 +3049,7 @@ pub mod cl {
                             modvars_addr,
                             (defining.slot as i32) * 8,
                         );
-                        let f =
-                            get_runtime_fn(module, builder, "wlift_aot_get_static_field", 2)?;
+                        let f = get_runtime_fn(module, builder, "wlift_aot_get_static_field", 2)?;
                         let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
                         let result = builder.ins().call(f, &[class_bits, sym_val]);
                         return Ok(Some(builder.inst_results(result)[0]));
@@ -3070,12 +3064,7 @@ pub mod cl {
                 if let Some(cfg) = aot_config {
                     if let Some(defining) = cfg.current_defining_class.borrow().as_ref() {
                         let class_data_id = module
-                            .declare_data(
-                                &defining.modvars_symbol,
-                                Linkage::Export,
-                                true,
-                                false,
-                            )
+                            .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
                             .map_err(|e| e.to_string())?;
                         let gv = module.declare_data_in_func(class_data_id, builder.func);
                         let modvars_addr = builder.ins().global_value(types::I64, gv);
@@ -3085,8 +3074,7 @@ pub mod cl {
                             modvars_addr,
                             (defining.slot as i32) * 8,
                         );
-                        let f =
-                            get_runtime_fn(module, builder, "wlift_aot_set_static_field", 3)?;
+                        let f = get_runtime_fn(module, builder, "wlift_aot_set_static_field", 3)?;
                         let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
                         let result = builder.ins().call(f, &[class_bits, sym_val, get(val)]);
                         return Ok(Some(builder.inst_results(result)[0]));
