@@ -101,12 +101,16 @@ pub mod cl {
     unsafe impl Sync for CraneliftCompiledCode {}
 
     /// Compile a MIR function to native code using Cranelift.
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_mir(
         mir: &MirFunction,
         interner: &Interner,
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
+        inline_bodies: Option<
+            std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
+        >,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -243,6 +247,7 @@ pub mod cl {
                     Some(inner_id),
                     None,
                     None, // f64 inner is JIT-only
+                    None, // f64 inner has no method calls — nothing to inline
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -353,6 +358,7 @@ pub mod cl {
                 callsite_ic_ptrs,
                 callsite_ic_live_ptrs,
                 jit_code_base,
+                inline_bodies.clone(),
             )?;
 
             builder.seal_all_blocks();
@@ -391,6 +397,7 @@ pub mod cl {
                 callsite_ic_ptrs,
                 callsite_ic_live_ptrs,
                 jit_code_base,
+                inline_bodies.clone(),
             )
         } else {
             Vec::new()
@@ -517,6 +524,7 @@ pub mod cl {
         mir.blocks.iter().any(has_backward_successor)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_osr_entries(
         mir: &MirFunction,
         interner: &Interner,
@@ -525,6 +533,9 @@ pub mod cl {
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
+        inline_bodies: Option<
+            std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
+        >,
     ) -> Vec<PendingOsrDefinition> {
         let mut defs = Vec::new();
         for target_block in collect_osr_targets(mir) {
@@ -566,6 +577,7 @@ pub mod cl {
                     None,
                     Some(layout.clone()),
                     None, // OSR-entry path is JIT-only
+                    inline_bodies.clone(),
                 );
                 if result.is_ok() {
                     builder.seal_all_blocks();
@@ -1058,11 +1070,12 @@ pub mod cl {
         aot_config: Option<&AotLoweringConfig>,
     ) -> Result<(), String> {
         lower_mir_impl(
-            mir, interner, builder, module, None, None, None, None, None, aot_config,
+            mir, interner, builder, module, None, None, None, None, None, aot_config, None,
         )
     }
 
     /// Lower a MIR function into Cranelift IR using the FunctionBuilder.
+    #[allow(clippy::too_many_arguments)]
     fn lower_mir_to_cranelift(
         mir: &MirFunction,
         interner: &Interner,
@@ -1071,6 +1084,9 @@ pub mod cl {
         callsite_ic_ptrs: Option<&[crate::mir::bytecode::CallSiteIC]>,
         callsite_ic_live_ptrs: Option<&[usize]>,
         jit_code_base: Option<*const *const u8>,
+        inline_bodies: Option<
+            std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
+        >,
     ) -> Result<(), String> {
         lower_mir_impl(
             mir,
@@ -1083,6 +1099,7 @@ pub mod cl {
             None,
             None,
             None,
+            inline_bodies,
         )
     }
 
@@ -1103,6 +1120,9 @@ pub mod cl {
         f64_self_id: Option<cranelift_module::FuncId>,
         osr_entry: Option<OsrEntryLayout>,
         aot_config: Option<&AotLoweringConfig>,
+        inline_bodies: Option<
+            std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
+        >,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
@@ -1329,6 +1349,7 @@ pub mod cl {
                     f64_self_id,
                     receiver_val,
                     aot_config,
+                    inline_bodies.as_ref(),
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -1476,6 +1497,9 @@ pub mod cl {
         f64_self_id: Option<cranelift_module::FuncId>,
         receiver_val: Option<Value>,
         aot_config: Option<&AotLoweringConfig>,
+        inline_bodies: Option<
+            &std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
+        >,
     ) -> Result<Option<Value>, String> {
         // Investigation mode — convert undefined-value to a graceful
         // Err so the broker thread survives, letting other functions
@@ -2198,6 +2222,152 @@ pub mod cl {
                     }
                     let result = builder.ins().call(f, &call_args);
                     return Ok(Some(builder.inst_results(result)[0]));
+                }
+
+                // === CHA-driven body inlining ===
+                // When the engine flagged this callee as a small,
+                // single-block, dispatch-free body, splice the body
+                // straight into the caller's Cranelift function
+                // behind the same class-check guard the kind=1 IC
+                // would emit. A receiver whose class doesn't match
+                // the speculation falls through to `wren_call_N`,
+                // matching the existing CallKnownFunc fallback.
+                //
+                // This subsumes the trivial-getter / pure-leaf-direct
+                // paths for any callee the inliner can lower, which
+                // is most short Wren methods (field load + arithmetic
+                // + field store + return). The body emits with no
+                // helper hop, no jit_ctx swap, no jit_roots push, no
+                // depth tracking — i.e. the AOT-shape direct call,
+                // but with a per-callsite speculation guard.
+                if let Some(bodies) = inline_bodies {
+                    if *expected_class != 0 && args.len() <= 4 {
+                        if let Some(callee_mir) = bodies.get(func_id).cloned() {
+                            let fast_block = builder.create_block();
+                            let slow_block = builder.create_block();
+                            let merge_block = builder.create_block();
+                            builder.append_block_param(merge_block, types::I64);
+
+                            // Class check using the same shape as the
+                            // existing kind=1 IC fast path.
+                            let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                            let obj_ptr = builder.ins().band(r, ptr_mask);
+                            let recv_class = builder.ins().load(
+                                types::I64,
+                                MemFlags::trusted(),
+                                obj_ptr,
+                                HEADER_CLASS,
+                            );
+                            let cached_class =
+                                builder.ins().iconst(types::I64, *expected_class as i64);
+                            let class_match =
+                                builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
+                            builder
+                                .ins()
+                                .brif(class_match, fast_block, &[], slow_block, &[]);
+
+                            // Fast block: walk the callee's single
+                            // block, lowering each instruction into the
+                            // caller's function with a fresh local
+                            // val_map. BlockParam(i) maps to the
+                            // caller-supplied receiver/arg values.
+                            builder.switch_to_block(fast_block);
+                            let mut callee_vals: HashMap<ValueId, Value> = HashMap::new();
+                            // arg slot 0 = receiver, 1.. = user args.
+                            let mut callee_args: Vec<Value> = Vec::with_capacity(args.len() + 1);
+                            callee_args.push(r);
+                            for a in args.iter() {
+                                callee_args.push(get(a));
+                            }
+                            let callee_block = &callee_mir.blocks[0];
+                            let mut inline_call_idx = 0usize;
+                            let mut inline_failed = false;
+                            for (vid, callee_inst) in &callee_block.instructions {
+                                match callee_inst {
+                                    Instruction::BlockParam(idx) => {
+                                        let i = *idx as usize;
+                                        if i < callee_args.len() {
+                                            callee_vals.insert(*vid, callee_args[i]);
+                                        } else {
+                                            // Eligibility check should have
+                                            // matched arity, but stay defensive.
+                                            inline_failed = true;
+                                            break;
+                                        }
+                                    }
+                                    _ => {
+                                        let res = lower_instruction(
+                                            callee_inst,
+                                            &callee_mir,
+                                            interner,
+                                            builder,
+                                            module,
+                                            &callee_vals,
+                                            get_runtime_fn,
+                                            None,
+                                            None,
+                                            jit_code_base,
+                                            &mut inline_call_idx,
+                                            f64_self_id,
+                                            Some(callee_args[0]),
+                                            aot_config,
+                                            None,
+                                        )?;
+                                        if let Some(v) = res {
+                                            callee_vals.insert(*vid, v);
+                                        }
+                                    }
+                                }
+                            }
+                            let return_val = if inline_failed {
+                                None
+                            } else {
+                                match &callee_block.terminator {
+                                    Terminator::Return(v) => callee_vals.get(v).copied(),
+                                    Terminator::ReturnNull => Some(
+                                        builder.ins().iconst(types::I64, TAG_NULL as i64),
+                                    ),
+                                    _ => None,
+                                }
+                            };
+                            if let Some(rv) = return_val {
+                                builder.ins().jump(merge_block, &[BlockArg::Value(rv)]);
+                            } else {
+                                // Inline fell through (unsupported terminator
+                                // or missing param) — collapse the fast block
+                                // into the slow path so emit stays sound.
+                                builder.ins().jump(slow_block, &[]);
+                            }
+
+                            // Slow path: full dispatch through wren_call_N.
+                            builder.switch_to_block(slow_block);
+                            let method_bits = method.index() as u64;
+                            let method_val =
+                                builder.ins().iconst(types::I64, method_bits as i64);
+                            let slow_name = match args.len() {
+                                0 => "wren_call_0",
+                                1 => "wren_call_1",
+                                2 => "wren_call_2",
+                                3 => "wren_call_3",
+                                _ => "wren_call_4",
+                            };
+                            let slow_arg_count = 2 + args.len().min(8);
+                            let slow_f =
+                                get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
+                            let mut slow_args = vec![r, method_val];
+                            for a in args.iter().take(8) {
+                                slow_args.push(get(a));
+                            }
+                            let slow_call = builder.ins().call(slow_f, &slow_args);
+                            let slow_result = builder.inst_results(slow_call)[0];
+                            builder
+                                .ins()
+                                .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                            builder.switch_to_block(merge_block);
+                            return Ok(Some(builder.block_params(merge_block)[0]));
+                        }
+                    }
                 }
 
                 // === Pure-leaf direct call (ZERO FFI) ===
