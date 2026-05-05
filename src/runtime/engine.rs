@@ -1196,13 +1196,6 @@ impl ExecutionEngine {
     /// class-checked direct calls (or trivial-getter inlines).
     /// Walks MIR Call/SuperCall in the same order
     /// `callsite_ic_data_for_compile` produces the snapshot.
-    ///
-    /// Polymorphic methods (multiple `(class, fn)` impls in CHA)
-    /// stay empty: planting an arbitrary first impl turns class-
-    /// check misses into a wren_call_N detour for every receiver
-    /// that doesn't match, which on benchmarks like delta_blue
-    /// regresses 3-5%. A multi-class dispatch tree (mirroring
-    /// AOT-CHA's emit) is the proper fix and will land separately.
     fn fill_ic_with_cha(
         &self,
         mir: &crate::mir::MirFunction,
