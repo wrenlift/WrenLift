@@ -2925,7 +2925,20 @@ impl VM {
         // miss them entirely under pass 1 alone. Walk x29 → caller's
         // fp → caller's caller's fp via the standard aarch64 frame
         // chain, look up each return address against `code_ranges`,
-        // and scan whatever safepoint matches.
+        // and scan the frame.
+        //
+        // For each AOT frame we use a *combined* approach: the
+        // Cranelift-emitted safepoint metadata gives precise
+        // coverage for marked Wren `Value`s, but Cranelift can't
+        // mark intermediate Values built inside the lowering's
+        // own helper-call chains (e.g. multi-element string
+        // concat results passed register-to-register). To catch
+        // those without manually declaring every internal Value,
+        // we ALSO conservatively scan every 8-byte aligned slot
+        // in the frame's local-storage range, validating each
+        // candidate against `gc.contains_heap_pointer` so a stray
+        // non-Value u64 with the TAG_OBJ bit pattern can't fool
+        // us into treating it as a root.
         //
         // The frame chain dies as soon as we cross out of code we
         // emitted (the linker's main, libc startup, ...) — those
@@ -2945,6 +2958,10 @@ impl VM {
 
             let max_frames = 256;
             let mut walked = 0;
+            // Track each iteration's `fp` (the inner frame's fp)
+            // so we know the bottom of the *caller's* frame
+            // — caller's locals span [inner_fp + 16, caller_fp).
+            let mut inner_fp = fp;
             while fp != 0 && walked < max_frames {
                 walked += 1;
                 if fp & 7 != 0 {
@@ -2960,42 +2977,66 @@ impl VM {
                 // has fp == saved_fp. Skip frames already scanned
                 // via pass 1.
                 if saved_fp == 0 || covered_fps.contains(&saved_fp) {
+                    inner_fp = fp;
                     fp = saved_fp;
                     continue;
                 }
 
-                let code_range = self
+                let in_aot = self
                     .engine
                     .code_ranges
                     .iter()
-                    .find(|r| saved_ret >= r.start && saved_ret < r.end);
-                if let Some(cr) = code_range {
-                    let meta = self
-                        .engine
-                        .jit_metadata
-                        .get(cr.func_id.0 as usize)
-                        .and_then(|m| m.as_ref());
-                    if let Some(meta) = meta {
-                        let offset = saved_ret.wrapping_sub(cr.start) as u32;
-                        if let Some(sp) =
-                            meta.safepoints.iter().find(|sp| sp.code_offset == offset)
-                        {
-                            for root in &sp.live_roots {
-                                if let RootLocation::Spill(spill_offset) = root.location {
-                                    let addr =
-                                        (saved_fp as isize + spill_offset as isize) as *mut u64;
-                                    let bits = unsafe { *addr };
-                                    let val = Value::from_bits(bits);
-                                    if val.is_object() {
-                                        found_roots.push(val);
-                                        slot_addrs.push(addr);
+                    .any(|r| saved_ret >= r.start && saved_ret < r.end);
+
+                if in_aot {
+                    // Frame extent for the caller (the AOT
+                    // function whose body is at saved_ret):
+                    // its locals + spills live at addresses
+                    // [fp + 16, saved_fp). aarch64 stack grows
+                    // down, so caller's saved_fp is the high
+                    // bound and the inner frame's saved-fp+lr
+                    // (just past current `fp`) is the low bound.
+                    let low = fp + 16;
+                    let high = saved_fp;
+                    if high > low {
+                        let mut addr = low;
+                        while addr + 8 <= high {
+                            // 8-byte aligned slot.
+                            if addr & 7 == 0 {
+                                let bits = unsafe { *(addr as *const u64) };
+                                let val = Value::from_bits(bits);
+                                if val.is_object() {
+                                    if let Some(p) = val.as_object() {
+                                        if self.gc.contains_heap_pointer(p as *const u8) {
+                                            // Avoid double-rooting
+                                            // a slot covered by
+                                            // pass 1's precise
+                                            // scan via jit_frame_entries
+                                            // (the saved_fp here
+                                            // is excluded from
+                                            // the covered_fps
+                                            // check above, so a
+                                            // duplicate entry is
+                                            // harmless: GC tolerates
+                                            // multi-rooted values
+                                            // and the write-back
+                                            // re-stores the same
+                                            // forwarded bits).
+                                            found_roots
+                                                .push(Value::from_bits(bits));
+                                            slot_addrs.push(addr as *mut u64);
+                                        }
                                     }
                                 }
                             }
+                            addr += 8;
                         }
                     }
                 }
+                inner_fp = fp;
                 fp = saved_fp;
+                let _ = inner_fp; // silence unused-write lint after the
+                                  // last loop iteration's reassignment.
             }
         }
 

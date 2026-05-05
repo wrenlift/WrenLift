@@ -191,6 +191,22 @@ impl GcImpl {
         gc_dispatch!(self, stats)
     }
 
+    /// Conservative-scan helper: is `ptr` inside any GC-owned
+    /// region? Used by AOT frame scanning to validate
+    /// NaN-box-shaped values before treating them as roots.
+    /// Only `Generational` actually distinguishes heap pages
+    /// from arbitrary memory; the other strategies hand back
+    /// `false` so conservative scanning surfaces no candidates
+    /// (they don't move objects, so missing a root never
+    /// matters under those strategies).
+    #[inline(always)]
+    pub fn contains_heap_pointer(&self, ptr: *const u8) -> bool {
+        match self {
+            GcImpl::Generational(gc) => gc.contains_heap_pointer(ptr),
+            GcImpl::Arena(_) | GcImpl::MarkSweep(_) => false,
+        }
+    }
+
     #[cfg(debug_assertions)]
     #[inline(always)]
     pub fn validate_write_barriers(&self) {

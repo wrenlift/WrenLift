@@ -33,7 +33,7 @@ const FORWARDED: u8 = 3;
 /// Each chunk is a separately heap-allocated block. Pointers to objects
 /// in earlier chunks remain valid when new chunks are added.
 pub struct OldArena {
-    chunks: Vec<Vec<u8>>,
+    pub chunks: Vec<Vec<u8>>,
     alloc_ptr: usize,
     chunk_size: usize,
 }
@@ -342,6 +342,27 @@ impl Gc {
 
     pub fn old_count(&self) -> usize {
         self.old_count
+    }
+
+    /// Conservative-scan fast-path: does this raw pointer fall
+    /// inside any GC-owned region (nursery or old-arena chunks)?
+    /// Used by `scan_native_stack_roots` when it walks AOT frames
+    /// and needs to validate a NaN-box-shaped value before
+    /// treating it as a root — avoids following a non-pointer
+    /// Number into garbage memory.
+    pub fn contains_heap_pointer(&self, ptr: *const u8) -> bool {
+        if self.nursery.contains(ptr) {
+            return true;
+        }
+        let addr = ptr as usize;
+        for chunk in &self.old_arena.chunks {
+            let start = chunk.as_ptr() as usize;
+            let end = start + chunk.len();
+            if addr >= start && addr < end {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn should_collect(&self) -> bool {
