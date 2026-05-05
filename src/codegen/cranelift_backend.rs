@@ -151,11 +151,7 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        >,
+        cha_by_method: crate::runtime::engine::SharedCha,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -584,11 +580,7 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        >,
+        cha_by_method: crate::runtime::engine::SharedCha,
     ) -> Vec<PendingOsrDefinition> {
         let mut defs = Vec::new();
         for target_block in collect_osr_targets(mir) {
@@ -1141,11 +1133,7 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        >,
+        cha_by_method: crate::runtime::engine::SharedCha,
     ) -> Result<(), String> {
         lower_mir_impl(
             mir,
@@ -1183,11 +1171,7 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        >,
+        cha_by_method: crate::runtime::engine::SharedCha,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
         let mut block_map: HashMap<BlockId, cranelift_codegen::ir::Block> = HashMap::new();
@@ -1566,11 +1550,7 @@ pub mod cl {
         inline_bodies: Option<
             &std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            &std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        >,
+        cha_by_method: Option<&std::sync::Arc<crate::runtime::engine::ChaMap>>,
     ) -> Result<Option<Value>, String> {
         // Investigation mode — convert undefined-value to a graceful
         // Err so the broker thread survives, letting other functions

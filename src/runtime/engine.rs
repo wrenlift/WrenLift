@@ -23,6 +23,16 @@ use crate::intern::SymbolId;
 use crate::mir::bytecode::{BytecodeFunction, CallSiteIC};
 use crate::mir::MirFunction;
 
+/// Class-hierarchy-analysis index: for each method symbol, the
+/// list of `(class_ptr, func_id, closure_ptr)` triples implementing
+/// it. Consumed by both the JIT (to plant IC entries before any
+/// runtime miss) and the interpreter (to dispatch monomorphic
+/// CHA-known sites without a method-cache lookup).
+pub type ChaMap = HashMap<SymbolId, Vec<(usize, u32, usize)>>;
+
+/// Optional shared CHA snapshot threaded through codegen.
+pub type SharedCha = Option<Arc<ChaMap>>;
+
 // ---------------------------------------------------------------------------
 // Execution mode
 // ---------------------------------------------------------------------------
@@ -1122,13 +1132,8 @@ impl ExecutionEngine {
     /// slow path. Including `closure_ptr` lets the interpreter
     /// dispatch directly from a CHA-planted IC entry instead of
     /// falling back to a method-table lookup.
-    pub fn build_jit_cha(
-        &self,
-    ) -> std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>> {
-        let mut by_method: std::collections::HashMap<
-            crate::intern::SymbolId,
-            Vec<(usize, u32, usize)>,
-        > = std::collections::HashMap::new();
+    pub fn build_jit_cha(&self) -> ChaMap {
+        let mut by_method: ChaMap = HashMap::new();
         for entry in self.modules.values() {
             for var in &entry.vars {
                 if !var.is_object() {
@@ -1285,7 +1290,7 @@ impl ExecutionEngine {
         &self,
         mir: &crate::mir::MirFunction,
         ic_snapshot: &mut [CallSiteIC],
-        cha: &std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
+        cha: &ChaMap,
     ) {
         use crate::mir::Instruction;
         let mut ic_idx = 0usize;
@@ -2225,18 +2230,14 @@ impl ExecutionEngine {
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
         let cha_disabled = std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_some();
-        let cha_for_codegen: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        > = if cha_disabled {
+        let cha_for_codegen: SharedCha = if cha_disabled {
             None
         } else {
             let cha = self.build_jit_cha();
             if let Some(ref mut ics) = callsite_ic_ptrs {
                 self.fill_ic_with_cha(&mir, ics, &cha);
             }
-            Some(std::sync::Arc::new(cha))
+            Some(Arc::new(cha))
         };
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
@@ -2380,18 +2381,14 @@ impl ExecutionEngine {
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
         let cha_disabled = std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_some();
-        let cha_for_codegen: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-            >,
-        > = if cha_disabled {
+        let cha_for_codegen: SharedCha = if cha_disabled {
             None
         } else {
             let cha = self.build_jit_cha();
             if let Some(ref mut ics) = callsite_ic_ptrs {
                 self.fill_ic_with_cha(&mir, ics, &cha);
             }
-            Some(std::sync::Arc::new(cha))
+            Some(Arc::new(cha))
         };
         let devirt_hints = callsite_ic_ptrs
             .as_ref()

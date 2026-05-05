@@ -2177,11 +2177,8 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] inline_bodies: Option<
         std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
     >,
-    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] cha_by_method: Option<
-        std::sync::Arc<
-            std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
-        >,
-    >,
+    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))]
+    cha_by_method: crate::runtime::engine::SharedCha,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
