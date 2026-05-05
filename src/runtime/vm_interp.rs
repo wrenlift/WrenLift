@@ -982,6 +982,41 @@ fn run_fiber_with_stop_depth(
                     Value::from_bits(f(recv_bits))
                 };
                 fiber = vm.fiber;
+                // Did the AOT body call `Fiber.abort` (i.e.
+                // `vm.has_error`)? If the running fiber is
+                // under `Fiber.try`, route the abort message
+                // back as the caller's resume value instead of
+                // bubbling out as a hard process error. The
+                // BC-interp side does this at every method-
+                // dispatch boundary; the AOT-stub fast path
+                // skipped it, so a `Fiber.new { Fiber.abort(
+                // "boom") }.try()` returned null instead of
+                // `"boom"`.
+                if vm.has_error {
+                    let msg = vm.last_error.clone().unwrap_or_default();
+                    if let Some(_routed) =
+                        unsafe { route_method_error_through_fiber_try(vm, fiber, msg) }
+                    {
+                        // route_method_error_through_fiber_try
+                        // already cleared is_try, set
+                        // fiber.error / state = Done, called
+                        // resume_caller (which writes
+                        // `jit_resume_value` for the JIT
+                        // barrier path). Drain the runtime
+                        // error and continue the loop so the
+                        // caller picks the value up.
+                        vm.has_error = false;
+                        vm.last_error = None;
+                        unsafe {
+                            (*fiber).mir_frames.pop();
+                        }
+                        values.clear();
+                        if vm.register_pool.len() < 128 {
+                            vm.register_pool.push(values);
+                        }
+                        continue 'fiber_loop;
+                    }
+                }
                 unsafe {
                     (*fiber).mir_frames.pop();
                     (*fiber).state = FiberState::Done;

@@ -2185,6 +2185,23 @@ fn handle_jit_fiber_action(
             } else {
                 set_jit_context(saved_jit_ctx);
                 set_jit_depth(saved_jit_depth);
+                // No outer caller fiber (top-level AOT body
+                // running directly from `wlift_aot_main`).
+                // Without this branch the abort message stays
+                // on `target.error` but never reaches the AOT
+                // call site of `fiber.try()`, which then sees
+                // `null` instead of the error string. Surface
+                // it directly so `var e = Fiber.new { Fiber.abort(
+                // "boom") }.try()` returns `"boom"` whether the
+                // call is happening inside a fiber or at the
+                // script's top level.
+                let target_state = unsafe { (*target).state };
+                if matches!(target_state, FiberState::Done) {
+                    let err = unsafe { (*target).error };
+                    if !err.is_null() {
+                        return err.to_bits();
+                    }
+                }
             }
             match result {
                 Ok(v) => v.to_bits(),
