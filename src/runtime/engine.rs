@@ -1118,7 +1118,7 @@ impl ExecutionEngine {
     /// thread and are only used to fill IC entries that the
     /// runtime later class-checks before dispatching, so a stale
     /// pointer just falls through to the slow path.
-    fn build_jit_cha(&self) -> std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>
+    pub fn build_jit_cha(&self) -> std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>
     {
         let mut by_method: std::collections::HashMap<
             crate::intern::SymbolId,
@@ -2217,12 +2217,20 @@ impl ExecutionEngine {
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
-        if std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_none() {
+        let cha_disabled = std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_some();
+        let cha_for_codegen: Option<
+            std::sync::Arc<
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+            >,
+        > = if cha_disabled {
+            None
+        } else {
+            let cha = self.build_jit_cha();
             if let Some(ref mut ics) = callsite_ic_ptrs {
-                let cha = self.build_jit_cha();
                 self.fill_ic_with_cha(&mir, ics, &cha);
             }
-        }
+            Some(std::sync::Arc::new(cha))
+        };
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
@@ -2250,6 +2258,7 @@ impl ExecutionEngine {
                 jit_code_base,
                 callee_purity,
                 inline_bodies,
+                cha_for_codegen,
             ) {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
@@ -2363,12 +2372,20 @@ impl ExecutionEngine {
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
-        if std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_none() {
+        let cha_disabled = std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_some();
+        let cha_for_codegen: Option<
+            std::sync::Arc<
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+            >,
+        > = if cha_disabled {
+            None
+        } else {
+            let cha = self.build_jit_cha();
             if let Some(ref mut ics) = callsite_ic_ptrs {
-                let cha = self.build_jit_cha();
                 self.fill_ic_with_cha(&mir, ics, &cha);
             }
-        }
+            Some(std::sync::Arc::new(cha))
+        };
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
@@ -2422,6 +2439,7 @@ impl ExecutionEngine {
                 Some(jit_code_base_raw as *const *const u8),
                 Some(callee_purity.clone()),
                 inline_bodies.clone(),
+                cha_for_codegen.clone(),
             )
             .map_err(|e| {
                 if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
