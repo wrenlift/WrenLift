@@ -12,8 +12,7 @@ use {super::object::*, super::value::Value, crate::codegen::runtime_fns::JitCont
 pub const HEADER_OBJ_TYPE: i32 = 0; // u8
 pub const HEADER_GC_MARK: i32 = 1; // u8
 pub const HEADER_GENERATION: i32 = 2; // u8
-pub const HEADER_FLAGS: i32 = 3; // u8 (bit 0 = HEADER_FLAG_STATIC)
-                                 // 4 bytes padding
+                                      // 5 bytes padding
 pub const HEADER_NEXT: i32 = 8; // *mut ObjHeader
 pub const HEADER_CLASS: i32 = 16; // *mut ObjClass
 pub const HEADER_SIZE: i32 = 24;
