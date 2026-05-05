@@ -1132,9 +1132,7 @@ pub mod cl {
         /// re-mutate the TLS context. `None` when the function
         /// body has no upvalue access (skip the load entirely).
         /// Cleared to `None` between emissions by `emit_aot_function`.
-        pub current_closure_ptr_var: std::cell::RefCell<
-            Option<cranelift_frontend::Variable>,
-        >,
+        pub current_closure_ptr_var: std::cell::RefCell<Option<cranelift_frontend::Variable>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1344,10 +1342,7 @@ pub mod cl {
                 && f64_self_id.is_none()
                 && mir.blocks.iter().any(|b| {
                     b.instructions.iter().any(|(_, i)| {
-                        matches!(
-                            i,
-                            Instruction::GetUpvalue(_) | Instruction::SetUpvalue(..)
-                        )
+                        matches!(i, Instruction::GetUpvalue(_) | Instruction::SetUpvalue(..))
                     })
                 });
             if needs_closure_ptr {
@@ -1452,8 +1447,7 @@ pub mod cl {
                 // calling the per-access helper.
                 if let Some(cfg) = aot_config {
                     if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
-                        let f =
-                            get_runtime_fn(module, builder, "wren_load_jit_closure", 0)?;
+                        let f = get_runtime_fn(module, builder, "wren_load_jit_closure", 0)?;
                         let call = builder.ins().call(f, &[]);
                         let closure_bits = builder.inst_results(call)[0];
                         builder.def_var(var, closure_bits);
@@ -2024,11 +2018,7 @@ pub mod cl {
                                 let tag_obj_const =
                                     builder.ins().iconst(types::I64, TAG_OBJ as i64);
                                 let high = builder.ins().band(r, tag_obj_const);
-                                let is_obj = builder.ins().icmp(
-                                    IntCC::Equal,
-                                    high,
-                                    tag_obj_const,
-                                );
+                                let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj_const);
                                 let object_block = builder.create_block();
                                 builder
                                     .ins()
@@ -3179,15 +3169,12 @@ pub mod cl {
                             UPVALUE_LOCATION,
                         );
                         let v = get(val);
-                        builder
-                            .ins()
-                            .store(MemFlags::trusted(), v, location_ptr, 0);
+                        builder.ins().store(MemFlags::trusted(), v, location_ptr, 0);
                         // Generational write barrier: the upvalue
                         // header is the slot's owner; a young value
                         // stored into an old upvalue must surface to
                         // the major GC's remembered set.
-                        let barrier =
-                            get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
+                        let barrier = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
                         builder.ins().call(barrier, &[upvalue_ptr, v]);
                         return Ok(Some(v));
                     }

@@ -147,9 +147,8 @@ mod tests {
         // We can't read the Vec's internal data-ptr field directly
         // without invoking UB; do it through a single u64 load at
         // the offset we expect, then compare against `as_ptr()`.
-        let probed = unsafe {
-            *(base.wrapping_add(CLOSURE_UPVALUES_DATA as usize) as *const usize)
-        };
+        let probed =
+            unsafe { *(base.wrapping_add(CLOSURE_UPVALUES_DATA as usize) as *const usize) };
         assert_eq!(
             probed, data_ptr_addr,
             "CLOSURE_UPVALUES_DATA points at Vec.cap (or worse) instead of \

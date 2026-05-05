@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wren_lift::codegen::aot::{
-    compile_walk_to_object_with_manifest, link_executable, locate_runtime_staticlib,
-    walk_imports, AotBundleMeta,
+    compile_walk_to_object_with_manifest, link_executable, locate_runtime_staticlib, walk_imports,
+    AotBundleMeta,
 };
 
 struct AotRun {
@@ -60,8 +60,7 @@ fn compile_link_run_files(entry: &str, files: &[(&str, &str)]) -> AotRun {
         .tempdir()
         .expect("tempdir");
     for (name, contents) in files {
-        fs::write(tmp.path().join(format!("{}.wren", name)), contents)
-            .expect("write source file");
+        fs::write(tmp.path().join(format!("{}.wren", name)), contents).expect("write source file");
     }
     let entry_path = tmp.path().join(format!("{}.wren", entry));
     let walk = walk_imports(&entry_path).expect("walk_imports");

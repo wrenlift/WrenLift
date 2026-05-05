@@ -1486,9 +1486,7 @@ pub fn locate_runtime_staticlib() -> Option<PathBuf> {
     }
 
     for profile in ["release", "debug"] {
-        let candidate = PathBuf::from("target")
-            .join(profile)
-            .join(staticlib_name);
+        let candidate = PathBuf::from("target").join(profile).join(staticlib_name);
         if candidate.is_file() {
             return Some(candidate);
         }
