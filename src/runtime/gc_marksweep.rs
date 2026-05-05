@@ -99,6 +99,16 @@ fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
 
 fn mark_gray(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
     unsafe {
+        // Static objects (AOT-emitted, `.data` / `.rodata`) sit
+        // outside the GC's allocation list. Skip marking — sweep
+        // never visits them, and writing to a `.rodata` mark byte
+        // would segfault. Outbound references from static data
+        // must land on other static objects or VM-rooted core
+        // classes; otherwise the heap target needs to be kept
+        // alive through a real GC root.
+        if (*header).is_static() {
+            return;
+        }
         if (*header).gc_mark != WHITE {
             return;
         }

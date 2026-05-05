@@ -98,7 +98,14 @@ pub struct ObjHeader {
     pub gc_mark: u8, // offset 1
     /// GC generation. 0 = young (nursery), 1 = old.
     pub generation: u8, // offset 2
-    // 5 bytes padding (implicit)
+    /// Header flags. Bit 0 (`HEADER_FLAG_STATIC`) marks objects
+    /// whose backing storage isn't owned by the GC — they live in
+    /// the `.data`/`.rodata` sections of an AOT-emitted binary.
+    /// The mark/sweep paths short-circuit on this bit so static
+    /// objects aren't traced into freed memory and aren't relinked
+    /// onto the heap allocation list.
+    pub flags: u8, // offset 3
+    // 4 bytes padding (implicit)
     /// Intrusive linked list of all heap objects (for GC sweep).
     pub next: *mut ObjHeader, // offset 8
     /// The class of this object (for method dispatch). Null for meta-objects.
@@ -106,15 +113,28 @@ pub struct ObjHeader {
                               // total: 24 bytes
 }
 
+/// `ObjHeader::flags` bit: storage lives in static memory, not the
+/// GC heap. Sweep skips it; mark short-circuits to avoid recursing
+/// into a `.rodata` payload as if it were a tracked heap graph.
+pub const HEADER_FLAG_STATIC: u8 = 0x01;
+
 impl ObjHeader {
     pub fn new(obj_type: ObjType) -> Self {
         Self {
             obj_type,
             gc_mark: 0,
             generation: 0,
+            flags: 0,
             next: std::ptr::null_mut(),
             class: std::ptr::null_mut(),
         }
+    }
+
+    /// Whether this object lives in static memory (AOT-emitted) and
+    /// must never be freed or relinked by the GC.
+    #[inline(always)]
+    pub fn is_static(&self) -> bool {
+        self.flags & HEADER_FLAG_STATIC != 0
     }
 }
 
