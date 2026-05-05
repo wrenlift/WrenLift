@@ -471,6 +471,16 @@ pub unsafe extern "C" fn wlift_aot_enter(
         jit_code_len: 0,
     };
     set_jit_context(new_ctx);
+    // Flip on the helper-driven GC trigger. AOT-emitted bodies
+    // never re-enter the bytecode interpreter loop where the
+    // standard safepoint runs, so without this every alloc helper
+    // is a no-op for GC and the heap grows unboundedly. JIT /
+    // interpreter modes leave the flag at its default `false` so
+    // they don't fire GC at points Cranelift's stack-map metadata
+    // doesn't cover.
+    crate::codegen::runtime_fns::set_aot_gc_enabled(
+        std::env::var_os("WLIFT_AOT_GC").is_some(),
+    );
 }
 
 /// One method's worth of class-install descriptor: `(sig, fn_ptr,
@@ -1072,6 +1082,41 @@ pub unsafe extern "C" fn wlift_aot_intern_symbol(
     };
     let vm_ref = unsafe { &mut *vm };
     vm_ref.interner.intern(s).index() as u64
+}
+
+/// Register an AOT-binary data region (a `wlift_modvars_<n>` or
+/// `wlift_consts_<n>` array) with the engine so the GC scans
+/// each slot as a `Value` root and writes back forwarded
+/// pointers. AOT modules don't enter `engine.modules` (no
+/// `interpret()` install pass), so const strings + closure
+/// pointers + class pointers stored in these regions would
+/// otherwise be invisible to the collector and the first minor
+/// GC would sweep them while AOT bodies still reference them.
+///
+/// Bootstrap calls this once per region per module — modvars
+/// first, consts second — right after `init_prelude` so the
+/// regions are registered before any AOT body executes.
+///
+/// # Safety
+///
+/// `region` must be a writable `[u64; count]` whose lifetime
+/// covers the rest of the program. The bootstrap satisfies this
+/// by passing addresses of `Linkage::Export` zero-init data
+/// blobs — those live in the binary's `.bss` for as long as the
+/// process runs.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_register_root_region(
+    vm: *mut WrenVM,
+    region: *mut u64,
+    count: usize,
+) -> c_int {
+    if vm.is_null() || region.is_null() || count == 0 {
+        return 70;
+    }
+    let vm_ref = unsafe { &mut *vm };
+    vm_ref.engine.aot_root_regions.push((region, count));
+    0
 }
 
 /// Resolve a bare-builtin import (`import "socket" for SocketCore`,

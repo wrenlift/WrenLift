@@ -3171,6 +3171,24 @@ impl VM {
             module_ranges.push((name.clone(), start, roots.len()));
         }
 
+        // 9b. AOT root regions — `wlift_modvars_<n>` and
+        // `wlift_consts_<n>` data sections registered by the
+        // AOT bootstrap. `engine.modules` is empty under AOT
+        // (the bootstrap doesn't go through `interpret`), so
+        // const strings + closure pointers + class pointers
+        // would otherwise be unreachable to the GC. Each region
+        // is a contiguous u64 array; we read each slot as a
+        // `Value` root and write back the forwarded pointer.
+        let aot_regions = self.engine.aot_root_regions.clone();
+        let mut aot_region_starts: Vec<usize> = Vec::with_capacity(aot_regions.len());
+        for &(addr, count) in &aot_regions {
+            aot_region_starts.push(roots.len());
+            for i in 0..count {
+                let bits = unsafe { *addr.add(i) };
+                roots.push(Value::from_bits(bits));
+            }
+        }
+
         // 10. Reload callbacks — closures registered via Hatch.onReload.
         let reload_cb_start = roots.len();
         roots.extend_from_slice(&self.reload_callbacks);
@@ -3281,6 +3299,18 @@ impl VM {
         for (name, start, end) in &module_ranges {
             if let Some(entry) = self.engine.modules.get_mut(name) {
                 entry.vars.copy_from_slice(&roots[*start..*end]);
+            }
+        }
+
+        // Write back AOT root regions (modvars + consts data
+        // sections in the linked binary) with forwarded pointers.
+        for (region_idx, &(addr, count)) in aot_regions.iter().enumerate() {
+            let start = aot_region_starts[region_idx];
+            for i in 0..count {
+                let bits = roots[start + i].to_bits();
+                unsafe {
+                    *addr.add(i) = bits;
+                }
             }
         }
 

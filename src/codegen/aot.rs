@@ -1812,6 +1812,16 @@ fn emit_aot_bootstrap_main(
         ],
         Some(types::I32),
     )?;
+    let register_root_region = declare_import(
+        module,
+        "wlift_aot_register_root_region",
+        &[
+            ptr_ty, // vm
+            ptr_ty, // region
+            ptr_ty, // count
+        ],
+        Some(types::I32),
+    )?;
     let install_class = declare_import(
         module,
         "wlift_aot_install_class",
@@ -2345,6 +2355,8 @@ fn emit_aot_bootstrap_main(
             module.declare_func_in_func(register_code_range, builder.func);
         let resolve_runtime_import_ref =
             module.declare_func_in_func(resolve_runtime_import, builder.func);
+        let register_root_region_ref =
+            module.declare_func_in_func(register_root_region, builder.func);
         let install_class_ref = module.declare_func_in_func(install_class, builder.func);
         let bind_foreign_class_ref = module.declare_func_in_func(bind_foreign_class, builder.func);
         let add_native_search_path_ref =
@@ -2409,6 +2421,22 @@ fn emit_aot_bootstrap_main(
             let _ = builder
                 .ins()
                 .call(init_prelude_ref, &[vm, modvars_addr, modvars_count]);
+
+            // Register modvars + consts as GC root regions BEFORE
+            // any allocations that could trigger a minor cycle —
+            // const-string allocs (next loop) push young objects
+            // into `consts[i]`, and a GC fired by a later helper
+            // would sweep them otherwise. Closure pointers stored
+            // later via `register_closure` go into closures_data
+            // (just FuncId numbers, not heap), so closures_data
+            // doesn't need scanning.
+            let _ = builder
+                .ins()
+                .call(register_root_region_ref, &[vm, modvars_addr, modvars_count]);
+            let consts_count = builder.ins().iconst(ptr_ty, m.const_text_ids.len() as i64);
+            let _ = builder
+                .ins()
+                .call(register_root_region_ref, &[vm, consts_addr, consts_count]);
 
             for (k, text_id) in m.const_text_ids.iter().enumerate() {
                 let text_gv = module.declare_data_in_func(*text_id, builder.func);

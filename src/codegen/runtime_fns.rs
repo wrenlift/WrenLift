@@ -1077,6 +1077,31 @@ pub fn push_jit_root(v: Value) {
     JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).push(v) });
 }
 
+thread_local! {
+    /// Toggle that gates helper-driven GC. Off by default so JIT
+    /// and interpreter modes keep their existing safepoint
+    /// schedule (the bytecode interpreter loop runs
+    /// `vm.collect_garbage()` every ~4096 ops). The AOT bootstrap
+    /// flips this on inside `wlift_aot_enter` because AOT bodies
+    /// never re-enter the interpreter and the loop's safepoint
+    /// is unreachable. Without the gate, firing GC mid-helper
+    /// for JIT/tiered runs corrupts state — the JIT lowering
+    /// only emits stack maps for safepoints it knows about, so a
+    /// helper-driven GC at a not-pre-declared point reads garbage
+    /// for spilled live roots.
+    static AOT_GC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline(always)]
+pub fn aot_gc_enabled() -> bool {
+    AOT_GC_ENABLED.with(|c| c.get())
+}
+
+#[inline(always)]
+pub fn set_aot_gc_enabled(v: bool) {
+    AOT_GC_ENABLED.with(|c| c.set(v));
+}
+
 /// End-of-alloc-helper safepoint. Pushes `val` as a transient JIT
 /// root, runs GC if nursery pressure trips `should_collect()`,
 /// pops the transient root, and returns the (possibly forwarded)
@@ -1113,6 +1138,15 @@ pub fn push_jit_root(v: Value) {
 /// `vm` must be the current thread's running VM.
 #[inline]
 pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
+    if !aot_gc_enabled() {
+        // JIT / interpreter mode: the bytecode interpreter loop's
+        // safepoint already runs GC at safe boundaries, and JIT
+        // stack maps only cover the safepoints Cranelift declared
+        // — firing GC inside the alloc helper here reads the wrong
+        // spill slots and corrupts live values. Skip the trigger
+        // and let the existing schedule do its work.
+        return val.to_bits();
+    }
     push_jit_root(val);
     if vm.gc.should_collect() {
         vm.collect_garbage();

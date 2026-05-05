@@ -592,6 +592,16 @@ pub struct ExecutionEngine {
     /// Code ranges for compiled functions, sorted by start address.
     /// Used by GC stack walker to map return addresses → safepoint metadata.
     pub code_ranges: Vec<CodeRange>,
+    /// AOT-binary modvars / consts data regions registered at
+    /// startup. Each `(addr, count)` is a slice of `count` u64
+    /// `Value`-bits the GC scans + writes back forwarded
+    /// pointers to. `engine.modules` is empty under AOT (the
+    /// bootstrap doesn't go through `interpret`'s install loop),
+    /// so without these the const strings + closure pointers in
+    /// `wlift_modvars_<n>` and `wlift_consts_<n>` aren't roots
+    /// and a minor GC sweeps them while the AOT body still
+    /// references them via `GetModuleVar`.
+    pub aot_root_regions: Vec<(*mut u64, usize)>,
     /// Threaded-code cache indexed by FuncId. Lazily populated on first
     /// interpreter dispatch — faster than bytecode for hot functions.
     /// `None` = not yet checked. `Some(None)` = checked, not eligible.
@@ -764,6 +774,7 @@ impl ExecutionEngine {
             bc_cache: Vec::new(),
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
+            aot_root_regions: Vec::new(),
             #[cfg(feature = "host")]
             threaded_code: Vec::new(),
             // Thresholds mirror the legacy jit_threshold / opt_threshold

@@ -3100,6 +3100,20 @@ pub mod cl {
                 for p in &parts[1..] {
                     let call = builder.ins().call(f, &[result, get(p)]);
                     result = builder.inst_results(call)[0];
+                    // Declare each intermediate concat result as
+                    // needing stack-map coverage. Without this,
+                    // a multi-part concat's intermediate strings
+                    // (held only in this register-passed chain)
+                    // aren't tracked across the next call's
+                    // safepoint, so a GC fired from inside the
+                    // next concat helper sweeps them. The
+                    // surrounding `lower_mir_impl` only declares
+                    // top-level instruction results; chains
+                    // built inside this lowering need explicit
+                    // declaration.
+                    if env_stack_maps() {
+                        builder.declare_value_needs_stack_map(result);
+                    }
                 }
                 Ok(Some(result))
             }
