@@ -5,7 +5,7 @@
 /// assertions at the bottom verify this.
 // Object/Value types used in test assertions only.
 #[cfg(test)]
-use {super::object::*, super::value::Value};
+use {super::object::*, super::value::Value, crate::codegen::runtime_fns::JitContext};
 
 // -- ObjHeader (24 bytes on 64-bit) -----------------------------------------
 
@@ -53,6 +53,35 @@ pub const TA_KIND_U8: u8 = 0;
 pub const TA_KIND_F32: u8 = 1;
 pub const TA_KIND_F64: u8 = 2;
 
+// -- ObjClosure --------------------------------------------------------------
+//
+// `upvalues` is a `Vec<*mut ObjUpvalue>` — its pointer field is
+// the data buffer holding `len` consecutive `*mut ObjUpvalue`
+// entries. The Vec layout is (ptr, capacity, length) on stable
+// Rust today, so `CLOSURE_UPVALUES_DATA` reads the data buffer
+// directly. The `len`/`cap` fields aren't accessed from JIT code.
+
+pub const CLOSURE_FUNCTION: i32 = 24; // *mut ObjFn
+pub const CLOSURE_UPVALUES_DATA: i32 = 32; // *mut *mut ObjUpvalue (Vec.ptr)
+
+// -- ObjUpvalue --------------------------------------------------------------
+
+pub const UPVALUE_LOCATION: i32 = 24; // *mut Value (open) or &closed (closed)
+pub const UPVALUE_CLOSED: i32 = 32; // Value (closed-over storage)
+
+// -- JitContext --------------------------------------------------------------
+//
+// Layout in `runtime_fns::JitContext`. Used by AOT codegen to
+// inline upvalue / static-field access without a helper hop —
+// load through the TLS context pointer + the right offset.
+
+pub const JIT_CTX_MODULE_VARS: i32 = 0;
+pub const JIT_CTX_VM: i32 = 16;
+pub const JIT_CTX_CURRENT_FUNC_ID: i32 = 40;
+pub const JIT_CTX_CLOSURE: i32 = 48;
+pub const JIT_CTX_DEFINING_CLASS: i32 = 56;
+pub const JIT_CTX_JIT_CODE_BASE: i32 = 64;
+
 // -- Value size --------------------------------------------------------------
 
 pub const VALUE_SIZE: i32 = 8; // NaN-boxed u64
@@ -92,6 +121,46 @@ mod tests {
         assert_eq!(memoffset_of!(ObjList, count), LIST_COUNT as usize);
         assert_eq!(memoffset_of!(ObjList, capacity), LIST_CAPACITY as usize);
         assert_eq!(memoffset_of!(ObjList, elements), LIST_ELEMENTS as usize);
+    }
+
+    #[test]
+    fn verify_closure_layout() {
+        assert_eq!(memoffset_of!(ObjClosure, function), CLOSURE_FUNCTION as usize);
+        // Vec::as_ptr() and the data field of std's Vec layout
+        // both point at the start of the buffer; the field offset
+        // here matches Rust's stable Vec internal layout.
+        assert_eq!(
+            memoffset_of!(ObjClosure, upvalues),
+            CLOSURE_UPVALUES_DATA as usize
+        );
+    }
+
+    #[test]
+    fn verify_upvalue_layout() {
+        assert_eq!(memoffset_of!(ObjUpvalue, location), UPVALUE_LOCATION as usize);
+        assert_eq!(memoffset_of!(ObjUpvalue, closed), UPVALUE_CLOSED as usize);
+    }
+
+    #[test]
+    fn verify_jit_ctx_layout() {
+        assert_eq!(
+            memoffset_of!(JitContext, module_vars),
+            JIT_CTX_MODULE_VARS as usize
+        );
+        assert_eq!(memoffset_of!(JitContext, vm), JIT_CTX_VM as usize);
+        assert_eq!(
+            memoffset_of!(JitContext, current_func_id),
+            JIT_CTX_CURRENT_FUNC_ID as usize
+        );
+        assert_eq!(memoffset_of!(JitContext, closure), JIT_CTX_CLOSURE as usize);
+        assert_eq!(
+            memoffset_of!(JitContext, defining_class),
+            JIT_CTX_DEFINING_CLASS as usize
+        );
+        assert_eq!(
+            memoffset_of!(JitContext, jit_code_base),
+            JIT_CTX_JIT_CODE_BASE as usize
+        );
     }
 
     #[test]
