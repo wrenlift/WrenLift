@@ -1077,6 +1077,52 @@ pub fn push_jit_root(v: Value) {
     JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).push(v) });
 }
 
+/// End-of-alloc-helper safepoint. Pushes `val` as a transient JIT
+/// root, runs GC if nursery pressure trips `should_collect()`,
+/// pops the transient root, and returns the (possibly forwarded)
+/// value's NaN-boxed bits.
+///
+/// Why this lives here: AOT-compiled bodies never re-enter the
+/// bytecode interpreter, so the per-tick safepoint at
+/// [`vm_interp::run_fiber`] is unreachable. Without a runtime
+/// safepoint inside the alloc helpers, GC never fires under AOT
+/// and the heap grows unboundedly.
+///
+/// Why the root is transient (push-then-pop): the caller already
+/// has a Cranelift-emitted stack map covering this call site —
+/// any live Wren `Value`s in the caller's frame are spilled to
+/// stack slots that the GC scanner reads via the registered code
+/// range. Leaving the alloc result permanently in `JIT_ROOTS_STORE`
+/// (which an earlier draft did) makes every allocation
+/// indefinitely reachable, so GC reclaims nothing and memory
+/// climbs linearly with allocation count — hello hit 7.5M live
+/// roots after a few seconds of boot, because every short-lived
+/// string/list/closure stayed pinned. Pop-on-return delegates
+/// long-term lifetime tracking to the stack maps where it
+/// belongs.
+///
+/// Safety relies on the AOT install path having registered every
+/// AOT function's code range + safepoint metadata via
+/// `wlift_aot_register_code_range`, so the GC stack walker's
+/// fp-chain pass in `vm.scan_native_stack_roots` can find AOT
+/// frames and scan their spilled live roots. Without that
+/// registration this helper would free live spill slots and
+/// crash the AOT body the next time it touched a register.
+///
+/// # Safety
+/// `vm` must be the current thread's running VM.
+#[inline]
+pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
+    push_jit_root(val);
+    if vm.gc.should_collect() {
+        vm.collect_garbage();
+    }
+    // Pop the transient root and return its (possibly forwarded)
+    // bits. From here on, the caller's stack map keeps the
+    // value alive across any further calls.
+    pop_jit_root().expect("finish_alloc: root vanished").to_bits()
+}
+
 /// Take all JIT roots for GC scanning. Returns the values (caller must write back
 /// after collection via `set_jit_roots` for nursery forwarding).
 pub fn take_jit_roots() -> Vec<Value> {
@@ -3391,8 +3437,7 @@ fn make_list_impl(elements: &[u64]) -> u64 {
     }
     let val = jit_root_at(root_len_before + elements.len());
     jit_roots_restore_len(root_len_before);
-    push_jit_root(val);
-    val.to_bits()
+    unsafe { finish_alloc(vm, val) }
 }
 
 /// Add a single element to an existing list.
@@ -3458,8 +3503,7 @@ pub extern "C" fn wren_make_map() -> u64 {
         (*map_ptr).header.class = vm.map_class;
     }
     let val = Value::object(map_ptr as *mut u8);
-    push_jit_root(val);
-    val.to_bits()
+    unsafe { finish_alloc(vm, val) }
 }
 
 /// Allocate a new range.
@@ -3480,8 +3524,7 @@ pub extern "C" fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
         (*range_ptr).header.class = vm.range_class;
     }
     let val = Value::object(range_ptr as *mut u8);
-    push_jit_root(val);
-    val.to_bits()
+    unsafe { finish_alloc(vm, val) }
 }
 
 /// Helper: allocate closure and populate upvalues from a slice of NaN-boxed values.
@@ -3541,7 +3584,16 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
         }
     }
 
-    Value::object(closure_ptr as *mut u8).to_bits()
+    // The closure (and its function object) were pushed as
+    // intermediate roots during the upvalue allocation loop; the
+    // upvalue allocs may have triggered a minor GC that
+    // forwarded the closure pointer in place inside
+    // `JIT_ROOTS_STORE`. Read the forwarded value back out
+    // before popping so `finish_alloc` sees the live closure
+    // pointer, not the stale local `closure_ptr`.
+    let closure_val = pop_jit_root().expect("closure root vanished");
+    pop_jit_root().expect("fn root vanished");
+    unsafe { finish_alloc(vm, closure_val) }
 }
 
 /// Allocate a closure with 0 upvalues.
@@ -3586,8 +3638,7 @@ pub extern "C" fn wren_string_concat(a: u64, b: u64) -> u64 {
     let sb = crate::runtime::vm_interp::value_to_string(vm, vb);
     let concatenated = format!("{}{}", sa, sb);
     let val = vm.new_string(concatenated);
-    push_jit_root(val);
-    val.to_bits()
+    unsafe { finish_alloc(vm, val) }
 }
 
 /// Convert a value to its string representation.
@@ -3603,8 +3654,7 @@ pub extern "C" fn wren_to_string(val: u64) -> u64 {
 
     let s = crate::runtime::vm_interp::value_to_string(vm, v);
     let val = vm.new_string(s);
-    push_jit_root(val);
-    val.to_bits()
+    unsafe { finish_alloc(vm, val) }
 }
 
 /// Materialize a string literal from its interned symbol id.
@@ -3618,8 +3668,7 @@ pub extern "C" fn wren_const_string(sym_idx: u64) -> u64 {
 
     let sym = crate::intern::SymbolId::from_raw(sym_idx as u32);
     let val = vm.new_string(vm.interner.resolve(sym).to_string());
-    push_jit_root(val);
-    val.to_bits()
+    unsafe { finish_alloc(vm, val) }
 }
 
 /// Type check: is value an instance of class?

@@ -2454,7 +2454,7 @@ impl VM {
     /// name from any module (which was non-deterministic under
     /// HashMap iteration and routinely picked the wrong one when two
     /// modules defined, say, `Response`).
-    fn find_imported_var_from(&self, name: &str, source: &str) -> Option<Value> {
+    pub fn find_imported_var_from(&self, name: &str, source: &str) -> Option<Value> {
         let entry = self.engine.modules.get(source)?;
         let idx = entry.var_names.iter().position(|n| n == name)?;
         let value = entry.vars.get(idx).copied()?;
@@ -2569,7 +2569,7 @@ impl VM {
 
     /// Try to load a built-in optional module ("meta" or "random").
     /// Returns true if the module was recognized and registered.
-    fn try_load_builtin_module(&mut self, name: &str) -> bool {
+    pub fn try_load_builtin_module(&mut self, name: &str) -> bool {
         match name {
             "meta" => {
                 let class = super::core::meta::register(self);
@@ -2860,12 +2860,18 @@ impl VM {
         use crate::codegen::native_meta::RootLocation;
         let mut found_roots = Vec::new();
         let mut slot_addrs = Vec::new();
+        let mut covered_fps: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+        // Pass 1: explicitly-pushed JIT frames. The JIT lowering
+        // calls `push_jit_frame` at every wren_call_N boundary, so
+        // each entry directly names the (fp, func_id, ret_addr)
+        // triple. AOT bodies don't push these — they hit pass 2.
         let jit_entries = crate::codegen::runtime_fns::jit_frame_entries();
         for &(jit_fp, func_id, ret_addr) in &jit_entries {
             if jit_fp == 0 {
                 continue;
             }
+            covered_fps.insert(jit_fp);
 
             // Look up the function's metadata by func_id.
             let meta = self
@@ -2909,6 +2915,87 @@ impl VM {
                         slot_addrs.push(addr);
                     }
                 }
+            }
+        }
+
+        // Pass 2: AOT frames discovered via the native fp chain.
+        // AOT bodies don't push_jit_frame (they're entered straight
+        // from the linker's main, no per-call helper to do the
+        // push), so a GC fired from inside an alloc helper would
+        // miss them entirely under pass 1 alone. Walk x29 → caller's
+        // fp → caller's caller's fp via the standard aarch64 frame
+        // chain, look up each return address against `code_ranges`,
+        // and scan whatever safepoint matches.
+        //
+        // The frame chain dies as soon as we cross out of code we
+        // emitted (the linker's main, libc startup, ...) — those
+        // frames don't have return addresses inside any registered
+        // code range, so they get skipped silently.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            let mut fp: usize;
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack))
+            };
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack))
+            };
+
+            let max_frames = 256;
+            let mut walked = 0;
+            while fp != 0 && walked < max_frames {
+                walked += 1;
+                if fp & 7 != 0 {
+                    break; // misaligned — corrupt frame, bail.
+                }
+                let saved_fp = unsafe { *(fp as *const usize) };
+                let saved_ret = unsafe { *((fp + 8) as *const usize) };
+                if saved_ret == 0 {
+                    break;
+                }
+
+                // The frame whose body executed up to `saved_ret`
+                // has fp == saved_fp. Skip frames already scanned
+                // via pass 1.
+                if saved_fp == 0 || covered_fps.contains(&saved_fp) {
+                    fp = saved_fp;
+                    continue;
+                }
+
+                let code_range = self
+                    .engine
+                    .code_ranges
+                    .iter()
+                    .find(|r| saved_ret >= r.start && saved_ret < r.end);
+                if let Some(cr) = code_range {
+                    let meta = self
+                        .engine
+                        .jit_metadata
+                        .get(cr.func_id.0 as usize)
+                        .and_then(|m| m.as_ref());
+                    if let Some(meta) = meta {
+                        let offset = saved_ret.wrapping_sub(cr.start) as u32;
+                        if let Some(sp) =
+                            meta.safepoints.iter().find(|sp| sp.code_offset == offset)
+                        {
+                            for root in &sp.live_roots {
+                                if let RootLocation::Spill(spill_offset) = root.location {
+                                    let addr =
+                                        (saved_fp as isize + spill_offset as isize) as *mut u64;
+                                    let bits = unsafe { *addr };
+                                    let val = Value::from_bits(bits);
+                                    if val.is_object() {
+                                        found_roots.push(val);
+                                        slot_addrs.push(addr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                fp = saved_fp;
             }
         }
 

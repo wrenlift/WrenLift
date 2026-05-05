@@ -902,6 +902,28 @@ impl ExecutionEngine {
 pub const WASM_JIT_THRESHOLD: u32 = 50;
 
 impl ExecutionEngine {
+    /// Install per-function `NativeFrameMetadata` into the slot
+    /// the GC stack walker reads. Used by the AOT install path:
+    /// AOT functions are registered via `register_aot_function`
+    /// (which pushes a `None` at jit_metadata[func_id]); the
+    /// follow-up `register_code_range` call needs the metadata
+    /// slot populated for `scan_native_stack_roots` to find the
+    /// safepoint live-roots when it walks the fp chain.
+    ///
+    /// JIT functions take a different path: their metadata is
+    /// staged in `baseline_metadata` / `optimized_metadata` and
+    /// promoted to `jit_metadata` by `set_tier_state`.
+    pub fn set_aot_metadata(
+        &mut self,
+        func_id: FuncId,
+        metadata: Arc<NativeFrameMetadata>,
+    ) {
+        let idx = func_id.0 as usize;
+        if idx < self.jit_metadata.len() {
+            self.jit_metadata[idx] = Some(metadata);
+        }
+    }
+
     /// Register a compiled function's code range for GC stack walking.
     pub fn register_code_range(
         &mut self,

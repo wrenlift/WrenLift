@@ -676,6 +676,122 @@ pub unsafe extern "C" fn wlift_aot_register_closure(
     func_id.0 as u64
 }
 
+/// Per-safepoint descriptor for `wlift_aot_register_code_range`.
+/// The bootstrap emits one of these per Cranelift user stack map
+/// captured during AOT lowering. `roots_start` + `roots_count`
+/// index into the per-function flat root-offsets array.
+#[cfg(feature = "aot")]
+#[repr(C)]
+pub struct WliftAotSafepointDesc {
+    /// Bytes from the function's entry to the return address
+    /// after the call instruction this safepoint covers. Matches
+    /// `(saved_lr - code_range.start)` at GC time.
+    pub code_offset: u32,
+    /// Index of the first root spill offset in the per-function
+    /// roots blob.
+    pub roots_start: u32,
+    /// Number of consecutive `i32` root spill offsets at
+    /// `roots[roots_start..roots_start+roots_count]`.
+    pub roots_count: u32,
+}
+
+/// Register an AOT-compiled function's code range + safepoint
+/// metadata with the engine so the GC stack walker can scan its
+/// frames during a collection cycle. AOT bodies are entered
+/// directly from the linker's `main()` (no per-call helper to
+/// push a `jit_frame_entry`), so without this registration the
+/// stack walker has no way to find them and any GC fired from
+/// inside an alloc helper sweeps live spill slots.
+///
+/// Symmetric to the JIT path's `register_code_range` call inside
+/// `engine::install_compiled_function`. The runtime synthesises a
+/// fresh `FuncId` (we don't need the same id as
+/// `register_aot_function` — the GC walker keys metadata off the
+/// `code_range`'s `func_id` field, which we control here).
+///
+/// # Safety
+///
+/// `fn_ptr` must point at the function's entry; `code_size` must
+/// match what Cranelift emitted (`CompiledCode::code_info().total_size`).
+/// `safepoints` and `roots` must be valid `[WliftAotSafepointDesc]`
+/// and `[i32]` arrays of the given lengths; the bootstrap satisfies
+/// these by emitting them as `Linkage::Local` `Data` blobs.
+#[no_mangle]
+#[cfg(feature = "aot")]
+pub unsafe extern "C" fn wlift_aot_register_code_range(
+    vm: *mut WrenVM,
+    fn_ptr: *const u8,
+    code_size: u32,
+    safepoints: *const WliftAotSafepointDesc,
+    safepoints_count: u32,
+    roots: *const i32,
+) -> c_int {
+    use crate::codegen::native_meta::{
+        LiveRootMetadata, NativeFrameMetadata, RootLocation, SafepointKind, SafepointMetadata,
+    };
+    use std::sync::Arc;
+
+    if vm.is_null() || fn_ptr.is_null() {
+        return 70;
+    }
+    let vm_ref = unsafe { &mut *vm };
+
+    let sp_slice: &[WliftAotSafepointDesc] = if safepoints.is_null() || safepoints_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(safepoints, safepoints_count as usize) }
+    };
+
+    let mut safepoints_meta: Vec<SafepointMetadata> = Vec::with_capacity(sp_slice.len());
+    for (ord, sp) in sp_slice.iter().enumerate() {
+        let mut live_roots: Vec<LiveRootMetadata> = Vec::with_capacity(sp.roots_count as usize);
+        if sp.roots_count > 0 && !roots.is_null() {
+            let root_slice = unsafe {
+                std::slice::from_raw_parts(
+                    roots.add(sp.roots_start as usize),
+                    sp.roots_count as usize,
+                )
+            };
+            for (slot, &offset) in root_slice.iter().enumerate() {
+                live_roots.push(LiveRootMetadata {
+                    slot: slot as u16,
+                    location: RootLocation::Spill(offset),
+                });
+            }
+        }
+        safepoints_meta.push(SafepointMetadata {
+            ordinal: ord as u32,
+            inst_index: 0,
+            code_offset: sp.code_offset,
+            kind: SafepointKind::CallRuntime,
+            live_roots,
+        });
+    }
+
+    let metadata = Arc::new(NativeFrameMetadata {
+        boxed_values: Vec::new(),
+        safepoints: safepoints_meta,
+        spill_safe_nonleaf: true,
+    });
+
+    // Synthesise a placeholder FuncId for code_range bookkeeping.
+    // The GC walker keys metadata off the code_range; the engine's
+    // `jit_metadata` slot for that FuncId needs the same Arc so
+    // `scan_native_stack_roots` finds it.
+    let name_sym = vm_ref.interner.intern("<aot-frame>");
+    let func_id = vm_ref
+        .engine
+        .register_aot_function(name_sym, 0, fn_ptr, None);
+    let start = fn_ptr as usize;
+    vm_ref
+        .engine
+        .set_aot_metadata(func_id, Arc::clone(&metadata));
+    vm_ref
+        .engine
+        .register_code_range(func_id, start, start + code_size as usize, metadata);
+    0
+}
+
 /// One foreign-method install descriptor: signature + the
 /// `#!symbol = "..."` override (or null to fall back to the
 /// signature's base name) + static/instance flag. Bootstrap
@@ -956,6 +1072,68 @@ pub unsafe extern "C" fn wlift_aot_intern_symbol(
     };
     let vm_ref = unsafe { &mut *vm };
     vm_ref.interner.intern(s).index() as u64
+}
+
+/// Resolve a bare-builtin import (`import "socket" for SocketCore`,
+/// `import "fs" for FS`, ...) into the AOT module's modvars at
+/// startup. The walker skips these from the dependency graph
+/// (they have no on-disk source) so the bootstrap has to ask
+/// the runtime to load the module + look up the binding by name.
+///
+/// `module_name` is the bare module string (e.g. `"socket"`),
+/// `var_name` is the Wren symbol the source binds (e.g.
+/// `"SocketCore"`). Both are UTF-8 byte ranges; the bootstrap
+/// emits them as `Linkage::Local` `Data` blobs.
+///
+/// Without this call, every method dispatch through the imported
+/// class hits a null receiver — `class_of(null)` is the Null
+/// class, the static-method lookup misses, and `wren_call_N`
+/// silently returns null. That's why hatch site's `app.listen`
+/// printed "listening on ..." but never actually bound a TCP
+/// socket: `SocketCore.tcpListen(addr)` never ran.
+///
+/// # Safety
+///
+/// Pointers must be valid UTF-8 byte ranges.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_resolve_runtime_import(
+    vm: *mut WrenVM,
+    modvars: *mut u64,
+    slot: usize,
+    module_name: *const c_char,
+    module_name_len: usize,
+    var_name: *const c_char,
+    var_name_len: usize,
+) -> c_int {
+    if vm.is_null() || modvars.is_null() || module_name.is_null() || var_name.is_null() {
+        return 70;
+    }
+    let mod_bytes = unsafe { std::slice::from_raw_parts(module_name as *const u8, module_name_len) };
+    let var_bytes = unsafe { std::slice::from_raw_parts(var_name as *const u8, var_name_len) };
+    let mod_str = match std::str::from_utf8(mod_bytes) {
+        Ok(s) => s,
+        Err(_) => return 65,
+    };
+    let var_str = match std::str::from_utf8(var_bytes) {
+        Ok(s) => s,
+        Err(_) => return 65,
+    };
+    let vm_ref = unsafe { &mut *vm };
+    // Lazy-load the built-in module if it hasn't been touched yet.
+    // Already-loaded modules are a no-op return-true.
+    let _ = vm_ref.try_load_builtin_module(mod_str);
+    if let Some(value) = vm_ref.find_imported_var_from(var_str, mod_str) {
+        unsafe {
+            *modvars.add(slot) = value.to_bits();
+        }
+        0
+    } else {
+        // Leave the slot at whatever it was (typically null);
+        // first-use will surface as a "X has no method" error
+        // matching the JIT path's behaviour for unresolved imports.
+        70
+    }
 }
 
 /// Read a static field off a class without consulting the

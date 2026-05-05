@@ -724,6 +724,27 @@ fn make_object_module() -> Result<ObjectModule, AotError> {
 /// `modvars` / `consts` data symbols (the lowering branches keyed
 /// off `aot_cfg`), so factoring this out keeps the per-function
 /// loop in `emit_aot_module` from re-declaring data per emission.
+/// Per-function metadata captured during emit. Fed back into the
+/// bootstrap so each AOT function's code range gets registered with
+/// the engine alongside its safepoint live-roots — without that,
+/// the GC stack walker can't find AOT frames and any GC fired
+/// from a runtime helper sweeps live spilled values.
+struct EmittedFnMeta {
+    code_size: u32,
+    /// MIR arity (including receiver). Carried through so the
+    /// bootstrap can re-import the function symbol with the same
+    /// signature `emit_aot_function` declared — Cranelift errors
+    /// `declare_function` on mismatched signatures, even when we
+    /// only want the address via `func_addr`.
+    arity: u8,
+    /// `None` when Cranelift emitted no user stack maps for this
+    /// function (e.g. a top-level body that never calls back into
+    /// runtime helpers). The bootstrap still registers the code
+    /// range so frame walks find it; the metadata's safepoints
+    /// list is just empty in that case.
+    native_meta: Option<crate::codegen::native_meta::NativeFrameMetadata>,
+}
+
 fn emit_aot_function(
     module: &mut ObjectModule,
     interner: &Interner,
@@ -731,7 +752,7 @@ fn emit_aot_function(
     aot_cfg: &AotLoweringConfig,
     symbol: &str,
     defining_class: Option<AotDefiningClass>,
-) -> Result<(), AotError> {
+) -> Result<EmittedFnMeta, AotError> {
     let mut sig = Signature::new(module.target_config().default_call_conv);
     let arity = mir.arity as usize;
     for _ in 0..arity {
@@ -760,11 +781,25 @@ fn emit_aot_function(
     module
         .define_function(func_id, &mut ctx)
         .map_err(|e| AotError::Module(e.to_string()))?;
+
+    // Capture safepoint metadata + code size before clearing the
+    // context. Same path the JIT's `compile_mir` uses — the
+    // `CompiledCode` is only valid until `clear_context` so we
+    // pull what we need first.
+    let compiled = ctx.compiled_code().expect("compiled_code post define_function");
+    let code_size = compiled.code_info().total_size;
+    let native_meta =
+        crate::codegen::cranelift_backend::cl::native_meta_from_cranelift(compiled);
+
     module.clear_context(&mut ctx);
 
     *aot_cfg.current_defining_class.borrow_mut() = None;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
-    Ok(())
+    Ok(EmittedFnMeta {
+        code_size,
+        arity: mir.arity,
+        native_meta,
+    })
 }
 
 /// Lower every reachable function in `aot_mod`'s MIR — top-level,
@@ -785,6 +820,11 @@ struct EmitAotResult {
     symbol_names: Vec<String>,
     classes: Vec<AotClassManifest>,
     closures: Vec<AotClosureManifest>,
+    /// Per-function code-range + safepoint metadata, keyed by the
+    /// emitted symbol name. Bootstrap reads this to call
+    /// `wlift_aot_register_code_range(fn_ptr, code_size, safepoints)`
+    /// at startup so the GC stack walker can find AOT frames.
+    fn_metas: Vec<(String, EmittedFnMeta)>,
 }
 
 #[derive(Debug, Clone)]
@@ -850,9 +890,11 @@ fn emit_aot_module(
         current_closure_ptr_var: std::cell::RefCell::new(None),
     };
 
+    let mut fn_metas: Vec<(String, EmittedFnMeta)> = Vec::new();
+
     // Top-level body — the entry point Phase 7's init pass calls
     // last, after every dependency module's top-level has run.
-    emit_aot_function(
+    let top_meta = emit_aot_function(
         module,
         &aot_mod.interner,
         &aot_mod.mir.top_level,
@@ -860,6 +902,7 @@ fn emit_aot_module(
         fn_symbol,
         None,
     )?;
+    fn_metas.push((fn_symbol.to_string(), top_meta));
 
     // Each class's methods. Methods share the module's `modvars`
     // and `consts` symbols. Per-method symbols flow back into
@@ -895,7 +938,7 @@ fn emit_aot_module(
         };
         for (method_idx, method) in class.methods.iter().enumerate() {
             let sym = format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx);
-            emit_aot_function(
+            let meta = emit_aot_function(
                 module,
                 &aot_mod.interner,
                 &method.mir,
@@ -903,6 +946,7 @@ fn emit_aot_module(
                 &sym,
                 defining_class_for_methods.clone(),
             )?;
+            fn_metas.push((sym.clone(), meta));
             methods_manifest.push(AotMethodManifest {
                 signature: method.signature.clone(),
                 fn_symbol: sym,
@@ -943,7 +987,9 @@ fn emit_aot_module(
         Vec::with_capacity(aot_mod.mir.closures.len());
     for (closure_idx, closure_mir) in aot_mod.mir.closures.iter().enumerate() {
         let sym = format!("{}__closure_{}", fn_symbol, closure_idx);
-        emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym, None)?;
+        let meta =
+            emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym, None)?;
+        fn_metas.push((sym.clone(), meta));
         closure_manifest.push(AotClosureManifest {
             fn_symbol: sym,
             arity: closure_mir.arity,
@@ -984,6 +1030,7 @@ fn emit_aot_module(
         symbol_names: symbol_remap.into_iter().map(|(_, t)| t).collect(),
         classes: classes_manifest,
         closures: closure_manifest,
+        fn_metas,
     })
 }
 
@@ -1195,6 +1242,50 @@ pub struct AotManifest {
     pub closures: Vec<AotClosureManifest>,
     /// Symbol of the `wlift_closures_<n>` slot table.
     pub closures_symbol: String,
+    /// Per-AOT-function safepoint metadata captured during emit.
+    /// Used by the bootstrap to call `wlift_aot_register_code_range`
+    /// once per function so the GC stack walker can find AOT
+    /// frames + map return addresses to live-root spill offsets.
+    pub fn_metas: Vec<AotFnMetaManifest>,
+    /// Bare-builtin imports the walker can't follow into source
+    /// (no `.wren` file for `"socket"`, `"fs"`, ...). Bootstrap
+    /// resolves each at startup via `wlift_aot_resolve_runtime_import`.
+    pub runtime_imports: Vec<AotRuntimeImport>,
+}
+
+/// Per-function code-range + safepoint info the bootstrap embeds
+/// in the AOT object as `Linkage::Local` data so it can call
+/// `wlift_aot_register_code_range` at startup. Code size is
+/// captured here (Cranelift's `CompiledCode.code_info().total_size`)
+/// because once the object linker rewrites symbols at link time
+/// the runtime can't recover per-function sizes by name alone.
+#[derive(Debug, Clone)]
+pub struct AotFnMetaManifest {
+    pub fn_symbol: String,
+    pub code_size: u32,
+    /// MIR arity (including the implicit receiver). The bootstrap
+    /// re-imports the function symbol with this arity so Cranelift's
+    /// `declare_function` accepts the call as compatible with what
+    /// `emit_aot_function` originally declared.
+    pub arity: u8,
+    /// `frame_to_fp_offset` — the same anchor `native_meta_from_cranelift`
+    /// already baked into each safepoint's spill offsets, retained
+    /// here for completeness even though the lowering side has
+    /// already turned each spill offset FP-relative.
+    pub fp_anchor: i64,
+    pub safepoints: Vec<AotSafepointEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AotSafepointEntry {
+    /// Offset of the safepoint's return-address-after-call from
+    /// the function's start, used by the GC scanner to look up
+    /// the active safepoint at GC time.
+    pub code_offset: u32,
+    /// FP-relative spill offsets of every live root at this
+    /// safepoint. The scanner reads `*(jit_fp + offset)` per
+    /// entry and adds it to the root set if it's an object Value.
+    pub root_fp_offsets: Vec<i32>,
 }
 
 /// Top-level AOT bundle metadata that doesn't fit per-module:
@@ -1221,6 +1312,19 @@ pub struct AotImportBinding {
     pub target_slot: u32,
     pub source_modvars_symbol: String,
     pub source_slot: u32,
+}
+
+/// Bare-builtin import (`import "socket" for SocketCore`,
+/// `import "fs" for FS`, ...). The walker skips these — they have
+/// no on-disk source — so the bootstrap calls
+/// `wlift_aot_resolve_runtime_import` once per binding at startup
+/// to look up the value through the runtime VM and write it
+/// into modvars[target_slot].
+#[derive(Debug, Clone)]
+pub struct AotRuntimeImport {
+    pub target_slot: u32,
+    pub module_name: String,
+    pub var_name: String,
 }
 
 /// Lower a pre-walked list of modules into one native object file
@@ -1393,6 +1497,48 @@ pub fn compile_walk_to_object_with_manifest(
             &cha,
         )?;
         let closures_symbol = format!("{}__closures_data", fn_symbol);
+        // Convert the per-fn captured `EmittedFnMeta` into the
+        // manifest shape the bootstrap consumes. Functions that
+        // had no Cranelift safepoints (e.g. trivial leaf bodies
+        // or top-level boots that don't call helpers) still get
+        // an entry with an empty safepoints list so their code
+        // range is registered for frame-walking.
+        let fn_metas: Vec<AotFnMetaManifest> = emitted
+            .fn_metas
+            .into_iter()
+            .map(|(sym, meta)| {
+                let (fp_anchor, safepoints) = match meta.native_meta {
+                    Some(nm) => {
+                        let safepoints = nm
+                            .safepoints
+                            .into_iter()
+                            .map(|sp| AotSafepointEntry {
+                                code_offset: sp.code_offset,
+                                root_fp_offsets: sp
+                                    .live_roots
+                                    .into_iter()
+                                    .filter_map(|r| match r.location {
+                                        crate::codegen::native_meta::RootLocation::Spill(o) => {
+                                            Some(o)
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect(),
+                            })
+                            .collect();
+                        (0, safepoints)
+                    }
+                    None => (0, Vec::new()),
+                };
+                AotFnMetaManifest {
+                    fn_symbol: sym,
+                    code_size: meta.code_size,
+                    arity: meta.arity,
+                    fp_anchor,
+                    safepoints,
+                }
+            })
+            .collect();
         manifests.push(AotManifest {
             fn_symbol,
             modvars_symbol,
@@ -1406,6 +1552,8 @@ pub fn compile_walk_to_object_with_manifest(
             imports: Vec::new(),
             closures: emitted.closures,
             closures_symbol,
+            fn_metas,
+            runtime_imports: Vec::new(),
         });
     }
 
@@ -1414,8 +1562,14 @@ pub fn compile_walk_to_object_with_manifest(
     // every manifest in hand so a `Some(path)` can resolve to the
     // dependency's modvars symbol + slot, and the bootstrap emits
     // a direct copy without any runtime name lookup.
+    //
+    // Sources that don't match any emitted manifest are bare-builtin
+    // imports (`"socket"`, `"fs"`, `"meta"`, ...) the walker
+    // skipped — those get an `AotRuntimeImport` entry the bootstrap
+    // resolves at startup via `wlift_aot_resolve_runtime_import`.
     for (idx, aot_mod) in modules.iter().enumerate() {
         let mut bindings: Vec<AotImportBinding> = Vec::new();
+        let mut runtime_imports: Vec<AotRuntimeImport> = Vec::new();
         for (slot, source) in aot_mod.module_var_sources.iter().enumerate() {
             let Some(source_path) = source else { continue };
             let var_name = &aot_mod.module_var_names[slot];
@@ -1436,9 +1590,19 @@ pub fn compile_walk_to_object_with_manifest(
                         source_slot: src_class.slot,
                     });
                 }
+            } else {
+                // No emitted module under this name → bare-builtin
+                // (or a registry/git dep the walker couldn't reach).
+                // Defer resolution to runtime.
+                runtime_imports.push(AotRuntimeImport {
+                    target_slot: slot as u32,
+                    module_name: source_path.clone(),
+                    var_name: var_name.clone(),
+                });
             }
         }
         manifests[idx].imports = bindings;
+        manifests[idx].runtime_imports = runtime_imports;
     }
 
     emit_aot_bootstrap_main(&mut module, &manifests, bundle)?;
@@ -1621,6 +1785,33 @@ fn emit_aot_bootstrap_main(
         &[ptr_ty, types::I8, ptr_ty],
         Some(types::I64),
     )?;
+    let register_code_range = declare_import(
+        module,
+        "wlift_aot_register_code_range",
+        &[
+            ptr_ty,     // vm
+            ptr_ty,     // fn_ptr
+            types::I32, // code_size
+            ptr_ty,     // safepoints desc
+            types::I32, // safepoints count
+            ptr_ty,     // roots
+        ],
+        Some(types::I32),
+    )?;
+    let resolve_runtime_import = declare_import(
+        module,
+        "wlift_aot_resolve_runtime_import",
+        &[
+            ptr_ty, // vm
+            ptr_ty, // modvars
+            ptr_ty, // slot
+            ptr_ty, // module_name
+            ptr_ty, // module_name_len
+            ptr_ty, // var_name
+            ptr_ty, // var_name_len
+        ],
+        Some(types::I32),
+    )?;
     let install_class = declare_import(
         module,
         "wlift_aot_install_class",
@@ -1759,6 +1950,30 @@ fn emit_aot_bootstrap_main(
         // engine FuncId into `closures_data[i]`.
         closures_data_id: cranelift_module::DataId,
         closures: Vec<(cranelift_module::FuncId, u8)>,
+        /// Per-AOT-function frame metadata: (fn_id import,
+        /// code_size, safepoints desc DataId, safepoint count,
+        /// roots DataId). Bootstrap calls
+        /// `wlift_aot_register_code_range` per entry so the GC
+        /// stack walker can map AOT frames' return addresses to
+        /// live-root spill offsets.
+        fn_metas: Vec<(
+            cranelift_module::FuncId,
+            u32,
+            cranelift_module::DataId,
+            u32,
+            cranelift_module::DataId,
+        )>,
+        /// Bare-builtin runtime imports — bootstrap resolves each
+        /// at startup via `wlift_aot_resolve_runtime_import`.
+        /// Tuple: (target_slot, module_name DataId, mod_len,
+        /// var_name DataId, var_len).
+        runtime_imports: Vec<(
+            u32,
+            cranelift_module::DataId,
+            usize,
+            cranelift_module::DataId,
+            usize,
+        )>,
     }
     let mut per_module: Vec<ManifestData> = Vec::with_capacity(manifests.len());
     for (i, m) in manifests.iter().enumerate() {
@@ -1924,6 +2139,126 @@ fn emit_aot_bootstrap_main(
             closures.push((body_id, closure.arity));
         }
 
+        // Per-function safepoint metadata. Each AOT function gets
+        // two `Linkage::Local` data symbols:
+        //   `<fn_sym>__sps`   — array of WliftAotSafepointDesc
+        //                       (3 × u32 per safepoint = 12 bytes)
+        //   `<fn_sym>__roots` — flat i32 array, indexed by
+        //                       safepoint.roots_start..count
+        // Plus a fresh `Linkage::Import` `FuncId` for the
+        // function symbol so the bootstrap can take its address.
+        let mut fn_metas: Vec<(
+            cranelift_module::FuncId,
+            u32,
+            cranelift_module::DataId,
+            u32,
+            cranelift_module::DataId,
+        )> = Vec::with_capacity(m.fn_metas.len());
+        for fn_meta in &m.fn_metas {
+            let mut sps_bytes: Vec<u8> = Vec::with_capacity(fn_meta.safepoints.len() * 12);
+            let mut roots_bytes: Vec<u8> = Vec::new();
+            let mut roots_cursor: u32 = 0;
+            for sp in &fn_meta.safepoints {
+                sps_bytes.extend_from_slice(&sp.code_offset.to_le_bytes());
+                sps_bytes.extend_from_slice(&roots_cursor.to_le_bytes());
+                let count = sp.root_fp_offsets.len() as u32;
+                sps_bytes.extend_from_slice(&count.to_le_bytes());
+                for off in &sp.root_fp_offsets {
+                    roots_bytes.extend_from_slice(&off.to_le_bytes());
+                }
+                roots_cursor += count;
+            }
+            // `define_data` needs at least 1 byte; pad with a
+            // single zero when the function has no safepoints.
+            if sps_bytes.is_empty() {
+                sps_bytes.push(0);
+            }
+            if roots_bytes.is_empty() {
+                roots_bytes.push(0);
+            }
+            let sps_id = module
+                .declare_data(
+                    &format!("{}__sps", fn_meta.fn_symbol),
+                    Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|e| AotError::Module(e.to_string()))?;
+            let mut sps_desc = DataDescription::new();
+            sps_desc.define(sps_bytes.into_boxed_slice());
+            module
+                .define_data(sps_id, &sps_desc)
+                .map_err(|e| AotError::Module(e.to_string()))?;
+            let roots_id = module
+                .declare_data(
+                    &format!("{}__roots", fn_meta.fn_symbol),
+                    Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|e| AotError::Module(e.to_string()))?;
+            let mut roots_desc = DataDescription::new();
+            roots_desc.define(roots_bytes.into_boxed_slice());
+            module
+                .define_data(roots_id, &roots_desc)
+                .map_err(|e| AotError::Module(e.to_string()))?;
+
+            // Re-import the function by symbol so we can take its
+            // address (the original FuncId from `emit_aot_function`
+            // lives inside that module-emit context; here we need
+            // a fresh import). Match the AOT body's actual
+            // signature — Cranelift's `declare_function` is only
+            // idempotent for matching signatures, otherwise it
+            // returns the "incompatible signature" module error.
+            let mut fn_sig = Signature::new(cc);
+            for _ in 0..(fn_meta.arity as usize) {
+                fn_sig.params.push(AbiParam::new(types::I64));
+            }
+            fn_sig.returns.push(AbiParam::new(types::I64));
+            let fn_id_import = module
+                .declare_function(&fn_meta.fn_symbol, Linkage::Import, &fn_sig)
+                .map_err(|e| AotError::Module(e.to_string()))?;
+            fn_metas.push((
+                fn_id_import,
+                fn_meta.code_size,
+                sps_id,
+                fn_meta.safepoints.len() as u32,
+                roots_id,
+            ));
+        }
+
+        // Per-runtime-import: emit a name + var-name byte blob for
+        // each bare-builtin import so the bootstrap can call
+        // `wlift_aot_resolve_runtime_import(vm, modvars, slot,
+        // mod_name_addr, mod_len, var_name_addr, var_len)` at
+        // startup.
+        let mut runtime_imports: Vec<(
+            u32,
+            cranelift_module::DataId,
+            usize,
+            cranelift_module::DataId,
+            usize,
+        )> = Vec::with_capacity(m.runtime_imports.len());
+        for (k, ri) in m.runtime_imports.iter().enumerate() {
+            let mod_id = define_bytes(
+                module,
+                &format!("wlift_runtime_mod_{}_{}", i, k),
+                ri.module_name.as_bytes(),
+            )?;
+            let var_id = define_bytes(
+                module,
+                &format!("wlift_runtime_var_{}_{}", i, k),
+                ri.var_name.as_bytes(),
+            )?;
+            runtime_imports.push((
+                ri.target_slot,
+                mod_id,
+                ri.module_name.len(),
+                var_id,
+                ri.var_name.len(),
+            ));
+        }
+
         per_module.push(ManifestData {
             fn_id,
             modvars_id,
@@ -1940,6 +2275,8 @@ fn emit_aot_bootstrap_main(
             imports,
             closures_data_id,
             closures,
+            fn_metas,
+            runtime_imports,
         });
     }
 
@@ -2004,6 +2341,10 @@ fn emit_aot_bootstrap_main(
         let alloc_const_ref = module.declare_func_in_func(alloc_const, builder.func);
         let intern_symbol_ref = module.declare_func_in_func(intern_symbol, builder.func);
         let register_closure_ref = module.declare_func_in_func(register_closure, builder.func);
+        let register_code_range_ref =
+            module.declare_func_in_func(register_code_range, builder.func);
+        let resolve_runtime_import_ref =
+            module.declare_func_in_func(resolve_runtime_import, builder.func);
         let install_class_ref = module.declare_func_in_func(install_class, builder.func);
         let bind_foreign_class_ref = module.declare_func_in_func(bind_foreign_class, builder.func);
         let add_native_search_path_ref =
@@ -2112,6 +2453,51 @@ fn emit_aot_bootstrap_main(
                     func_id_val,
                     closures_addr,
                     (k as i32) * 8,
+                );
+            }
+
+            // Register each AOT function's code range + safepoint
+            // metadata so the GC stack walker can find AOT frames
+            // by return-address lookup. Without this every GC
+            // fired from inside an alloc helper sweeps live spill
+            // slots in AOT frames and leaves the body running
+            // against freed memory.
+            for (fn_id_import, code_size, sps_id, sps_count, roots_id) in &m.fn_metas {
+                let fn_ref = module.declare_func_in_func(*fn_id_import, builder.func);
+                let fn_addr = builder.ins().func_addr(ptr_ty, fn_ref);
+                let code_size_val = builder.ins().iconst(types::I32, *code_size as i64);
+                let sps_gv = module.declare_data_in_func(*sps_id, builder.func);
+                let sps_addr = builder.ins().global_value(ptr_ty, sps_gv);
+                let sps_count_val = builder.ins().iconst(types::I32, *sps_count as i64);
+                let roots_gv = module.declare_data_in_func(*roots_id, builder.func);
+                let roots_addr = builder.ins().global_value(ptr_ty, roots_gv);
+                let _ = builder.ins().call(
+                    register_code_range_ref,
+                    &[vm, fn_addr, code_size_val, sps_addr, sps_count_val, roots_addr],
+                );
+            }
+
+            // Resolve bare-builtin imports — `import "socket" for
+            // SocketCore`, `import "fs" for FS`, ... The walker
+            // skipped these (no on-disk source); the bootstrap
+            // asks the runtime to load the module + look up the
+            // binding by name and write it into the modvars slot
+            // the AOT body reads through `GetModuleVar`.
+            //
+            // Runs BEFORE class install so a user class with a
+            // bare-builtin parent (e.g. `class X is FS { }`) sees
+            // a populated parent slot in modvars.
+            for (target_slot, mod_id, mod_len, var_id, var_len) in &m.runtime_imports {
+                let mod_gv = module.declare_data_in_func(*mod_id, builder.func);
+                let mod_addr = builder.ins().global_value(ptr_ty, mod_gv);
+                let mod_len_v = builder.ins().iconst(ptr_ty, *mod_len as i64);
+                let var_gv = module.declare_data_in_func(*var_id, builder.func);
+                let var_addr = builder.ins().global_value(ptr_ty, var_gv);
+                let var_len_v = builder.ins().iconst(ptr_ty, *var_len as i64);
+                let slot_v = builder.ins().iconst(ptr_ty, *target_slot as i64);
+                let _ = builder.ins().call(
+                    resolve_runtime_import_ref,
+                    &[vm, modvars_addr, slot_v, mod_addr, mod_len_v, var_addr, var_len_v],
                 );
             }
 

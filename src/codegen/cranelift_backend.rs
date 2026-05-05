@@ -475,7 +475,7 @@ pub mod cl {
     /// compiled code has no frame layout (shouldn't happen for normal
     /// functions, but `frame_layout` is `Option`-typed so we guard
     /// defensively rather than panic).
-    fn native_meta_from_cranelift(
+    pub fn native_meta_from_cranelift(
         compiled: &cranelift_codegen::CompiledCode,
     ) -> Option<crate::codegen::native_meta::NativeFrameMetadata> {
         use crate::codegen::native_meta::{
