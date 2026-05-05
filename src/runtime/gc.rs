@@ -565,7 +565,13 @@ impl Gc {
     }
 
     pub fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
-        self.alloc(ObjClass::new(name, superclass))
+        // ObjClass instances live for the program's lifetime and
+        // get baked into JIT class-check constants. Allocate them
+        // straight to the old arena so the pointer is stable for
+        // the lifetime of any JIT'd code that references it — a
+        // nursery-then-promoted class would invalidate every
+        // class-check that captured the old address.
+        self.alloc_old(ObjClass::new(name, superclass))
     }
 
     #[inline(always)]

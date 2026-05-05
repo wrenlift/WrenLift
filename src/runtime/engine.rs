@@ -1137,19 +1137,6 @@ impl ExecutionEngine {
                 if obj_type != crate::runtime::object::ObjType::Class {
                     continue;
                 }
-                // Defense-in-depth: skip nursery-allocated classes.
-                // `alloc_class` now goes straight to the old arena
-                // so this is a no-op in normal flows, but classes
-                // promoted via legacy paths (or fresh allocations
-                // from a different GC backend) could still be
-                // young, and a class-check baked with a young
-                // pointer would coincidentally match a recycled
-                // nursery slot after promotion — exactly the
-                // e2e_jit_nbody crash pattern.
-                let generation = unsafe { (*header).generation };
-                if generation == 0 {
-                    continue;
-                }
                 let class_ptr = ptr as *mut crate::runtime::object::ObjClass;
                 let class = unsafe { &*class_ptr };
                 for (idx, slot) in class.methods.iter().enumerate() {

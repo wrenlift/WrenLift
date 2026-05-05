@@ -24,11 +24,51 @@ pub mod cl {
     use std::collections::{HashMap, HashSet};
 
     const QNAN: u64 = 0x7FFC_0000_0000_0000;
+    const SIGN_BIT: u64 = 1u64 << 63;
+    /// Top-16-bit pattern for an object NaN-box: `SIGN_BIT | QNAN`. A
+    /// receiver Value is an object iff `(value & TAG_OBJ) == TAG_OBJ`
+    /// — every other Wren Value (Number, Null, Bool, Undefined,
+    /// String-box) clears at least one of those bits. JIT class-check
+    /// sites must guard with this before reading `recv.class`,
+    /// because the load offset (`HEADER_CLASS`) doesn't fail
+    /// "safely" for a non-object: a Number's f64 bits, masked
+    /// through PTR_MASK, can land at an unmapped page and SIGSEGV.
+    const TAG_OBJ: u64 = SIGN_BIT | QNAN;
     const TAG_NULL: u64 = QNAN; // 0x7FFC_0000_0000_0000 — no extra bits
     const TAG_FALSE: u64 = QNAN | 1;
     const TAG_TRUE: u64 = QNAN | 2;
     // Note: QNAN | 3 = TAG_UNDEFINED (not null!)
     const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+    /// Emit a guarded receiver-class load: returns `(obj_ptr,
+    /// recv_class)` iff the receiver is a NaN-boxed object,
+    /// branching to `not_object_block` otherwise. Safe to use on
+    /// any Value; non-object receivers (Numbers, Null, Bool, ...)
+    /// take the not-object branch instead of dereferencing garbage
+    /// at HEADER_CLASS.
+    fn emit_class_load_guarded(
+        builder: &mut FunctionBuilder,
+        recv: cranelift_codegen::ir::Value,
+        not_object_block: cranelift_codegen::ir::Block,
+    ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
+        use cranelift_codegen::ir::condcodes::IntCC;
+        use cranelift_codegen::ir::{InstBuilder, MemFlags};
+        let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
+        let high = builder.ins().band(recv, tag_obj);
+        let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
+        let object_block = builder.create_block();
+        builder
+            .ins()
+            .brif(is_obj, object_block, &[], not_object_block, &[]);
+        builder.switch_to_block(object_block);
+        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+        let obj_ptr = builder.ins().band(recv, ptr_mask);
+        let recv_class =
+            builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+        (obj_ptr, recv_class)
+    }
 
     // ---------------------------------------------------------------------
     // Cached process-wide env flags for the JIT compile path
@@ -590,18 +630,8 @@ pub mod cl {
                     None,
                     Some(layout.clone()),
                     None, // OSR-entry path is JIT-only
-                    // Skip the JIT inliner + CHA tree on OSR
-                    // entries. The OSR layout passes only the
-                    // values live across the back-edge, which can
-                    // leave some Call receivers absent from the
-                    // val_map; the inliner / CHA tree then read a
-                    // dummy 0, mask through PTR_MASK, and load
-                    // garbage at offset HEADER_CLASS, causing a
-                    // SIGSEGV (e2e_jit_nbody). The whole-function
-                    // compile still gets CHA + inlining; OSR
-                    // entries fall through to the runtime helper.
-                    None,
-                    None,
+                    inline_bodies.clone(),
+                    cha_by_method.clone(),
                 );
                 if result.is_ok() {
                     builder.seal_all_blocks();
@@ -2091,15 +2121,16 @@ pub mod cl {
                             let merge_block = builder.create_block();
                             builder.append_block_param(merge_block, types::I64);
 
-                            let ptr_mask =
-                                builder.ins().iconst(types::I64, PTR_MASK as i64);
-                            let obj_ptr = builder.ins().band(r, ptr_mask);
-                            let recv_class = builder.ins().load(
-                                types::I64,
-                                MemFlags::trusted(),
-                                obj_ptr,
-                                HEADER_CLASS,
-                            );
+                            // Non-objects (Numbers, Null, Bool, ...)
+                            // skip every class check and route to
+                            // wren_call_N; reading `recv.class` from
+                            // their NaN-box bits would dereference
+                            // garbage. The slow_block is the merge
+                            // target for both "no impl matched" and
+                            // "receiver isn't an object".
+                            let slow_block = builder.create_block();
+                            let (_obj_ptr, recv_class) =
+                                emit_class_load_guarded(builder, r, slow_block);
 
                             for (class_ptr, fid) in &impls {
                                 let next_check = builder.create_block();
@@ -2238,6 +2269,13 @@ pub mod cl {
                                 builder.switch_to_block(next_check);
                             }
 
+                            // After all class checks miss, fall into
+                            // the shared slow_block (also reached by
+                            // the is-object guard for non-object
+                            // receivers).
+                            builder.ins().jump(slow_block, &[]);
+
+                            builder.switch_to_block(slow_block);
                             // No class matched — full dispatch
                             // through wren_call_N.
                             let method_bits = method.index() as u64;
@@ -2291,15 +2329,12 @@ pub mod cl {
                         let merge_block = builder.create_block();
                         builder.append_block_param(merge_block, types::I64);
 
-                        // Extract receiver class: recv & PTR_MASK → load class at offset 16
-                        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                        let obj_ptr = builder.ins().band(r, ptr_mask);
-                        let recv_class = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            obj_ptr,
-                            HEADER_CLASS,
-                        );
+                        // is-object guard + class load. Non-objects
+                        // (Numbers, Null, Bool, ...) skip straight
+                        // to the slow path; reading their NaN-box
+                        // bits at +16 would dereference garbage.
+                        let (obj_ptr, recv_class) =
+                            emit_class_load_guarded(builder, r, slow_block);
 
                         // Kind=5 getter: class is baked as constant.
                         let cached_class = builder.ins().iconst(types::I64, ic.class as i64);
@@ -2489,16 +2524,11 @@ pub mod cl {
                             let merge_block = builder.create_block();
                             builder.append_block_param(merge_block, types::I64);
 
-                            // Class check using the same shape as the
-                            // existing kind=1 IC fast path.
-                            let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                            let obj_ptr = builder.ins().band(r, ptr_mask);
-                            let recv_class = builder.ins().load(
-                                types::I64,
-                                MemFlags::trusted(),
-                                obj_ptr,
-                                HEADER_CLASS,
-                            );
+                            // is-object guard + class load. Non-objects
+                            // skip the inlined body and route to the
+                            // slow path.
+                            let (_obj_ptr, recv_class) =
+                                emit_class_load_guarded(builder, r, slow_block);
                             let cached_class =
                                 builder.ins().iconst(types::I64, *expected_class as i64);
                             let class_match =
@@ -2642,15 +2672,9 @@ pub mod cl {
                         let merge_block = builder.create_block();
                         builder.append_block_param(merge_block, types::I64);
 
-                        // Class check
-                        let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                        let obj_ptr = builder.ins().band(r, ptr_mask);
-                        let recv_class = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            obj_ptr,
-                            HEADER_CLASS,
-                        );
+                        // is-object guard + class load.
+                        let (_obj_ptr, recv_class) =
+                            emit_class_load_guarded(builder, r, slow_block);
                         let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
                         let class_match =
                             builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
@@ -2733,12 +2757,9 @@ pub mod cl {
                     let merge_block = builder.create_block();
                     builder.append_block_param(merge_block, types::I64);
 
-                    let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                    let obj_ptr = builder.ins().band(r, ptr_mask);
-                    let recv_class =
-                        builder
-                            .ins()
-                            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+                    // is-object guard + class load.
+                    let (obj_ptr, recv_class) =
+                        emit_class_load_guarded(builder, r, slow_block);
                     let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
                     let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
                     builder
@@ -2797,16 +2818,15 @@ pub mod cl {
                     let merge_block = builder.create_block();
                     builder.append_block_param(merge_block, types::I64);
 
-                    // Check receiver is an object (MSB of NaN-box set means obj).
-                    // For simplicity we just extract obj_ptr and load class —
-                    // if recv is not an object this reads garbage but the class
-                    // comparison below will fail safely.
-                    let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
-                    let obj_ptr = builder.ins().band(r, ptr_mask);
-                    let recv_class =
-                        builder
-                            .ins()
-                            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+                    // is-object guard + class load. Non-object
+                    // receivers (Numbers, Null, Bool, ...) skip
+                    // straight to wren_call_N — a Number's f64
+                    // bits masked through PTR_MASK can land at an
+                    // unmapped page on macOS aarch64, so the
+                    // pre-existing "comparison fails safely"
+                    // assumption did not hold.
+                    let (_obj_ptr, recv_class) =
+                        emit_class_load_guarded(builder, r, slow_block);
                     let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
                     let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
 
