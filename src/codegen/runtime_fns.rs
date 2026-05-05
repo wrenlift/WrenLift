@@ -1548,6 +1548,20 @@ pub extern "C" fn wren_get_module_var(slot: u64) -> u64 {
     .unwrap_or(Value::null().to_bits())
 }
 
+/// Read the current `JitContext.closure` raw pointer. AOT bodies
+/// call this once at function entry (when the body has any
+/// upvalue access) and stash the result in a function-scoped
+/// local — every subsequent `Instruction::GetUpvalue` /
+/// `SetUpvalue` then lowers to inline pointer chasing against
+/// that local instead of routing through `wren_get/set_upvalue`,
+/// which would re-read TLS and pay a helper-call's worth of
+/// overhead on every access.
+#[no_mangle]
+pub extern "C" fn wren_load_jit_closure() -> u64 {
+    let ctx = read_jit_ctx();
+    ctx.closure as u64
+}
+
 /// Load the JIT code pointer for a given function ID.
 /// Returns the function pointer as u64 (0 if not compiled).
 /// Used by CallKnownFunc to do direct JIT-to-JIT calls.
@@ -4380,6 +4394,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Collections
         // Known-function dispatch (devirtualized)
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
+        "wren_load_jit_closure" => Some(wren_load_jit_closure as *const () as usize),
         "wren_known_call_0" => Some(wren_known_call_0 as *const () as usize),
         "wren_known_call_1" => Some(wren_known_call_1 as *const () as usize),
         "wren_known_call_2" => Some(wren_known_call_2 as *const () as usize),

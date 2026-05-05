@@ -182,10 +182,11 @@ fn multi_module() {
 
 #[test]
 fn closure_upvalue() {
-    // Closure capturing a local + reading it back: validates
-    // that the closure body's wren_get_upvalue path resolves
-    // through ctx.closure (set by call_closure_jit_or_sync on
-    // each invocation).
+    // Closure capturing a local + reading it back: exercises
+    // the AOT inline upvalue read against the function-scoped
+    // `closure_ptr` Variable (loaded once at entry from
+    // `JitContext.closure`, then consulted per-access without
+    // a helper call).
     let r = compile_link_run(
         "var n = 40\n\
          var add2 = Fn.new { n + 2 }\n\
@@ -193,4 +194,23 @@ fn closure_upvalue() {
     );
     assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "42\n");
+}
+
+#[test]
+fn closure_upvalue_mutation() {
+    // Closure reads an upvalue, mutates it, reads it back —
+    // exercises both inline GetUpvalue and SetUpvalue
+    // (including the wren_write_barrier call) under AOT.
+    // Repeated invocations must observe the carried-over
+    // upvalue state.
+    let r = compile_link_run(
+        "var n = 0\n\
+         var bump = Fn.new { n = n + 1 }\n\
+         bump.call()\n\
+         bump.call()\n\
+         bump.call()\n\
+         System.print(n)\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "3\n");
 }

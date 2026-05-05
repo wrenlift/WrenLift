@@ -895,6 +895,7 @@ pub mod cl {
             "wren_call_7",
             "wren_call_8",
             "wren_load_jit_ptr",
+            "wren_load_jit_closure",
             "wren_known_call_0",
             "wren_known_call_1",
             "wren_known_call_2",
@@ -1119,6 +1120,21 @@ pub mod cl {
         /// closures (where static-field access is unreachable
         /// or already returns null in the legacy helper).
         pub current_defining_class: std::cell::RefCell<Option<AotDefiningClass>>,
+
+        /// Function-scoped closure pointer for the body
+        /// currently being lowered. When the MIR contains any
+        /// `Instruction::GetUpvalue` / `SetUpvalue` the lowering
+        /// reads `JitContext.closure` once at function entry into
+        /// this Cranelift `Variable`, then every upvalue access
+        /// becomes inline pointer chasing against the stored
+        /// pointer — no per-access TLS read, no per-access helper
+        /// call, and the value survives nested calls that
+        /// re-mutate the TLS context. `None` when the function
+        /// body has no upvalue access (skip the load entirely).
+        /// Cleared to `None` between emissions by `emit_aot_function`.
+        pub current_closure_ptr_var: std::cell::RefCell<
+            Option<cranelift_frontend::Variable>,
+        >,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1318,6 +1334,32 @@ pub mod cl {
             Ok(func_ref)
         };
 
+        // Pre-scan: if this is an AOT body that touches upvalues, hoist
+        // a `closure_ptr` Variable that we'll define once at function
+        // entry and read on every GetUpvalue / SetUpvalue. Skipped when
+        // the body has no upvalue ops (no overhead) and when running
+        // outside AOT (the JIT helper path keeps its own TLS state).
+        if let Some(cfg) = aot_config {
+            let needs_closure_ptr = osr_entry.is_none()
+                && f64_self_id.is_none()
+                && mir.blocks.iter().any(|b| {
+                    b.instructions.iter().any(|(_, i)| {
+                        matches!(
+                            i,
+                            Instruction::GetUpvalue(_) | Instruction::SetUpvalue(..)
+                        )
+                    })
+                });
+            if needs_closure_ptr {
+                // FunctionBuilder mints the variable index for us;
+                // we just stash the returned Variable so the
+                // entry-block setup + every upvalue lowering site
+                // can look it up.
+                let var = builder.declare_var(types::I64);
+                *cfg.current_closure_ptr_var.borrow_mut() = Some(var);
+            }
+        }
+
         // Process blocks in reverse post-order (dominance order).
         // The MIR block array may have preheader blocks (bb4) listed after
         // loop bodies (bb2), but Cranelift requires values to be defined
@@ -1399,6 +1441,22 @@ pub mod cl {
                                 }
                             }
                         }
+                    }
+                }
+
+                // AOT-only: define the function-scoped closure-pointer
+                // variable from `JitContext.closure`. The Variable was
+                // declared above; defining it here in the entry block
+                // makes it available to every subsequent GetUpvalue /
+                // SetUpvalue lowering site without re-reading TLS or
+                // calling the per-access helper.
+                if let Some(cfg) = aot_config {
+                    if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
+                        let f =
+                            get_runtime_fn(module, builder, "wren_load_jit_closure", 0)?;
+                        let call = builder.ins().call(f, &[]);
+                        let closure_bits = builder.inst_results(call)[0];
+                        builder.def_var(var, closure_bits);
                     }
                 }
             }
@@ -3010,13 +3068,94 @@ pub mod cl {
             }
 
             // === Upvalues ===
+            //
+            // AOT mode: when the body has any upvalue access, the
+            // entry block stashed `JitContext.closure` into a
+            // function-scoped Cranelift Variable. Lower each access
+            // to inline pointer chasing against that local — saves
+            // the per-access TLS read + helper-call overhead, and
+            // the local survives nested calls that re-mutate TLS.
+            //
+            // Layout: ObjClosure.upvalues is a `Vec<*mut ObjUpvalue>`,
+            // so the data pointer lives at +CLOSURE_UPVALUES_DATA;
+            // each ObjUpvalue's value is reached through its
+            // `location` field at +UPVALUE_LOCATION (open upvalues
+            // point at a stack slot, closed ones at the upvalue's
+            // own `closed` storage — the indirection is essential).
+            //
+            // JIT mode keeps the helper call (the dispatch path
+            // already populates `ctx.closure` and the helper
+            // amortises away under tier-up perf budgets).
             Instruction::GetUpvalue(idx) => {
+                if let Some(cfg) = aot_config {
+                    if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
+                        let closure_ptr = builder.use_var(var);
+                        let upvalues_data = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            closure_ptr,
+                            CLOSURE_UPVALUES_DATA,
+                        );
+                        let upvalue_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            upvalues_data,
+                            (*idx as i32) * 8,
+                        );
+                        let location_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            upvalue_ptr,
+                            UPVALUE_LOCATION,
+                        );
+                        let value =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), location_ptr, 0);
+                        return Ok(Some(value));
+                    }
+                }
                 let f = get_runtime_fn(module, builder, "wren_get_upvalue", 1)?;
                 let idx_val = builder.ins().iconst(types::I64, *idx as i64);
                 let result = builder.ins().call(f, &[idx_val]);
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::SetUpvalue(idx, val) => {
+                if let Some(cfg) = aot_config {
+                    if let Some(var) = *cfg.current_closure_ptr_var.borrow() {
+                        let closure_ptr = builder.use_var(var);
+                        let upvalues_data = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            closure_ptr,
+                            CLOSURE_UPVALUES_DATA,
+                        );
+                        let upvalue_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            upvalues_data,
+                            (*idx as i32) * 8,
+                        );
+                        let location_ptr = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            upvalue_ptr,
+                            UPVALUE_LOCATION,
+                        );
+                        let v = get(val);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), v, location_ptr, 0);
+                        // Generational write barrier: the upvalue
+                        // header is the slot's owner; a young value
+                        // stored into an old upvalue must surface to
+                        // the major GC's remembered set.
+                        let barrier =
+                            get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
+                        builder.ins().call(barrier, &[upvalue_ptr, v]);
+                        return Ok(Some(v));
+                    }
+                }
                 let f = get_runtime_fn(module, builder, "wren_set_upvalue", 2)?;
                 let idx_val = builder.ins().iconst(types::I64, *idx as i64);
                 let result = builder.ins().call(f, &[idx_val, get(val)]);
