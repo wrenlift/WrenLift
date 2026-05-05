@@ -1111,6 +1111,126 @@ impl ExecutionEngine {
             .collect()
     }
 
+    /// JIT-side class-hierarchy snapshot. Mirrors AOT's `AotCha`:
+    /// each entry maps a method symbol to every (class_ptr, FuncId)
+    /// pair that implements it. Built fresh per compile from the
+    /// live module-var table; class pointers travel to the broker
+    /// thread and are only used to fill IC entries that the
+    /// runtime later class-checks before dispatching, so a stale
+    /// pointer just falls through to the slow path.
+    fn build_jit_cha(&self) -> std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>
+    {
+        let mut by_method: std::collections::HashMap<
+            crate::intern::SymbolId,
+            Vec<(usize, u32)>,
+        > = std::collections::HashMap::new();
+        for entry in self.modules.values() {
+            for var in &entry.vars {
+                if !var.is_object() {
+                    continue;
+                }
+                let Some(ptr) = var.as_object() else {
+                    continue;
+                };
+                let header = ptr as *const crate::runtime::object::ObjHeader;
+                let obj_type = unsafe { (*header).obj_type };
+                if obj_type != crate::runtime::object::ObjType::Class {
+                    continue;
+                }
+                let class_ptr = ptr as *mut crate::runtime::object::ObjClass;
+                let class = unsafe { &*class_ptr };
+                for (idx, slot) in class.methods.iter().enumerate() {
+                    let Some(method) = slot else { continue };
+                    let closure_ptr = match method {
+                        crate::runtime::object::Method::Closure(p) => *p,
+                        // Constructors / native / foreign methods need
+                        // their own dispatch flavour; only plain
+                        // closures are safe to plant as a kind=1 IC.
+                        _ => continue,
+                    };
+                    if closure_ptr.is_null() {
+                        continue;
+                    }
+                    let closure = unsafe { &*closure_ptr };
+                    if closure.function.is_null() {
+                        continue;
+                    }
+                    let func_id = unsafe { (*closure.function).fn_id };
+                    if let Some(mir) = self.get_mir(FuncId(func_id)) {
+                        if Self::mir_uses_defining_class(&mir) {
+                            continue;
+                        }
+                    }
+                    let sym = crate::intern::SymbolId::from_raw(idx as u32);
+                    by_method
+                        .entry(sym)
+                        .or_default()
+                        .push((class_ptr as usize, func_id));
+                }
+            }
+        }
+        by_method
+    }
+
+    fn mir_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
+        use crate::mir::Instruction;
+        for block in &mir.blocks {
+            for (_, inst) in &block.instructions {
+                if matches!(
+                    inst,
+                    Instruction::SuperCall { .. }
+                        | Instruction::GetStaticField(_)
+                        | Instruction::SetStaticField(_, _)
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Mutate `ic_snapshot` in place: for any empty entry, plant a
+    /// kind=1 IC when CHA shows exactly one impl for the call's
+    /// method symbol. The downstream `compute_devirt_hints` +
+    /// `devirt_calls_with_ic` then converts those Call sites into
+    /// class-checked direct calls (or trivial-getter inlines).
+    /// Walks MIR Call/SuperCall in the same order
+    /// `callsite_ic_data_for_compile` produces the snapshot.
+    fn fill_ic_with_cha(
+        &self,
+        mir: &crate::mir::MirFunction,
+        ic_snapshot: &mut [CallSiteIC],
+        cha: &std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+    ) {
+        use crate::mir::Instruction;
+        let mut ic_idx = 0usize;
+        for block in &mir.blocks {
+            for (_, inst) in &block.instructions {
+                match inst {
+                    Instruction::Call { method, .. } => {
+                        if let Some(slot) = ic_snapshot.get_mut(ic_idx) {
+                            if slot.kind == 0 {
+                                if let Some(impls) = cha.get(method) {
+                                    if impls.len() == 1 {
+                                        let (class_ptr, fid) = impls[0];
+                                        slot.class = class_ptr;
+                                        slot.func_id = fid as u64;
+                                        slot.kind = 1;
+                                    }
+                                }
+                            }
+                        }
+                        ic_idx += 1;
+                    }
+                    Instruction::SuperCall { .. } => {
+                        ic_idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// Compute a per-function "no observable side effects" map keyed
     /// by `FuncId.0`. Used by the post-devirt CSE pass in codegen so
     /// `CallKnownFunc { func_id }` calls into pure user methods don't
@@ -2014,10 +2134,16 @@ impl ExecutionEngine {
             }
         }
         let compile_mir = Self::build_compile_mir(&mir, tier, interner, profile.as_ref());
-        let (callsite_ic_ptrs, callsite_ic_live_ptrs) = self
+        let (mut callsite_ic_ptrs, callsite_ic_live_ptrs) = self
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
+        if std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_none() {
+            if let Some(ref mut ics) = callsite_ic_ptrs {
+                let cha = self.build_jit_cha();
+                self.fill_ic_with_cha(&mir, ics, &cha);
+            }
+        }
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
@@ -2148,10 +2274,16 @@ impl ExecutionEngine {
         let target = Self::native_target();
         let interner_clone = interner.clone();
         let trace_name_clone = trace_name.clone();
-        let (callsite_ic_ptrs, callsite_ic_live_ptrs) = self
+        let (mut callsite_ic_ptrs, callsite_ic_live_ptrs) = self
             .callsite_ic_data_for_compile(id)
             .map(|(s, l)| (Some(s), Some(l)))
             .unwrap_or((None, None));
+        if std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_none() {
+            if let Some(ref mut ics) = callsite_ic_ptrs {
+                let cha = self.build_jit_cha();
+                self.fill_ic_with_cha(&mir, ics, &cha);
+            }
+        }
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
