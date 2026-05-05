@@ -2196,8 +2196,33 @@ fn run_fiber_with_stop_depth(
                         class
                     };
 
-                    let (method_entry, defining_class) =
-                        if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method) {
+                    // CHA-aware fast path: if the JIT-side CHA has
+                    // already planted an IC entry for this call site
+                    // and the receiver's class matches, dispatch
+                    // directly via the planted closure pointer.
+                    // Skips both `method_cache.lookup` and the
+                    // method-table walk. Same dispatch decision the
+                    // JIT will see when it consumes the IC, so the
+                    // interpreter and JIT share a view of every
+                    // monomorphic call site CHA covers.
+                    let cha_method = if ic_idx < ic_table.len() {
+                        let ic = &ic_table[ic_idx];
+                        if ic.kind == 1
+                            && ic.class != 0
+                            && !ic.closure.is_null()
+                            && ic.class == cache_key_class as usize
+                        {
+                            Some(Method::Closure(ic.closure as *mut ObjClosure))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let (method_entry, defining_class) = if let Some(m) = cha_method {
+                        (Some(m), Some(cache_key_class))
+                    } else if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method) {
                             (Some(m), Some(dc))
                         } else {
                             let result = if class == vm.class_class {

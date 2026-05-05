@@ -1112,17 +1112,22 @@ impl ExecutionEngine {
     }
 
     /// JIT-side class-hierarchy snapshot. Mirrors AOT's `AotCha`:
-    /// each entry maps a method symbol to every (class_ptr, FuncId)
-    /// pair that implements it. Built fresh per compile from the
-    /// live module-var table; class pointers travel to the broker
-    /// thread and are only used to fill IC entries that the
-    /// runtime later class-checks before dispatching, so a stale
-    /// pointer just falls through to the slow path.
-    pub fn build_jit_cha(&self) -> std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>
-    {
+    /// each entry maps a method symbol to every
+    /// `(class_ptr, FuncId, closure_ptr)` triple that implements
+    /// it. Built fresh per compile from the live module-var
+    /// table. Class and closure pointers travel to the broker
+    /// thread for IC fill — both interp and JIT consume the
+    /// resulting IC entries with a class-check guard before
+    /// dispatch, so a stale pointer just falls through to the
+    /// slow path. Including `closure_ptr` lets the interpreter
+    /// dispatch directly from a CHA-planted IC entry instead of
+    /// falling back to a method-table lookup.
+    pub fn build_jit_cha(
+        &self,
+    ) -> std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>> {
         let mut by_method: std::collections::HashMap<
             crate::intern::SymbolId,
-            Vec<(usize, u32)>,
+            Vec<(usize, u32, usize)>,
         > = std::collections::HashMap::new();
         for entry in self.modules.values() {
             for var in &entry.vars {
@@ -1162,10 +1167,11 @@ impl ExecutionEngine {
                         }
                     }
                     let sym = crate::intern::SymbolId::from_raw(idx as u32);
-                    by_method
-                        .entry(sym)
-                        .or_default()
-                        .push((class_ptr as usize, func_id));
+                    by_method.entry(sym).or_default().push((
+                        class_ptr as usize,
+                        func_id,
+                        closure_ptr as usize,
+                    ));
                 }
             }
         }
@@ -1279,7 +1285,7 @@ impl ExecutionEngine {
         &self,
         mir: &crate::mir::MirFunction,
         ic_snapshot: &mut [CallSiteIC],
-        cha: &std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+        cha: &std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
     ) {
         use crate::mir::Instruction;
         let mut ic_idx = 0usize;
@@ -1291,9 +1297,10 @@ impl ExecutionEngine {
                             if slot.kind == 0 {
                                 if let Some(impls) = cha.get(method) {
                                     if impls.len() == 1 {
-                                        let (class_ptr, fid) = impls[0];
+                                        let (class_ptr, fid, closure_ptr) = impls[0];
                                         slot.class = class_ptr;
                                         slot.func_id = fid as u64;
+                                        slot.closure = closure_ptr as *const u8;
                                         slot.kind = 1;
                                     }
                                 }
@@ -2220,7 +2227,7 @@ impl ExecutionEngine {
         let cha_disabled = std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_some();
         let cha_for_codegen: Option<
             std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         > = if cha_disabled {
             None
@@ -2375,7 +2382,7 @@ impl ExecutionEngine {
         let cha_disabled = std::env::var_os("WLIFT_DISABLE_JIT_CHA").is_some();
         let cha_for_codegen: Option<
             std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         > = if cha_disabled {
             None

@@ -2179,7 +2179,7 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     >,
     #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] cha_by_method: Option<
         std::sync::Arc<
-            std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+            std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
         >,
     >,
 ) -> Result<CompiledArtifact, String> {

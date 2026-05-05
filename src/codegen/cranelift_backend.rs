@@ -153,7 +153,7 @@ pub mod cl {
         >,
         cha_by_method: Option<
             std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         >,
     ) -> Result<CraneliftCompiledCode, String> {
@@ -586,7 +586,7 @@ pub mod cl {
         >,
         cha_by_method: Option<
             std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         >,
     ) -> Vec<PendingOsrDefinition> {
@@ -1143,7 +1143,7 @@ pub mod cl {
         >,
         cha_by_method: Option<
             std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         >,
     ) -> Result<(), String> {
@@ -1185,7 +1185,7 @@ pub mod cl {
         >,
         cha_by_method: Option<
             std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         >,
     ) -> Result<(), String> {
@@ -1568,7 +1568,7 @@ pub mod cl {
         >,
         cha_by_method: Option<
             &std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
+                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32, usize)>>,
             >,
         >,
     ) -> Result<Option<Value>, String> {
@@ -2113,7 +2113,7 @@ pub mod cl {
                 // alone keeps thrashing).
                 if let Some(cha) = cha_by_method {
                     if args.len() <= 4 {
-                        let impls: Vec<(usize, u32)> = cha
+                        let impls: Vec<(usize, u32, usize)> = cha
                             .get(method)
                             .cloned()
                             .unwrap_or_default();
@@ -2132,7 +2132,7 @@ pub mod cl {
                             let (_obj_ptr, recv_class) =
                                 emit_class_load_guarded(builder, r, slow_block);
 
-                            for (class_ptr, fid) in &impls {
+                            for (class_ptr, fid, _closure_ptr) in &impls {
                                 let next_check = builder.create_block();
                                 let fast_block = builder.create_block();
                                 let cached_class =
