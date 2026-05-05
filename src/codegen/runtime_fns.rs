@@ -1534,6 +1534,7 @@ pub fn module_name() -> String {
 // ---------------------------------------------------------------------------
 
 /// Get a module variable by slot index.
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_get_module_var(slot: u64) -> u64 {
     with_context(|ctx| {
@@ -1562,6 +1563,7 @@ pub extern "C" fn wren_load_jit_ptr(func_id: u64) -> u64 {
 }
 
 /// Set a module variable by slot index.
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     with_context(|ctx| {
@@ -2125,7 +2127,10 @@ pub unsafe extern "C" fn wren_call_0(_receiver: u64, _method: u64) -> u64 {
         inner = sym wren_call_0_inner,
     );
 }
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    feature = "host"
+))]
 #[no_mangle]
 pub extern "C" fn wren_call_0(receiver: u64, method: u64) -> u64 {
     wren_call_0_inner(receiver, method, 0, 0)
@@ -2183,7 +2188,10 @@ pub unsafe extern "C" fn wren_call_1(_receiver: u64, _method: u64, _a0: u64) -> 
         inner = sym wren_call_1_inner,
     );
 }
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    feature = "host"
+))]
 #[no_mangle]
 pub extern "C" fn wren_call_1(receiver: u64, method: u64, a0: u64) -> u64 {
     wren_call_1_inner(receiver, method, a0, 0, 0)
@@ -2246,7 +2254,10 @@ pub unsafe extern "C" fn wren_call_2(_receiver: u64, _method: u64, _a0: u64, _a1
         inner = sym wren_call_2_inner,
     );
 }
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    feature = "host"
+))]
 #[no_mangle]
 pub extern "C" fn wren_call_2(receiver: u64, method: u64, a0: u64, a1: u64) -> u64 {
     wren_call_2_inner(receiver, method, a0, a1, 0, 0)
@@ -2346,7 +2357,10 @@ pub unsafe extern "C" fn wren_call_3(
         inner = sym wren_call_3_inner,
     );
 }
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    feature = "host"
+))]
 #[no_mangle]
 pub extern "C" fn wren_call_3(receiver: u64, method: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     wren_call_3_inner(receiver, method, a0, a1, a2, 0, 0)
@@ -2451,7 +2465,10 @@ pub unsafe extern "C" fn wren_call_4(
         inner = sym wren_call_4_inner,
     );
 }
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[cfg(all(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    feature = "host"
+))]
 #[no_mangle]
 pub extern "C" fn wren_call_4(
     receiver: u64,
@@ -2504,6 +2521,7 @@ fn wren_call_n_inner(receiver: u64, method: u64, args_in: &[u64]) -> u64 {
     result
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_call_5(
     receiver: u64,
@@ -2517,6 +2535,7 @@ pub extern "C" fn wren_call_5(
     wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4])
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_call_6(
     receiver: u64,
@@ -2531,6 +2550,7 @@ pub extern "C" fn wren_call_6(
     wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4, a5])
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_call_7(
     receiver: u64,
@@ -2546,6 +2566,7 @@ pub extern "C" fn wren_call_7(
     wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4, a5, a6])
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_call_8(
     receiver: u64,
@@ -4017,26 +4038,31 @@ fn box_num(n: f64) -> u64 {
     Value::num(n).to_bits()
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_num_add(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "+(_)", "+", |x, y| x + y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_num_sub(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "-(_)", "-", |x, y| x - y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_num_mul(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "*(_)", "*", |x, y| x * y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_num_div(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "/(_)", "/", |x, y| x / y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "%(_)", "%", |x, y| x % y)
@@ -4077,6 +4103,7 @@ fn wren_arith_dispatch(
     }
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_num_neg(a: u64) -> u64 {
     let va = Value::from_bits(a);
@@ -4106,21 +4133,25 @@ pub extern "C" fn wren_num_neg(a: u64) -> u64 {
 // Boxed comparison runtime functions
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_cmp_lt(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, "<(_)", "<", |x, y| x < y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_cmp_gt(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, ">(_)", ">", |x, y| x > y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_cmp_le(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, "<=(_)", "<=", |x, y| x <= y)
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_cmp_ge(a: u64, b: u64) -> u64 {
     wren_cmp_dispatch(a, b, ">=(_)", ">=", |x, y| x >= y)
@@ -4161,6 +4192,7 @@ fn wren_cmp_dispatch(
     }
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
     // Wren's `==` is overloadable per class. Mirror the
@@ -4186,6 +4218,7 @@ pub extern "C" fn wren_cmp_eq(a: u64, b: u64) -> u64 {
     Value::bool(lhs.equals(rhs)).to_bits()
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
     let lhs = Value::from_bits(a);
@@ -4208,11 +4241,13 @@ pub extern "C" fn wren_cmp_ne(a: u64, b: u64) -> u64 {
 // Boxed logical
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_not(a: u64) -> u64 {
     Value::bool(Value::from_bits(a).is_falsy()).to_bits()
 }
 
+#[cfg(feature = "host")]
 #[no_mangle]
 pub extern "C" fn wren_is_truthy(value: u64) -> u64 {
     let v = Value::from_bits(value);
