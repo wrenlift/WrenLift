@@ -419,8 +419,18 @@ fn build_aot_module_from_source(
     source_bytes: &[u8],
     field_layouts: &mut HashMap<String, Vec<String>>,
 ) -> Result<AotModule, AotError> {
-    let source = std::str::from_utf8(source_bytes)
+    let raw = std::str::from_utf8(source_bytes)
         .map_err(|e| AotError::Frontend(format!("{} is not valid UTF-8: {}", request_name, e)))?;
+    // Strip `#!native` / `#!wasm` cross-target lines for the
+    // host build before parsing — without this, packages that
+    // declare both a native and a wasm import for the same
+    // symbol (e.g. `@hatch:window`'s `window_native` /
+    // `window_web` pair) would surface as duplicate
+    // module-var definitions in the resolver. The interpreter
+    // (`wlift run`) and `hatch build` apply the same filter
+    // upstream; AOT is the path that previously skipped it.
+    let filtered = crate::parse::cfg::apply(raw, None);
+    let source: &str = &filtered;
     let parsed = parse(source);
     if !parsed.errors.is_empty() {
         return Err(AotError::Frontend(
@@ -516,19 +526,37 @@ fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
         Err(_) => return map,
     };
 
-    // For every path-linked dep, read its own hatchfile to find
-    // its `[package].entry` module name → resolve to a `.wren`
-    // file under the dep's directory.
-    for (name, dep) in manifest
-        .dependencies
-        .iter()
-        .chain(manifest.spec_dependencies.iter())
-    {
-        let crate::hatch::Dependency::Path { path, .. } = dep else {
-            continue;
+    // BFS over path-linked deps. Each dep's own `hatchfile` may
+    // declare further `@hatch:*` deps (e.g. `@hatch:test`
+    // pulls in `@hatch:fmt`); without traversing transitively
+    // the scoped resolver misses them, the walker leaves the
+    // import slot unresolved, and the AOT body silently reads
+    // null at first use of the symbol. Visited set guards against
+    // diamond cycles. Spec-deps (test/assert) get the same
+    // treatment so a spec running from inside a package's
+    // directory sees its test framework's runtime deps too.
+    let mut queue: std::collections::VecDeque<(String, std::path::PathBuf)> =
+        std::collections::VecDeque::new();
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    let push_deps =
+        |m: &crate::hatch::Manifest,
+         workspace: &std::path::Path,
+         q: &mut std::collections::VecDeque<(String, std::path::PathBuf)>| {
+            for (name, dep) in m.dependencies.iter().chain(m.spec_dependencies.iter()) {
+                let crate::hatch::Dependency::Path { path, .. } = dep else {
+                    continue;
+                };
+                q.push_back((name.clone(), workspace.join(path)));
+            }
         };
-        let dep_dir = workspace_root.join(path);
-        let dep_hatchfile = dep_dir.join("hatchfile");
+    push_deps(&manifest, &workspace_root, &mut queue);
+    while let Some((name, dep_dir)) = queue.pop_front() {
+        let canonical = std::fs::canonicalize(&dep_dir).unwrap_or(dep_dir.clone());
+        if !visited.insert(canonical.clone()) {
+            continue;
+        }
+        let dep_hatchfile = canonical.join("hatchfile");
         let Ok(dep_text) = std::fs::read_to_string(&dep_hatchfile) else {
             continue;
         };
@@ -536,12 +564,14 @@ fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
             Ok(m) => m,
             Err(_) => continue,
         };
-        // `entry` is a module name (e.g. `"fmt"`). The `.wren`
-        // file lives at `<dep_dir>/<entry>.wren`.
-        let entry_file = dep_dir.join(format!("{}.wren", dep_manifest.entry));
+        let entry_file = canonical.join(format!("{}.wren", dep_manifest.entry));
         if entry_file.exists() {
-            map.insert(name.clone(), entry_file);
+            // First definition wins — the entry's direct deps
+            // take precedence over a transitive package's
+            // re-export of the same name.
+            map.entry(name.clone()).or_insert(entry_file);
         }
+        push_deps(&dep_manifest, &canonical, &mut queue);
     }
     map
 }
@@ -559,8 +589,13 @@ fn walk_module(
         return Ok(());
     }
 
-    let source = std::str::from_utf8(source_bytes)
+    let raw = std::str::from_utf8(source_bytes)
         .map_err(|e| AotError::Frontend(format!("{} is not valid UTF-8: {}", canonical_name, e)))?;
+    // Strip `#!native` / `#!wasm` cross-target lines for the
+    // host AOT build; same rationale as
+    // `build_aot_module_from_source` above.
+    let filtered = crate::parse::cfg::apply(raw, None);
+    let source: &str = &filtered;
     let parsed = parse(source);
     if !parsed.errors.is_empty() {
         return Err(AotError::Frontend(
