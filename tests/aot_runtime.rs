@@ -203,6 +203,12 @@ fn closure_upvalue_mutation() {
     // (including the wren_write_barrier call) under AOT.
     // Repeated invocations must observe the carried-over
     // upvalue state.
+    //
+    // Caveat: top-level `var n` is a *module variable*, not a
+    // captured local — MIR lowers `n` references to
+    // GetModuleVar / SetModuleVar, not GetUpvalue / SetUpvalue.
+    // The genuine upvalue path runs through
+    // `closure_captures_function_local` below.
     let r = compile_link_run(
         "var n = 0\n\
          var bump = Fn.new { n = n + 1 }\n\
@@ -210,6 +216,38 @@ fn closure_upvalue_mutation() {
          bump.call()\n\
          bump.call()\n\
          System.print(n)\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "3\n");
+}
+
+#[test]
+fn closure_captures_function_local() {
+    // Real upvalue: a function-local `n` captured by an inner
+    // closure. The factory returns the closure; the outer
+    // local goes out of scope, so the upvalue must carry the
+    // closed-over value through `ObjUpvalue`'s `closed` field
+    // and indirect through `location`. AOT lowers GetUpvalue /
+    // SetUpvalue inline against the closure's `upvalues` Vec
+    // data pointer (not the Vec field itself — Rust's current
+    // Vec layout puts capacity at offset 0, the data pointer
+    // at offset 8, length at offset 16). Pre-fix this test
+    // SIGSEGVed at the first upvalue read because the lowering
+    // dereferenced the capacity field as a pointer.
+    let r = compile_link_run(
+        "class Counter {\n  \
+            static make() {\n    \
+                var n = 0\n    \
+                return Fn.new {\n      \
+                    n = n + 1\n      \
+                    return n\n    \
+                }\n  \
+            }\n\
+         }\n\
+         var bump = Counter.make()\n\
+         bump.call()\n\
+         bump.call()\n\
+         System.print(bump.call())\n",
     );
     assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
     assert_eq!(r.stdout, "3\n");

@@ -54,14 +54,19 @@ pub const TA_KIND_F64: u8 = 2;
 
 // -- ObjClosure --------------------------------------------------------------
 //
-// `upvalues` is a `Vec<*mut ObjUpvalue>` — its pointer field is
-// the data buffer holding `len` consecutive `*mut ObjUpvalue`
-// entries. The Vec layout is (ptr, capacity, length) on stable
-// Rust today, so `CLOSURE_UPVALUES_DATA` reads the data buffer
-// directly. The `len`/`cap` fields aren't accessed from JIT code.
+// `upvalues` is a `Vec<*mut ObjUpvalue>` whose internal layout is
+// `(cap, ptr, len)` on current stable Rust — `Vec::as_ptr()`
+// returns the value at offset 8 inside the Vec. The closure's
+// `upvalues` field starts at byte 32, so the data-pointer field
+// lives at byte 40. The `verify_closure_data_ptr_offset` test
+// pins this against `Vec::as_ptr()` so a future Rust layout
+// change fails loudly instead of silently miscompiling — JIT
+// inlining walks raw memory through this offset and a stale
+// constant points at `cap` instead of `ptr`, returning bogus
+// addresses on every upvalue access.
 
 pub const CLOSURE_FUNCTION: i32 = 24; // *mut ObjFn
-pub const CLOSURE_UPVALUES_DATA: i32 = 32; // *mut *mut ObjUpvalue (Vec.ptr)
+pub const CLOSURE_UPVALUES_DATA: i32 = 40; // *mut *mut ObjUpvalue (Vec data ptr)
 
 // -- ObjUpvalue --------------------------------------------------------------
 
@@ -128,12 +133,28 @@ mod tests {
             memoffset_of!(ObjClosure, function),
             CLOSURE_FUNCTION as usize
         );
-        // Vec::as_ptr() and the data field of std's Vec layout
-        // both point at the start of the buffer; the field offset
-        // here matches Rust's stable Vec internal layout.
+        // CLOSURE_UPVALUES_DATA is the byte offset at which the
+        // Vec's data pointer lives — not the offset of the Vec
+        // field itself. Compute the expected offset by asking
+        // `Vec::as_ptr()` for the data buffer's address and
+        // subtracting the closure base. If a future Rust release
+        // shuffles Vec's internal layout (it has done so before)
+        // this test fails loudly instead of letting JIT-inlined
+        // upvalue access dereference the `cap` field as a pointer.
+        let closure = ObjClosure::new(std::ptr::null_mut(), 1);
+        let base = &closure as *const _ as usize;
+        let data_ptr_addr = closure.upvalues.as_ptr() as usize;
+        // We can't read the Vec's internal data-ptr field directly
+        // without invoking UB; do it through a single u64 load at
+        // the offset we expect, then compare against `as_ptr()`.
+        let probed = unsafe {
+            *(base.wrapping_add(CLOSURE_UPVALUES_DATA as usize) as *const usize)
+        };
         assert_eq!(
-            memoffset_of!(ObjClosure, upvalues),
-            CLOSURE_UPVALUES_DATA as usize
+            probed, data_ptr_addr,
+            "CLOSURE_UPVALUES_DATA points at Vec.cap (or worse) instead of \
+             Vec's data pointer — Rust's Vec internal layout shifted. JIT \
+             upvalue inlining miscompiles until this is fixed."
         );
     }
 
