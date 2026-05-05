@@ -111,11 +111,6 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
-            >,
-        >,
     ) -> Result<CraneliftCompiledCode, String> {
         // 1. Create Cranelift ISA for the host
         let mut flag_builder = settings::builder();
@@ -253,7 +248,6 @@ pub mod cl {
                     None,
                     None, // f64 inner is JIT-only
                     None, // f64 inner has no method calls — nothing to inline
-                    None, // and no method dispatch — nothing for CHA
                 )?;
                 builder.seal_all_blocks();
                 builder.finalize();
@@ -365,7 +359,6 @@ pub mod cl {
                 callsite_ic_live_ptrs,
                 jit_code_base,
                 inline_bodies.clone(),
-                cha_by_method.clone(),
             )?;
 
             builder.seal_all_blocks();
@@ -405,7 +398,6 @@ pub mod cl {
                 callsite_ic_live_ptrs,
                 jit_code_base,
                 inline_bodies.clone(),
-                cha_by_method.clone(),
             )
         } else {
             Vec::new()
@@ -544,11 +536,6 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
-            >,
-        >,
     ) -> Vec<PendingOsrDefinition> {
         let mut defs = Vec::new();
         for target_block in collect_osr_targets(mir) {
@@ -591,7 +578,6 @@ pub mod cl {
                     Some(layout.clone()),
                     None, // OSR-entry path is JIT-only
                     inline_bodies.clone(),
-                    cha_by_method.clone(),
                 );
                 if result.is_ok() {
                     builder.seal_all_blocks();
@@ -1084,7 +1070,7 @@ pub mod cl {
         aot_config: Option<&AotLoweringConfig>,
     ) -> Result<(), String> {
         lower_mir_impl(
-            mir, interner, builder, module, None, None, None, None, None, aot_config, None, None,
+            mir, interner, builder, module, None, None, None, None, None, aot_config, None,
         )
     }
 
@@ -1101,11 +1087,6 @@ pub mod cl {
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
         >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
-            >,
-        >,
     ) -> Result<(), String> {
         lower_mir_impl(
             mir,
@@ -1119,7 +1100,6 @@ pub mod cl {
             None,
             None,
             inline_bodies,
-            cha_by_method,
         )
     }
 
@@ -1142,11 +1122,6 @@ pub mod cl {
         aot_config: Option<&AotLoweringConfig>,
         inline_bodies: Option<
             std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
-        >,
-        cha_by_method: Option<
-            std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
-            >,
         >,
     ) -> Result<(), String> {
         // Map MIR blocks to Cranelift blocks
@@ -1375,7 +1350,6 @@ pub mod cl {
                     receiver_val,
                     aot_config,
                     inline_bodies.as_ref(),
-                    cha_by_method.as_ref(),
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
@@ -1525,11 +1499,6 @@ pub mod cl {
         aot_config: Option<&AotLoweringConfig>,
         inline_bodies: Option<
             &std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
-        >,
-        cha_by_method: Option<
-            &std::sync::Arc<
-                std::collections::HashMap<crate::intern::SymbolId, Vec<(usize, u32)>>,
-            >,
         >,
     ) -> Result<Option<Value>, String> {
         // Investigation mode — convert undefined-value to a graceful
@@ -2059,206 +2028,6 @@ pub mod cl {
                 let ic_idx = *call_site_idx;
                 *call_site_idx += 1;
 
-                // === JIT-CHA multi-class dispatch tree ===
-                // For every (class, func_id) pair the engine's CHA
-                // discovered for this method, emit a class check.
-                // On match, splice the callee body inline if it's
-                // small enough; otherwise route through the existing
-                // `wren_known_call_N_nocheck` helper, which still
-                // skips the polymorphism re-check the slow path
-                // does. Receivers that aren't in CHA fall through
-                // to `wren_call_N`. This subsumes the kind=1 IC
-                // fast path while extending coverage to call sites
-                // that see multiple receiver classes (where the IC
-                // alone keeps thrashing).
-                if let Some(cha) = cha_by_method {
-                    if args.len() <= 4 {
-                        let impls: Vec<(usize, u32)> = cha
-                            .get(method)
-                            .cloned()
-                            .unwrap_or_default();
-                        if !impls.is_empty() {
-                            let merge_block = builder.create_block();
-                            builder.append_block_param(merge_block, types::I64);
-
-                            let ptr_mask =
-                                builder.ins().iconst(types::I64, PTR_MASK as i64);
-                            let obj_ptr = builder.ins().band(r, ptr_mask);
-                            let recv_class = builder.ins().load(
-                                types::I64,
-                                MemFlags::trusted(),
-                                obj_ptr,
-                                HEADER_CLASS,
-                            );
-
-                            for (class_ptr, fid) in &impls {
-                                let next_check = builder.create_block();
-                                let fast_block = builder.create_block();
-                                let cached_class =
-                                    builder.ins().iconst(types::I64, *class_ptr as i64);
-                                let class_match = builder.ins().icmp(
-                                    IntCC::Equal,
-                                    recv_class,
-                                    cached_class,
-                                );
-                                builder
-                                    .ins()
-                                    .brif(class_match, fast_block, &[], next_check, &[]);
-
-                                builder.switch_to_block(fast_block);
-                                let inlinable_body = inline_bodies
-                                    .as_ref()
-                                    .and_then(|b| b.get(fid))
-                                    .cloned();
-                                let mut emitted_inline = false;
-                                if let Some(callee_mir) = inlinable_body {
-                                    let mut callee_vals: HashMap<ValueId, Value> =
-                                        HashMap::new();
-                                    let mut callee_args: Vec<Value> =
-                                        Vec::with_capacity(args.len() + 1);
-                                    callee_args.push(r);
-                                    for a in args.iter() {
-                                        callee_args.push(get(a));
-                                    }
-                                    let callee_block = &callee_mir.blocks[0];
-                                    let mut inline_call_idx = 0usize;
-                                    let mut inline_failed = false;
-                                    for (vid, callee_inst) in &callee_block.instructions {
-                                        match callee_inst {
-                                            Instruction::BlockParam(idx) => {
-                                                let i = *idx as usize;
-                                                if i < callee_args.len() {
-                                                    callee_vals.insert(*vid, callee_args[i]);
-                                                } else {
-                                                    inline_failed = true;
-                                                    break;
-                                                }
-                                            }
-                                            _ => {
-                                                let res = lower_instruction(
-                                                    callee_inst,
-                                                    &callee_mir,
-                                                    interner,
-                                                    builder,
-                                                    module,
-                                                    &callee_vals,
-                                                    get_runtime_fn,
-                                                    None,
-                                                    None,
-                                                    jit_code_base,
-                                                    &mut inline_call_idx,
-                                                    f64_self_id,
-                                                    Some(callee_args[0]),
-                                                    aot_config,
-                                                    None,
-                                                    None,
-                                                )?;
-                                                if let Some(v) = res {
-                                                    callee_vals.insert(*vid, v);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let return_val = if inline_failed {
-                                        None
-                                    } else {
-                                        match &callee_block.terminator {
-                                            Terminator::Return(v) => {
-                                                callee_vals.get(v).copied()
-                                            }
-                                            Terminator::ReturnNull => Some(
-                                                builder
-                                                    .ins()
-                                                    .iconst(types::I64, TAG_NULL as i64),
-                                            ),
-                                            _ => None,
-                                        }
-                                    };
-                                    if let Some(rv) = return_val {
-                                        builder
-                                            .ins()
-                                            .jump(merge_block, &[BlockArg::Value(rv)]);
-                                        emitted_inline = true;
-                                    }
-                                }
-
-                                if !emitted_inline {
-                                    // Helper-based fast path for
-                                    // non-inlinable callees. Mirrors
-                                    // the kind=1 IC fast block (class
-                                    // check + nocheck helper). Args
-                                    // capped at 3 since the *_nocheck
-                                    // family only goes up to arity 3.
-                                    if args.len() <= 3 {
-                                        let packed = (*fid as u64)
-                                            | ((method.index() as u64) << 32);
-                                        let fid_val =
-                                            builder.ins().iconst(types::I64, packed as i64);
-                                        let fast_name = match args.len() {
-                                            0 => "wren_known_call_0_nocheck",
-                                            1 => "wren_known_call_1_nocheck",
-                                            2 => "wren_known_call_2_nocheck",
-                                            _ => "wren_known_call_3_nocheck",
-                                        };
-                                        let fast_arg_count = 2 + args.len().min(3);
-                                        let fast_f = get_runtime_fn(
-                                            module,
-                                            builder,
-                                            fast_name,
-                                            fast_arg_count,
-                                        )?;
-                                        let mut fast_args = vec![fid_val, r];
-                                        for a in args.iter().take(3) {
-                                            fast_args.push(get(a));
-                                        }
-                                        let fast_call = builder.ins().call(fast_f, &fast_args);
-                                        let fast_result =
-                                            builder.inst_results(fast_call)[0];
-                                        builder.ins().jump(
-                                            merge_block,
-                                            &[BlockArg::Value(fast_result)],
-                                        );
-                                    } else {
-                                        // Arity 4: fall through to
-                                        // wren_call_N at the tail.
-                                        builder.ins().jump(next_check, &[]);
-                                    }
-                                }
-
-                                builder.switch_to_block(next_check);
-                            }
-
-                            // No class matched — full dispatch
-                            // through wren_call_N.
-                            let method_bits = method.index() as u64;
-                            let method_val =
-                                builder.ins().iconst(types::I64, method_bits as i64);
-                            let slow_name = match args.len() {
-                                0 => "wren_call_0",
-                                1 => "wren_call_1",
-                                2 => "wren_call_2",
-                                3 => "wren_call_3",
-                                _ => "wren_call_4",
-                            };
-                            let slow_arg_count = 2 + args.len().min(8);
-                            let slow_f =
-                                get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
-                            let mut slow_args = vec![r, method_val];
-                            for a in args.iter().take(8) {
-                                slow_args.push(get(a));
-                            }
-                            let slow_call = builder.ins().call(slow_f, &slow_args);
-                            let slow_result = builder.inst_results(slow_call)[0];
-                            builder
-                                .ins()
-                                .jump(merge_block, &[BlockArg::Value(slow_result)]);
-
-                            builder.switch_to_block(merge_block);
-                            return Ok(Some(builder.block_params(merge_block)[0]));
-                        }
-                    }
-                }
-
                 // Try inline IC: emit class-check + fast path.
                 // Kind=5 (getter): inline field load (class baked as constant).
                 // Kind=1: currently only used for IC index encoding in slow path.
@@ -2542,7 +2311,6 @@ pub mod cl {
                                             f64_self_id,
                                             Some(callee_args[0]),
                                             aot_config,
-                                            None,
                                             None,
                                         )?;
                                         if let Some(v) = res {
