@@ -108,6 +108,15 @@ pub struct AotModule {
     /// have to agree: bundle a module under the exact spelling
     /// the source's `import` statement uses.
     pub request_name: String,
+    /// Additional import-path strings other modules used to
+    /// reach this same canonical file. Populated by the walker
+    /// on revisits — a module first walked as `./fmt` and then
+    /// re-imported transitively as `@hatch:fmt` ends up with
+    /// `request_name = "./fmt"` + `aliases = ["@hatch:fmt"]`.
+    /// The bootstrap's import-binding pass matches against
+    /// both so a transitive importer's modvar slot still finds
+    /// its source class.
+    pub aliases: Vec<String>,
     /// Raw source bytes, for the bootstrap to embed into the
     /// produced executable. Read once during the walk so a later
     /// edit to the source file doesn't desync the embedded copy
@@ -476,6 +485,7 @@ fn build_aot_module_from_source(
     Ok(AotModule {
         name: request_name.to_string(),
         request_name: request_name.to_string(),
+        aliases: Vec::new(),
         source: source_bytes.to_vec(),
         module_var_count,
         module_var_names,
@@ -661,6 +671,17 @@ fn walk_module(
             .to_string_lossy()
             .into_owned();
         if visited.contains(&imported_canonical) {
+            // Already walked under a different request_name.
+            // Record this request_name as an alias on the
+            // existing module so the import-binding pass can
+            // match transitive importers' alternate spellings
+            // (e.g. `./fmt` first time, `@hatch:fmt` here).
+            if let Some(existing) = out.iter_mut().find(|m| m.name == imported_canonical) {
+                let s = req.to_string();
+                if existing.request_name != s && !existing.aliases.contains(&s) {
+                    existing.aliases.push(s);
+                }
+            }
             continue;
         }
         let imported_bytes = std::fs::read(&candidate).map_err(AotError::Io)?;
@@ -691,6 +712,7 @@ fn walk_module(
     out.push(AotModule {
         name: canonical_name.to_string(),
         request_name: request_name.to_string(),
+        aliases: Vec::new(),
         source: source_bytes.to_vec(),
         module_var_count,
         module_var_names,
@@ -1372,6 +1394,7 @@ fn build_single_aot_module(source: &str, name: &str) -> Result<AotModule, AotErr
     Ok(AotModule {
         name: name.to_string(),
         request_name: name.to_string(),
+        aliases: Vec::new(),
         source: source.as_bytes().to_vec(),
         module_var_count: resolved.module_vars.len(),
         module_var_names,
@@ -1526,6 +1549,9 @@ pub struct AotManifest {
     pub symbols_symbol: String,
     pub symbol_names: Vec<String>,
     pub module_name: String,
+    /// Other import-path strings this module is reachable as.
+    /// See `AotModule.aliases`.
+    pub module_aliases: Vec<String>,
     pub classes: Vec<AotClassManifest>,
     /// Cross-module import bindings — each entry directs the
     /// bootstrap to copy `source_modvars[source_slot]` into
@@ -1854,6 +1880,7 @@ pub fn compile_walk_to_object_with_manifest(
             symbols_symbol,
             symbol_names: emitted.symbol_names,
             module_name: aot_mod.request_name.clone(),
+            module_aliases: aot_mod.aliases.clone(),
             classes: emitted.classes,
             imports: Vec::new(),
             closures: emitted.closures,
@@ -1880,14 +1907,18 @@ pub fn compile_walk_to_object_with_manifest(
             let Some(source_path) = source else { continue };
             let var_name = &aot_mod.module_var_names[slot];
 
-            // Match against any earlier-installed module sharing
-            // the import path. Dependency-first walker order
-            // guarantees the source has been emitted by the time
-            // we get here.
-            let matched = manifests
-                .iter()
-                .take(idx)
-                .find(|src| &src.module_name == source_path);
+            // Match against any earlier-installed module
+            // sharing the import path. Dependency-first walker
+            // order guarantees the source has been emitted by
+            // the time we get here. Modules reached via
+            // multiple import strings (e.g. `./fmt` from a
+            // spec sibling AND `@hatch:fmt` from a transitive
+            // dep) record every alias so transitive importers
+            // find the same canonical manifest.
+            let matched = manifests.iter().take(idx).find(|src| {
+                &src.module_name == source_path
+                    || src.module_aliases.iter().any(|a| a == source_path)
+            });
             if let Some(src) = matched {
                 if let Some(src_class) = src.classes.iter().find(|c| &c.name == var_name) {
                     bindings.push(AotImportBinding {
