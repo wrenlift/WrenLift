@@ -382,6 +382,34 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
     })
 }
 
+/// Test-only re-exports for sibling AOT crates. Real consumers
+/// reach into the public emit/walk APIs; this `tests_helpers`
+/// shim lets `aot_state_machine`'s unit tests parse + lower a
+/// snippet into MIR without re-implementing the front-end stack.
+#[cfg(test)]
+pub(crate) mod tests_helpers {
+    use super::*;
+    /// Parse + lower `src` into the entry module's MIR + a clone
+    /// of the closure at index `closure_idx`. Returns `(closure_mir,
+    /// interner)`. Panics on any front-end error since the snippets
+    /// are committed into the test source.
+    pub fn build_mir_from_source(
+        src: &str,
+        closure_idx: usize,
+    ) -> (crate::mir::MirFunction, crate::intern::Interner) {
+        let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
+        let m = build_aot_module_from_source("main", src.as_bytes(), &mut layouts)
+            .expect("front end");
+        let closure = m
+            .mir
+            .closures
+            .get(closure_idx)
+            .cloned()
+            .expect("closure at index");
+        (closure, m.interner)
+    }
+}
+
 /// Parse → sema → MIR-build a single in-memory source. Same
 /// pipeline `walk_module` runs per `.wren` file, factored out so
 /// the `.hatch`-archive walker can reuse it without recursing
@@ -3144,6 +3172,33 @@ mod tests {
             "fiber body closure missing from taint set: {:?}",
             tainted
         );
+    }
+
+    /// One-off: dumps MIR for the trivial fiber test so I can
+    /// design the state-machine transform off the actual shape.
+    /// Not normally run; use `--ignored` to invoke.
+    #[test]
+    #[ignore]
+    fn dump_fiber_test_mir() {
+        let src = r#"
+var f = Fiber.new {
+  System.print("step 1")
+  Fiber.yield(10)
+  System.print("step 2")
+  Fiber.yield(20)
+  System.print("step 3")
+  return 30
+}
+System.print("a=%(f.call())")
+"#;
+        let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
+        let m = build_aot_module_from_source("main", src.as_bytes(), &mut layouts).unwrap();
+        eprintln!("=== top-level ===");
+        eprintln!("{}", m.mir.top_level.pretty_print(&m.interner));
+        for (i, c) in m.mir.closures.iter().enumerate() {
+            eprintln!("=== closure {} ===", i);
+            eprintln!("{}", c.pretty_print(&m.interner));
+        }
     }
 
     /// A function that doesn't reach `Fiber.yield` should not be

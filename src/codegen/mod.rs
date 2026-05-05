@@ -19,6 +19,8 @@
 pub mod aarch64;
 #[cfg(feature = "aot")]
 pub mod aot;
+#[cfg(feature = "aot")]
+pub mod aot_state_machine;
 pub mod cfg;
 #[cfg(feature = "cranelift")]
 pub mod cranelift_backend;
