@@ -1278,7 +1278,7 @@ impl ExecutionEngine {
     }
 
     /// Check if a MIR function is a trivial getter: `get_field this, #N; return`.
-    fn mir_trivial_getter_field(mir: &crate::mir::MirFunction) -> Option<u16> {
+    pub fn mir_trivial_getter_field(mir: &crate::mir::MirFunction) -> Option<u16> {
         use crate::mir::{Instruction, Terminator};
         if mir.blocks.len() != 1 {
             return None;

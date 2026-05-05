@@ -13,7 +13,9 @@ pub mod cl {
     use crate::runtime::object_layout::*;
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
-    use cranelift_codegen::ir::{AbiParam, BlockArg, Function, InstBuilder, MemFlags, Value};
+    use cranelift_codegen::ir::{
+        AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, Value,
+    };
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_codegen::Context;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -926,6 +928,34 @@ pub mod cl {
         Ok(func_ref)
     }
 
+    /// Whole-program method table built once at AOT-build time.
+    /// Maps each method signature text to every implementation
+    /// across all walked modules. The Call-site lowering consults
+    /// this to devirtualize: a sig with one impl becomes a direct
+    /// call (guarded by a class check); a sig with several emits
+    /// a class-dispatch tree branching to each implementation.
+    /// Trivial getters get inlined as a single field load instead
+    /// of a call.
+    pub struct AotCha {
+        pub by_sig: std::collections::HashMap<String, Vec<AotMethodImpl>>,
+    }
+
+    pub struct AotMethodImpl {
+        pub class_name: String,
+        pub fn_symbol: String,
+        pub arity: u8,
+        /// `Some(idx)` if the method body is `return _field` —
+        /// lets the call site emit a direct load instead of a
+        /// function call. Mirrors the JIT's IC kind=5 inline.
+        pub trivial_getter_field: Option<u16>,
+        /// Symbol of the modvars data array that holds this
+        /// class's pointer (defining module's modvars). Used at
+        /// the dispatch site to load `&class` for the class
+        /// check.
+        pub class_modvars_symbol: String,
+        pub class_slot: u32,
+    }
+
     /// Per-module data the AOT lowering needs at every emit site
     /// that today calls a TLS-routed runtime helper. Passing this
     /// switches the lowering off the JIT-shaped fast/slow paths
@@ -988,6 +1018,15 @@ pub mod cl {
         /// slot array, populated at startup by
         /// `wlift_aot_register_closure`.
         pub closures_data: cranelift_module::DataId,
+
+        /// Whole-program method table — `None` falls back to the
+        /// pre-CHA behaviour where every Call site routes
+        /// through `wren_call_N`. With CHA wired, every Call to a
+        /// signature with at least one user-defined
+        /// implementation skips the helper entirely: 1 impl
+        /// becomes a class-checked direct call (or trivial-getter
+        /// inline); 2+ impls become a class-dispatch tree.
+        pub cha: Option<*const AotCha>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1775,6 +1814,189 @@ pub mod cl {
                     ));
                 }
                 let r = get(receiver);
+
+                // ============================================================
+                // AOT devirtualization (CHA-driven).
+                //
+                // Look up `method`'s signature in the whole-program method
+                // table. For every signature with at least one user-defined
+                // implementation we emit a class-checked direct call —
+                // optionally inlining trivial getters as a single field
+                // load. The slow `wren_call_N` path stays as the fallback
+                // when the receiver's class doesn't match any known impl
+                // (e.g. the call is actually on a prelude class). With CHA
+                // wired, monomorphic dispatch in AOT bodies costs `mask +
+                // load + icmp + brif + load`, not a runtime helper call.
+                // ============================================================
+                if let Some(cfg) = aot_config {
+                    if let Some(cha_ptr) = cfg.cha {
+                        let cha = unsafe { &*cha_ptr };
+                        let sig_text = interner.resolve(*method).to_string();
+                        if let Some(impls) = cha.by_sig.get(&sig_text) {
+                            if !impls.is_empty() {
+                                let merge_block = builder.create_block();
+                                builder.append_block_param(merge_block, types::I64);
+
+                                // Receiver's class header field.
+                                let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
+                                let recv_obj = builder.ins().band(r, mask);
+                                let recv_class_field = builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    recv_obj,
+                                    HEADER_CLASS,
+                                );
+
+                                // Chain a class-check per impl. Match
+                                // → emit body (direct call or inline
+                                // trivial-getter load), jump to merge.
+                                // Miss → fall to the next check or the
+                                // final `wren_call_N` slow block.
+                                for impl_ in impls {
+                                    let next_check = builder.create_block();
+                                    let fast_block = builder.create_block();
+
+                                    let class_data_id = module
+                                        .declare_data(
+                                            &impl_.class_modvars_symbol,
+                                            Linkage::Export,
+                                            true,
+                                            false,
+                                        )
+                                        .map_err(|e| e.to_string())?;
+                                    let gv =
+                                        module.declare_data_in_func(class_data_id, builder.func);
+                                    let modvars_addr = builder.ins().global_value(types::I64, gv);
+                                    let boxed_cls = builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        modvars_addr,
+                                        (impl_.class_slot as i32) * 8,
+                                    );
+                                    let cls_mask =
+                                        builder.ins().iconst(types::I64, PTR_MASK as i64);
+                                    let expected_cls = builder.ins().band(boxed_cls, cls_mask);
+                                    let eq = builder.ins().icmp(
+                                        IntCC::Equal,
+                                        recv_class_field,
+                                        expected_cls,
+                                    );
+                                    builder.ins().brif(eq, fast_block, &[], next_check, &[]);
+
+                                    builder.switch_to_block(fast_block);
+                                    let fast_result = if let Some(field_idx) =
+                                        impl_.trivial_getter_field
+                                    {
+                                        // Inline trivial getter: load
+                                        // recv.fields[field_idx].
+                                        let fields_ptr = builder.ins().load(
+                                            types::I64,
+                                            MemFlags::trusted(),
+                                            recv_obj,
+                                            INSTANCE_FIELDS,
+                                        );
+                                        builder.ins().load(
+                                            types::I64,
+                                            MemFlags::trusted(),
+                                            fields_ptr,
+                                            (field_idx as i32) * 8,
+                                        )
+                                    } else {
+                                        // Direct call to the AOT'd
+                                        // method body. The body's
+                                        // MIR arity ALREADY counts
+                                        // the receiver — so the
+                                        // signature has `arity`
+                                        // params total (recv + N-1
+                                        // user args), and the call
+                                        // passes `[r, args...]` of
+                                        // matching length.
+                                        let mut sig = Signature::new(
+                                            module.target_config().default_call_conv,
+                                        );
+                                        for _ in 0..(impl_.arity as usize) {
+                                            sig.params.push(AbiParam::new(types::I64));
+                                        }
+                                        sig.returns.push(AbiParam::new(types::I64));
+                                        let body_id = module
+                                            .declare_function(
+                                                &impl_.fn_symbol,
+                                                Linkage::Import,
+                                                &sig,
+                                            )
+                                            .map_err(|e| e.to_string())?;
+                                        let fn_ref =
+                                            module.declare_func_in_func(body_id, builder.func);
+                                        let user_arity = (impl_.arity as usize).saturating_sub(1);
+                                        let mut call_args = vec![r];
+                                        for a in args.iter().take(user_arity) {
+                                            call_args.push(get(a));
+                                        }
+                                        // Pad with nulls when MIR
+                                        // site arg count is below
+                                        // the body's declared
+                                        // arity. Defensive — the
+                                        // resolver should have
+                                        // matched arities, but a
+                                        // mismatched signature
+                                        // would otherwise fault
+                                        // Cranelift's verifier.
+                                        while call_args.len() < impl_.arity as usize {
+                                            let null =
+                                                builder.ins().iconst(types::I64, TAG_NULL as i64);
+                                            call_args.push(null);
+                                        }
+                                        let call = builder.ins().call(fn_ref, &call_args);
+                                        builder.inst_results(call)[0]
+                                    };
+                                    builder
+                                        .ins()
+                                        .jump(merge_block, &[BlockArg::Value(fast_result)]);
+
+                                    builder.switch_to_block(next_check);
+                                }
+
+                                // Fallback: wren_call_N with the
+                                // remapped symbol — used when none of
+                                // the known impl class checks matched
+                                // (receiver was a prelude type or an
+                                // unrelated class).
+                                let slot = aot_intern_symbol(cfg, method.index(), interner);
+                                let sym_gv =
+                                    module.declare_data_in_func(cfg.symbols_data, builder.func);
+                                let sym_base = builder.ins().global_value(types::I64, sym_gv);
+                                let method_val = builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    sym_base,
+                                    (slot as i32) * 8,
+                                );
+                                let call_name = match args.len() {
+                                    0 => "wren_call_0",
+                                    1 => "wren_call_1",
+                                    2 => "wren_call_2",
+                                    3 => "wren_call_3",
+                                    _ => "wren_call_4",
+                                };
+                                let arg_count = 2 + args.len().min(4);
+                                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
+                                let mut slow_args = vec![r, method_val];
+                                for a in args.iter().take(4) {
+                                    slow_args.push(get(a));
+                                }
+                                let slow_call = builder.ins().call(f, &slow_args);
+                                let slow_result = builder.inst_results(slow_call)[0];
+                                builder
+                                    .ins()
+                                    .jump(merge_block, &[BlockArg::Value(slow_result)]);
+
+                                builder.switch_to_block(merge_block);
+                                return Ok(Some(builder.block_params(merge_block)[0]));
+                            }
+                        }
+                    }
+                }
+
                 let ic_idx = *call_site_idx;
                 *call_site_idx += 1;
 

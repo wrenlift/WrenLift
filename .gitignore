@@ -23,3 +23,6 @@ site/install.sh
 # Roadmap stays — that one's public. Specific plan files live on
 # disk for reference but never get committed.
 docs/*-plan.md
+
+# AOT bench output — regenerated on every `bench/run-aot.sh` run.
+bench/.aot-out/

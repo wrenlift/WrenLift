@@ -39,7 +39,9 @@ use cranelift_module::{DataDescription, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::ast::Stmt;
-use crate::codegen::cranelift_backend::cl::{lower_mir_to_module, AotLoweringConfig};
+use crate::codegen::cranelift_backend::cl::{
+    lower_mir_to_module, AotCha, AotLoweringConfig, AotMethodImpl,
+};
 use crate::intern::Interner;
 use crate::mir::builder::lower_module_with_known_classes;
 use crate::mir::ModuleMir;
@@ -791,6 +793,7 @@ fn emit_aot_module(
     modvars_symbol: &str,
     consts_symbol: &str,
     symbols_symbol: &str,
+    cha: &AotCha,
 ) -> Result<EmitAotResult, AotError> {
     // Per-module .bss for module vars. `var_count == 0` is rare
     // (a module that defines no top-level names — pure imports
@@ -835,6 +838,7 @@ fn emit_aot_module(
         symbols_data,
         symbol_remap: std::cell::RefCell::new(Vec::new()),
         closures_data,
+        cha: Some(cha as *const AotCha),
     };
 
     // Top-level body — the entry point Phase 7's init pass calls
@@ -1022,6 +1026,7 @@ fn build_single_aot_module(source: &str, name: &str) -> Result<AotModule, AotErr
 /// [`compile_path_to_object`].
 pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
     let aot_mod = build_single_aot_module(source, "<inline>")?;
+    let cha = build_cha(std::slice::from_ref(&aot_mod), 0);
     let mut module = make_object_module()?;
     emit_aot_module(
         &mut module,
@@ -1030,6 +1035,7 @@ pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
         "wlift_modvars_main",
         "wlift_consts_main",
         "wlift_symbols_main",
+        &cha,
     )?;
     let product = module.finish();
     let bytes = product
@@ -1200,6 +1206,56 @@ pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result
     compile_modules_to_object_with_manifest(modules, output).map(|_| ())
 }
 
+/// Build the whole-program method table — every (signature →
+/// `Vec<AotMethodImpl>`) pair across all walked modules — once
+/// up front. The lowering threads a borrow of this into
+/// `AotLoweringConfig` so each Call site can devirtualize.
+fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
+    let mut by_sig: HashMap<String, Vec<AotMethodImpl>> = HashMap::new();
+
+    for (idx, aot_mod) in modules.iter().enumerate() {
+        let fn_prefix = if idx == last_idx {
+            "wlift_aot_main".to_string()
+        } else {
+            format!("wlift_aot_mod_{}", idx)
+        };
+        let modvars_symbol = if idx == last_idx {
+            "wlift_modvars_main".to_string()
+        } else {
+            format!("wlift_modvars_{}", idx)
+        };
+
+        for (c_idx, class_mir) in aot_mod.mir.classes.iter().enumerate() {
+            let class_name = aot_mod.interner.resolve(class_mir.name).to_string();
+            let class_slot_opt = aot_mod
+                .module_var_names
+                .iter()
+                .position(|n| n == &class_name);
+            let Some(class_slot) = class_slot_opt else {
+                continue;
+            };
+            for (m_idx, method) in class_mir.methods.iter().enumerate() {
+                let fn_symbol = format!("{}__method_{}_{}", fn_prefix, c_idx, m_idx);
+                let trivial =
+                    crate::runtime::engine::ExecutionEngine::mir_trivial_getter_field(&method.mir);
+                by_sig
+                    .entry(method.signature.clone())
+                    .or_default()
+                    .push(AotMethodImpl {
+                        class_name: class_name.clone(),
+                        fn_symbol,
+                        arity: method.mir.arity,
+                        trivial_getter_field: trivial,
+                        class_modvars_symbol: modvars_symbol.clone(),
+                        class_slot: class_slot as u32,
+                    });
+            }
+        }
+    }
+
+    AotCha { by_sig }
+}
+
 /// Lower a pre-walked list of modules into one native object file
 /// at `output`, returning a per-module manifest. The same `.o`
 /// also carries a Cranelift-emitted `main` function that
@@ -1233,6 +1289,14 @@ pub fn compile_walk_to_object_with_manifest(
 
     let mut module = make_object_module()?;
     let last_idx = modules.len() - 1;
+
+    // Build the whole-program method table (CHA) up front so the
+    // Call-site lowering can devirtualize. Same module-naming
+    // convention the per-module emit loop below uses, so the
+    // class_modvars_symbol + class_slot fields point at the
+    // exact data the bootstrap installs the class pointer into.
+    let cha = build_cha(modules, last_idx);
+
     let mut manifests: Vec<AotManifest> = Vec::with_capacity(modules.len());
     for (idx, aot_mod) in modules.iter().enumerate() {
         let (fn_symbol, modvars_symbol, consts_symbol, symbols_symbol) = if idx == last_idx {
@@ -1257,6 +1321,7 @@ pub fn compile_walk_to_object_with_manifest(
             &modvars_symbol,
             &consts_symbol,
             &symbols_symbol,
+            &cha,
         )?;
         let closures_symbol = format!("{}__closures_data", fn_symbol);
         manifests.push(AotManifest {
