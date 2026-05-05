@@ -974,6 +974,27 @@ fn run_fiber_with_stop_depth(
                 .map(|m| m.blocks.is_empty())
                 .unwrap_or(false);
             if !aot_fn.is_null() && mir_empty {
+                // Set the JIT context's `closure` slot so the
+                // body's `wren_load_jit_closure` (used by every
+                // GetUpvalue / SetUpvalue site) reads the right
+                // pointer. Without it, a fiber body created via
+                // `Fiber.new { ... }` that captures a function-
+                // local upvalue dereferenced null on first
+                // upvalue read. `call_closure_jit_or_sync`'s
+                // wren_call_* path already does this for normal
+                // closure calls; the AOT-stub fast path bypasses
+                // wren_call_* and was missing the setup.
+                let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+                if let Some(c) = closure {
+                    crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                        if ctx.vm.is_null() {
+                            ctx.vm = vm as *mut _ as *mut u8;
+                        }
+                        ctx.current_func_id = func_id.0 as u64;
+                        ctx.closure = c as *mut u8;
+                        ctx.defining_class = std::ptr::null_mut();
+                    });
+                }
                 let return_val = unsafe {
                     let f: extern "C" fn(u64) -> u64 = std::mem::transmute(aot_fn);
                     let recv_bits = closure
@@ -981,6 +1002,9 @@ fn run_fiber_with_stop_depth(
                         .unwrap_or_else(|| Value::null().to_bits());
                     Value::from_bits(f(recv_bits))
                 };
+                if closure.is_some() {
+                    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+                }
                 fiber = vm.fiber;
                 // Did the AOT body call `Fiber.abort` (i.e.
                 // `vm.has_error`)? If the running fiber is
