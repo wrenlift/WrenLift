@@ -2004,6 +2004,37 @@ pub mod cl {
                                 let merge_block = builder.create_block();
                                 builder.append_block_param(merge_block, types::I64);
 
+                                // Slow-path block — `wren_call_N` with
+                                // the remapped symbol. Reached either
+                                // when the receiver isn't an object at
+                                // all (Number / Null / Bool) or when no
+                                // CHA-known class matched. Created up
+                                // front so the is-object guard can
+                                // branch straight here without a class
+                                // load that would fault on non-object
+                                // receivers.
+                                let slow_block = builder.create_block();
+
+                                // Is-object guard: short-circuit to the
+                                // slow path before the receiver-class
+                                // load, since masking a Number Value
+                                // off the bottom 48 bits and reading
+                                // `+HEADER_CLASS` lands in unmapped
+                                // memory.
+                                let tag_obj_const =
+                                    builder.ins().iconst(types::I64, TAG_OBJ as i64);
+                                let high = builder.ins().band(r, tag_obj_const);
+                                let is_obj = builder.ins().icmp(
+                                    IntCC::Equal,
+                                    high,
+                                    tag_obj_const,
+                                );
+                                let object_block = builder.create_block();
+                                builder
+                                    .ins()
+                                    .brif(is_obj, object_block, &[], slow_block, &[]);
+                                builder.switch_to_block(object_block);
+
                                 // Receiver's class header field.
                                 let mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                                 let recv_obj = builder.ins().band(r, mask);
@@ -2122,6 +2153,11 @@ pub mod cl {
 
                                     builder.switch_to_block(next_check);
                                 }
+
+                                // Last next_check falls through here;
+                                // route it to the shared slow_block.
+                                builder.ins().jump(slow_block, &[]);
+                                builder.switch_to_block(slow_block);
 
                                 // Fallback: wren_call_N with the
                                 // remapped symbol — used when none of
