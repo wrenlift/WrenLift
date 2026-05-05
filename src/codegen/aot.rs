@@ -915,12 +915,37 @@ fn emit_aot_function(
     aot_cfg: &AotLoweringConfig,
     symbol: &str,
     defining_class: Option<AotDefiningClass>,
+    is_state_machine: bool,
 ) -> Result<EmittedFnMeta, AotError> {
     let mut sig = Signature::new(module.target_config().default_call_conv);
-    let arity = mir.arity as usize;
-    for _ in 0..arity {
-        sig.params.push(AbiParam::new(types::I64));
-    }
+    let sm_payload: Option<(
+        crate::mir::MirFunction,
+        crate::codegen::aot_state_machine::StateMachineLayout,
+    )> = if is_state_machine {
+        // State-machine bodies use a fixed `(fiber: i64,
+        // resume_v: i64) -> i64` signature. The MIR's original
+        // arity is irrelevant — fiber bodies are 0-arg by
+        // construction (Wren `Fiber.new { ... }` blocks take no
+        // params); the runtime invokes the poll function with
+        // fiber + resume_v instead of through `wren_call_*`.
+        let mut transformed = mir.clone();
+        let layout = crate::codegen::aot_state_machine::transform_to_state_machine(
+            &mut transformed,
+            interner,
+        )
+        .map_err(|e| AotError::Module(e.to_string()))?;
+        // 2 params: fiber, resume_v.
+        for _ in 0..2 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        Some((transformed, layout))
+    } else {
+        let arity = mir.arity as usize;
+        for _ in 0..arity {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        None
+    };
     sig.returns.push(AbiParam::new(types::I64));
 
     let func_id = module
@@ -930,14 +955,26 @@ fn emit_aot_function(
     *aot_cfg.current_defining_class.borrow_mut() = defining_class;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
     *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
+    *aot_cfg.current_state_machine_layout.borrow_mut() =
+        sm_payload.as_ref().map(|(_, l)| l.clone());
 
     let mut ctx = module.make_context();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
     {
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        lower_mir_to_module(mir, interner, &mut builder, module, Some(aot_cfg))
-            .map_err(AotError::Module)?;
+        let mir_to_lower: &crate::mir::MirFunction = sm_payload
+            .as_ref()
+            .map(|(t, _)| t)
+            .unwrap_or(mir);
+        lower_mir_to_module(
+            mir_to_lower,
+            interner,
+            &mut builder,
+            module,
+            Some(aot_cfg),
+        )
+        .map_err(AotError::Module)?;
         builder.seal_all_blocks();
         builder.finalize();
     }
@@ -960,9 +997,12 @@ fn emit_aot_function(
     *aot_cfg.current_defining_class.borrow_mut() = None;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
     *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
+    *aot_cfg.current_state_machine_layout.borrow_mut() = None;
+    *aot_cfg.current_fiber_ptr_var.borrow_mut() = None;
+    drop(sm_payload);
     Ok(EmittedFnMeta {
         code_size,
-        arity: mir.arity,
+        arity: if is_state_machine { 2 } else { mir.arity },
         native_meta,
     })
 }
@@ -996,6 +1036,12 @@ struct EmitAotResult {
 pub struct AotClosureManifest {
     pub fn_symbol: String,
     pub arity: u8,
+    /// True when the closure body uses `Fiber.yield` (transitively)
+    /// and was lowered with the stackless state-machine signature
+    /// `(fiber: i64, resume_v: i64) -> i64`. Bootstrap re-imports
+    /// these with the matching 2-param shape; runtime dispatch
+    /// invokes them via the poll-fn path rather than `wren_call_*`.
+    pub is_state_machine: bool,
 }
 
 fn emit_aot_module(
@@ -1006,6 +1052,11 @@ fn emit_aot_module(
     consts_symbol: &str,
     symbols_symbol: &str,
     cha: &AotCha,
+    // Resolved-name set of methods/closures whose bodies need
+    // the state-machine transform — see
+    // `compute_aot_tainted_method_names`. Closures are tagged
+    // `<closure:<module>:<idx>>`.
+    tainted_names: &HashSet<String>,
 ) -> Result<EmitAotResult, AotError> {
     // Per-module .bss for module vars. `var_count == 0` is rare
     // (a module that defines no top-level names — pure imports
@@ -1054,6 +1105,8 @@ fn emit_aot_module(
         current_defining_class: std::cell::RefCell::new(None),
         current_closure_ptr_var: std::cell::RefCell::new(None),
         current_jit_roots_snapshot_var: std::cell::RefCell::new(None),
+        current_state_machine_layout: std::cell::RefCell::new(None),
+        current_fiber_ptr_var: std::cell::RefCell::new(None),
     };
 
     let mut fn_metas: Vec<(String, EmittedFnMeta)> = Vec::new();
@@ -1067,6 +1120,12 @@ fn emit_aot_module(
         &aot_cfg,
         fn_symbol,
         None,
+        // Top-level bodies are AOT-only for v1 — the trivial
+        // case that uses `Fiber.yield` from the entry script
+        // body would taint here, but the supported pattern is
+        // yielding from inside `Fiber.new { ... }` (an anonymous
+        // closure), which gets handled below.
+        false,
     )?;
     fn_metas.push((fn_symbol.to_string(), top_meta));
 
@@ -1104,6 +1163,13 @@ fn emit_aot_module(
         };
         for (method_idx, method) in class.methods.iter().enumerate() {
             let sym = format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx);
+            // v1 doesn't apply the state-machine transform to
+            // class methods even when their signature is
+            // tainted — `fill_()` etc. ride a `Fiber.yield`
+            // boundary indirectly. Falling back to false here
+            // keeps the AOT signature stable until the v2 work
+            // (live-value save/restore + per-method poll
+            // dispatch) lands.
             let meta = emit_aot_function(
                 module,
                 &aot_mod.interner,
@@ -1111,6 +1177,7 @@ fn emit_aot_module(
                 &aot_cfg,
                 &sym,
                 defining_class_for_methods.clone(),
+                false,
             )?;
             fn_metas.push((sym.clone(), meta));
             methods_manifest.push(AotMethodManifest {
@@ -1153,12 +1220,22 @@ fn emit_aot_module(
         Vec::with_capacity(aot_mod.mir.closures.len());
     for (closure_idx, closure_mir) in aot_mod.mir.closures.iter().enumerate() {
         let sym = format!("{}__closure_{}", fn_symbol, closure_idx);
-        let meta =
-            emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym, None)?;
+        let closure_tag = format!("<closure:{}:{}>", aot_mod.request_name, closure_idx);
+        let is_state_machine = tainted_names.contains(&closure_tag);
+        let meta = emit_aot_function(
+            module,
+            &aot_mod.interner,
+            closure_mir,
+            &aot_cfg,
+            &sym,
+            None,
+            is_state_machine,
+        )?;
         fn_metas.push((sym.clone(), meta));
         closure_manifest.push(AotClosureManifest {
             fn_symbol: sym,
             arity: closure_mir.arity,
+            is_state_machine,
         });
     }
 
@@ -1265,6 +1342,7 @@ fn build_single_aot_module(source: &str, name: &str) -> Result<AotModule, AotErr
 pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
     let aot_mod = build_single_aot_module(source, "<inline>")?;
     let cha = build_cha(std::slice::from_ref(&aot_mod), 0);
+    let tainted = compute_aot_tainted_method_names(std::slice::from_ref(&aot_mod));
     let mut module = make_object_module()?;
     emit_aot_module(
         &mut module,
@@ -1274,6 +1352,7 @@ pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
         "wlift_consts_main",
         "wlift_symbols_main",
         &cha,
+        &tainted,
     )?;
     let product = module.finish();
     let bytes = product
@@ -1636,6 +1715,11 @@ pub fn compile_walk_to_object_with_manifest(
     // exact data the bootstrap installs the class pointer into.
     let cha = build_cha(modules, last_idx);
 
+    // Whole-program taint set so each module's emit loop can
+    // tell which closures need the state-machine transform.
+    // Computed once over `modules`; consumed per-module below.
+    let tainted = compute_aot_tainted_method_names(modules);
+
     let mut manifests: Vec<AotManifest> = Vec::with_capacity(modules.len());
     for (idx, aot_mod) in modules.iter().enumerate() {
         let (fn_symbol, modvars_symbol, consts_symbol, symbols_symbol) = if idx == last_idx {
@@ -1661,6 +1745,7 @@ pub fn compile_walk_to_object_with_manifest(
             &consts_symbol,
             &symbols_symbol,
             &cha,
+            &tainted,
         )?;
         let closures_symbol = format!("{}__closures_data", fn_symbol);
         // Convert the per-fn captured `EmittedFnMeta` into the
@@ -2305,7 +2390,18 @@ fn emit_aot_bootstrap_main(
         let mut closures = Vec::with_capacity(m.closures.len());
         for closure in &m.closures {
             let mut sig = Signature::new(cc);
-            for _ in 0..(closure.arity as usize) {
+            // State-machine bodies have a fixed 2-arg signature
+            // (fiber, resume_v) regardless of the original Wren
+            // arity. The MIR-arity field stays as-declared in
+            // the manifest so existing consumers see the
+            // user-visible value, but Cranelift needs the
+            // physical signature here.
+            let physical_arity = if closure.is_state_machine {
+                2usize
+            } else {
+                closure.arity as usize
+            };
+            for _ in 0..physical_arity {
                 sig.params.push(AbiParam::new(types::I64));
             }
             sig.returns.push(AbiParam::new(types::I64));

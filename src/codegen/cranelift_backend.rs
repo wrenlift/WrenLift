@@ -1148,6 +1148,31 @@ pub mod cl {
         /// model. Cleared between emissions by `emit_aot_function`.
         pub current_jit_roots_snapshot_var:
             std::cell::RefCell<Option<cranelift_frontend::Variable>>,
+
+        /// State-machine layout for the function currently being
+        /// lowered. `Some(_)` flips the lowering onto the stackless-
+        /// coroutine shape: function signature becomes `(fiber: i64,
+        /// resume_v: i64) -> i64`; a synthetic dispatch block calls
+        /// `wlift_aot_sm_load_state(fiber)` and `br_table`s to one of
+        /// `layout.resume_entries`; every `Terminator::Return(v)` in
+        /// `layout.yield_blocks` is preceded by `wlift_aot_sm_yield(
+        /// fiber, next_state)` (suspension semantics) while every
+        /// other return is preceded by `wlift_aot_sm_done(fiber)`
+        /// (final-value semantics). This is the AOT analogue of what
+        /// the BC interp already does via `pending_fiber_action +
+        /// run_fiber`. Cleared between emissions by
+        /// `emit_aot_function`.
+        pub current_state_machine_layout:
+            std::cell::RefCell<Option<crate::codegen::aot_state_machine::StateMachineLayout>>,
+
+        /// Function-scoped fiber-pointer variable for the
+        /// state-machine body currently being lowered. Defined
+        /// once at function entry from the first block param;
+        /// every yield-/done-terminator emit reads it to pass
+        /// `fiber` to the runtime helper. `None` when the function
+        /// isn't a state machine. Cleared between emissions.
+        pub current_fiber_ptr_var:
+            std::cell::RefCell<Option<cranelift_frontend::Variable>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1380,6 +1405,65 @@ pub mod cl {
                 let snap_var = builder.declare_var(types::I64);
                 *cfg.current_jit_roots_snapshot_var.borrow_mut() = Some(snap_var);
             }
+
+            // State-machine bodies need a Variable to carry the
+            // fiber pointer across the function so each Return's
+            // yield/done helper call can pass it.
+            if cfg.current_state_machine_layout.borrow().is_some() {
+                let fiber_var = builder.declare_var(types::I64);
+                *cfg.current_fiber_ptr_var.borrow_mut() = Some(fiber_var);
+            }
+        }
+
+        // State-machine prologue. Emit a synthetic dispatch block
+        // BEFORE the RPO walk so it becomes Cranelift's function
+        // entry (entry = first block switched to). It holds the
+        // 2-param signature (`fiber`, `resume_v`), reads the
+        // saved state ID via a runtime helper, and `br_table`s
+        // to the right resume entry. Subsequent blocks are
+        // emitted in their normal RPO order.
+        if let Some(cfg) = aot_config {
+            let layout = cfg.current_state_machine_layout.borrow().clone();
+            if let Some(layout) = layout {
+                let dispatch_block = builder.create_block();
+                builder.switch_to_block(dispatch_block);
+                let fiber_param = builder.append_block_param(dispatch_block, types::I64);
+                let _resume_v_param =
+                    builder.append_block_param(dispatch_block, types::I64);
+                if let Some(var) = *cfg.current_fiber_ptr_var.borrow() {
+                    builder.def_var(var, fiber_param);
+                }
+                let load_state = get_runtime_fn(
+                    module,
+                    builder,
+                    "wlift_aot_sm_load_state",
+                    1,
+                )?;
+                let call = builder.ins().call(load_state, &[fiber_param]);
+                let state_id_64 = builder.inst_results(call)[0];
+                let state_id =
+                    builder.ins().ireduce(types::I32, state_id_64);
+                // br_table over the resume entries. Cranelift
+                // requires a default block for out-of-range
+                // values; use the first resume entry as the
+                // default since reaching an out-of-range state
+                // ID means the state struct was corrupted (the
+                // function would have set it to one of these).
+                let default_block = block_map[&layout.resume_entries[0]];
+                let mut jt_data = cranelift_codegen::ir::JumpTableData::new(
+                    builder.func.dfg.block_call(default_block, &[]),
+                    &layout
+                        .resume_entries
+                        .iter()
+                        .map(|bid| {
+                            builder.func.dfg.block_call(block_map[bid], &[])
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let _ = &mut jt_data;
+                let jt = builder.create_jump_table(jt_data);
+                builder.ins().br_table(state_id, jt);
+            }
         }
 
         // Process blocks in reverse post-order (dominance order).
@@ -1559,6 +1643,40 @@ pub mod cl {
                             1,
                         )?;
                         let _ = builder.ins().call(f, &[snap]);
+                    }
+
+                    // State-machine bodies stamp the
+                    // suspension/done semantics into the runtime
+                    // *before* the bare Return — so the dispatcher
+                    // running this poll sees `kind=Yield` and
+                    // resumes from the saved state on next call,
+                    // or `kind=Done` and marks the fiber finished.
+                    let layout = cfg.current_state_machine_layout.borrow().clone();
+                    if let Some(layout) = layout {
+                        if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
+                            let fiber = builder.use_var(fiber_var);
+                            if let Some(next_state) = layout.yield_blocks.get(&bid) {
+                                let yield_fn = get_runtime_fn(
+                                    module,
+                                    builder,
+                                    "wlift_aot_sm_yield",
+                                    2,
+                                )?;
+                                let next_state_v = builder
+                                    .ins()
+                                    .iconst(types::I64, *next_state as i64);
+                                let _ =
+                                    builder.ins().call(yield_fn, &[fiber, next_state_v]);
+                            } else {
+                                let done_fn = get_runtime_fn(
+                                    module,
+                                    builder,
+                                    "wlift_aot_sm_done",
+                                    1,
+                                )?;
+                                let _ = builder.ins().call(done_fn, &[fiber]);
+                            }
+                        }
                     }
                 }
             }
