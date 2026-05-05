@@ -2060,7 +2060,6 @@ pub fn compile_function_artifact_with_interner(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -2173,9 +2172,6 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
     #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] callee_purity: Option<
         std::sync::Arc<std::collections::HashMap<u32, bool>>,
     >,
-    #[cfg_attr(not(feature = "cranelift"), allow(unused_variables))] inline_bodies: Option<
-        std::sync::Arc<std::collections::HashMap<u32, std::sync::Arc<MirFunction>>>,
-    >,
 ) -> Result<CompiledArtifact, String> {
     match target {
         Target::Wasm => {
@@ -2221,7 +2217,6 @@ pub fn compile_function_artifact_with_interner_and_callsite_ics(
                 callsite_ic_ptrs.as_deref(),
                 callsite_ic_live_ptrs.as_deref(),
                 jit_code_base,
-                inline_bodies.clone(),
             )?;
             // Pull the GC root metadata out before we move `compiled`
             // into the `CompiledFunction` wrapper. Cranelift's

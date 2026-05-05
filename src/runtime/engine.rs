@@ -1189,78 +1189,6 @@ impl ExecutionEngine {
         false
     }
 
-    /// Eligibility for the trivial-method inliner. The body is
-    /// inlinable when it's a single block, fits in a small budget,
-    /// and contains only ops the codegen can lower without spawning
-    /// helpers, allocations, or further dispatch. The class-check
-    /// guard wraps the inlined body at the call site, so a polymorphic
-    /// receiver still falls back through `wren_call_N`.
-    pub fn mir_inlinable_single_block(mir: &crate::mir::MirFunction) -> bool {
-        use crate::mir::{Instruction, Terminator};
-        if mir.blocks.len() != 1 {
-            return false;
-        }
-        let block = &mir.blocks[0];
-        let n_real = block
-            .instructions
-            .iter()
-            .filter(|(_, inst)| !matches!(inst, Instruction::BlockParam(_)))
-            .count();
-        if n_real > 8 {
-            return false;
-        }
-        for (_, inst) in &block.instructions {
-            match inst {
-                // Disallowed: anything that needs dispatch, allocation,
-                // module/static/upvalue context, or a helper call. The
-                // inliner emits the body directly into the caller's
-                // Cranelift function with no surrounding frame.
-                Instruction::Call { .. }
-                | Instruction::CallKnownFunc { .. }
-                | Instruction::CallStaticSelf { .. }
-                | Instruction::SuperCall { .. }
-                | Instruction::GetModuleVar(_)
-                | Instruction::SetModuleVar(_, _)
-                | Instruction::GetStaticField(_)
-                | Instruction::SetStaticField(_, _)
-                | Instruction::GetUpvalue(_)
-                | Instruction::SetUpvalue(_, _)
-                | Instruction::MakeList(_)
-                | Instruction::MakeMap(_)
-                | Instruction::MakeRange(..)
-                | Instruction::MakeClosure { .. }
-                | Instruction::StringConcat(_)
-                | Instruction::ToString(_)
-                | Instruction::SubscriptGet { .. }
-                | Instruction::SubscriptSet { .. }
-                | Instruction::GuardNum(_) => return false,
-                _ => {}
-            }
-        }
-        matches!(
-            block.terminator,
-            Terminator::Return(_) | Terminator::ReturnNull
-        )
-    }
-
-    /// Build a `func_id → MIR` table of every callee whose body is
-    /// safe to inline at a JIT call site. Used by the codegen to
-    /// substitute the body in place of a `wren_known_call_N` helper
-    /// when the speculative class check matches.
-    pub fn compute_inline_bodies(
-        &self,
-    ) -> Arc<std::collections::HashMap<u32, Arc<crate::mir::MirFunction>>> {
-        let mut map: std::collections::HashMap<u32, Arc<crate::mir::MirFunction>> =
-            std::collections::HashMap::new();
-        for (idx, body) in self.functions.iter().enumerate() {
-            let mir = body.mir();
-            if Self::mir_inlinable_single_block(mir) && !Self::mir_uses_defining_class(mir) {
-                map.insert(idx as u32, Arc::clone(mir));
-            }
-        }
-        Arc::new(map)
-    }
-
     /// Mutate `ic_snapshot` in place: for any empty entry, plant a
     /// kind=1 IC when CHA shows exactly one impl for the call's
     /// method symbol. The downstream `compute_devirt_hints` +
@@ -2228,11 +2156,6 @@ impl ExecutionEngine {
             .map(|ics| self.compute_devirt_hints(ics));
         let jit_code_base = Some(self.jit_code.as_ptr());
         let callee_purity = Some(self.compute_callee_purity_map());
-        let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
-            Some(self.compute_inline_bodies())
-        } else {
-            None
-        };
         if std::env::var("WLIFT_JIT_DUMP").is_ok() {
             eprintln!("=== {:?} compile FuncId({}) ===", tier, id.0);
             eprintln!("{}", compile_mir.pretty_print(interner));
@@ -2249,7 +2172,6 @@ impl ExecutionEngine {
                 devirt_hints,
                 jit_code_base,
                 callee_purity,
-                inline_bodies,
             ) {
                 Ok(compiled) => compiled,
                 Err(_) => return false,
@@ -2374,11 +2296,6 @@ impl ExecutionEngine {
             .map(|ics| self.compute_devirt_hints(ics));
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let callee_purity = self.compute_callee_purity_map();
-        let inline_bodies = if std::env::var_os("WLIFT_DISABLE_JIT_INLINE").is_none() {
-            Some(self.compute_inline_bodies())
-        } else {
-            None
-        };
 
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -2421,7 +2338,6 @@ impl ExecutionEngine {
                 devirt_hints,
                 Some(jit_code_base_raw as *const *const u8),
                 Some(callee_purity.clone()),
-                inline_bodies.clone(),
             )
             .map_err(|e| {
                 if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
