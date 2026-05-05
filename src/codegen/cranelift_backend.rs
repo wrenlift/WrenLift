@@ -63,10 +63,9 @@ pub mod cl {
         builder.switch_to_block(object_block);
         let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
         let obj_ptr = builder.ins().band(recv, ptr_mask);
-        let recv_class =
-            builder
-                .ins()
-                .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+        let recv_class = builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
         (obj_ptr, recv_class)
     }
 
@@ -2093,10 +2092,8 @@ pub mod cl {
                 // alone keeps thrashing).
                 if let Some(cha) = cha_by_method {
                     if args.len() <= 4 {
-                        let impls: Vec<(usize, u32, usize)> = cha
-                            .get(method)
-                            .cloned()
-                            .unwrap_or_default();
+                        let impls: Vec<(usize, u32, usize)> =
+                            cha.get(method).cloned().unwrap_or_default();
                         if !impls.is_empty() {
                             let merge_block = builder.create_block();
                             builder.append_block_param(merge_block, types::I64);
@@ -2117,24 +2114,18 @@ pub mod cl {
                                 let fast_block = builder.create_block();
                                 let cached_class =
                                     builder.ins().iconst(types::I64, *class_ptr as i64);
-                                let class_match = builder.ins().icmp(
-                                    IntCC::Equal,
-                                    recv_class,
-                                    cached_class,
-                                );
+                                let class_match =
+                                    builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
                                 builder
                                     .ins()
                                     .brif(class_match, fast_block, &[], next_check, &[]);
 
                                 builder.switch_to_block(fast_block);
-                                let inlinable_body = inline_bodies
-                                    .as_ref()
-                                    .and_then(|b| b.get(fid))
-                                    .cloned();
+                                let inlinable_body =
+                                    inline_bodies.as_ref().and_then(|b| b.get(fid)).cloned();
                                 let mut emitted_inline = false;
                                 if let Some(callee_mir) = inlinable_body {
-                                    let mut callee_vals: HashMap<ValueId, Value> =
-                                        HashMap::new();
+                                    let mut callee_vals: HashMap<ValueId, Value> = HashMap::new();
                                     let mut callee_args: Vec<Value> =
                                         Vec::with_capacity(args.len() + 1);
                                     callee_args.push(r);
@@ -2184,21 +2175,15 @@ pub mod cl {
                                         None
                                     } else {
                                         match &callee_block.terminator {
-                                            Terminator::Return(v) => {
-                                                callee_vals.get(v).copied()
-                                            }
+                                            Terminator::Return(v) => callee_vals.get(v).copied(),
                                             Terminator::ReturnNull => Some(
-                                                builder
-                                                    .ins()
-                                                    .iconst(types::I64, TAG_NULL as i64),
+                                                builder.ins().iconst(types::I64, TAG_NULL as i64),
                                             ),
                                             _ => None,
                                         }
                                     };
                                     if let Some(rv) = return_val {
-                                        builder
-                                            .ins()
-                                            .jump(merge_block, &[BlockArg::Value(rv)]);
+                                        builder.ins().jump(merge_block, &[BlockArg::Value(rv)]);
                                         emitted_inline = true;
                                     }
                                 }
@@ -2211,8 +2196,8 @@ pub mod cl {
                                     // capped at 3 since the *_nocheck
                                     // family only goes up to arity 3.
                                     if args.len() <= 3 {
-                                        let packed = (*fid as u64)
-                                            | ((method.index() as u64) << 32);
+                                        let packed =
+                                            (*fid as u64) | ((method.index() as u64) << 32);
                                         let fid_val =
                                             builder.ins().iconst(types::I64, packed as i64);
                                         let fast_name = match args.len() {
@@ -2233,12 +2218,10 @@ pub mod cl {
                                             fast_args.push(get(a));
                                         }
                                         let fast_call = builder.ins().call(fast_f, &fast_args);
-                                        let fast_result =
-                                            builder.inst_results(fast_call)[0];
-                                        builder.ins().jump(
-                                            merge_block,
-                                            &[BlockArg::Value(fast_result)],
-                                        );
+                                        let fast_result = builder.inst_results(fast_call)[0];
+                                        builder
+                                            .ins()
+                                            .jump(merge_block, &[BlockArg::Value(fast_result)]);
                                     } else {
                                         // Arity 4: fall through to
                                         // wren_call_N at the tail.
@@ -2259,8 +2242,7 @@ pub mod cl {
                             // No class matched — full dispatch
                             // through wren_call_N.
                             let method_bits = method.index() as u64;
-                            let method_val =
-                                builder.ins().iconst(types::I64, method_bits as i64);
+                            let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                             let slow_name = match args.len() {
                                 0 => "wren_call_0",
                                 1 => "wren_call_1",
@@ -2313,8 +2295,7 @@ pub mod cl {
                         // (Numbers, Null, Bool, ...) skip straight
                         // to the slow path; reading their NaN-box
                         // bits at +16 would dereference garbage.
-                        let (obj_ptr, recv_class) =
-                            emit_class_load_guarded(builder, r, slow_block);
+                        let (obj_ptr, recv_class) = emit_class_load_guarded(builder, r, slow_block);
 
                         // Kind=5 getter: class is baked as constant.
                         let cached_class = builder.ins().iconst(types::I64, ic.class as i64);
@@ -2576,9 +2557,9 @@ pub mod cl {
                             } else {
                                 match &callee_block.terminator {
                                     Terminator::Return(v) => callee_vals.get(v).copied(),
-                                    Terminator::ReturnNull => Some(
-                                        builder.ins().iconst(types::I64, TAG_NULL as i64),
-                                    ),
+                                    Terminator::ReturnNull => {
+                                        Some(builder.ins().iconst(types::I64, TAG_NULL as i64))
+                                    }
                                     _ => None,
                                 }
                             };
@@ -2594,8 +2575,7 @@ pub mod cl {
                             // Slow path: full dispatch through wren_call_N.
                             builder.switch_to_block(slow_block);
                             let method_bits = method.index() as u64;
-                            let method_val =
-                                builder.ins().iconst(types::I64, method_bits as i64);
+                            let method_val = builder.ins().iconst(types::I64, method_bits as i64);
                             let slow_name = match args.len() {
                                 0 => "wren_call_0",
                                 1 => "wren_call_1",
@@ -2738,8 +2718,7 @@ pub mod cl {
                     builder.append_block_param(merge_block, types::I64);
 
                     // is-object guard + class load.
-                    let (obj_ptr, recv_class) =
-                        emit_class_load_guarded(builder, r, slow_block);
+                    let (obj_ptr, recv_class) = emit_class_load_guarded(builder, r, slow_block);
                     let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
                     let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
                     builder
@@ -2805,8 +2784,7 @@ pub mod cl {
                     // unmapped page on macOS aarch64, so the
                     // pre-existing "comparison fails safely"
                     // assumption did not hold.
-                    let (_obj_ptr, recv_class) =
-                        emit_class_load_guarded(builder, r, slow_block);
+                    let (_obj_ptr, recv_class) = emit_class_load_guarded(builder, r, slow_block);
                     let cached_class = builder.ins().iconst(types::I64, *expected_class as i64);
                     let class_match = builder.ins().icmp(IntCC::Equal, recv_class, cached_class);
 

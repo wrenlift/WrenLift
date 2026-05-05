@@ -124,7 +124,10 @@ mod tests {
 
     #[test]
     fn verify_closure_layout() {
-        assert_eq!(memoffset_of!(ObjClosure, function), CLOSURE_FUNCTION as usize);
+        assert_eq!(
+            memoffset_of!(ObjClosure, function),
+            CLOSURE_FUNCTION as usize
+        );
         // Vec::as_ptr() and the data field of std's Vec layout
         // both point at the start of the buffer; the field offset
         // here matches Rust's stable Vec internal layout.
@@ -136,7 +139,10 @@ mod tests {
 
     #[test]
     fn verify_upvalue_layout() {
-        assert_eq!(memoffset_of!(ObjUpvalue, location), UPVALUE_LOCATION as usize);
+        assert_eq!(
+            memoffset_of!(ObjUpvalue, location),
+            UPVALUE_LOCATION as usize
+        );
         assert_eq!(memoffset_of!(ObjUpvalue, closed), UPVALUE_CLOSED as usize);
     }
 

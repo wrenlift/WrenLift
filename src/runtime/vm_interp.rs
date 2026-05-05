@@ -2223,38 +2223,38 @@ fn run_fiber_with_stop_depth(
                     let (method_entry, defining_class) = if let Some(m) = cha_method {
                         (Some(m), Some(cache_key_class))
                     } else if let Some((m, dc)) = vm.method_cache.lookup(cache_key_class, method) {
-                            (Some(m), Some(dc))
-                        } else {
-                            let result = if class == vm.class_class {
-                                let recv_class_ptr = cache_key_class;
-                                let method_str = vm.interner.resolve(method);
-                                let prefix = b"static:";
-                                let total = prefix.len() + method_str.len();
-                                let mut buf = [0u8; 128];
-                                let found = if total <= buf.len() {
-                                    buf[..prefix.len()].copy_from_slice(prefix);
-                                    buf[prefix.len()..total].copy_from_slice(method_str.as_bytes());
-                                    let static_str =
-                                        unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
-                                    vm.interner.lookup(static_str).and_then(|sym| {
-                                        unsafe { (*recv_class_ptr).find_method(sym).cloned() }
-                                            .map(|m| (m, recv_class_ptr))
-                                    })
-                                } else {
-                                    None
-                                };
-                                found.or_else(|| unsafe { find_method_with_class(class, method) })
+                        (Some(m), Some(dc))
+                    } else {
+                        let result = if class == vm.class_class {
+                            let recv_class_ptr = cache_key_class;
+                            let method_str = vm.interner.resolve(method);
+                            let prefix = b"static:";
+                            let total = prefix.len() + method_str.len();
+                            let mut buf = [0u8; 128];
+                            let found = if total <= buf.len() {
+                                buf[..prefix.len()].copy_from_slice(prefix);
+                                buf[prefix.len()..total].copy_from_slice(method_str.as_bytes());
+                                let static_str =
+                                    unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+                                vm.interner.lookup(static_str).and_then(|sym| {
+                                    unsafe { (*recv_class_ptr).find_method(sym).cloned() }
+                                        .map(|m| (m, recv_class_ptr))
+                                })
                             } else {
-                                unsafe { find_method_with_class(class, method) }
+                                None
                             };
-                            if let Some((ref m, dc)) = result {
-                                vm.method_cache.insert(cache_key_class, method, *m, dc);
-                            }
-                            match result {
-                                Some((m, c)) => (Some(m), Some(c)),
-                                None => (None, None),
-                            }
+                            found.or_else(|| unsafe { find_method_with_class(class, method) })
+                        } else {
+                            unsafe { find_method_with_class(class, method) }
                         };
+                        if let Some((ref m, dc)) = result {
+                            vm.method_cache.insert(cache_key_class, method, *m, dc);
+                        }
+                        match result {
+                            Some((m, c)) => (Some(m), Some(c)),
+                            None => (None, None),
+                        }
+                    };
 
                     match method_entry {
                         Some(
