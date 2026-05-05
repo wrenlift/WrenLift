@@ -2164,14 +2164,30 @@ pub mod cl {
                                     sym_base,
                                     (slot as i32) * 8,
                                 );
-                                let call_name = match args.len() {
+                                // Pick the helper whose user-arg
+                                // count matches the call site. The
+                                // `wren_call_N` family ranges
+                                // 0..=8; clamp the higher end to
+                                // wren_call_8 so a future call-site
+                                // arity bump won't silently
+                                // truncate args. Keep arg_count in
+                                // sync with the chosen helper —
+                                // mismatched declarations land as a
+                                // Cranelift "incompatible signature"
+                                // module error.
+                                let user_arity = args.len().min(8);
+                                let call_name = match user_arity {
                                     0 => "wren_call_0",
                                     1 => "wren_call_1",
                                     2 => "wren_call_2",
                                     3 => "wren_call_3",
-                                    _ => "wren_call_4",
+                                    4 => "wren_call_4",
+                                    5 => "wren_call_5",
+                                    6 => "wren_call_6",
+                                    7 => "wren_call_7",
+                                    _ => "wren_call_8",
                                 };
-                                let arg_count = 2 + args.len().min(8);
+                                let arg_count = 2 + user_arity;
                                 let f = get_runtime_fn(module, builder, call_name, arg_count)?;
                                 let mut slow_args = vec![r, method_val];
                                 for a in args.iter().take(8) {

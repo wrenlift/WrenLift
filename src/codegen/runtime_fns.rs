@@ -4082,6 +4082,103 @@ pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
     wren_arith_dispatch(a, b, "%(_)", "%", |x, y| x % y)
 }
 
+// ---------------------------------------------------------------------------
+// Bitwise — declared by the Cranelift lowering for `Instruction::BitAnd /
+// BitOr / BitXor / BitNot / Shl / Shr`. Wren truncates Num operands to i32
+// before the op (per the bytecode interpreter's `Op::BitAnd` / etc.). Hatch
+// packages use these for hash mixing; without the symbols the staticlib
+// failed to link any AOT object that touched those ops.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "host")]
+#[no_mangle]
+pub extern "C" fn wren_bit_and(a: u64, b: u64) -> u64 {
+    wren_bit_binop(a, b, "&(_)", "&", |x, y| x & y)
+}
+
+#[cfg(feature = "host")]
+#[no_mangle]
+pub extern "C" fn wren_bit_or(a: u64, b: u64) -> u64 {
+    wren_bit_binop(a, b, "|(_)", "|", |x, y| x | y)
+}
+
+#[cfg(feature = "host")]
+#[no_mangle]
+pub extern "C" fn wren_bit_xor(a: u64, b: u64) -> u64 {
+    wren_bit_binop(a, b, "^(_)", "^", |x, y| x ^ y)
+}
+
+#[cfg(feature = "host")]
+#[no_mangle]
+pub extern "C" fn wren_bit_shl(a: u64, b: u64) -> u64 {
+    wren_bit_binop(a, b, "<<(_)", "<<", |x, y| {
+        ((x as u32).wrapping_shl((y & 31) as u32)) as i32
+    })
+}
+
+#[cfg(feature = "host")]
+#[no_mangle]
+pub extern "C" fn wren_bit_shr(a: u64, b: u64) -> u64 {
+    wren_bit_binop(a, b, ">>(_)", ">>", |x, y| {
+        ((x as u32).wrapping_shr((y & 31) as u32)) as i32
+    })
+}
+
+#[cfg(feature = "host")]
+#[no_mangle]
+pub extern "C" fn wren_bit_not(a: u64) -> u64 {
+    let va = Value::from_bits(a);
+    if va.is_num() {
+        let n = unbox_num(a) as i32;
+        return box_num((!n) as f64);
+    }
+    match unsafe { vm_ref() } {
+        Some(vm) => {
+            let sym = vm.interner.lookup("~").or_else(|| vm.interner.lookup("!"));
+            if let Some(sym) = sym {
+                let class = vm.class_of(va);
+                if let Some((method, _dc)) = unsafe { find_method_with_class(class, sym) } {
+                    return dispatch_method(vm, method, &[va], None);
+                }
+            }
+            Value::null().to_bits()
+        }
+        None => Value::null().to_bits(),
+    }
+}
+
+#[inline]
+fn wren_bit_binop(
+    a: u64,
+    b: u64,
+    method_with_paren: &str,
+    method_bare: &str,
+    fast: impl FnOnce(i32, i32) -> i32,
+) -> u64 {
+    let va = Value::from_bits(a);
+    if va.is_num() {
+        let x = unbox_num(a) as i32;
+        let y = unbox_num(b) as i32;
+        return box_num(fast(x, y) as f64);
+    }
+    match unsafe { vm_ref() } {
+        Some(vm) => {
+            let sym = vm
+                .interner
+                .lookup(method_with_paren)
+                .or_else(|| vm.interner.lookup(method_bare));
+            if let Some(sym) = sym {
+                let class = vm.class_of(va);
+                if let Some((method, _dc)) = unsafe { find_method_with_class(class, sym) } {
+                    return dispatch_method(vm, method, &[va, Value::from_bits(b)], None);
+                }
+            }
+            Value::null().to_bits()
+        }
+        None => Value::null().to_bits(),
+    }
+}
+
 /// Common path for arithmetic-operator slow paths: if the receiver
 /// is a Num, run the f64 op; otherwise dispatch the user-defined
 /// operator method (e.g. `Mat4 * Mat4` → `Mat4.* (o)`). Mirrors
@@ -4448,6 +4545,13 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_num_div" => Some(wren_num_div as *const () as usize),
         "wren_num_mod" => Some(wren_num_mod as *const () as usize),
         "wren_num_neg" => Some(wren_num_neg as *const () as usize),
+        // Boxed bitwise
+        "wren_bit_and" => Some(wren_bit_and as *const () as usize),
+        "wren_bit_or" => Some(wren_bit_or as *const () as usize),
+        "wren_bit_xor" => Some(wren_bit_xor as *const () as usize),
+        "wren_bit_not" => Some(wren_bit_not as *const () as usize),
+        "wren_bit_shl" => Some(wren_bit_shl as *const () as usize),
+        "wren_bit_shr" => Some(wren_bit_shr as *const () as usize),
         // Boxed comparisons
         "wren_cmp_lt" => Some(wren_cmp_lt as *const () as usize),
         "wren_cmp_gt" => Some(wren_cmp_gt as *const () as usize),
