@@ -766,6 +766,7 @@ fn emit_aot_function(
 
     *aot_cfg.current_defining_class.borrow_mut() = defining_class;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
+    *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
 
     let mut ctx = module.make_context();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
@@ -795,6 +796,7 @@ fn emit_aot_function(
 
     *aot_cfg.current_defining_class.borrow_mut() = None;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
+    *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
     Ok(EmittedFnMeta {
         code_size,
         arity: mir.arity,
@@ -888,6 +890,7 @@ fn emit_aot_module(
         cha: Some(cha as *const AotCha),
         current_defining_class: std::cell::RefCell::new(None),
         current_closure_ptr_var: std::cell::RefCell::new(None),
+        current_jit_roots_snapshot_var: std::cell::RefCell::new(None),
     };
 
     let mut fn_metas: Vec<(String, EmittedFnMeta)> = Vec::new();

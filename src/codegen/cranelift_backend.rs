@@ -896,6 +896,8 @@ pub mod cl {
             "wren_call_8",
             "wren_load_jit_ptr",
             "wren_load_jit_closure",
+            "wren_jit_roots_snapshot",
+            "wren_jit_roots_restore",
             "wren_known_call_0",
             "wren_known_call_1",
             "wren_known_call_2",
@@ -1133,6 +1135,19 @@ pub mod cl {
         /// body has no upvalue access (skip the load entirely).
         /// Cleared to `None` between emissions by `emit_aot_function`.
         pub current_closure_ptr_var: std::cell::RefCell<Option<cranelift_frontend::Variable>>,
+
+        /// Function-scoped JIT-roots snapshot. AOT lowering emits
+        /// `wren_jit_roots_snapshot()` at function entry and
+        /// `wren_jit_roots_restore(snapshot)` before every return,
+        /// so any roots leaked into `JIT_ROOTS_STORE` by the
+        /// function's allocations get released at the function
+        /// boundary. Mirrors the snapshot/restore pattern
+        /// `wren_call_N_inner` already uses for its arg roots —
+        /// applies it function-wide for AOT bodies because they
+        /// leak roots under finish_alloc's "push but don't pop"
+        /// model. Cleared between emissions by `emit_aot_function`.
+        pub current_jit_roots_snapshot_var:
+            std::cell::RefCell<Option<cranelift_frontend::Variable>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1353,6 +1368,18 @@ pub mod cl {
                 let var = builder.declare_var(types::I64);
                 *cfg.current_closure_ptr_var.borrow_mut() = Some(var);
             }
+
+            // Always declare a JIT-roots snapshot Variable for AOT
+            // bodies (skipping OSR + f64-inner emit paths, which
+            // don't allocate Wren values). Defined at function
+            // entry, read at every Return instruction's lowering
+            // to restore JIT_ROOTS_STORE to its entry length —
+            // releases any roots leaked into the global stack by
+            // finish_alloc's "push but don't pop" model.
+            if osr_entry.is_none() && f64_self_id.is_none() {
+                let snap_var = builder.declare_var(types::I64);
+                *cfg.current_jit_roots_snapshot_var.borrow_mut() = Some(snap_var);
+            }
         }
 
         // Process blocks in reverse post-order (dominance order).
@@ -1452,6 +1479,24 @@ pub mod cl {
                         let closure_bits = builder.inst_results(call)[0];
                         builder.def_var(var, closure_bits);
                     }
+
+                    // AOT-only: snapshot JIT_ROOTS_STORE.len() at
+                    // function entry. Each Return restores to this
+                    // length, releasing any roots leaked into the
+                    // global stack by finish_alloc's "push but
+                    // don't pop" mode. Mirrors wren_call_N_inner's
+                    // root_base / jit_roots_restore_len pair.
+                    if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
+                        let f = get_runtime_fn(
+                            module,
+                            builder,
+                            "wren_jit_roots_snapshot",
+                            0,
+                        )?;
+                        let call = builder.ins().call(f, &[]);
+                        let snap = builder.inst_results(call)[0];
+                        builder.def_var(snap_var, snap);
+                    }
                 }
             }
 
@@ -1490,6 +1535,30 @@ pub mod cl {
                     }
                     if mark_stack_map && is_wren_value(vid, &value_types) {
                         builder.declare_value_needs_stack_map(val);
+                    }
+                }
+            }
+
+            // Pre-terminator hook: AOT bodies emit a JIT-roots
+            // restore right before every Return so any roots
+            // leaked into JIT_ROOTS_STORE by alloc helpers
+            // (finish_alloc's "push but don't pop" mode) get
+            // released at the function boundary. The snapshot
+            // Variable was defined at function entry above.
+            if matches!(
+                block.terminator,
+                Terminator::Return(_) | Terminator::ReturnNull
+            ) {
+                if let Some(cfg) = aot_config {
+                    if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
+                        let snap = builder.use_var(snap_var);
+                        let f = get_runtime_fn(
+                            module,
+                            builder,
+                            "wren_jit_roots_restore",
+                            1,
+                        )?;
+                        let _ = builder.ins().call(f, &[snap]);
                     }
                 }
             }

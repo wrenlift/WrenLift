@@ -1136,25 +1136,58 @@ pub fn set_aot_gc_enabled(v: bool) {
 ///
 /// # Safety
 /// `vm` must be the current thread's running VM.
+///
+/// AOT-mode contract: the value is pushed onto `JIT_ROOTS_STORE`
+/// and **stays** there. The AOT lowering pairs each function with
+/// an entry-time `wren_jit_roots_snapshot` and an exit-time
+/// `wren_jit_roots_restore_len` so per-function leaked roots get
+/// reclaimed at function boundaries — same shape `wren_call_N`'s
+/// snapshot/restore uses. This sidesteps the gap where Cranelift's
+/// stack maps don't cover every Value live across a helper call:
+/// every allocated value is unconditionally tracked through the
+/// roots Vec, end of story.
+///
+/// JIT / interpreter mode keeps the no-op behaviour — the
+/// bytecode interpreter loop's safepoint already runs GC at safe
+/// boundaries and the JIT path's existing root-tracking machinery
+/// handles the rest.
 #[inline]
 pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
     if !aot_gc_enabled() {
-        // JIT / interpreter mode: the bytecode interpreter loop's
-        // safepoint already runs GC at safe boundaries, and JIT
-        // stack maps only cover the safepoints Cranelift declared
-        // — firing GC inside the alloc helper here reads the wrong
-        // spill slots and corrupts live values. Skip the trigger
-        // and let the existing schedule do its work.
         return val.to_bits();
     }
     push_jit_root(val);
     if vm.gc.should_collect() {
         vm.collect_garbage();
+        // Mirror the bytecode interpreter's post-GC cleanup —
+        // method_cache and inline-cache entries can hold pointers
+        // to freed/forwarded objects. Without invalidation, a
+        // subsequent dispatch path reads stale data (or follows a
+        // pointer into reused memory) and segfaults.
+        vm.method_cache.invalidate();
+        vm.engine.invalidate_inline_caches();
     }
-    // Pop the transient root and return its (possibly forwarded)
-    // bits. From here on, the caller's stack map keeps the
-    // value alive across any further calls.
-    pop_jit_root().expect("finish_alloc: root vanished").to_bits()
+    // Read back the (possibly forwarded) value and return it,
+    // leaving the root in place for the AOT function's lifetime.
+    let len = jit_roots_snapshot_len();
+    jit_root_at(len - 1).to_bits()
+}
+
+/// Snapshot the current JIT roots length. Called at AOT function
+/// entry; paired with `wren_jit_roots_restore_len` at exit so any
+/// roots leaked into `JIT_ROOTS_STORE` by the function's
+/// allocations get released at the function boundary.
+#[no_mangle]
+pub extern "C" fn wren_jit_roots_snapshot() -> u64 {
+    jit_roots_snapshot_len() as u64
+}
+
+/// Restore JIT roots to a previous snapshot length. Called at AOT
+/// function exit (or any other scope boundary the lowering wants
+/// to release roots at).
+#[no_mangle]
+pub extern "C" fn wren_jit_roots_restore(len: u64) {
+    jit_roots_restore_len(len as usize);
 }
 
 /// Take all JIT roots for GC scanning. Returns the values (caller must write back
@@ -4575,6 +4608,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Known-function dispatch (devirtualized)
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
         "wren_load_jit_closure" => Some(wren_load_jit_closure as *const () as usize),
+        "wren_jit_roots_snapshot" => Some(wren_jit_roots_snapshot as *const () as usize),
+        "wren_jit_roots_restore" => Some(wren_jit_roots_restore as *const () as usize),
         "wren_known_call_0" => Some(wren_known_call_0 as *const () as usize),
         "wren_known_call_1" => Some(wren_known_call_1 as *const () as usize),
         "wren_known_call_2" => Some(wren_known_call_2 as *const () as usize),
