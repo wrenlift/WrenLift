@@ -602,6 +602,13 @@ pub struct ExecutionEngine {
     /// and a minor GC sweeps them while the AOT body still
     /// references them via `GetModuleVar`.
     pub aot_root_regions: Vec<(*mut u64, usize)>,
+    /// Per-FuncId flag — `true` when the function was AOT-emitted
+    /// as a state machine (tainted by `Fiber.yield`). Dispatch
+    /// reads this off the function pointer the closure resolves
+    /// to and routes through `wlift_aot_invoke_state_machine`
+    /// (calls the poll fn with `(fiber, resume_v)`) instead of
+    /// the regular `wren_call_*` path.
+    pub aot_state_machine: Vec<bool>,
     /// Threaded-code cache indexed by FuncId. Lazily populated on first
     /// interpreter dispatch — faster than bytecode for hot functions.
     /// `None` = not yet checked. `Some(None)` = checked, not eligible.
@@ -775,6 +782,7 @@ impl ExecutionEngine {
             type_profiles: Vec::new(),
             code_ranges: Vec::new(),
             aot_root_regions: Vec::new(),
+            aot_state_machine: Vec::new(),
             #[cfg(feature = "host")]
             threaded_code: Vec::new(),
             // Thresholds mirror the legacy jit_threshold / opt_threshold
@@ -831,6 +839,7 @@ impl ExecutionEngine {
         #[cfg(feature = "host")]
         self.threaded_code.push(None); // None = not yet checked
         self.type_profiles.push(None);
+        self.aot_state_machine.push(false);
         // Register the bead with a null core pointer; tier decisions
         // are driven entirely from Rust state, beadie just tracks
         // per-function transitions.
@@ -864,6 +873,27 @@ impl ExecutionEngine {
         let mir = MirFunction::new(name, arity);
         let id = self.register_function_in(mir, module);
         self.jit_code[id.0 as usize] = fn_ptr;
+        id
+    }
+
+    /// Variant of [`register_aot_function`] that flags `id` as
+    /// AOT state-machine-backed. Dispatch reads `aot_state_machine[
+    /// id]` to route through the poll-fn invocation path
+    /// (`(fiber, resume_v) -> result`) instead of
+    /// `wren_call_*`. The fn pointer's signature must already
+    /// match — the AOT emit pass picks it based on the same
+    /// taint set.
+    pub fn register_aot_state_machine_function(
+        &mut self,
+        name: SymbolId,
+        fn_ptr: *const u8,
+        module: Option<Rc<String>>,
+    ) -> FuncId {
+        // arity = 0 from Wren's perspective — fiber bodies are
+        // 0-arg blocks; the (fiber, resume_v) signature is an
+        // implementation detail of the poll path.
+        let id = self.register_aot_function(name, 0, fn_ptr, module);
+        self.aot_state_machine[id.0 as usize] = true;
         id
     }
 

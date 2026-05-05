@@ -377,6 +377,35 @@ fn nested_closures_share_upvalues() {
 }
 
 #[test]
+fn fiber_yield_state_machine() {
+    // Pure-AOT Fiber.yield support — no interpreter fallback.
+    // The closure body is lowered with the stackless 2-arg
+    // poll signature; each yield advances the state ID and
+    // stamps `kind=Yield`, the dispatcher reads back the kind
+    // to suspend the fiber and surface the value to the
+    // caller. Three `f.call()`s drain the body's three states:
+    // 10, 20, 30 (the final return).
+    let r = compile_link_run(
+        "var f = Fiber.new {\n  \
+           System.print(\"step 1\")\n  \
+           Fiber.yield(10)\n  \
+           System.print(\"step 2\")\n  \
+           Fiber.yield(20)\n  \
+           System.print(\"step 3\")\n  \
+           return 30\n\
+         }\n\
+         System.print(\"a=%(f.call())\")\n\
+         System.print(\"b=%(f.call())\")\n\
+         System.print(\"c=%(f.call())\")\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(
+        r.stdout,
+        "step 1\na=10\nstep 2\nb=20\nstep 3\nc=30\n"
+    );
+}
+
+#[test]
 fn nested_class_method_calls() {
     // Non-trivial method chain with intermediate object
     // construction. Exercises the IC + GC interaction across

@@ -686,6 +686,33 @@ pub unsafe extern "C" fn wlift_aot_register_closure(
     func_id.0 as u64
 }
 
+/// State-machine variant of [`wlift_aot_register_closure`]. The
+/// bootstrap calls this for closures the AOT pipeline lowered
+/// with the stackless `(fiber, resume_v) -> i64` shape; the
+/// runtime flips `engine.aot_state_machine[id] = true` so
+/// `fiber.call`/`Fiber.yield` dispatch picks the poll path
+/// instead of `wren_call_*`.
+///
+/// # Safety
+///
+/// `fn_ptr` must match the state-machine signature.
+#[no_mangle]
+#[cfg(feature = "aot")]
+pub unsafe extern "C" fn wlift_aot_register_state_machine_closure(
+    vm: *mut WrenVM,
+    fn_ptr: *const u8,
+) -> u64 {
+    if vm.is_null() || fn_ptr.is_null() {
+        return u64::MAX;
+    }
+    let vm_ref = unsafe { &mut *vm };
+    let name_sym = vm_ref.interner.intern("<aot-sm-closure>");
+    let func_id = vm_ref
+        .engine
+        .register_aot_state_machine_function(name_sym, fn_ptr, None);
+    func_id.0 as u64
+}
+
 /// Per-safepoint descriptor for `wlift_aot_register_code_range`.
 /// The bootstrap emits one of these per Cranelift user stack map
 /// captured during AOT lowering. `roots_start` + `roots_count`
@@ -1117,6 +1144,101 @@ pub unsafe extern "C" fn wlift_aot_register_root_region(
     let vm_ref = unsafe { &mut *vm };
     vm_ref.engine.aot_root_regions.push((region, count));
     0
+}
+
+/// Outcome stamped by an AOT state-machine poll function before
+/// it returns. The dispatcher calling the poll reads it back via
+/// [`wlift_aot_sm_take_poll_kind`] to decide whether the fiber
+/// suspended (kind = `Yield`, the returned value is the yield
+/// argument) or completed (kind = `Done`, the returned value is
+/// the body's final return). Lives in a `thread_local` rather
+/// than as a field on `WrenVM` / `ObjFiber` so the
+/// already-loaded plugin ABI stays binary-compatible.
+#[cfg(feature = "aot")]
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AotSmPollKind {
+    /// Default — set on entry to each poll so a missing
+    /// `wlift_aot_sm_done` would surface as "fiber finished
+    /// without a result" rather than a stale Yield from an
+    /// earlier invocation.
+    None = 0,
+    Yield = 1,
+    Done = 2,
+}
+
+#[cfg(feature = "aot")]
+thread_local! {
+    static AOT_SM_POLL_KIND: std::cell::Cell<AotSmPollKind> =
+        const { std::cell::Cell::new(AotSmPollKind::None) };
+}
+
+/// Read the current state ID of `fiber`'s AOT state machine.
+/// Called from the poll fn's dispatch prologue to decide which
+/// `br_table` arm to enter on resume. New fibers come back as
+/// `0`; `wlift_aot_sm_yield` advances it before returning.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_load_state(fiber: *mut crate::runtime::object::ObjFiber) -> u64 {
+    if fiber.is_null() {
+        return 0;
+    }
+    unsafe { (*fiber).aot_state_id as u64 }
+}
+
+/// Stamp `kind = Yield`, advance the fiber's state ID to
+/// `next_state`, and return. The poll fn's epilogue follows this
+/// call with a bare `return v` whose value the dispatcher passes
+/// back to the `fiber.call` site as the suspension result.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_yield(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    next_state: u64,
+) {
+    if !fiber.is_null() {
+        unsafe {
+            (*fiber).aot_state_id = next_state as u32;
+        }
+    }
+    AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Yield));
+}
+
+/// Stamp `kind = Done`. The poll fn's bare `return v` carries
+/// the body's final return value; the dispatcher transitions the
+/// fiber to `Done` and surfaces `v` to the caller.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_done(_fiber: *mut crate::runtime::object::ObjFiber) {
+    AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Done));
+}
+
+/// Read + clear the per-thread state-machine poll kind. The
+/// dispatcher calls this immediately after a poll returns to
+/// learn whether the fiber suspended or completed. Always
+/// resets to `None` so a subsequent poll that forgets to stamp
+/// surfaces as a stuck-fiber error instead of inheriting the
+/// previous outcome.
+#[cfg(feature = "aot")]
+#[inline]
+pub fn wlift_aot_sm_take_poll_kind() -> AotSmPollKind {
+    AOT_SM_POLL_KIND.with(|c| {
+        let k = c.get();
+        c.set(AotSmPollKind::None);
+        k
+    })
 }
 
 /// Resolve a bare-builtin import (`import "socket" for SocketCore`,

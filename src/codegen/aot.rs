@@ -2036,6 +2036,12 @@ fn emit_aot_bootstrap_main(
         &[ptr_ty, types::I8, ptr_ty],
         Some(types::I64),
     )?;
+    let register_sm_closure = declare_import(
+        module,
+        "wlift_aot_register_state_machine_closure",
+        &[ptr_ty, ptr_ty],
+        Some(types::I64),
+    )?;
     let register_code_range = declare_import(
         module,
         "wlift_aot_register_code_range",
@@ -2210,7 +2216,7 @@ fn emit_aot_bootstrap_main(
         // `wlift_aot_register_closure`, writing the returned
         // engine FuncId into `closures_data[i]`.
         closures_data_id: cranelift_module::DataId,
-        closures: Vec<(cranelift_module::FuncId, u8)>,
+        closures: Vec<(cranelift_module::FuncId, u8, bool)>,
         /// Per-AOT-function frame metadata: (fn_id import,
         /// code_size, safepoints desc DataId, safepoint count,
         /// roots DataId). Bootstrap calls
@@ -2408,7 +2414,7 @@ fn emit_aot_bootstrap_main(
             let body_id = module
                 .declare_function(&closure.fn_symbol, Linkage::Import, &sig)
                 .map_err(|e| AotError::Module(e.to_string()))?;
-            closures.push((body_id, closure.arity));
+            closures.push((body_id, closure.arity, closure.is_state_machine));
         }
 
         // Per-function safepoint metadata. Each AOT function gets
@@ -2613,6 +2619,8 @@ fn emit_aot_bootstrap_main(
         let alloc_const_ref = module.declare_func_in_func(alloc_const, builder.func);
         let intern_symbol_ref = module.declare_func_in_func(intern_symbol, builder.func);
         let register_closure_ref = module.declare_func_in_func(register_closure, builder.func);
+        let register_sm_closure_ref =
+            module.declare_func_in_func(register_sm_closure, builder.func);
         let register_code_range_ref =
             module.declare_func_in_func(register_code_range, builder.func);
         let resolve_runtime_import_ref =
@@ -2730,14 +2738,21 @@ fn emit_aot_bootstrap_main(
             // from this slot table at run time.
             let closures_gv = module.declare_data_in_func(m.closures_data_id, builder.func);
             let closures_addr = builder.ins().global_value(ptr_ty, closures_gv);
-            for (k, (body_id, arity)) in m.closures.iter().enumerate() {
+            for (k, (body_id, arity, is_sm)) in m.closures.iter().enumerate() {
                 let body_ref = module.declare_func_in_func(*body_id, builder.func);
                 let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
-                let arity_val = builder.ins().iconst(types::I8, *arity as i64);
-                let reg_call = builder
-                    .ins()
-                    .call(register_closure_ref, &[vm, arity_val, body_addr]);
-                let func_id_val = builder.inst_results(reg_call)[0];
+                let func_id_val = if *is_sm {
+                    let reg_call = builder
+                        .ins()
+                        .call(register_sm_closure_ref, &[vm, body_addr]);
+                    builder.inst_results(reg_call)[0]
+                } else {
+                    let arity_val = builder.ins().iconst(types::I8, *arity as i64);
+                    let reg_call = builder
+                        .ins()
+                        .call(register_closure_ref, &[vm, arity_val, body_addr]);
+                    builder.inst_results(reg_call)[0]
+                };
                 builder.ins().store(
                     MemFlags::trusted(),
                     func_id_val,

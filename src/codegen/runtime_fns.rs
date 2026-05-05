@@ -2017,6 +2017,91 @@ fn handle_jit_fiber_action(
                     (*target).caller = caller;
                 }
             }
+
+            // AOT state-machine path. The target fiber's body
+            // FuncId is registered with `aot_state_machine[id] =
+            // true` when its closure was lowered as a stackless
+            // poll function. Invoke it directly with `(fiber,
+            // resume_v)` and read back the kind/value pair —
+            // there's no MIR / bytecode body to drive through
+            // `run_fiber`, so trying to interpret it would fall
+            // straight off the empty `mir_frames` and look like
+            // an immediately-finished fiber.
+            #[cfg(feature = "aot")]
+            {
+                let target_func_id = unsafe {
+                    (*target)
+                        .mir_frames
+                        .first()
+                        .map(|f| f.func_id.0 as usize)
+                };
+                let is_sm = target_func_id
+                    .map(|idx| {
+                        vm.engine
+                            .aot_state_machine
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if is_sm {
+                    let func_id = target_func_id.unwrap();
+                    let fn_ptr = vm.engine.jit_code.get(func_id).copied().unwrap_or(std::ptr::null());
+                    if fn_ptr.is_null() {
+                        unsafe {
+                            (*target).state = FiberState::Done;
+                        }
+                        set_jit_context(saved_jit_ctx);
+                        set_jit_depth(saved_jit_depth);
+                        return Value::null().to_bits();
+                    }
+                    // Mark the target as Running, switch
+                    // vm.fiber pointer for the call so any
+                    // ambient code (e.g. `Fiber.current`) inside
+                    // the poll sees the right active fiber.
+                    unsafe {
+                        (*target).state = FiberState::Running;
+                    }
+                    vm.fiber = target;
+                    let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
+                        unsafe { std::mem::transmute(fn_ptr) };
+                    let ret_bits = poll(target, value.to_bits());
+                    let kind = crate::capi::wlift_aot_sm_take_poll_kind();
+                    // Restore caller-side context regardless of outcome.
+                    if !caller.is_null() {
+                        unsafe {
+                            (*caller).state = FiberState::Running;
+                        }
+                        vm.fiber = caller;
+                    } else {
+                        vm.fiber = std::ptr::null_mut();
+                    }
+                    set_jit_context(saved_jit_ctx);
+                    set_jit_depth(saved_jit_depth);
+                    match kind {
+                        crate::capi::AotSmPollKind::Yield => {
+                            unsafe {
+                                (*target).state = FiberState::Suspended;
+                            }
+                        }
+                        crate::capi::AotSmPollKind::Done => unsafe {
+                            (*target).state = FiberState::Done;
+                        },
+                        crate::capi::AotSmPollKind::None => {
+                            // Body returned without stamping —
+                            // treat as Done to avoid leaking a
+                            // stuck Running state. The bare
+                            // value is whatever the function
+                            // returned, which the caller will
+                            // observe.
+                            unsafe {
+                                (*target).state = FiberState::Done;
+                            }
+                        }
+                    }
+                    return ret_bits;
+                }
+            }
             let target_state = unsafe { (*target).state };
             if target_state == FiberState::Suspended {
                 // Resuming a suspended fiber: deliver the value.

@@ -985,6 +985,13 @@ pub struct ObjFiber {
     /// Absolute deadline in millis since the Unix epoch, or None for "no
     /// deadline". Inherits from the spawn parent at `Fiber.new`.
     pub deadline_ms: Option<f64>,
+    /// State ID for AOT-state-machine fiber bodies. `0` is the
+    /// initial entry; `Fiber.yield` advances it before returning,
+    /// the next `fiber.call` reads it back to resume from the
+    /// matching block. Unused (stays `0`) for fibers whose body
+    /// is interpreted or JIT-compiled — they keep using the
+    /// `mir_frames` register file.
+    pub aot_state_id: u32,
 }
 
 impl Default for ObjFiber {
@@ -1010,6 +1017,7 @@ impl ObjFiber {
             context_map: Value::null(),
             cancelled: false,
             deadline_ms: None,
+            aot_state_id: 0,
         }
     }
 
