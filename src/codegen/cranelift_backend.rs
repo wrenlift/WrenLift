@@ -1584,6 +1584,41 @@ pub mod cl {
                 }
             }
 
+            // State-machine resume entry: emit
+            // `wlift_aot_sm_load_value(fiber, slot)` for every
+            // value live across the corresponding suspension,
+            // and define each as the freshly-allocated ValueId
+            // the transform inserted during MIR rewriting. The
+            // remaining instructions in this block reference
+            // those fresh ValueIds, not the originals.
+            if let Some(cfg) = aot_config {
+                if let Some(layout) = cfg.current_state_machine_layout.borrow().clone() {
+                    if let Some(loads) = layout.resume_loads.get(&bid) {
+                        if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
+                            let fiber = builder.use_var(fiber_var);
+                            let load_fn = get_runtime_fn(
+                                module,
+                                builder,
+                                "wlift_aot_sm_load_value",
+                                2,
+                            )?;
+                            for (slot, fresh_vid) in loads {
+                                let slot_v =
+                                    builder.ins().iconst(types::I64, *slot as i64);
+                                let call = builder.ins().call(load_fn, &[fiber, slot_v]);
+                                let v = builder.inst_results(call)[0];
+                                val_map.insert(*fresh_vid, v);
+                                if mark_stack_map
+                                    && is_wren_value(*fresh_vid, &value_types)
+                                {
+                                    builder.declare_value_needs_stack_map(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Lower each instruction
             for &(vid, ref inst) in &block.instructions {
                 // Track raw booleans from f64 comparisons
@@ -1656,6 +1691,34 @@ pub mod cl {
                         if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
                             let fiber = builder.use_var(fiber_var);
                             if let Some(next_state) = layout.yield_blocks.get(&bid) {
+                                // Save every live-across value
+                                // before the suspension. The
+                                // matching resume block prologue
+                                // loads them back into fresh
+                                // ValueIds the transform already
+                                // wired into downstream
+                                // instructions.
+                                if let Some(saves) = layout.yield_saves.get(&bid) {
+                                    let save_fn = get_runtime_fn(
+                                        module,
+                                        builder,
+                                        "wlift_aot_sm_save_value",
+                                        3,
+                                    )?;
+                                    for (slot, vid) in saves {
+                                        let v = match val_map.get(vid) {
+                                            Some(v) => *v,
+                                            None => continue,
+                                        };
+                                        let slot_v = builder
+                                            .ins()
+                                            .iconst(types::I64, *slot as i64);
+                                        let _ = builder.ins().call(
+                                            save_fn,
+                                            &[fiber, slot_v, v],
+                                        );
+                                    }
+                                }
                                 let yield_fn = get_runtime_fn(
                                     module,
                                     builder,

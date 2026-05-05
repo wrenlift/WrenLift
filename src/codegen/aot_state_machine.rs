@@ -52,6 +52,18 @@ pub struct StateMachineLayout {
     /// suspension: store `next_state` to the state struct, stamp
     /// kind=Yield, return v. Other returns stamp kind=Done.
     pub yield_blocks: HashMap<BlockId, u32>,
+    /// Per yield block, the live-across values to save before
+    /// the Return — `(slot_index, value_to_save)`. Lowered as a
+    /// `wlift_aot_sm_save_value(fiber, slot, v)` call sequence
+    /// in the AOT body.
+    pub yield_saves: HashMap<BlockId, Vec<(u32, ValueId)>>,
+    /// Per resume block, the loads to emit at the block's
+    /// entry — `(slot_index, fresh_value_id_to_define)`. The
+    /// transform has already rewritten every downstream use of
+    /// the original ValueId to point at this fresh one, so the
+    /// lowering just needs to call `wlift_aot_sm_load_value(
+    /// fiber, slot)` and store the result in `val_map[fresh_id]`.
+    pub resume_loads: HashMap<BlockId, Vec<(u32, ValueId)>>,
 }
 
 /// Names of methods whose `Call` represents a suspension point.
@@ -142,7 +154,14 @@ pub fn transform_to_state_machine(
     let mut layout = StateMachineLayout {
         resume_entries: vec![mir.entry_block()],
         yield_blocks: HashMap::new(),
+        yield_saves: HashMap::new(),
+        resume_loads: HashMap::new(),
     };
+    // Per-suspension save slot allocation. The vec is shared
+    // across all suspensions — slots get reused as later yields
+    // overwrite earlier saves. `next_slot` tracks the high-water
+    // mark so concurrent saves never alias.
+    let mut next_slot: u32 = 0;
 
     loop {
         let mut found: Option<(BlockId, usize, ValueId)> = None;
@@ -211,42 +230,93 @@ pub fn transform_to_state_machine(
                 .expect("suspension still present after ConstNull insert")
         };
 
-        // Liveness sanity: any value defined in this block
-        // *before* the suspension and used in instructions
-        // *after* it (inside this same block, or transitively
-        // via the original terminator's successors) is a live
-        // value across the suspension. v1 refuses; v2 will save
-        // them. For now scan only inside this block — if a
-        // post-yield instruction uses a pre-yield value, error.
-        {
+        // Liveness pass: collect values defined in this block
+        // *before* the suspension that are used in either:
+        //   - the rest of this block (after the yield), or
+        //   - the trailing terminator, or
+        //   - any block transitively reachable from the new
+        //     resume block via terminator successors.
+        // Each such value gets a save-before-yield + load-on-resume
+        // pair in the layout; subsequent uses are remapped to the
+        // freshly-loaded ValueId so SSA stays valid.
+        let live_across: Vec<ValueId> = {
             let blk = &mir.blocks[blk_id.0 as usize];
             let mut defined_before: std::collections::HashSet<ValueId> =
                 std::collections::HashSet::new();
             for (vid, _) in &blk.instructions[..inst_idx] {
                 defined_before.insert(*vid);
             }
+            // Block params don't survive a split here for v1
+            // (entry-block params are mapped to function args at
+            // lowering time and the post-resume code references
+            // them indirectly through other instructions). v2's
+            // more complete liveness analysis will need to fold
+            // these in; for now they're unhandled and yield-in-a-
+            // block-with-real-params errors out via the branch
+            // refusal below.
+            //
+            // Walk reachable-from-yield-tail uses.
+            let mut used_after: std::collections::HashSet<ValueId> =
+                std::collections::HashSet::new();
             for (_, inst) in &blk.instructions[inst_idx + 1..] {
-                let uses = collect_uses(inst);
-                for u in uses {
-                    if defined_before.contains(&u) {
-                        return Err(StateMachineError::LiveValueAcrossSuspension {
-                            block: blk_id,
-                            value: u,
-                        });
+                for u in collect_uses(inst) {
+                    used_after.insert(u);
+                }
+            }
+            for u in collect_terminator_uses(&blk.terminator) {
+                used_after.insert(u);
+            }
+            // BFS from the original terminator's successors.
+            let mut visited: std::collections::HashSet<BlockId> =
+                std::collections::HashSet::new();
+            let mut stack: Vec<BlockId> = blk.terminator.successors();
+            while let Some(b) = stack.pop() {
+                if !visited.insert(b) {
+                    continue;
+                }
+                let s_blk = &mir.blocks[b.0 as usize];
+                for (_, inst) in &s_blk.instructions {
+                    for u in collect_uses(inst) {
+                        used_after.insert(u);
                     }
                 }
-            }
-            // The trailing terminator: also scan its uses for
-            // any pre-yield-defined value.
-            for u in collect_terminator_uses(&blk.terminator) {
-                if defined_before.contains(&u) {
-                    return Err(StateMachineError::LiveValueAcrossSuspension {
-                        block: blk_id,
-                        value: u,
-                    });
+                for u in collect_terminator_uses(&s_blk.terminator) {
+                    used_after.insert(u);
+                }
+                for s in s_blk.terminator.successors() {
+                    stack.push(s);
                 }
             }
-        }
+            // Stable ordering for deterministic slot assignment:
+            // walk the pre-yield instruction list and pick those
+            // that are also used after.
+            let mut live: Vec<ValueId> = Vec::new();
+            for (vid, _) in &blk.instructions[..inst_idx] {
+                if used_after.contains(vid) {
+                    live.push(*vid);
+                }
+            }
+            live
+        };
+
+        // Allocate save slots + fresh ValueIds for the loads.
+        let saves: Vec<(u32, ValueId)> = live_across
+            .iter()
+            .map(|v| {
+                let slot = next_slot;
+                next_slot += 1;
+                (slot, *v)
+            })
+            .collect();
+        let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
+        let loads: Vec<(u32, ValueId)> = saves
+            .iter()
+            .map(|(slot, original)| {
+                let fresh = mir.new_value();
+                remap.insert(*original, fresh);
+                (*slot, fresh)
+            })
+            .collect();
 
         // Split the block.
         //   blk[0..inst_idx]       → stays in `blk`. Drop the
@@ -272,12 +342,186 @@ pub fn transform_to_state_machine(
         new_block.instructions = post_instructions;
         new_block.terminator = original_terminator;
 
+        // Remap every reference to a saved value in the new
+        // resume block + every block transitively reachable from
+        // it. Subsequent uses now read the freshly-loaded
+        // ValueId from the resume block's prologue (emitted by
+        // the AOT lowering from `layout.resume_loads`).
+        if !remap.is_empty() {
+            let mut visited: std::collections::HashSet<BlockId> =
+                std::collections::HashSet::new();
+            let mut stack: Vec<BlockId> = vec![new_block_id];
+            while let Some(b) = stack.pop() {
+                if !visited.insert(b) {
+                    continue;
+                }
+                let blk = mir.block_mut(b);
+                for (_, inst) in &mut blk.instructions {
+                    remap_instruction_uses(inst, &remap);
+                }
+                remap_terminator_uses(&mut blk.terminator, &remap);
+                for s in blk.terminator.successors() {
+                    stack.push(s);
+                }
+            }
+        }
+
         let next_state = layout.resume_entries.len() as u32;
         layout.resume_entries.push(new_block_id);
         layout.yield_blocks.insert(blk_id, next_state);
+        if !saves.is_empty() {
+            layout.yield_saves.insert(blk_id, saves);
+            layout.resume_loads.insert(new_block_id, loads);
+        }
     }
 
     Ok(layout)
+}
+
+/// Replace every `ValueId` operand of `inst` with the mapping in
+/// `remap`. Untouched if the operand isn't a key. Mirrors the
+/// shape of `Instruction::operands` but writes back. v1's
+/// liveness check only reads operands; the v2 lifting needs the
+/// in-place rewrite to keep SSA valid after a split.
+fn remap_instruction_uses(inst: &mut Instruction, remap: &HashMap<ValueId, ValueId>) {
+    let mp = |v: &mut ValueId| {
+        if let Some(new) = remap.get(v) {
+            *v = *new;
+        }
+    };
+    use Instruction::*;
+    match inst {
+        Add(a, b) | Sub(a, b) | Mul(a, b) | Div(a, b) | Mod(a, b) => {
+            mp(a);
+            mp(b);
+        }
+        AddF64(a, b) | SubF64(a, b) | MulF64(a, b) | DivF64(a, b) | ModF64(a, b) => {
+            mp(a);
+            mp(b);
+        }
+        CmpLt(a, b) | CmpGt(a, b) | CmpLe(a, b) | CmpGe(a, b) | CmpEq(a, b) | CmpNe(a, b) => {
+            mp(a);
+            mp(b);
+        }
+        CmpLtF64(a, b) | CmpGtF64(a, b) | CmpLeF64(a, b) | CmpGeF64(a, b) => {
+            mp(a);
+            mp(b);
+        }
+        BitAnd(a, b) | BitOr(a, b) | BitXor(a, b) | Shl(a, b) | Shr(a, b) => {
+            mp(a);
+            mp(b);
+        }
+        MathBinaryF64(_, a, b) => {
+            mp(a);
+            mp(b);
+        }
+        Neg(a) | NegF64(a) | Not(a) | BitNot(a) | GuardNum(a) | GuardBool(a) | Unbox(a)
+        | Box(a) | Move(a) | ToString(a) => mp(a),
+        MathUnaryF64(_, a) => mp(a),
+        GuardClass(a, _) | GuardProtocol(a, _) | IsType(a, _) => mp(a),
+        GetField(recv, _) => mp(recv),
+        SetField(recv, _, val) => {
+            mp(recv);
+            mp(val);
+        }
+        SetStaticField(_, val) | SetUpvalue(_, val) | SetModuleVar(_, val) => mp(val),
+        Call { receiver, args, .. } | CallKnownFunc { receiver, args, .. } => {
+            mp(receiver);
+            for a in args.iter_mut() {
+                mp(a);
+            }
+        }
+        CallStaticSelf { args } => {
+            for a in args.iter_mut() {
+                mp(a);
+            }
+        }
+        SuperCall { args, .. } => {
+            for a in args.iter_mut() {
+                mp(a);
+            }
+        }
+        MakeClosure { upvalues, .. } => {
+            for v in upvalues.iter_mut() {
+                mp(v);
+            }
+        }
+        MakeList(elems) => {
+            for v in elems.iter_mut() {
+                mp(v);
+            }
+        }
+        MakeMap(pairs) => {
+            for (k, v) in pairs.iter_mut() {
+                mp(k);
+                mp(v);
+            }
+        }
+        MakeRange(from, to, _) => {
+            mp(from);
+            mp(to);
+        }
+        StringConcat(parts) => {
+            for v in parts.iter_mut() {
+                mp(v);
+            }
+        }
+        SubscriptGet { receiver, args } => {
+            mp(receiver);
+            for a in args.iter_mut() {
+                mp(a);
+            }
+        }
+        SubscriptSet { receiver, args, value } => {
+            mp(receiver);
+            for a in args.iter_mut() {
+                mp(a);
+            }
+            mp(value);
+        }
+        // Pure constants and parameter loads have no operand uses.
+        ConstNum(_) | ConstBool(_) | ConstNull | ConstString(_) | ConstF64(_) | ConstI64(_) => {}
+        GetModuleVar(_) | GetStaticField(_) | GetUpvalue(_) | BlockParam(_) => {}
+        // Defensive fallback: any unknown variant is left alone.
+        // Tracking new variants happens via the operands_mut()
+        // canonical walker once it lands; for now the explicit
+        // list above covers every Instruction the MIR builder
+        // emits.
+        #[allow(unreachable_patterns)]
+        _ => {}
+    }
+}
+
+/// Mirror of [`remap_instruction_uses`] for terminators.
+fn remap_terminator_uses(term: &mut Terminator, remap: &HashMap<ValueId, ValueId>) {
+    let mp = |v: &mut ValueId| {
+        if let Some(new) = remap.get(v) {
+            *v = *new;
+        }
+    };
+    match term {
+        Terminator::Return(v) => mp(v),
+        Terminator::ReturnNull | Terminator::Unreachable => {}
+        Terminator::Branch { args, .. } => {
+            for a in args.iter_mut() {
+                mp(a);
+            }
+        }
+        Terminator::CondBranch {
+            condition,
+            true_args,
+            false_args,
+            ..
+        } => {
+            mp(condition);
+            for a in true_args.iter_mut() {
+                mp(a);
+            }
+            for a in false_args.iter_mut() {
+                mp(a);
+            }
+        }
+    }
 }
 
 /// Collect ValueId reads from one instruction. Defers to the
@@ -327,11 +571,13 @@ f.call()
         assert_eq!(layout.yield_blocks.len(), 2, "expected 2 yield blocks");
     }
 
-    /// Fiber body with a yield that has a value live across it
-    /// — must error with `LiveValueAcrossSuspension` so the AOT
-    /// driver can degrade cleanly until v2 lands.
+    /// v2 lift: a value defined before the yield and used
+    /// after must round-trip through the fiber's saved-slot
+    /// table. The transform allocates a slot per live value
+    /// and rewrites downstream uses to reference the
+    /// freshly-loaded ValueId.
     #[test]
-    fn live_value_across_yield_errors() {
+    fn live_value_across_yield_saves_and_remaps() {
         let src = r#"
 var f = Fiber.new {
   var x = 7
@@ -341,14 +587,33 @@ var f = Fiber.new {
 f.call()
 "#;
         let (mut mir, interner) = build_mir_from_source(src, /* closure_idx */ 0);
-        let result = transform_to_state_machine(&mut mir, &interner);
+        let layout = transform_to_state_machine(&mut mir, &interner)
+            .expect("v2 transform handles live values across yield");
         assert!(
-            matches!(
-                result,
-                Err(StateMachineError::LiveValueAcrossSuspension { .. })
-            ),
-            "expected LiveValueAcrossSuspension; got {:?}",
-            result
+            !layout.yield_saves.is_empty(),
+            "expected saves for the live `x`, got {:?}",
+            layout.yield_saves
+        );
+        assert!(
+            !layout.resume_loads.is_empty(),
+            "expected matching loads at the resume entry, got {:?}",
+            layout.resume_loads
+        );
+        // Sanity: every saved (slot, original) has a paired
+        // (slot, fresh) in the resume entry.
+        let saved_slots: std::collections::HashSet<u32> = layout
+            .yield_saves
+            .values()
+            .flat_map(|v| v.iter().map(|(s, _)| *s))
+            .collect();
+        let load_slots: std::collections::HashSet<u32> = layout
+            .resume_loads
+            .values()
+            .flat_map(|v| v.iter().map(|(s, _)| *s))
+            .collect();
+        assert_eq!(
+            saved_slots, load_slots,
+            "save/load slot sets must match"
         );
     }
 }

@@ -992,6 +992,14 @@ pub struct ObjFiber {
     /// is interpreted or JIT-compiled — they keep using the
     /// `mir_frames` register file.
     pub aot_state_id: u32,
+    /// Saved-value slot table for the AOT state machine. Each
+    /// suspension writes the live values it needs preserved
+    /// (locals defined before the yield + used after) into a
+    /// run of slots; the matching resume entry reads them back
+    /// into fresh SSA values. Slots are reused across
+    /// suspensions — a later yield's live set overwrites
+    /// earlier saves. The vec resizes on demand at first save.
+    pub aot_saved_values: Vec<Value>,
 }
 
 impl Default for ObjFiber {
@@ -1018,6 +1026,7 @@ impl ObjFiber {
             cancelled: false,
             deadline_ms: None,
             aot_state_id: 0,
+            aot_saved_values: Vec::new(),
         }
     }
 

@@ -1241,6 +1241,63 @@ pub fn wlift_aot_sm_take_poll_kind() -> AotSmPollKind {
     })
 }
 
+/// Save a Wren value into the fiber's saved-slot table at
+/// `slot`. Called at every suspension by the AOT-emitted poll
+/// function for each value live across the yield. The vec is
+/// resized on demand so slots can be assigned in any order
+/// without an upfront sizing pass.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_save_value(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    slot: u64,
+    value_bits: u64,
+) {
+    if fiber.is_null() {
+        return;
+    }
+    let slot = slot as usize;
+    unsafe {
+        let saved = &mut (*fiber).aot_saved_values;
+        if slot >= saved.len() {
+            saved.resize(slot + 1, crate::runtime::value::Value::null());
+        }
+        saved[slot] = crate::runtime::value::Value::from_bits(value_bits);
+    }
+}
+
+/// Read back a saved value at `slot`. Called at the resume
+/// entry of every state that has live-in saved values.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`. Returns null bits
+/// for out-of-range slots so a corrupted state struct surfaces
+/// as a runtime null rather than UB.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_load_value(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    slot: u64,
+) -> u64 {
+    if fiber.is_null() {
+        return crate::runtime::value::Value::null().to_bits();
+    }
+    let slot = slot as usize;
+    unsafe {
+        let saved = &(*fiber).aot_saved_values;
+        saved
+            .get(slot)
+            .copied()
+            .unwrap_or_else(crate::runtime::value::Value::null)
+            .to_bits()
+    }
+}
+
 /// Resolve a bare-builtin import (`import "socket" for SocketCore`,
 /// `import "fs" for FS`, ...) into the AOT module's modvars at
 /// startup. The walker skips these from the dependency graph
