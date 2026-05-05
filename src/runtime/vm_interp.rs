@@ -4391,6 +4391,7 @@ pub unsafe fn call_jit_fn_pub(fn_ptr: *const u8, args: &[Value]) -> u64 {
 #[inline(always)]
 unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
     ensure_ctx_reg();
+    let b = |i: usize| args[i].to_bits();
     match args.len() {
         0 => {
             let f: extern "C" fn() -> u64 = std::mem::transmute(fn_ptr);
@@ -4398,24 +4399,37 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
         }
         1 => {
             let f: extern "C" fn(u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits())
+            f(b(0))
         }
         2 => {
             let f: extern "C" fn(u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits())
+            f(b(0), b(1))
         }
         3 => {
             let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
+            f(b(0), b(1), b(2))
+        }
+        4 => {
+            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3))
+        }
+        5 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4))
+        }
+        6 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5))
+        }
+        7 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6))
         }
         _ => {
-            let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
-            f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-            )
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7))
         }
     }
 }

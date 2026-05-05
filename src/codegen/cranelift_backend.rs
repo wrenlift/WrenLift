@@ -833,6 +833,10 @@ pub mod cl {
             "wren_call_2",
             "wren_call_3",
             "wren_call_4",
+            "wren_call_5",
+            "wren_call_6",
+            "wren_call_7",
+            "wren_call_8",
             "wren_load_jit_ptr",
             "wren_known_call_0",
             "wren_known_call_1",
@@ -1803,14 +1807,14 @@ pub mod cl {
                 // wren_call_N helpers only exist up to arity 4. Calls with
                 // more than 4 args silently truncated on the JIT path,
                 // which corrupts callee parameters (e.g. Render_.new with
-                // 7 args saw its final three become undefined). Bail out
-                // so the function falls back to the interpreter until we
-                // grow wren_call_5..wren_call_8 wrappers.
-                if args.len() > 4 {
+                // 7 args saw its final three become undefined). Bail
+                // out for arities beyond the helper family
+                // (`wren_call_0..wren_call_8`); deltablue's arity-5
+                // call sites land inside that range now.
+                if args.len() > 8 {
                     return Err(format!(
-                        "Call with arity {} not supported by JIT (need wren_call_{})",
+                        "Call with arity {} not supported by JIT (max 8)",
                         args.len(),
-                        args.len()
                     ));
                 }
                 let r = get(receiver);
@@ -1978,10 +1982,10 @@ pub mod cl {
                                     3 => "wren_call_3",
                                     _ => "wren_call_4",
                                 };
-                                let arg_count = 2 + args.len().min(4);
+                                let arg_count = 2 + args.len().min(8);
                                 let f = get_runtime_fn(module, builder, call_name, arg_count)?;
                                 let mut slow_args = vec![r, method_val];
-                                for a in args.iter().take(4) {
+                                for a in args.iter().take(8) {
                                     slow_args.push(get(a));
                                 }
                                 let slow_call = builder.ins().call(f, &slow_args);
@@ -2072,10 +2076,10 @@ pub mod cl {
                             3 => "wren_call_3",
                             _ => "wren_call_4",
                         };
-                        let arg_count = 2 + args.len().min(4);
+                        let arg_count = 2 + args.len().min(8);
                         let f = get_runtime_fn(module, builder, call_name, arg_count)?;
                         let mut slow_args = vec![r, method_val];
-                        for a in args.iter().take(4) {
+                        for a in args.iter().take(8) {
                             slow_args.push(get(a));
                         }
                         let slow_call = builder.ins().call(f, &slow_args);
@@ -2123,12 +2127,16 @@ pub mod cl {
                     1 => "wren_call_1",
                     2 => "wren_call_2",
                     3 => "wren_call_3",
-                    _ => "wren_call_4",
+                    4 => "wren_call_4",
+                    5 => "wren_call_5",
+                    6 => "wren_call_6",
+                    7 => "wren_call_7",
+                    _ => "wren_call_8",
                 };
-                let arg_count = 2 + args.len().min(4);
+                let arg_count = 2 + args.len().min(8);
                 let f = get_runtime_fn(module, builder, call_name, arg_count)?;
                 let mut call_args = vec![r, method_val];
-                for a in args.iter().take(4) {
+                for a in args.iter().take(8) {
                     call_args.push(get(a));
                 }
                 let result = builder.ins().call(f, &call_args);
@@ -2145,11 +2153,13 @@ pub mod cl {
                 receiver,
                 args,
             } => {
-                // Same wren_call_N arity limit as Instruction::Call — the
-                // slow-path fallback inside this branch also truncates.
-                if args.len() > 4 {
+                // Same wren_call_N arity limit as Instruction::Call —
+                // the slow-path fallback inside this branch also
+                // truncates. Aligned to the wren_call_0..wren_call_8
+                // family.
+                if args.len() > 8 {
                     return Err(format!(
-                        "CallKnownFunc with arity {} not supported by JIT",
+                        "CallKnownFunc with arity {} not supported by JIT (max 8)",
                         args.len()
                     ));
                 }
@@ -2180,10 +2190,10 @@ pub mod cl {
                         3 => "wren_call_3",
                         _ => "wren_call_4",
                     };
-                    let arg_count = 2 + args.len().min(4);
+                    let arg_count = 2 + args.len().min(8);
                     let f = get_runtime_fn(module, builder, call_name, arg_count)?;
                     let mut call_args = vec![r, method_val];
-                    for a in args.iter().take(4) {
+                    for a in args.iter().take(8) {
                         call_args.push(get(a));
                     }
                     let result = builder.ins().call(f, &call_args);
@@ -2284,10 +2294,10 @@ pub mod cl {
                             3 => "wren_call_3",
                             _ => "wren_call_4",
                         };
-                        let slow_arg_count = 2 + args.len().min(4);
+                        let slow_arg_count = 2 + args.len().min(8);
                         let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
                         let mut slow_args = vec![r, method_val];
-                        for a in args.iter().take(4) {
+                        for a in args.iter().take(8) {
                             slow_args.push(get(a));
                         }
                         let slow_call = builder.ins().call(slow_f, &slow_args);
@@ -2351,10 +2361,10 @@ pub mod cl {
                         3 => "wren_call_3",
                         _ => "wren_call_4",
                     };
-                    let slow_arg_count = 2 + args.len().min(4);
+                    let slow_arg_count = 2 + args.len().min(8);
                     let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
                     let mut slow_args = vec![r, method_val];
-                    for a in args.iter().take(4) {
+                    for a in args.iter().take(8) {
                         slow_args.push(get(a));
                     }
                     let slow_call = builder.ins().call(slow_f, &slow_args);
@@ -2433,10 +2443,10 @@ pub mod cl {
                         3 => "wren_call_3",
                         _ => "wren_call_4",
                     };
-                    let slow_arg_count = 2 + args.len().min(4);
+                    let slow_arg_count = 2 + args.len().min(8);
                     let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
                     let mut slow_args = vec![r, method_val];
-                    for a in args.iter().take(4) {
+                    for a in args.iter().take(8) {
                         slow_args.push(get(a));
                     }
                     let slow_call = builder.ins().call(slow_f, &slow_args);

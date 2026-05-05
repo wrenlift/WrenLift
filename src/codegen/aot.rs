@@ -1206,6 +1206,37 @@ pub fn compile_modules_to_object(modules: &[AotModule], output: &Path) -> Result
     compile_modules_to_object_with_manifest(modules, output).map(|_| ())
 }
 
+/// Scan a method's MIR for instructions that read
+/// `JitContext.defining_class` at runtime. Currently:
+///
+/// * `SuperCall` — `wren_super_call_N` walks up
+///   `defining_class.superclass` to resolve the target.
+/// * `GetStaticField` / `SetStaticField` — read or write a
+///   field on `defining_class` directly.
+///
+/// `dispatch_method`'s `Closure` arm sets `defining_class` per
+/// call before entering the body, but the AOT CHA direct-call
+/// path skips that setup to avoid the per-call context swap.
+/// Excluding these methods from devirt keeps the runtime's
+/// implicit-context contract intact at the cost of one
+/// `wren_call_N` per affected site.
+fn method_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
+    use crate::mir::Instruction;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            if matches!(
+                inst,
+                Instruction::SuperCall { .. }
+                    | Instruction::GetStaticField(_)
+                    | Instruction::SetStaticField(_, _)
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Build the whole-program method table — every (signature →
 /// `Vec<AotMethodImpl>`) pair across all walked modules — once
 /// up front. The lowering threads a borrow of this into
@@ -1235,6 +1266,19 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                 continue;
             };
             for (m_idx, method) in class_mir.methods.iter().enumerate() {
+                // Skip methods that issue a SuperCall — those need
+                // `JitContext.defining_class` to be set to *this*
+                // method's class (the runtime's dispatch_method
+                // does it before calling the closure body); the
+                // CHA direct-call path doesn't set it. Routing
+                // through `wren_call_N` keeps super dispatch
+                // correct at the cost of devirt for these
+                // methods. Same call covers methods that read
+                // static fields off the defining class, since
+                // those also consult `defining_class`.
+                if method_uses_defining_class(&method.mir) {
+                    continue;
+                }
                 let fn_symbol = format!("{}__method_{}_{}", fn_prefix, c_idx, m_idx);
                 let trivial =
                     crate::runtime::engine::ExecutionEngine::mir_trivial_getter_field(&method.mir);

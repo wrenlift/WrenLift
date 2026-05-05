@@ -4018,6 +4018,49 @@ impl VM {
             let fn_ptr = unsafe { (*live_closure).function };
             let func_id = crate::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
 
+            // AOT-stub fast path: a function registered via
+            // `engine.register_aot_function` carries an empty MIR
+            // and a populated `jit_code[func_id]` slot. Walking the
+            // empty `mir.blocks[0]` would panic; route through
+            // `call_jit_fn` directly with the closure as receiver.
+            // Only fires when the body is genuinely AOT-stubbed —
+            // JIT-tier-up'd functions still walk MIR for their
+            // inner closure dispatch shape.
+            let aot_fn = self
+                .engine
+                .jit_code
+                .get(func_id.0 as usize)
+                .copied()
+                .unwrap_or(std::ptr::null());
+            let mir_empty = self
+                .engine
+                .get_mir(func_id)
+                .map(|m| m.blocks.is_empty())
+                .unwrap_or(false);
+            if !aot_fn.is_null() && mir_empty && args.len() <= 7 {
+                let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+                crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                    ctx.current_func_id = func_id.0 as u64;
+                    ctx.closure = live_closure as *mut u8;
+                    ctx.defining_class = live_defining_class
+                        .map(|p| p as *mut u8)
+                        .unwrap_or(std::ptr::null_mut());
+                });
+                let mut jit_args = [Value::null(); 8];
+                let recv = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+                jit_args[0] = recv;
+                for i in 0..args.len() {
+                    jit_args[i + 1] =
+                        crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
+                }
+                let n = args.len() + 1;
+                let result_bits =
+                    unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
+                crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return Some(Value::from_bits(result_bits));
+            }
+
             let mir = match self.engine.get_mir(func_id) {
                 Some(mir) => mir,
                 None => {
@@ -4086,12 +4129,50 @@ impl VM {
             return result.ok();
         }
 
+        // No active fiber: same AOT-stub fast path as the
+        // active-fiber branch above. Without this, sequence/iter
+        // helpers calling user closures via NativeContext when
+        // there's no live fiber (test setup, embedding API)
+        // would walk the empty stub MIR and panic on
+        // `mir.blocks[0]`.
+        let fn_ptr = unsafe { (*live_closure).function };
+        let func_id = crate::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+        let aot_fn = self
+            .engine
+            .jit_code
+            .get(func_id.0 as usize)
+            .copied()
+            .unwrap_or(std::ptr::null());
+        let mir_empty = self
+            .engine
+            .get_mir(func_id)
+            .map(|m| m.blocks.is_empty())
+            .unwrap_or(false);
+        if !aot_fn.is_null() && mir_empty && args.len() <= 7 {
+            let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = func_id.0 as u64;
+                ctx.closure = live_closure as *mut u8;
+                ctx.defining_class = live_defining_class
+                    .map(|p| p as *mut u8)
+                    .unwrap_or(std::ptr::null_mut());
+            });
+            let mut jit_args = [Value::null(); 8];
+            let recv = crate::codegen::runtime_fns::jit_root_at(root_len_before);
+            jit_args[0] = recv;
+            for i in 0..args.len() {
+                jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
+            }
+            let n = args.len() + 1;
+            let result_bits = unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
+            crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return Some(Value::from_bits(result_bits));
+        }
+
         let temp_fiber = self.acquire_sync_fiber();
         unsafe {
             (*temp_fiber).header.class = self.fiber_class;
-
-            let fn_ptr = (*live_closure).function;
-            let func_id = crate::runtime::engine::FuncId((*fn_ptr).fn_id);
 
             let mir = match self.engine.get_mir(func_id) {
                 Some(mir) => mir,
@@ -4246,7 +4327,7 @@ impl VM {
         } else {
             std::ptr::null()
         };
-        if !jit_ptr.is_null() && ctor_args.len() <= 3 {
+        if !jit_ptr.is_null() && ctor_args.len() <= 7 {
             // Push every ctor arg as a JIT root so a GC fired during
             // the constructor body (allocations, foreign calls, etc.)
             // updates each pointer through the shared roots Vec
@@ -4257,6 +4338,11 @@ impl VM {
             // the args already loaded into registers — which is the
             // class of "Constructor JIT SIGSEGV under GC pressure"
             // bug logged in CLAUDE.md / project_cranelift_fixes.
+            //
+            // Cap at 7 user args (8 total with the implicit
+            // instance receiver) to match the wren_call_0..wren_call_8
+            // helper family + call_jit_fn's arity ladder. Beyond
+            // that the caller still falls through to the MIR walker.
             for arg in ctor_args.iter() {
                 crate::codegen::runtime_fns::push_jit_root(*arg);
             }
@@ -4266,7 +4352,9 @@ impl VM {
             // reading via `jit_root_at` keeps every value in
             // lockstep with the GC's view).
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
-            let mut jit_args = [Value::null(); 4];
+            // Sized to fit the widest call_jit_fn arm (instance + 7
+            // user args = 8 slots).
+            let mut jit_args = [Value::null(); 8];
             jit_args[0] = live_instance;
             for i in 0..ctor_args.len() {
                 jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1 + i);

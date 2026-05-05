@@ -2463,6 +2463,105 @@ pub extern "C" fn wren_call_4(
 ) -> u64 {
     wren_call_4_inner(receiver, method, a0, a1, a2, a3, 0, 0)
 }
+/// Call helper for arity 5..8. Same shape as wren_call_4_inner —
+/// roots every arg, dispatches via the standard helper, pops
+/// frame on the way back. Skipping the naked-asm jit_fp/ret_addr
+/// capture used by call_0..4: with all 8 aarch64 register slots
+/// already filled by user args + recv + method + jit_fp, the
+/// 9th arg (ret_addr) would have to spill — and stack maps are
+/// gated off by default anyway. Pass 0/0 here, matching the
+/// non-mainstream-arch fallback the lower-arity helpers already
+/// take.
+fn wren_call_n_inner(receiver: u64, method: u64, args_in: &[u64]) -> u64 {
+    note_wren_call_entry();
+    let root_base = jit_roots_snapshot_len();
+    push_jit_root(Value::from_bits(receiver));
+    for &a in args_in {
+        push_jit_root(Value::from_bits(a));
+    }
+    let result = (|| {
+        let recv = jit_root_at(root_base);
+        let mut args = Vec::with_capacity(args_in.len() + 1);
+        args.push(recv);
+        for i in 0..args_in.len() {
+            args.push(jit_root_at(root_base + 1 + i));
+        }
+        if let Some(result) = try_dispatch_call_noframe_fast(recv, method, &args) {
+            return result;
+        }
+        push_jit_frame(0, read_jit_ctx().current_func_id as u32, 0);
+        let recv = jit_root_at(root_base);
+        let mut args = Vec::with_capacity(args_in.len() + 1);
+        args.push(recv);
+        for i in 0..args_in.len() {
+            args.push(jit_root_at(root_base + 1 + i));
+        }
+        let result = dispatch_call(recv, method, &args);
+        pop_jit_frame();
+        result
+    })();
+    jit_roots_restore_len(root_base);
+    result
+}
+
+#[no_mangle]
+pub extern "C" fn wren_call_5(
+    receiver: u64,
+    method: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+) -> u64 {
+    wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4])
+}
+
+#[no_mangle]
+pub extern "C" fn wren_call_6(
+    receiver: u64,
+    method: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+) -> u64 {
+    wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4, a5])
+}
+
+#[no_mangle]
+pub extern "C" fn wren_call_7(
+    receiver: u64,
+    method: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) -> u64 {
+    wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4, a5, a6])
+}
+
+#[no_mangle]
+pub extern "C" fn wren_call_8(
+    receiver: u64,
+    method: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+) -> u64 {
+    wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4, a5, a6, a7])
+}
+
 extern "C" fn wren_call_4_inner(
     receiver: u64,
     method: u64,
@@ -4229,6 +4328,10 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_call_2" => Some(wren_call_2 as *const () as usize),
         "wren_call_3" => Some(wren_call_3 as *const () as usize),
         "wren_call_4" => Some(wren_call_4 as *const () as usize),
+        "wren_call_5" => Some(wren_call_5 as *const () as usize),
+        "wren_call_6" => Some(wren_call_6 as *const () as usize),
+        "wren_call_7" => Some(wren_call_7 as *const () as usize),
+        "wren_call_8" => Some(wren_call_8 as *const () as usize),
         "wren_call_static_self_0" => Some(wren_call_static_self_0 as *const () as usize),
         "wren_call_static_self_1" => Some(wren_call_static_self_1 as *const () as usize),
         "wren_call_static_self_2" => Some(wren_call_static_self_2 as *const () as usize),
