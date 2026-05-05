@@ -817,8 +817,6 @@ fn build_bytecode_cache(source: &str, filename: &str, out_path: &str, cli: &Cli)
 /// to point at one.
 #[cfg(feature = "aot")]
 fn aot_build_executable(input: &str, out_path: &str) {
-    use std::process::Command;
-
     let entry_path = std::path::PathBuf::from(input);
     if !entry_path.is_file() {
         eprintln!(
@@ -840,7 +838,7 @@ fn aot_build_executable(input: &str, out_path: &str) {
         }
     };
 
-    let staticlib_path = match locate_wren_lift_staticlib() {
+    let staticlib_path = match wren_lift::codegen::aot::locate_runtime_staticlib() {
         Some(p) => p,
         None => {
             eprintln!("error: could not locate libwren_lift.a — set WLIFT_STATICLIB to its");
@@ -881,40 +879,12 @@ fn aot_build_executable(input: &str, out_path: &str) {
         eprintln!("wlift: kept object at {}", keep.display());
     }
 
-    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let mut cmd = Command::new(&cc);
-    cmd.arg(&obj_path)
-        .arg(&staticlib_path)
-        .arg("-o")
-        .arg(out_path);
-    // System libraries the runtime staticlib pulls in (pthread,
-    // dl, math, libc++ runtime). macOS frameworks live behind
-    // `-framework`. Windows would land later — `wlift build`
-    // there needs lib.exe / link.exe, separate driver story.
-    if cfg!(target_os = "macos") {
-        cmd.arg("-lpthread")
-            .arg("-ldl")
-            .arg("-lm")
-            .arg("-framework")
-            .arg("CoreFoundation")
-            .arg("-framework")
-            .arg("Security");
-    } else if cfg!(target_os = "linux") {
-        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
-    }
-
-    let status = match cmd.status() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: invoking `{}`: {}", cc, e);
-            eprintln!(
-                "       Set CC to a compiler binary (e.g. `gcc`, `clang`) if `cc` isn't on PATH."
-            );
-            process::exit(1);
-        }
-    };
-    if !status.success() {
-        eprintln!("error: linker exited with {}", status);
+    if let Err(e) = wren_lift::codegen::aot::link_executable(
+        &obj_path,
+        &staticlib_path,
+        std::path::Path::new(out_path),
+    ) {
+        eprintln!("error: {}", e);
         process::exit(1);
     }
     eprintln!("wlift: produced {}", out_path);
@@ -928,46 +898,6 @@ fn aot_build_executable(_input: &str, _out_path: &str) {
          that ships the AOT pipeline."
     );
     process::exit(1);
-}
-
-/// Walk a small set of well-known locations for the WrenLift
-/// runtime staticlib (`libwren_lift.a`). Returns the first
-/// existing file. Order: `WLIFT_STATICLIB` env var (explicit
-/// override) → next to `wlift` itself → `target/release/...` →
-/// `target/debug/...` from CWD.
-#[cfg(feature = "aot")]
-fn locate_wren_lift_staticlib() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("WLIFT_STATICLIB") {
-        let path = std::path::PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    let staticlib_name = if cfg!(target_os = "windows") {
-        "wren_lift.lib"
-    } else {
-        "libwren_lift.a"
-    };
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(staticlib_name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    for profile in ["release", "debug"] {
-        let candidate = std::path::PathBuf::from("target")
-            .join(profile)
-            .join(staticlib_name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 /// `target` (when `Some`) is stamped into the manifest's `target`

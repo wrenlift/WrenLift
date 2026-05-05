@@ -1448,6 +1448,103 @@ pub fn compile_walk_to_object_with_manifest(
     Ok(manifests)
 }
 
+/// Locate `libwren_lift.a` (or `wren_lift.lib` on Windows) for
+/// the linker step that turns an AOT-emitted `.o` into a
+/// runnable executable. Lookup order:
+///
+/// 1. `WLIFT_STATICLIB` env var pointing at an explicit path.
+/// 2. Sibling of the running executable (CLI install case).
+/// 3. `target/{release,debug}/` from the current working
+///    directory (developer checkout case).
+///
+/// Returns `None` if no candidate file exists; callers should
+/// surface a `cargo build --release --features aot` hint.
+pub fn locate_runtime_staticlib() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("WLIFT_STATICLIB") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let staticlib_name = if cfg!(target_os = "windows") {
+        "wren_lift.lib"
+    } else {
+        "libwren_lift.a"
+    };
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(staticlib_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    for profile in ["release", "debug"] {
+        let candidate = PathBuf::from("target")
+            .join(profile)
+            .join(staticlib_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Link a previously-emitted AOT object file against
+/// `libwren_lift.a` into a standalone executable at `out`. The
+/// command is the same one the `wlift --aot` CLI runs: invoke
+/// `$CC` (defaults to `cc`) with the object, the staticlib, and
+/// the platform-specific system libraries the runtime depends
+/// on (pthread, dl, m everywhere; CoreFoundation + Security on
+/// macOS).
+///
+/// On macOS arm64, also runs an ad-hoc `codesign -f -s -` over
+/// the produced binary so the OS doesn't refuse to execute the
+/// freshly-linked file (Gatekeeper rejects unsigned arm64 Mach-O
+/// binaries with EBADARCH on recent macOS releases). The codesign
+/// step is best-effort; failures are surfaced but don't poison
+/// the link result for callers that are happy to ship unsigned.
+pub fn link_executable(obj: &Path, staticlib: &Path, out: &Path) -> Result<(), AotError> {
+    use std::process::Command;
+
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let mut cmd = Command::new(&cc);
+    cmd.arg(obj).arg(staticlib).arg("-o").arg(out);
+    if cfg!(target_os = "macos") {
+        cmd.arg("-lpthread")
+            .arg("-ldl")
+            .arg("-lm")
+            .arg("-framework")
+            .arg("CoreFoundation")
+            .arg("-framework")
+            .arg("Security");
+    } else if cfg!(target_os = "linux") {
+        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+    }
+
+    let status = cmd.status().map_err(|e| {
+        AotError::Module(format!(
+            "invoking `{}`: {}; set CC to a compiler binary if `cc` isn't on PATH",
+            cc, e
+        ))
+    })?;
+    if !status.success() {
+        return Err(AotError::Module(format!("linker exited with {}", status)));
+    }
+
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        let _ = Command::new("codesign")
+            .args(["-f", "-s", "-"])
+            .arg(out)
+            .status();
+    }
+
+    Ok(())
+}
+
 /// Emit the program entry — `main(argc, argv)` — directly into
 /// the AOT object via Cranelift, alongside the per-module name
 /// strings and const-text bytes the entry references. The
