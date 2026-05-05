@@ -1137,14 +1137,15 @@ impl ExecutionEngine {
                 if obj_type != crate::runtime::object::ObjType::Class {
                     continue;
                 }
-                // Skip nursery-allocated classes. The generational
-                // GC promotes them on the first minor collection
-                // and the recycled nursery slot can be reclaimed
-                // by an unrelated allocation; a class-check baked
-                // with the old address would coincidentally match
-                // the recycled object and the inlined body would
-                // dereference at the wrong layout. Old-gen
-                // pointers are stable for the rest of the run.
+                // Defense-in-depth: skip nursery-allocated classes.
+                // `alloc_class` now goes straight to the old arena
+                // so this is a no-op in normal flows, but classes
+                // promoted via legacy paths (or fresh allocations
+                // from a different GC backend) could still be
+                // young, and a class-check baked with a young
+                // pointer would coincidentally match a recycled
+                // nursery slot after promotion — exactly the
+                // e2e_jit_nbody crash pattern.
                 let generation = unsafe { (*header).generation };
                 if generation == 0 {
                     continue;
