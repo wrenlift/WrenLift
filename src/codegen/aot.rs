@@ -707,6 +707,141 @@ fn make_object_module() -> Result<ObjectModule, AotError> {
     Ok(ObjectModule::new(object_builder))
 }
 
+/// Direct method names that suspend the running fiber. Functions
+/// containing a `Call` to one of these — or transitively reaching
+/// one through their own `Call` chain — must be lowered as a
+/// state machine instead of a straight-line native function so
+/// suspension actually stops execution and a later `fiber.call`
+/// resumes from the saved state. Mirrors the JIT-side
+/// `direct_yield_method_names` in `engine.rs`; kept separate here
+/// because the AOT pipeline operates over `&[AotModule]` and
+/// resolves symbols per-module rather than off a shared
+/// `Interner`.
+///
+/// `try()` / `transfer()` / `transferError(_)` are deliberately
+/// out of this list for AOT: those primitives synchronously drive
+/// a target fiber to its next yield from a *non-yielding caller*,
+/// so the caller doesn't need a state machine — only the target
+/// body's transitive yield reach does.
+fn aot_direct_yield_method_names() -> &'static [&'static str] {
+    &["yield()", "yield(_)", "suspend()"]
+}
+
+/// Walk every reachable MIR in `modules` and return the set of
+/// resolved method names whose implementation transitively reaches
+/// `Fiber.yield` / `Fiber.suspend`. Cross-module taint propagation
+/// works on resolved names rather than `SymbolId` because each
+/// `AotModule` mints its own interner — symbol identities don't
+/// line up across modules but the printed signatures do.
+///
+/// Used by the AOT pipeline to decide which functions need the
+/// state-machine MIR transform. The returned set is a closure
+/// over the call graph: any function whose name appears in the
+/// set is tainted, and any function calling a tainted-named
+/// method is itself tainted.
+pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String> {
+    let mut tainted: HashSet<String> = aot_direct_yield_method_names()
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    // Fixed-point iteration. Each pass marks any function whose
+    // body calls a tainted method as itself tainted (under its
+    // mir.name resolved against its module's interner). Bound by
+    // the total function count + 1 so we always terminate.
+    let total: usize = modules
+        .iter()
+        .map(|m| {
+            1 + m
+                .mir
+                .classes
+                .iter()
+                .map(|c| c.methods.len())
+                .sum::<usize>()
+                + m.mir.closures.len()
+        })
+        .sum();
+    let bound = total.saturating_add(1);
+
+    for _ in 0..bound {
+        let mut changed = false;
+        for aot_mod in modules {
+            // Top-level body. Top-level itself is rarely tainted in
+            // practice but the walk is uniform — its "name" is the
+            // module's request_name, which won't be invoked as a
+            // method, so adding it to the set is harmless and
+            // keeps the propagation closed.
+            let top_name = format!("<top:{}>", aot_mod.request_name);
+            if !tainted.contains(&top_name)
+                && mir_calls_any_tainted_named_method(
+                    &aot_mod.mir.top_level,
+                    &aot_mod.interner,
+                    &tainted,
+                )
+            {
+                tainted.insert(top_name);
+                changed = true;
+            }
+            for class in &aot_mod.mir.classes {
+                for method in &class.methods {
+                    let name = method.signature.clone();
+                    if tainted.contains(&name) {
+                        continue;
+                    }
+                    if mir_calls_any_tainted_named_method(
+                        &method.mir,
+                        &aot_mod.interner,
+                        &tainted,
+                    ) {
+                        tainted.insert(name);
+                        changed = true;
+                    }
+                }
+            }
+            for (idx, closure) in aot_mod.mir.closures.iter().enumerate() {
+                // Closure names aren't user-visible signatures —
+                // tag them by `(module, index)` so taint propagates
+                // through fiber bodies (which are anonymous closures
+                // passed to `Fiber.new { ... }`).
+                let cname = format!("<closure:{}:{}>", aot_mod.request_name, idx);
+                if tainted.contains(&cname) {
+                    continue;
+                }
+                if mir_calls_any_tainted_named_method(closure, &aot_mod.interner, &tainted) {
+                    tainted.insert(cname);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    tainted
+}
+
+/// True if `mir` contains a `Call` whose method (resolved against
+/// `interner`) appears in `tainted`. Helper for the AOT taint
+/// fixed-point pass — each call is the propagation edge in the
+/// call graph.
+fn mir_calls_any_tainted_named_method(
+    mir: &crate::mir::MirFunction,
+    interner: &Interner,
+    tainted: &HashSet<String>,
+) -> bool {
+    use crate::mir::Instruction;
+    for block in &mir.blocks {
+        for (_, inst) in &block.instructions {
+            if let Instruction::Call { method, .. } = inst {
+                if tainted.contains(interner.resolve(*method)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Declare + lower one Wren module's top-level into the shared
 /// `ObjectModule` under `fn_symbol`, with module-var reads/writes
 /// rerouted through the per-module `modvars_symbol` data array.
@@ -2972,6 +3107,69 @@ mod tests {
              — that path TLS-reads JitContext.defining_class which AOT never \
              populates; got {:?}",
             names
+        );
+    }
+
+    /// Cross-module taint propagation: a fiber body that uses
+    /// `Fiber.yield` is tainted; a method that calls into that
+    /// closure is *not* tainted (the call is synchronous from
+    /// the caller's POV — only the fiber body itself needs the
+    /// state-machine transform). Direct reach is the floor.
+    #[test]
+    fn taint_set_includes_fiber_body_with_yield() {
+        let src = r#"
+            var f = Fiber.new {
+              System.print("step 1")
+              Fiber.yield(10)
+              System.print("step 2")
+              return 30
+            }
+            System.print("a=%(f.call())")
+        "#;
+        let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
+        let aot_mod = build_aot_module_from_source("main", src.as_bytes(), &mut layouts)
+            .expect("build_aot_module_from_source");
+        let modules = vec![aot_mod];
+        let tainted = compute_aot_tainted_method_names(&modules);
+        // The literal yield method names are always in the set.
+        assert!(tainted.contains("yield()"));
+        assert!(tainted.contains("yield(_)"));
+        // The closure body that calls `Fiber.yield(10)` must be
+        // tainted under its `<closure:main:0>` tag — this is what
+        // drives the state-machine transform decision.
+        assert!(
+            tainted
+                .iter()
+                .any(|n| n.starts_with("<closure:main:")),
+            "fiber body closure missing from taint set: {:?}",
+            tainted
+        );
+    }
+
+    /// A function that doesn't reach `Fiber.yield` should not be
+    /// in the taint set even when it lives in the same module as
+    /// a fiber that does.
+    #[test]
+    fn taint_set_excludes_non_yielding_methods() {
+        let src = r#"
+            class Helper {
+              static plain() { return 42 }
+            }
+            var f = Fiber.new {
+              Fiber.yield(1)
+            }
+            System.print(Helper.plain())
+            f.call()
+        "#;
+        let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
+        let aot_mod = build_aot_module_from_source("main", src.as_bytes(), &mut layouts)
+            .expect("build_aot_module_from_source");
+        let modules = vec![aot_mod];
+        let tainted = compute_aot_tainted_method_names(&modules);
+        assert!(
+            !tainted.contains("plain()"),
+            "Helper.plain doesn't yield; should stay out of the taint set: {:?}",
+            tainted
         );
     }
 }
