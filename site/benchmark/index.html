@@ -193,6 +193,9 @@
   .bar-row.is-wrenlift .bar-label {
     color: var(--ink); font-weight: 800;
   }
+  .bar-row.is-wren .bar-label {
+    color: var(--ink); font-weight: 700;
+  }
   .bar-track {
     position: relative; height: 100%;
   }
@@ -209,6 +212,10 @@
     background: var(--ember);
     box-shadow: 3px 3px 0 var(--ink);
   }
+  .bar-row.is-wren .bar-fill {
+    background: var(--sage);
+    box-shadow: 3px 3px 0 var(--ink);
+  }
   .bar-time {
     position: absolute;
     left: calc(100% + 10px); top: 50%; transform: translateY(-50%);
@@ -216,6 +223,7 @@
     color: var(--ink); white-space: nowrap;
   }
   .bar-row.is-wrenlift .bar-time { color: var(--ink); font-weight: 800; }
+  .bar-row.is-wren .bar-time { color: var(--ink); font-weight: 700; }
 
   .loading {
     color: var(--ink-3); font-style: italic; margin: 32px 0;
@@ -375,8 +383,10 @@
     entries.forEach(e => {
       const pct = (e.time / maxTime) * 78;
       const isW = e.name === "wrenlift";
+      const isWren = e.name === "wren";
+      const rowClass = isW ? "is-wrenlift" : isWren ? "is-wren" : "";
       rows += `
-        <div class="bar-row ${isW ? "is-wrenlift" : ""}">
+        <div class="bar-row ${rowClass}">
           <div class="bar-label">${e.name}</div>
           <div class="bar-track">
             <div class="bar-fill" style="width: ${pct}%">
