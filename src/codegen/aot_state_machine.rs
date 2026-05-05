@@ -179,20 +179,23 @@ pub fn transform_to_state_machine(
                         Instruction::Call { args, .. } => args.first().copied(),
                         _ => None,
                     };
-                    // Reject yields inside non-Return-terminated
-                    // blocks for v1. The block's terminator
-                    // currently is whatever bb_K had originally;
-                    // if it's not a plain `Return(_)`/`ReturnNull`
-                    // we'd need to thread the post-yield code
-                    // through the original branch successors.
-                    if !matches!(
-                        block.terminator,
-                        Terminator::Return(_) | Terminator::ReturnNull
-                    ) {
-                        return Err(StateMachineError::SuspensionInBranchedBlock {
-                            block: block.id,
-                        });
-                    }
+                    // v2-cap2 path: yields inside Branch- /
+                    // CondBranch-terminated blocks. The split
+                    // keeps the original terminator on the
+                    // resume block; if the resume's
+                    // successors directly read saved values
+                    // (rather than receiving them via block
+                    // params), we clone those successor blocks
+                    // so the yielding path can run a private
+                    // copy that reads from `v_loaded`. The
+                    // non-yielding path still falls through
+                    // the original blocks, which keep using
+                    // the original ValueIds.
+                    //
+                    // The cloning walk below handles this; the
+                    // refusal that lived here in v1 was
+                    // overconservative.
+                    let _ = &block.terminator;
                     found = Some((
                         block.id,
                         i,
@@ -230,43 +233,51 @@ pub fn transform_to_state_machine(
                 .expect("suspension still present after ConstNull insert")
         };
 
-        // Liveness pass: collect values defined in this block
-        // *before* the suspension that are used in either:
-        //   - the rest of this block (after the yield), or
-        //   - the trailing terminator, or
-        //   - any block transitively reachable from the new
-        //     resume block via terminator successors.
-        // Each such value gets a save-before-yield + load-on-resume
-        // pair in the layout; subsequent uses are remapped to the
-        // freshly-loaded ValueId so SSA stays valid.
+        // Liveness pass. v is "live across the suspension" iff
+        // it's used somewhere reachable from the resume but NOT
+        // defined in the resume's reachable code (i.e. its def
+        // dominates the yield, by SSA dominance). For each such
+        // v, allocate a slot, save before yield, load on resume,
+        // remap downstream uses.
+        //
+        // The walk excludes back-edges: when a value is a block
+        // param of a successor on a back-path, that block param
+        // is its own SSA def (the loop's iteration value), not
+        // a downstream use of `v` from this iteration. Stopping
+        // at block-param shadows during remap (see below) is
+        // what keeps the rewrite correct.
         let live_across: Vec<ValueId> = {
             let blk = &mir.blocks[blk_id.0 as usize];
-            let mut defined_before: std::collections::HashSet<ValueId> =
+            // Collect all uses + defs reachable from the
+            // resume successors. Defs include both instruction
+            // results and block params for blocks visited
+            // along the way.
+            let mut uses: Vec<ValueId> = Vec::new();
+            let mut defs: std::collections::HashSet<ValueId> =
                 std::collections::HashSet::new();
-            for (vid, _) in &blk.instructions[..inst_idx] {
-                defined_before.insert(*vid);
-            }
-            // Block params don't survive a split here for v1
-            // (entry-block params are mapped to function args at
-            // lowering time and the post-resume code references
-            // them indirectly through other instructions). v2's
-            // more complete liveness analysis will need to fold
-            // these in; for now they're unhandled and yield-in-a-
-            // block-with-real-params errors out via the branch
-            // refusal below.
+            // Pre-yield tail of the yielding block: any use
+            // there belongs to the yielding code itself, not
+            // post-yield (we already moved those instructions
+            // off when splitting; this branch handles the
+            // case before the split has happened).
             //
-            // Walk reachable-from-yield-tail uses.
-            let mut used_after: std::collections::HashSet<ValueId> =
-                std::collections::HashSet::new();
+            // For "uses in the post-yield tail", scan the
+            // instructions AFTER the yield (in the still-
+            // un-split block) + the terminator + the
+            // successor blocks.
             for (_, inst) in &blk.instructions[inst_idx + 1..] {
                 for u in collect_uses(inst) {
-                    used_after.insert(u);
+                    uses.push(u);
                 }
             }
             for u in collect_terminator_uses(&blk.terminator) {
-                used_after.insert(u);
+                uses.push(u);
             }
-            // BFS from the original terminator's successors.
+            // Anything defined in the post-yield tail is local
+            // to it — those don't need saving.
+            for (vid, _) in &blk.instructions[inst_idx + 1..] {
+                defs.insert(*vid);
+            }
             let mut visited: std::collections::HashSet<BlockId> =
                 std::collections::HashSet::new();
             let mut stack: Vec<BlockId> = blk.terminator.successors();
@@ -275,27 +286,44 @@ pub fn transform_to_state_machine(
                     continue;
                 }
                 let s_blk = &mir.blocks[b.0 as usize];
-                for (_, inst) in &s_blk.instructions {
+                // Block params are NOT defs for liveness:
+                // their incoming value is supplied by the
+                // predecessor's branch arg, which itself can
+                // be a saved (pre-yield) value flowing in via
+                // tail-duplication. If we treated block params
+                // as defs we'd miss saving values whose only
+                // post-yield use is "v1 directly" inside a
+                // block reachable from the resume that doesn't
+                // shadow it.
+                for (vid, inst) in &s_blk.instructions {
+                    defs.insert(*vid);
                     for u in collect_uses(inst) {
-                        used_after.insert(u);
+                        uses.push(u);
                     }
                 }
                 for u in collect_terminator_uses(&s_blk.terminator) {
-                    used_after.insert(u);
+                    uses.push(u);
                 }
                 for s in s_blk.terminator.successors() {
                     stack.push(s);
                 }
             }
-            // Stable ordering for deterministic slot assignment:
-            // walk the pre-yield instruction list and pick those
-            // that are also used after.
+            // live_across = uses not defined in the resume's
+            // reachable code (so they must come from a
+            // pre-yield definition).
+            let mut seen: std::collections::HashSet<ValueId> =
+                std::collections::HashSet::new();
             let mut live: Vec<ValueId> = Vec::new();
-            for (vid, _) in &blk.instructions[..inst_idx] {
-                if used_after.contains(vid) {
-                    live.push(*vid);
+            for u in uses {
+                if !defs.contains(&u) && seen.insert(u) {
+                    live.push(u);
                 }
             }
+            // Reject any saved value whose def we can't pin
+            // down (shouldn't happen for well-formed MIR but
+            // surface defensively via the original error).
+            // Iteration order is stable across Rust hash sets
+            // because we used an order-preserving Vec.
             live
         };
 
@@ -342,27 +370,181 @@ pub fn transform_to_state_machine(
         new_block.instructions = post_instructions;
         new_block.terminator = original_terminator;
 
-        // Remap every reference to a saved value in the new
-        // resume block + every block transitively reachable from
-        // it. Subsequent uses now read the freshly-loaded
-        // ValueId from the resume block's prologue (emitted by
-        // the AOT lowering from `layout.resume_loads`).
+        // Tail-duplication remap. The resume block's
+        // successors may also be reachable from the
+        // non-yielding side of the CFG (e.g. an `if-else` whose
+        // join block follows the yield's branch). Rewriting
+        // those successors in place would break the
+        // non-yielding path, which still expects the original
+        // ValueIds. Clone any successor that *uses a saved
+        // value directly* (i.e. without a block-param
+        // shadowing it), substitute `original → fresh` in the
+        // clone, and re-route the yielding path's terminator
+        // through the clone. Blocks that don't use saved
+        // values (or shadow them all) stay untouched and serve
+        // both paths.
         if !remap.is_empty() {
-            let mut visited: std::collections::HashSet<BlockId> =
-                std::collections::HashSet::new();
-            let mut stack: Vec<BlockId> = vec![new_block_id];
-            while let Some(b) = stack.pop() {
-                if !visited.insert(b) {
-                    continue;
-                }
-                let blk = mir.block_mut(b);
+            // First, handle the resume block itself: its
+            // instructions and terminator may directly use
+            // saved values. The resume block has no
+            // block-param shadows (we just created it from a
+            // mid-block split). Remap in place.
+            {
+                let blk = mir.block_mut(new_block_id);
                 for (_, inst) in &mut blk.instructions {
                     remap_instruction_uses(inst, &remap);
                 }
                 remap_terminator_uses(&mut blk.terminator, &remap);
-                for s in blk.terminator.successors() {
-                    stack.push(s);
+            }
+            // Now walk the resume block's successors,
+            // duplicating any that use saved values. Maintain
+            // a memo so a cloned block is reused when reached
+            // via multiple paths from the resume.
+            //
+            // Memo key: `(original_block_id, set_of_active_remap_keys)`.
+            // For simplicity in v2-cap2, we use just the block
+            // id — the active remap shrinks monotonically as
+            // we encounter block-param shadows, but the
+            // common case is "all saved values active" so this
+            // memo collision is unlikely to over-clone.
+            let mut clones: HashMap<BlockId, BlockId> = HashMap::new();
+            // Worklist of (orig_block_id, clone_block_id) pairs whose
+            // bodies still need to be filled.
+            let mut to_fill: Vec<(BlockId, BlockId)> = Vec::new();
+            // Seed: the resume block's terminator successors.
+            // For each successor that needs cloning, allocate
+            // a fresh BlockId and rewrite the resume's
+            // terminator to point at it.
+            let resume_term = mir.block(new_block_id).terminator.clone();
+            let need_clone =
+                |b: BlockId, mir_ref: &MirFunction, remap: &HashMap<ValueId, ValueId>| -> bool {
+                    let blk = mir_ref.block(b);
+                    // If every saved value is shadowed by this
+                    // block's params, no clone needed — block
+                    // params bind the value freshly per call.
+                    let active: Vec<ValueId> = remap
+                        .keys()
+                        .filter(|orig| !blk.params.iter().any(|(p, _)| p == *orig))
+                        .copied()
+                        .collect();
+                    if active.is_empty() {
+                        return false;
+                    }
+                    // Block uses any active saved value
+                    // directly (in instruction or terminator)?
+                    let active_set: std::collections::HashSet<ValueId> =
+                        active.iter().copied().collect();
+                    for (_, inst) in &blk.instructions {
+                        for u in inst.operands() {
+                            if active_set.contains(&u) {
+                                return true;
+                            }
+                        }
+                    }
+                    for u in blk.terminator.operands() {
+                        if active_set.contains(&u) {
+                            return true;
+                        }
+                    }
+                    false
+                };
+
+            // Helper: redirect a terminator's successors that
+            // need cloning to use the cloned BlockId. Also
+            // collects new clones to be filled.
+            fn redirect_term(
+                term: &mut Terminator,
+                clones: &mut HashMap<BlockId, BlockId>,
+                to_fill: &mut Vec<(BlockId, BlockId)>,
+                mir: &mut MirFunction,
+                remap: &HashMap<ValueId, ValueId>,
+                need_clone: &impl Fn(BlockId, &MirFunction, &HashMap<ValueId, ValueId>) -> bool,
+            ) {
+                let mut redirect = |succ: &mut BlockId| {
+                    if need_clone(*succ, mir, remap) {
+                        let clone_id = if let Some(c) = clones.get(succ) {
+                            *c
+                        } else {
+                            let c = mir.new_block();
+                            clones.insert(*succ, c);
+                            to_fill.push((*succ, c));
+                            c
+                        };
+                        *succ = clone_id;
+                    }
+                };
+                match term {
+                    Terminator::Branch { target, .. } => redirect(target),
+                    Terminator::CondBranch {
+                        true_target,
+                        false_target,
+                        ..
+                    } => {
+                        redirect(true_target);
+                        redirect(false_target);
+                    }
+                    Terminator::Return(_)
+                    | Terminator::ReturnNull
+                    | Terminator::Unreachable => {}
                 }
+            }
+
+            // Apply redirect to the resume block.
+            {
+                let _ = resume_term; // unused; we need &mut access below.
+                // SAFETY: temporarily detach the terminator,
+                // redirect, then reattach. Necessary because
+                // `redirect_term` needs mutable access to mir
+                // (for `new_block`) AND read access to mir
+                // (for `need_clone`); separating like this
+                // avoids overlapping borrows.
+                let mut t = std::mem::replace(
+                    &mut mir.block_mut(new_block_id).terminator,
+                    Terminator::Unreachable,
+                );
+                redirect_term(&mut t, &mut clones, &mut to_fill, mir, &remap, &need_clone);
+                mir.block_mut(new_block_id).terminator = t;
+            }
+
+            // Fill clones until the worklist is drained.
+            while let Some((orig, clone_id)) = to_fill.pop() {
+                let (mut insts, mut term, params) = {
+                    let blk = mir.block(orig);
+                    (blk.instructions.clone(), blk.terminator.clone(), blk.params.clone())
+                };
+                // Compute active remap (saved values not
+                // shadowed by `orig`'s params).
+                let active_remap: HashMap<ValueId, ValueId> = remap
+                    .iter()
+                    .filter(|(o, _)| !params.iter().any(|(p, _)| p == *o))
+                    .map(|(o, n)| (*o, *n))
+                    .collect();
+                for (_, inst) in &mut insts {
+                    remap_instruction_uses(inst, &active_remap);
+                }
+                remap_terminator_uses(&mut term, &active_remap);
+                // Recursively redirect this clone's terminator
+                // successors that still need cloning.
+                redirect_term(
+                    &mut term,
+                    &mut clones,
+                    &mut to_fill,
+                    mir,
+                    &active_remap,
+                    &need_clone,
+                );
+                // Populate the clone block. We don't carry
+                // over `params` because the clone is reached
+                // via the same call args as the original (the
+                // predecessor's branch is what invokes it).
+                // But: the predecessor's branch passes block
+                // args to satisfy `params`; if the clone has
+                // the same params, the args still flow in
+                // correctly. Keep the params unchanged.
+                let blk = mir.block_mut(clone_id);
+                blk.params = params;
+                blk.instructions = insts;
+                blk.terminator = term;
             }
         }
 

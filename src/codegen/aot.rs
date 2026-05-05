@@ -3285,6 +3285,32 @@ mod tests {
         );
     }
 
+    /// Dumps MIR for the loop+yield case to see if cross-block
+    /// values use block params or direct refs. Drives v2-cap2's
+    /// remap-scope decision. Not run by default.
+    #[test]
+    #[ignore]
+    fn dump_loop_yield_mir() {
+        let src = r#"
+var f = Fiber.new {
+  var i = 0
+  while (i < 4) {
+    if (i % 2 == 0) {
+      Fiber.yield(i)
+    }
+    i = i + 1
+  }
+}
+f.call()
+"#;
+        let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
+        let m = build_aot_module_from_source("main", src.as_bytes(), &mut layouts).unwrap();
+        for (i, c) in m.mir.closures.iter().enumerate() {
+            eprintln!("=== closure {} ===", i);
+            eprintln!("{}", c.pretty_print(&m.interner));
+        }
+    }
+
     /// One-off: dumps MIR for the trivial fiber test so I can
     /// design the state-machine transform off the actual shape.
     /// Not normally run; use `--ignored` to invoke.

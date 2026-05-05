@@ -406,6 +406,44 @@ fn fiber_yield_state_machine() {
 }
 
 #[test]
+fn fiber_yield_in_loop_with_branch_and_live_loop_var() {
+    // v2-cap1 + cap-2: yield inside an `if` inside a `while`,
+    // with the loop counter `i` live across the suspension.
+    // Exercises:
+    //   - tail-duplication of the post-yield code path so the
+    //     non-yielding side (i odd) still flows through the
+    //     original block,
+    //   - save/load of `i` (bb1's block param) via the fiber's
+    //     saved-slot table,
+    //   - the back-edge branch arg correctly threading the
+    //     loaded value back into the loop header.
+    // Expected: yields at i=0 and i=2, then returns "done"
+    // when i hits 4 and exits the while.
+    let r = compile_link_run(
+        "var f = Fiber.new {\n  \
+           var i = 0\n  \
+           while (i < 4) {\n    \
+             if (i % 2 == 0) {\n      \
+               Fiber.yield(i)\n    \
+             }\n    \
+             i = i + 1\n  \
+           }\n  \
+           return \"done\"\n\
+         }\n\
+         while (true) {\n  \
+           var v = f.call()\n  \
+           if (f.isDone) {\n    \
+             System.print(\"final=%(v)\")\n    \
+             break\n  \
+           }\n  \
+           System.print(\"yielded %(v)\")\n\
+         }\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "yielded 0\nyielded 2\nfinal=done\n");
+}
+
+#[test]
 fn nested_class_method_calls() {
     // Non-trivial method chain with intermediate object
     // construction. Exercises the IC + GC interaction across
