@@ -916,6 +916,7 @@ fn emit_aot_function(
     symbol: &str,
     defining_class: Option<AotDefiningClass>,
     is_state_machine: bool,
+    tainted_names: &HashSet<String>,
 ) -> Result<EmittedFnMeta, AotError> {
     let mut sig = Signature::new(module.target_config().default_call_conv);
     let sm_payload: Option<(
@@ -932,6 +933,7 @@ fn emit_aot_function(
         let layout = crate::codegen::aot_state_machine::transform_to_state_machine(
             &mut transformed,
             interner,
+            tainted_names,
         )
         .map_err(|e| AotError::Module(e.to_string()))?;
         // 2 params: fiber, resume_v.
@@ -979,9 +981,15 @@ fn emit_aot_function(
         builder.finalize();
     }
 
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| AotError::Module(e.to_string()))?;
+    module.define_function(func_id, &mut ctx).map_err(|e| {
+        if std::env::var_os("WLIFT_AOT_DUMP").is_some() {
+            eprintln!("=== AOT define_function failed for {symbol} ===");
+            eprintln!("{e:?}");
+            eprintln!("--- IR ---");
+            eprintln!("{}", ctx.func.display());
+        }
+        AotError::Module(e.to_string())
+    })?;
 
     // Capture safepoint metadata + code size before clearing the
     // context. Same path the JIT's `compile_mir` uses — the
@@ -999,6 +1007,7 @@ fn emit_aot_function(
     *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
     *aot_cfg.current_state_machine_layout.borrow_mut() = None;
     *aot_cfg.current_fiber_ptr_var.borrow_mut() = None;
+    *aot_cfg.current_resume_v_var.borrow_mut() = None;
     drop(sm_payload);
     Ok(EmittedFnMeta {
         code_size,
@@ -1107,12 +1116,15 @@ fn emit_aot_module(
         current_jit_roots_snapshot_var: std::cell::RefCell::new(None),
         current_state_machine_layout: std::cell::RefCell::new(None),
         current_fiber_ptr_var: std::cell::RefCell::new(None),
+        current_resume_v_var: std::cell::RefCell::new(None),
     };
 
     let mut fn_metas: Vec<(String, EmittedFnMeta)> = Vec::new();
 
     // Top-level body — the entry point Phase 7's init pass calls
     // last, after every dependency module's top-level has run.
+    let top_tag = format!("<top:{}>", aot_mod.request_name);
+    let top_is_sm = tainted_names.contains(&top_tag);
     let top_meta = emit_aot_function(
         module,
         &aot_mod.interner,
@@ -1120,12 +1132,8 @@ fn emit_aot_module(
         &aot_cfg,
         fn_symbol,
         None,
-        // Top-level bodies are AOT-only for v1 — the trivial
-        // case that uses `Fiber.yield` from the entry script
-        // body would taint here, but the supported pattern is
-        // yielding from inside `Fiber.new { ... }` (an anonymous
-        // closure), which gets handled below.
-        false,
+        top_is_sm,
+        tainted_names,
     )?;
     fn_metas.push((fn_symbol.to_string(), top_meta));
 
@@ -1163,13 +1171,15 @@ fn emit_aot_module(
         };
         for (method_idx, method) in class.methods.iter().enumerate() {
             let sym = format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx);
-            // v1 doesn't apply the state-machine transform to
-            // class methods even when their signature is
-            // tainted — `fill_()` etc. ride a `Fiber.yield`
-            // boundary indirectly. Falling back to false here
-            // keeps the AOT signature stable until the v2 work
-            // (live-value save/restore + per-method poll
-            // dispatch) lands.
+            // State-machine methods: any method whose
+            // resolved signature is in the whole-program taint
+            // set. Their MIR gets the same split-at-yield
+            // transform as closures, but their on-entry args
+            // come from the fiber's topmost frame (caller
+            // wrote them via `wlift_aot_sm_save_value` before
+            // invocation) instead of Cranelift parameters.
+            // The signature flips to `(fiber, resume_v) -> i64`.
+            let is_state_machine = tainted_names.contains(&method.signature);
             let meta = emit_aot_function(
                 module,
                 &aot_mod.interner,
@@ -1177,7 +1187,8 @@ fn emit_aot_module(
                 &aot_cfg,
                 &sym,
                 defining_class_for_methods.clone(),
-                false,
+                is_state_machine,
+                tainted_names,
             )?;
             fn_metas.push((sym.clone(), meta));
             methods_manifest.push(AotMethodManifest {
@@ -1186,6 +1197,7 @@ fn emit_aot_module(
                 arity: method.mir.arity,
                 is_static: method.is_static,
                 is_constructor: method.is_constructor,
+                is_state_machine,
             });
         }
 
@@ -1230,6 +1242,7 @@ fn emit_aot_module(
             &sym,
             None,
             is_state_machine,
+            tainted_names,
         )?;
         fn_metas.push((sym.clone(), meta));
         closure_manifest.push(AotClosureManifest {
@@ -1414,6 +1427,13 @@ pub struct AotMethodManifest {
     pub arity: u8,
     pub is_static: bool,
     pub is_constructor: bool,
+    /// True when the method body uses `Fiber.yield`
+    /// (transitively) and was lowered with the stackless
+    /// state-machine `(fiber, resume_v) -> i64` signature.
+    /// Bootstrap re-imports it with the matching 2-arg shape;
+    /// callers in other tainted functions invoke it via the
+    /// cross-fn poll path rather than `wren_call_*`.
+    pub is_state_machine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2310,7 +2330,16 @@ fn emit_aot_bootstrap_main(
                     method.signature.as_bytes(),
                 )?;
                 let mut body_sig = Signature::new(cc);
-                for _ in 0..(method.arity as usize) {
+                // State-machine methods have a fixed
+                // (fiber, resume_v) -> i64 signature regardless
+                // of the source-level arity — match the
+                // declaration `emit_aot_function` produced.
+                let physical_arity = if method.is_state_machine {
+                    2usize
+                } else {
+                    method.arity as usize
+                };
+                for _ in 0..physical_arity {
                     body_sig.params.push(AbiParam::new(types::I64));
                 }
                 body_sig.returns.push(AbiParam::new(types::I64));
@@ -2323,6 +2352,9 @@ fn emit_aot_bootstrap_main(
                 }
                 if method.is_constructor {
                     flags |= 2;
+                }
+                if method.is_state_machine {
+                    flags |= 4;
                 }
                 methods.push((sig_id, method.signature.len(), body_id, method.arity, flags));
             }
@@ -3283,6 +3315,57 @@ mod tests {
             "fiber body closure missing from taint set: {:?}",
             tainted
         );
+    }
+
+    /// Dumps MIR for the cross-fn case to see what serve_-style
+    /// chains look like before the transform.
+    #[test]
+    #[ignore]
+    fn dump_crossfn_mir() {
+        let src = r#"
+class Counter {
+  construct new() { _v = 0 }
+  step() {
+    _v = _v + 1
+    Fiber.yield(_v)
+    _v = _v + 1
+    return _v
+  }
+}
+var c = Counter.new()
+var f = Fiber.new {
+  c.step()
+  c.step()
+}
+"#;
+        let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
+        let m = build_aot_module_from_source("main", src.as_bytes(), &mut layouts).unwrap();
+        eprintln!("=== top-level ===");
+        eprintln!("{}", m.mir.top_level.pretty_print(&m.interner));
+        for (ci, cl) in m.mir.classes.iter().enumerate() {
+            for (mi, method) in cl.methods.iter().enumerate() {
+                eprintln!(
+                    "=== class {} ({}) method {} ({}) ===",
+                    ci,
+                    m.interner.resolve(cl.name),
+                    mi,
+                    method.signature,
+                );
+                eprintln!("{}", method.mir.pretty_print(&m.interner));
+            }
+        }
+        for (i, c) in m.mir.closures.iter().enumerate() {
+            eprintln!("=== closure {} ===", i);
+            eprintln!("{}", c.pretty_print(&m.interner));
+        }
+        let modules = vec![m];
+        let tainted = compute_aot_tainted_method_names(&modules);
+        eprintln!("=== tainted set ===");
+        let mut sorted: Vec<_> = tainted.iter().collect();
+        sorted.sort();
+        for n in sorted {
+            eprintln!("  {}", n);
+        }
     }
 
     /// Dumps MIR for the loop+yield case to see if cross-block

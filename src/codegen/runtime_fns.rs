@@ -1675,6 +1675,16 @@ pub extern "C" fn wren_load_jit_closure() -> u64 {
     ctx.closure as u64
 }
 
+/// Load the active JIT context's `vm` pointer. Used by the AOT
+/// state-machine cross-fn lowering to thread the VM through to
+/// `wlift_aot_invoke_sm_method`'s class lookup without baking a
+/// pointer constant at compile time.
+#[no_mangle]
+pub extern "C" fn wren_load_jit_vm() -> u64 {
+    let ctx = read_jit_ctx();
+    ctx.vm as u64
+}
+
 /// Load the JIT code pointer for a given function ID.
 /// Returns the function pointer as u64 (0 if not compiled).
 /// Used by CallKnownFunc to do direct JIT-to-JIT calls.
@@ -2055,11 +2065,23 @@ fn handle_jit_fiber_action(
                         set_jit_depth(saved_jit_depth);
                         return Value::null().to_bits();
                     }
-                    // Mark the target as Running, switch
-                    // vm.fiber pointer for the call so any
-                    // ambient code (e.g. `Fiber.current`) inside
-                    // the poll sees the right active fiber.
+                    // First-call frame setup. If this is the
+                    // initial `fiber.call`, push the root
+                    // state-machine frame for the body. On
+                    // resume calls, the existing frame stack
+                    // is preserved (the previous yield left
+                    // it intact). Either way, point the
+                    // active-depth at the body's frame so the
+                    // body's poll reads its own state — even
+                    // when nested cross-fn calls left child
+                    // frames on top.
                     unsafe {
+                        if (*target).aot_frames.is_empty() {
+                            (*target).aot_frames.push(
+                                crate::runtime::object::AotFrameState::default(),
+                            );
+                        }
+                        (*target).aot_active_depth = 0;
                         (*target).state = FiberState::Running;
                     }
                     vm.fiber = target;
@@ -2085,6 +2107,12 @@ fn handle_jit_fiber_action(
                             }
                         }
                         crate::capi::AotSmPollKind::Done => unsafe {
+                            // Root frame done — clear the
+                            // frame stack so a subsequent
+                            // `fiber.call` (which would error
+                            // anyway) doesn't trip over stale
+                            // state.
+                            (*target).aot_frames.clear();
                             (*target).state = FiberState::Done;
                         },
                         crate::capi::AotSmPollKind::None => {
@@ -2095,6 +2123,7 @@ fn handle_jit_fiber_action(
                             // returned, which the caller will
                             // observe.
                             unsafe {
+                                (*target).aot_frames.clear();
                                 (*target).state = FiberState::Done;
                             }
                         }
@@ -4693,6 +4722,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         // Known-function dispatch (devirtualized)
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
         "wren_load_jit_closure" => Some(wren_load_jit_closure as *const () as usize),
+        "wren_load_jit_vm" => Some(wren_load_jit_vm as *const () as usize),
         "wren_jit_roots_snapshot" => Some(wren_jit_roots_snapshot as *const () as usize),
         "wren_jit_roots_restore" => Some(wren_jit_roots_restore as *const () as usize),
         "wren_known_call_0" => Some(wren_known_call_0 as *const () as usize),

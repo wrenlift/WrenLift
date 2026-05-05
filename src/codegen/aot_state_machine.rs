@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 
 use crate::intern::Interner;
+use crate::intern::SymbolId;
 use crate::mir::{BlockId, Instruction, MirFunction, Terminator, ValueId};
 
 /// Decision payload returned by [`transform_to_state_machine`].
@@ -64,21 +65,105 @@ pub struct StateMachineLayout {
     /// lowering just needs to call `wlift_aot_sm_load_value(
     /// fiber, slot)` and store the result in `val_map[fresh_id]`.
     pub resume_loads: HashMap<BlockId, Vec<(u32, ValueId)>>,
+    /// Per yielding block, the *kind* of suspension. Direct
+    /// `Fiber.yield(_)` keeps the existing yield-stamp +
+    /// `Return` lowering. Cross-fn tainted Calls get a more
+    /// involved sequence (push frame + save args + invoke
+    /// callee's poll + check kind + propagate Yield).
+    pub block_kinds: HashMap<BlockId, BlockKind>,
 }
 
-/// Names of methods whose `Call` represents a suspension point.
-/// Mirrors `aot_direct_yield_method_names` in `aot.rs`. The set
-/// is duplicated here because this module is consumed by the AOT
-/// lowering pass which doesn't otherwise pull in `aot.rs`.
-fn suspension_method_names() -> &'static [&'static str] {
+/// What kind of suspension a block represents. AOT lowering
+/// branches on this when emitting the pre-Return helpers (for
+/// `DirectYield` / `CrossFnCallInit`) or replacing the body
+/// entirely (for `CrossFnCallResume`).
+#[derive(Debug, Clone)]
+pub enum BlockKind {
+    /// `Fiber.yield(_)` / `Fiber.suspend()`. Body sets kind=Yield
+    /// and returns the yield value directly.
+    DirectYield,
+    /// First half of a cross-fn call site. Lowering emits the
+    /// pre-call setup (advance own state, push child frame,
+    /// save args) then jumps to the matching `CrossFnCallResume`
+    /// block. Reached only via fall-through from the preceding
+    /// state's code; the dispatcher's `br_table` does NOT land
+    /// here.
+    CrossFnCallInit {
+        /// MIR BlockId of the matching `CrossFnCallResume`
+        /// (synthetic) block. The init's lowering jumps here
+        /// after pre-call setup.
+        resume_check_block: BlockId,
+        receiver: ValueId,
+        args: Vec<ValueId>,
+        result: ValueId,
+        method_sym: SymbolId,
+    },
+    /// Second half of a cross-fn call site — synthetic block
+    /// the dispatcher's `br_table` lands in on resume from a
+    /// yielded child. Lowering emits `invoke_sm_method + peek +
+    /// brif`; on Yield returns the propagated value, on Done
+    /// pops the child frame and jumps to the post-call block
+    /// (`done_block`). Has no MIR-level instructions; the
+    /// terminator is set to `ReturnNull` as a placeholder that
+    /// the lowering overrides.
+    CrossFnCallResume {
+        /// MIR BlockId of the post-call block (the original
+        /// post-Call instructions + original terminator).
+        done_block: BlockId,
+        receiver: ValueId,
+        args: Vec<ValueId>,
+        result: ValueId,
+        method_sym: SymbolId,
+    },
+}
+
+/// Names of methods whose `Call` is a *direct* suspension —
+/// `Fiber.yield` / `Fiber.suspend`. These get the simple
+/// "stamp kind=Yield, return value" lowering. Cross-fn Calls
+/// to other tainted methods route through a different (more
+/// involved) sequence.
+fn direct_yield_method_names() -> &'static [&'static str] {
     &["yield()", "yield(_)", "suspend()"]
 }
 
-/// True if the instruction is a Call whose method name is one
-/// of the suspension primitives.
+/// Classification of a suspension Call. v2-cap3 distinguishes
+/// `Fiber.yield(_)` from cross-fn calls into other tainted
+/// methods; both are suspension points but get different
+/// lowering.
+#[derive(Debug, Clone, Copy)]
+enum SuspensionKind {
+    DirectYield,
+    CrossFnCall,
+}
+
+/// Inspect a Call instruction and decide whether it's a
+/// suspension point and which kind. `tainted_names` is the
+/// whole-program transitive yield-method set.
+fn classify_call(
+    inst: &Instruction,
+    interner: &Interner,
+    tainted_names: &std::collections::HashSet<String>,
+) -> Option<SuspensionKind> {
+    let Instruction::Call { method, .. } = inst else {
+        return None;
+    };
+    let name = interner.resolve(*method);
+    if direct_yield_method_names().contains(&name) {
+        return Some(SuspensionKind::DirectYield);
+    }
+    if tainted_names.contains(name) {
+        return Some(SuspensionKind::CrossFnCall);
+    }
+    None
+}
+
+/// True if the instruction is a Call to one of the direct yield
+/// primitives. v1 helper retained for the closure-only path that
+/// doesn't need the cross-fn classification — used by the unit
+/// tests.
 fn is_suspension_call(inst: &Instruction, interner: &Interner) -> bool {
     if let Instruction::Call { method, .. } = inst {
-        suspension_method_names()
+        direct_yield_method_names()
             .iter()
             .any(|n| interner.resolve(*method) == *n)
     } else {
@@ -145,6 +230,12 @@ impl std::error::Error for StateMachineError {}
 pub fn transform_to_state_machine(
     mir: &mut MirFunction,
     interner: &Interner,
+    // Whole-program tainted method-name set. Calls to methods
+    // in this set are treated as cross-fn suspensions in
+    // addition to direct `Fiber.yield(_)`. v2-cap1 / cap-2
+    // callers can pass an empty set and only direct yields
+    // will be recognised as suspensions.
+    tainted_names: &std::collections::HashSet<String>,
 ) -> Result<StateMachineLayout, StateMachineError> {
     // First, find every suspension call site as (block_id,
     // instruction_index). Walk in block order; instructions
@@ -156,80 +247,89 @@ pub fn transform_to_state_machine(
         yield_blocks: HashMap::new(),
         yield_saves: HashMap::new(),
         resume_loads: HashMap::new(),
+        block_kinds: HashMap::new(),
     };
     // Per-suspension save slot allocation. The vec is shared
     // across all suspensions — slots get reused as later yields
     // overwrite earlier saves. `next_slot` tracks the high-water
-    // mark so concurrent saves never alias.
-    let mut next_slot: u32 = 0;
+    // mark so concurrent saves never alias. State-machine method
+    // arg slots come out of the same pool: the caller writes
+    // args into the new frame's slots 0..N, the callee's entry
+    // block loads from those same slots, and live-across saves
+    // (within the callee) start at slot N. Because each frame
+    // has its own slot table on `aot_frames`, the per-function
+    // numbering doesn't collide with callers.
+    let mut next_slot: u32 = mir.arity as u32;
 
     loop {
-        let mut found: Option<(BlockId, usize, ValueId)> = None;
+        // Find the next un-handled suspension: a Call whose
+        // method is either a direct yield or a cross-fn call to
+        // a tainted method. Because we mutate the MIR after
+        // each suspension is handled (split + new blocks
+        // appended), a re-scan at the top of the loop is the
+        // simplest way to walk every suspension exactly once.
+        let mut found: Option<(BlockId, usize, SuspensionKind)> = None;
         'outer: for block in &mir.blocks {
-            // Block must end in a Return for v1. Branches inside
-            // a yielding chunk are deferred to v2.
+            if layout.block_kinds.contains_key(&block.id) {
+                // Already split this block as the *yielding*
+                // half of a previous iteration — skip.
+                continue;
+            }
             for (i, (_dst, inst)) in block.instructions.iter().enumerate() {
-                if is_suspension_call(inst, interner) {
-                    // The yield value is the first argument
-                    // (`Fiber.yield(_)`). For `Fiber.yield()`
-                    // (zero-arg form) we synthesise a null
-                    // value via a fresh ConstNull placed just
-                    // before the split point. Detect both.
-                    let arg = match inst {
-                        Instruction::Call { args, .. } => args.first().copied(),
-                        _ => None,
-                    };
-                    // v2-cap2 path: yields inside Branch- /
-                    // CondBranch-terminated blocks. The split
-                    // keeps the original terminator on the
-                    // resume block; if the resume's
-                    // successors directly read saved values
-                    // (rather than receiving them via block
-                    // params), we clone those successor blocks
-                    // so the yielding path can run a private
-                    // copy that reads from `v_loaded`. The
-                    // non-yielding path still falls through
-                    // the original blocks, which keep using
-                    // the original ValueIds.
-                    //
-                    // The cloning walk below handles this; the
-                    // refusal that lived here in v1 was
-                    // overconservative.
-                    let _ = &block.terminator;
-                    found = Some((
-                        block.id,
-                        i,
-                        arg.unwrap_or(ValueId(u32::MAX)), // sentinel; resolved below
-                    ));
+                if let Some(kind) = classify_call(inst, interner, tainted_names) {
+                    found = Some((block.id, i, kind));
                     break 'outer;
                 }
             }
         }
-        let Some((blk_id, inst_idx, mut yield_value)) = found else {
+        let Some((blk_id, inst_idx, susp_kind)) = found else {
             break;
         };
 
-        // Resolve `Fiber.yield()` (no-arg) by synthesising a
-        // ConstNull immediately before the suspension call. We
-        // append it to the block's instruction list, then peel
-        // the suspension off.
-        if yield_value.0 == u32::MAX {
-            let new_vid = mir.new_value();
-            let blk_mut = &mut mir.blocks[blk_id.0 as usize];
-            blk_mut
-                .instructions
-                .insert(inst_idx, (new_vid, Instruction::ConstNull));
-            yield_value = new_vid;
-        }
-        // After the optional ConstNull insert, the suspension
-        // call sits at `inst_idx + (1 if no-arg else 0)`. Re-scan
-        // for the suspension index — it's still the last item
-        // before any post-suspension instructions.
+        // Materialise the per-kind data needed before the
+        // split. DirectYield carries just the yield value;
+        // CrossFnCall carries the call's metadata so the
+        // lowering can emit the push/save/invoke sequence.
+        let (yield_value, cross_fn_meta): (ValueId, Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>) =
+            match susp_kind {
+                SuspensionKind::DirectYield => {
+                    let arg = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx].1 {
+                        Instruction::Call { args, .. } => args.first().copied(),
+                        _ => None,
+                    };
+                    let yield_value = if let Some(a) = arg {
+                        a
+                    } else {
+                        // `Fiber.yield()` with no args: synthesise
+                        // a ConstNull just before the suspension.
+                        let new_vid = mir.new_value();
+                        let blk_mut = &mut mir.blocks[blk_id.0 as usize];
+                        blk_mut
+                            .instructions
+                            .insert(inst_idx, (new_vid, Instruction::ConstNull));
+                        new_vid
+                    };
+                    (yield_value, None)
+                }
+                SuspensionKind::CrossFnCall => {
+                    let (call_dst, call_inst) =
+                        mir.blocks[blk_id.0 as usize].instructions[inst_idx].clone();
+                    let Instruction::Call { receiver, method, args, .. } = call_inst else {
+                        unreachable!("classify_call only returns Some for Call instructions");
+                    };
+                    (
+                        call_dst,
+                        Some((receiver, args.clone(), call_dst, method)),
+                    )
+                }
+            };
+        // Re-find the suspension's index — the optional
+        // ConstNull insert above may have shifted positions.
         let inst_idx = {
             let blk = &mir.blocks[blk_id.0 as usize];
             blk.instructions
                 .iter()
-                .position(|(_, inst)| is_suspension_call(inst, interner))
+                .position(|(_, inst)| classify_call(inst, interner, tainted_names).is_some())
                 .expect("suspension still present after ConstNull insert")
         };
 
@@ -310,20 +410,31 @@ pub fn transform_to_state_machine(
             }
             // live_across = uses not defined in the resume's
             // reachable code (so they must come from a
-            // pre-yield definition).
+            // pre-yield definition). For CrossFnCall sites,
+            // exclude the call's `result` ValueId — it has no
+            // pre-call definition (the suspension Call was
+            // dropped during split), and the lowering
+            // rebinds it to the runtime `ret` of
+            // `wlift_aot_invoke_sm_method` directly via
+            // `val_map.insert(result, ret)`. Save/load through
+            // the slot table would just round-trip null.
+            let exclude_dst = match susp_kind {
+                SuspensionKind::CrossFnCall => {
+                    cross_fn_meta.as_ref().map(|(_, _, dst, _)| *dst)
+                }
+                _ => None,
+            };
             let mut seen: std::collections::HashSet<ValueId> =
                 std::collections::HashSet::new();
             let mut live: Vec<ValueId> = Vec::new();
             for u in uses {
+                if Some(u) == exclude_dst {
+                    continue;
+                }
                 if !defs.contains(&u) && seen.insert(u) {
                     live.push(u);
                 }
             }
-            // Reject any saved value whose def we can't pin
-            // down (shouldn't happen for well-formed MIR but
-            // surface defensively via the original error).
-            // Iteration order is stable across Rust hash sets
-            // because we used an order-preserving Vec.
             live
         };
 
@@ -548,12 +659,83 @@ pub fn transform_to_state_machine(
             }
         }
 
-        let next_state = layout.resume_entries.len() as u32;
-        layout.resume_entries.push(new_block_id);
-        layout.yield_blocks.insert(blk_id, next_state);
         if !saves.is_empty() {
             layout.yield_saves.insert(blk_id, saves);
             layout.resume_loads.insert(new_block_id, loads);
+        }
+        // Record kinds + register the resume entry for the
+        // dispatcher's `br_table`. DirectYield uses the
+        // post-suspension block (`new_block_id`) as the resume
+        // entry; CrossFnCall introduces an extra synthetic
+        // block (`call_check`) between the yielding init and
+        // the post-call code, so the dispatcher re-runs
+        // `invoke_sm_method` on each resume rather than
+        // skipping past it.
+        match (susp_kind, cross_fn_meta) {
+            (SuspensionKind::DirectYield, _) => {
+                let next_state = layout.resume_entries.len() as u32;
+                layout.resume_entries.push(new_block_id);
+                layout.yield_blocks.insert(blk_id, next_state);
+                layout.block_kinds.insert(blk_id, BlockKind::DirectYield);
+            }
+            (SuspensionKind::CrossFnCall, Some((receiver, args, result, method_sym))) => {
+                // Allocate the synthetic call_check block. Its
+                // MIR terminator is a Branch to the done_block
+                // (the post-call block) so `compute_rpo` walks
+                // call_check before its done_block — without
+                // that ordering, `done_block`'s terminator
+                // would reference `result`'s ValueId before
+                // call_check's lowering bound it in val_map.
+                // The actual lowering of call_check overrides
+                // both instructions and terminator via the
+                // 'cross_fn_resume hook in cranelift_backend.
+                let call_check_id = mir.new_block();
+                {
+                    let blk = mir.block_mut(call_check_id);
+                    blk.terminator = Terminator::Branch {
+                        target: new_block_id,
+                        args: Vec::new(),
+                    };
+                }
+                // Re-route the yielding block's terminator
+                // through call_check so the same ordering
+                // argument applies to it. Lowering's
+                // CrossFnCallInit hook will override (jumping
+                // to call_check directly after pre-call
+                // setup); the MIR Branch is purely for rpo
+                // structure.
+                {
+                    let blk = mir.block_mut(blk_id);
+                    blk.terminator = Terminator::Branch {
+                        target: call_check_id,
+                        args: Vec::new(),
+                    };
+                }
+                let next_state = layout.resume_entries.len() as u32;
+                layout.resume_entries.push(call_check_id);
+                layout.yield_blocks.insert(blk_id, next_state);
+                layout.block_kinds.insert(
+                    blk_id,
+                    BlockKind::CrossFnCallInit {
+                        resume_check_block: call_check_id,
+                        receiver,
+                        args: args.clone(),
+                        result,
+                        method_sym,
+                    },
+                );
+                layout.block_kinds.insert(
+                    call_check_id,
+                    BlockKind::CrossFnCallResume {
+                        done_block: new_block_id,
+                        receiver,
+                        args,
+                        result,
+                        method_sym,
+                    },
+                );
+            }
+            _ => unreachable!("classify_call invariants kept the susp_kind and meta in sync"),
         }
     }
 
@@ -742,7 +924,7 @@ var f = Fiber.new {
 f.call()
 "#;
         let (mut mir, interner) = build_mir_from_source(src, /* closure_idx */ 0);
-        let layout = transform_to_state_machine(&mut mir, &interner)
+        let layout = transform_to_state_machine(&mut mir, &interner, &Default::default())
             .expect("v1 transform succeeds on linear yields");
         assert_eq!(
             layout.resume_entries.len(),
@@ -769,7 +951,7 @@ var f = Fiber.new {
 f.call()
 "#;
         let (mut mir, interner) = build_mir_from_source(src, /* closure_idx */ 0);
-        let layout = transform_to_state_machine(&mut mir, &interner)
+        let layout = transform_to_state_machine(&mut mir, &interner, &Default::default())
             .expect("v2 transform handles live values across yield");
         assert!(
             !layout.yield_saves.is_empty(),

@@ -1173,6 +1173,17 @@ pub mod cl {
         /// isn't a state machine. Cleared between emissions.
         pub current_fiber_ptr_var:
             std::cell::RefCell<Option<cranelift_frontend::Variable>>,
+
+        /// Function-scoped resume-value variable. Holds the
+        /// `resume_v` parameter of the state-machine poll
+        /// signature so cross-fn call sites can thread it
+        /// through to `wlift_aot_invoke_sm_method`. Without
+        /// this, every nested cross-fn call would pass `0` as
+        /// the resume value and a re-entered child state
+        /// machine would lose the value the user passed to
+        /// `fiber.call`.
+        pub current_resume_v_var:
+            std::cell::RefCell<Option<cranelift_frontend::Variable>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1408,10 +1419,14 @@ pub mod cl {
 
             // State-machine bodies need a Variable to carry the
             // fiber pointer across the function so each Return's
-            // yield/done helper call can pass it.
+            // yield/done helper call can pass it. `resume_v_var`
+            // similarly carries the second poll-fn param so
+            // nested cross-fn invocations can thread it through.
             if cfg.current_state_machine_layout.borrow().is_some() {
                 let fiber_var = builder.declare_var(types::I64);
                 *cfg.current_fiber_ptr_var.borrow_mut() = Some(fiber_var);
+                let resume_v_var = builder.declare_var(types::I64);
+                *cfg.current_resume_v_var.borrow_mut() = Some(resume_v_var);
             }
         }
 
@@ -1428,10 +1443,13 @@ pub mod cl {
                 let dispatch_block = builder.create_block();
                 builder.switch_to_block(dispatch_block);
                 let fiber_param = builder.append_block_param(dispatch_block, types::I64);
-                let _resume_v_param =
+                let resume_v_param =
                     builder.append_block_param(dispatch_block, types::I64);
                 if let Some(var) = *cfg.current_fiber_ptr_var.borrow() {
                     builder.def_var(var, fiber_param);
+                }
+                if let Some(var) = *cfg.current_resume_v_var.borrow() {
+                    builder.def_var(var, resume_v_param);
                 }
                 let load_state = get_runtime_fn(
                     module,
@@ -1474,11 +1492,162 @@ pub mod cl {
             Some(layout) => compute_rpo_from(mir, layout.target_block),
             None => compute_rpo(mir),
         };
-        for &block_idx in &rpo {
+        'block_loop: for &block_idx in &rpo {
             let block = &mir.blocks[block_idx];
             let bid = BlockId(block_idx as u32);
             let cl_block = block_map[&bid];
             builder.switch_to_block(cl_block);
+
+            // Synthetic CrossFnCallResume block: the block has
+            // no MIR-level instructions; the lowering replaces
+            // its body entirely with `invoke_sm_method + peek
+            // + brif`. Reached from the matching CrossFnCallInit
+            // block via a direct jump AND from the dispatch's
+            // br_table when the caller resumes after a child
+            // yield.
+            'cross_fn_resume: {
+                use crate::codegen::aot_state_machine::BlockKind;
+                let cfg = match aot_config {
+                    Some(c) => c,
+                    None => break 'cross_fn_resume,
+                };
+                let kind = cfg
+                    .current_state_machine_layout
+                    .borrow()
+                    .as_ref()
+                    .and_then(|l| l.block_kinds.get(&bid).cloned());
+                let Some(BlockKind::CrossFnCallResume {
+                    done_block,
+                    receiver,
+                    args,
+                    result,
+                    method_sym,
+                }) = kind
+                else {
+                    break 'cross_fn_resume;
+                };
+                let fiber = match *cfg.current_fiber_ptr_var.borrow() {
+                    Some(v) => builder.use_var(v),
+                    None => break 'cross_fn_resume,
+                };
+                // 1) invoke. Receiver/args were saved into the
+                // child frame slots either by the matching
+                // Init block (initial entry) or by a previous
+                // suspension's still-live frame (resume entry).
+                let invoke_fn = get_runtime_fn(
+                    module,
+                    builder,
+                    "wlift_aot_invoke_sm_method",
+                    6,
+                )?;
+                let vm_fn = get_runtime_fn(module, builder, "wren_load_jit_vm", 0)?;
+                let vm_call = builder.ins().call(vm_fn, &[]);
+                let vm = builder.inst_results(vm_call)[0];
+                // Always read the receiver from slot 0 of the
+                // child (top) frame. The Init block stashed it
+                // there, and on resume the dispatcher's br_table
+                // enters this synthetic block without going
+                // through Init — so the caller's val_map for
+                // the original receiver ValueId may not even
+                // dominate this block. Reading from the saved
+                // slot keeps the Cranelift IR
+                // dominance-correct.
+                let _ = receiver;
+                let load_arg_fn =
+                    get_runtime_fn(module, builder, "wlift_aot_sm_load_arg", 2)?;
+                let zero = builder.ins().iconst(types::I64, 0);
+                let recv_call = builder.ins().call(load_arg_fn, &[fiber, zero]);
+                let recv_v = builder.inst_results(recv_call)[0];
+                let symbols_gv =
+                    module.declare_data_in_func(cfg.symbols_data, builder.func);
+                let symbols_addr = builder.ins().global_value(types::I64, symbols_gv);
+                let sym_slot = aot_intern_symbol(cfg, method_sym.index(), interner);
+                let sym_v = builder.ins().load(
+                    types::I64,
+                    cranelift_codegen::ir::MemFlags::trusted(),
+                    symbols_addr,
+                    (sym_slot as i32) * 8,
+                );
+                let num_args_v = builder.ins().iconst(types::I64, args.len() as i64);
+                let resume_v = if let Some(rv) = *cfg.current_resume_v_var.borrow() {
+                    builder.use_var(rv)
+                } else {
+                    builder.ins().iconst(types::I64, 0)
+                };
+                let invoke_call = builder.ins().call(
+                    invoke_fn,
+                    &[vm, fiber, recv_v, sym_v, num_args_v, resume_v],
+                );
+                let ret = builder.inst_results(invoke_call)[0];
+                // 2) peek + brif.
+                let peek_fn = get_runtime_fn(
+                    module,
+                    builder,
+                    "wlift_aot_sm_peek_poll_kind",
+                    0,
+                )?;
+                let peek_call = builder.ins().call(peek_fn, &[]);
+                let kind_64 = builder.inst_results(peek_call)[0];
+                let yield_const = builder.ins().iconst(types::I64, 1);
+                let is_yield = builder.ins().icmp(
+                    cranelift_codegen::ir::condcodes::IntCC::Equal,
+                    kind_64,
+                    yield_const,
+                );
+                let propagate_block = builder.create_block();
+                let done_cl_block_local = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_yield, propagate_block, &[], done_cl_block_local, &[]);
+                // 3) propagate: just Return ret.
+                builder.switch_to_block(propagate_block);
+                let return_ty = builder.func.signature.returns[0].value_type;
+                let ret_propagate = if builder.func.dfg.value_type(ret) != return_ty {
+                    builder.ins().bitcast(
+                        return_ty,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        ret,
+                    )
+                } else {
+                    ret
+                };
+                builder.ins().return_(&[ret_propagate]);
+                // 4) done: pop frame, clear kind, jump to
+                //    done_block. The MIR transform already
+                //    rewrote downstream uses of `result` to
+                //    a fresh ValueId loaded by the resume
+                //    block's prologue (cap-1's resume_loads),
+                //    so we only need the runtime to put the
+                //    call's ret in the right slot. We use
+                //    save_value (writes to caller's
+                //    active-depth frame) at the slot the
+                //    transform allocated for `result`.
+                builder.switch_to_block(done_cl_block_local);
+                let pop_fn = get_runtime_fn(
+                    module,
+                    builder,
+                    "wlift_aot_sm_pop_frame",
+                    1,
+                )?;
+                let _ = builder.ins().call(pop_fn, &[fiber]);
+                let clear_fn = get_runtime_fn(
+                    module,
+                    builder,
+                    "wlift_aot_sm_clear_poll_kind",
+                    0,
+                )?;
+                let _ = builder.ins().call(clear_fn, &[]);
+                // Bind the result. The done_block (post-call
+                // MIR block) reads `result` directly via
+                // val_map; insert here so its instruction
+                // lowering sees the right Cranelift Value.
+                val_map.insert(result, ret);
+                let target = block_map[&done_block];
+                builder.ins().jump(target, &[]);
+                // Skip the regular per-instruction + terminator
+                // emission for this block.
+                continue 'block_loop;
+            }
 
             // Reset call_site_idx to the pre-computed base for this block.
             // This ensures IC entries are read from the correct sequential
@@ -1523,6 +1692,47 @@ pub mod cl {
                                 val_map.insert(vid, entry_params[param_idx]);
                             }
                             param_idx += 1;
+                        }
+                    }
+                } else if aot_config
+                    .map(|c| c.current_state_machine_layout.borrow().is_some())
+                    .unwrap_or(false)
+                {
+                    // State-machine entry: bb0 is reached via
+                    // the dispatch block's `br_table`, which
+                    // doesn't pass any block args. Don't append
+                    // block params — the (fiber, resume_v)
+                    // signature lives on the dispatch block.
+                    // Instead, materialise each `BlockParam(i)`
+                    // by loading from `wlift_aot_sm_load_value(
+                    // fiber, i)`: the caller wrote the args
+                    // there before invocation, and arg `0` is
+                    // the receiver for instance methods.
+                    if let Some(cfg) = aot_config {
+                        if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
+                            let fiber = builder.use_var(fiber_var);
+                            let load_fn = get_runtime_fn(
+                                module,
+                                builder,
+                                "wlift_aot_sm_load_value",
+                                2,
+                            )?;
+                            for &(vid, ref inst) in &block.instructions {
+                                if let Instruction::BlockParam(idx) = inst {
+                                    let slot = builder
+                                        .ins()
+                                        .iconst(types::I64, *idx as i64);
+                                    let call = builder.ins().call(load_fn, &[fiber, slot]);
+                                    let v = builder.inst_results(call)[0];
+                                    val_map.insert(vid, v);
+                                    if *idx == 0 {
+                                        receiver_val = Some(v);
+                                    }
+                                    if mark_stack_map && is_wren_value(vid, &value_types) {
+                                        builder.declare_value_needs_stack_map(v);
+                                    }
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1664,10 +1874,33 @@ pub mod cl {
             // (finish_alloc's "push but don't pop" mode) get
             // released at the function boundary. The snapshot
             // Variable was defined at function entry above.
+            //
+            // For state-machine cross-fn call sites we
+            // override the terminator entirely (the propagate
+            // branch returns, the done branch jumps); track
+            // that here so the generic terminator emission
+            // below skips the duplicate.
+            let mut skip_default_terminator = false;
+            // The pre-terminator hook fires for both Return-
+            // (DirectYield) and Branch- (CrossFnCallInit, where
+            // the transform wired the yielding block to its
+            // synthetic call_check via Branch so compute_rpo
+            // walks them in the right order) terminated blocks
+            // when the layout has a block_kind for them.
+            let has_state_machine_kind = aot_config
+                .and_then(|c| {
+                    c.current_state_machine_layout
+                        .borrow()
+                        .as_ref()
+                        .map(|l| l.block_kinds.contains_key(&bid))
+                })
+                .unwrap_or(false);
             if matches!(
                 block.terminator,
                 Terminator::Return(_) | Terminator::ReturnNull
-            ) {
+            ) || (has_state_machine_kind
+                && matches!(block.terminator, Terminator::Branch { .. }))
+            {
                 if let Some(cfg) = aot_config {
                     if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
                         let snap = builder.use_var(snap_var);
@@ -1719,17 +1952,118 @@ pub mod cl {
                                         );
                                     }
                                 }
-                                let yield_fn = get_runtime_fn(
-                                    module,
-                                    builder,
-                                    "wlift_aot_sm_yield",
-                                    2,
-                                )?;
-                                let next_state_v = builder
-                                    .ins()
-                                    .iconst(types::I64, *next_state as i64);
-                                let _ =
-                                    builder.ins().call(yield_fn, &[fiber, next_state_v]);
+                                // Branch on kind: DirectYield
+                                // emits the yield-stamp + plain
+                                // Return; CrossFnCall builds the
+                                // push/save/invoke/peek/branch
+                                // sequence and replaces the
+                                // Return's value with the
+                                // call's runtime result.
+                                use crate::codegen::aot_state_machine::BlockKind;
+                                let kind_record = layout.block_kinds.get(&bid).cloned();
+                                match kind_record {
+                                    Some(BlockKind::CrossFnCallInit {
+                                        resume_check_block,
+                                        receiver,
+                                        args,
+                                        result: _result,
+                                        method_sym: _method_sym,
+                                    }) => {
+                                        // Init half: advance own
+                                        // state to the call_check
+                                        // block's state, push a
+                                        // new frame for the
+                                        // callee, save args, and
+                                        // jump to the call_check
+                                        // block. The actual
+                                        // invoke + kind-check +
+                                        // propagate is in the
+                                        // CrossFnCallResume
+                                        // lowering below, which
+                                        // both this jump and the
+                                        // dispatcher's `br_table`
+                                        // land in.
+                                        let set_state_fn = get_runtime_fn(
+                                            module,
+                                            builder,
+                                            "wlift_aot_sm_set_state",
+                                            2,
+                                        )?;
+                                        let ns = builder
+                                            .ins()
+                                            .iconst(types::I64, *next_state as i64);
+                                        let _ = builder
+                                            .ins()
+                                            .call(set_state_fn, &[fiber, ns]);
+                                        let push_fn = get_runtime_fn(
+                                            module,
+                                            builder,
+                                            "wlift_aot_sm_push_frame",
+                                            1,
+                                        )?;
+                                        let _ = builder.ins().call(push_fn, &[fiber]);
+                                        let save_arg_fn = get_runtime_fn(
+                                            module,
+                                            builder,
+                                            "wlift_aot_sm_save_arg",
+                                            3,
+                                        )?;
+                                        let recv_v = match val_map.get(&receiver) {
+                                            Some(v) => *v,
+                                            None => builder.ins().iconst(types::I64, 0),
+                                        };
+                                        let zero = builder.ins().iconst(types::I64, 0);
+                                        let _ = builder
+                                            .ins()
+                                            .call(save_arg_fn, &[fiber, zero, recv_v]);
+                                        for (i, a) in args.iter().enumerate() {
+                                            let av = match val_map.get(a) {
+                                                Some(v) => *v,
+                                                None => {
+                                                    builder.ins().iconst(types::I64, 0)
+                                                }
+                                            };
+                                            let slot = builder
+                                                .ins()
+                                                .iconst(types::I64, (i + 1) as i64);
+                                            let _ = builder
+                                                .ins()
+                                                .call(save_arg_fn, &[fiber, slot, av]);
+                                        }
+                                        let target = block_map[&resume_check_block];
+                                        builder.ins().jump(target, &[]);
+                                        // Generic terminator
+                                        // emission below would
+                                        // try to lower the bare
+                                        // Return(result) on the
+                                        // already-terminated
+                                        // block — switch to a
+                                        // fresh dead block to
+                                        // absorb its `return 0`.
+                                        let dead_block = builder.create_block();
+                                        builder.switch_to_block(dead_block);
+                                        skip_default_terminator = true;
+                                    }
+                                    _ => {
+                                        // DirectYield (or no
+                                        // BlockKind for legacy
+                                        // closures pre-cap-3):
+                                        // existing yield-stamp +
+                                        // bare Return treatment.
+                                        let yield_fn = get_runtime_fn(
+                                            module,
+                                            builder,
+                                            "wlift_aot_sm_yield",
+                                            2,
+                                        )?;
+                                        let next_state_v = builder
+                                            .ins()
+                                            .iconst(types::I64, *next_state as i64);
+                                        let _ = builder
+                                            .ins()
+                                            .call(yield_fn, &[fiber, next_state_v]);
+                                    }
+                                }
                             } else {
                                 let done_fn = get_runtime_fn(
                                     module,
@@ -1744,8 +2078,25 @@ pub mod cl {
                 }
             }
 
-            // Lower terminator
-            lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools)?;
+            // Lower terminator (unless the cross-fn lowering
+            // already emitted the propagate / done branches and
+            // switched to a dead block — see
+            // `skip_default_terminator` above).
+            if !skip_default_terminator {
+                lower_terminator(
+                    &block.terminator,
+                    builder,
+                    &val_map,
+                    &block_map,
+                    &raw_bools,
+                )?;
+            } else {
+                // The dead-block terminator must still be
+                // well-formed for Cranelift's verifier. A bare
+                // `return 0` is unreachable but valid.
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.ins().return_(&[zero]);
+            }
         }
 
         Ok(())

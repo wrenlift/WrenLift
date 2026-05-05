@@ -444,6 +444,45 @@ fn fiber_yield_in_loop_with_branch_and_live_loop_var() {
 }
 
 #[test]
+fn cross_function_fiber_yield_propagation() {
+    // v2-cap3: a class method that yields, called from inside
+    // a fiber body. The yield must propagate up through the
+    // cross-fn poll path so the caller's fiber.call observes
+    // the yield, and a subsequent fiber.call resumes the
+    // method at its post-yield state. Two `c.step()`
+    // invocations chain yield->return->yield->return:
+    //
+    //   c.step() #1: _v=1, yield 1.
+    //   resume:      _v=2, return 2.
+    //   c.step() #2: _v=3, yield 3.
+    //   resume:      _v=4, return 4.
+    //
+    // The closure body's value flows through, so the fiber
+    // observes 1, 3, 4 across three calls.
+    let r = compile_link_run(
+        "class Counter {\n  \
+           construct new() { _v = 0 }\n  \
+           step() {\n    \
+             _v = _v + 1\n    \
+             Fiber.yield(_v)\n    \
+             _v = _v + 1\n    \
+             return _v\n  \
+           }\n\
+         }\n\
+         var c = Counter.new()\n\
+         var f = Fiber.new {\n  \
+           c.step()\n  \
+           c.step()\n\
+         }\n\
+         System.print(\"a=%(f.call())\")\n\
+         System.print(\"b=%(f.call())\")\n\
+         System.print(\"c=%(f.call())\")\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "a=1\nb=3\nc=4\n");
+}
+
+#[test]
 fn nested_class_method_calls() {
     // Non-trivial method chain with intermediate object
     // construction. Exercises the IC + GC interaction across

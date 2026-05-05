@@ -985,21 +985,37 @@ pub struct ObjFiber {
     /// Absolute deadline in millis since the Unix epoch, or None for "no
     /// deadline". Inherits from the spawn parent at `Fiber.new`.
     pub deadline_ms: Option<f64>,
-    /// State ID for AOT-state-machine fiber bodies. `0` is the
-    /// initial entry; `Fiber.yield` advances it before returning,
-    /// the next `fiber.call` reads it back to resume from the
-    /// matching block. Unused (stays `0`) for fibers whose body
-    /// is interpreted or JIT-compiled — they keep using the
-    /// `mir_frames` register file.
-    pub aot_state_id: u32,
-    /// Saved-value slot table for the AOT state machine. Each
-    /// suspension writes the live values it needs preserved
-    /// (locals defined before the yield + used after) into a
-    /// run of slots; the matching resume entry reads them back
-    /// into fresh SSA values. Slots are reused across
-    /// suspensions — a later yield's live set overwrites
-    /// earlier saves. The vec resizes on demand at first save.
-    pub aot_saved_values: Vec<Value>,
+    /// Stack of state-machine frames for AOT fiber execution.
+    /// One frame per active poll call: the fiber-body root
+    /// frame is pushed on the first `fiber.call`; nested
+    /// state-machine method calls push child frames and pop
+    /// them on `Done`; a `Yield` stamp leaves frames in place
+    /// so the next `fiber.call` resumes from the deepest
+    /// suspended state.
+    pub aot_frames: Vec<AotFrameState>,
+    /// Index into `aot_frames` of the frame whose poll fn is
+    /// *currently* running. The dispatcher / `wlift_aot_invoke_sm_method`
+    /// bump this when entering a child poll and restore it on
+    /// return. Without it, when a child has yielded and the
+    /// dispatcher re-invokes the body's poll, `load_state` would
+    /// read the child's `state_id` (top of stack) instead of the
+    /// body's (which is at `aot_active_depth`).
+    pub aot_active_depth: usize,
+}
+
+/// One state-machine frame on `ObjFiber.aot_frames`. Holds the
+/// resume state ID and a per-frame slot table for live-across
+/// values; each frame is independent so a parent's saved
+/// locals don't collide with a child's.
+#[derive(Debug, Default, Clone)]
+pub struct AotFrameState {
+    /// Resume state ID. `0` = run from the entry block.
+    pub state_id: u32,
+    /// Live-across-suspension values + (initial-call) args
+    /// passed by the caller. The MIR transform allocates slot
+    /// indices at AOT build time; the runtime resizes on
+    /// demand at first save.
+    pub saved_values: Vec<Value>,
 }
 
 impl Default for ObjFiber {
@@ -1025,8 +1041,8 @@ impl ObjFiber {
             context_map: Value::null(),
             cancelled: false,
             deadline_ms: None,
-            aot_state_id: 0,
-            aot_saved_values: Vec::new(),
+            aot_frames: Vec::new(),
+            aot_active_depth: 0,
         }
     }
 

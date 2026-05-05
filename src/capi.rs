@@ -484,10 +484,12 @@ pub unsafe extern "C" fn wlift_aot_enter(
 }
 
 /// One method's worth of class-install descriptor: `(sig, fn_ptr,
-/// arity, flags)`. Flags bit-0 = `is_static`, bit-1 = `is_constructor`.
-/// The bootstrap emits one of these per AOT-lowered method as a
-/// `Linkage::Local` `Data` blob, then hands the pointer + count to
-/// `wlift_aot_install_class`.
+/// arity, flags)`. Flags bit-0 = `is_static`, bit-1 = `is_constructor`,
+/// bit-2 = `is_state_machine` (method body uses Fiber.yield
+/// transitively, lowered with `(fiber, resume_v) -> i64`
+/// signature). The bootstrap emits one of these per AOT-lowered
+/// method as a `Linkage::Local` `Data` blob, then hands the
+/// pointer + count to `wlift_aot_install_class`.
 #[cfg(feature = "aot")]
 #[repr(C)]
 pub struct WliftAotMethodDesc {
@@ -593,6 +595,7 @@ pub unsafe extern "C" fn wlift_aot_install_class(
         };
         let is_static = desc.flags & 1 != 0;
         let is_constructor = desc.flags & 2 != 0;
+        let is_state_machine = desc.flags & 4 != 0;
 
         let sig_sym = vm_ref.interner.intern(sig);
         let bind_sym = if is_static || is_constructor {
@@ -605,12 +608,20 @@ pub unsafe extern "C" fn wlift_aot_install_class(
         // Register the AOT body as a stub-MIR function with its
         // jit_code slot pre-patched to the native pointer. The
         // closure-dispatch path picks it up like any JIT'd fn.
-        let func_id = vm_ref.engine.register_aot_function(
-            sig_sym,
-            desc.arity,
-            desc.fn_ptr,
-            Some(std::rc::Rc::clone(&module_rc)),
-        );
+        let func_id = if is_state_machine {
+            vm_ref.engine.register_aot_state_machine_function(
+                sig_sym,
+                desc.fn_ptr,
+                Some(std::rc::Rc::clone(&module_rc)),
+            )
+        } else {
+            vm_ref.engine.register_aot_function(
+                sig_sym,
+                desc.arity,
+                desc.fn_ptr,
+                Some(std::rc::Rc::clone(&module_rc)),
+            )
+        };
 
         let fn_obj = vm_ref.gc.alloc_fn(sig_sym, 0, 0, func_id.0);
         unsafe {
@@ -1175,8 +1186,10 @@ thread_local! {
 
 /// Read the current state ID of `fiber`'s AOT state machine.
 /// Called from the poll fn's dispatch prologue to decide which
-/// `br_table` arm to enter on resume. New fibers come back as
-/// `0`; `wlift_aot_sm_yield` advances it before returning.
+/// `br_table` arm to enter on resume. New frames come back as
+/// `0`; `wlift_aot_sm_yield` advances it before returning. Reads
+/// the topmost frame on `aot_frames` — that's the currently
+/// executing state machine.
 ///
 /// # Safety
 ///
@@ -1187,17 +1200,23 @@ pub unsafe extern "C" fn wlift_aot_sm_load_state(fiber: *mut crate::runtime::obj
     if fiber.is_null() {
         return 0;
     }
-    unsafe { (*fiber).aot_state_id as u64 }
+    unsafe {
+        let depth = (*fiber).aot_active_depth;
+        let frames = &(*fiber).aot_frames;
+        frames.get(depth).map(|f| f.state_id as u64).unwrap_or(0)
+    }
 }
 
-/// Stamp `kind = Yield`, advance the fiber's state ID to
-/// `next_state`, and return. The poll fn's epilogue follows this
-/// call with a bare `return v` whose value the dispatcher passes
-/// back to the `fiber.call` site as the suspension result.
+/// Stamp `kind = Yield`, advance the topmost frame's state ID
+/// to `next_state`, and return. The poll fn's epilogue follows
+/// this call with a bare `return v` whose value the dispatcher
+/// passes back to the `fiber.call` site as the suspension
+/// result.
 ///
 /// # Safety
 ///
-/// `fiber` must be a valid `*mut ObjFiber`.
+/// `fiber` must be a valid `*mut ObjFiber`. Caller guarantees
+/// the fiber has at least one frame on its `aot_frames` stack.
 #[cfg(feature = "aot")]
 #[no_mangle]
 pub unsafe extern "C" fn wlift_aot_sm_yield(
@@ -1206,7 +1225,11 @@ pub unsafe extern "C" fn wlift_aot_sm_yield(
 ) {
     if !fiber.is_null() {
         unsafe {
-            (*fiber).aot_state_id = next_state as u32;
+            let depth = (*fiber).aot_active_depth;
+            let frames = &mut (*fiber).aot_frames;
+            if let Some(frame) = frames.get_mut(depth) {
+                frame.state_id = next_state as u32;
+            }
         }
     }
     AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Yield));
@@ -1241,15 +1264,17 @@ pub fn wlift_aot_sm_take_poll_kind() -> AotSmPollKind {
     })
 }
 
-/// Save a Wren value into the fiber's saved-slot table at
-/// `slot`. Called at every suspension by the AOT-emitted poll
-/// function for each value live across the yield. The vec is
+/// Save a Wren value into the topmost frame's saved-slot table
+/// at `slot`. Called at every suspension by the AOT-emitted
+/// poll function for each value live across the yield, and at
+/// each cross-fn call site for caller arg slots. The vec is
 /// resized on demand so slots can be assigned in any order
 /// without an upfront sizing pass.
 ///
 /// # Safety
 ///
-/// `fiber` must be a valid `*mut ObjFiber`.
+/// `fiber` must be a valid `*mut ObjFiber` with at least one
+/// frame on `aot_frames`.
 #[cfg(feature = "aot")]
 #[no_mangle]
 pub unsafe extern "C" fn wlift_aot_sm_save_value(
@@ -1262,22 +1287,31 @@ pub unsafe extern "C" fn wlift_aot_sm_save_value(
     }
     let slot = slot as usize;
     unsafe {
-        let saved = &mut (*fiber).aot_saved_values;
-        if slot >= saved.len() {
-            saved.resize(slot + 1, crate::runtime::value::Value::null());
+        let depth = (*fiber).aot_active_depth;
+        let frames = &mut (*fiber).aot_frames;
+        let frame = match frames.get_mut(depth) {
+            Some(f) => f,
+            None => return,
+        };
+        if slot >= frame.saved_values.len() {
+            frame
+                .saved_values
+                .resize(slot + 1, crate::runtime::value::Value::null());
         }
-        saved[slot] = crate::runtime::value::Value::from_bits(value_bits);
+        frame.saved_values[slot] = crate::runtime::value::Value::from_bits(value_bits);
     }
 }
 
-/// Read back a saved value at `slot`. Called at the resume
-/// entry of every state that has live-in saved values.
+/// Read back a saved value at `slot` from the topmost frame.
+/// Called at the resume entry of every state that has live-in
+/// saved values, and on first-call entry of a state-machine
+/// method when loading args from caller-populated slots.
 ///
 /// # Safety
 ///
 /// `fiber` must be a valid `*mut ObjFiber`. Returns null bits
-/// for out-of-range slots so a corrupted state struct surfaces
-/// as a runtime null rather than UB.
+/// for out-of-range slots / no-frame so a corrupted state
+/// struct surfaces as a runtime null rather than UB.
 #[cfg(feature = "aot")]
 #[no_mangle]
 pub unsafe extern "C" fn wlift_aot_sm_load_value(
@@ -1289,13 +1323,323 @@ pub unsafe extern "C" fn wlift_aot_sm_load_value(
     }
     let slot = slot as usize;
     unsafe {
-        let saved = &(*fiber).aot_saved_values;
-        saved
+        let depth = (*fiber).aot_active_depth;
+        let frames = &(*fiber).aot_frames;
+        let frame = match frames.get(depth) {
+            Some(f) => f,
+            None => return crate::runtime::value::Value::null().to_bits(),
+        };
+        frame
+            .saved_values
             .get(slot)
             .copied()
             .unwrap_or_else(crate::runtime::value::Value::null)
             .to_bits()
     }
+}
+
+/// Write a value into slot `slot` of the *topmost* frame (the
+/// one most recently pushed via [`wlift_aot_sm_push_frame`]).
+/// Used by cross-fn callers to populate the child frame's args
+/// before invoking its poll fn — distinct from
+/// [`wlift_aot_sm_save_value`], which writes to the
+/// *active-depth* frame (the caller's), so a caller's
+/// live-across save and a child's arg write don't alias.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber` with at least one
+/// frame.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_save_arg(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    slot: u64,
+    value_bits: u64,
+) {
+    if fiber.is_null() {
+        return;
+    }
+    let slot = slot as usize;
+    unsafe {
+        let frame = match (*fiber).aot_frames.last_mut() {
+            Some(f) => f,
+            None => return,
+        };
+        if slot >= frame.saved_values.len() {
+            frame
+                .saved_values
+                .resize(slot + 1, crate::runtime::value::Value::null());
+        }
+        frame.saved_values[slot] = crate::runtime::value::Value::from_bits(value_bits);
+    }
+}
+
+/// Read a value from slot `slot` of the *topmost* frame (the
+/// child frame the parent pushed for a cross-fn call). Used by
+/// the parent's call_check block on resume — the receiver and
+/// args were stashed there at the matching Init block, and
+/// reading them via val_map / Cranelift SSA isn't safe because
+/// the dispatcher's `br_table` enters the call_check block
+/// without going through Init.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber` with at least one
+/// frame.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_load_arg(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    slot: u64,
+) -> u64 {
+    if fiber.is_null() {
+        return crate::runtime::value::Value::null().to_bits();
+    }
+    let slot = slot as usize;
+    unsafe {
+        let frames = &(*fiber).aot_frames;
+        let frame = match frames.last() {
+            Some(f) => f,
+            None => return crate::runtime::value::Value::null().to_bits(),
+        };
+        frame
+            .saved_values
+            .get(slot)
+            .copied()
+            .unwrap_or_else(crate::runtime::value::Value::null)
+            .to_bits()
+    }
+}
+
+/// Push a fresh state-machine frame on `fiber`. Used at every
+/// cross-fn call site before invoking a state-machine callee:
+/// the caller pushes a frame, writes args into the new
+/// frame's slot table via [`wlift_aot_sm_save_value`], and then
+/// calls the callee's poll fn. The callee's `wlift_aot_sm_*`
+/// helpers all operate on this newly-pushed frame.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_push_frame(fiber: *mut crate::runtime::object::ObjFiber) {
+    if fiber.is_null() {
+        return;
+    }
+    unsafe {
+        (*fiber)
+            .aot_frames
+            .push(crate::runtime::object::AotFrameState::default());
+    }
+}
+
+/// Pop the topmost state-machine frame off `fiber`. Called
+/// after a child state-machine returns `Done`, releasing the
+/// child's saved-slot storage so subsequent calls don't carry
+/// stale values.
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber`. No-op if the frame
+/// stack is already empty (defensive — shouldn't happen in
+/// well-formed AOT codegen, but a corrupted call sequence
+/// shouldn't UB the runtime).
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_pop_frame(fiber: *mut crate::runtime::object::ObjFiber) {
+    if fiber.is_null() {
+        return;
+    }
+    unsafe {
+        (*fiber).aot_frames.pop();
+    }
+}
+
+/// Set the topmost frame's `state_id` to `state` *without*
+/// stamping the global poll-kind. Used by cross-fn callers to
+/// proactively advance their own resume state before invoking a
+/// child state machine — that way, if the child yields, the
+/// dispatcher re-enters the caller at this state on the next
+/// `fiber.call`. Distinct from [`wlift_aot_sm_yield`] (which
+/// also flips kind = Yield, intended for the actual suspending
+/// return path).
+///
+/// # Safety
+///
+/// `fiber` must be a valid `*mut ObjFiber` with at least one
+/// frame on `aot_frames`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_set_state(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    state: u64,
+) {
+    if fiber.is_null() {
+        return;
+    }
+    unsafe {
+        let depth = (*fiber).aot_active_depth;
+        let frames = &mut (*fiber).aot_frames;
+        if let Some(frame) = frames.get_mut(depth) {
+            frame.state_id = state as u32;
+        }
+    }
+}
+
+/// Read the current poll-kind without clearing it. Used by
+/// cross-fn callers after a child state-machine returns: if the
+/// child yielded, the kind is already set to `Yield`, and the
+/// caller's propagation path leaves it alone so the outer
+/// dispatcher still observes Yield. Distinct from
+/// [`wlift_aot_sm_take_poll_kind`], which both reads and resets
+/// (used at the dispatcher / outermost layer).
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_peek_poll_kind() -> u32 {
+    AOT_SM_POLL_KIND.with(|c| c.get() as u32)
+}
+
+/// Reset poll-kind back to `None`. Called by cross-fn callers
+/// after observing a child state-machine's `Done` so the
+/// caller's own continuation can subsequently set
+/// kind = Yield/Done as it pleases without inheriting the
+/// child's already-consumed Done stamp.
+///
+/// Without this reset, a fall-through after a `Done` child call
+/// would leave kind = Done globally; the caller's eventual
+/// completion (which calls `wlift_aot_sm_done`) would re-stamp
+/// fine, but a *yield* later in the caller's body would race
+/// with the stale Done in code paths that read kind opportunistically.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_sm_clear_poll_kind() {
+    AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::None));
+}
+
+/// Cross-function dispatch helper: invokes the state-machine
+/// `method_sym` on `recv`'s class with the args already saved
+/// into the topmost frame's slots `0..num_args`. Returns the
+/// callee's poll result. The caller is expected to:
+///
+/// 1. Save its own live-across-suspension locals via
+///    [`wlift_aot_sm_save_value`].
+/// 2. Advance its own state via [`wlift_aot_sm_set_state`] to
+///    the state ID it wants the dispatcher to re-enter at.
+/// 3. Push a new frame via [`wlift_aot_sm_push_frame`].
+/// 4. Save args (receiver into slot 0, user args into 1..N).
+/// 5. Call this helper.
+/// 6. Peek the poll kind via [`wlift_aot_sm_peek_poll_kind`].
+///    On Yield: return immediately with the helper's result.
+///    On Done: pop the frame, clear kind, bind result, continue.
+///
+/// `recv_bits` is the receiver's NaN-boxed value used for
+/// class lookup; `method_sym` is the *VM*-interner SymbolId
+/// (the AOT bootstrap re-interned via `wlift_aot_intern_symbol`,
+/// so the call site loads it from the per-module symbols table).
+///
+/// # Safety
+///
+/// All pointers must be valid; `fiber` must have at least one
+/// frame already pushed (the caller's), and a freshly-pushed
+/// child frame on top.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
+    vm: *mut WrenVM,
+    fiber: *mut crate::runtime::object::ObjFiber,
+    recv_bits: u64,
+    method_sym: u64,
+    _num_args: u64,
+    resume_v: u64,
+) -> u64 {
+    use crate::runtime::object::{Method, ObjHeader, ObjType};
+    use crate::runtime::value::Value;
+    if vm.is_null() || fiber.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm_ref = unsafe { &mut *vm };
+    let recv = Value::from_bits(recv_bits);
+    // Resolve the receiver's class — instance, then fall back
+    // to "the receiver IS a class" for static dispatch
+    // (`Foo.bar(_)` style calls where recv = the class object).
+    let class_ptr = vm_ref.class_of(recv);
+    if class_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let sym_id = crate::intern::SymbolId::from_raw(method_sym as u32);
+    let idx = sym_id.index() as usize;
+    // Walk class.methods[idx] for an installed Method::Closure
+    // pointing at a state-machine FuncId. Polymorphic dispatch
+    // works naturally because the lookup uses `class_of(recv)`.
+    let method_entry = unsafe {
+        let cls = class_ptr;
+        let methods = &(*cls).methods;
+        if idx < methods.len() {
+            methods[idx]
+        } else {
+            None
+        }
+    };
+    let closure_ptr = match method_entry {
+        Some(Method::Closure(cp)) => cp,
+        Some(Method::Constructor(cp)) => cp,
+        _ => {
+            // Not a closure-backed method (foreign / native /
+            // missing) — can't be state-machine. Surface as
+            // null; the caller's Done branch will bind null
+            // and continue.
+            return Value::null().to_bits();
+        }
+    };
+    let func_id = unsafe {
+        let fn_obj = (*closure_ptr).function;
+        (*fn_obj).fn_id
+    };
+    let idx = func_id as usize;
+    let is_sm = vm_ref
+        .engine
+        .aot_state_machine
+        .get(idx)
+        .copied()
+        .unwrap_or(false);
+    if !is_sm {
+        return Value::null().to_bits();
+    }
+    let fn_ptr = vm_ref
+        .engine
+        .jit_code
+        .get(idx)
+        .copied()
+        .unwrap_or(std::ptr::null());
+    if fn_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    // Defensive: the receiver's `class_of` must produce a real
+    // ObjClass for the dispatch to be meaningful.
+    let header = class_ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Class {
+        return Value::null().to_bits();
+    }
+    let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
+        unsafe { std::mem::transmute(fn_ptr) };
+    // Active-depth swap. The newly-pushed child frame is now at
+    // `len() - 1`; bump active_depth there for the duration of
+    // the child's poll so its `load_state` / `save_value` /
+    // `load_value` operate on its own frame, not the caller's.
+    // Restore on return so the caller's continuation sees its
+    // own state again.
+    let saved_depth = unsafe { (*fiber).aot_active_depth };
+    let new_depth = unsafe { (*fiber).aot_frames.len().saturating_sub(1) };
+    unsafe {
+        (*fiber).aot_active_depth = new_depth;
+    }
+    let result = poll(fiber, resume_v);
+    unsafe {
+        (*fiber).aot_active_depth = saved_depth;
+    }
+    result
 }
 
 /// Resolve a bare-builtin import (`import "socket" for SocketCore`,
