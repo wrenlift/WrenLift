@@ -1017,6 +1017,27 @@ pub mod cl {
         pub class_slot: u32,
     }
 
+    /// Per-emit defining-class context for static-field
+    /// lowering. The AOT driver sets this on the cell before
+    /// emitting each class method (and clears it again
+    /// afterwards), so `Instruction::GetStaticField` /
+    /// `SetStaticField` can load the receiver class from the
+    /// defining-class slot in modvars and pass it explicitly to
+    /// the helper instead of relying on `JitContext.defining_class`
+    /// being threaded through TLS — which `wlift_aot_enter` does
+    /// not populate.
+    #[derive(Clone, Debug)]
+    pub struct AotDefiningClass {
+        /// Linker symbol of the defining class's owning module's
+        /// modvars data array. Same names the CHA dispatch tree
+        /// uses (`wlift_modvars_<n>`).
+        pub modvars_symbol: String,
+        /// Slot index inside that modvars array holding the
+        /// `*mut ObjClass` (NaN-boxed). Populated at startup by
+        /// `wlift_aot_install_class`.
+        pub slot: u32,
+    }
+
     /// Per-module data the AOT lowering needs at every emit site
     /// that today calls a TLS-routed runtime helper. Passing this
     /// switches the lowering off the JIT-shaped fast/slow paths
@@ -1088,6 +1109,16 @@ pub mod cl {
         /// becomes a class-checked direct call (or trivial-getter
         /// inline); 2+ impls become a class-dispatch tree.
         pub cha: Option<*const AotCha>,
+
+        /// Defining-class context for the function currently
+        /// being emitted. The AOT driver flips this between
+        /// emissions so each class method's
+        /// `Instruction::GetStaticField` / `SetStaticField` can
+        /// resolve its owning class via modvars without
+        /// per-frame TLS setup. `None` for top-level bodies and
+        /// closures (where static-field access is unreachable
+        /// or already returns null in the legacy helper).
+        pub current_defining_class: std::cell::RefCell<Option<AotDefiningClass>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -2993,13 +3024,74 @@ pub mod cl {
             }
 
             // === Static fields ===
+            //
+            // AOT mode under a class-method emit: load the
+            // defining class from `wlift_modvars_<n>[slot]` and
+            // call `wlift_aot_get/set_static_field(class, sym)`.
+            // Bypasses `JitContext.defining_class` — `wlift_aot_enter`
+            // never populates it, so the JIT helper's TLS read
+            // would return null in every AOT frame.
+            //
+            // JIT mode (or AOT top-level / closure where no
+            // defining class is in scope) keeps the legacy
+            // `wren_get/set_static_field` call.
             Instruction::GetStaticField(sym) => {
+                if let Some(cfg) = aot_config {
+                    if let Some(defining) = cfg.current_defining_class.borrow().as_ref() {
+                        let class_data_id = module
+                            .declare_data(
+                                &defining.modvars_symbol,
+                                Linkage::Export,
+                                true,
+                                false,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let gv = module.declare_data_in_func(class_data_id, builder.func);
+                        let modvars_addr = builder.ins().global_value(types::I64, gv);
+                        let class_bits = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            modvars_addr,
+                            (defining.slot as i32) * 8,
+                        );
+                        let f =
+                            get_runtime_fn(module, builder, "wlift_aot_get_static_field", 2)?;
+                        let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
+                        let result = builder.ins().call(f, &[class_bits, sym_val]);
+                        return Ok(Some(builder.inst_results(result)[0]));
+                    }
+                }
                 let f = get_runtime_fn(module, builder, "wren_get_static_field", 1)?;
                 let idx_val = builder.ins().iconst(types::I64, sym.index() as i64);
                 let result = builder.ins().call(f, &[idx_val]);
                 Ok(Some(builder.inst_results(result)[0]))
             }
             Instruction::SetStaticField(sym, val) => {
+                if let Some(cfg) = aot_config {
+                    if let Some(defining) = cfg.current_defining_class.borrow().as_ref() {
+                        let class_data_id = module
+                            .declare_data(
+                                &defining.modvars_symbol,
+                                Linkage::Export,
+                                true,
+                                false,
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let gv = module.declare_data_in_func(class_data_id, builder.func);
+                        let modvars_addr = builder.ins().global_value(types::I64, gv);
+                        let class_bits = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            modvars_addr,
+                            (defining.slot as i32) * 8,
+                        );
+                        let f =
+                            get_runtime_fn(module, builder, "wlift_aot_set_static_field", 3)?;
+                        let sym_val = builder.ins().iconst(types::I64, sym.index() as i64);
+                        let result = builder.ins().call(f, &[class_bits, sym_val, get(val)]);
+                        return Ok(Some(builder.inst_results(result)[0]));
+                    }
+                }
                 let f = get_runtime_fn(module, builder, "wren_set_static_field", 2)?;
                 let idx_val = builder.ins().iconst(types::I64, sym.index() as i64);
                 let result = builder.ins().call(f, &[idx_val, get(val)]);

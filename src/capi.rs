@@ -958,6 +958,76 @@ pub unsafe extern "C" fn wlift_aot_intern_symbol(
     vm_ref.interner.intern(s).index() as u64
 }
 
+/// Read a static field off a class without consulting the
+/// thread-local `JitContext.defining_class`. The AOT lowering
+/// loads the class pointer from this module's modvars at the
+/// emitted method's defining-class slot and threads it in
+/// here, so the helper is independent of any per-frame TLS
+/// setup. Mirrors `wren_get_static_field`'s storage contract
+/// (a `HashMap<SymbolId, Value>` keyed by source-side
+/// SymbolId — same key on get and set within a class).
+///
+/// # Safety
+///
+/// `class_bits` must be the NaN-boxed `Value` of an `ObjClass`,
+/// matching what AOT modvars hold post-`wlift_aot_install_class`.
+#[no_mangle]
+#[cfg(feature = "aot")]
+pub unsafe extern "C" fn wlift_aot_get_static_field(class_bits: u64, field_sym: u64) -> u64 {
+    use crate::runtime::object::ObjClass;
+    use crate::runtime::value::Value;
+    let class_val = Value::from_bits(class_bits);
+    let Some(obj) = class_val.as_object() else {
+        return Value::null().to_bits();
+    };
+    let class = obj as *const ObjClass;
+    let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+    unsafe {
+        (*class)
+            .static_fields
+            .get(&sym)
+            .copied()
+            .unwrap_or(Value::null())
+            .to_bits()
+    }
+}
+
+/// Write a static field on a class. Performs the same write
+/// barrier `wren_set_static_field` does — the class is the
+/// owner of the slot, and the inserted value may be a young
+/// pointer the major collector needs to see.
+///
+/// # Safety
+///
+/// `class_bits` must be the NaN-boxed `Value` of an `ObjClass`.
+#[no_mangle]
+#[cfg(feature = "aot")]
+pub unsafe extern "C" fn wlift_aot_set_static_field(
+    class_bits: u64,
+    field_sym: u64,
+    value: u64,
+) -> u64 {
+    use crate::codegen::runtime_fns::read_jit_ctx;
+    use crate::runtime::object::{ObjClass, ObjHeader};
+    use crate::runtime::value::Value;
+    let class_val = Value::from_bits(class_bits);
+    let Some(obj) = class_val.as_object() else {
+        return value;
+    };
+    let class = obj as *mut ObjClass;
+    let sym = crate::intern::SymbolId::from_raw(field_sym as u32);
+    let value = Value::from_bits(value);
+    unsafe {
+        (*class).static_fields.insert(sym, value);
+        let ctx = read_jit_ctx();
+        if !ctx.vm.is_null() {
+            let vm = &mut *(ctx.vm as *mut crate::runtime::vm::VM);
+            vm.gc.write_barrier(class as *mut ObjHeader, value);
+        }
+    }
+    value.to_bits()
+}
+
 /// Restore the `JitContext` saved by a matching `wlift_aot_enter`.
 /// Pass the same `saved` pointer the enter call wrote into.
 ///

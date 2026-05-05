@@ -40,7 +40,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::ast::Stmt;
 use crate::codegen::cranelift_backend::cl::{
-    lower_mir_to_module, AotCha, AotLoweringConfig, AotMethodImpl,
+    lower_mir_to_module, AotCha, AotDefiningClass, AotLoweringConfig, AotMethodImpl,
 };
 use crate::intern::Interner;
 use crate::mir::builder::lower_module_with_known_classes;
@@ -730,6 +730,7 @@ fn emit_aot_function(
     mir: &crate::mir::MirFunction,
     aot_cfg: &AotLoweringConfig,
     symbol: &str,
+    defining_class: Option<AotDefiningClass>,
 ) -> Result<(), AotError> {
     let mut sig = Signature::new(module.target_config().default_call_conv);
     let arity = mir.arity as usize;
@@ -741,6 +742,8 @@ fn emit_aot_function(
     let func_id = module
         .declare_function(symbol, Linkage::Export, &sig)
         .map_err(|e| AotError::Module(e.to_string()))?;
+
+    *aot_cfg.current_defining_class.borrow_mut() = defining_class;
 
     let mut ctx = module.make_context();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
@@ -757,6 +760,8 @@ fn emit_aot_function(
         .define_function(func_id, &mut ctx)
         .map_err(|e| AotError::Module(e.to_string()))?;
     module.clear_context(&mut ctx);
+
+    *aot_cfg.current_defining_class.borrow_mut() = None;
     Ok(())
 }
 
@@ -839,6 +844,7 @@ fn emit_aot_module(
         symbol_remap: std::cell::RefCell::new(Vec::new()),
         closures_data,
         cha: Some(cha as *const AotCha),
+        current_defining_class: std::cell::RefCell::new(None),
     };
 
     // Top-level body — the entry point Phase 7's init pass calls
@@ -849,6 +855,7 @@ fn emit_aot_module(
         &aot_mod.mir.top_level,
         &aot_cfg,
         fn_symbol,
+        None,
     )?;
 
     // Each class's methods. Methods share the module's `modvars`
@@ -875,9 +882,24 @@ fn emit_aot_module(
             .unwrap_or(usize::MAX);
 
         let mut methods_manifest: Vec<AotMethodManifest> = Vec::with_capacity(class.methods.len());
+        let defining_class_for_methods = if slot != usize::MAX {
+            Some(AotDefiningClass {
+                modvars_symbol: modvars_symbol.to_string(),
+                slot: slot as u32,
+            })
+        } else {
+            None
+        };
         for (method_idx, method) in class.methods.iter().enumerate() {
             let sym = format!("{}__method_{}_{}", fn_symbol, class_idx, method_idx);
-            emit_aot_function(module, &aot_mod.interner, &method.mir, &aot_cfg, &sym)?;
+            emit_aot_function(
+                module,
+                &aot_mod.interner,
+                &method.mir,
+                &aot_cfg,
+                &sym,
+                defining_class_for_methods.clone(),
+            )?;
             methods_manifest.push(AotMethodManifest {
                 signature: method.signature.clone(),
                 fn_symbol: sym,
@@ -918,7 +940,7 @@ fn emit_aot_module(
         Vec::with_capacity(aot_mod.mir.closures.len());
     for (closure_idx, closure_mir) in aot_mod.mir.closures.iter().enumerate() {
         let sym = format!("{}__closure_{}", fn_symbol, closure_idx);
-        emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym)?;
+        emit_aot_function(module, &aot_mod.interner, closure_mir, &aot_cfg, &sym, None)?;
         closure_manifest.push(AotClosureManifest {
             fn_symbol: sym,
             arity: closure_mir.arity,
@@ -2379,6 +2401,61 @@ mod tests {
         assert!(
             has("wlift_aot_mod_0"),
             "expected wlift_aot_mod_0 (helper top-level); got {:?}",
+            names
+        );
+    }
+
+    /// Static fields touch the new explicit-class lowering: a
+    /// class with a static getter + setter compiles to method
+    /// bodies that reference `wlift_aot_get_static_field` /
+    /// `wlift_aot_set_static_field` (linker-resolved against
+    /// the runtime staticlib at build time), instead of the
+    /// `wren_get/set_static_field` JIT helpers that read the
+    /// uninitialised TLS `defining_class` slot.
+    #[test]
+    fn static_field_emits_explicit_class_helpers() {
+        let tmp = tempfile::Builder::new()
+            .prefix("wlift_aot_static_field_")
+            .suffix(".o")
+            .tempfile()
+            .expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        compile_to_object(
+            "class Counter {\n  \
+                static n { __n }\n  \
+                static incr() { __n = (__n == null ? 0 : __n) + 1 }\n\
+             }\n",
+            &path,
+        )
+        .expect("compile_to_object");
+
+        let bytes = std::fs::read(&path).expect("read object");
+        use object::{Object, ObjectSymbol};
+        let obj = object::File::parse(&*bytes).expect("parse object");
+        let names: Vec<String> = obj
+            .symbols()
+            .filter_map(|s| s.name().ok().map(str::to_string))
+            .collect();
+        let has = |needle: &str| {
+            names
+                .iter()
+                .any(|n| n == needle || n == &format!("_{}", needle))
+        };
+        assert!(
+            has("wlift_aot_get_static_field"),
+            "expected import of wlift_aot_get_static_field; got {:?}",
+            names
+        );
+        assert!(
+            has("wlift_aot_set_static_field"),
+            "expected import of wlift_aot_set_static_field; got {:?}",
+            names
+        );
+        assert!(
+            !has("wren_get_static_field"),
+            "should not import wren_get_static_field from a class method body \
+             — that path TLS-reads JitContext.defining_class which AOT never \
+             populates; got {:?}",
             names
         );
     }
