@@ -590,18 +590,8 @@ pub mod cl {
                     None,
                     Some(layout.clone()),
                     None, // OSR-entry path is JIT-only
-                    // Skip the JIT inliner + CHA tree on OSR
-                    // entries. The OSR layout passes only the
-                    // values live across the back-edge, which can
-                    // leave some Call receivers absent from the
-                    // val_map; the inliner / CHA tree then read a
-                    // dummy 0, mask through PTR_MASK, and load
-                    // garbage at offset HEADER_CLASS, causing a
-                    // SIGSEGV (e2e_jit_nbody). The whole-function
-                    // compile still gets CHA + inlining; OSR
-                    // entries fall through to the runtime helper.
-                    None,
-                    None,
+                    inline_bodies.clone(),
+                    cha_by_method.clone(),
                 );
                 if result.is_ok() {
                     builder.seal_all_blocks();

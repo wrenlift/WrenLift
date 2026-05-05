@@ -1137,18 +1137,6 @@ impl ExecutionEngine {
                 if obj_type != crate::runtime::object::ObjType::Class {
                     continue;
                 }
-                // Skip nursery-allocated classes. The generational
-                // GC promotes them on the first minor collection
-                // and the recycled nursery slot can be reclaimed
-                // by an unrelated allocation; a class-check baked
-                // with the old address would coincidentally match
-                // the recycled object and the inlined body would
-                // dereference at the wrong layout. Old-gen
-                // pointers are stable for the rest of the run.
-                let generation = unsafe { (*header).generation };
-                if generation == 0 {
-                    continue;
-                }
                 let class_ptr = ptr as *mut crate::runtime::object::ObjClass;
                 let class = unsafe { &*class_ptr };
                 for (idx, slot) in class.methods.iter().enumerate() {
