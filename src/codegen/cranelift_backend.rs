@@ -1901,6 +1901,24 @@ pub mod cl {
                             }
                         }
                     }
+                    // DirectYield resume: bind the suspension Call's
+                    // result ValueId to the `resume_v` poll-fn
+                    // parameter. The transform dropped the Call when
+                    // splitting (so the ValueId has no MIR-level
+                    // def), but post-yield code may reference it
+                    // (e.g. `var x = Fiber.yield()` then uses `x`).
+                    // The resumer's `fiber.call(value)` threaded
+                    // `value` through to `resume_v`; that's exactly
+                    // what the yield's result should bind to.
+                    if let Some(call_dst) = layout.direct_yield_results.get(&bid).copied() {
+                        if let Some(resume_var) = *cfg.current_resume_v_var.borrow() {
+                            let v = builder.use_var(resume_var);
+                            val_map.insert(call_dst, v);
+                            if mark_stack_map && is_wren_value(call_dst, &value_types) {
+                                builder.declare_value_needs_stack_map(v);
+                            }
+                        }
+                    }
                 }
             }
 

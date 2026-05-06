@@ -71,6 +71,17 @@ pub struct StateMachineLayout {
     /// involved sequence (push frame + save args + invoke
     /// callee's poll + check kind + propagate Yield).
     pub block_kinds: HashMap<BlockId, BlockKind>,
+    /// Per DirectYield resume block, the original ValueId that
+    /// was the suspension Call's result (e.g. `var x =
+    /// Fiber.yield(...)` in the source binds `x` to this
+    /// ValueId). The transform drops the Call when splitting,
+    /// so this ValueId has no MIR-level def afterwards. The
+    /// backend rebinds it to the `resume_v` poll-fn parameter
+    /// at the resume block's entry — that parameter carries
+    /// whatever value `fiber.call(value)` passed back from the
+    /// resumer. CrossFnCall results are bound separately via
+    /// the invoke helper's return value.
+    pub direct_yield_results: HashMap<BlockId, ValueId>,
 }
 
 /// What kind of suspension a block represents. AOT lowering
@@ -234,6 +245,7 @@ pub fn transform_to_state_machine(
         yield_saves: HashMap::new(),
         resume_loads: HashMap::new(),
         block_kinds: HashMap::new(),
+        direct_yield_results: HashMap::new(),
     };
     // Per-suspension save slot allocation. The vec is shared
     // across all suspensions — slots get reused as later yields
@@ -276,12 +288,15 @@ pub fn transform_to_state_machine(
         // split. DirectYield carries just the yield value;
         // CrossFnCall carries the call's metadata so the
         // lowering can emit the push/save/invoke sequence.
-        let (yield_value, cross_fn_meta): (ValueId, Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>) =
-            match susp_kind {
+        let (yield_value, direct_yield_result, cross_fn_meta): (
+            ValueId,
+            Option<ValueId>,
+            Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>,
+        ) = match susp_kind {
                 SuspensionKind::DirectYield => {
-                    let arg = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx].1 {
-                        Instruction::Call { args, .. } => args.first().copied(),
-                        _ => None,
+                    let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
+                        (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
+                        _ => unreachable!("classify_call only returns Some for Call instructions"),
                     };
                     let yield_value = if let Some(a) = arg {
                         a
@@ -295,7 +310,7 @@ pub fn transform_to_state_machine(
                             .insert(inst_idx, (new_vid, Instruction::ConstNull));
                         new_vid
                     };
-                    (yield_value, None)
+                    (yield_value, Some(call_dst), None)
                 }
                 SuspensionKind::CrossFnCall => {
                     let (call_dst, call_inst) =
@@ -305,6 +320,7 @@ pub fn transform_to_state_machine(
                     };
                     (
                         call_dst,
+                        None,
                         Some((receiver, args.clone(), call_dst, method)),
                     )
                 }
@@ -626,6 +642,9 @@ pub fn transform_to_state_machine(
                 layout.resume_entries.push(new_block_id);
                 layout.yield_blocks.insert(blk_id, next_state);
                 layout.block_kinds.insert(blk_id, BlockKind::DirectYield);
+                if let Some(dst) = direct_yield_result {
+                    layout.direct_yield_results.insert(new_block_id, dst);
+                }
             }
             (SuspensionKind::CrossFnCall, Some((receiver, args, result, method_sym))) => {
                 // Allocate the synthetic call_check block. Its
