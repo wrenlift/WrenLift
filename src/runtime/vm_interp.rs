@@ -1025,6 +1025,18 @@ fn run_fiber_with_stop_depth(
                 // closure calls; the AOT-stub fast path bypasses
                 // wren_call_* and was missing the setup.
                 let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+                // Swap module_vars to the callee's defining
+                // module so its `GetModuleVar(slot)` reads from
+                // the right slot table. Without this, a fiber
+                // body defined in module A but invoked from a
+                // tick on the scheduler in module B sees B's
+                // modvars and every `GetModuleVar` returns the
+                // wrong slot — `Http_` resolves to whatever
+                // happens to live at that slot in the caller's
+                // module, and `Http_.readRequest(_)` silently
+                // dispatches against an unrelated class.
+                let callee_module =
+                    vm.engine.func_module(func_id).cloned();
                 if let Some(c) = closure {
                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                         if ctx.vm.is_null() {
@@ -1034,6 +1046,22 @@ fn run_fiber_with_stop_depth(
                         ctx.closure = c as *mut u8;
                         ctx.defining_class = std::ptr::null_mut();
                     });
+                }
+                if let Some(mn) = callee_module.as_ref() {
+                    let cur = crate::codegen::runtime_fns::read_jit_ctx();
+                    let bytes = mn.as_bytes();
+                    let same = bytes.as_ptr() == cur.module_name
+                        && bytes.len() as u32 == cur.module_name_len;
+                    if !same {
+                        if let Some(m) = vm.engine.modules.get(mn.as_str()) {
+                            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                                ctx.module_vars = m.vars.as_ptr() as *mut u64;
+                                ctx.module_var_count = m.vars.len() as u32;
+                                ctx.module_name = bytes.as_ptr();
+                                ctx.module_name_len = bytes.len() as u32;
+                            });
+                        }
+                    }
                 }
                 let return_val = unsafe {
                     let f: extern "C" fn(u64) -> u64 = std::mem::transmute(aot_fn);

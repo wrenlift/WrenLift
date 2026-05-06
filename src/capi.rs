@@ -1601,7 +1601,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         // Walk class.methods[idx] for an installed Method::Closure
         // pointing at a state-machine FuncId. Polymorphic dispatch
         // works naturally because the lookup uses `class_of(recv)`.
-        let method_entry = unsafe {
+        let mut method_entry = unsafe {
             let cls = class_ptr;
             let methods = &(*cls).methods;
             if idx < methods.len() {
@@ -1610,6 +1610,41 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
                 None
             }
         };
+        // Static methods don't live on the receiver's class
+        // (which for a class-object receiver is the metaclass) —
+        // they live on the receiver itself, registered under
+        // `static:<sig>`. Mirror dispatch_call_rooted's static
+        // branch: when the receiver IS a class object and the
+        // metaclass lookup missed, build the `static:` symbol
+        // and re-look up on the class object directly. Without
+        // this, `Http_.readRequest(conn)` from inside an
+        // SM-tainted `App.serve_` body misses every dispatch
+        // and silently returns null.
+        let mut effective_class_ptr = class_ptr;
+        if method_entry.is_none() && class_ptr == vm_ref.class_class && recv.is_object() {
+            if let Some(recv_class) = recv.as_object().map(|p| p as *mut crate::runtime::object::ObjClass) {
+                let header = recv_class as *const ObjHeader;
+                if unsafe { (*header).obj_type } == ObjType::Class {
+                    let method_str = vm_ref.interner.resolve(sym_id).to_string();
+                    let static_str = format!("static:{}", method_str);
+                    if let Some(static_sym) = vm_ref.interner.lookup(&static_str) {
+                        let s_idx = static_sym.index() as usize;
+                        method_entry = unsafe {
+                            let methods = &(*recv_class).methods;
+                            if s_idx < methods.len() {
+                                methods[s_idx]
+                            } else {
+                                None
+                            }
+                        };
+                        if method_entry.is_some() {
+                            effective_class_ptr = recv_class;
+                        }
+                    }
+                }
+            }
+        }
+        let class_ptr = effective_class_ptr;
         let cp = match method_entry {
             Some(Method::Closure(cp)) => cp,
             Some(Method::Constructor(cp)) => cp,

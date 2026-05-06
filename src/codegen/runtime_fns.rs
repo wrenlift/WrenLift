@@ -1830,17 +1830,45 @@ pub fn call_closure_jit_or_sync(
 
     // Update context for the callee: set closure, defining_class, and
     // ensure vm is set (may be null if we're called from a fresh thread
-    // or after a context restore).
+    // or after a context restore). Swap `module_vars` to the closure's
+    // defining module so its `GetModuleVar(slot)` ops resolve against
+    // the right slot table — without this, a closure defined in main
+    // and invoked from inside `@hatch:template`'s body (e.g. site's
+    // `FnLoader.new(Fn.new {|name| Fs.readText("./views/" + name) })`
+    // called from `TemplateRegistry.get`) reads the caller's slot N
+    // and `Fs` comes back null. Same fast/slow split
+    // `call_jit_with_shadow` uses: skip the swap for intra-module
+    // calls.
+    let callee_func_id =
+        crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
+    let callee_module = vm.engine.func_module(callee_func_id).cloned();
     mutate_jit_ctx(|ctx| {
         if ctx.vm.is_null() {
             ctx.vm = vm as *mut _ as *mut u8;
         }
-        ctx.current_func_id = unsafe { (*(*closure_ptr).function).fn_id } as u64;
+        ctx.current_func_id = callee_func_id.0 as u64;
         ctx.closure = closure_ptr as *mut u8;
         ctx.defining_class = defining_class
             .map(|p| p as *mut u8)
             .unwrap_or(std::ptr::null_mut());
     });
+    if let Some(mn) = callee_module.as_ref() {
+        let bytes = mn.as_bytes();
+        let cur = read_jit_ctx();
+        let same =
+            bytes.as_ptr() == cur.module_name && bytes.len() as u32 == cur.module_name_len;
+        if !same {
+            if let Some(m) = vm.engine.modules.get(mn.as_str()) {
+                let bytes = mn.as_bytes();
+                mutate_jit_ctx(|ctx| {
+                    ctx.module_vars = m.vars.as_ptr() as *mut u64;
+                    ctx.module_var_count = m.vars.len() as u32;
+                    ctx.module_name = bytes.as_ptr();
+                    ctx.module_name_len = bytes.len() as u32;
+                });
+            }
+        }
+    }
 
     // Install completed compilations so we can dispatch natively.
     if vm.engine.has_pending_compilations() {
