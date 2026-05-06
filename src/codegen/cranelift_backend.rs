@@ -1451,16 +1451,17 @@ pub mod cl {
                 if let Some(var) = *cfg.current_resume_v_var.borrow() {
                     builder.def_var(var, resume_v_param);
                 }
-                // Take the JIT-roots snapshot at the dispatch
-                // block (the actual function entry for
-                // state-machine bodies). The pre-Return hook
-                // reads `snap_var` before every yield/done
-                // restore; if the dispatcher's `br_table`
-                // jumps directly to a resume_entry the bb0
-                // setup never runs, leaving `snap_var`
-                // undefined and the body's eventual
-                // `wren_jit_roots_restore(snap)` panicking on
-                // an out-of-bounds index.
+                // Define every function-entry Variable here at
+                // the actual function entry (the dispatch
+                // block) — the dispatcher's `br_table` can
+                // jump straight to a resume_entry block (state
+                // >= 1), bypassing bb0 where the same setup
+                // would otherwise run. Variables left
+                // undefined under that path produce panics
+                // (snap_var → out-of-bounds in
+                // `wren_jit_roots_restore`) or SIGSEGVs
+                // (closure_ptr_var → null deref on every
+                // GetUpvalue / SetUpvalue site).
                 if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
                     let f = get_runtime_fn(
                         module,
@@ -1471,6 +1472,17 @@ pub mod cl {
                     let call = builder.ins().call(f, &[]);
                     let snap = builder.inst_results(call)[0];
                     builder.def_var(snap_var, snap);
+                }
+                if let Some(closure_var) = *cfg.current_closure_ptr_var.borrow() {
+                    let f = get_runtime_fn(
+                        module,
+                        builder,
+                        "wren_load_jit_closure",
+                        0,
+                    )?;
+                    let call = builder.ins().call(f, &[]);
+                    let closure_bits = builder.inst_results(call)[0];
+                    builder.def_var(closure_var, closure_bits);
                 }
                 let load_state = get_runtime_fn(
                     module,
