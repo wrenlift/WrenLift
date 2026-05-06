@@ -4185,6 +4185,23 @@ impl VM {
                     return None;
                 }
             };
+            // AOT-stub functions have empty MIR — they expect
+            // the fast path above to call their `jit_code[id]`
+            // pointer. If we fall through here it's because
+            // the pointer was never registered (foreign method
+            // without a binding, or a method dispatch hitting
+            // a stub with neither MIR nor AOT body). Surface a
+            // runtime error rather than panicking on
+            // `mir.blocks[0]`.
+            if mir.blocks.is_empty() {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                self.has_error = true;
+                self.last_error = Some(format!(
+                    "method dispatch hit AOT stub with no body (func_id={})",
+                    func_id.0
+                ));
+                return Some(Value::null());
+            }
             let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
             let block = &mir.blocks[0];
