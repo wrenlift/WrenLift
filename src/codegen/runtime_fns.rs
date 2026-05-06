@@ -294,6 +294,14 @@ fn try_dispatch_trivial_accessor_fastpath(
 #[inline(always)]
 fn try_dispatch_call_noframe_fast(recv: Value, method_packed: u64, args: &[Value]) -> Option<u64> {
     let vm = unsafe { vm_ref() }?;
+    // Same has_error short-circuit as `dispatch_call_rooted`. The
+    // no-frame fast path is the first stop on every JIT-issued
+    // Call; without the guard a chained call after a Fiber.abort
+    // would still hit a list/method-cache fast path and overwrite
+    // the in-flight error with whatever the second call returns.
+    if vm.has_error {
+        return Some(Value::null().to_bits());
+    }
     let (method_sym, _) = decode_method_and_ic(method_packed);
     let class = vm.class_of(recv);
 
@@ -2073,6 +2081,19 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
         Some(v) => v,
         None => return Value::null().to_bits(),
     };
+    // If we already have a runtime error in flight, short-circuit
+    // every subsequent call within the AOT body to a null return.
+    // The block-entry `wren_aot_check_error` poll catches the
+    // error at the next branch boundary and unwinds, but a
+    // straight-line block can hold multiple Call sites — without
+    // this guard, an aborted `checkAlive_()` is followed by the
+    // foreign `SqliteCore.execute(_id, ...)` call, which validates
+    // _id and overwrites the original "use after close" error
+    // with its own "id must be a non-negative integer". Mirrors
+    // the BC interpreter's per-opcode `has_error` short-circuit.
+    if vm.has_error {
+        return Value::null().to_bits();
+    }
     vm.engine
         .note_runtime_call_stats(|s| s.dispatch_call_entries += 1);
     let (method_sym, ic_idx) = decode_method_and_ic(method_packed);
