@@ -157,20 +157,6 @@ fn classify_call(
     None
 }
 
-/// True if the instruction is a Call to one of the direct yield
-/// primitives. v1 helper retained for the closure-only path that
-/// doesn't need the cross-fn classification — used by the unit
-/// tests.
-fn is_suspension_call(inst: &Instruction, interner: &Interner) -> bool {
-    if let Instruction::Call { method, .. } = inst {
-        direct_yield_method_names()
-            .iter()
-            .any(|n| interner.resolve(*method) == *n)
-    } else {
-        false
-    }
-}
-
 /// Errors the transform can refuse with. v1 caps refer to the
 /// liveness-across-suspension case the simple split can't safely
 /// emit; the AOT pipeline degrades to a hard error so we don't
@@ -333,89 +319,73 @@ pub fn transform_to_state_machine(
                 .expect("suspension still present after ConstNull insert")
         };
 
-        // Liveness pass. v is "live across the suspension" iff
-        // it's used somewhere reachable from the resume but NOT
-        // defined in the resume's reachable code (i.e. its def
-        // dominates the yield, by SSA dominance). For each such
-        // v, allocate a slot, save before yield, load on resume,
-        // remap downstream uses.
+        // Liveness pass.
         //
-        // The walk excludes back-edges: when a value is a block
-        // param of a successor on a back-path, that block param
-        // is its own SSA def (the loop's iteration value), not
-        // a downstream use of `v` from this iteration. Stopping
-        // at block-param shadows during remap (see below) is
-        // what keeps the rewrite correct.
+        // The earlier "uses minus reachable defs" shortcut was
+        // unsound: a def in block X cancelled a use in block Y
+        // even when X didn't dominate Y, so values used on a
+        // path that bypasses their def saw undefined SSA at
+        // lowering. Cranelift caught one such pattern in
+        // `@hatch:proc`'s closure_50 with "uses value v494 from
+        // non-dominating inst555". With proper backward live-
+        // variable analysis the same v494 ends up in the save
+        // set, restored fresh at the resume entry.
+        //
+        // We compute liveness AFTER splitting the block so the
+        // post-yield tail is its own CFG node — `live_in` at the
+        // resume block's entry is exactly the set of values that
+        // flow across the yield boundary. The split fragment
+        // below does the real split; the rest of the original
+        // transform (allocate slots, fresh ValueIds, remap, tail-
+        // duplicate) runs against the freshly-split MIR.
+
+        // --- Split the block. ---
+        let new_block_id = mir.new_block();
+        let original_terminator = {
+            let blk = &mut mir.blocks[blk_id.0 as usize];
+            let mut tail = blk.instructions.split_off(inst_idx);
+            // tail[0] is the suspension Call — drop it.
+            tail.remove(0);
+            let original_terminator =
+                std::mem::replace(&mut blk.terminator, Terminator::Return(yield_value));
+            let new_block = &mut mir.blocks[new_block_id.0 as usize];
+            new_block.instructions = tail;
+            new_block.terminator = original_terminator.clone();
+            original_terminator
+        };
+        let _ = original_terminator;
+
+        // --- Standard backward liveness on the now-split MIR. ---
         let live_across: Vec<ValueId> = {
-            let blk = &mir.blocks[blk_id.0 as usize];
-            // Collect all uses + defs reachable from the
-            // resume successors. Defs include both instruction
-            // results and block params for blocks visited
-            // along the way.
-            let mut uses: Vec<ValueId> = Vec::new();
-            let mut defs: std::collections::HashSet<ValueId> =
-                std::collections::HashSet::new();
-            // Pre-yield tail of the yielding block: any use
-            // there belongs to the yielding code itself, not
-            // post-yield (we already moved those instructions
-            // off when splitting; this branch handles the
-            // case before the split has happened).
-            //
-            // For "uses in the post-yield tail", scan the
-            // instructions AFTER the yield (in the still-
-            // un-split block) + the terminator + the
-            // successor blocks.
-            for (_, inst) in &blk.instructions[inst_idx + 1..] {
-                for u in collect_uses(inst) {
-                    uses.push(u);
+            let live_in_at_resume = compute_live_in(mir, new_block_id);
+            // Forward-reach from the resume block defines what's
+            // post-yield; everything else (including earlier
+            // resume blocks from prior SM iterations, which have
+            // no MIR predecessors after their own splits) counts
+            // as pre-yield.
+            let mut pre_yield_defs = collect_pre_yield_defs(mir, new_block_id);
+            // Include ValueIds that an earlier SM iteration
+            // already promoted to a per-resume load. Those have
+            // no MIR-level def (the load is materialised inline
+            // by the cranelift lowering at the prior resume
+            // entry), so a vanilla def-block scan misses them
+            // and they fall out of subsequent iterations'
+            // save sets — exactly what made `live.spec`'s
+            // closure_12 yield-3 forget to re-save the iter-1
+            // load value, leaving Cranelift to compile a use of
+            // an undefined SSA value with the dominance
+            // verifier complaining loudly.
+            for loads in layout.resume_loads.values() {
+                for (_slot, fresh_vid) in loads {
+                    pre_yield_defs.insert(*fresh_vid);
                 }
             }
-            for u in collect_terminator_uses(&blk.terminator) {
-                uses.push(u);
-            }
-            // Anything defined in the post-yield tail is local
-            // to it — those don't need saving.
-            for (vid, _) in &blk.instructions[inst_idx + 1..] {
-                defs.insert(*vid);
-            }
-            let mut visited: std::collections::HashSet<BlockId> =
-                std::collections::HashSet::new();
-            let mut stack: Vec<BlockId> = blk.terminator.successors();
-            while let Some(b) = stack.pop() {
-                if !visited.insert(b) {
-                    continue;
-                }
-                let s_blk = &mir.blocks[b.0 as usize];
-                // Block params are NOT defs for liveness:
-                // their incoming value is supplied by the
-                // predecessor's branch arg, which itself can
-                // be a saved (pre-yield) value flowing in via
-                // tail-duplication. If we treated block params
-                // as defs we'd miss saving values whose only
-                // post-yield use is "v1 directly" inside a
-                // block reachable from the resume that doesn't
-                // shadow it.
-                for (vid, inst) in &s_blk.instructions {
-                    defs.insert(*vid);
-                    for u in collect_uses(inst) {
-                        uses.push(u);
-                    }
-                }
-                for u in collect_terminator_uses(&s_blk.terminator) {
-                    uses.push(u);
-                }
-                for s in s_blk.terminator.successors() {
-                    stack.push(s);
-                }
-            }
-            // live_across = uses not defined in the resume's
-            // reachable code (so they must come from a
-            // pre-yield definition). For CrossFnCall sites,
-            // exclude the call's `result` ValueId — it has no
-            // pre-call definition (the suspension Call was
-            // dropped during split), and the lowering
+
+            // CrossFnCall result: the suspension Call's `result`
+            // ValueId has no pre-call definition (the call was
+            // dropped above during the split), and the lowering
             // rebinds it to the runtime `ret` of
-            // `wlift_aot_invoke_sm_method` directly via
+            // `wlift_aot_invoke_sm_method` via
             // `val_map.insert(result, ret)`. Save/load through
             // the slot table would just round-trip null.
             let exclude_dst = match susp_kind {
@@ -424,17 +394,14 @@ pub fn transform_to_state_machine(
                 }
                 _ => None,
             };
-            let mut seen: std::collections::HashSet<ValueId> =
-                std::collections::HashSet::new();
-            let mut live: Vec<ValueId> = Vec::new();
-            for u in uses {
-                if Some(u) == exclude_dst {
-                    continue;
-                }
-                if !defs.contains(&u) && seen.insert(u) {
-                    live.push(u);
-                }
-            }
+
+            // Stable order so slot assignment is deterministic.
+            let mut live: Vec<ValueId> = live_in_at_resume
+                .into_iter()
+                .filter(|v| Some(*v) != exclude_dst)
+                .filter(|v| pre_yield_defs.contains(v))
+                .collect();
+            live.sort_by_key(|v| v.0);
             live
         };
 
@@ -457,29 +424,11 @@ pub fn transform_to_state_machine(
             })
             .collect();
 
-        // Split the block.
-        //   blk[0..inst_idx]       → stays in `blk`. Drop the
-        //                            suspension Call itself; the
-        //                            caller observes `yield_value`
-        //                            via the new Return terminator.
-        //   blk[inst_idx+1..]      → moves to a fresh resume block.
-        //   blk.terminator         → moves with it.
-        //   blk.terminator (new)   → Return(yield_value).
-        let new_block_id = mir.new_block();
-        let (post_instructions, original_terminator) = {
-            let blk = &mut mir.blocks[blk_id.0 as usize];
-            let mut tail = blk.instructions.split_off(inst_idx);
-            // tail[0] is the suspension call — drop it.
-            tail.remove(0);
-            let original_terminator =
-                std::mem::replace(&mut blk.terminator, Terminator::Return(yield_value));
-            (tail, original_terminator)
-        };
-        // `new_block` was appended via `mir.new_block()` already;
-        // populate it now.
-        let new_block = mir.block_mut(new_block_id);
-        new_block.instructions = post_instructions;
-        new_block.terminator = original_terminator;
+        // The block split already happened above (right before
+        // the liveness pass) — `blk_id` now ends in
+        // `Return(yield_value)`, the post-yield tail lives in
+        // `new_block_id`. Continue with the tail-duplication +
+        // remap pass.
 
         // Tail-duplication remap. The resume block's
         // successors may also be reachable from the
@@ -893,6 +842,132 @@ fn remap_terminator_uses(term: &mut Terminator, remap: &HashMap<ValueId, ValueId
 /// in sync with future `Instruction` enum additions.
 fn collect_uses(inst: &Instruction) -> Vec<ValueId> {
     inst.operands()
+}
+
+/// Standard backward live-variable analysis. Returns the set of
+/// ValueIds live at the entry of `target_block`. Used by the SM
+/// transform's split point to figure out which pre-yield values
+/// must be saved across a suspension and reloaded on resume.
+///
+/// Block-level uses/defs are collected once, then `live_in[B] =
+/// uses(B) ∪ (live_out[B] − defs(B))` and `live_out[B] = ∪
+/// live_in[succ]` are iterated to a fixed point. Block params
+/// count as defs (they're SSA values introduced at block entry).
+fn compute_live_in(
+    mir: &MirFunction,
+    target_block: BlockId,
+) -> std::collections::HashSet<ValueId> {
+    use std::collections::HashSet;
+    let n = mir.blocks.len();
+    let mut block_uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut block_defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut successors: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+
+    for (i, blk) in mir.blocks.iter().enumerate() {
+        let mut local_defs = HashSet::new();
+        // Block params are defs at entry.
+        for (vid, _) in &blk.params {
+            local_defs.insert(*vid);
+        }
+        // Walk instructions in order: a use precedes the
+        // instruction's own def, so a use is "real" only if not
+        // already locally defined by a previous instruction.
+        for (vid, inst) in &blk.instructions {
+            for u in collect_uses(inst) {
+                if !local_defs.contains(&u) {
+                    block_uses[i].insert(u);
+                }
+            }
+            local_defs.insert(*vid);
+        }
+        for u in collect_terminator_uses(&blk.terminator) {
+            if !local_defs.contains(&u) {
+                block_uses[i].insert(u);
+            }
+        }
+        block_defs[i] = local_defs;
+        successors[i] = blk.terminator.successors();
+    }
+
+    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        // Reverse-postorder-ish: iterate from the last block
+        // backwards. Doesn't affect correctness, just shaves a
+        // few worklist passes vs. forward order.
+        for i in (0..n).rev() {
+            let mut live_out: HashSet<ValueId> = HashSet::new();
+            for succ in &successors[i] {
+                let s = succ.0 as usize;
+                if s < n {
+                    for v in &live_in[s] {
+                        live_out.insert(*v);
+                    }
+                }
+            }
+            let mut new_live_in = block_uses[i].clone();
+            for v in &live_out {
+                if !block_defs[i].contains(v) {
+                    new_live_in.insert(*v);
+                }
+            }
+            if new_live_in != live_in[i] {
+                live_in[i] = new_live_in;
+                changed = true;
+            }
+        }
+    }
+
+    live_in[target_block.0 as usize].clone()
+}
+
+/// Set of ValueIds whose def block is NOT forward-reachable from
+/// `resume_block` — i.e. values that already exist when the
+/// yield happens and would be lost across the suspension if we
+/// didn't save them. Post-resume-defined values are produced
+/// fresh on every resume, so saving them at the yield (where
+/// they don't yet exist) would be incorrect.
+///
+/// In the post-split MIR every resume block has zero MIR-level
+/// predecessors (the dispatcher's `br_table` edge is added at
+/// lowering, after this transform runs). So forward-reachability
+/// from one resume block doesn't sweep through other resumes —
+/// each yield's pre-yield-defs are computed against its own
+/// resume successor subgraph, independent of earlier yields'
+/// resume blocks even though they share the original function's
+/// CFG.
+fn collect_pre_yield_defs(
+    mir: &MirFunction,
+    resume_block: BlockId,
+) -> std::collections::HashSet<ValueId> {
+    use std::collections::HashSet;
+    let n = mir.blocks.len();
+    let mut post_yield: HashSet<BlockId> = HashSet::new();
+    let mut stack = vec![resume_block];
+    while let Some(b) = stack.pop() {
+        if !post_yield.insert(b) {
+            continue;
+        }
+        if (b.0 as usize) < n {
+            for s in mir.blocks[b.0 as usize].terminator.successors() {
+                stack.push(s);
+            }
+        }
+    }
+    let mut pre_yield_defs: HashSet<ValueId> = HashSet::new();
+    for (i, blk) in mir.blocks.iter().enumerate() {
+        if post_yield.contains(&BlockId(i as u32)) {
+            continue;
+        }
+        for (vid, _) in &blk.params {
+            pre_yield_defs.insert(*vid);
+        }
+        for (vid, _) in &blk.instructions {
+            pre_yield_defs.insert(*vid);
+        }
+    }
+    pre_yield_defs
 }
 
 /// Collect ValueId reads from a terminator. Uses `Terminator::operands`
