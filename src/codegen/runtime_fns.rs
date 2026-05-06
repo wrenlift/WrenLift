@@ -1685,6 +1685,20 @@ pub extern "C" fn wren_load_jit_vm() -> u64 {
     ctx.vm as u64
 }
 
+/// Returns 1 when the VM has an in-flight runtime error, 0 otherwise.
+/// AOT bodies poll this at every basic-block entry — without it,
+/// straight-line Cranelift code keeps running after `Fiber.abort`
+/// (the BC interp's per-opcode `has_error` check has no analogue),
+/// turning a single abort inside a `while (true) { … }` loop into
+/// an infinite stream of repeat-aborts.
+#[no_mangle]
+pub extern "C" fn wren_aot_check_error() -> u64 {
+    match unsafe { vm_ref() } {
+        Some(vm) if vm.has_error => 1,
+        _ => 0,
+    }
+}
+
 /// Load the JIT code pointer for a given function ID.
 /// Returns the function pointer as u64 (0 if not compiled).
 /// Used by CallKnownFunc to do direct JIT-to-JIT calls.
@@ -4764,6 +4778,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_load_jit_ptr" => Some(wren_load_jit_ptr as *const () as usize),
         "wren_load_jit_closure" => Some(wren_load_jit_closure as *const () as usize),
         "wren_load_jit_vm" => Some(wren_load_jit_vm as *const () as usize),
+        "wren_aot_check_error" => Some(wren_aot_check_error as *const () as usize),
         "wren_jit_roots_snapshot" => Some(wren_jit_roots_snapshot as *const () as usize),
         "wren_jit_roots_restore" => Some(wren_jit_roots_restore as *const () as usize),
         "wren_known_call_0" => Some(wren_known_call_0 as *const () as usize),

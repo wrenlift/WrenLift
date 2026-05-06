@@ -1014,6 +1014,7 @@ fn emit_aot_function(
     *aot_cfg.current_defining_class.borrow_mut() = defining_class;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
     *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
+    *aot_cfg.current_abort_exit_block.borrow_mut() = None;
     *aot_cfg.current_state_machine_layout.borrow_mut() =
         sm_payload.as_ref().map(|(_, l)| l.clone());
 
@@ -1062,6 +1063,7 @@ fn emit_aot_function(
     *aot_cfg.current_defining_class.borrow_mut() = None;
     *aot_cfg.current_closure_ptr_var.borrow_mut() = None;
     *aot_cfg.current_jit_roots_snapshot_var.borrow_mut() = None;
+    *aot_cfg.current_abort_exit_block.borrow_mut() = None;
     *aot_cfg.current_state_machine_layout.borrow_mut() = None;
     *aot_cfg.current_fiber_ptr_var.borrow_mut() = None;
     *aot_cfg.current_resume_v_var.borrow_mut() = None;
@@ -1171,6 +1173,7 @@ fn emit_aot_module(
         current_defining_class: std::cell::RefCell::new(None),
         current_closure_ptr_var: std::cell::RefCell::new(None),
         current_jit_roots_snapshot_var: std::cell::RefCell::new(None),
+        current_abort_exit_block: std::cell::RefCell::new(None),
         current_state_machine_layout: std::cell::RefCell::new(None),
         current_fiber_ptr_var: std::cell::RefCell::new(None),
         current_resume_v_var: std::cell::RefCell::new(None),

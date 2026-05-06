@@ -1149,6 +1149,21 @@ pub mod cl {
         pub current_jit_roots_snapshot_var:
             std::cell::RefCell<Option<cranelift_frontend::Variable>>,
 
+        /// Shared abort-exit block emitted once at function entry.
+        /// Each MIR block's lowering polls `wren_aot_check_error()`
+        /// at its top and branches here when the VM is mid-error;
+        /// the block restores `wren_jit_roots_snapshot_var` and
+        /// returns null so the AOT-stub fast path's `has_error`
+        /// route in `vm_interp::run_fiber` picks the error up. The
+        /// per-opcode `has_error` check the BC interpreter does
+        /// has no direct analogue in straight-line Cranelift code,
+        /// so without this branch a `Fiber.abort` inside a
+        /// `while (true) { … }` body keeps iterating after the
+        /// abort fires. Cleared between emissions by
+        /// `emit_aot_function`.
+        pub current_abort_exit_block:
+            std::cell::RefCell<Option<cranelift_codegen::ir::Block>>,
+
         /// State-machine layout for the function currently being
         /// lowered. `Some(_)` flips the lowering onto the stackless-
         /// coroutine shape: function signature becomes `(fiber: i64,
@@ -1862,6 +1877,43 @@ pub mod cl {
                 }
             }
 
+            // Poll `vm.has_error` at every block entry except bb0
+            // (which sits behind the function-entry snapshot that
+            // can't have observed an in-flight error). Without this,
+            // a `Fiber.abort` mid-loop sets the flag but the AOT
+            // body keeps iterating — the BC interp's per-opcode
+            // check has no analogue in straight-line Cranelift code,
+            // so a spec like `JSON.parse("{")` re-aborts forever
+            // at successive offsets. Check + brif to a shared
+            // abort-exit block, lazy-created on first need; the
+            // post-loop emit fills in its body (roots-restore +
+            // typed null return).
+            if let Some(cfg) = aot_config {
+                if block_idx != 0
+                    && cfg.current_jit_roots_snapshot_var.borrow().is_some()
+                    && f64_self_id.is_none()
+                {
+                    let existing = *cfg.current_abort_exit_block.borrow();
+                    let abort_exit = match existing {
+                        Some(b) => b,
+                        None => {
+                            let b = builder.create_block();
+                            *cfg.current_abort_exit_block.borrow_mut() = Some(b);
+                            b
+                        }
+                    };
+                    let f =
+                        get_runtime_fn(module, builder, "wren_aot_check_error", 0)?;
+                    let call = builder.ins().call(f, &[]);
+                    let err = builder.inst_results(call)[0];
+                    let cont = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(err, abort_exit, &[], cont, &[]);
+                    builder.switch_to_block(cont);
+                }
+            }
+
             // Lower each instruction
             for &(vid, ref inst) in &block.instructions {
                 // Track raw booleans from f64 comparisons
@@ -2129,6 +2181,37 @@ pub mod cl {
                 // `return 0` is unreachable but valid.
                 let zero = builder.ins().iconst(types::I64, 0);
                 builder.ins().return_(&[zero]);
+            }
+        }
+
+        // Fill in the shared abort-exit block (if any block needed
+        // it). Restores the function-entry roots snapshot, then
+        // returns a typed null so the AOT-stub fast path's
+        // `has_error` route in `vm_interp::run_fiber` picks the
+        // error up. Returning the function's declared type avoids
+        // a Cranelift verifier mismatch on f64-inner emit paths
+        // (which never set this block in the first place).
+        if let Some(cfg) = aot_config {
+            if let Some(abort_exit) = *cfg.current_abort_exit_block.borrow() {
+                builder.switch_to_block(abort_exit);
+                if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
+                    let snap = builder.use_var(snap_var);
+                    let f = get_runtime_fn(
+                        module,
+                        builder,
+                        "wren_jit_roots_restore",
+                        1,
+                    )?;
+                    let _ = builder.ins().call(f, &[snap]);
+                }
+                let return_ty = builder.func.signature.returns[0].value_type;
+                let null = if return_ty == types::F64 {
+                    let zero = builder.ins().iconst(types::I64, TAG_NULL as i64);
+                    builder.ins().bitcast(types::F64, MemFlags::new(), zero)
+                } else {
+                    builder.ins().iconst(return_ty, TAG_NULL as i64)
+                };
+                builder.ins().return_(&[null]);
             }
         }
 
