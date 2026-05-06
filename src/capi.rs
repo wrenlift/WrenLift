@@ -1329,6 +1329,7 @@ pub unsafe extern "C" fn wlift_aot_sm_load_value(
             Some(f) => f,
             None => return crate::runtime::value::Value::null().to_bits(),
         };
+        let _ = depth;
         frame
             .saved_values
             .get(slot)
@@ -1778,14 +1779,21 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     }
     let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
         unsafe { std::mem::transmute(fn_ptr) };
-    // Active-depth swap. The newly-pushed child frame is now at
-    // `len() - 1`; bump active_depth there for the duration of
-    // the child's poll so its `load_state` / `save_value` /
-    // `load_value` operate on its own frame, not the caller's.
-    // Restore on return so the caller's continuation sees its
-    // own state again.
+    // Active-depth swap. The CALLEE's frame is exactly one
+    // level deeper than the caller's, regardless of the total
+    // frame-stack depth. Resuming a body whose nested children
+    // are still on the stack (e.g. an outer wrapper closure
+    // resuming after a yield from `Probe.run`'s `tinyYield_`)
+    // leaves three frames on the stack: wrapper@0, Probe.run@1,
+    // tinyYield_@2. When the wrapper's `bb2` re-invokes
+    // Probe.run on this resume, the callee's frame is
+    // wrapper-depth+1 = 1, NOT `len()-1 = 2` (which is
+    // tinyYield_'s leftover frame from the first yield).
+    // Computing the swap as `saved_depth + 1` keeps the depth
+    // pointing at the right callee even across deeply nested
+    // re-entries.
     let saved_depth = unsafe { (*fiber).aot_active_depth };
-    let new_depth = unsafe { (*fiber).aot_frames.len().saturating_sub(1) };
+    let new_depth = saved_depth + 1;
     unsafe {
         (*fiber).aot_active_depth = new_depth;
     }

@@ -1004,6 +1004,24 @@ fn collect_pre_yield_defs(
         }
     }
     let mut pre_yield_defs: HashSet<ValueId> = HashSet::new();
+    // Block params of *every* block count as pre-yield defs.
+    // A param's value comes from the predecessor's branch arg —
+    // if any predecessor is pre-yield, the param's value at the
+    // yield point originates pre-yield. Loop-back params (e.g.
+    // `bb1` in a `while` whose post-yield path branches back to
+    // it) need this: their initial value comes from the pre-yield
+    // entry branch, and that's the value we need to preserve
+    // across the suspension. Without including them, the
+    // resume-block uses see them via SSA dominance from a path
+    // (bb1 → ... → resume) that the dispatcher's `br_table`
+    // doesn't actually traverse on re-poll, and Cranelift
+    // rejects the IR with a non-dominating-use error — or the
+    // body silently reads garbage from an undefined SSA value.
+    for blk in mir.blocks.iter() {
+        for (vid, _) in &blk.params {
+            pre_yield_defs.insert(*vid);
+        }
+    }
     for (i, blk) in mir.blocks.iter().enumerate() {
         if post_yield.contains(&BlockId(i as u32)) {
             continue;
