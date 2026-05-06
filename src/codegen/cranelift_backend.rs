@@ -1182,6 +1182,7 @@ pub mod cl {
         /// the BC interp already does via `pending_fiber_action +
         /// run_fiber`. Cleared between emissions by
         /// `emit_aot_function`.
+        #[cfg(feature = "aot")]
         pub current_state_machine_layout:
             std::cell::RefCell<Option<crate::codegen::aot_state_machine::StateMachineLayout>>,
 
@@ -1442,6 +1443,7 @@ pub mod cl {
             // yield/done helper call can pass it. `resume_v_var`
             // similarly carries the second poll-fn param so
             // nested cross-fn invocations can thread it through.
+            #[cfg(feature = "aot")]
             if cfg.current_state_machine_layout.borrow().is_some() {
                 let fiber_var = builder.declare_var(types::I64);
                 *cfg.current_fiber_ptr_var.borrow_mut() = Some(fiber_var);
@@ -1457,6 +1459,7 @@ pub mod cl {
         // saved state ID via a runtime helper, and `br_table`s
         // to the right resume entry. Subsequent blocks are
         // emitted in their normal RPO order.
+        #[cfg(feature = "aot")]
         if let Some(cfg) = aot_config {
             let layout = cfg.current_state_machine_layout.borrow().clone();
             if let Some(layout) = layout {
@@ -1558,6 +1561,7 @@ pub mod cl {
             // block via a direct jump AND from the dispatch's
             // br_table when the caller resumes after a child
             // yield.
+            #[cfg(feature = "aot")]
             'cross_fn_resume: {
                 use crate::codegen::aot_state_machine::BlockKind;
                 let cfg = match aot_config {
@@ -1747,10 +1751,18 @@ pub mod cl {
                             param_idx += 1;
                         }
                     }
-                } else if aot_config
-                    .map(|c| c.current_state_machine_layout.borrow().is_some())
-                    .unwrap_or(false)
-                {
+                } else if {
+                    #[cfg(feature = "aot")]
+                    {
+                        aot_config
+                            .map(|c| c.current_state_machine_layout.borrow().is_some())
+                            .unwrap_or(false)
+                    }
+                    #[cfg(not(feature = "aot"))]
+                    {
+                        false
+                    }
+                } {
                     // State-machine entry: bb0 is reached via
                     // the dispatch block's `br_table`, which
                     // doesn't pass any block args. Don't append
@@ -1854,6 +1866,7 @@ pub mod cl {
             // the transform inserted during MIR rewriting. The
             // remaining instructions in this block reference
             // those fresh ValueIds, not the originals.
+            #[cfg(feature = "aot")]
             if let Some(cfg) = aot_config {
                 if let Some(layout) = cfg.current_state_machine_layout.borrow().clone() {
                     if let Some(loads) = layout.resume_loads.get(&bid) {
@@ -1977,6 +1990,7 @@ pub mod cl {
             // synthetic call_check via Branch so compute_rpo
             // walks them in the right order) terminated blocks
             // when the layout has a block_kind for them.
+            #[cfg(feature = "aot")]
             let has_state_machine_kind = aot_config
                 .and_then(|c| {
                     c.current_state_machine_layout
@@ -1985,6 +1999,8 @@ pub mod cl {
                         .map(|l| l.block_kinds.contains_key(&bid))
                 })
                 .unwrap_or(false);
+            #[cfg(not(feature = "aot"))]
+            let has_state_machine_kind = false;
             if matches!(
                 block.terminator,
                 Terminator::Return(_) | Terminator::ReturnNull
@@ -2009,8 +2025,10 @@ pub mod cl {
                     // running this poll sees `kind=Yield` and
                     // resumes from the saved state on next call,
                     // or `kind=Done` and marks the fiber finished.
-                    let layout = cfg.current_state_machine_layout.borrow().clone();
-                    if let Some(layout) = layout {
+                    #[cfg(feature = "aot")]
+                    if let Some(layout) =
+                        cfg.current_state_machine_layout.borrow().clone()
+                    {
                         if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
                             let fiber = builder.use_var(fiber_var);
                             if let Some(next_state) = layout.yield_blocks.get(&bid) {
