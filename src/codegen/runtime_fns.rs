@@ -2385,6 +2385,23 @@ fn handle_jit_fiber_action(
                             }
                         }
                     }
+                    // If the body aborted under is_try, route the
+                    // error to fib.error so the caller's `.try()`
+                    // returns the error string instead of leaking
+                    // the abort to the host. Mirrors the BC interp's
+                    // post-method-dispatch hook in run_fiber.
+                    if vm.has_error {
+                        let msg = vm.last_error.clone().unwrap_or_default();
+                        if let Some(routed) = unsafe {
+                            crate::runtime::vm_interp::route_method_error_through_fiber_try(
+                                vm, target, msg,
+                            )
+                        } {
+                            vm.has_error = false;
+                            vm.last_error = None;
+                            return routed.to_bits();
+                        }
+                    }
                     return ret_bits;
                 }
             }
@@ -2483,6 +2500,15 @@ fn handle_jit_fiber_action(
 
 /// Dispatch a resolved method entry.
 #[inline(always)]
+pub fn dispatch_method_pub(
+    vm: &mut crate::runtime::vm::VM,
+    method: Method,
+    args: &[Value],
+    defining_class: Option<*mut crate::runtime::object::ObjClass>,
+) -> u64 {
+    dispatch_method(vm, method, args, defining_class)
+}
+
 fn dispatch_method(
     vm: &mut crate::runtime::vm::VM,
     method: Method,

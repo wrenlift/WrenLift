@@ -973,6 +973,46 @@ fn run_fiber_with_stop_depth(
                 .get_mir(func_id)
                 .map(|m| m.blocks.is_empty())
                 .unwrap_or(false);
+            // SM bodies advertise (fiber, resume_v) -> i64 — the
+            // (u64) -> u64 transmute below would feed the receiver
+            // bits into x0 (where the body expects fiber) and
+            // SIGSEGV at the first wlift_aot_sm_load_state. Route
+            // SM-tainted bodies through call_closure_jit_or_sync's
+            // SM branch instead: it pushes a child frame, saves
+            // args via wlift_aot_sm_save_arg, calls the poll fn,
+            // and surfaces Yield via pending_fiber_action. Mirrors
+            // the gate at dispatch_method (Method::Closure).
+            #[cfg(feature = "aot")]
+            let is_sm = vm
+                .engine
+                .aot_state_machine
+                .get(func_id.0 as usize)
+                .copied()
+                .unwrap_or(false);
+            #[cfg(not(feature = "aot"))]
+            let is_sm = false;
+            if !aot_fn.is_null() && mir_empty && is_sm {
+                if let Some(c) = closure {
+                    let result = crate::codegen::runtime_fns::call_closure_jit_or_sync(
+                        vm,
+                        c,
+                        &[],
+                        None,
+                    );
+                    fiber = vm.fiber;
+                    if !fiber.is_null() {
+                        unsafe {
+                            (*fiber).mir_frames.pop();
+                        }
+                    }
+                    values.clear();
+                    if vm.register_pool.len() < 128 {
+                        vm.register_pool.push(values);
+                    }
+                    let _ = result;
+                    continue 'fiber_loop;
+                }
+            }
             if !aot_fn.is_null() && mir_empty {
                 // Set the JIT context's `closure` slot so the
                 // body's `wren_load_jit_closure` (used by every
@@ -4532,7 +4572,7 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
 /// chain miss) get the same `Fiber.try` semantics. Without this,
 /// `Fiber.try { B.new().missing() }` aborts the process even
 /// though `Fiber.try { Fiber.abort("nope") }` is caught cleanly.
-unsafe fn route_method_error_through_fiber_try(
+pub unsafe fn route_method_error_through_fiber_try(
     vm: &mut VM,
     fiber: *mut ObjFiber,
     err_msg: String,

@@ -1074,7 +1074,7 @@ fn emit_aot_function(
             module,
             Some(aot_cfg),
         )
-        .map_err(AotError::Module)?;
+        .map_err(|e| AotError::Module(format!("[{}] {}", symbol, e)))?;
         builder.seal_all_blocks();
         builder.finalize();
     }

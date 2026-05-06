@@ -1613,11 +1613,47 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         let cp = match method_entry {
             Some(Method::Closure(cp)) => cp,
             Some(Method::Constructor(cp)) => cp,
-            _ => {
-                // Not a closure-backed method (foreign / native /
-                // missing) — can't be state-machine. Surface as
-                // null; the caller's Done branch will bind null
-                // and continue.
+            Some(Method::Native(_))
+            | Some(Method::ForeignC(_))
+            | Some(Method::ForeignCDynamic(_)) => {
+                // Native / foreign methods can't be state-machine
+                // (they're not closure-backed bodies), but the
+                // tainted caller's CrossFnCallInit pushed a child
+                // frame and stashed the receiver+args in slots
+                // 0..N anyway. Re-build the args slice from those
+                // slots and route through the standard dispatch.
+                // Fiber.call / Fiber.try / List.add / etc. all
+                // hit this branch when `call(N)` taint expansion
+                // brings them under cross-fn dispatch.
+                let num_args = _num_args as usize;
+                let mut args: Vec<crate::runtime::value::Value> =
+                    Vec::with_capacity(num_args + 1);
+                args.push(recv);
+                for i in 1..=num_args {
+                    let v = unsafe {
+                        (*fiber)
+                            .aot_frames
+                            .last()
+                            .and_then(|f| f.saved_values.get(i).copied())
+                            .unwrap_or_else(crate::runtime::value::Value::null)
+                    };
+                    args.push(v);
+                }
+                let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+                let result = crate::codegen::runtime_fns::dispatch_method_pub(
+                    vm_ref,
+                    method_entry.unwrap(),
+                    &args,
+                    Some(class_ptr),
+                );
+                crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+                AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Done));
+                return result;
+            }
+            None => {
+                // Method not installed at all — surface as null;
+                // the caller's Done branch binds null and the
+                // post-call code continues without crashing.
                 return Value::null().to_bits();
             }
         };
@@ -1686,11 +1722,13 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
                 None,
             )
         };
-        unsafe {
-            if !(*fiber).aot_frames.is_empty() {
-                (*fiber).aot_frames.pop();
-            }
-        }
+        // Don't pop the child frame here — the caller's
+        // CrossFnCallResume Done branch (in the cranelift backend)
+        // emits its own `wlift_aot_sm_pop_frame` after reading
+        // the kind. Popping twice corrupts the active-depth
+        // invariant: the caller's own frame disappears, the next
+        // `wlift_aot_sm_load_value` reads from a stale frame, and
+        // saved-across-suspension values come back null.
         AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Done));
         return result_bits;
     }
@@ -1716,7 +1754,25 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     unsafe {
         (*fiber).aot_active_depth = new_depth;
     }
+    // Save and re-point the JIT context's `closure` slot at the
+    // poll fn's own closure so its `GetUpvalue` /
+    // `wren_load_jit_closure` reads upvalues from the right
+    // ObjClosure. Without this, every cross-fn SM dispatch into
+    // a closure body inherits the caller's `ctx.closure` and
+    // reads upvalues from the wrong array — at best stale, at
+    // worst NULL+offset SIGSEGVing on first GetUpvalue. Same
+    // shape as `call_closure_jit_or_sync`'s SM branch.
+    let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+    crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+        if ctx.vm.is_null() {
+            ctx.vm = vm as *mut u8;
+        }
+        ctx.current_func_id = idx as u64;
+        ctx.closure = closure_ptr as *mut u8;
+        ctx.defining_class = std::ptr::null_mut();
+    });
     let result = poll(fiber, resume_v);
+    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
     unsafe {
         (*fiber).aot_active_depth = saved_depth;
     }
