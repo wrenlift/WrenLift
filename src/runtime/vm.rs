@@ -4315,6 +4315,22 @@ impl VM {
                     return None;
                 }
             };
+            // Same AOT-stub-with-no-body protection the non-constructor
+            // dispatch above already has. The fast path only fires when
+            // `aot_fn` is non-null; we land here when the manifest
+            // shipped a stub MIR (empty Vec) but no `jit_code`, e.g. a
+            // foreign-method registration that didn't take. Avoid the
+            // `mir.blocks[0]` panic and route through the fiber error
+            // path so the test framework reports it cleanly.
+            if mir.blocks.is_empty() {
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                self.has_error = true;
+                self.last_error = Some(format!(
+                    "constructor dispatch hit AOT stub with no body (func_id={})",
+                    func_id.0
+                ));
+                return Some(Value::null());
+            }
             let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
             // Bind block params using the actual BlockParam index (not a

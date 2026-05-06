@@ -445,13 +445,71 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
             let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
             f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
         }
-        _ => {
+        4 => {
             let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
             f(
                 args[0].to_bits(),
                 args[1].to_bits(),
                 args[2].to_bits(),
                 args[3].to_bits(),
+            )
+        }
+        5 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+            )
+        }
+        6 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+            )
+        }
+        7 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+            )
+        }
+        // 8 args = receiver + 7 user args. AOT-emitted method
+        // bodies declare their physical arity to match — anything
+        // wider than that is rare enough that no live spec hits it
+        // (the runtime helpers cap at `wren_call_8` regardless).
+        // Truncating to 4 here was what made
+        // `Render_.renderFullWithFrags(_,_,_,_,_,_,_)` silently
+        // dispatch with 4 args and read garbage for the rest — the
+        // template spec's 81/96 fails all fanned out from this one
+        // dropped path.
+        _ => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
             )
         }
     }
@@ -1781,7 +1839,7 @@ pub fn call_closure_jit_or_sync(
         vm.engine.poll_compilations();
     }
     let mut had_native_candidate = false;
-    if args.len() <= 4 {
+    if args.len() <= 8 {
         let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
 
         // AOT state-machine closures advertise a `(fiber: i64,
@@ -2412,7 +2470,7 @@ fn dispatch_method(
                 }
             }
 
-            if args.len() <= 4 && !jit_disabled() {
+            if args.len() <= 8 && !jit_disabled() {
                 let fn_ptr = vm
                     .engine
                     .jit_code
@@ -3487,13 +3545,62 @@ unsafe fn call_jit_with_shadow_raw(fn_ptr: *const u8, args: &[Value]) -> u64 {
             let f: extern "C" fn(u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
             f(args[0].to_bits(), args[1].to_bits(), args[2].to_bits())
         }
-        _ => {
+        4 => {
             let f: extern "C" fn(u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
             f(
                 args[0].to_bits(),
                 args[1].to_bits(),
                 args[2].to_bits(),
                 args[3].to_bits(),
+            )
+        }
+        5 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+            )
+        }
+        6 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+            )
+        }
+        7 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+            )
+        }
+        _ => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
             )
         }
     }
