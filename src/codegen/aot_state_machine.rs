@@ -79,9 +79,21 @@ pub struct StateMachineLayout {
     /// backend rebinds it to the `resume_v` poll-fn parameter
     /// at the resume block's entry — that parameter carries
     /// whatever value `fiber.call(value)` passed back from the
-    /// resumer. CrossFnCall results are bound separately via
-    /// the invoke helper's return value.
+    /// resumer.
     pub direct_yield_results: HashMap<BlockId, ValueId>,
+    /// Per CrossFnCall done block, `(slot, call_dst)` for the
+    /// suspension Call's result. The cranelift backend's
+    /// done-branch lowering writes the runtime `ret` of
+    /// `wlift_aot_invoke_sm_method` into `slot` via
+    /// `wlift_aot_sm_save_value`; the done block's prologue
+    /// loads it back, providing a dominating def for every
+    /// downstream use. Without this, val_map.insert(result, ret)
+    /// in the done branch only dominates the immediate done
+    /// jump — successors reached via tail-duplicated paths or
+    /// other CFG join points see an undefined SSA value, and
+    /// Cranelift's verifier rejects with "uses value vN from
+    /// non-dominating instM".
+    pub cross_fn_results: HashMap<BlockId, (u32, ValueId)>,
 }
 
 /// What kind of suspension a block represents. AOT lowering
@@ -246,6 +258,7 @@ pub fn transform_to_state_machine(
         resume_loads: HashMap::new(),
         block_kinds: HashMap::new(),
         direct_yield_results: HashMap::new(),
+        cross_fn_results: HashMap::new(),
     };
     // Per-suspension save slot allocation. The vec is shared
     // across all suspensions — slots get reused as later yields
@@ -624,9 +637,13 @@ pub fn transform_to_state_machine(
             }
         }
 
+        // `saves` is keyed unconditionally on the yielding block.
+        // `resume_loads` keying is deferred to the per-kind
+        // branch below so it can use the right block id (the
+        // `br_table` target — `new_block_id` for DirectYield,
+        // the synthetic `call_check_id` for CrossFnCall).
         if !saves.is_empty() {
             layout.yield_saves.insert(blk_id, saves);
-            layout.resume_loads.insert(new_block_id, loads);
         }
         // Record kinds + register the resume entry for the
         // dispatcher's `br_table`. DirectYield uses the
@@ -644,6 +661,9 @@ pub fn transform_to_state_machine(
                 layout.block_kinds.insert(blk_id, BlockKind::DirectYield);
                 if let Some(dst) = direct_yield_result {
                     layout.direct_yield_results.insert(new_block_id, dst);
+                }
+                if !loads.is_empty() {
+                    layout.resume_loads.insert(new_block_id, loads);
                 }
             }
             (SuspensionKind::CrossFnCall, Some((receiver, args, result, method_sym))) => {
@@ -702,6 +722,15 @@ pub fn transform_to_state_machine(
                         method_sym,
                     },
                 );
+                // Insert resume_loads ONLY under call_check (the
+                // dispatcher's `br_table` target). The done
+                // block is a successor of call_check via the
+                // done branch in the cranelift lowering, so the
+                // load emitted at call_check dominates every
+                // post-call use.
+                if !loads.is_empty() {
+                    layout.resume_loads.insert(call_check_id, loads);
+                }
             }
             _ => unreachable!("classify_call invariants kept the susp_kind and meta in sync"),
         }

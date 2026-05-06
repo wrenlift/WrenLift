@@ -502,7 +502,20 @@ type ScopedResolver = HashMap<String, PathBuf>;
 
 fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
     let mut map = HashMap::new();
-    let entry_dir = entry_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    // Canonicalise the entry path so `entry_dir.parent()` walks
+    // up an absolute hierarchy. Without this, a relative entry
+    // like `main.wren` produces `entry_dir = ""`, the
+    // `workspace.parent()` calls below all return `None`, and
+    // the workspace-fallback for `@hatch:<pkg>` Version-pinned
+    // deps never gets a chance to walk into a sibling
+    // `packages/hatch-<pkg>` directory — leaving every imported
+    // class as a null modvar at runtime.
+    let canonical_entry = std::fs::canonicalize(entry_path)
+        .unwrap_or_else(|_| entry_path.to_path_buf());
+    let entry_dir = canonical_entry
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
 
     // Walk up from the entry's dir looking for a hatchfile.
     let mut cursor = Some(entry_dir);
@@ -574,13 +587,45 @@ fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
                             .map(|s| format!("hatch-{}", s));
                         if let Some(dir) = sibling_name {
                             // workspace = the package dir (parent of
-                            // the current `hatchfile`). Siblings live
-                            // one level up.
+                            // the current `hatchfile`). Try common
+                            // monorepo layouts in order:
+                            //   <ws>/../<pkg>            — flat (one
+                            //                              level up,
+                            //                              packages
+                            //                              as siblings).
+                            //   <ws>/../packages/<pkg>   — site-style
+                            //                              (the site
+                            //                              at
+                            //                              `hatch/site/`
+                            //                              has
+                            //                              `hatch/packages/<pkg>`
+                            //                              as transitive
+                            //                              siblings).
+                            //   <ws>/../../packages/<pkg> — also a
+                            //                              valid
+                            //                              monorepo
+                            //                              shape, e.g.
+                            //                              `apps/site/`
+                            //                              with
+                            //                              `apps/../packages/`.
+                            // First match wins; later entries leave
+                            // the queue unchanged because the visited
+                            // set deduplicates by canonical path.
                             let parent = workspace.parent();
                             if let Some(parent) = parent {
-                                let sibling = parent.join(&dir);
-                                if sibling.join("hatchfile").exists() {
-                                    q.push_back((name.clone(), sibling));
+                                let candidates = [
+                                    parent.join(&dir),
+                                    parent.join("packages").join(&dir),
+                                    parent
+                                        .parent()
+                                        .map(|gp| gp.join("packages").join(&dir))
+                                        .unwrap_or_else(|| parent.join(&dir)),
+                                ];
+                                for sibling in candidates {
+                                    if sibling.join("hatchfile").exists() {
+                                        q.push_back((name.clone(), sibling));
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -942,6 +987,89 @@ pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String
             break;
         }
     }
+    // After fixed-point convergence: if any closure is SM-
+    // tainted, every `Fn.call(...)` invocation is a potential
+    // yield boundary because Wren can't statically tell which
+    // closure a `_fn.call(...)` will resolve to. Add the
+    // `call()` / `call(_)` / … `call(_,_,_,_,_,_,_,_)` symbols
+    // to the tainted set and re-run propagation so any method
+    // wrapping a yielding helper closure (Reader.readAll's
+    // `while (true) { readRaw_(...) }` → `_readFn.call(max)`,
+    // where `_readFn` was an SM closure) becomes SM-transformed
+    // too. Without this the site spins forever in `app.listen`'s
+    // accept loop because the scheduler's `tick` (which calls
+    // `fiber.call()` on suspended fibers) doesn't propagate
+    // yields back through the loop and request fibers
+    // accumulate, ballooning memory.
+    let any_sm_closure = std::env::var_os("WLIFT_AOT_CALL_N").is_some()
+        && tainted.iter().any(|n| n.starts_with("<closure:"));
+    if any_sm_closure {
+        let call_sigs = [
+            "call()",
+            "call(_)",
+            "call(_,_)",
+            "call(_,_,_)",
+            "call(_,_,_,_)",
+            "call(_,_,_,_,_)",
+            "call(_,_,_,_,_,_)",
+            "call(_,_,_,_,_,_,_)",
+            "call(_,_,_,_,_,_,_,_)",
+        ];
+        let mut added = false;
+        for sig in &call_sigs {
+            if tainted.insert((*sig).to_string()) {
+                added = true;
+            }
+        }
+        if added {
+            for _ in 0..bound {
+                let mut changed = false;
+                for aot_mod in modules {
+                    let top_name = format!("<top:{}>", aot_mod.request_name);
+                    if !tainted.contains(&top_name)
+                        && mir_calls_any_tainted_named_method(
+                            &aot_mod.mir.top_level,
+                            &aot_mod.interner,
+                            &tainted,
+                        )
+                    {
+                        tainted.insert(top_name);
+                        changed = true;
+                    }
+                    for class in &aot_mod.mir.classes {
+                        for method in &class.methods {
+                            let name = method.signature.clone();
+                            if tainted.contains(&name) {
+                                continue;
+                            }
+                            if mir_calls_any_tainted_named_method(
+                                &method.mir,
+                                &aot_mod.interner,
+                                &tainted,
+                            ) {
+                                tainted.insert(name);
+                                changed = true;
+                            }
+                        }
+                    }
+                    for (idx, closure) in aot_mod.mir.closures.iter().enumerate() {
+                        let cname = format!("<closure:{}:{}>", aot_mod.request_name, idx);
+                        if tainted.contains(&cname) {
+                            continue;
+                        }
+                        if mir_calls_any_tainted_named_method(closure, &aot_mod.interner, &tainted)
+                        {
+                            tainted.insert(cname);
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+    }
     tainted
 }
 
@@ -1086,7 +1214,7 @@ fn emit_aot_function(
             eprintln!("--- IR ---");
             eprintln!("{}", ctx.func.display());
         }
-        AotError::Module(e.to_string())
+        AotError::Module(format!("[{}] {}", symbol, e))
     })?;
 
     // Capture safepoint metadata + code size before clearing the
@@ -1987,7 +2115,6 @@ pub fn compile_walk_to_object_with_manifest(
         for (slot, source) in aot_mod.module_var_sources.iter().enumerate() {
             let Some(source_path) = source else { continue };
             let var_name = &aot_mod.module_var_names[slot];
-
             // Match against any earlier-installed module
             // sharing the import path. Dependency-first walker
             // order guarantees the source has been emitted by

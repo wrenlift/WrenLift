@@ -1306,6 +1306,19 @@ pub mod cl {
 
         // Map MIR values to Cranelift values.
         let mut val_map: HashMap<ValueId, Value> = HashMap::new();
+        // Per-fresh_vid Cranelift Variables for state-machine
+        // resume-load values. The dispatcher's `br_table` jumps
+        // directly into a resume entry, so the same fresh ValueId
+        // can be defined by multiple emit sites (the call_check
+        // synthetic, the post-yield block, etc.). val_map is a
+        // single-binding HashMap and can't merge those defs;
+        // routing them through Variables lets Cranelift's
+        // SSA construction pick the right value at each use.
+        // Each block iteration refreshes val_map[fresh_vid] to
+        // `use_var(var)` so downstream val_map lookups still
+        // return one Value but the Variable carries the
+        // multi-block convergence.
+        let mut var_map: HashMap<ValueId, cranelift_frontend::Variable> = HashMap::new();
 
         // GC stack-map marking: when an SSA value holds a Wren `Value`
         // (NaN-boxed pointer-or-scalar), we tell Cranelift to keep it
@@ -1556,12 +1569,59 @@ pub mod cl {
             Some(layout) => compute_rpo_from(mir, layout.target_block),
             None => compute_rpo(mir),
         };
+        // Determine reachability from bb0 (or osr_entry's
+        // start) over the post-transform MIR. The SM transform's
+        // tail-duplication can leave the original (pre-clone)
+        // blocks unreachable. Emitting them via the regular
+        // lowering path would try to bind operands to ValueIds
+        // whose def was dropped during the split — and there's
+        // no `val_map` entry for those ValueIds. Cranelift
+        // requires every created block to have a terminator
+        // though, so emit a `trap` for unreachable blocks
+        // instead of just skipping them. SM resume entries are
+        // reached only via the synthetic dispatch's `br_table`
+        // (not from bb0), so seed the walk with them too.
+        let reachable: std::collections::HashSet<usize> = {
+            let start = osr_entry
+                .as_ref()
+                .map(|l| l.target_block.0 as usize)
+                .unwrap_or(0);
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = vec![start];
+            #[cfg(feature = "aot")]
+            if let Some(cfg) = aot_config {
+                if let Some(layout) = cfg.current_state_machine_layout.borrow().as_ref() {
+                    for entry in &layout.resume_entries {
+                        stack.push(entry.0 as usize);
+                    }
+                }
+            }
+            while let Some(i) = stack.pop() {
+                if !seen.insert(i) {
+                    continue;
+                }
+                if i < mir.blocks.len() {
+                    for s in mir.blocks[i].terminator.successors() {
+                        stack.push(s.0 as usize);
+                    }
+                }
+            }
+            seen
+        };
+
         #[cfg_attr(not(feature = "aot"), allow(unused_labels))]
         'block_loop: for &block_idx in &rpo {
             let block = &mir.blocks[block_idx];
             let bid = BlockId(block_idx as u32);
             let cl_block = block_map[&bid];
             builder.switch_to_block(cl_block);
+
+            if !reachable.contains(&block_idx) {
+                builder
+                    .ins()
+                    .trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
+                continue 'block_loop;
+            }
 
             // Synthetic CrossFnCallResume block: the block has
             // no MIR-level instructions; the lowering replaces
@@ -1596,6 +1656,47 @@ pub mod cl {
                     Some(v) => builder.use_var(v),
                     None => break 'cross_fn_resume,
                 };
+                // Emit the resume_loads prologue — the dispatcher's
+                // `br_table` jumps directly to this synthetic
+                // call_check block, so saved-across-yield values
+                // need a dominating load HERE before any
+                // post-call code reads them. The transform now
+                // keys these on the call_check id (not the
+                // done_block) for exactly this reason.
+                {
+                    let layout_clone = cfg.current_state_machine_layout.borrow().clone();
+                    if let Some(layout) = layout_clone {
+                        if let Some(loads) = layout.resume_loads.get(&bid) {
+                            let load_fn = get_runtime_fn(
+                                module,
+                                builder,
+                                "wlift_aot_sm_load_value",
+                                2,
+                            )?;
+                            for (slot, fresh_vid) in loads {
+                                let slot_v = builder
+                                    .ins()
+                                    .iconst(types::I64, *slot as i64);
+                                let call =
+                                    builder.ins().call(load_fn, &[fiber, slot_v]);
+                                let v = builder.inst_results(call)[0];
+                                let var = *var_map
+                                    .entry(*fresh_vid)
+                                    .or_insert_with(|| {
+                                        let v = builder.declare_var(types::I64);
+                                        v
+                                    });
+                                builder.def_var(var, v);
+                                val_map.insert(*fresh_vid, v);
+                                if mark_stack_map
+                                    && is_wren_value(*fresh_vid, &value_types)
+                                {
+                                    builder.declare_value_needs_stack_map(v);
+                                }
+                            }
+                        }
+                    }
+                }
                 // 1) invoke. Receiver/args were saved into the
                 // child frame slots either by the matching
                 // Init block (initial entry) or by a previous
@@ -1703,11 +1804,30 @@ pub mod cl {
                     0,
                 )?;
                 let _ = builder.ins().call(clear_fn, &[]);
-                // Bind the result. The done_block (post-call
-                // MIR block) reads `result` directly via
-                // val_map; insert here so its instruction
-                // lowering sees the right Cranelift Value.
+                // Bind the result. val_map.insert dominates the
+                // immediate done_block jump; ALSO save to a
+                // per-call slot so the done_block's prologue can
+                // load_value it back. Without the slot, any
+                // post-done block reached via a tail-duplicated
+                // path (or any CFG join) would see `result` as
+                // an undefined SSA value — the verifier rejects
+                // with "uses value vN from non-dominating instM".
                 val_map.insert(result, ret);
+                let result_slot = cfg
+                    .current_state_machine_layout
+                    .borrow()
+                    .as_ref()
+                    .and_then(|l| l.cross_fn_results.get(&done_block).copied());
+                if let Some((slot, _)) = result_slot {
+                    let save_fn = get_runtime_fn(
+                        module,
+                        builder,
+                        "wlift_aot_sm_save_value",
+                        3,
+                    )?;
+                    let slot_v = builder.ins().iconst(types::I64, slot as i64);
+                    let _ = builder.ins().call(save_fn, &[fiber, slot_v, ret]);
+                }
                 let target = block_map[&done_block];
                 builder.ins().jump(target, &[]);
                 // Skip the regular per-instruction + terminator
@@ -1892,6 +2012,10 @@ pub mod cl {
                                     builder.ins().iconst(types::I64, *slot as i64);
                                 let call = builder.ins().call(load_fn, &[fiber, slot_v]);
                                 let v = builder.inst_results(call)[0];
+                                let var = *var_map
+                                    .entry(*fresh_vid)
+                                    .or_insert_with(|| builder.declare_var(types::I64));
+                                builder.def_var(var, v);
                                 val_map.insert(*fresh_vid, v);
                                 if mark_stack_map
                                     && is_wren_value(*fresh_vid, &value_types)
@@ -1913,6 +2037,32 @@ pub mod cl {
                     if let Some(call_dst) = layout.direct_yield_results.get(&bid).copied() {
                         if let Some(resume_var) = *cfg.current_resume_v_var.borrow() {
                             let v = builder.use_var(resume_var);
+                            val_map.insert(call_dst, v);
+                            if mark_stack_map && is_wren_value(call_dst, &value_types) {
+                                builder.declare_value_needs_stack_map(v);
+                            }
+                        }
+                    }
+                    // CrossFnCall done_block prologue: load the
+                    // call's result from the slot the done branch
+                    // saved into. Provides a dominating def for
+                    // every downstream use of `result`, regardless
+                    // of how the post-done CFG was duplicated or
+                    // joined.
+                    if let Some((slot, call_dst)) =
+                        layout.cross_fn_results.get(&bid).copied()
+                    {
+                        if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
+                            let fiber = builder.use_var(fiber_var);
+                            let load_fn = get_runtime_fn(
+                                module,
+                                builder,
+                                "wlift_aot_sm_load_value",
+                                2,
+                            )?;
+                            let slot_v = builder.ins().iconst(types::I64, slot as i64);
+                            let call = builder.ins().call(load_fn, &[fiber, slot_v]);
+                            let v = builder.inst_results(call)[0];
                             val_map.insert(call_dst, v);
                             if mark_stack_map && is_wren_value(call_dst, &value_types) {
                                 builder.declare_value_needs_stack_map(v);
