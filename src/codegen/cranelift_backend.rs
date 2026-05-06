@@ -929,6 +929,11 @@ pub mod cl {
             "wren_make_closure_2",
             "wren_make_closure_3",
             "wren_make_closure_4",
+            "wren_make_closure_5",
+            "wren_make_closure_6",
+            "wren_make_closure_7",
+            "wren_make_closure_8",
+            "wren_make_closure_n",
             "wren_get_module_var",
             "wren_const_string",
             "wren_set_module_var",
@@ -4006,14 +4011,7 @@ pub mod cl {
             // `wlift_aot_register_closure` once per closure at
             // startup, populating the slot.
             Instruction::MakeClosure { fn_id, upvalues } => {
-                let name = match upvalues.len() {
-                    0 => "wren_make_closure_0",
-                    1 => "wren_make_closure_1",
-                    2 => "wren_make_closure_2",
-                    3 => "wren_make_closure_3",
-                    _ => "wren_make_closure_4",
-                };
-                let f = get_runtime_fn(module, builder, name, 1 + upvalues.len().min(4))?;
+                let n = upvalues.len();
                 let fn_id_val = if let Some(cfg) = aot_config {
                     let gv = module.declare_data_in_func(cfg.closures_data, builder.func);
                     let base = builder.ins().global_value(types::I64, gv);
@@ -4023,12 +4021,51 @@ pub mod cl {
                 } else {
                     builder.ins().iconst(types::I64, *fn_id as i64)
                 };
-                let mut args = vec![fn_id_val];
-                for uv in upvalues.iter().take(4) {
-                    args.push(get(uv));
+                if n <= 8 {
+                    let name = match n {
+                        0 => "wren_make_closure_0",
+                        1 => "wren_make_closure_1",
+                        2 => "wren_make_closure_2",
+                        3 => "wren_make_closure_3",
+                        4 => "wren_make_closure_4",
+                        5 => "wren_make_closure_5",
+                        6 => "wren_make_closure_6",
+                        7 => "wren_make_closure_7",
+                        _ => "wren_make_closure_8",
+                    };
+                    let f = get_runtime_fn(module, builder, name, 1 + n)?;
+                    let mut args = vec![fn_id_val];
+                    for uv in upvalues.iter() {
+                        args.push(get(uv));
+                    }
+                    let result = builder.ins().call(f, &args);
+                    Ok(Some(builder.inst_results(result)[0]))
+                } else {
+                    // > 8 upvalues: spill the captured values into a
+                    // stack-allocated `[u64; n]` buffer and route through
+                    // `wren_make_closure_n(fn_id, n, ptr)` so every
+                    // upvalue reaches the closure's Vec. Truncating
+                    // past index 7 was what made `Session.cookie`'s
+                    // 7-upvalue middleware (well within range, but
+                    // we hit the same path on bigger captures) miss
+                    // its trailing slots and crash at first access.
+                    let slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            (n * 8) as u32,
+                            8,
+                        ),
+                    );
+                    for (i, uv) in upvalues.iter().enumerate() {
+                        let v = get(uv);
+                        builder.ins().stack_store(v, slot, (i * 8) as i32);
+                    }
+                    let buf = builder.ins().stack_addr(types::I64, slot, 0);
+                    let count = builder.ins().iconst(types::I64, n as i64);
+                    let f = get_runtime_fn(module, builder, "wren_make_closure_n", 3)?;
+                    let result = builder.ins().call(f, &[fn_id_val, count, buf]);
+                    Ok(Some(builder.inst_results(result)[0]))
                 }
-                let result = builder.ins().call(f, &args);
-                Ok(Some(builder.inst_results(result)[0]))
             }
 
             // === Subscript operations ===

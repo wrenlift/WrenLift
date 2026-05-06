@@ -554,10 +554,38 @@ fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
          workspace: &std::path::Path,
          q: &mut std::collections::VecDeque<(String, std::path::PathBuf)>| {
             for (name, dep) in m.dependencies.iter().chain(m.spec_dependencies.iter()) {
-                let crate::hatch::Dependency::Path { path, .. } = dep else {
-                    continue;
-                };
-                q.push_back((name.clone(), workspace.join(path)));
+                match dep {
+                    crate::hatch::Dependency::Path { path, .. } => {
+                        q.push_back((name.clone(), workspace.join(path)));
+                    }
+                    // Workspace fallback for version-pinned deps: in
+                    // dev monorepos every `@hatch:<name>` import has
+                    // a sibling directory `<package_parent>/hatch-
+                    // <name>` alongside the current package. Without
+                    // this, proc.wren's `import "@hatch:io"` would
+                    // miss the resolver (proc's hatchfile pins
+                    // `@hatch:io = "0.2.0"` rather than path-linking
+                    // it), the import-binding pass would skip the
+                    // entry, and every `Reader` / `Writer` use
+                    // would read null at runtime.
+                    _ => {
+                        let sibling_name = name
+                            .strip_prefix("@hatch:")
+                            .map(|s| format!("hatch-{}", s));
+                        if let Some(dir) = sibling_name {
+                            // workspace = the package dir (parent of
+                            // the current `hatchfile`). Siblings live
+                            // one level up.
+                            let parent = workspace.parent();
+                            if let Some(parent) = parent {
+                                let sibling = parent.join(&dir);
+                                if sibling.join("hatchfile").exists() {
+                                    q.push_back((name.clone(), sibling));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         };
     push_deps(&manifest, &workspace_root, &mut queue);

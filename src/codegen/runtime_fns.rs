@@ -1784,6 +1784,93 @@ pub fn call_closure_jit_or_sync(
     if args.len() <= 4 {
         let func_id = crate::runtime::engine::FuncId(unsafe { (*(*closure_ptr).function).fn_id });
 
+        // AOT state-machine closures advertise a `(fiber: i64,
+        // resume_v: i64) -> i64` poll signature, not the regular
+        // `(receiver, ...args) -> i64` calling convention. Calling
+        // them through `call_jit_with_shadow` would pass user args
+        // as the fiber pointer and SIGSEGV on the first
+        // `wlift_aot_sm_load_state` (the io spec's
+        // `Reader.withTryFn`-style helper triggered exactly that —
+        // a yielding closure stored as `_readFn` and invoked via
+        // `_readFn.call(max)`). Route through the SM-aware
+        // dispatch instead: push a child frame on the running
+        // fiber, invoke the poll fn with `(vm.fiber, args[0])`,
+        // and propagate the kind/value back. Yields surface as
+        // `pending_fiber_action = Yield(value)` so the outer
+        // fiber-driver picks them up the same way the BC interp
+        // does after a primitive yield.
+        #[cfg(feature = "aot")]
+        {
+            let is_sm = vm
+                .engine
+                .aot_state_machine
+                .get(func_id.0 as usize)
+                .copied()
+                .unwrap_or(false);
+            if is_sm {
+                let fn_ptr = vm
+                    .engine
+                    .jit_code
+                    .get(func_id.0 as usize)
+                    .copied()
+                    .unwrap_or(std::ptr::null());
+                if !fn_ptr.is_null() && !vm.fiber.is_null() {
+                    let fiber = vm.fiber;
+                    let resume_v = args.get(0).copied().unwrap_or(Value::null()).to_bits();
+                    let saved_depth = unsafe { (*fiber).aot_active_depth };
+                    unsafe {
+                        (*fiber)
+                            .aot_frames
+                            .push(crate::runtime::object::AotFrameState::default());
+                        (*fiber).aot_active_depth =
+                            (*fiber).aot_frames.len().saturating_sub(1);
+                    }
+                    mutate_jit_ctx(|ctx| {
+                        if ctx.vm.is_null() {
+                            ctx.vm = vm as *mut _ as *mut u8;
+                        }
+                        ctx.current_func_id = func_id.0 as u64;
+                        ctx.closure = closure_ptr as *mut u8;
+                        ctx.defining_class = defining_class
+                            .map(|p| p as *mut u8)
+                            .unwrap_or(std::ptr::null_mut());
+                    });
+                    let poll: extern "C" fn(
+                        *mut crate::runtime::object::ObjFiber,
+                        u64,
+                    ) -> u64 =
+                        unsafe { std::mem::transmute(fn_ptr) };
+                    let ret_bits = poll(fiber, resume_v);
+                    let kind = crate::capi::wlift_aot_sm_take_poll_kind();
+                    unsafe {
+                        (*fiber).aot_active_depth = saved_depth;
+                    }
+                    restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
+                    if kind == crate::capi::AotSmPollKind::Yield {
+                        // Yield: surface to the BC interp's
+                        // pending_fiber_action loop so the
+                        // running fiber suspends. The handle
+                        // path on the next dispatch boundary
+                        // unwinds back to the fiber's caller.
+                        let yield_val = Value::from_bits(ret_bits);
+                        vm.pending_fiber_action =
+                            Some(crate::runtime::vm::FiberAction::Yield { value: yield_val });
+                        return Value::null().to_bits();
+                    }
+                    // Done: leave the child frame on the stack
+                    // (the SM transform writes its result via
+                    // `wlift_aot_sm_done(fiber)`, which is what
+                    // the caller's continuation reads).
+                    unsafe {
+                        if !(*fiber).aot_frames.is_empty() {
+                            (*fiber).aot_frames.pop();
+                        }
+                    }
+                    return ret_bits;
+                }
+            }
+        }
+
         let native_fn_ptr: Option<*const u8> = if JIT_DISABLED.with(|d| d.get()) {
             None
         } else {
@@ -3857,6 +3944,77 @@ pub extern "C" fn wren_make_closure_3(fn_id: u64, uv0: u64, uv1: u64, uv2: u64) 
 pub extern "C" fn wren_make_closure_4(fn_id: u64, uv0: u64, uv1: u64, uv2: u64, uv3: u64) -> u64 {
     make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3])
 }
+/// Allocate a closure with 5 upvalues.
+#[no_mangle]
+pub extern "C" fn wren_make_closure_5(
+    fn_id: u64,
+    uv0: u64,
+    uv1: u64,
+    uv2: u64,
+    uv3: u64,
+    uv4: u64,
+) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3, uv4])
+}
+/// Allocate a closure with 6 upvalues.
+#[no_mangle]
+pub extern "C" fn wren_make_closure_6(
+    fn_id: u64,
+    uv0: u64,
+    uv1: u64,
+    uv2: u64,
+    uv3: u64,
+    uv4: u64,
+    uv5: u64,
+) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3, uv4, uv5])
+}
+/// Allocate a closure with 7 upvalues.
+#[no_mangle]
+pub extern "C" fn wren_make_closure_7(
+    fn_id: u64,
+    uv0: u64,
+    uv1: u64,
+    uv2: u64,
+    uv3: u64,
+    uv4: u64,
+    uv5: u64,
+    uv6: u64,
+) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3, uv4, uv5, uv6])
+}
+/// Allocate a closure with 8 upvalues. AOT bodies that capture
+/// more than 8 upvalues fall through to the generic `wren_make_
+/// closure_n` slow path so the lowering doesn't silently truncate.
+#[no_mangle]
+pub extern "C" fn wren_make_closure_8(
+    fn_id: u64,
+    uv0: u64,
+    uv1: u64,
+    uv2: u64,
+    uv3: u64,
+    uv4: u64,
+    uv5: u64,
+    uv6: u64,
+    uv7: u64,
+) -> u64 {
+    make_closure_inner(fn_id, &[uv0, uv1, uv2, uv3, uv4, uv5, uv6, uv7])
+}
+/// Allocate a closure with `n` upvalues read from a contiguous
+/// `[u64; n]` buffer the lowering builds on the JIT stack. Used as
+/// the > 8-upvalue fallback. Without it, lowering had to truncate
+/// the upvalue list past arity 4, so a 5+-upvalue closure read
+/// past the end of its `Vec<*mut ObjUpvalue>` and crashed at the
+/// first access of the dropped index — exactly what happened to
+/// `Session.cookie`'s 7-upvalue middleware in the web spec.
+#[no_mangle]
+pub extern "C" fn wren_make_closure_n(fn_id: u64, count: u64, upvalues: *const u64) -> u64 {
+    if upvalues.is_null() {
+        return make_closure_inner(fn_id, &[]);
+    }
+    let slice = unsafe { std::slice::from_raw_parts(upvalues, count as usize) };
+    make_closure_inner(fn_id, slice)
+}
 
 /// Concatenate two strings.
 #[no_mangle]
@@ -4810,6 +4968,11 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_closure_2" => Some(wren_make_closure_2 as *const () as usize),
         "wren_make_closure_3" => Some(wren_make_closure_3 as *const () as usize),
         "wren_make_closure_4" => Some(wren_make_closure_4 as *const () as usize),
+        "wren_make_closure_5" => Some(wren_make_closure_5 as *const () as usize),
+        "wren_make_closure_6" => Some(wren_make_closure_6 as *const () as usize),
+        "wren_make_closure_7" => Some(wren_make_closure_7 as *const () as usize),
+        "wren_make_closure_8" => Some(wren_make_closure_8 as *const () as usize),
+        "wren_make_closure_n" => Some(wren_make_closure_n as *const () as usize),
         // Strings
         "wren_string_concat" => Some(wren_string_concat as *const () as usize),
         "wren_to_string" => Some(wren_to_string as *const () as usize),
