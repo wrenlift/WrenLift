@@ -2084,6 +2084,30 @@ fn handle_jit_fiber_action(
                         (*target).aot_active_depth = 0;
                         (*target).state = FiberState::Running;
                     }
+                    // Set the JIT context's `closure` slot
+                    // before invoking the poll fn, same shape
+                    // as the AOT-stub fast path (Phase 2). The
+                    // body's `wren_load_jit_closure` (every
+                    // GetUpvalue / SetUpvalue site) reads it;
+                    // without this a yielding fiber whose body
+                    // captured a function-local upvalue
+                    // dereferenced null on first upvalue read.
+                    let target_closure = unsafe {
+                        (*target)
+                            .mir_frames
+                            .first()
+                            .and_then(|f| f.closure)
+                    };
+                    if let Some(c) = target_closure {
+                        mutate_jit_ctx(|ctx| {
+                            if ctx.vm.is_null() {
+                                ctx.vm = vm as *mut _ as *mut u8;
+                            }
+                            ctx.current_func_id = func_id as u64;
+                            ctx.closure = c as *mut u8;
+                            ctx.defining_class = std::ptr::null_mut();
+                        });
+                    }
                     vm.fiber = target;
                     let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
                         unsafe { std::mem::transmute(fn_ptr) };

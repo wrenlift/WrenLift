@@ -1451,6 +1451,27 @@ pub mod cl {
                 if let Some(var) = *cfg.current_resume_v_var.borrow() {
                     builder.def_var(var, resume_v_param);
                 }
+                // Take the JIT-roots snapshot at the dispatch
+                // block (the actual function entry for
+                // state-machine bodies). The pre-Return hook
+                // reads `snap_var` before every yield/done
+                // restore; if the dispatcher's `br_table`
+                // jumps directly to a resume_entry the bb0
+                // setup never runs, leaving `snap_var`
+                // undefined and the body's eventual
+                // `wren_jit_roots_restore(snap)` panicking on
+                // an out-of-bounds index.
+                if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
+                    let f = get_runtime_fn(
+                        module,
+                        builder,
+                        "wren_jit_roots_snapshot",
+                        0,
+                    )?;
+                    let call = builder.ins().call(f, &[]);
+                    let snap = builder.inst_results(call)[0];
+                    builder.def_var(snap_var, snap);
+                }
                 let load_state = get_runtime_fn(
                     module,
                     builder,
