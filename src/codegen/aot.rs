@@ -688,11 +688,23 @@ fn walk_module(
             // entry's hatchfile [dependencies] table.
             scoped_path.clone()
         } else {
-            // Unresolved scoped/bare import — leaves the slot
-            // null and the AOT body will surface the error at
-            // first use. Same behaviour as the runtime when an
-            // import goes unresolved.
-            continue;
+            // Bare name — fall back to a sibling file in the
+            // importer's directory before giving up. Wren's
+            // runtime loader treats a bare `import "foo"` as
+            // `./foo.wren` next to the importer (used by
+            // `assets.wren`'s `import "assets_native" for ...`
+            // style cross-target re-export modules); the AOT
+            // walker has to mirror that or the symbols stay
+            // unbound and every use reads null.
+            let Some(base_dir) = module_dir.as_ref() else {
+                continue;
+            };
+            let sibling = with_wren_suffix(base_dir.join(Path::new(req)));
+            if sibling.exists() {
+                sibling
+            } else {
+                continue;
+            }
         };
         let imported_canonical = std::fs::canonicalize(&candidate)
             .map_err(AotError::Io)?
@@ -1946,16 +1958,39 @@ pub fn compile_walk_to_object_with_manifest(
             // spec sibling AND `@hatch:fmt` from a transitive
             // dep) record every alias so transitive importers
             // find the same canonical manifest.
-            let matched = manifests.iter().take(idx).find(|src| {
+            let matched_idx = manifests.iter().take(idx).position(|src| {
                 &src.module_name == source_path
                     || src.module_aliases.iter().any(|a| a == source_path)
             });
-            if let Some(src) = matched {
-                if let Some(src_class) = src.classes.iter().find(|c| &c.name == var_name) {
+            if let Some(src_idx) = matched_idx {
+                let src = &manifests[src_idx];
+                let src_module = &modules[src_idx];
+                // Try class lookup first — direct definition.
+                let src_slot = src
+                    .classes
+                    .iter()
+                    .find(|c| &c.name == var_name)
+                    .map(|c| c.slot)
+                    .or_else(|| {
+                        // Re-export: source itself imported this name
+                        // from somewhere else, so it lives in the
+                        // module's modvars without being a class
+                        // declared by the module. Locate the slot
+                        // through the source's module_var_names; the
+                        // bootstrap copies the populated slot across,
+                        // matching what the runtime loader does for
+                        // chained `import "./re_export" for X` shapes.
+                        src_module
+                            .module_var_names
+                            .iter()
+                            .position(|n| n == var_name)
+                            .map(|p| p as u32)
+                    });
+                if let Some(source_slot) = src_slot {
                     bindings.push(AotImportBinding {
                         target_slot: slot as u32,
                         source_modvars_symbol: src.modvars_symbol.clone(),
-                        source_slot: src_class.slot,
+                        source_slot,
                     });
                 }
             } else {
