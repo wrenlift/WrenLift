@@ -1641,7 +1641,58 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         .copied()
         .unwrap_or(false);
     if !is_sm {
-        return Value::null().to_bits();
+        // Non-SM callee in a cross-fn call site. Happens whenever a
+        // tainted outer body lowers a Call as `CrossFnCallInit` —
+        // every `Fn.call` becomes one of these once `call(_,…)` is
+        // in the taint set, but the resolved closure may not itself
+        // yield. Dispatch through the regular closure path, pop
+        // the child frame the caller pushed, stamp `Done` so the
+        // caller's `take_poll_kind` continues instead of yielding,
+        // and return the body's result. Without this every
+        // non-yielding closure stored as a field (Reader's
+        // `setReadFn_` callback, MapSequence's mapping fn, …)
+        // returned null when invoked from inside a tainted method.
+        let num_args = _num_args as usize;
+        let mut args: Vec<crate::runtime::value::Value> =
+            Vec::with_capacity(num_args + 1);
+        args.push(recv);
+        for i in 1..=num_args {
+            let v = unsafe {
+                (*fiber)
+                    .aot_frames
+                    .last()
+                    .and_then(|f| f.saved_values.get(i).copied())
+                    .unwrap_or_else(crate::runtime::value::Value::null)
+            };
+            args.push(v);
+        }
+        // Fn.call shape passes user-args only (no receiver as
+        // first slot). Method-style cross-fn calls pass the
+        // recv-then-user-args slice the body's mir.arity is sized
+        // for. `closure_ptr_from_recv.is_some()` discriminates
+        // between the two.
+        let result_bits = if closure_ptr_from_recv.is_some() {
+            crate::codegen::runtime_fns::call_closure_jit_or_sync(
+                vm_ref,
+                closure_ptr,
+                &args[1..],
+                None,
+            )
+        } else {
+            crate::codegen::runtime_fns::call_closure_jit_or_sync(
+                vm_ref,
+                closure_ptr,
+                &args,
+                None,
+            )
+        };
+        unsafe {
+            if !(*fiber).aot_frames.is_empty() {
+                (*fiber).aot_frames.pop();
+            }
+        }
+        AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Done));
+        return result_bits;
     }
     let fn_ptr = vm_ref
         .engine

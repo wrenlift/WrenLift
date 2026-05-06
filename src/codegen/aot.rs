@@ -1223,8 +1223,13 @@ fn emit_aot_module(
 
     // Top-level body — the entry point Phase 7's init pass calls
     // last, after every dependency module's top-level has run.
-    let top_tag = format!("<top:{}>", aot_mod.request_name);
-    let top_is_sm = tainted_names.contains(&top_tag);
+    // The bootstrap declares every top-level fn as `() -> i64`, so
+    // a state-machine transform here would clash with a 0-arg call
+    // site (`(fiber, resume_v) -> i64` vs `()` is an "incompatible
+    // signature" link error). Force non-SM regardless of taint —
+    // yields inside the top-level body run synchronously through
+    // `vm_interp`'s pending-action unwinder, the same path the BC
+    // interpreter takes.
     let top_meta = emit_aot_function(
         module,
         &aot_mod.interner,
@@ -1232,7 +1237,7 @@ fn emit_aot_module(
         &aot_cfg,
         fn_symbol,
         None,
-        top_is_sm,
+        false,
         tainted_names,
     )?;
     fn_metas.push((fn_symbol.to_string(), top_meta));
