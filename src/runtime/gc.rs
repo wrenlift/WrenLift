@@ -1262,6 +1262,19 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                     }
                 }
             }
+            // AOT state-machine frames hold live-across-suspension
+            // values + cross-fn-call args (saved by the caller's
+            // CrossFnCallInit before invoking the child poll fn).
+            // These are roots for the duration of the suspension —
+            // without tracing them, an ObjList stashed into a slot
+            // before `fn.call(...)` becomes stale (under moving GC)
+            // or sweeped (under marksweep) once the callee triggers
+            // a collection, and the resume reads a freed pointer.
+            for frame in &fiber.aot_frames {
+                for &val in &frame.saved_values {
+                    mark_value(val, gray_stack);
+                }
+            }
             if !fiber.caller.is_null() {
                 mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
             }
@@ -1408,6 +1421,13 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
                 }
                 if let Some(ref mut class) = frame.defining_class {
                     update_raw_ptr_inline(class, nursery);
+                }
+            }
+            // AOT state-machine frame slots — see trace_object's
+            // matching arm for why these need forwarding.
+            for frame in &mut fiber.aot_frames {
+                for val in frame.saved_values.iter_mut() {
+                    update_value_inline(val, nursery);
                 }
             }
             update_raw_ptr_inline(&mut fiber.caller, nursery);

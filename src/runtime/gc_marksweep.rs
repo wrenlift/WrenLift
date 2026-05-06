@@ -173,6 +173,16 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
                     }
                 }
             }
+            // AOT state-machine frames hold cross-suspension live
+            // values + cross-fn-call args; without tracing them, an
+            // ObjList saved by the caller before invoking a callee
+            // closure gets sweeped if the callee allocates and
+            // triggers a collection.
+            for frame in &fiber.aot_frames {
+                for &val in &frame.saved_values {
+                    mark_value(val, gray_stack);
+                }
+            }
             if !fiber.caller.is_null() {
                 mark_gray(fiber.caller as *mut ObjHeader, gray_stack);
             }
