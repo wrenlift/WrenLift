@@ -1866,13 +1866,16 @@ pub fn call_closure_jit_or_sync(
         // fiber-driver picks them up the same way the BC interp
         // does after a primitive yield.
         #[cfg(feature = "aot")]
+        let is_sm = vm
+            .engine
+            .aot_state_machine
+            .get(func_id.0 as usize)
+            .copied()
+            .unwrap_or(false);
+        #[cfg(not(feature = "aot"))]
+        let is_sm = false;
+        #[cfg(feature = "aot")]
         {
-            let is_sm = vm
-                .engine
-                .aot_state_machine
-                .get(func_id.0 as usize)
-                .copied()
-                .unwrap_or(false);
             if is_sm {
                 let fn_ptr = vm
                     .engine
@@ -1880,6 +1883,24 @@ pub fn call_closure_jit_or_sync(
                     .get(func_id.0 as usize)
                     .copied()
                     .unwrap_or(std::ptr::null());
+                // The AOT bootstrap calls `wlift_aot_main` without
+                // running through `vm.interpret`, so `vm.fiber`
+                // can legitimately be null when an SM-tainted
+                // method is invoked from the top-level body.
+                // Allocate a root fiber on demand — the SM body
+                // only needs `(*fiber).aot_frames` and
+                // `aot_active_depth`; the fresh `ObjFiber` has
+                // both fields zeroed by default. Restore the
+                // previous (null) `vm.fiber` after the call so
+                // every later call re-runs the same lazy-alloc
+                // dance.
+                if !fn_ptr.is_null() && vm.fiber.is_null() {
+                    let lazy_fiber = vm.gc.alloc_fiber();
+                    unsafe {
+                        (*lazy_fiber).header.class = vm.fiber_class;
+                    }
+                    vm.fiber = lazy_fiber;
+                }
                 if !fn_ptr.is_null() && !vm.fiber.is_null() {
                     let fiber = vm.fiber;
                     let saved_depth = unsafe { (*fiber).aot_active_depth };
@@ -1960,7 +1981,16 @@ pub fn call_closure_jit_or_sync(
             }
         }
 
-        let native_fn_ptr: Option<*const u8> = if JIT_DISABLED.with(|d| d.get()) {
+        // SM bodies advertise the `(fiber, resume_v) -> i64`
+        // poll ABI, so `call_jit_with_shadow` (which packs
+        // `(receiver, ...args)` into the same registers) would
+        // crash on first `wlift_aot_sm_load_state`. The SM
+        // branch above already handles every case where
+        // `vm.fiber` is non-null; if it's null, fall through
+        // to `call_closure_sync` (BC interp on the original
+        // MIR — the SM transform is JIT-only). Never let the
+        // native fast path catch an SM body.
+        let native_fn_ptr: Option<*const u8> = if JIT_DISABLED.with(|d| d.get()) || is_sm {
             None
         } else {
             vm.engine
@@ -2521,16 +2551,38 @@ fn dispatch_method(
                     .get(fn_idx)
                     .copied()
                     .unwrap_or(std::ptr::null());
+                // AOT state-machine bodies advertise the
+                // `(fiber, resume_v) -> i64` poll ABI, NOT the
+                // regular `(receiver, ...args) -> i64` calling
+                // convention. `call_jit_with_shadow` blindly
+                // packs `(receiver, ...args)` into the registers
+                // the body expects to read as `(fiber, resume_v)`,
+                // so the receiver is dereferenced as `*mut
+                // ObjFiber` on first `wlift_aot_sm_load_state` →
+                // SIGSEGV. Drop into the SM-aware
+                // `call_closure_jit_or_sync` slow path; it pushes
+                // a child aot_frame, saves args via
+                // `wlift_aot_sm_save_arg`, and drives the poll fn
+                // until Done (or surfaces Yield to the BC loop).
+                #[cfg(feature = "aot")]
+                let is_sm = vm
+                    .engine
+                    .aot_state_machine
+                    .get(fn_idx)
+                    .copied()
+                    .unwrap_or(false);
+                #[cfg(not(feature = "aot"))]
+                let is_sm = false;
                 // With Cranelift, allow non-leaf JIT dispatch — Cranelift
                 // handles register allocation and call conventions correctly.
                 // The non-cranelift fallback still gates on is_leaf to avoid
                 // spill-slot bugs.
                 #[cfg(feature = "cranelift")]
-                let allow_jit = !fn_ptr.is_null();
+                let allow_jit = !fn_ptr.is_null() && !is_sm;
                 #[cfg(not(feature = "cranelift"))]
                 let allow_jit = {
                     let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-                    !fn_ptr.is_null() && is_leaf
+                    !fn_ptr.is_null() && is_leaf && !is_sm
                 };
                 if allow_jit {
                     let saved_ctx = read_jit_ctx();

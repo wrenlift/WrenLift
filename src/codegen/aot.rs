@@ -1460,8 +1460,8 @@ fn build_single_aot_module(source: &str, name: &str) -> Result<AotModule, AotErr
 /// [`compile_path_to_object`].
 pub fn compile_to_object(source: &str, output: &Path) -> Result<(), AotError> {
     let aot_mod = build_single_aot_module(source, "<inline>")?;
-    let cha = build_cha(std::slice::from_ref(&aot_mod), 0);
     let tainted = compute_aot_tainted_method_names(std::slice::from_ref(&aot_mod));
+    let cha = build_cha(std::slice::from_ref(&aot_mod), 0, &tainted);
     let mut module = make_object_module()?;
     emit_aot_module(
         &mut module,
@@ -1744,7 +1744,11 @@ fn method_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
 /// `Vec<AotMethodImpl>`) pair across all walked modules — once
 /// up front. The lowering threads a borrow of this into
 /// `AotLoweringConfig` so each Call site can devirtualize.
-fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
+fn build_cha(
+    modules: &[AotModule],
+    last_idx: usize,
+    tainted_names: &HashSet<String>,
+) -> AotCha {
     let mut by_sig: HashMap<String, Vec<AotMethodImpl>> = HashMap::new();
 
     for (idx, aot_mod) in modules.iter().enumerate() {
@@ -1797,6 +1801,7 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                 // `group(name)` shape, where the second body
                 // unwraps the named-groups map and the first
                 // does a list-index lookup, ran the wrong arm).
+                let is_state_machine = tainted_names.contains(&method.signature);
                 if let Some(existing) = entry
                     .iter_mut()
                     .find(|impl_| impl_.class_name == class_name)
@@ -1808,6 +1813,7 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         trivial_getter_field: trivial,
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
+                        is_state_machine,
                     };
                 } else {
                     entry.push(AotMethodImpl {
@@ -1817,6 +1823,7 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         trivial_getter_field: trivial,
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
+                        is_state_machine,
                     });
                 }
             }
@@ -1860,17 +1867,20 @@ pub fn compile_walk_to_object_with_manifest(
     let mut module = make_object_module()?;
     let last_idx = modules.len() - 1;
 
+    // Whole-program taint set so each module's emit loop can
+    // tell which closures need the state-machine transform.
+    // Computed once over `modules`; consumed per-module below.
+    let tainted = compute_aot_tainted_method_names(modules);
+
     // Build the whole-program method table (CHA) up front so the
     // Call-site lowering can devirtualize. Same module-naming
     // convention the per-module emit loop below uses, so the
     // class_modvars_symbol + class_slot fields point at the
     // exact data the bootstrap installs the class pointer into.
-    let cha = build_cha(modules, last_idx);
-
-    // Whole-program taint set so each module's emit loop can
-    // tell which closures need the state-machine transform.
-    // Computed once over `modules`; consumed per-module below.
-    let tainted = compute_aot_tainted_method_names(modules);
+    // Threading the taint set in lets each impl carry its
+    // `is_state_machine` flag so the CHA dispatch tree can skip
+    // direct-call for SM-tainted bodies (different ABI).
+    let cha = build_cha(modules, last_idx, &tainted);
 
     let mut manifests: Vec<AotManifest> = Vec::with_capacity(modules.len());
     for (idx, aot_mod) in modules.iter().enumerate() {

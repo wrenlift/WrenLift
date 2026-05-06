@@ -1023,6 +1023,14 @@ pub mod cl {
         /// check.
         pub class_modvars_symbol: String,
         pub class_slot: u32,
+        /// `true` when this body was emitted with the SM poll
+        /// ABI (`(fiber, resume_v) -> i64`) instead of the
+        /// regular `(receiver, ...args) -> i64`. The CHA
+        /// dispatch tree skips the direct-call fast block for
+        /// these and routes through `wren_call_N`, which
+        /// detects SM in `dispatch_method` and drives the poll
+        /// fn through `call_closure_jit_or_sync`.
+        pub is_state_machine: bool,
     }
 
     /// Per-emit defining-class context for static-field
@@ -1548,6 +1556,7 @@ pub mod cl {
             Some(layout) => compute_rpo_from(mir, layout.target_block),
             None => compute_rpo(mir),
         };
+        #[cfg_attr(not(feature = "aot"), allow(unused_labels))]
         'block_loop: for &block_idx in &rpo {
             let block = &mir.blocks[block_idx];
             let bid = BlockId(block_idx as u32);
@@ -1983,6 +1992,7 @@ pub mod cl {
             // branch returns, the done branch jumps); track
             // that here so the generic terminator emission
             // below skips the duplicate.
+            #[cfg_attr(not(feature = "aot"), allow(unused_mut))]
             let mut skip_default_terminator = false;
             // The pre-terminator hook fires for both Return-
             // (DirectYield) and Branch- (CrossFnCallInit, where
@@ -2812,6 +2822,24 @@ pub mod cl {
                                 // Miss → fall to the next check or the
                                 // final `wren_call_N` slow block.
                                 for impl_ in impls {
+                                    // SM bodies have the
+                                    // `(fiber, resume_v) -> i64`
+                                    // poll ABI; a direct
+                                    // Cranelift call would pack
+                                    // `(receiver, ...args)` into
+                                    // those slots and SIGSEGV
+                                    // on the first
+                                    // `wlift_aot_sm_load_state`.
+                                    // Skip the fast block — the
+                                    // shared `wren_call_N` slow
+                                    // block at the bottom routes
+                                    // through `dispatch_method`,
+                                    // which detects SM and uses
+                                    // `call_closure_jit_or_sync`'s
+                                    // SM-aware path.
+                                    if impl_.is_state_machine {
+                                        continue;
+                                    }
                                     let next_check = builder.create_block();
                                     let fast_block = builder.create_block();
 
