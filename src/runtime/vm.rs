@@ -4130,54 +4130,76 @@ impl VM {
         let live_defining_class = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1)
             .as_object()
             .map(|p| p as *mut crate::runtime::object::ObjClass);
-        let current_fiber = self.fiber;
-        if !current_fiber.is_null() {
-            let fn_ptr = unsafe { (*live_closure).function };
-            let func_id = crate::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
 
-            // AOT-stub fast path: a function registered via
-            // `engine.register_aot_function` carries an empty MIR
-            // and a populated `jit_code[func_id]` slot. Walking the
-            // empty `mir.blocks[0]` would panic; route through
-            // `call_jit_fn` directly with the closure as receiver.
-            // Only fires when the body is genuinely AOT-stubbed —
-            // JIT-tier-up'd functions still walk MIR for their
-            // inner closure dispatch shape.
-            let aot_fn = self
-                .engine
-                .jit_code
-                .get(func_id.0 as usize)
-                .copied()
-                .unwrap_or(std::ptr::null());
-            let mir_empty = self
+        // AOT-stub fast path: a function registered via
+        // `engine.register_aot_function` carries an empty MIR and a
+        // populated `jit_code[func_id]` slot. Walking the empty
+        // `mir.blocks[0]` would panic; route through `call_jit_fn`
+        // directly. The fast path doesn't depend on `vm.fiber` —
+        // the AOT body uses TLS `JitContext` for everything it
+        // touches — so apply it before the fiber-required slow
+        // path. The same dispatch goes through here whether the
+        // caller has a current fiber (regular method call) or not
+        // (e.g. `call_method_on` invoked from a native sequence
+        // helper before any fiber has been pushed: that path used
+        // to fall straight to the empty-MIR slow branch and return
+        // null, which is exactly what made `[1,2,3].map(pred).
+        // toList` come back as `[null, null, null]`).
+        let fn_ptr = unsafe { (*live_closure).function };
+        let func_id = crate::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+        let aot_fn = self
+            .engine
+            .jit_code
+            .get(func_id.0 as usize)
+            .copied()
+            .unwrap_or(std::ptr::null());
+        let mir_empty = self
+            .engine
+            .get_mir(func_id)
+            .map(|m| m.blocks.is_empty())
+            .unwrap_or(false);
+        if !aot_fn.is_null() && mir_empty && args.len() <= 8 {
+            let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
+                ctx.current_func_id = func_id.0 as u64;
+                ctx.closure = live_closure as *mut u8;
+                ctx.defining_class = live_defining_class
+                    .map(|p| p as *mut u8)
+                    .unwrap_or(std::ptr::null_mut());
+            });
+            let body_arity = self
                 .engine
                 .get_mir(func_id)
-                .map(|m| m.blocks.is_empty())
-                .unwrap_or(false);
-            if !aot_fn.is_null() && mir_empty && args.len() <= 7 {
-                let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
-                crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
-                    ctx.current_func_id = func_id.0 as u64;
-                    ctx.closure = live_closure as *mut u8;
-                    ctx.defining_class = live_defining_class
-                        .map(|p| p as *mut u8)
-                        .unwrap_or(std::ptr::null_mut());
-                });
-                let mut jit_args = [Value::null(); 8];
+                .map(|m| m.arity as usize)
+                .unwrap_or(args.len());
+            let mut jit_args = [Value::null(); 8];
+            let n;
+            if args.len() < body_arity {
+                // Caller didn't supply a receiver but body's arity
+                // expects one. Plug the closure pointer in slot 0
+                // (the historical `Method::Closure` shape).
                 let recv = crate::codegen::runtime_fns::jit_root_at(root_len_before);
                 jit_args[0] = recv;
                 for i in 0..args.len() {
                     jit_args[i + 1] =
                         crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
                 }
-                let n = args.len() + 1;
-                let result_bits =
-                    unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
-                crate::codegen::runtime_fns::set_jit_context(saved_ctx);
-                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-                return Some(Value::from_bits(result_bits));
+                n = args.len() + 1;
+            } else {
+                for i in 0..args.len() {
+                    jit_args[i] =
+                        crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
+                }
+                n = args.len();
             }
-
+            let result_bits =
+                unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
+            crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+            crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+            return Some(Value::from_bits(result_bits));
+        }
+        let current_fiber = self.fiber;
+        if !current_fiber.is_null() {
             let mir = match self.engine.get_mir(func_id) {
                 Some(mir) => mir,
                 None => {
