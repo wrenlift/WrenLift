@@ -1780,10 +1780,32 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                 let fn_symbol = format!("{}__method_{}_{}", fn_prefix, c_idx, m_idx);
                 let trivial =
                     crate::runtime::engine::ExecutionEngine::mir_trivial_getter_field(&method.mir);
-                by_sig
-                    .entry(method.signature.clone())
-                    .or_default()
-                    .push(AotMethodImpl {
+                let entry = by_sig.entry(method.signature.clone()).or_default();
+                // Wren's class-body semantics: a duplicate
+                // `method(_)` definition replaces the earlier one
+                // — `cls.methods[sym]` ends up holding the LAST
+                // body. Mirror that here so CHA's class-check
+                // dispatch tree resolves to the same impl the
+                // runtime install loop installed; otherwise the
+                // first definition keeps winning at every call
+                // site (the regex spec's two-arity `group(_)` /
+                // `group(name)` shape, where the second body
+                // unwraps the named-groups map and the first
+                // does a list-index lookup, ran the wrong arm).
+                if let Some(existing) = entry
+                    .iter_mut()
+                    .find(|impl_| impl_.class_name == class_name)
+                {
+                    *existing = AotMethodImpl {
+                        class_name: class_name.clone(),
+                        fn_symbol,
+                        arity: method.mir.arity,
+                        trivial_getter_field: trivial,
+                        class_modvars_symbol: modvars_symbol.clone(),
+                        class_slot: class_slot as u32,
+                    };
+                } else {
+                    entry.push(AotMethodImpl {
                         class_name: class_name.clone(),
                         fn_symbol,
                         arity: method.mir.arity,
@@ -1791,6 +1813,7 @@ fn build_cha(modules: &[AotModule], last_idx: usize) -> AotCha {
                         class_modvars_symbol: modvars_symbol.clone(),
                         class_slot: class_slot as u32,
                     });
+                }
             }
         }
     }

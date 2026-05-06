@@ -1874,7 +1874,6 @@ pub fn call_closure_jit_or_sync(
                     .unwrap_or(std::ptr::null());
                 if !fn_ptr.is_null() && !vm.fiber.is_null() {
                     let fiber = vm.fiber;
-                    let resume_v = args.get(0).copied().unwrap_or(Value::null()).to_bits();
                     let saved_depth = unsafe { (*fiber).aot_active_depth };
                     unsafe {
                         (*fiber)
@@ -1883,6 +1882,30 @@ pub fn call_closure_jit_or_sync(
                         (*fiber).aot_active_depth =
                             (*fiber).aot_frames.len().saturating_sub(1);
                     }
+                    // Save the user-supplied args into the freshly-
+                    // pushed child frame's slot table so the SM
+                    // body's `wlift_aot_sm_load_arg(fiber, slot)`
+                    // sites pick them up. Without this every
+                    // BlockParam read fell through to a default
+                    // null and `tryReadStdoutBytes(pid, max)` got
+                    // `max=null` on first call, aborting before
+                    // any I/O happened.
+                    for (i, a) in args.iter().enumerate() {
+                        unsafe {
+                            crate::capi::wlift_aot_sm_save_arg(
+                                fiber,
+                                i as u64,
+                                a.to_bits(),
+                            );
+                        }
+                    }
+                    // Resume value is null on the first invocation
+                    // (state == 0); subsequent re-entries from the
+                    // outer fiber driver come back through this
+                    // path with the value the resumer threaded in,
+                    // but for that case the SM body re-reads its
+                    // saved args anyway.
+                    let resume_v = Value::null().to_bits();
                     mutate_jit_ctx(|ctx| {
                         if ctx.vm.is_null() {
                             ctx.vm = vm as *mut _ as *mut u8;
@@ -3022,6 +3045,30 @@ pub extern "C" fn wren_call_8(
     a7: u64,
 ) -> u64 {
     wren_call_n_inner(receiver, method, &[a0, a1, a2, a3, a4, a5, a6, a7])
+}
+
+/// Variadic dispatch helper for `> 8`-arg call sites. Cranelift
+/// emits a `[u64; n]` stack buffer at the call site, fills it
+/// with arg bits, and routes through here so codegen doesn't have
+/// to mint a fresh `wren_call_N` per arity. AOT bodies with deep
+/// receiver-heavy method calls (`@hatch:gpu`'s pipeline /
+/// render-pass setup goes up to 12 + receiver) used to abort the
+/// build with "Call with arity N not supported by JIT (max 8)".
+///
+/// # Safety
+/// `args_ptr` must point to `count` `u64`s.
+#[no_mangle]
+pub unsafe extern "C" fn wren_call_dynamic(
+    receiver: u64,
+    method: u64,
+    count: u64,
+    args_ptr: *const u64,
+) -> u64 {
+    if args_ptr.is_null() {
+        return wren_call_n_inner(receiver, method, &[]);
+    }
+    let slice = unsafe { std::slice::from_raw_parts(args_ptr, count as usize) };
+    wren_call_n_inner(receiver, method, slice)
 }
 
 extern "C" fn wren_call_4_inner(
@@ -5028,6 +5075,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_call_6" => Some(wren_call_6 as *const () as usize),
         "wren_call_7" => Some(wren_call_7 as *const () as usize),
         "wren_call_8" => Some(wren_call_8 as *const () as usize),
+        "wren_call_dynamic" => Some(wren_call_dynamic as *const () as usize),
         "wren_call_static_self_0" => Some(wren_call_static_self_0 as *const () as usize),
         "wren_call_static_self_1" => Some(wren_call_static_self_1 as *const () as usize),
         "wren_call_static_self_2" => Some(wren_call_static_self_2 as *const () as usize),

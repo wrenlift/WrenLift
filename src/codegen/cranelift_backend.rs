@@ -2683,18 +2683,49 @@ pub mod cl {
                 args,
                 pure_call: _,
             } => {
-                // wren_call_N helpers only exist up to arity 4. Calls with
-                // more than 4 args silently truncated on the JIT path,
-                // which corrupts callee parameters (e.g. Render_.new with
-                // 7 args saw its final three become undefined). Bail
-                // out for arities beyond the helper family
-                // (`wren_call_0..wren_call_8`); deltablue's arity-5
-                // call sites land inside that range now.
+                // Calls with > 8 user args route through
+                // `wren_call_dynamic(receiver, method, count, ptr)`
+                // — Cranelift can't pass more than 8 i64s in
+                // registers without spilling, so spill to a
+                // stack-allocated `[u64; n]` buffer once and let
+                // the dispatcher walk it. Skips CHA / IC fast
+                // paths to keep the lowering simple; AOT bodies
+                // with > 8-arg method calls are rare enough
+                // (`@hatch:gpu`'s pipeline setup) that the loss
+                // of devirt isn't a hot-path concern.
                 if args.len() > 8 {
-                    return Err(format!(
-                        "Call with arity {} not supported by JIT (max 8)",
-                        args.len(),
-                    ));
+                    let r = get(receiver);
+                    let method_val = if let Some(cfg) = aot_config {
+                        let slot = aot_intern_symbol(cfg, method.index(), interner);
+                        let sym_gv =
+                            module.declare_data_in_func(cfg.symbols_data, builder.func);
+                        let sym_base = builder.ins().global_value(types::I64, sym_gv);
+                        builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            sym_base,
+                            (slot as i32) * 8,
+                        )
+                    } else {
+                        builder.ins().iconst(types::I64, method.index() as i64)
+                    };
+                    let buf_size = (args.len() * 8) as u32;
+                    let stack_slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            buf_size,
+                            8,
+                        ),
+                    );
+                    for (i, a) in args.iter().enumerate() {
+                        let v = get(a);
+                        builder.ins().stack_store(v, stack_slot, (i * 8) as i32);
+                    }
+                    let buf = builder.ins().stack_addr(types::I64, stack_slot, 0);
+                    let count = builder.ins().iconst(types::I64, args.len() as i64);
+                    let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
+                    let call = builder.ins().call(f, &[r, method_val, count, buf]);
+                    return Ok(Some(builder.inst_results(call)[0]));
                 }
                 let r = get(receiver);
 

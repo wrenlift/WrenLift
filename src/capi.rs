@@ -1561,37 +1561,73 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     }
     let vm_ref = unsafe { &mut *vm };
     let recv = Value::from_bits(recv_bits);
-    // Resolve the receiver's class — instance, then fall back
-    // to "the receiver IS a class" for static dispatch
-    // (`Foo.bar(_)` style calls where recv = the class object).
-    let class_ptr = vm_ref.class_of(recv);
-    if class_ptr.is_null() {
-        return Value::null().to_bits();
-    }
     let sym_id = crate::intern::SymbolId::from_raw(method_sym as u32);
-    let idx = sym_id.index() as usize;
-    // Walk class.methods[idx] for an installed Method::Closure
-    // pointing at a state-machine FuncId. Polymorphic dispatch
-    // works naturally because the lookup uses `class_of(recv)`.
-    let method_entry = unsafe {
-        let cls = class_ptr;
-        let methods = &(*cls).methods;
-        if idx < methods.len() {
-            methods[idx]
-        } else {
-            None
-        }
+
+    // Closure receiver + `call(...)` method: this is `_fn.call(
+    // user_args)` from inside an SM-tainted body. The receiver is
+    // the closure itself, the method symbol is one of the `call(_,
+    // ...)` stubs on Fn class. Skip the class-method lookup
+    // (it'd resolve to `fn_call_stub`, the native error helper)
+    // and dispatch the closure body directly. Without this, every
+    // call-via-Fn-call site routed into a CrossFnCallInit returned
+    // null, so any SM helper closure stored as a field —
+    // `Reader.withTryFn`'s inner `_readFn`, the
+    // `MapSequence._fn`, etc. — never ran from inside a tainted
+    // caller.
+    let closure_ptr_from_recv = if recv.is_object() && vm_ref.is_call_sym(sym_id) {
+        recv.as_object().and_then(|p| {
+            let header = p as *const ObjHeader;
+            if unsafe { (*header).obj_type } == ObjType::Closure {
+                Some(p as *mut crate::runtime::object::ObjClosure)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
     };
-    let closure_ptr = match method_entry {
-        Some(Method::Closure(cp)) => cp,
-        Some(Method::Constructor(cp)) => cp,
-        _ => {
-            // Not a closure-backed method (foreign / native /
-            // missing) — can't be state-machine. Surface as
-            // null; the caller's Done branch will bind null
-            // and continue.
+
+    let closure_ptr = if let Some(cp) = closure_ptr_from_recv {
+        cp
+    } else {
+        // Resolve the receiver's class — instance, then fall back
+        // to "the receiver IS a class" for static dispatch
+        // (`Foo.bar(_)` style calls where recv = the class object).
+        let class_ptr = vm_ref.class_of(recv);
+        if class_ptr.is_null() {
             return Value::null().to_bits();
         }
+        let idx = sym_id.index() as usize;
+        // Walk class.methods[idx] for an installed Method::Closure
+        // pointing at a state-machine FuncId. Polymorphic dispatch
+        // works naturally because the lookup uses `class_of(recv)`.
+        let method_entry = unsafe {
+            let cls = class_ptr;
+            let methods = &(*cls).methods;
+            if idx < methods.len() {
+                methods[idx]
+            } else {
+                None
+            }
+        };
+        let cp = match method_entry {
+            Some(Method::Closure(cp)) => cp,
+            Some(Method::Constructor(cp)) => cp,
+            _ => {
+                // Not a closure-backed method (foreign / native /
+                // missing) — can't be state-machine. Surface as
+                // null; the caller's Done branch will bind null
+                // and continue.
+                return Value::null().to_bits();
+            }
+        };
+        // Defensive: the receiver's `class_of` must produce a real
+        // ObjClass for the dispatch to be meaningful.
+        let header = class_ptr as *const ObjHeader;
+        if unsafe { (*header).obj_type } != ObjType::Class {
+            return Value::null().to_bits();
+        }
+        cp
     };
     let func_id = unsafe {
         let fn_obj = (*closure_ptr).function;
@@ -1614,12 +1650,6 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         .copied()
         .unwrap_or(std::ptr::null());
     if fn_ptr.is_null() {
-        return Value::null().to_bits();
-    }
-    // Defensive: the receiver's `class_of` must produce a real
-    // ObjClass for the dispatch to be meaningful.
-    let header = class_ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::Class {
         return Value::null().to_bits();
     }
     let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
