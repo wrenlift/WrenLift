@@ -1201,6 +1201,27 @@ fn emit_aot_function(
             .as_ref()
             .map(|(t, _)| t)
             .unwrap_or(mir);
+        // Diagnostic: dump SM-transformed MIR + layout when the
+        // function symbol or resolved MIR name matches the value
+        // of WLIFT_AOT_DUMP_FN.
+        if let Ok(want) = std::env::var("WLIFT_AOT_DUMP_FN") {
+            let mir_name = interner.resolve(mir.name).to_string();
+            if symbol.contains(&want) || mir_name.contains(&want) {
+                eprintln!(
+                    "=== AOT dump for {} (mir.name={}) ===",
+                    symbol, mir_name
+                );
+                if let Some((sm_mir, sm_layout)) = sm_payload.as_ref() {
+                    eprintln!("--- SM-transformed MIR ---");
+                    eprintln!("{:#?}", sm_mir);
+                    eprintln!("--- SM layout ---");
+                    eprintln!("{:#?}", sm_layout);
+                } else {
+                    eprintln!("--- MIR (non-SM) ---");
+                    eprintln!("{:#?}", mir_to_lower);
+                }
+            }
+        }
         lower_mir_to_module(
             mir_to_lower,
             interner,
@@ -2118,6 +2139,12 @@ pub fn compile_walk_to_object_with_manifest(
     for (idx, aot_mod) in modules.iter().enumerate() {
         let mut bindings: Vec<AotImportBinding> = Vec::new();
         let mut runtime_imports: Vec<AotRuntimeImport> = Vec::new();
+        if std::env::var_os("WLIFT_AOT_DEBUG_IMPORTS").is_some() {
+            eprintln!(
+                "[aot manifest {}] request_name={} module_name={} aliases={:?}",
+                idx, aot_mod.request_name, manifests[idx].module_name, manifests[idx].module_aliases
+            );
+        }
         for (slot, source) in aot_mod.module_var_sources.iter().enumerate() {
             let Some(source_path) = source else { continue };
             let var_name = &aot_mod.module_var_names[slot];
@@ -2158,13 +2185,34 @@ pub fn compile_walk_to_object_with_manifest(
                             .map(|p| p as u32)
                     });
                 if let Some(source_slot) = src_slot {
+                    if std::env::var_os("WLIFT_AOT_DEBUG_IMPORTS").is_some() {
+                        eprintln!(
+                            "[aot import] {}.{} <- {}.[slot {}] (target_slot {})",
+                            aot_mod.request_name,
+                            var_name,
+                            src.module_name,
+                            source_slot,
+                            slot
+                        );
+                    }
                     bindings.push(AotImportBinding {
                         target_slot: slot as u32,
                         source_modvars_symbol: src.modvars_symbol.clone(),
                         source_slot,
                     });
+                } else if std::env::var_os("WLIFT_AOT_DEBUG_IMPORTS").is_some() {
+                    eprintln!(
+                        "[aot import] UNRESOLVED {}.{} <- {}: no class or modvar slot",
+                        aot_mod.request_name, var_name, src.module_name
+                    );
                 }
             } else {
+                if std::env::var_os("WLIFT_AOT_DEBUG_IMPORTS").is_some() {
+                    eprintln!(
+                        "[aot import] RUNTIME {}.{} from {} (target_slot {})",
+                        aot_mod.request_name, var_name, source_path, slot
+                    );
+                }
                 // No emitted module under this name → bare-builtin
                 // (or a registry/git dep the walker couldn't reach).
                 // Defer resolution to runtime.
