@@ -1002,28 +1002,12 @@ pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String
     // yields back through the loop and request fibers
     // accumulate, ballooning memory.
     //
-    // Architecturally this taint expansion is mandatory: any
-    // yielding closure-call site that escapes the SM mesh leaks
-    // into the native `FiberAction::Yield` arm of
+    // Always-on. Any yielding closure-call site that escapes the
+    // SM mesh leaks into the native `FiberAction::Yield` arm of
     // `handle_jit_fiber_action`, which can't unwind a native
-    // stack. The opt-in gate stays in place because flipping it
-    // surfaces a separate, *closure-dispatch* bug under
-    // call(N) tainting — `WLIFT_AOT_TRACE_SM=1` shows zero
-    // Mechanism-B leaks, but `@hatch:web`'s middleware chain
-    // recurses infinitely between two closures
-    // (`main__closure_1` ↔ `mod_10__closure_8` per lldb,
-    // alternating same call-site offsets ~98K times before a
-    // 128MB linker-bumped stack overflows). Each cycle is
-    // ~1.2KB; the SM-poll propagation works correctly per the
-    // trace, so the recursion isn't a missing yield — it's the
-    // user's `next.call(req)` chain resolving to the wrong
-    // closure on some path. Closing this needs runtime work to
-    // verify how `wlift_aot_invoke_sm_method`'s closure-by-recv
-    // dispatch resolves the `next` parameter passed through
-    // multiple cross-fn-call frames; the simplest repro is
-    // `WLIFT_AOT_CALL_N=1` + `curl :3000` against the AOT'd
-    // hatch/site.
-    let any_sm_closure = std::env::var_os("WLIFT_AOT_CALL_N").is_some()
+    // stack. `WLIFT_AOT_NO_CALL_N` opts out for benchmarking
+    // bodies that statically have no yielding closures.
+    let any_sm_closure = std::env::var_os("WLIFT_AOT_NO_CALL_N").is_none()
         && tainted.iter().any(|n| n.starts_with("<closure:"));
     if any_sm_closure {
         let call_sigs = [

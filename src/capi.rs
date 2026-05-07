@@ -1184,6 +1184,18 @@ thread_local! {
         const { std::cell::Cell::new(AotSmPollKind::None) };
 }
 
+/// Cached `WLIFT_AOT_TRACE_SM` env-var check. Runs once on
+/// first call instead of per-dispatch — the trace path makes
+/// `wlift_aot_invoke_sm_method` 100x slower if we re-check the
+/// env var on every cross-fn call (refresh loops generate
+/// 50K+ dispatches per second).
+#[cfg(feature = "aot")]
+pub(crate) fn aot_trace_sm_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WLIFT_AOT_TRACE_SM").is_some())
+}
+
 /// Read the current state ID of `fiber`'s AOT state machine.
 /// Called from the poll fn's dispatch prologue to decide which
 /// `br_table` arm to enter on resume. New frames come back as
@@ -1374,6 +1386,110 @@ pub unsafe extern "C" fn wlift_aot_sm_save_arg(
         }
         frame.saved_values[slot] = crate::runtime::value::Value::from_bits(value_bits);
     }
+}
+
+/// Diagnostic: log a save_arg event from the SM transform's
+/// `CrossFnCallInit` lowering. Called immediately after each
+/// `wlift_aot_sm_save_arg` so a trace consumer can correlate
+/// what the AOT codegen *meant* to save (the MIR ValueId +
+/// resolved value bits) against what `wlift_aot_invoke_sm_method`
+/// later reads via `wlift_aot_sm_load_arg` at the matching
+/// `CrossFnCallResume`. Gated on `WLIFT_AOT_TRACE_SM`; no-op
+/// when unset.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_trace_init_save(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    slot: u64,
+    value_id: u64,
+    value_bits: u64,
+) {
+    if !aot_trace_sm_enabled() {
+        return;
+    }
+    let depth = if fiber.is_null() {
+        u64::MAX
+    } else {
+        unsafe { (*fiber).aot_active_depth as u64 }
+    };
+    let frames_len = if fiber.is_null() {
+        0
+    } else {
+        unsafe { (*fiber).aot_frames.len() }
+    };
+    let v = crate::runtime::value::Value::from_bits(value_bits);
+    let kind = if v.is_null() {
+        "null".to_string()
+    } else if v.is_bool() {
+        format!("bool({})", v.as_bool().unwrap_or(false))
+    } else if v.is_num() {
+        format!("num({})", v.as_num().unwrap_or(0.0))
+    } else if v.is_object() {
+        if let Some(p) = v.as_object() {
+            let header = p as *const crate::runtime::object::ObjHeader;
+            let ty = unsafe { (*header).obj_type };
+            format!("obj({:?}@0x{:x})", ty, p as usize)
+        } else {
+            "obj(?)".to_string()
+        }
+    } else {
+        format!("0x{:x}", value_bits)
+    };
+    eprintln!(
+        "SM-INIT-SAVE depth={} frames_len={} slot={} v_id=v{} value={}",
+        depth, frames_len, slot, value_id, kind
+    );
+}
+
+/// Diagnostic mirror of [`wlift_aot_trace_init_save`] for the
+/// resume_check's `load_arg` reads. The receiver/args were
+/// stashed by a matching Init block; this logs what the load
+/// actually picked up so a save→load divergence (e.g. a
+/// pop_frame between the two, or an unintended frame push)
+/// surfaces directly. Gated on `WLIFT_AOT_TRACE_SM`.
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_trace_init_load(
+    fiber: *mut crate::runtime::object::ObjFiber,
+    slot: u64,
+    value_id: u64,
+    value_bits: u64,
+) {
+    if !aot_trace_sm_enabled() {
+        return;
+    }
+    let depth = if fiber.is_null() {
+        u64::MAX
+    } else {
+        unsafe { (*fiber).aot_active_depth as u64 }
+    };
+    let frames_len = if fiber.is_null() {
+        0
+    } else {
+        unsafe { (*fiber).aot_frames.len() }
+    };
+    let v = crate::runtime::value::Value::from_bits(value_bits);
+    let kind = if v.is_null() {
+        "null".to_string()
+    } else if v.is_bool() {
+        format!("bool({})", v.as_bool().unwrap_or(false))
+    } else if v.is_num() {
+        format!("num({})", v.as_num().unwrap_or(0.0))
+    } else if v.is_object() {
+        if let Some(p) = v.as_object() {
+            let header = p as *const crate::runtime::object::ObjHeader;
+            let ty = unsafe { (*header).obj_type };
+            format!("obj({:?}@0x{:x})", ty, p as usize)
+        } else {
+            "obj(?)".to_string()
+        }
+    } else {
+        format!("0x{:x}", value_bits)
+    };
+    eprintln!(
+        "SM-INIT-LOAD depth={} frames_len={} slot={} v_id=v{} value={}",
+        depth, frames_len, slot, value_id, kind
+    );
 }
 
 /// Read a value from slot `slot` of the *topmost* frame (the
@@ -1568,7 +1684,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     // {entry-kind, exit-kind, receiver-class, method, depth} so
     // `Yield` propagation breaks become visible. Off the hot
     // path when unset.
-    let trace = std::env::var_os("WLIFT_AOT_TRACE_SM").is_some();
+    let trace = aot_trace_sm_enabled();
     let trace_method_name = if trace {
         vm_ref.interner.resolve(sym_id).to_string()
     } else {

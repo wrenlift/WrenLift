@@ -2517,7 +2517,7 @@ fn handle_jit_fiber_action(
         }
         FiberAction::Yield { value } => {
             // Yield from JIT context — the fiber should return the value.
-            if std::env::var_os("WLIFT_AOT_TRACE_SM").is_some() {
+            if crate::capi::aot_trace_sm_enabled() {
                 eprintln!(
                     "SM-LEAK FiberAction::Yield reached handle_jit_fiber_action — taint set is incomplete (this is the Mechanism B leak)"
                 );

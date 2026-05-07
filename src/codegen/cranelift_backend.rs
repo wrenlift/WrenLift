@@ -1753,6 +1753,21 @@ pub mod cl {
                 let zero = builder.ins().iconst(types::I64, 0);
                 let recv_call = builder.ins().call(load_arg_fn, &[fiber, zero]);
                 let recv_v = builder.inst_results(recv_call)[0];
+                // Trace the loaded recv against the receiver MIR
+                // ValueId so a save→load mismatch becomes visible.
+                let trace_load_fn = get_runtime_fn(
+                    module,
+                    builder,
+                    "wlift_aot_trace_init_load",
+                    4,
+                )?;
+                let recv_id = builder
+                    .ins()
+                    .iconst(types::I64, receiver.0 as i64);
+                let _ = builder.ins().call(
+                    trace_load_fn,
+                    &[fiber, zero, recv_id, recv_v],
+                );
                 let symbols_gv =
                     module.declare_data_in_func(cfg.symbols_data, builder.func);
                 let symbols_addr = builder.ins().global_value(types::I64, symbols_gv);
@@ -1939,11 +1954,39 @@ pub mod cl {
                                 "wlift_aot_sm_load_value",
                                 2,
                             )?;
+                            // Closure bodies have no implicit
+                            // `this` BlockParam — `BlockParam(0)`
+                            // is the first user arg. The caller
+                            // (CrossFnCallInit's save_arg
+                            // sequence) writes the closure
+                            // receiver at slot 0 and user args
+                            // at slot 1..N regardless of whether
+                            // the callee is a method or a
+                            // closure, so closure bodies need to
+                            // read user args at slot+1 to skip
+                            // the receiver slot.
+                            //
+                            // Without this, every `Fn.new {|req,
+                            // next| ...}` body under
+                            // WLIFT_AOT_CALL_N saw `req` ← the
+                            // closure itself and `next` ← the
+                            // actual req — `step_`'s `mw.call(
+                            // req, next)` chain through
+                            // `@hatch:web`'s middleware
+                            // recursed infinitely between two
+                            // closures (each thinking its
+                            // `next` was actually `req`'s
+                            // value) and exhausted the stack on
+                            // every request.
+                            let is_closure_body =
+                                interner.resolve(mir.name) == "<closure>";
+                            let slot_offset = if is_closure_body { 1u16 } else { 0u16 };
                             for &(vid, ref inst) in &block.instructions {
                                 if let Instruction::BlockParam(idx) = inst {
-                                    let slot = builder
-                                        .ins()
-                                        .iconst(types::I64, *idx as i64);
+                                    let slot = builder.ins().iconst(
+                                        types::I64,
+                                        (*idx + slot_offset) as i64,
+                                    );
                                     let call = builder.ins().call(load_fn, &[fiber, slot]);
                                     let v = builder.inst_results(call)[0];
                                     val_map.insert(vid, v);
@@ -2322,6 +2365,12 @@ pub mod cl {
                                             "wlift_aot_sm_save_arg",
                                             3,
                                         )?;
+                                        let trace_init_fn = get_runtime_fn(
+                                            module,
+                                            builder,
+                                            "wlift_aot_trace_init_save",
+                                            4,
+                                        )?;
                                         let recv_v = match val_map.get(&receiver) {
                                             Some(v) => *v,
                                             None => builder.ins().iconst(types::I64, 0),
@@ -2330,6 +2379,12 @@ pub mod cl {
                                         let _ = builder
                                             .ins()
                                             .call(save_arg_fn, &[fiber, zero, recv_v]);
+                                        let recv_id = builder
+                                            .ins()
+                                            .iconst(types::I64, receiver.0 as i64);
+                                        let _ = builder
+                                            .ins()
+                                            .call(trace_init_fn, &[fiber, zero, recv_id, recv_v]);
                                         for (i, a) in args.iter().enumerate() {
                                             let av = match val_map.get(a) {
                                                 Some(v) => *v,
@@ -2343,6 +2398,12 @@ pub mod cl {
                                             let _ = builder
                                                 .ins()
                                                 .call(save_arg_fn, &[fiber, slot, av]);
+                                            let arg_id = builder
+                                                .ins()
+                                                .iconst(types::I64, a.0 as i64);
+                                            let _ = builder
+                                                .ins()
+                                                .call(trace_init_fn, &[fiber, slot, arg_id, av]);
                                         }
                                         let target = block_map[&resume_check_block];
                                         builder.ins().jump(target, &[]);
