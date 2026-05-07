@@ -410,11 +410,39 @@ pub fn transform_to_state_machine(
                 }
             }
 
-            // CrossFnCall result: the suspension Call's `result`
-            // ValueId has no pre-call definition (the call was
-            // dropped above during the split), and the lowering
-            // rebinds it to the runtime `ret` of
-            // `wlift_aot_invoke_sm_method` via
+            // CrossFnCall results from earlier-processed yields:
+            // each `CrossFnCallResume` block synthetically defines
+            // its `result` ValueId in cranelift via
+            // `val_map.insert(result, ret)` (the runtime call's
+            // return). The result has no MIR-level def, so a
+            // vanilla def-block scan would miss it — but it IS
+            // available at every block downstream of the matching
+            // resume. Including it here lets a later yield save
+            // the result across its own suspension, generating a
+            // load that dominates any tail-duplicated successor.
+            //
+            // Without this: when the post-resume block tree is
+            // cloned for a different resume entry (the
+            // tail-duplication for a later yield's saved values),
+            // the clone references the original `result` ValueId
+            // but the Cranelift binding only dominates the
+            // original done-block, not the clone. Surfaces as
+            // "undefined value v15" on `App.serve_(_)`'s SSE
+            // branch under WLIFT_AOT_CALL_N taint expansion —
+            // `Http_.handle(req)`'s result is used after
+            // `writer.call(emit)` resumes, but the resume's
+            // tail-dup clone has no dominating def.
+            for kind in layout.block_kinds.values() {
+                if let BlockKind::CrossFnCallResume { result, .. } = kind {
+                    pre_yield_defs.insert(*result);
+                }
+            }
+
+            // CrossFnCall result for the CURRENT yield: the
+            // suspension Call's `result` ValueId has no pre-call
+            // definition (the call was dropped above during the
+            // split), and the lowering rebinds it to the runtime
+            // `ret` of `wlift_aot_invoke_sm_method` via
             // `val_map.insert(result, ret)`. Save/load through
             // the slot table would just round-trip null.
             let exclude_dst = match susp_kind {
@@ -970,31 +998,42 @@ fn compute_live_in(
     live_in[target_block.0 as usize].clone()
 }
 
-/// Set of ValueIds whose def block is NOT forward-reachable from
-/// `resume_block` — i.e. values that already exist when the
-/// yield happens and would be lost across the suspension if we
-/// didn't save them. Post-resume-defined values are produced
-/// fresh on every resume, so saving them at the yield (where
-/// they don't yet exist) would be incorrect.
+/// Set of ValueIds defined "before" the current yield — i.e.
+/// values that exist when the yield happens and would be lost
+/// across the suspension if we didn't save them. Computed as
+/// forward-reach from `bb0` over the post-transform CFG: the
+/// SM transform splits each yielding block so its terminator is
+/// `Return(yield_value)` (no successor), and resume entries have
+/// empty MIR predecessors (the dispatcher's `br_table` edge is
+/// added at lowering, after this transform runs). So a plain
+/// forward-from-`bb0` walk via terminator successors lands
+/// exactly on the blocks that lexically precede every yield in
+/// the original control flow.
 ///
-/// In the post-split MIR every resume block has zero MIR-level
-/// predecessors (the dispatcher's `br_table` edge is added at
-/// lowering, after this transform runs). So forward-reachability
-/// from one resume block doesn't sweep through other resumes —
-/// each yield's pre-yield-defs are computed against its own
-/// resume successor subgraph, independent of earlier yields'
-/// resume blocks even though they share the original function's
-/// CFG.
+/// The earlier "forward-from-resume" formulation broke on loops:
+/// `while (cond) { Fiber.yield() }` makes the loop's body block
+/// (which defines values used at the resume entry as branch
+/// args) forward-reachable from the resume, mistakenly classing
+/// it as post-yield-only. Surfaced as `undefined value v6 in
+/// terminator` in `@hatch:web`'s `App.handle(_)` once
+/// WLIFT_AOT_CALL_N taint expansion brought the inner-loop call
+/// into the SM mesh.
+///
+/// Block params get added unconditionally because a param's
+/// value comes from its predecessor's branch arg — a loop-back
+/// param's initial value originates pre-yield even though the
+/// param appears in a "post-yield-only" block per the structural
+/// reach.
 fn collect_pre_yield_defs(
     mir: &MirFunction,
-    resume_block: BlockId,
+    _resume_block: BlockId,
 ) -> std::collections::HashSet<ValueId> {
     use std::collections::HashSet;
     let n = mir.blocks.len();
-    let mut post_yield: HashSet<BlockId> = HashSet::new();
-    let mut stack = vec![resume_block];
+    let mut pre_yield_blocks: HashSet<BlockId> = HashSet::new();
+    let mut stack = vec![BlockId(0)];
     while let Some(b) = stack.pop() {
-        if !post_yield.insert(b) {
+        if !pre_yield_blocks.insert(b) {
             continue;
         }
         if (b.0 as usize) < n {
@@ -1004,26 +1043,13 @@ fn collect_pre_yield_defs(
         }
     }
     let mut pre_yield_defs: HashSet<ValueId> = HashSet::new();
-    // Block params of *every* block count as pre-yield defs.
-    // A param's value comes from the predecessor's branch arg —
-    // if any predecessor is pre-yield, the param's value at the
-    // yield point originates pre-yield. Loop-back params (e.g.
-    // `bb1` in a `while` whose post-yield path branches back to
-    // it) need this: their initial value comes from the pre-yield
-    // entry branch, and that's the value we need to preserve
-    // across the suspension. Without including them, the
-    // resume-block uses see them via SSA dominance from a path
-    // (bb1 → ... → resume) that the dispatcher's `br_table`
-    // doesn't actually traverse on re-poll, and Cranelift
-    // rejects the IR with a non-dominating-use error — or the
-    // body silently reads garbage from an undefined SSA value.
     for blk in mir.blocks.iter() {
         for (vid, _) in &blk.params {
             pre_yield_defs.insert(*vid);
         }
     }
     for (i, blk) in mir.blocks.iter().enumerate() {
-        if post_yield.contains(&BlockId(i as u32)) {
+        if !pre_yield_blocks.contains(&BlockId(i as u32)) {
             continue;
         }
         for (vid, _) in &blk.params {

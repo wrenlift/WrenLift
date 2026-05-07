@@ -1567,6 +1567,34 @@ pub mod cl {
         // before use. RPO guarantees dominators come first.
         let rpo = match osr_entry.as_ref() {
             Some(layout) => compute_rpo_from(mir, layout.target_block),
+            #[cfg(feature = "aot")]
+            None => {
+                // SM resume entries are reached only via the synthetic
+                // dispatch's `br_table`, so a plain DFS-from-bb0 leaves
+                // them and every block downstream of them off the RPO
+                // walk — they fall into the "unreachable" tail in raw
+                // block-index order. That order isn't a valid dominance
+                // order: a CrossFnCallResume block emits the
+                // `wlift_aot_sm_load_value` defs for its
+                // saved-across-yield ValueIds, and any post-resume
+                // block that uses those defs must come AFTER it in
+                // RPO. Without seeding DFS from every resume entry,
+                // the post-resume block lowers first and Cranelift
+                // rejects the use of an undefined SSA value (e.g.
+                // `App.serve_(_)`'s SSE branch references the load
+                // for the `conn` save-slot before the load is
+                // emitted, surfacing as `undefined value v47`).
+                let mut roots: Vec<BlockId> = vec![BlockId(0)];
+                if let Some(cfg) = aot_config {
+                    if let Some(layout) =
+                        cfg.current_state_machine_layout.borrow().as_ref()
+                    {
+                        roots.extend(layout.resume_entries.iter().copied());
+                    }
+                }
+                compute_rpo_multi_root(mir, &roots)
+            }
+            #[cfg(not(feature = "aot"))]
             None => compute_rpo(mir),
         };
         // Determine reachability from bb0 (or osr_entry's
@@ -5069,6 +5097,50 @@ pub mod cl {
 
         dfs(start.0 as usize, mir, &mut visited, &mut post_order);
         post_order.reverse();
+        post_order
+    }
+
+    /// Reverse post-order with multiple DFS roots. Each root is
+    /// visited only once across all roots so a block reachable
+    /// from several roots ends up in a single, dominance-respecting
+    /// position. Unreachable blocks are appended in block-index
+    /// order so every block has a slot (Cranelift requires a
+    /// terminator on every created block; the lowering emits a
+    /// `trap` for blocks that didn't make the `reachable` set).
+    ///
+    /// AOT state-machine bodies need this: the synthetic dispatch
+    /// `br_table` is the only predecessor of each resume entry, so
+    /// a plain DFS-from-bb0 misses them. Seeding DFS from `bb0`
+    /// plus every resume entry recovers the dominance order
+    /// Cranelift expects between a CrossFnCallResume block (which
+    /// emits the `load_value` defs for its saved values) and any
+    /// downstream block that uses those defs.
+    #[cfg(feature = "aot")]
+    fn compute_rpo_multi_root(mir: &MirFunction, roots: &[BlockId]) -> Vec<usize> {
+        let n = mir.blocks.len();
+        let mut visited = vec![false; n];
+        let mut post_order = Vec::with_capacity(n);
+
+        fn dfs(idx: usize, mir: &MirFunction, visited: &mut [bool], post_order: &mut Vec<usize>) {
+            if idx >= mir.blocks.len() || visited[idx] {
+                return;
+            }
+            visited[idx] = true;
+            for succ in mir.blocks[idx].terminator.successors() {
+                dfs(succ.0 as usize, mir, visited, post_order);
+            }
+            post_order.push(idx);
+        }
+
+        for root in roots {
+            dfs(root.0 as usize, mir, &mut visited, &mut post_order);
+        }
+        post_order.reverse();
+        for (i, &seen) in visited.iter().enumerate().take(n) {
+            if !seen {
+                post_order.push(i);
+            }
+        }
         post_order
     }
 }

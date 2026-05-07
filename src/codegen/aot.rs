@@ -1001,6 +1001,28 @@ pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String
     // `fiber.call()` on suspended fibers) doesn't propagate
     // yields back through the loop and request fibers
     // accumulate, ballooning memory.
+    //
+    // Architecturally this taint expansion is mandatory: any
+    // yielding closure-call site that escapes the SM mesh leaks
+    // into the native `FiberAction::Yield` arm of
+    // `handle_jit_fiber_action`, which can't unwind a native
+    // stack. The opt-in gate stays in place because flipping it
+    // surfaces a separate, *closure-dispatch* bug under
+    // call(N) tainting — `WLIFT_AOT_TRACE_SM=1` shows zero
+    // Mechanism-B leaks, but `@hatch:web`'s middleware chain
+    // recurses infinitely between two closures
+    // (`main__closure_1` ↔ `mod_10__closure_8` per lldb,
+    // alternating same call-site offsets ~98K times before a
+    // 128MB linker-bumped stack overflows). Each cycle is
+    // ~1.2KB; the SM-poll propagation works correctly per the
+    // trace, so the recursion isn't a missing yield — it's the
+    // user's `next.call(req)` chain resolving to the wrong
+    // closure on some path. Closing this needs runtime work to
+    // verify how `wlift_aot_invoke_sm_method`'s closure-by-recv
+    // dispatch resolves the `next` parameter passed through
+    // multiple cross-fn-call frames; the simplest repro is
+    // `WLIFT_AOT_CALL_N=1` + `curl :3000` against the AOT'd
+    // hatch/site.
     let any_sm_closure = std::env::var_os("WLIFT_AOT_CALL_N").is_some()
         && tainted.iter().any(|n| n.starts_with("<closure:"));
     if any_sm_closure {
@@ -2253,9 +2275,36 @@ pub fn link_executable(obj: &Path, staticlib: &Path, out: &Path) -> Result<(), A
             .arg("-framework")
             .arg("CoreFoundation")
             .arg("-framework")
-            .arg("Security");
+            .arg("Security")
+            // Bump the main-thread stack from macOS's 8MB default
+            // to 128MB. AOT-compiled SM poll functions hold
+            // sizeable spill frames (~33KB each at -O2), so a
+            // moderately deep cross-fn dispatch chain (a routing
+            // pipeline through `@hatch:web` stacks ~30 layers per
+            // request) can exhaust the default. Bump is on
+            // `link_executable` rather than at runtime because
+            // macOS doesn't let a process raise its own
+            // main-thread stack after launch — `setrlimit
+            // (RLIMIT_STACK)` and `ulimit -s` apply only to
+            // newly-spawned threads. Override with
+            // `WLIFT_AOT_STACK_SIZE` (hex bytes) if a target
+            // needs more.
+            .arg("-Wl,-stack_size,0x8000000");
     } else if cfg!(target_os = "linux") {
-        cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+        cmd.arg("-lpthread")
+            .arg("-ldl")
+            .arg("-lm")
+            // Linux honours `RLIMIT_STACK` so a runtime override
+            // works there, but match the macOS default for
+            // parity.
+            .arg("-Wl,-z,stack-size=134217728");
+    }
+    if let Ok(custom) = std::env::var("WLIFT_AOT_STACK_SIZE") {
+        if cfg!(target_os = "macos") {
+            cmd.arg(format!("-Wl,-stack_size,{}", custom));
+        } else if cfg!(target_os = "linux") {
+            cmd.arg(format!("-Wl,-z,stack-size={}", custom));
+        }
     }
 
     let status = cmd.status().map_err(|e| {

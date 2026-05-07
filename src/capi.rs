@@ -1564,6 +1564,51 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     let recv = Value::from_bits(recv_bits);
     let sym_id = crate::intern::SymbolId::from_raw(method_sym as u32);
 
+    // WLIFT_AOT_TRACE_SM=1 — log every cross-fn dispatch's
+    // {entry-kind, exit-kind, receiver-class, method, depth} so
+    // `Yield` propagation breaks become visible. Off the hot
+    // path when unset.
+    let trace = std::env::var_os("WLIFT_AOT_TRACE_SM").is_some();
+    let trace_method_name = if trace {
+        vm_ref.interner.resolve(sym_id).to_string()
+    } else {
+        String::new()
+    };
+    let trace_recv_class = if trace {
+        let cls = vm_ref.class_of(recv);
+        if cls.is_null() {
+            "<no-class>".to_string()
+        } else {
+            let header = cls as *const ObjHeader;
+            if unsafe { (*header).obj_type } == ObjType::Class {
+                let name_sym = unsafe { (*cls).name };
+                vm_ref.interner.resolve(name_sym).to_string()
+            } else {
+                "<not-class>".to_string()
+            }
+        }
+    } else {
+        String::new()
+    };
+    let trace_kind_in = if trace {
+        AOT_SM_POLL_KIND.with(|c| c.get() as u32)
+    } else {
+        0
+    };
+    let trace_depth = if trace {
+        unsafe { (*fiber).aot_active_depth }
+    } else {
+        0
+    };
+    let trace_log_exit = move |arm: &str, kind_out: u32| {
+        if trace {
+            eprintln!(
+                "SM-INVOKE depth={} kind_in={} {}.{} -> {} kind_out={}",
+                trace_depth, trace_kind_in, trace_recv_class, trace_method_name, arm, kind_out
+            );
+        }
+    };
+
     // Closure receiver + `call(...)` method: this is `_fn.call(
     // user_args)` from inside an SM-tainted body. The receiver is
     // the closure itself, the method symbol is one of the `call(_,
@@ -1683,13 +1728,17 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
                     Some(class_ptr),
                 );
                 crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+                let pending = AOT_SM_POLL_KIND.with(|c| c.get() as u32);
                 AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Done));
+                trace_log_exit("native-fallback", pending);
+                let _ = pending;
                 return result;
             }
             None => {
                 // Method not installed at all — surface as null;
                 // the caller's Done branch binds null and the
                 // post-call code continues without crashing.
+                trace_log_exit("method-not-found", AotSmPollKind::Done as u32);
                 return Value::null().to_bits();
             }
         };
@@ -1697,6 +1746,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         // ObjClass for the dispatch to be meaningful.
         let header = class_ptr as *const ObjHeader;
         if unsafe { (*header).obj_type } != ObjType::Class {
+            trace_log_exit("defensive-class-check", AotSmPollKind::None as u32);
             return Value::null().to_bits();
         }
         cp
@@ -1706,6 +1756,20 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         (*fn_obj).fn_id
     };
     let idx = func_id as usize;
+    if trace {
+        let fn_obj = unsafe { (*closure_ptr).function };
+        let arity = unsafe { (*fn_obj).arity };
+        let name_sym = unsafe { (*fn_obj).name };
+        let fn_name = vm_ref.interner.resolve(name_sym).to_string();
+        eprintln!(
+            "SM-DISPATCH depth={} closure=0x{:x} fn_id={} fn_name={:?} arity={}",
+            trace_depth,
+            closure_ptr as usize,
+            idx,
+            fn_name,
+            arity
+        );
+    }
     let is_sm = vm_ref
         .engine
         .aot_state_machine
@@ -1765,7 +1829,10 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         // invariant: the caller's own frame disappears, the next
         // `wlift_aot_sm_load_value` reads from a stale frame, and
         // saved-across-suspension values come back null.
+        let pending_after_call = AOT_SM_POLL_KIND.with(|c| c.get() as u32);
         AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::Done));
+        trace_log_exit("non-sm-closure", pending_after_call);
+        let _ = pending_after_call;
         return result_bits;
     }
     let fn_ptr = vm_ref
@@ -1775,6 +1842,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         .copied()
         .unwrap_or(std::ptr::null());
     if fn_ptr.is_null() {
+        trace_log_exit("sm-no-jit", AotSmPollKind::None as u32);
         return Value::null().to_bits();
     }
     let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
@@ -1815,10 +1883,13 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         ctx.defining_class = std::ptr::null_mut();
     });
     let result = poll(fiber, resume_v);
+    let kind_after_poll = AOT_SM_POLL_KIND.with(|c| c.get() as u32);
     crate::codegen::runtime_fns::set_jit_context(saved_ctx);
     unsafe {
         (*fiber).aot_active_depth = saved_depth;
     }
+    trace_log_exit("sm-poll", kind_after_poll);
+    let _ = kind_after_poll;
     result
 }
 
