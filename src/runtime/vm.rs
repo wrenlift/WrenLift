@@ -907,22 +907,26 @@ impl VM {
             }
         }
 
-        // Install order: every non-entry module first, then the entry.
-        // The entry of a `@hatch:foo` package is often a dispatcher
-        // that does `import "foo_web" for X` (or `_native`); resolving
-        // that import needs the backend module already installed.
-        // `manifest.modules` is sorted alphabetically at build time so
-        // the entry can land mid-list — pulling it to the end here
-        // makes the dispatcher's slot fill on first install instead of
-        // staying null until a (non-existent) backfill pass runs.
+        // Reachability filter: a portable `.hatch` archive bundles
+        // both native and wasm wrappers for cross-target packages
+        // (e.g. `@hatch:gpu`'s `gpu_native` + `gpu_web`). On a host
+        // run the wasm-side wrappers are unreachable from `entry` —
+        // the dispatcher's `#!wasm import "gpu_web"` line was cfg-
+        // stripped at bundle time — and installing them anyway makes
+        // every foreign-class registration in the unreachable module
+        // try to resolve its symbols against the wrong dylib (gpu_web
+        // and gpu_native both bind `wlift_gpu` but with disjoint
+        // symbol sets). Walk the bundled Source sections from `entry`
+        // and only install reachable modules.
         let entry = &hatch.manifest.entry;
+        let reachable = compute_reachable_hatch_modules(entry, hatch);
         let mut install_order: Vec<&String> = hatch
             .manifest
             .modules
             .iter()
-            .filter(|m| *m != entry)
+            .filter(|m| *m != entry && reachable.contains(*m))
             .collect();
-        if hatch.manifest.modules.iter().any(|m| m == entry) {
+        if hatch.manifest.modules.iter().any(|m| m == entry) && reachable.contains(entry) {
             install_order.push(entry);
         }
 
@@ -4775,6 +4779,88 @@ impl Drop for VM {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// BFS from `entry` through every module reachable inside `hatch`'s
+/// Source sections. A `.hatch` archive carries every package module
+/// — including target-only siblings (e.g. `gpu_native` + `gpu_web`)
+/// the package author cfg-gates from a single dispatcher (`gpu.wren`).
+/// On the wrong target the unreachable side's foreign-class
+/// declarations would still try to bind their (alien-target) symbols
+/// against the hosts dylib and fail wholesale; installing only
+/// reachable modules sidesteps that.
+fn compute_reachable_hatch_modules(
+    entry: &str,
+    hatch: &crate::hatch::Hatch,
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut sources: std::collections::HashMap<&str, &[u8]> = std::collections::HashMap::new();
+    for section in &hatch.sections {
+        if matches!(section.kind, crate::hatch::SectionKind::Source) {
+            sources.insert(section.name.as_str(), section.data.as_slice());
+        }
+    }
+
+    let mut reachable: HashSet<String> = HashSet::new();
+    // No Source sections (legacy / Wlbc-only bundle): fall back to
+    // the entire manifest module list so behaviour matches the
+    // pre-filter status quo. This path can't tell which modules are
+    // unreachable, so we'd rather over-install than break.
+    if sources.is_empty() {
+        reachable.extend(hatch.manifest.modules.iter().cloned());
+        return reachable;
+    }
+
+    let mut queue: Vec<String> = vec![entry.to_string()];
+    while let Some(name) = queue.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(bytes) = sources.get(name.as_str()) else {
+            continue;
+        };
+        let Ok(raw) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        // Source sections were cfg-stripped at bundle time; re-apply
+        // for `None` (host) is idempotent on those, and harmless on
+        // the legacy path where they weren't.
+        let stripped = crate::parse::cfg::apply(raw, None);
+        for imp in extract_archive_imports(&stripped) {
+            if sources.contains_key(imp.as_str()) && !reachable.contains(&imp) {
+                queue.push(imp);
+            }
+        }
+    }
+    reachable
+}
+
+/// Pull the literal-string argument out of every `import "..."`
+/// statement in `src`. Wren's idiomatic top-level form keeps each
+/// import on its own line, so a regex-free line scan is enough.
+fn extract_archive_imports(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("import") else {
+            continue;
+        };
+        if !rest
+            .as_bytes()
+            .first()
+            .is_some_and(|b| matches!(b, b' ' | b'\t'))
+        {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        if let Some(end) = rest.find('"') {
+            out.push(rest[..end].to_string());
+        }
+    }
+    out
+}
 
 /// Patch MakeClosure fn_id indices to actual engine FuncIds.
 fn patch_closure_ids(func: &mut crate::mir::MirFunction, closure_func_ids: &[u32]) {

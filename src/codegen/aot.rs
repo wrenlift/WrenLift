@@ -350,6 +350,23 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
         )));
     }
 
+    // Reachability filter: a portable .hatch archive bundles both
+    // native and wasm wrappers for cross-target packages (e.g.
+    // `@hatch:gpu`'s `gpu_native` + `gpu_web`, both with disjoint
+    // foreign-symbol sets binding the same dylib name). On a host
+    // AOT build the wasm-side wrappers are unreachable from `entry`
+    // — `@hatch:gpu`'s `#!wasm import "gpu_web"` line is cfg-stripped
+    // — and compiling them in anyway makes the bootstrap try to
+    // resolve their wasm-only symbols against the native dylib,
+    // which fails on every method. BFS from `entry` through cfg-
+    // stripped imports and only keep modules actually reachable.
+    let entry = hatch.manifest.entry.clone();
+    let reachable = if sources.contains_key(&entry) {
+        compute_reachable_archive_modules(&entry, &sources)
+    } else {
+        HashSet::new()
+    };
+
     // Order: dependency-first via `manifest.modules`, with the
     // archive's `entry` module appearing last so the bootstrap
     // dispatches it last (matches the .wren walker convention).
@@ -357,14 +374,16 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
         .manifest
         .modules
         .iter()
-        .filter(|n| sources.contains_key(*n))
+        .filter(|n| sources.contains_key(*n) && reachable.contains(*n))
         .cloned()
         .collect();
     if order.is_empty() {
-        // Manifest didn't list modules — fall back to alphabetical.
-        order.extend(sources.keys().cloned());
+        // Manifest didn't list modules — fall back to reachable set
+        // in arbitrary order. (Reachable is empty only when entry
+        // itself is missing from sources, in which case the loop
+        // below produces no modules and the caller errors out.)
+        order.extend(reachable.iter().cloned());
     }
-    let entry = hatch.manifest.entry.clone();
     order.retain(|n| n != &entry);
     if sources.contains_key(&entry) {
         order.push(entry);
@@ -389,6 +408,68 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
             native_libs,
         },
     })
+}
+
+/// BFS from `entry` through cfg-stripped imports, returning every
+/// module name reachable inside the archive's source map.
+/// `extract_archive_imports` does the per-line scan (Wren imports
+/// are committed to single-line form, so a regex-free scanner is
+/// enough).
+fn compute_reachable_archive_modules(
+    entry: &str,
+    sources: &std::collections::HashMap<String, &[u8]>,
+) -> HashSet<String> {
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = vec![entry.to_string()];
+    while let Some(name) = queue.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(bytes) = sources.get(&name) else {
+            continue;
+        };
+        let Ok(raw) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let stripped = crate::parse::cfg::apply(raw, None);
+        for imp in extract_archive_imports(&stripped) {
+            if sources.contains_key(&imp) && !reachable.contains(&imp) {
+                queue.push(imp);
+            }
+        }
+    }
+    reachable
+}
+
+/// Pull the literal-string argument out of every `import "..."`
+/// statement in `src`. Wren's idiomatic top-level form keeps each
+/// import on its own line, so a line-by-line scan is enough; the
+/// archive walker doesn't need full parser fidelity here, just the
+/// names to drive the reachability BFS.
+fn extract_archive_imports(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("import") else {
+            continue;
+        };
+        if !rest
+            .as_bytes()
+            .first()
+            .is_some_and(|b| matches!(b, b' ' | b'\t'))
+        {
+            // `imported_thing` / `import_x` — not the keyword.
+            continue;
+        }
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        if let Some(end) = rest.find('"') {
+            out.push(rest[..end].to_string());
+        }
+    }
+    out
 }
 
 /// Test-only re-exports for sibling AOT crates. Real consumers
