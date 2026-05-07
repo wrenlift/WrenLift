@@ -826,6 +826,55 @@ fn aot_build_executable(input: &str, out_path: &str) {
         process::exit(1);
     }
 
+    // Pre-flight the output path so a typo (e.g. `--aot
+    // /bouncing-ball` when `./bouncing-ball` was intended)
+    // surfaces here instead of a cryptic linker error from
+    // clang. Read-only filesystems (macOS root, Linux
+    // overlay roots) and missing parent directories both
+    // produce vague `ld` errors that don't point at the
+    // wlift invocation; checking up front gives a clear
+    // message.
+    let out_path_obj = std::path::Path::new(out_path);
+    if let Some(parent) = out_path_obj.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            eprintln!(
+                "error: --aot output path's parent directory '{}' doesn't exist",
+                parent.display()
+            );
+            process::exit(1);
+        }
+    }
+    // Probe writability by opening the file for create+truncate.
+    // We immediately drop the handle so the linker can use the
+    // path as its `-o` target.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_path)
+    {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "error: --aot output path '{}' is not writable: {}",
+                out_path, e
+            );
+            if out_path.starts_with('/')
+                && std::path::Path::new(out_path)
+                    .parent()
+                    .map(|p| p.as_os_str().is_empty() || p == std::path::Path::new("/"))
+                    .unwrap_or(false)
+            {
+                eprintln!(
+                    "       (the leading '/' makes this an absolute path under \
+                     the root filesystem; if you meant `./{}`, drop the slash)",
+                    out_path.trim_start_matches('/')
+                );
+            }
+            process::exit(1);
+        }
+    }
+
     // Walk imports up front so the same dependency-first list
     // drives both the object emit (one CLIF function per module)
     // and the bootstrap shim (embeds each module's source bytes
