@@ -1912,14 +1912,8 @@ impl VM {
                                     }
                                 }
                                 Err(err) => {
-                                    // Per-method miss isn't fatal — the unbound method just
-                                    // errors at call time. Sibling target-specific wrappers
-                                    // (e.g. gpu_native + gpu_web both binding `wlift_gpu`)
-                                    // routinely produce dozens of misses on the wrong target.
-                                    if trace {
-                                        crate::diagnostics::Diagnostic::warning(err.to_string())
-                                            .eprint_no_source();
-                                    }
+                                    crate::diagnostics::Diagnostic::error(err.to_string())
+                                        .eprint_no_source();
                                 }
                             }
                         }

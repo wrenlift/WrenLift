@@ -963,12 +963,7 @@ pub unsafe extern "C" fn wlift_aot_bind_foreign_class(
             match crate::runtime::foreign::resolve_symbol(&library, lib_str, &symbol_owned) {
                 Ok(r) => r,
                 Err(e) => {
-                    // Per-method miss isn't fatal — the unbound method just errors at
-                    // call time. Sibling target-specific wrappers around one dylib
-                    // (e.g. gpu_native + gpu_web) routinely miss on the wrong target.
-                    if std::env::var_os("WLIFT_TRACE_FOREIGN").is_some() {
-                        vm_ref.report_error(&e.to_string());
-                    }
+                    vm_ref.report_error(&e.to_string());
                     continue;
                 }
             };
@@ -1194,6 +1189,7 @@ thread_local! {
 /// `wlift_aot_invoke_sm_method` 100x slower if we re-check the
 /// env var on every cross-fn call (refresh loops generate
 /// 50K+ dispatches per second).
+#[cfg(feature = "aot")]
 pub(crate) fn aot_trace_sm_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
