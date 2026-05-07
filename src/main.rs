@@ -826,16 +826,41 @@ fn aot_build_executable(input: &str, out_path: &str) {
         process::exit(1);
     }
 
-    // Pre-flight the output path so a typo (e.g. `--aot
-    // /bouncing-ball` when `./bouncing-ball` was intended)
-    // surfaces here instead of a cryptic linker error from
-    // clang. Read-only filesystems (macOS root, Linux
-    // overlay roots) and missing parent directories both
-    // produce vague `ld` errors that don't point at the
-    // wlift invocation; checking up front gives a clear
-    // message.
+    // Resolve the output path. If the user gave us a
+    // directory (e.g. `wlift --aot bouncing-ball foo.hatch`
+    // from a cwd that already has a `bouncing-ball/` next
+    // to the source), default to writing the binary INTO
+    // that directory using the source file's stem as the
+    // filename. Mirrors `cargo build`'s behaviour where
+    // the target dir is implicit and the binary name is
+    // derived from the manifest. Saves the user from
+    // either picking a different name or splatting their
+    // package directory with an executable that shadows
+    // the dir.
     let out_path_obj = std::path::Path::new(out_path);
-    if let Some(parent) = out_path_obj.parent() {
+    let resolved_out: std::path::PathBuf = if out_path_obj.is_dir() {
+        let stem = entry_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "wlift_aot_out".to_string());
+        let resolved = out_path_obj.join(&stem);
+        eprintln!(
+            "wlift: --aot output '{}' is a directory; writing to '{}/{}' (source stem)",
+            out_path, out_path, stem
+        );
+        resolved
+    } else {
+        out_path_obj.to_path_buf()
+    };
+    let resolved_out_str = resolved_out.to_string_lossy().into_owned();
+
+    // Pre-flight the (resolved) output path so a typo
+    // (e.g. `--aot /bouncing-ball` when `./bouncing-ball`
+    // was intended) surfaces here instead of a cryptic
+    // linker error from clang. Read-only filesystems and
+    // missing parent directories both produce vague `ld`
+    // errors that don't point at the wlift invocation.
+    if let Some(parent) = resolved_out.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             eprintln!(
                 "error: --aot output path's parent directory '{}' doesn't exist",
@@ -844,23 +869,21 @@ fn aot_build_executable(input: &str, out_path: &str) {
             process::exit(1);
         }
     }
-    // Probe writability by opening the file for create+truncate.
-    // We immediately drop the handle so the linker can use the
-    // path as its `-o` target.
     match std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(out_path)
+        .open(&resolved_out)
     {
         Ok(_) => {}
         Err(e) => {
             eprintln!(
                 "error: --aot output path '{}' is not writable: {}",
-                out_path, e
+                resolved_out.display(),
+                e
             );
-            if out_path.starts_with('/')
-                && std::path::Path::new(out_path)
+            if resolved_out_str.starts_with('/')
+                && resolved_out
                     .parent()
                     .map(|p| p.as_os_str().is_empty() || p == std::path::Path::new("/"))
                     .unwrap_or(false)
@@ -868,12 +891,13 @@ fn aot_build_executable(input: &str, out_path: &str) {
                 eprintln!(
                     "       (the leading '/' makes this an absolute path under \
                      the root filesystem; if you meant `./{}`, drop the slash)",
-                    out_path.trim_start_matches('/')
+                    resolved_out_str.trim_start_matches('/')
                 );
             }
             process::exit(1);
         }
     }
+    let out_path = resolved_out_str.as_str();
 
     // Walk imports up front so the same dependency-first list
     // drives both the object emit (one CLIF function per module)
