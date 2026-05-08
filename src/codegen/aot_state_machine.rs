@@ -298,6 +298,7 @@ pub fn transform_to_state_machine(
         // split. DirectYield carries just the yield value;
         // CrossFnCall carries the call's metadata so the
         // lowering can emit the push/save/invoke sequence.
+        #[allow(clippy::type_complexity)]
         let (yield_value, direct_yield_result, cross_fn_meta): (
             ValueId,
             Option<ValueId>,

@@ -4279,7 +4279,7 @@ pub extern "C" fn wren_make_closure_8(
 /// first access of the dropped index — exactly what happened to
 /// `Session.cookie`'s 7-upvalue middleware in the web spec.
 #[no_mangle]
-pub extern "C" fn wren_make_closure_n(fn_id: u64, count: u64, upvalues: *const u64) -> u64 {
+pub unsafe extern "C" fn wren_make_closure_n(fn_id: u64, count: u64, upvalues: *const u64) -> u64 {
     if upvalues.is_null() {
         return make_closure_inner(fn_id, &[]);
     }

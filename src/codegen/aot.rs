@@ -1209,7 +1209,7 @@ struct EmittedFnMeta {
     /// list is just empty in that case.
     native_meta: Option<crate::codegen::native_meta::NativeFrameMetadata>,
 }
-
+#[allow(clippy::too_many_arguments)]
 fn emit_aot_function(
     module: &mut ObjectModule,
     interner: &Interner,
@@ -1367,7 +1367,7 @@ pub struct AotClosureManifest {
     /// invokes them via the poll-fn path rather than `wren_call_*`.
     pub is_state_machine: bool,
 }
-
+#[allow(clippy::too_many_arguments)]
 fn emit_aot_module(
     module: &mut ObjectModule,
     aot_mod: &AotModule,

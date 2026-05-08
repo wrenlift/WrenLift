@@ -4189,6 +4189,7 @@ impl VM {
                 }
                 n = args.len() + 1;
             } else {
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..args.len() {
                     jit_args[i] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
                 }

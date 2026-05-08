@@ -1397,6 +1397,7 @@ pub unsafe extern "C" fn wlift_aot_sm_save_arg(
 /// `CrossFnCallResume`. Gated on `WLIFT_AOT_TRACE_SM`; no-op
 /// when unset.
 #[cfg(feature = "aot")]
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn wlift_aot_trace_init_save(
     fiber: *mut crate::runtime::object::ObjFiber,
@@ -1448,6 +1449,7 @@ pub unsafe extern "C" fn wlift_aot_trace_init_save(
 /// pop_frame between the two, or an unintended frame push)
 /// surfaces directly. Gated on `WLIFT_AOT_TRACE_SM`.
 #[cfg(feature = "aot")]
+#[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn wlift_aot_trace_init_load(
     fiber: *mut crate::runtime::object::ObjFiber,
@@ -1614,6 +1616,7 @@ pub unsafe extern "C" fn wlift_aot_sm_set_state(
 /// (used at the dispatcher / outermost layer).
 #[cfg(feature = "aot")]
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn wlift_aot_sm_peek_poll_kind() -> u32 {
     AOT_SM_POLL_KIND.with(|c| c.get() as u32)
 }
@@ -1631,6 +1634,7 @@ pub unsafe extern "C" fn wlift_aot_sm_peek_poll_kind() -> u32 {
 /// with the stale Done in code paths that read kind opportunistically.
 #[cfg(feature = "aot")]
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn wlift_aot_sm_clear_poll_kind() {
     AOT_SM_POLL_KIND.with(|c| c.set(AotSmPollKind::None));
 }

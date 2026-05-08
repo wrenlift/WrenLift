@@ -4595,6 +4595,7 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
 /// chain miss) get the same `Fiber.try` semantics. Without this,
 /// `Fiber.try { B.new().missing() }` aborts the process even
 /// though `Fiber.try { Fiber.abort("nope") }` is caught cleanly.
+#[allow(clippy::missing_safety_doc)]
 pub unsafe fn route_method_error_through_fiber_try(
     vm: &mut VM,
     fiber: *mut ObjFiber,

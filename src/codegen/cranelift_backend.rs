@@ -1278,6 +1278,7 @@ pub mod cl {
     /// - Unbox/Box of params/returns are no-ops
     /// - CallStaticSelf calls the inner function directly with f64 args
     #[allow(clippy::too_many_arguments)] // Lowering context is inherently wide (IC, OSR, f64 inner, AOT mode, ...).
+    #[allow(clippy::blocks_in_conditions)]
     fn lower_mir_impl(
         mir: &MirFunction,
         interner: &Interner,
@@ -1677,10 +1678,9 @@ pub mod cl {
                                 let slot_v = builder.ins().iconst(types::I64, *slot as i64);
                                 let call = builder.ins().call(load_fn, &[fiber, slot_v]);
                                 let v = builder.inst_results(call)[0];
-                                let var = *var_map.entry(*fresh_vid).or_insert_with(|| {
-                                    let v = builder.declare_var(types::I64);
-                                    v
-                                });
+                                let var = *var_map
+                                    .entry(*fresh_vid)
+                                    .or_insert_with(|| builder.declare_var(types::I64));
                                 builder.def_var(var, v);
                                 val_map.insert(*fresh_vid, v);
                                 if mark_stack_map && is_wren_value(*fresh_vid, &value_types) {
@@ -4969,6 +4969,7 @@ pub mod cl {
 
     /// Compute reverse post-order of MIR blocks starting from bb0.
     /// Guarantees dominators are visited before the blocks they dominate.
+    #[allow(dead_code)]
     fn compute_rpo(mir: &MirFunction) -> Vec<usize> {
         let n = mir.blocks.len();
         let mut visited = vec![false; n];
