@@ -522,6 +522,35 @@ unsafe fn list_get(list: &ObjList, i: usize) -> Value {
     unsafe { *list.elements.add(i) }
 }
 
+/// Borrow the raw little-endian byte representation of a typed
+/// numeric array. Returns `None` for any other shape — string,
+/// list, plain object, etc. — leaving the caller free to fall
+/// back to a slower converter.
+///
+/// `expected` constrains the kind: `Float32Array` (`F32`) for
+/// `writeFloats`, `Int32Array` (`I32`) for `writeUints` (caller
+/// reinterprets the i32 lanes as u32 bytes — they're bit-
+/// equivalent in two's-complement little-endian).
+unsafe fn typed_array_bytes_view<'a>(
+    v: Value,
+    expected: wren_lift::runtime::object::TypedArrayKind,
+) -> Option<&'a [u8]> {
+    use wren_lift::runtime::object::{ObjType, ObjTypedArray};
+    if !v.is_object() {
+        return None;
+    }
+    let ptr = v.as_object()?;
+    let header = ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::TypedArray {
+        return None;
+    }
+    let arr = ptr as *const ObjTypedArray;
+    if unsafe { (*arr).kind_tag() } != expected {
+        return None;
+    }
+    Some(unsafe { (*arr).as_bytes() })
+}
+
 /// Decode a List<String> of usage flags into a `wgpu::BufferUsages`
 /// bitmask. Unknown entries surface as a runtime error so typos
 /// don't silently fail at submit time.
@@ -947,24 +976,165 @@ unsafe fn write_buffer_with(
     }
 }
 
+/// Try a typed-array fast path before falling through to a
+/// `List<Num>` walker. The typed-array path skips the
+/// per-element `f64 → f32` conversion the converter does — the
+/// bytes are already in little-endian native form, so we
+/// `queue.write_buffer` them straight. Net effect on a
+/// 1000-sprite frame: pushVertex_ writes 48000 floats per frame,
+/// and the walker did 48000 boxed-Num reads + f32 conversions
+/// per frame on every flush; the typed-array path makes that a
+/// single memcpy.
+unsafe fn write_buffer_typed_or_list(
+    vm: *mut VM,
+    label: &str,
+    expected_kind: wren_lift::runtime::object::TypedArrayKind,
+    converter: fn(f64) -> Vec<u8>,
+    bytes_per_element: usize,
+) {
+    unsafe {
+        // Typed-array fast path.
+        if let Some(bytes) = typed_array_bytes_view(slot(vm, 3), expected_kind) {
+            let buffer_id = match id_of(ctx(vm), slot(vm, 1), label) {
+                Some(i) => i,
+                None => return,
+            };
+            let offset = match slot(vm, 2).as_num() {
+                Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
+                _ => {
+                    ctx(vm).runtime_error(format!(
+                        "{}: offset must be a non-negative integer.",
+                        label
+                    ));
+                    return;
+                }
+            };
+            let buf_reg = buffers().lock().unwrap();
+            let buf = match buf_reg.buffers.get(&buffer_id) {
+                Some(b) => b,
+                None => {
+                    ctx(vm).runtime_error(format!("{}: unknown buffer id.", label));
+                    return;
+                }
+            };
+            let dev_reg = devices().lock().unwrap();
+            let dev = match dev_reg.devices.get(&buf.device_id) {
+                Some(d) => d,
+                None => {
+                    ctx(vm).runtime_error(format!("{}: device dropped before write.", label));
+                    return;
+                }
+            };
+            dev.queue.write_buffer(&buf.buffer, offset, bytes);
+            set_return(vm, Value::null());
+            return;
+        }
+        // Slow path: walk a `List<Num>`.
+        write_buffer_with(vm, label, converter, bytes_per_element);
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut VM) {
     unsafe {
-        write_buffer_with(
+        write_buffer_typed_or_list(
             vm,
             "Buffer.writeFloats",
+            wren_lift::runtime::object::TypedArrayKind::F32,
             |n| (n as f32).to_le_bytes().to_vec(),
             4,
         );
     }
 }
 
+/// Write only the first `count` floats of `data` (a
+/// `Float32Array`) to the buffer. Used by `Renderer2D` and
+/// friends to flush a pre-allocated max-size vertex array
+/// without paying for the unused tail bytes — at 1000 sprites
+/// out of a 4096 cap that's the difference between a 192 KB
+/// `queue.write_buffer` and a 786 KB one.
+///
+/// Slot layout: `(id, offset, data: Float32Array, count: Num)`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_buffer_write_floats_n(vm: *mut VM) {
+    unsafe {
+        let label = "Buffer.writeFloatsN";
+        let buffer_id = match id_of(ctx(vm), slot(vm, 1), label) {
+            Some(i) => i,
+            None => return,
+        };
+        let offset = match slot(vm, 2).as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u64,
+            _ => {
+                ctx(vm).runtime_error(format!("{}: offset must be a non-negative integer.", label));
+                return;
+            }
+        };
+        let bytes = match typed_array_bytes_view(
+            slot(vm, 3),
+            wren_lift::runtime::object::TypedArrayKind::F32,
+        ) {
+            Some(b) => b,
+            None => {
+                ctx(vm).runtime_error(format!("{}: data must be a Float32Array.", label));
+                return;
+            }
+        };
+        let count = match slot(vm, 4).as_num() {
+            Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+            _ => {
+                ctx(vm).runtime_error(format!("{}: count must be a non-negative integer.", label));
+                return;
+            }
+        };
+        let bytes_to_write = count.checked_mul(4).unwrap_or(usize::MAX);
+        if bytes_to_write > bytes.len() {
+            ctx(vm).runtime_error(format!(
+                "{}: count {} exceeds Float32Array length {}.",
+                label,
+                count,
+                bytes.len() / 4
+            ));
+            return;
+        }
+        let buf_reg = buffers().lock().unwrap();
+        let buf = match buf_reg.buffers.get(&buffer_id) {
+            Some(b) => b,
+            None => {
+                ctx(vm).runtime_error(format!("{}: unknown buffer id.", label));
+                return;
+            }
+        };
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&buf.device_id) {
+            Some(d) => d,
+            None => {
+                ctx(vm).runtime_error(format!("{}: device dropped before write.", label));
+                return;
+            }
+        };
+        dev.queue
+            .write_buffer(&buf.buffer, offset, &bytes[..bytes_to_write]);
+        set_return(vm, Value::null());
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut VM) {
     unsafe {
-        write_buffer_with(
+        // `Int32Array` lanes carry the same bit pattern as `u32`
+        // when reinterpreted little-endian — two's-complement
+        // negatives turn into the matching large-u32 patterns,
+        // matching what `n as u32` does for finite non-negative
+        // f64s in the fallback. Negative values via the typed-
+        // array path round-trip as their u32 reinterpretation;
+        // the slow path clamps them to 0 instead. Documented as
+        // a difference in the user-facing wrapper if it ever
+        // bites.
+        write_buffer_typed_or_list(
             vm,
             "Buffer.writeUints",
+            wren_lift::runtime::object::TypedArrayKind::I32,
             |n| {
                 let v = if n.is_finite() && n >= 0.0 {
                     (n as u32).to_le_bytes()
