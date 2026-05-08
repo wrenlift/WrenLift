@@ -1391,6 +1391,10 @@ class MainWlift {
       wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
       wren_jit_slot_for_module_var: wasm.wren_jit_slot_for_module_var,
       wren_get_module_var: wasm.wren_get_module_var,
+      // See `worker.js` for the rationale — JIT'd class
+      // methods import these for `_foo` reads / writes.
+      wren_get_field: wasm.wren_get_field,
+      wren_set_field: wasm.wren_set_field,
       // SIMD intrinsic helpers — see the matching block in
       // `worker.js` for the full rationale. `bitmask` / `allTrue`
       // / `anyTrue` are the only ones the wasm emitter routes

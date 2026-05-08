@@ -317,6 +317,13 @@ __wliftWrenImports = {
   wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
   wren_jit_slot_for_module_var: wasm.wren_jit_slot_for_module_var,
   wren_get_module_var: wasm.wren_get_module_var,
+  // Field accessors for tier-up'd class methods. JIT'd
+  // `Instruction::GetField` / `SetField` lower into these
+  // imports — without them, any function that touches `_foo`
+  // would LinkError at instantiation time, which is why the
+  // mir-helper gate used to reject the instruction wholesale.
+  wren_get_field: wasm.wren_get_field,
+  wren_set_field: wasm.wren_set_field,
   // SIMD intrinsic helpers — only the Simd-exclusive selectors
   // (`bitmask` / `allTrue` / `anyTrue`) are wired into the wasm
   // emitter today. The remaining f32x4 / i32x4 binops + cmps are

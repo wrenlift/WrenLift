@@ -231,17 +231,16 @@ fn mir_needs_unsupported_helpers(
                 | Instruction::ToString(_)
                 | Instruction::SubscriptGet { .. }
                 | Instruction::SubscriptSet { .. }
-                | Instruction::GetField(..)
-                | Instruction::SetField(..)
                 | Instruction::GetStaticField(..)
                 | Instruction::SetStaticField(..)
                 | Instruction::SetModuleVar(..)
                 | Instruction::IsType(..)
                 | Instruction::GuardClass(..) => return true,
-                // GetModuleVar accepted (`wren_get_module_var`
-                // binds it against the user-source module).
-                // SetModuleVar still rejects — no symmetric
-                // helper yet.
+                // GetModuleVar / GetField / SetField accepted —
+                // their `wren_*` helpers are exported by the
+                // cdylib and resolve through the wasm-side
+                // shim. SetModuleVar / GetStaticField /
+                // SetStaticField still reject — no helpers yet.
                 _ => {}
             }
         }
@@ -1090,6 +1089,60 @@ pub fn wren_get_module_var(slot_idx: u64) -> u64 {
         .copied()
         .unwrap_or(Value::null())
         .to_bits()
+}
+
+/// Read field `field_idx` of the receiver instance. The wasm
+/// emitter generates this for every `Instruction::GetField`,
+/// which is what `obj._foo` lowers to inside the class's own
+/// methods. Returns NaN-boxed null on a non-Instance receiver
+/// or out-of-range index — matches the BC interpreter's
+/// fallback rather than aborting, since the JIT'd path is
+/// expected to be hit only after the type-checking front end
+/// already validated the access.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_get_field(recv_bits: u64, field_idx: u64) -> u64 {
+    use wren_lift::runtime::object::{ObjHeader, ObjInstance, ObjType};
+    let v = Value::from_bits(recv_bits);
+    if !v.is_object() {
+        return Value::null().to_bits();
+    }
+    let Some(ptr) = v.as_object() else {
+        return Value::null().to_bits();
+    };
+    let header = ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Instance {
+        return Value::null().to_bits();
+    }
+    let inst = unsafe { &*(ptr as *const ObjInstance) };
+    inst.get_field(field_idx as usize)
+        .unwrap_or(Value::null())
+        .to_bits()
+}
+
+/// Companion to `wren_get_field` — write `val_bits` into field
+/// `field_idx` of the receiver. Returns the written value (so
+/// the wasm emitter can plumb the result of `obj._foo = v`
+/// through the next instruction's local-set without a separate
+/// load), or null on a non-Instance / out-of-range write.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_set_field(recv_bits: u64, field_idx: u64, val_bits: u64) -> u64 {
+    use wren_lift::runtime::object::{ObjHeader, ObjInstance, ObjType};
+    let v = Value::from_bits(recv_bits);
+    if !v.is_object() {
+        return Value::null().to_bits();
+    }
+    let Some(ptr) = v.as_object() else {
+        return Value::null().to_bits();
+    };
+    let header = ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Instance {
+        return Value::null().to_bits();
+    }
+    let inst = unsafe { &mut *(ptr as *mut ObjInstance) };
+    inst.set_field(field_idx as usize, Value::from_bits(val_bits));
+    val_bits
 }
 
 /// Combined helper: load the closure stored in
