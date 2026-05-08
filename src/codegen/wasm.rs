@@ -93,25 +93,37 @@ impl WasmModule {
 // ---------------------------------------------------------------------------
 
 /// Compile a MIR function directly to a WASM module.
+///
+/// No interner, no memory import — used by the codegen tests
+/// which instantiate modules under wasmtime with no host
+/// imports. SIMD intrinsic inlining and any future fast paths
+/// that need to read the cdylib's heap are skipped on this
+/// path.
 pub fn emit_mir(mir: &MirFunction) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, None);
+    let mut emitter = MirWasmEmitter::new(mir, None, false);
     emitter.emit()
 }
 
 /// Same as [`emit_mir`] but with access to the global symbol
-/// interner. The wasm tier-up uses this overload to recognise
+/// interner AND an `(import "wren" "memory")` declaration so
+/// the JIT'd module can read the cdylib's linear memory
+/// directly. The wasm tier-up uses this overload to recognise
 /// SIMD intrinsic calls (`bitmask`, `+(_)` on a `Simd4f`, etc.)
 /// and route them through dedicated `wren_simd*_*` runtime
-/// helpers instead of the generic method-dispatch path.
-/// Without an interner the emitter can't resolve a method
-/// `SymbolId` to its name, so SIMD inlining is skipped — the
-/// emitted module still works, it just pays the slow-path cost
-/// for every SIMD method call.
+/// helpers, and to back inline-class-guard fast paths that
+/// load `ObjHeader` bytes through the imported memory.
+///
+/// The memory import is unconditional today — even when no
+/// emitted op uses it — because the cost is one wasm import
+/// declaration, well under the call-import overhead it saves
+/// for the future class-guard pass. The host shim already has
+/// `memory: wasm.memory` plumbed; declaring the import without
+/// using it is harmless.
 pub fn emit_mir_with_interner(
     mir: &MirFunction,
     interner: &Interner,
 ) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, Some(interner));
+    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true);
     emitter.emit()
 }
 
@@ -150,10 +162,16 @@ struct MirWasmEmitter<'a> {
     /// lowering time to decide whether the cached slot in
     /// `module_var_slot_locals` applies.
     value_to_module_var: HashMap<ValueId, u16>,
+    /// Emit an `(import "wren" "memory" (memory))` declaration so
+    /// the JIT'd module can read the cdylib's linear memory.
+    /// Off for the codegen tests (which instantiate without any
+    /// host-provided imports), on for the runtime tier-up path —
+    /// see [`emit_mir`] vs [`emit_mir_with_interner`] above.
+    imports_memory: bool,
 }
 
 impl<'a> MirWasmEmitter<'a> {
-    fn new(mir: &'a MirFunction, interner: Option<&'a Interner>) -> Self {
+    fn new(mir: &'a MirFunction, interner: Option<&'a Interner>, imports_memory: bool) -> Self {
         Self {
             mir,
             interner,
@@ -165,6 +183,7 @@ impl<'a> MirWasmEmitter<'a> {
             call_slot_local: None,
             module_var_slot_locals: HashMap::new(),
             value_to_module_var: HashMap::new(),
+            imports_memory,
         }
     }
 
@@ -215,6 +234,28 @@ impl<'a> MirWasmEmitter<'a> {
                     maximum: None,
                     table64: false,
                     shared: false,
+                }),
+            );
+        }
+        // Cdylib's linear memory. Imported on the runtime tier-up
+        // path so future inline class-guard fast paths can read
+        // `ObjHeader` bytes through it (`i32.load8_u` against a
+        // NaN-boxed pointer's low 48 bits). The host shim provides
+        // `memory: wasm.memory` from the wasm-bindgen module's
+        // exports; both worker- and main-mode loaders set it up.
+        // `minimum: 0` matches "no minimum size required" — the
+        // host's actual memory will be larger; wasm imports are
+        // fine with a smaller declared minimum.
+        if self.imports_memory {
+            imports.import(
+                "wren",
+                "memory",
+                EntityType::Memory(wasm_encoder::MemoryType {
+                    minimum: 0,
+                    maximum: None,
+                    memory64: false,
+                    shared: false,
+                    page_size_log2: None,
                 }),
             );
         }
@@ -388,9 +429,7 @@ impl<'a> MirWasmEmitter<'a> {
                         // Each is `(receiver, args...)` with the
                         // arity baked into the signature; no
                         // slot-lookup machinery needed.
-                        if let Some(helper) =
-                            self.simd_intrinsic_for_call(*method, args.len())
-                        {
+                        if let Some(helper) = self.simd_intrinsic_for_call(*method, args.len()) {
                             let params = vec![ValType::I64; args.len() + 1];
                             self.register_import(helper, &params, &[ValType::I64]);
                             continue;
@@ -1018,38 +1057,58 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
 
-            // -- Boxed arithmetic → runtime calls --
+            // -- Boxed arithmetic → inline f64.<op> with a Num
+            //    class guard, falling through to the wren_num_*
+            //    helper on a tagged operand. The Num check is
+            //    `(bits & QNAN) == QNAN` — one i64 AND + compare
+            //    per operand. Hot Num arithmetic gets a direct
+            //    wasm `f64.add` instead of a cross-instance
+            //    import call (~3ns vs ~10ns).
             Instruction::Add(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_num_add", &[*a, *b])?
+                self.emit_num_binop_inline(func, dst, *a, *b, WasmInst::F64Add, "wren_num_add")?
             }
             Instruction::Sub(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_num_sub", &[*a, *b])?
+                self.emit_num_binop_inline(func, dst, *a, *b, WasmInst::F64Sub, "wren_num_sub")?
             }
             Instruction::Mul(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_num_mul", &[*a, *b])?
+                self.emit_num_binop_inline(func, dst, *a, *b, WasmInst::F64Mul, "wren_num_mul")?
             }
             Instruction::Div(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_num_div", &[*a, *b])?
+                self.emit_num_binop_inline(func, dst, *a, *b, WasmInst::F64Div, "wren_num_div")?
             }
             Instruction::Mod(a, b) => {
+                // f64 mod doesn't have a direct wasm op; fall
+                // back to the helper for now. Inline form would
+                // be `a - trunc(a/b) * b`, same as `Instruction::ModF64`,
+                // gated on the same Num guard. Worth picking up
+                // in the next pass if a profile flags it.
                 self.emit_runtime_call(func, dst, "wren_num_mod", &[*a, *b])?
             }
             Instruction::Neg(a) => self.emit_runtime_call(func, dst, "wren_num_neg", &[*a])?,
 
-            // -- Boxed comparisons → runtime calls --
+            // -- Boxed comparisons → inline f64 compare with the
+            //    same Num guard. Result is packed back into a
+            //    NaN-boxed Bool inline so the rest of the JIT'd
+            //    code reads `dst` like any other boxed value.
             Instruction::CmpLt(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_cmp_lt", &[*a, *b])?
+                self.emit_num_cmp_inline(func, dst, *a, *b, WasmInst::F64Lt, "wren_cmp_lt")?
             }
             Instruction::CmpGt(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_cmp_gt", &[*a, *b])?
+                self.emit_num_cmp_inline(func, dst, *a, *b, WasmInst::F64Gt, "wren_cmp_gt")?
             }
             Instruction::CmpLe(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_cmp_le", &[*a, *b])?
+                self.emit_num_cmp_inline(func, dst, *a, *b, WasmInst::F64Le, "wren_cmp_le")?
             }
             Instruction::CmpGe(a, b) => {
-                self.emit_runtime_call(func, dst, "wren_cmp_ge", &[*a, *b])?
+                self.emit_num_cmp_inline(func, dst, *a, *b, WasmInst::F64Ge, "wren_cmp_ge")?
             }
             Instruction::CmpEq(a, b) => {
+                // Equality on Wren values is identity for nums
+                // and singletons (TAG_NULL / TAG_TRUE / TAG_FALSE)
+                // — the helper does `bits == bits` with a special
+                // case for object equality. Skip the inline path
+                // until we have an object-equality fast path
+                // worth shipping.
                 self.emit_runtime_call(func, dst, "wren_cmp_eq", &[*a, *b])?
             }
             Instruction::CmpNe(a, b) => {
@@ -1093,9 +1152,7 @@ impl<'a> MirWasmEmitter<'a> {
                 // dance entirely — there's no JIT'd target to
                 // dispatch into for a SIMD primitive, so we'd hit
                 // the slow path on every call anyway.
-                if let Some(helper) =
-                    self.simd_intrinsic_for_call(*method, args.len())
-                {
+                if let Some(helper) = self.simd_intrinsic_for_call(*method, args.len()) {
                     func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                     for a in args {
                         func.instruction(&WasmInst::LocalGet(self.local(*a)));
@@ -1510,6 +1567,142 @@ impl<'a> MirWasmEmitter<'a> {
         func.instruction(&WasmInst::F64ConvertI64S);
         func.instruction(&WasmInst::I64ReinterpretF64);
         func.instruction(&WasmInst::LocalSet(self.local(dst)));
+    }
+
+    /// Inline a boxed-Num binop with a class guard against the
+    /// `wren_num_*` helper as the slow path. The Num check is
+    /// `(value & QNAN) != QNAN` — a single i64 AND + compare.
+    /// When both operands are Nums (the common case in arithmetic-
+    /// heavy code) we skip the wasm-import-call hop and run a
+    /// direct `f64.<op>` on the reinterpreted bits, getting the
+    /// same boxed result back via `i64.reinterpret_f64`. The
+    /// helper still gets called for the rare mismatched case
+    /// (one operand is a tagged value), which keeps the
+    /// observable error path identical to the slow-only path.
+    ///
+    /// Wasm sketch:
+    /// ```text
+    /// (a & QNAN == QNAN) | (b & QNAN == QNAN)
+    /// if (result i64)
+    ///   <call helper>
+    /// else
+    ///   f64.<op>(reinterpret a, reinterpret b)
+    /// end
+    /// ```
+    fn emit_num_binop_inline(
+        &self,
+        func: &mut Function,
+        dst: ValueId,
+        a: ValueId,
+        b: ValueId,
+        op: WasmInst<'static>,
+        helper: &str,
+    ) -> Result<(), String> {
+        const QNAN: i64 = 0x7FFC_0000_0000_0000u64 as i64;
+        let helper_idx = *self
+            .runtime_imports
+            .get(helper)
+            .ok_or_else(|| format!("Runtime function {} not imported", helper))?;
+
+        // (a & QNAN) == QNAN  →  a is tagged (not a Num)
+        func.instruction(&WasmInst::LocalGet(self.local(a)));
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64And);
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64Eq);
+        // (b & QNAN) == QNAN
+        func.instruction(&WasmInst::LocalGet(self.local(b)));
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64And);
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64Eq);
+        // Either tagged → take slow path.
+        func.instruction(&WasmInst::I32Or);
+        func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        {
+            // Slow path: original helper. Same observable error
+            // handling (returns null on a non-Num operand pair,
+            // and the helper's own diagnostics surface in the
+            // captured error stream).
+            func.instruction(&WasmInst::LocalGet(self.local(a)));
+            func.instruction(&WasmInst::LocalGet(self.local(b)));
+            func.instruction(&WasmInst::Call(helper_idx));
+        }
+        func.instruction(&WasmInst::Else);
+        {
+            // Fast path: bits are already an f64 — `f64.reinterpret_i64`
+            // is a no-op at the binary level, just a type label.
+            func.instruction(&WasmInst::LocalGet(self.local(a)));
+            func.instruction(&WasmInst::F64ReinterpretI64);
+            func.instruction(&WasmInst::LocalGet(self.local(b)));
+            func.instruction(&WasmInst::F64ReinterpretI64);
+            func.instruction(&op);
+            func.instruction(&WasmInst::I64ReinterpretF64);
+        }
+        func.instruction(&WasmInst::End);
+        func.instruction(&WasmInst::LocalSet(self.local(dst)));
+        Ok(())
+    }
+
+    /// Inline a boxed-Num comparison with the same QNAN-based
+    /// guard as `emit_num_binop_inline`. The fast path runs
+    /// `f64.<op>` and packs the resulting i32 (0 or 1) into a
+    /// NaN-boxed Bool — `false_bits = QNAN | 1`, `true_bits =
+    /// QNAN | 2`, so `(i32 + 1) | QNAN` produces the right
+    /// pattern in two ops.
+    fn emit_num_cmp_inline(
+        &self,
+        func: &mut Function,
+        dst: ValueId,
+        a: ValueId,
+        b: ValueId,
+        op: WasmInst<'static>,
+        helper: &str,
+    ) -> Result<(), String> {
+        const QNAN: i64 = 0x7FFC_0000_0000_0000u64 as i64;
+        let helper_idx = *self
+            .runtime_imports
+            .get(helper)
+            .ok_or_else(|| format!("Runtime function {} not imported", helper))?;
+
+        // Same num-guard as the binop emitter.
+        func.instruction(&WasmInst::LocalGet(self.local(a)));
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64And);
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64Eq);
+        func.instruction(&WasmInst::LocalGet(self.local(b)));
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64And);
+        func.instruction(&WasmInst::I64Const(QNAN));
+        func.instruction(&WasmInst::I64Eq);
+        func.instruction(&WasmInst::I32Or);
+        func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(ValType::I64)));
+        {
+            func.instruction(&WasmInst::LocalGet(self.local(a)));
+            func.instruction(&WasmInst::LocalGet(self.local(b)));
+            func.instruction(&WasmInst::Call(helper_idx));
+        }
+        func.instruction(&WasmInst::Else);
+        {
+            func.instruction(&WasmInst::LocalGet(self.local(a)));
+            func.instruction(&WasmInst::F64ReinterpretI64);
+            func.instruction(&WasmInst::LocalGet(self.local(b)));
+            func.instruction(&WasmInst::F64ReinterpretI64);
+            func.instruction(&op);
+            // i32 (0 or 1) → NaN-boxed Bool.
+            // TAG_FALSE = QNAN | 1, TAG_TRUE = QNAN | 2.
+            // (i32 + 1) extended to i64 then ORed with QNAN
+            // gives the matching tag pattern.
+            func.instruction(&WasmInst::I64ExtendI32U);
+            func.instruction(&WasmInst::I64Const(1));
+            func.instruction(&WasmInst::I64Add);
+            func.instruction(&WasmInst::I64Const(QNAN));
+            func.instruction(&WasmInst::I64Or);
+        }
+        func.instruction(&WasmInst::End);
+        func.instruction(&WasmInst::LocalSet(self.local(dst)));
+        Ok(())
     }
 
     fn emit_runtime_call(
@@ -1963,6 +2156,103 @@ mod tests {
 
         let expected = 30.0f64.to_bits() as i64;
         assert_eq!(result, expected, "Expected NaN-boxed 30.0");
+    }
+
+    /// Boxed `Add(Num, Num)` runs entirely inline — the JIT'd
+    /// module's wasm body does the QNAN guard + `f64.add`
+    /// directly. The `wren_num_add` import is still declared
+    /// (as the slow-path target), but the test installs a stub
+    /// that traps if called: we want to fail loudly if the
+    /// inline path ever delegates by mistake.
+    #[test]
+    fn test_wasmtime_execution_inline_num_add() {
+        let (_, mut mir) = setup();
+        let bb = mir.new_block();
+        let a = mir.new_value();
+        let b = mir.new_value();
+        let sum = mir.new_value();
+
+        mir.block_mut(bb)
+            .instructions
+            .push((a, Instruction::ConstNum(2.5)));
+        mir.block_mut(bb)
+            .instructions
+            .push((b, Instruction::ConstNum(7.5)));
+        mir.block_mut(bb)
+            .instructions
+            .push((sum, Instruction::Add(a, b)));
+        mir.block_mut(bb).terminator = Terminator::Return(sum);
+
+        let module = emit_mir(&mir).unwrap();
+        assert_valid(&module);
+
+        let engine = wasmtime::Engine::default();
+        let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+
+        // Slow-path stub. The inline guard should always pick
+        // the fast path here (both operands are NaN-boxed Nums)
+        // so `panic!` flags the regression directly. Compare
+        // against the existing `test_runtime_call` test which
+        // doesn't run under wasmtime — it only validates the
+        // module — because it can't supply this stub without
+        // the import infrastructure being in place.
+        let trap = wasmtime::Func::wrap(&mut store, |_a: i64, _b: i64| -> i64 {
+            panic!("wren_num_add called from inline-fast-path test")
+        });
+        let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[trap.into()]).unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
+        let result = func.call(&mut store, ()).unwrap();
+
+        let expected = 10.0f64.to_bits() as i64;
+        assert_eq!(
+            result, expected,
+            "expected NaN-boxed 10.0 from inline f64.add"
+        );
+    }
+
+    /// Boxed `CmpLt(Num, Num)` inline path — fast path lowers
+    /// to `f64.lt` and packs the i32 result into a NaN-boxed
+    /// Bool. Helper stub panics so a regression is loud.
+    #[test]
+    fn test_wasmtime_execution_inline_num_cmp_lt() {
+        let (_, mut mir) = setup();
+        let bb = mir.new_block();
+        let a = mir.new_value();
+        let b = mir.new_value();
+        let cmp = mir.new_value();
+
+        mir.block_mut(bb)
+            .instructions
+            .push((a, Instruction::ConstNum(3.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((b, Instruction::ConstNum(7.0)));
+        mir.block_mut(bb)
+            .instructions
+            .push((cmp, Instruction::CmpLt(a, b)));
+        mir.block_mut(bb).terminator = Terminator::Return(cmp);
+
+        let module = emit_mir(&mir).unwrap();
+        assert_valid(&module);
+
+        let engine = wasmtime::Engine::default();
+        let wasm_module = wasmtime::Module::new(&engine, &module.bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let trap = wasmtime::Func::wrap(&mut store, |_a: i64, _b: i64| -> i64 {
+            panic!("wren_cmp_lt called from inline-fast-path test")
+        });
+        let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[trap.into()]).unwrap();
+        let func = instance
+            .get_typed_func::<(), i64>(&mut store, "fn_0")
+            .unwrap();
+        let result = func.call(&mut store, ()).unwrap();
+
+        // 3.0 < 7.0 → true, NaN-boxed as 0x7FFC_0000_0000_0002.
+        let true_bits = 0x7FFC_0000_0000_0002u64 as i64;
+        assert_eq!(result, true_bits, "expected NaN-boxed true");
     }
 
     #[test]

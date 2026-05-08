@@ -1426,6 +1426,10 @@ class MainWlift {
       wren_simd4i_all_true: wasm.wren_simd4i_all_true,
       wren_simd4i_any_true: wasm.wren_simd4i_any_true,
       __wlift_jit_table: __wliftJitTable,
+      // See `worker.js` for the rationale — JIT'd modules import
+      // the cdylib's linear memory for inline class-guard fast
+      // paths.
+      memory: wasm.memory,
     };
     globalThis._wlift_jit_instantiate = (bytes) => {
       const module = new WebAssembly.Module(bytes);

@@ -353,6 +353,12 @@ __wliftWrenImports = {
   wren_simd4i_all_true: wasm.wren_simd4i_all_true,
   wren_simd4i_any_true: wasm.wren_simd4i_any_true,
   __wlift_jit_table: __wliftJitTable,
+  // Live linear memory of the cdylib. Tier-up'd modules import
+  // this so inline class-guard / field-load fast paths can read
+  // `ObjHeader` bytes off a NaN-boxed pointer without an import-
+  // call hop. The wasm-bindgen `--target web` build always
+  // exposes `memory` on the exports object.
+  memory: wasm.memory,
 };
 // Stash the namespace on the worker's globalThis so the worker-
 // side `_wlift_jit_*` shims and JIT counters can be poked at
