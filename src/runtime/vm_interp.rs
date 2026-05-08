@@ -4924,6 +4924,26 @@ pub fn value_to_string(vm: &VM, value: Value) -> String {
             }
             ObjType::Fn | ObjType::Closure => "Fn".to_string(),
             ObjType::Fiber => "Fiber".to_string(),
+            ObjType::Simd => {
+                use crate::runtime::object::{ObjSimd, SimdKind};
+                let simd = unsafe { &*(ptr as *const ObjSimd) };
+                match simd.kind_tag() {
+                    SimdKind::F32x4 => format!(
+                        "Simd4f({}, {}, {}, {})",
+                        simd.get_f32(0).unwrap_or(0.0),
+                        simd.get_f32(1).unwrap_or(0.0),
+                        simd.get_f32(2).unwrap_or(0.0),
+                        simd.get_f32(3).unwrap_or(0.0),
+                    ),
+                    SimdKind::I32x4 => format!(
+                        "Simd4i({}, {}, {}, {})",
+                        simd.get_i32(0).unwrap_or(0),
+                        simd.get_i32(1).unwrap_or(0),
+                        simd.get_i32(2).unwrap_or(0),
+                        simd.get_i32(3).unwrap_or(0),
+                    ),
+                }
+            }
             // Classes stringify to their own name (`List`, `String`,
             // a user class's declared name, etc.), matching what
             // `Class.toString` returns when dispatched explicitly.

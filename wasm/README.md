@@ -16,7 +16,7 @@ runtime defaults to `ExecutionMode::Interpreter` on wasm.
 ## Browser build
 
 ```sh
-# from the repo root
+# from the repo root — baseline (no v128, runs on every browser)
 wasm-pack build wasm --target web --release --no-typescript
 ```
 
@@ -28,6 +28,41 @@ pkg/
   wlift_wasm_bg.wasm     # ~2.3 MB optimised cdylib
   package.json           # npm-publishable
 ```
+
+### SIMD-enabled build (optional)
+
+The runtime's SIMD kernels (`Simd4f` / `Simd4i` ops) take an explicit
+wasm `simd128` fast path through `core::arch::wasm32::*` — but the
+intrinsics are gated on the build feature, so a default
+`wasm-pack build` produces the scalar-fallback artifact. Build
+the SIMD flavour by setting `RUSTFLAGS` and renaming the output:
+
+```sh
+RUSTFLAGS="-C target-feature=+simd128" \
+  wasm-pack build wasm --target web --release --no-typescript \
+                       --out-name wlift_wasm_bg.simd128
+mv wasm/pkg/wlift_wasm_bg.simd128_bg.wasm \
+   wasm/pkg/wlift_wasm_bg.simd128.wasm
+```
+
+Then ship both `wlift_wasm_bg.wasm` and `wlift_wasm_bg.simd128.wasm`
+side-by-side and let `createWlift` feature-detect at load time:
+
+```js
+import { createWlift } from "./wlift.js";
+
+const wlift = await createWlift({
+  wasm: {
+    url:        new URL("./wlift_wasm_bg.wasm",        import.meta.url),
+    simd128Url: new URL("./wlift_wasm_bg.simd128.wasm", import.meta.url),
+  },
+});
+```
+
+`simd128Supported()` (also exported from `wlift.js`) returns the
+boolean answer if you want to make the choice yourself. Pre-2021
+Safari / older Edge builds without the SIMD proposal fall through
+to the baseline URL.
 
 Then serve `wasm/web/index.html` with any static file server
 that loads ESM modules. Quick option:
@@ -48,10 +83,12 @@ editor to re-run.
 cargo test --test wasm_smoke -- --nocapture
 ```
 
-Builds `smoke.wasm` for `wasm32-wasip1`, runs it via the
-embedded `wasmtime` crate, and asserts the captured stdout
-matches the expected lines (`hello from wasm!`, fib output,
-list ops, monotonic clock probe).
+Builds `smoke.wasm` for `wasm32-wasip1` twice — once with the
+default flags (baseline) and once with `-C target-feature=+simd128`
+— runs each under the embedded `wasmtime` runtime, and asserts
+both produce identical output. The simd128 variant additionally
+asserts wasm v128 opcodes are present (so a regression that
+quietly drops the explicit intrinsic paths can't sneak through).
 
 ## What works today
 

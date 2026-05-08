@@ -96,12 +96,17 @@ jobs:
             echo "CC_wasm32_wasip1=/opt/wasi-sdk-${WASI_SDK_FULL}-x86_64-linux/bin/clang"
           } >> "$GITHUB_ENV"
 
-      - name: Wasm smoke test
-        # Builds `wlift_wasm`'s `smoke` binary for `wasm32-wasip1`,
-        # runs it via the embedded `wasmtime` crate, and asserts
-        # the captured Wren output. Catches the kind of wasm
-        # regression `cargo clippy` doesn't see (panicking
-        # `Instant::now`, missing trampolines, runtime UB). Same
+      - name: Wasm smoke test (baseline + simd128)
+        # The smoke test internally builds the wasi smoke binary
+        # twice — once with the default flags (the baseline build
+        # that runs on every browser) and once with
+        # `RUSTFLAGS=-C target-feature=+simd128` (the SIMD build
+        # for modern browsers). Both are run under the embedded
+        # `wasmtime` runtime; the simd128 leg additionally walks
+        # the wasm code section and asserts v128 opcodes are
+        # actually present, so a regression that quietly drops
+        # `simd_kernels.rs`'s explicit `core::arch::wasm32` paths
+        # back to the scalar fallback can't sneak through. Same
         # macOS-clang constraint as the wasm clippy step above.
         if: runner.os == 'Linux'
         run: cargo test --release --test wasm_smoke -- --nocapture

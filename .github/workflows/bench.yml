@@ -212,11 +212,33 @@ jobs:
         # the upstream curl-bash installer in CI.
         run: cargo install wasm-pack --locked
 
-      - name: Build the wasm playground
+      - name: Build the wasm playground (baseline)
         # `--no-typescript` matches `wasm/README.md` — the
         # playground's JS imports the .js shim directly, no .d.ts
         # consumers in the deploy.
         run: wasm-pack build wasm --target web --release --no-typescript
+
+      - name: Build the wasm playground (simd128)
+        # Second pass with `+simd128` enabled so modern browsers
+        # can pick up the wasm-SIMD fast path in `simd_kernels.rs`.
+        # Out-dir is parallel to the baseline so both .wasm files
+        # land in `wasm/pkg-simd128/` ready to be staged side-by-
+        # side. wasm-pack rebuilds from a clean target dir under
+        # `--out-dir`, so the cargo cache from the baseline pass
+        # doesn't leak un-flagged objects into the SIMD output.
+        env:
+          RUSTFLAGS: "-C target-feature=+simd128"
+        run: |
+          wasm-pack build wasm --target web --release --no-typescript \
+                                --out-dir pkg-simd128
+          # wasm-pack's `--out-name` defaults to the crate name; the
+          # SIMD build keeps the same name so the JS wrapper inside
+          # `pkg-simd128/wlift_wasm.js` references its own `_bg.wasm`.
+          # We only ship the renamed wasm next to the baseline
+          # wrapper — the SIMD-flavour JS wrapper stays inside
+          # `pkg-simd128/` and isn't deployed.
+          cp wasm/pkg-simd128/wlift_wasm_bg.wasm \
+             wasm/pkg/wlift_wasm_bg.simd128.wasm
 
       - name: Stage playground into site/
         # Layout the playground expects: `playground/web/` +
@@ -244,16 +266,22 @@ jobs:
           # resolves cleanly from a single origin.
           mkdir -p site/playground/web
           cp -R wasm/web/. site/playground/web/
-          cp wasm/pkg/wlift_wasm.js wasm/pkg/wlift_wasm_bg.wasm \
-            site/playground/web/
+          cp wasm/pkg/wlift_wasm.js \
+             wasm/pkg/wlift_wasm_bg.wasm \
+             wasm/pkg/wlift_wasm_bg.simd128.wasm \
+             site/playground/web/
 
           # Public distribution endpoint. `wrenlift.com/dist/wlift.js`
           # is the canonical CDN URL embedders import; we stage
-          # the same three files here (no playground UI clutter)
-          # so the import URL doesn't leak the playground path.
+          # both `.wasm` flavours (baseline + simd128) plus the JS
+          # wrapper here so a single ESM import on the consumer
+          # side picks up either build via `simd128Supported()`.
+          # No playground UI clutter — keep the dist/ tree clean.
           mkdir -p site/dist
           cp wasm/web/wlift.js wasm/web/gpu-bridge.js wasm/web/worker.js \
-            wasm/pkg/wlift_wasm.js wasm/pkg/wlift_wasm_bg.wasm \
+            wasm/pkg/wlift_wasm.js \
+            wasm/pkg/wlift_wasm_bg.wasm \
+            wasm/pkg/wlift_wasm_bg.simd128.wasm \
             site/dist/
 
           # Per-package docs JSON for every wrenlift/hatch package.

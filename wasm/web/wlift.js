@@ -61,10 +61,65 @@ import { createGpuBridge } from "./gpu-bridge.js";
 // `shared: true` flag falls through to plain worker mode.
 
 export async function createWlift(opts = {}) {
-  const { mode = "worker", shared = false } = opts;
-  if (mode === "worker") return new WorkerWlift({ shared }).init();
-  if (mode === "main")   return new MainWlift().init();
+  const { mode = "worker", shared = false, wasm } = opts;
+  const wasmUrl = pickWasmUrl(wasm);
+  if (mode === "worker") return new WorkerWlift({ shared, wasmUrl }).init();
+  if (mode === "main")   return new MainWlift({ wasmUrl }).init();
   throw new Error(`createWlift: unknown mode '${mode}', expected 'worker' or 'main'`);
+}
+
+// Pick which `wlift_wasm_bg.*.wasm` the loader hands wasm-bindgen.
+// Three input shapes are accepted on `opts.wasm`:
+//
+//   undefined       — let wasm-bindgen resolve the default URL next
+//                     to `wlift_wasm.js`. Same behaviour as before.
+//   string | URL    — use this URL verbatim (no feature detection).
+//   { url, simd128Url } — embedder ships two builds; pick the SIMD
+//                     one when the host validates a v128 module,
+//                     otherwise fall back to `url`. Either field is
+//                     optional; missing fields fall through to the
+//                     wasm-bindgen default.
+//
+// Returning `undefined` means "use the default" so we don't break
+// deployments that haven't shipped a second build.
+function pickWasmUrl(wasm) {
+  if (wasm === undefined || wasm === null) return undefined;
+  if (typeof wasm === "string" || wasm instanceof URL) return wasm;
+  if (typeof wasm === "object") {
+    const { url, simd128Url } = wasm;
+    if (simd128Url && simd128Supported()) return simd128Url;
+    return url;
+  }
+  return undefined;
+}
+
+// Feature-detect wasm SIMD (the v128 spec). Resolves to `true` when
+// the host can instantiate a tiny module that uses `i32x4.splat`.
+// Older Safari and any browser that hasn't shipped the SIMD proposal
+// rejects it; the embedder uses this to pick between the baseline
+// `wlift_wasm_bg.wasm` build (no v128 ops, runs everywhere) and an
+// optional `wlift_wasm_bg.simd128.wasm` build (compiled with
+// `RUSTFLAGS=-C target-feature=+simd128`, faster on modern browsers).
+//
+// Minimal `()->()` module whose body does `i32.const 0`,
+// `i32x4.splat`, `drop`, `end`. The single v128-producing op makes
+// `WebAssembly.validate` return false on hosts that don't support
+// the SIMD proposal. Same probe shape `wasm-feature-detect` ships.
+const _SIMD_PROBE = new Uint8Array([
+  0,97,115,109, 1,0,0,0,                    // \0asm v1
+  1,4,1,96,0,0,                             // type: ()->()
+  3,2,1,0,                                  // func: of type 0
+  10,9,1,7,0, 65,0, 253,15, 26, 11,         // code: i32.const 0; i32x4.splat; drop; end
+]);
+let _simdSupported = null;
+export function simd128Supported() {
+  if (_simdSupported !== null) return _simdSupported;
+  try {
+    _simdSupported = WebAssembly.validate(_SIMD_PROBE);
+  } catch (_) {
+    _simdSupported = false;
+  }
+  return _simdSupported;
 }
 
 // DOM `MouseEvent.button` is a numeric index (0/1/2 → left/middle/
@@ -521,7 +576,7 @@ export async function runProject(wlift, source, hatchfileText, opts = {}) {
 // ---------------------------------------------------------------------------
 
 class WorkerWlift {
-  constructor({ shared = false } = {}) {
+  constructor({ shared = false, wasmUrl } = {}) {
     this.mode    = "worker";
     this.version = null;
     // SAB requires both crossOriginIsolated AND a SAB-aware
@@ -532,7 +587,16 @@ class WorkerWlift {
     // can't cross worker → page, so the request is a no-op.
     this._sharedRequested = shared && sharedMemorySupported();
     this._memory = null;
-    this.worker  = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    // Worker top-level `await init()` runs before any `postMessage`
+    // can land, so a SIMD-flavoured wasm URL has to ride on the
+    // worker URL itself as a search param. The worker reads it back
+    // before passing the URL into wasm-bindgen's `default()`.
+    const workerUrl = new URL("./worker.js", import.meta.url);
+    if (wasmUrl !== undefined) {
+      const asString = wasmUrl instanceof URL ? wasmUrl.href : String(wasmUrl);
+      workerUrl.searchParams.set("wasmUrl", asString);
+    }
+    this.worker  = new Worker(workerUrl, { type: "module" });
     this.pending = new Map();
     this.nextId  = 1;
     this._ready  = new Promise((resolve) => { this._resolveReady = resolve; });
@@ -773,11 +837,12 @@ class WorkerWlift {
 // ---------------------------------------------------------------------------
 
 class MainWlift {
-  constructor() {
+  constructor({ wasmUrl } = {}) {
     this.mode    = "main";
     this.version = null;
     this._mod    = null;
     this._memory = null;
+    this._wasmUrl = wasmUrl;
   }
 
   async init() {
@@ -900,7 +965,9 @@ class MainWlift {
     // from the default `init()`. `exports.memory` is the live
     // `WebAssembly.Memory` instance — that's what main-mode
     // callers want for direct buffer access.
-    const wasm = await mod.default();
+    const wasm = this._wasmUrl
+      ? await mod.default(this._wasmUrl)
+      : await mod.default();
     this._mod    = mod;
     this._memory = wasm.memory;
     this.version = mod.version();

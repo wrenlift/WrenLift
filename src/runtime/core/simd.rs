@@ -1,8 +1,13 @@
 //! Built-in Simd / Simd4f / Simd4i classes.
 //!
 //! Storage lives in `ObjSimd`, a fixed-width inline 16-byte payload whose
-//! interpretation is selected by `SimdKind`.
+//! interpretation is selected by `SimdKind`. The arithmetic / comparison
+//! kernels route through `simd_kernels`, which prefers a 128-bit vector
+//! ISA when one is available (wasm `simd128`, x86 `sse2`, aarch64 `neon`)
+//! and falls back to a scalar loop otherwise — same observable result on
+//! every target.
 
+use crate::runtime::core::simd_kernels as k;
 use crate::runtime::object::{
     NativeContext, ObjHeader, ObjSimd, ObjType, ObjTypedArray, SimdKind, TypedArrayKind,
 };
@@ -413,250 +418,186 @@ fn simd4f_binary(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     label: &str,
-    op: impl Fn(f32, f32) -> f32,
+    kernel: fn([u32; 4], [u32; 4]) -> [u32; 4],
 ) -> Value {
-    let left = receiver_simd(args);
+    let left = receiver_simd(args).lanes;
     let Some(right) = simd_arg(ctx, args[1], SimdKind::F32x4, label) else {
         return Value::null();
     };
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        let a = left.get_f32(i).unwrap_or(0.0);
-        let b = unsafe { (*right).get_f32(i).unwrap_or(0.0) };
-        *slot = op(a, b).to_bits();
-    }
-    make_simd(ctx, SimdKind::F32x4, lanes)
+    let right = unsafe { (*right).lanes };
+    make_simd(ctx, SimdKind::F32x4, kernel(left, right))
 }
 
 fn simd4i_binary(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     label: &str,
-    op: impl Fn(i32, i32) -> i32,
+    kernel: fn([u32; 4], [u32; 4]) -> [u32; 4],
 ) -> Value {
-    let left = receiver_simd(args);
+    let left = receiver_simd(args).lanes;
     let Some(right) = simd_arg(ctx, args[1], SimdKind::I32x4, label) else {
         return Value::null();
     };
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        let a = left.get_i32(i).unwrap_or(0);
-        let b = unsafe { (*right).get_i32(i).unwrap_or(0) };
-        *slot = op(a, b) as u32;
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    let right = unsafe { (*right).lanes };
+    make_simd(ctx, SimdKind::I32x4, kernel(left, right))
 }
 
 fn simd4f_compare(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     label: &str,
-    op: impl Fn(f32, f32) -> bool,
+    kernel: fn([u32; 4], [u32; 4]) -> [u32; 4],
 ) -> Value {
-    let left = receiver_simd(args);
+    let left = receiver_simd(args).lanes;
     let Some(right) = simd_arg(ctx, args[1], SimdKind::F32x4, label) else {
         return Value::null();
     };
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        let a = left.get_f32(i).unwrap_or(0.0);
-        let b = unsafe { (*right).get_f32(i).unwrap_or(0.0) };
-        *slot = if op(a, b) { u32::MAX } else { 0 };
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    let right = unsafe { (*right).lanes };
+    make_simd(ctx, SimdKind::I32x4, kernel(left, right))
 }
 
 fn simd4i_compare(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     label: &str,
-    op: impl Fn(i32, i32) -> bool,
+    kernel: fn([u32; 4], [u32; 4]) -> [u32; 4],
 ) -> Value {
-    let left = receiver_simd(args);
+    let left = receiver_simd(args).lanes;
     let Some(right) = simd_arg(ctx, args[1], SimdKind::I32x4, label) else {
         return Value::null();
     };
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        let a = left.get_i32(i).unwrap_or(0);
-        let b = unsafe { (*right).get_i32(i).unwrap_or(0) };
-        *slot = if op(a, b) { u32::MAX } else { 0 };
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    let right = unsafe { (*right).lanes };
+    make_simd(ctx, SimdKind::I32x4, kernel(left, right))
 }
 
 fn simd4f_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_binary(ctx, args, "Simd4f.+", |a, b| a + b)
+    simd4f_binary(ctx, args, "Simd4f.+", k::f32x4_add)
 }
 fn simd4f_sub(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_binary(ctx, args, "Simd4f.-", |a, b| a - b)
+    simd4f_binary(ctx, args, "Simd4f.-", k::f32x4_sub)
 }
 fn simd4f_mul(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_binary(ctx, args, "Simd4f.*", |a, b| a * b)
+    simd4f_binary(ctx, args, "Simd4f.*", k::f32x4_mul)
 }
 fn simd4f_div(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_binary(ctx, args, "Simd4f./", |a, b| a / b)
+    simd4f_binary(ctx, args, "Simd4f./", k::f32x4_div)
 }
 fn simd4f_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_binary(ctx, args, "Simd4f.min", |a, b| a.min(b))
+    simd4f_binary(ctx, args, "Simd4f.min", k::f32x4_min)
 }
 fn simd4f_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_binary(ctx, args, "Simd4f.max", |a, b| a.max(b))
+    simd4f_binary(ctx, args, "Simd4f.max", k::f32x4_max)
 }
 fn simd4f_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = (-simd.get_f32(i).unwrap_or(0.0)).to_bits();
-    }
-    make_simd(ctx, SimdKind::F32x4, lanes)
+    let lanes = receiver_simd(args).lanes;
+    make_simd(ctx, SimdKind::F32x4, k::f32x4_neg(lanes))
 }
 fn simd4f_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = simd.get_f32(i).unwrap_or(0.0).abs().to_bits();
-    }
-    make_simd(ctx, SimdKind::F32x4, lanes)
+    let lanes = receiver_simd(args).lanes;
+    make_simd(ctx, SimdKind::F32x4, k::f32x4_abs(lanes))
 }
 fn simd4f_sqrt(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = simd.get_f32(i).unwrap_or(0.0).sqrt().to_bits();
-    }
-    make_simd(ctx, SimdKind::F32x4, lanes)
+    let lanes = receiver_simd(args).lanes;
+    make_simd(ctx, SimdKind::F32x4, k::f32x4_sqrt(lanes))
 }
 fn simd4f_eq(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_compare(ctx, args, "Simd4f.==", |a, b| a == b)
+    simd4f_compare(ctx, args, "Simd4f.==", k::f32x4_eq)
 }
 fn simd4f_ne(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_compare(ctx, args, "Simd4f.!=", |a, b| a != b)
+    simd4f_compare(ctx, args, "Simd4f.!=", k::f32x4_ne)
 }
 fn simd4f_lt(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_compare(ctx, args, "Simd4f.<", |a, b| a < b)
+    simd4f_compare(ctx, args, "Simd4f.<", k::f32x4_lt)
 }
 fn simd4f_le(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_compare(ctx, args, "Simd4f.<=", |a, b| a <= b)
+    simd4f_compare(ctx, args, "Simd4f.<=", k::f32x4_le)
 }
 fn simd4f_gt(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_compare(ctx, args, "Simd4f.>", |a, b| a > b)
+    simd4f_compare(ctx, args, "Simd4f.>", k::f32x4_gt)
 }
 fn simd4f_ge(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4f_compare(ctx, args, "Simd4f.>=", |a, b| a >= b)
+    simd4f_compare(ctx, args, "Simd4f.>=", k::f32x4_ge)
 }
 
 fn simd4i_add(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.+", i32::wrapping_add)
+    simd4i_binary(ctx, args, "Simd4i.+", k::i32x4_add)
 }
 fn simd4i_sub(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.-", i32::wrapping_sub)
+    simd4i_binary(ctx, args, "Simd4i.-", k::i32x4_sub)
 }
 fn simd4i_mul(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.*", i32::wrapping_mul)
+    simd4i_binary(ctx, args, "Simd4i.*", k::i32x4_mul)
 }
 fn simd4i_and(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.&", |a, b| a & b)
+    simd4i_binary(ctx, args, "Simd4i.&", k::i32x4_and)
 }
 fn simd4i_or(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.|", |a, b| a | b)
+    simd4i_binary(ctx, args, "Simd4i.|", k::i32x4_or)
 }
 fn simd4i_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.^", |a, b| a ^ b)
+    simd4i_binary(ctx, args, "Simd4i.^", k::i32x4_xor)
 }
 fn simd4i_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.min", |a, b| a.min(b))
+    simd4i_binary(ctx, args, "Simd4i.min", k::i32x4_min)
 }
 fn simd4i_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_binary(ctx, args, "Simd4i.max", |a, b| a.max(b))
+    simd4i_binary(ctx, args, "Simd4i.max", k::i32x4_max)
 }
 fn simd4i_neg(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = simd.get_i32(i).unwrap_or(0).wrapping_neg() as u32;
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    let lanes = receiver_simd(args).lanes;
+    make_simd(ctx, SimdKind::I32x4, k::i32x4_neg(lanes))
 }
 fn simd4i_not(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = !simd.lane_bits(i).unwrap_or(0);
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    let lanes = receiver_simd(args).lanes;
+    make_simd(ctx, SimdKind::I32x4, k::i32x4_not(lanes))
 }
 fn simd4i_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = simd.get_i32(i).unwrap_or(0).wrapping_abs() as u32;
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    let lanes = receiver_simd(args).lanes;
+    make_simd(ctx, SimdKind::I32x4, k::i32x4_abs(lanes))
 }
 fn simd4i_shl(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
+    let lanes = receiver_simd(args).lanes;
     let Some(shift) = i32_arg(ctx, args[1], "Simd4i.<<") else {
         return Value::null();
     };
-    let shift = (shift as u32) & 31;
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = simd.get_i32(i).unwrap_or(0).wrapping_shl(shift) as u32;
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    make_simd(ctx, SimdKind::I32x4, k::i32x4_shl(lanes, shift as u32))
 }
 fn simd4i_shr(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
+    let lanes = receiver_simd(args).lanes;
     let Some(shift) = i32_arg(ctx, args[1], "Simd4i.>>") else {
         return Value::null();
     };
-    let shift = (shift as u32) & 31;
-    let mut lanes = [0u32; 4];
-    for (i, slot) in lanes.iter_mut().enumerate() {
-        *slot = (simd.get_i32(i).unwrap_or(0) >> shift) as u32;
-    }
-    make_simd(ctx, SimdKind::I32x4, lanes)
+    make_simd(ctx, SimdKind::I32x4, k::i32x4_shr(lanes, shift as u32))
 }
 fn simd4i_eq(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_compare(ctx, args, "Simd4i.==", |a, b| a == b)
+    simd4i_compare(ctx, args, "Simd4i.==", k::i32x4_eq)
 }
 fn simd4i_ne(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_compare(ctx, args, "Simd4i.!=", |a, b| a != b)
+    simd4i_compare(ctx, args, "Simd4i.!=", k::i32x4_ne)
 }
 fn simd4i_lt(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_compare(ctx, args, "Simd4i.<", |a, b| a < b)
+    simd4i_compare(ctx, args, "Simd4i.<", k::i32x4_lt)
 }
 fn simd4i_le(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_compare(ctx, args, "Simd4i.<=", |a, b| a <= b)
+    simd4i_compare(ctx, args, "Simd4i.<=", k::i32x4_le)
 }
 fn simd4i_gt(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_compare(ctx, args, "Simd4i.>", |a, b| a > b)
+    simd4i_compare(ctx, args, "Simd4i.>", k::i32x4_gt)
 }
 fn simd4i_ge(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    simd4i_compare(ctx, args, "Simd4i.>=", |a, b| a >= b)
+    simd4i_compare(ctx, args, "Simd4i.>=", k::i32x4_ge)
 }
 
 fn simd4i_all_true(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    Value::bool((0..4).all(|i| simd.get_i32(i).unwrap_or(0) != 0))
+    Value::bool(k::i32x4_all_true(receiver_simd(args).lanes))
 }
 
 fn simd4i_any_true(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    Value::bool((0..4).any(|i| simd.get_i32(i).unwrap_or(0) != 0))
+    Value::bool(k::i32x4_any_true(receiver_simd(args).lanes))
 }
 
 fn simd4i_bitmask(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let simd = receiver_simd(args);
-    let mut mask = 0u32;
-    for lane in 0..4 {
-        let bits = simd.lane_bits(lane).unwrap_or(0);
-        if (bits & 0x8000_0000) != 0 {
-            mask |= 1 << lane;
-        }
-    }
-    Value::num(mask as f64)
+    Value::num(k::i32x4_bitmask(receiver_simd(args).lanes) as f64)
 }
 
 pub fn bind(vm: &mut VM) {

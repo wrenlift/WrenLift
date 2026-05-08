@@ -24,6 +24,7 @@ mod system;
 pub mod time;
 pub mod toml;
 mod simd;
+mod simd_kernels;
 mod typed_array;
 pub mod uuid;
 

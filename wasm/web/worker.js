@@ -263,7 +263,20 @@ globalThis._wlift_jit_reset = () => {
 // marshaling on every call, which the JIT'd code pays per
 // cross-module call. With ~22k recursive calls in fib(20) that
 // adds up; raw exports are direct wasm-to-wasm.
-const wasm = await init();
+//
+// `wasmUrl` search param: `WorkerWlift` writes a custom wasm URL
+// into the worker's own URL when the embedder picks a SIMD
+// (or any other) flavoured build via `createWlift({wasm: …})`.
+// We pass it straight through to wasm-bindgen's `default()`.
+// Absent param ⇒ wasm-bindgen falls back to its co-located default.
+const _wasmUrlParam = (() => {
+  try {
+    return new URL(self.location.href).searchParams.get("wasmUrl") || undefined;
+  } catch (_) {
+    return undefined;
+  }
+})();
+const wasm = _wasmUrlParam ? await init(_wasmUrlParam) : await init();
 __wliftWrenImports = {
   wren_num_add:   wasm.wren_num_add,
   wren_num_sub:   wasm.wren_num_sub,
