@@ -382,21 +382,109 @@ pub fn jit_emit_from_source(source: &str) -> Vec<u8> {
 // Implementations match Wren's core arithmetic / comparison:
 // type-check operands, fall back to `null` on mismatch.
 
-fn binop_num<F: Fn(f64, f64) -> f64>(a: u64, b: u64, op: F) -> u64 {
+fn binop_num<F: Fn(f64, f64) -> f64>(a: u64, b: u64, sig: &str, op: F) -> u64 {
     let av = Value::from_bits(a);
-    let bv = Value::from_bits(b);
-    match (av.as_num(), bv.as_num()) {
-        (Some(an), Some(bn)) => Value::num(op(an, bn)).to_bits(),
-        _ => Value::null().to_bits(),
+    if let Some(an) = av.as_num() {
+        if let Some(bn) = Value::from_bits(b).as_num() {
+            return Value::num(op(an, bn)).to_bits();
+        }
+    }
+    // Type mismatch — try SIMD specializations, then fall back
+    // to full method dispatch. Mirrors the host's
+    // `wren_arith_dispatch` so observable behaviour matches the
+    // BC interpreter for any non-Num receiver.
+    if let Some(result) = try_simd_arith_fast_path(a, b, sig) {
+        return result;
+    }
+    method_dispatch_fallback(a, sig, &[Value::from_bits(b)])
+}
+
+fn cmp_num<F: Fn(f64, f64) -> bool>(a: u64, b: u64, sig: &str, op: F) -> u64 {
+    let av = Value::from_bits(a);
+    if let Some(an) = av.as_num() {
+        if let Some(bn) = Value::from_bits(b).as_num() {
+            return Value::bool(op(an, bn)).to_bits();
+        }
+    }
+    if let Some(result) = try_simd_arith_fast_path(a, b, sig) {
+        return result;
+    }
+    method_dispatch_fallback(a, sig, &[Value::from_bits(b)])
+}
+
+/// Try a `Simd4f` / `Simd4i`-specialized fast path for an
+/// arithmetic / comparison helper. Cranelift native inlines the
+/// equivalent guard + kernel call directly into JIT'd machine
+/// code; on wasm we route through the helper instead because
+/// the JIT'd module reaches the runtime via wasm imports — but
+/// matching here once still skips the cost of
+/// `interner.lookup → find_method_with_class → dispatch_method`,
+/// which is the next-biggest line item after the f64 fast path.
+///
+/// Returns `None` on a non-Simd receiver so the caller can fall
+/// through to full method dispatch.
+fn try_simd_arith_fast_path(a: u64, b: u64, sig: &str) -> Option<u64> {
+    use wren_lift::runtime::object::{ObjHeader, ObjSimd, ObjType, SimdKind};
+    let av = Value::from_bits(a);
+    if !av.is_object() {
+        return None;
+    }
+    let ptr = av.as_object()?;
+    if ptr.is_null() {
+        return None;
+    }
+    let header = ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Simd {
+        return None;
+    }
+    let kind = unsafe { (*(ptr as *const ObjSimd)).kind_tag() };
+    match (kind, sig) {
+        // f32x4 binops
+        (SimdKind::F32x4, "+(_)") => Some(wren_simd4f_add(a, b)),
+        (SimdKind::F32x4, "-(_)") => Some(wren_simd4f_sub(a, b)),
+        (SimdKind::F32x4, "*(_)") => Some(wren_simd4f_mul(a, b)),
+        (SimdKind::F32x4, "/(_)") => Some(wren_simd4f_div(a, b)),
+        // f32x4 comparisons (return Simd4i lane masks)
+        (SimdKind::F32x4, "==(_)") => Some(wren_simd4f_eq(a, b)),
+        (SimdKind::F32x4, "!=(_)") => Some(wren_simd4f_ne(a, b)),
+        (SimdKind::F32x4, "<(_)") => Some(wren_simd4f_lt(a, b)),
+        (SimdKind::F32x4, "<=(_)") => Some(wren_simd4f_le(a, b)),
+        (SimdKind::F32x4, ">(_)") => Some(wren_simd4f_gt(a, b)),
+        (SimdKind::F32x4, ">=(_)") => Some(wren_simd4f_ge(a, b)),
+        // i32x4 binops + bitwise
+        (SimdKind::I32x4, "+(_)") => Some(wren_simd4i_add(a, b)),
+        (SimdKind::I32x4, "-(_)") => Some(wren_simd4i_sub(a, b)),
+        (SimdKind::I32x4, "*(_)") => Some(wren_simd4i_mul(a, b)),
+        (SimdKind::I32x4, "&(_)") => Some(wren_simd4i_and(a, b)),
+        (SimdKind::I32x4, "|(_)") => Some(wren_simd4i_or(a, b)),
+        (SimdKind::I32x4, "^(_)") => Some(wren_simd4i_xor(a, b)),
+        // i32x4 comparisons
+        (SimdKind::I32x4, "==(_)") => Some(wren_simd4i_eq(a, b)),
+        (SimdKind::I32x4, "!=(_)") => Some(wren_simd4i_ne(a, b)),
+        (SimdKind::I32x4, "<(_)") => Some(wren_simd4i_lt(a, b)),
+        (SimdKind::I32x4, "<=(_)") => Some(wren_simd4i_le(a, b)),
+        (SimdKind::I32x4, ">(_)") => Some(wren_simd4i_gt(a, b)),
+        (SimdKind::I32x4, ">=(_)") => Some(wren_simd4i_ge(a, b)),
+        _ => None,
     }
 }
 
-fn cmp_num<F: Fn(f64, f64) -> bool>(a: u64, b: u64, op: F) -> u64 {
-    let av = Value::from_bits(a);
-    let bv = Value::from_bits(b);
-    match (av.as_num(), bv.as_num()) {
-        (Some(an), Some(bn)) => Value::bool(op(an, bn)).to_bits(),
-        _ => Value::null().to_bits(),
+/// Full method dispatch through the live VM. `sig` is the Wren
+/// selector ("+(_)" / "<(_)" / etc.); we hand it straight to
+/// `call_method_on`, which handles class lookup, method-table
+/// walk, and result boxing. Returns NaN-boxed null when no VM
+/// is in scope (defensive — the JIT'd code only runs inside
+/// `vm.interpret`, but a stray top-level call shouldn't panic).
+fn method_dispatch_fallback(recv_bits: u64, sig: &str, args: &[Value]) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    use wren_lift::runtime::object::NativeContext;
+    match vm.call_method_on(Value::from_bits(recv_bits), sig, args) {
+        Some(v) => v.to_bits(),
+        None => Value::null().to_bits(),
     }
 }
 
@@ -443,48 +531,49 @@ pub fn wren_jit_roots_restore_len(len: u32) {
 
 #[wasm_bindgen]
 pub fn wren_num_add(a: u64, b: u64) -> u64 {
-    binop_num(a, b, |x, y| x + y)
+    binop_num(a, b, "+(_)", |x, y| x + y)
 }
 #[wasm_bindgen]
 pub fn wren_num_sub(a: u64, b: u64) -> u64 {
-    binop_num(a, b, |x, y| x - y)
+    binop_num(a, b, "-(_)", |x, y| x - y)
 }
 #[wasm_bindgen]
 pub fn wren_num_mul(a: u64, b: u64) -> u64 {
-    binop_num(a, b, |x, y| x * y)
+    binop_num(a, b, "*(_)", |x, y| x * y)
 }
 #[wasm_bindgen]
 pub fn wren_num_div(a: u64, b: u64) -> u64 {
-    binop_num(a, b, |x, y| x / y)
+    binop_num(a, b, "/(_)", |x, y| x / y)
 }
 #[wasm_bindgen]
 pub fn wren_num_mod(a: u64, b: u64) -> u64 {
-    binop_num(a, b, |x, y| x % y)
+    binop_num(a, b, "%(_)", |x, y| x % y)
 }
 #[wasm_bindgen]
 pub fn wren_num_neg(a: u64) -> u64 {
     let av = Value::from_bits(a);
-    match av.as_num() {
-        Some(n) => Value::num(-n).to_bits(),
-        None => Value::null().to_bits(),
+    if let Some(n) = av.as_num() {
+        return Value::num(-n).to_bits();
     }
+    // Non-Num: dispatch as the prefix `-` method on the receiver.
+    method_dispatch_fallback(a, "-", &[])
 }
 
 #[wasm_bindgen]
 pub fn wren_cmp_lt(a: u64, b: u64) -> u64 {
-    cmp_num(a, b, |x, y| x < y)
+    cmp_num(a, b, "<(_)", |x, y| x < y)
 }
 #[wasm_bindgen]
 pub fn wren_cmp_gt(a: u64, b: u64) -> u64 {
-    cmp_num(a, b, |x, y| x > y)
+    cmp_num(a, b, ">(_)", |x, y| x > y)
 }
 #[wasm_bindgen]
 pub fn wren_cmp_le(a: u64, b: u64) -> u64 {
-    cmp_num(a, b, |x, y| x <= y)
+    cmp_num(a, b, "<=(_)", |x, y| x <= y)
 }
 #[wasm_bindgen]
 pub fn wren_cmp_ge(a: u64, b: u64) -> u64 {
-    cmp_num(a, b, |x, y| x >= y)
+    cmp_num(a, b, ">=(_)", |x, y| x >= y)
 }
 
 #[wasm_bindgen]
