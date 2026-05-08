@@ -120,7 +120,7 @@ fn build_smoke(simd128: bool) -> Vec<u8> {
 /// on `0xFD` bytes that show up inside LEB128 encodings, immediates,
 /// data segments, etc.
 fn count_simd_opcodes(bytes: &[u8]) -> usize {
-    use wasmparser::{Operator, Parser, Payload};
+    use wasmparser::{Parser, Payload};
     let mut count = 0usize;
     for payload in Parser::new(0).parse_all(bytes) {
         let payload = payload.expect("wasmparser walks smoke.wasm");

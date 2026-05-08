@@ -118,8 +118,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
         | ObjType::Range
         | ObjType::Foreign
         | ObjType::TypedArray
-        | ObjType::Simd => {
-        }
+        | ObjType::Simd => {}
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);

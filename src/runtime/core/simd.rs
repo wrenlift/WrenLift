@@ -114,7 +114,11 @@ fn lane_index_arg(
             return None;
         }
     };
-    let lane = if allow_negative && raw < 0 { raw + 4 } else { raw };
+    let lane = if allow_negative && raw < 0 {
+        raw + 4
+    } else {
+        raw
+    };
     if !(0..4).contains(&lane) {
         ctx.runtime_error(format!("{}: index {} out of bounds.", label, raw));
         return None;

@@ -3057,7 +3057,12 @@ System.print(Int32Array.fromList([9, 8, 7, 6]).toString)
         vm.output_buffer = Some(String::new());
         let result = vm.interpret("main", source);
         let output = vm.take_output();
-        assert!(matches!(result, InterpretResult::Success), "{:?}\n{}", result, output);
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}\n{}",
+            result,
+            output
+        );
         assert_eq!(
             output.trim_end(),
             "4\n16\n[7, -2, 123, 0]\nInt32Array(4)",
@@ -3100,7 +3105,12 @@ System.print(Simd4i.new(-1, 0, 1065353216, 1073741824).reinterpretAsFloat[2])
         vm.output_buffer = Some(String::new());
         let result = vm.interpret("main", source);
         let output = vm.take_output();
-        assert!(matches!(result, InterpretResult::Success), "{:?}\n{}", result, output);
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}\n{}",
+            result,
+            output
+        );
         assert_eq!(
             output.trim_end(),
             "2\n5\n[12, 13, 14, 15, 5, 6]\n14\ntrue\nfalse\n[3, 9, 7, 9]\nSimd4f(9, 7, 9, 3)\n14\n1",
@@ -3139,7 +3149,12 @@ System.print(sum)
             ..Default::default()
         },
     );
-    assert!(matches!(result, InterpretResult::Success), "{:?}\n{}", result, output);
+    assert!(
+        matches!(result, InterpretResult::Success),
+        "{:?}\n{}",
+        result,
+        output
+    );
     assert_eq!(output.trim_end(), "400040000");
 }
 

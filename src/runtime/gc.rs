@@ -1213,8 +1213,7 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
         | ObjType::Range
         | ObjType::Foreign
         | ObjType::TypedArray
-        | ObjType::Simd => {
-        }
+        | ObjType::Simd => {}
 
         ObjType::List => {
             let list = &*(header as *mut ObjList);
@@ -1386,8 +1385,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
         | ObjType::Range
         | ObjType::Foreign
         | ObjType::TypedArray
-        | ObjType::Simd => {
-        }
+        | ObjType::Simd => {}
 
         ObjType::List => {
             let list = &mut *(header as *mut ObjList);

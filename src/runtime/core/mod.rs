@@ -19,12 +19,12 @@ pub mod random;
 mod range;
 pub mod regex;
 mod sequence;
+mod simd;
+mod simd_kernels;
 mod string;
 mod system;
 pub mod time;
 pub mod toml;
-mod simd;
-mod simd_kernels;
 mod typed_array;
 pub mod uuid;
 

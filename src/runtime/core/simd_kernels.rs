@@ -38,9 +38,7 @@ pub fn f32x4_add(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
         let bv = simd_isa::v128_load(b.as_ptr().cast());
         store_v128(simd_isa::f32x4_add(av, bv))
     }
-    #[cfg(not(any(
-        all(target_arch = "wasm32", target_feature = "simd128"),
-    )))]
+    #[cfg(not(any(all(target_arch = "wasm32", target_feature = "simd128"),)))]
     {
         scalar_f32_binop(a, b, |x, y| x + y)
     }
@@ -653,7 +651,12 @@ mod tests {
     use super::*;
 
     fn f32_lanes(a: [f32; 4]) -> [u32; 4] {
-        [a[0].to_bits(), a[1].to_bits(), a[2].to_bits(), a[3].to_bits()]
+        [
+            a[0].to_bits(),
+            a[1].to_bits(),
+            a[2].to_bits(),
+            a[3].to_bits(),
+        ]
     }
     fn from_f32_lanes(a: [u32; 4]) -> [f32; 4] {
         [

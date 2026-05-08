@@ -86,12 +86,10 @@ pub mod cl {
 
         let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
         let obj_ptr = builder.ins().band(boxed, ptr_mask);
-        let obj_type = builder.ins().uload8(
-            types::I64,
-            MemFlags::trusted(),
-            obj_ptr,
-            HEADER_OBJ_TYPE,
-        );
+        let obj_type =
+            builder
+                .ins()
+                .uload8(types::I64, MemFlags::trusted(), obj_ptr, HEADER_OBJ_TYPE);
         let expected = builder.ins().iconst(types::I64, expected_obj_type as i64);
         let type_ok = builder.ins().icmp(IntCC::Equal, obj_type, expected);
         let ok_block = builder.create_block();
@@ -109,12 +107,9 @@ pub mod cl {
     ) -> Value {
         let obj_ptr =
             emit_guarded_obj_ptr_with_type(builder, boxed, OBJ_TYPE_SIMD as i32, miss_block);
-        let kind = builder.ins().uload8(
-            types::I64,
-            MemFlags::trusted(),
-            obj_ptr,
-            SIMD_KIND,
-        );
+        let kind = builder
+            .ins()
+            .uload8(types::I64, MemFlags::trusted(), obj_ptr, SIMD_KIND);
         let expected = builder.ins().iconst(types::I64, expected_kind as i64);
         let kind_ok = builder.ins().icmp(IntCC::Equal, kind, expected);
         let ok_block = builder.create_block();
@@ -145,6 +140,7 @@ pub mod cl {
         builder.ins().bitcast(types::I64, MemFlags::new(), num)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_method_call_slow<G>(
         interner: &Interner,
         builder: &mut FunctionBuilder,
@@ -158,11 +154,11 @@ pub mod cl {
     ) -> Result<Value, String>
     where
         G: FnMut(
-            &mut dyn Module,
-            &mut FunctionBuilder,
-            &str,
-            usize,
-        ) -> Result<cranelift_codegen::ir::FuncRef, String>
+                &mut dyn Module,
+                &mut FunctionBuilder,
+                &str,
+                usize,
+            ) -> Result<cranelift_codegen::ir::FuncRef, String>
             + ?Sized,
     {
         let method_val = if let Some(cfg) = aot_config {
@@ -206,11 +202,11 @@ pub mod cl {
     ) -> Result<Value, String>
     where
         G: FnMut(
-            &mut dyn Module,
-            &mut FunctionBuilder,
-            &str,
-            usize,
-        ) -> Result<cranelift_codegen::ir::FuncRef, String>
+                &mut dyn Module,
+                &mut FunctionBuilder,
+                &str,
+                usize,
+            ) -> Result<cranelift_codegen::ir::FuncRef, String>
             + ?Sized,
     {
         let lane_ty = builder.func.dfg.value_type(vector).lane_type();
@@ -237,6 +233,7 @@ pub mod cl {
         Ok(builder.inst_results(call)[0])
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_lower_simd_intrinsic_call<G>(
         interner: &Interner,
         builder: &mut FunctionBuilder,
@@ -250,11 +247,11 @@ pub mod cl {
     ) -> Result<Option<Value>, String>
     where
         G: FnMut(
-            &mut dyn Module,
-            &mut FunctionBuilder,
-            &str,
-            usize,
-        ) -> Result<cranelift_codegen::ir::FuncRef, String>
+                &mut dyn Module,
+                &mut FunctionBuilder,
+                &str,
+                usize,
+            ) -> Result<cranelift_codegen::ir::FuncRef, String>
             + ?Sized,
     {
         let method_sig = interner.resolve(method);
@@ -293,18 +290,11 @@ pub mod cl {
         let merge_block = builder.create_block();
         builder.append_block_param(merge_block, types::I64);
 
-        let recv_obj = emit_guarded_obj_ptr_with_type(
-            builder,
-            receiver,
-            OBJ_TYPE_SIMD as i32,
-            slow_block,
-        );
-        let recv_kind = builder.ins().uload8(
-            types::I64,
-            MemFlags::trusted(),
-            recv_obj,
-            SIMD_KIND,
-        );
+        let recv_obj =
+            emit_guarded_obj_ptr_with_type(builder, receiver, OBJ_TYPE_SIMD as i32, slow_block);
+        let recv_kind = builder
+            .ins()
+            .uload8(types::I64, MemFlags::trusted(), recv_obj, SIMD_KIND);
         let f32_kind = builder.ins().iconst(types::I64, SIMD_KIND_F32X4 as i64);
         let i32_kind = builder.ins().iconst(types::I64, SIMD_KIND_I32X4 as i64);
 
@@ -319,9 +309,10 @@ pub mod cl {
                     .brif(is_f32, f32_block, &[], i32_check_block, &[]);
 
                 builder.switch_to_block(f32_block);
-                let lhs = builder
-                    .ins()
-                    .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
+                let lhs =
+                    builder
+                        .ins()
+                        .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let rhs = emit_guarded_simd_vector(
                     builder,
                     args[0],
@@ -330,20 +321,24 @@ pub mod cl {
                     slow_block,
                 );
                 let out = $f32_emit(builder, lhs, rhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4f", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4f",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
 
                 builder.switch_to_block(i32_check_block);
                 let is_i32 = builder.ins().icmp(IntCC::Equal, recv_kind, i32_kind);
                 builder.ins().brif(is_i32, i32_block, &[], slow_block, &[]);
 
                 builder.switch_to_block(i32_block);
-                let lhs = builder
-                    .ins()
-                    .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
+                let lhs =
+                    builder
+                        .ins()
+                        .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let rhs = emit_guarded_simd_vector(
                     builder,
                     args[0],
@@ -352,11 +347,14 @@ pub mod cl {
                     slow_block,
                 );
                 let out = $i32_emit(builder, lhs, rhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }};
         }
 
@@ -371,9 +369,10 @@ pub mod cl {
                     .brif(is_f32, f32_block, &[], i32_check_block, &[]);
 
                 builder.switch_to_block(f32_block);
-                let lhs = builder
-                    .ins()
-                    .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
+                let lhs =
+                    builder
+                        .ins()
+                        .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let rhs = emit_guarded_simd_vector(
                     builder,
                     args[0],
@@ -383,20 +382,24 @@ pub mod cl {
                 );
                 let out = $f32_emit(builder, lhs, rhs);
                 let out = bitcast_vector_if_needed(builder, out, types::I32X4);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
 
                 builder.switch_to_block(i32_check_block);
                 let is_i32 = builder.ins().icmp(IntCC::Equal, recv_kind, i32_kind);
                 builder.ins().brif(is_i32, i32_block, &[], slow_block, &[]);
 
                 builder.switch_to_block(i32_block);
-                let lhs = builder
-                    .ins()
-                    .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
+                let lhs =
+                    builder
+                        .ins()
+                        .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let rhs = emit_guarded_simd_vector(
                     builder,
                     args[0],
@@ -406,11 +409,14 @@ pub mod cl {
                 );
                 let out = $i32_emit(builder, lhs, rhs);
                 let out = bitcast_vector_if_needed(builder, out, types::I32X4);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }};
         }
 
@@ -425,30 +431,38 @@ pub mod cl {
                     .brif(is_f32, f32_block, &[], i32_check_block, &[]);
 
                 builder.switch_to_block(f32_block);
-                let lhs = builder
-                    .ins()
-                    .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
+                let lhs =
+                    builder
+                        .ins()
+                        .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let out = $f32_emit(builder, lhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4f", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4f",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
 
                 builder.switch_to_block(i32_check_block);
                 let is_i32 = builder.ins().icmp(IntCC::Equal, recv_kind, i32_kind);
                 builder.ins().brif(is_i32, i32_block, &[], slow_block, &[]);
 
                 builder.switch_to_block(i32_block);
-                let lhs = builder
-                    .ins()
-                    .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
+                let lhs =
+                    builder
+                        .ins()
+                        .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let out = $i32_emit(builder, lhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }};
         }
 
@@ -482,11 +496,14 @@ pub mod cl {
                     slow_block,
                 );
                 let out = builder.ins().fdiv(lhs, rhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4f", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4f",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("min(_)", 1) => dual_same_kind_binary!(
                 |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fmin(lhs, rhs),
@@ -497,28 +514,76 @@ pub mod cl {
                 |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().smax(lhs, rhs)
             ),
             ("==(_)", 1) => dual_compare!(
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(FloatCC::Equal, lhs, rhs),
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(IntCC::Equal, lhs, rhs)
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(
+                    FloatCC::Equal,
+                    lhs,
+                    rhs
+                ),
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(
+                    IntCC::Equal,
+                    lhs,
+                    rhs
+                )
             ),
             ("!=(_)", 1) => dual_compare!(
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(FloatCC::NotEqual, lhs, rhs),
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(IntCC::NotEqual, lhs, rhs)
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(
+                    FloatCC::NotEqual,
+                    lhs,
+                    rhs
+                ),
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(
+                    IntCC::NotEqual,
+                    lhs,
+                    rhs
+                )
             ),
             ("<(_)", 1) => dual_compare!(
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(FloatCC::LessThan, lhs, rhs),
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs)
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(
+                    FloatCC::LessThan,
+                    lhs,
+                    rhs
+                ),
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(
+                    IntCC::SignedLessThan,
+                    lhs,
+                    rhs
+                )
             ),
             ("<=(_)", 1) => dual_compare!(
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(FloatCC::LessThanOrEqual, lhs, rhs),
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, rhs)
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(
+                    FloatCC::LessThanOrEqual,
+                    lhs,
+                    rhs
+                ),
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(
+                    IntCC::SignedLessThanOrEqual,
+                    lhs,
+                    rhs
+                )
             ),
             (">(_)", 1) => dual_compare!(
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(FloatCC::GreaterThan, lhs, rhs),
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(IntCC::SignedGreaterThan, lhs, rhs)
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(
+                    FloatCC::GreaterThan,
+                    lhs,
+                    rhs
+                ),
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(
+                    IntCC::SignedGreaterThan,
+                    lhs,
+                    rhs
+                )
             ),
             (">=(_)", 1) => dual_compare!(
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(FloatCC::GreaterThanOrEqual, lhs, rhs),
-                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs, rhs)
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().fcmp(
+                    FloatCC::GreaterThanOrEqual,
+                    lhs,
+                    rhs
+                ),
+                |builder: &mut FunctionBuilder, lhs, rhs| builder.ins().icmp(
+                    IntCC::SignedGreaterThanOrEqual,
+                    lhs,
+                    rhs
+                )
             ),
             ("-", 0) => dual_same_kind_unary!(
                 |builder: &mut FunctionBuilder, lhs| builder.ins().fneg(lhs),
@@ -538,11 +603,14 @@ pub mod cl {
                         .ins()
                         .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let out = builder.ins().sqrt(lhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4f", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4f",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("reinterpretAsInt", 0) => {
                 let f32_block = builder.create_block();
@@ -553,11 +621,14 @@ pub mod cl {
                     builder
                         .ins()
                         .load(types::F32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", lhs)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    lhs,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("reinterpretAsFloat", 0) => {
                 let i32_block = builder.create_block();
@@ -568,11 +639,14 @@ pub mod cl {
                     builder
                         .ins()
                         .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4f", lhs)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4f",
+                    lhs,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("&(_)", 1) => {
                 let i32_block = builder.create_block();
@@ -591,11 +665,14 @@ pub mod cl {
                     slow_block,
                 );
                 let out = builder.ins().band(lhs, rhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("|(_)", 1) => {
                 let i32_block = builder.create_block();
@@ -614,11 +691,14 @@ pub mod cl {
                     slow_block,
                 );
                 let out = builder.ins().bor(lhs, rhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("^(_)", 1) => {
                 let i32_block = builder.create_block();
@@ -637,11 +717,14 @@ pub mod cl {
                     slow_block,
                 );
                 let out = builder.ins().bxor(lhs, rhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("~", 0) => {
                 let i32_block = builder.create_block();
@@ -653,11 +736,14 @@ pub mod cl {
                         .ins()
                         .load(types::I32X4, MemFlags::trusted(), recv_obj, SIMD_LANES);
                 let out = builder.ins().bnot(lhs);
-                let result =
-                    emit_alloc_simd_vector(builder, module, get_runtime_fn, "wren_alloc_simd4i", out)?;
-                builder
-                    .ins()
-                    .jump(merge_block, &[BlockArg::Value(result)]);
+                let result = emit_alloc_simd_vector(
+                    builder,
+                    module,
+                    get_runtime_fn,
+                    "wren_alloc_simd4i",
+                    out,
+                )?;
+                builder.ins().jump(merge_block, &[BlockArg::Value(result)]);
             }
             ("allTrue", 0) => {
                 let i32_block = builder.create_block();
@@ -4997,7 +5083,9 @@ pub mod cl {
                 builder.switch_to_block(type_miss_block);
                 let simd_tag = builder.ins().iconst(types::I64, OBJ_TYPE_SIMD as i64);
                 let is_simd = builder.ins().icmp(IntCC::Equal, obj_type_byte, simd_tag);
-                builder.ins().brif(is_simd, simd_block, &[], slow_block, &[]);
+                builder
+                    .ins()
+                    .brif(is_simd, simd_block, &[], slow_block, &[]);
 
                 // 3. TypedArray fast path: convert NaN-boxed Num
                 //    index to i64, bounds-check against element
@@ -5118,41 +5206,48 @@ pub mod cl {
                 let simd_idx_i = builder.ins().fcvt_to_sint(types::I64, simd_idx_f);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let four_lanes = builder.ins().iconst(types::I64, 4);
-                let simd_in_range_low = builder
-                    .ins()
-                    .icmp(IntCC::SignedGreaterThanOrEqual, simd_idx_i, zero);
+                let simd_in_range_low =
+                    builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, simd_idx_i, zero);
                 let simd_in_range_high =
-                    builder.ins().icmp(IntCC::SignedLessThan, simd_idx_i, four_lanes);
+                    builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, simd_idx_i, four_lanes);
                 let simd_in_range = builder.ins().band(simd_in_range_low, simd_in_range_high);
                 builder
                     .ins()
                     .brif(simd_in_range, simd_in_bounds_block, &[], slow_block, &[]);
 
                 builder.switch_to_block(simd_in_bounds_block);
-                let simd_kind = builder.ins().uload8(
-                    types::I64,
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    SIMD_KIND,
-                );
+                let simd_kind =
+                    builder
+                        .ins()
+                        .uload8(types::I64, MemFlags::trusted(), obj_ptr, SIMD_KIND);
                 let simd_f32_const = builder.ins().iconst(types::I64, SIMD_KIND_F32X4 as i64);
                 let simd_is_f32 = builder.ins().icmp(IntCC::Equal, simd_kind, simd_f32_const);
-                builder
-                    .ins()
-                    .brif(simd_is_f32, simd_get_f32_block, &[], simd_get_i32_block, &[]);
+                builder.ins().brif(
+                    simd_is_f32,
+                    simd_get_f32_block,
+                    &[],
+                    simd_get_i32_block,
+                    &[],
+                );
 
                 builder.switch_to_block(simd_get_f32_block);
                 let simd_data_base = builder.ins().iadd_imm(obj_ptr, SIMD_LANES as i64);
                 let four_simd_f32 = builder.ins().iconst(types::I64, 4);
                 let simd_f32_offset = builder.ins().imul(simd_idx_i, four_simd_f32);
                 let simd_f32_addr = builder.ins().iadd(simd_data_base, simd_f32_offset);
-                let simd_f32_val = builder
-                    .ins()
-                    .load(types::F32, MemFlags::trusted(), simd_f32_addr, 0);
+                let simd_f32_val =
+                    builder
+                        .ins()
+                        .load(types::F32, MemFlags::trusted(), simd_f32_addr, 0);
                 let simd_f32_as_f64 = builder.ins().fpromote(types::F64, simd_f32_val);
-                let simd_f32_bits = builder
-                    .ins()
-                    .bitcast(types::I64, MemFlags::new(), simd_f32_as_f64);
+                let simd_f32_bits =
+                    builder
+                        .ins()
+                        .bitcast(types::I64, MemFlags::new(), simd_f32_as_f64);
                 builder
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(simd_f32_bits)]);
@@ -5162,14 +5257,16 @@ pub mod cl {
                 let four_simd_i32 = builder.ins().iconst(types::I64, 4);
                 let simd_i32_offset = builder.ins().imul(simd_idx_i, four_simd_i32);
                 let simd_i32_addr = builder.ins().iadd(simd_data_base, simd_i32_offset);
-                let simd_i32_val = builder
-                    .ins()
-                    .load(types::I32, MemFlags::trusted(), simd_i32_addr, 0);
+                let simd_i32_val =
+                    builder
+                        .ins()
+                        .load(types::I32, MemFlags::trusted(), simd_i32_addr, 0);
                 let simd_i32_as_i64 = builder.ins().sextend(types::I64, simd_i32_val);
                 let simd_i32_as_f64 = builder.ins().fcvt_from_sint(types::F64, simd_i32_as_i64);
-                let simd_i32_bits = builder
-                    .ins()
-                    .bitcast(types::I64, MemFlags::new(), simd_i32_as_f64);
+                let simd_i32_bits =
+                    builder
+                        .ins()
+                        .bitcast(types::I64, MemFlags::new(), simd_i32_as_f64);
                 builder
                     .ins()
                     .jump(merge_block, &[BlockArg::Value(simd_i32_bits)]);

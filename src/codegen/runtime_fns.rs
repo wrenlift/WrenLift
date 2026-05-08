@@ -4487,12 +4487,12 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                     }
                     let i = i as usize;
                     let v = match unsafe { (*simd).kind_tag() } {
-                        crate::runtime::object::SimdKind::F32x4 => {
-                            unsafe { (*simd).get_f32(i).unwrap_or(0.0) as f64 }
-                        }
-                        crate::runtime::object::SimdKind::I32x4 => {
-                            unsafe { (*simd).get_i32(i).unwrap_or(0) as f64 }
-                        }
+                        crate::runtime::object::SimdKind::F32x4 => unsafe {
+                            (*simd).get_f32(i).unwrap_or(0.0) as f64
+                        },
+                        crate::runtime::object::SimdKind::I32x4 => unsafe {
+                            (*simd).get_i32(i).unwrap_or(0) as f64
+                        },
                     };
                     return Value::num(v).to_bits();
                 }
@@ -4577,9 +4577,7 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                                 }
                             }
                             TypedArrayKind::I32 => {
-                                if v.fract() == 0.0
-                                    && v >= i32::MIN as f64
-                                    && v <= i32::MAX as f64
+                                if v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64
                                 {
                                     unsafe { (*arr).set_i32(i, v as i32) };
                                 }
