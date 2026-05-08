@@ -1,6 +1,6 @@
 [package]
 name = "wlift_gpu"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 description = "GPU plugin for the WrenLift runtime — wgpu-backed primitives bundled into @hatch:gpu."
 
