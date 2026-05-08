@@ -488,8 +488,8 @@ pub(crate) mod tests_helpers {
         closure_idx: usize,
     ) -> (crate::mir::MirFunction, crate::intern::Interner) {
         let mut layouts: HashMap<String, Vec<String>> = HashMap::new();
-        let m = build_aot_module_from_source("main", src.as_bytes(), &mut layouts)
-            .expect("front end");
+        let m =
+            build_aot_module_from_source("main", src.as_bytes(), &mut layouts).expect("front end");
         let closure = m
             .mir
             .closures
@@ -591,8 +591,8 @@ fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
     // deps never gets a chance to walk into a sibling
     // `packages/hatch-<pkg>` directory — leaving every imported
     // class as a null modvar at runtime.
-    let canonical_entry = std::fs::canonicalize(entry_path)
-        .unwrap_or_else(|_| entry_path.to_path_buf());
+    let canonical_entry =
+        std::fs::canonicalize(entry_path).unwrap_or_else(|_| entry_path.to_path_buf());
     let entry_dir = canonical_entry
         .parent()
         .unwrap_or(Path::new("."))
@@ -663,9 +663,8 @@ fn build_scoped_resolver(entry_path: &Path) -> ScopedResolver {
                     // entry, and every `Reader` / `Writer` use
                     // would read null at runtime.
                     _ => {
-                        let sibling_name = name
-                            .strip_prefix("@hatch:")
-                            .map(|s| format!("hatch-{}", s));
+                        let sibling_name =
+                            name.strip_prefix("@hatch:").map(|s| format!("hatch-{}", s));
                         if let Some(dir) = sibling_name {
                             // workspace = the package dir (parent of
                             // the current `hatchfile`). Try common
@@ -1003,13 +1002,7 @@ pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String
     let total: usize = modules
         .iter()
         .map(|m| {
-            1 + m
-                .mir
-                .classes
-                .iter()
-                .map(|c| c.methods.len())
-                .sum::<usize>()
-                + m.mir.closures.len()
+            1 + m.mir.classes.iter().map(|c| c.methods.len()).sum::<usize>() + m.mir.closures.len()
         })
         .sum();
     let bound = total.saturating_add(1);
@@ -1039,11 +1032,8 @@ pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String
                     if tainted.contains(&name) {
                         continue;
                     }
-                    if mir_calls_any_tainted_named_method(
-                        &method.mir,
-                        &aot_mod.interner,
-                        &tainted,
-                    ) {
+                    if mir_calls_any_tainted_named_method(&method.mir, &aot_mod.interner, &tainted)
+                    {
                         tainted.insert(name);
                         changed = true;
                     }
@@ -1278,20 +1268,15 @@ fn emit_aot_function(
     {
         let mut fb_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-        let mir_to_lower: &crate::mir::MirFunction = sm_payload
-            .as_ref()
-            .map(|(t, _)| t)
-            .unwrap_or(mir);
+        let mir_to_lower: &crate::mir::MirFunction =
+            sm_payload.as_ref().map(|(t, _)| t).unwrap_or(mir);
         // Diagnostic: dump SM-transformed MIR + layout when the
         // function symbol or resolved MIR name matches the value
         // of WLIFT_AOT_DUMP_FN.
         if let Ok(want) = std::env::var("WLIFT_AOT_DUMP_FN") {
             let mir_name = interner.resolve(mir.name).to_string();
             if symbol.contains(&want) || mir_name.contains(&want) {
-                eprintln!(
-                    "=== AOT dump for {} (mir.name={}) ===",
-                    symbol, mir_name
-                );
+                eprintln!("=== AOT dump for {} (mir.name={}) ===", symbol, mir_name);
                 if let Some((sm_mir, sm_layout)) = sm_payload.as_ref() {
                     eprintln!("--- SM-transformed MIR ---");
                     eprintln!("{:#?}", sm_mir);
@@ -1303,14 +1288,8 @@ fn emit_aot_function(
                 }
             }
         }
-        lower_mir_to_module(
-            mir_to_lower,
-            interner,
-            &mut builder,
-            module,
-            Some(aot_cfg),
-        )
-        .map_err(|e| AotError::Module(format!("[{}] {}", symbol, e)))?;
+        lower_mir_to_module(mir_to_lower, interner, &mut builder, module, Some(aot_cfg))
+            .map_err(|e| AotError::Module(format!("[{}] {}", symbol, e)))?;
         builder.seal_all_blocks();
         builder.finalize();
     }
@@ -1329,10 +1308,11 @@ fn emit_aot_function(
     // context. Same path the JIT's `compile_mir` uses — the
     // `CompiledCode` is only valid until `clear_context` so we
     // pull what we need first.
-    let compiled = ctx.compiled_code().expect("compiled_code post define_function");
+    let compiled = ctx
+        .compiled_code()
+        .expect("compiled_code post define_function");
     let code_size = compiled.code_info().total_size;
-    let native_meta =
-        crate::codegen::cranelift_backend::cl::native_meta_from_cranelift(compiled);
+    let native_meta = crate::codegen::cranelift_backend::cl::native_meta_from_cranelift(compiled);
 
     module.clear_context(&mut ctx);
 
@@ -1980,11 +1960,7 @@ fn method_uses_defining_class(mir: &crate::mir::MirFunction) -> bool {
 /// `Vec<AotMethodImpl>`) pair across all walked modules — once
 /// up front. The lowering threads a borrow of this into
 /// `AotLoweringConfig` so each Call site can devirtualize.
-fn build_cha(
-    modules: &[AotModule],
-    last_idx: usize,
-    tainted_names: &HashSet<String>,
-) -> AotCha {
+fn build_cha(modules: &[AotModule], last_idx: usize, tainted_names: &HashSet<String>) -> AotCha {
     let mut by_sig: HashMap<String, Vec<AotMethodImpl>> = HashMap::new();
 
     for (idx, aot_mod) in modules.iter().enumerate() {
@@ -2223,7 +2199,10 @@ pub fn compile_walk_to_object_with_manifest(
         if std::env::var_os("WLIFT_AOT_DEBUG_IMPORTS").is_some() {
             eprintln!(
                 "[aot manifest {}] request_name={} module_name={} aliases={:?}",
-                idx, aot_mod.request_name, manifests[idx].module_name, manifests[idx].module_aliases
+                idx,
+                aot_mod.request_name,
+                manifests[idx].module_name,
+                manifests[idx].module_aliases
             );
         }
         for (slot, source) in aot_mod.module_var_sources.iter().enumerate() {
@@ -2269,11 +2248,7 @@ pub fn compile_walk_to_object_with_manifest(
                     if std::env::var_os("WLIFT_AOT_DEBUG_IMPORTS").is_some() {
                         eprintln!(
                             "[aot import] {}.{} <- {}.[slot {}] (target_slot {})",
-                            aot_mod.request_name,
-                            var_name,
-                            src.module_name,
-                            source_slot,
-                            slot
+                            aot_mod.request_name, var_name, src.module_name, source_slot, slot
                         );
                     }
                     bindings.push(AotImportBinding {
@@ -3269,7 +3244,14 @@ fn emit_aot_bootstrap_main(
                 let roots_addr = builder.ins().global_value(ptr_ty, roots_gv);
                 let _ = builder.ins().call(
                     register_code_range_ref,
-                    &[vm, fn_addr, code_size_val, sps_addr, sps_count_val, roots_addr],
+                    &[
+                        vm,
+                        fn_addr,
+                        code_size_val,
+                        sps_addr,
+                        sps_count_val,
+                        roots_addr,
+                    ],
                 );
             }
 
@@ -3293,7 +3275,15 @@ fn emit_aot_bootstrap_main(
                 let slot_v = builder.ins().iconst(ptr_ty, *target_slot as i64);
                 let _ = builder.ins().call(
                     resolve_runtime_import_ref,
-                    &[vm, modvars_addr, slot_v, mod_addr, mod_len_v, var_addr, var_len_v],
+                    &[
+                        vm,
+                        modvars_addr,
+                        slot_v,
+                        mod_addr,
+                        mod_len_v,
+                        var_addr,
+                        var_len_v,
+                    ],
                 );
             }
 
@@ -3768,9 +3758,7 @@ mod tests {
         // tainted under its `<closure:main:0>` tag — this is what
         // drives the state-machine transform decision.
         assert!(
-            tainted
-                .iter()
-                .any(|n| n.starts_with("<closure:main:")),
+            tainted.iter().any(|n| n.starts_with("<closure:main:")),
             "fiber body closure missing from taint set: {:?}",
             tainted
         );

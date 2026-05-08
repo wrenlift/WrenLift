@@ -478,9 +478,7 @@ pub unsafe extern "C" fn wlift_aot_enter(
     // interpreter modes leave the flag at its default `false` so
     // they don't fire GC at points Cranelift's stack-map metadata
     // doesn't cover.
-    crate::codegen::runtime_fns::set_aot_gc_enabled(
-        std::env::var_os("WLIFT_AOT_GC").is_some(),
-    );
+    crate::codegen::runtime_fns::set_aot_gc_enabled(std::env::var_os("WLIFT_AOT_GC").is_some());
 }
 
 /// One method's worth of class-install descriptor: `(sig, fn_ptr,
@@ -1208,7 +1206,9 @@ pub(crate) fn aot_trace_sm_enabled() -> bool {
 /// `fiber` must be a valid `*mut ObjFiber`.
 #[cfg(feature = "aot")]
 #[no_mangle]
-pub unsafe extern "C" fn wlift_aot_sm_load_state(fiber: *mut crate::runtime::object::ObjFiber) -> u64 {
+pub unsafe extern "C" fn wlift_aot_sm_load_state(
+    fiber: *mut crate::runtime::object::ObjFiber,
+) -> u64 {
     if fiber.is_null() {
         return 0;
     }
@@ -1784,7 +1784,10 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         // and silently returns null.
         let mut effective_class_ptr = class_ptr;
         if method_entry.is_none() && class_ptr == vm_ref.class_class && recv.is_object() {
-            if let Some(recv_class) = recv.as_object().map(|p| p as *mut crate::runtime::object::ObjClass) {
+            if let Some(recv_class) = recv
+                .as_object()
+                .map(|p| p as *mut crate::runtime::object::ObjClass)
+            {
                 let header = recv_class as *const ObjHeader;
                 if unsafe { (*header).obj_type } == ObjType::Class {
                     let method_str = vm_ref.interner.resolve(sym_id).to_string();
@@ -1823,8 +1826,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
                 // hit this branch when `call(N)` taint expansion
                 // brings them under cross-fn dispatch.
                 let num_args = _num_args as usize;
-                let mut args: Vec<crate::runtime::value::Value> =
-                    Vec::with_capacity(num_args + 1);
+                let mut args: Vec<crate::runtime::value::Value> = Vec::with_capacity(num_args + 1);
                 args.push(recv);
                 for i in 1..=num_args {
                     let v = unsafe {
@@ -1879,11 +1881,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         let fn_name = vm_ref.interner.resolve(name_sym).to_string();
         eprintln!(
             "SM-DISPATCH depth={} closure=0x{:x} fn_id={} fn_name={:?} arity={}",
-            trace_depth,
-            closure_ptr as usize,
-            idx,
-            fn_name,
-            arity
+            trace_depth, closure_ptr as usize, idx, fn_name, arity
         );
     }
     let is_sm = vm_ref
@@ -1905,8 +1903,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         // `setReadFn_` callback, MapSequence's mapping fn, …)
         // returned null when invoked from inside a tainted method.
         let num_args = _num_args as usize;
-        let mut args: Vec<crate::runtime::value::Value> =
-            Vec::with_capacity(num_args + 1);
+        let mut args: Vec<crate::runtime::value::Value> = Vec::with_capacity(num_args + 1);
         args.push(recv);
         for i in 1..=num_args {
             let v = unsafe {
@@ -1931,12 +1928,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
                 None,
             )
         } else {
-            crate::codegen::runtime_fns::call_closure_jit_or_sync(
-                vm_ref,
-                closure_ptr,
-                &args,
-                None,
-            )
+            crate::codegen::runtime_fns::call_closure_jit_or_sync(vm_ref, closure_ptr, &args, None)
         };
         // Don't pop the child frame here — the caller's
         // CrossFnCallResume Done branch (in the cranelift backend)
@@ -2044,7 +2036,8 @@ pub unsafe extern "C" fn wlift_aot_resolve_runtime_import(
     if vm.is_null() || modvars.is_null() || module_name.is_null() || var_name.is_null() {
         return 70;
     }
-    let mod_bytes = unsafe { std::slice::from_raw_parts(module_name as *const u8, module_name_len) };
+    let mod_bytes =
+        unsafe { std::slice::from_raw_parts(module_name as *const u8, module_name_len) };
     let var_bytes = unsafe { std::slice::from_raw_parts(var_name as *const u8, var_name_len) };
     let mod_str = match std::str::from_utf8(mod_bytes) {
         Ok(s) => s,

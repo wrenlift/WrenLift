@@ -2981,8 +2981,7 @@ impl VM {
                         .and_then(|m| m.as_ref());
                     if let Some(meta) = meta {
                         let offset = saved_ret.wrapping_sub(cr.start) as u32;
-                        if let Some(sp) =
-                            meta.safepoints.iter().find(|sp| sp.code_offset == offset)
+                        if let Some(sp) = meta.safepoints.iter().find(|sp| sp.code_offset == offset)
                         {
                             for root in &sp.live_roots {
                                 if let RootLocation::Spill(spill_offset) = root.location {
@@ -4191,13 +4190,11 @@ impl VM {
                 n = args.len() + 1;
             } else {
                 for i in 0..args.len() {
-                    jit_args[i] =
-                        crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
+                    jit_args[i] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
                 }
                 n = args.len();
             }
-            let result_bits =
-                unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
+            let result_bits = unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
             crate::codegen::runtime_fns::set_jit_context(saved_ctx);
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
             return Some(Value::from_bits(result_bits));

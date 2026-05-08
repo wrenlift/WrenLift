@@ -473,8 +473,7 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
             )
         }
         6 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
             f(
                 args[0].to_bits(),
                 args[1].to_bits(),
@@ -1855,8 +1854,7 @@ pub fn call_closure_jit_or_sync(
     if let Some(mn) = callee_module.as_ref() {
         let bytes = mn.as_bytes();
         let cur = read_jit_ctx();
-        let same =
-            bytes.as_ptr() == cur.module_name && bytes.len() as u32 == cur.module_name_len;
+        let same = bytes.as_ptr() == cur.module_name && bytes.len() as u32 == cur.module_name_len;
         if !same {
             if let Some(m) = vm.engine.modules.get(mn.as_str()) {
                 let bytes = mn.as_bytes();
@@ -1936,8 +1934,7 @@ pub fn call_closure_jit_or_sync(
                         (*fiber)
                             .aot_frames
                             .push(crate::runtime::object::AotFrameState::default());
-                        (*fiber).aot_active_depth =
-                            (*fiber).aot_frames.len().saturating_sub(1);
+                        (*fiber).aot_active_depth = (*fiber).aot_frames.len().saturating_sub(1);
                     }
                     // Save the user-supplied args into the freshly-
                     // pushed child frame's slot table so the SM
@@ -1949,11 +1946,7 @@ pub fn call_closure_jit_or_sync(
                     // any I/O happened.
                     for (i, a) in args.iter().enumerate() {
                         unsafe {
-                            crate::capi::wlift_aot_sm_save_arg(
-                                fiber,
-                                i as u64,
-                                a.to_bits(),
-                            );
+                            crate::capi::wlift_aot_sm_save_arg(fiber, i as u64, a.to_bits());
                         }
                     }
                     // Resume value is null on the first invocation
@@ -1973,10 +1966,7 @@ pub fn call_closure_jit_or_sync(
                             .map(|p| p as *mut u8)
                             .unwrap_or(std::ptr::null_mut());
                     });
-                    let poll: extern "C" fn(
-                        *mut crate::runtime::object::ObjFiber,
-                        u64,
-                    ) -> u64 =
+                    let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
                         unsafe { std::mem::transmute(fn_ptr) };
                     let ret_bits = poll(fiber, resume_v);
                     let kind = crate::capi::wlift_aot_sm_take_poll_kind();
@@ -2300,12 +2290,8 @@ fn handle_jit_fiber_action(
             // an immediately-finished fiber.
             #[cfg(feature = "aot")]
             {
-                let target_func_id = unsafe {
-                    (*target)
-                        .mir_frames
-                        .first()
-                        .map(|f| f.func_id.0 as usize)
-                };
+                let target_func_id =
+                    unsafe { (*target).mir_frames.first().map(|f| f.func_id.0 as usize) };
                 let is_sm = target_func_id
                     .map(|idx| {
                         vm.engine
@@ -2317,7 +2303,12 @@ fn handle_jit_fiber_action(
                     .unwrap_or(false);
                 if is_sm {
                     let func_id = target_func_id.unwrap();
-                    let fn_ptr = vm.engine.jit_code.get(func_id).copied().unwrap_or(std::ptr::null());
+                    let fn_ptr = vm
+                        .engine
+                        .jit_code
+                        .get(func_id)
+                        .copied()
+                        .unwrap_or(std::ptr::null());
                     if fn_ptr.is_null() {
                         unsafe {
                             (*target).state = FiberState::Done;
@@ -2338,9 +2329,9 @@ fn handle_jit_fiber_action(
                     // frames on top.
                     unsafe {
                         if (*target).aot_frames.is_empty() {
-                            (*target).aot_frames.push(
-                                crate::runtime::object::AotFrameState::default(),
-                            );
+                            (*target)
+                                .aot_frames
+                                .push(crate::runtime::object::AotFrameState::default());
                         }
                         (*target).aot_active_depth = 0;
                         (*target).state = FiberState::Running;
@@ -2353,12 +2344,8 @@ fn handle_jit_fiber_action(
                     // without this a yielding fiber whose body
                     // captured a function-local upvalue
                     // dereferenced null on first upvalue read.
-                    let target_closure = unsafe {
-                        (*target)
-                            .mir_frames
-                            .first()
-                            .and_then(|f| f.closure)
-                    };
+                    let target_closure =
+                        unsafe { (*target).mir_frames.first().and_then(|f| f.closure) };
                     if let Some(c) = target_closure {
                         mutate_jit_ctx(|ctx| {
                             if ctx.vm.is_null() {
@@ -2386,11 +2373,9 @@ fn handle_jit_fiber_action(
                     set_jit_context(saved_jit_ctx);
                     set_jit_depth(saved_jit_depth);
                     match kind {
-                        crate::capi::AotSmPollKind::Yield => {
-                            unsafe {
-                                (*target).state = FiberState::Suspended;
-                            }
-                        }
+                        crate::capi::AotSmPollKind::Yield => unsafe {
+                            (*target).state = FiberState::Suspended;
+                        },
                         crate::capi::AotSmPollKind::Done => unsafe {
                             // Root frame done — clear the
                             // frame stack so a subsequent
@@ -2517,6 +2502,7 @@ fn handle_jit_fiber_action(
         }
         FiberAction::Yield { value } => {
             // Yield from JIT context — the fiber should return the value.
+            #[cfg(feature = "aot")]
             if crate::capi::aot_trace_sm_enabled() {
                 eprintln!(
                     "SM-LEAK FiberAction::Yield reached handle_jit_fiber_action — taint set is incomplete (this is the Mechanism B leak)"
@@ -3744,8 +3730,7 @@ unsafe fn call_jit_with_shadow_raw(fn_ptr: *const u8, args: &[Value]) -> u64 {
             )
         }
         6 => {
-            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
-                std::mem::transmute(fn_ptr);
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = std::mem::transmute(fn_ptr);
             f(
                 args[0].to_bits(),
                 args[1].to_bits(),

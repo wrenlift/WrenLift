@@ -190,10 +190,7 @@ pub enum StateMachineError {
     /// Implementing this requires lowering "save value to state
     /// struct" + "load on resume" through a per-state field
     /// table; v1 doesn't.
-    LiveValueAcrossSuspension {
-        block: BlockId,
-        value: ValueId,
-    },
+    LiveValueAcrossSuspension { block: BlockId, value: ValueId },
     /// A suspension Call landed inside a block that already has
     /// a non-Return terminator (e.g. inside a Branch). v1 only
     /// supports linear bodies; this surfaces if a yield is
@@ -306,38 +303,44 @@ pub fn transform_to_state_machine(
             Option<ValueId>,
             Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>,
         ) = match susp_kind {
-                SuspensionKind::DirectYield => {
-                    let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
-                        (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
-                        _ => unreachable!("classify_call only returns Some for Call instructions"),
-                    };
-                    let yield_value = if let Some(a) = arg {
-                        a
-                    } else {
-                        // `Fiber.yield()` with no args: synthesise
-                        // a ConstNull just before the suspension.
-                        let new_vid = mir.new_value();
-                        let blk_mut = &mut mir.blocks[blk_id.0 as usize];
-                        blk_mut
-                            .instructions
-                            .insert(inst_idx, (new_vid, Instruction::ConstNull));
-                        new_vid
-                    };
-                    (yield_value, Some(call_dst), None)
-                }
-                SuspensionKind::CrossFnCall => {
-                    let (call_dst, call_inst) =
-                        mir.blocks[blk_id.0 as usize].instructions[inst_idx].clone();
-                    let Instruction::Call { receiver, method, args, .. } = call_inst else {
-                        unreachable!("classify_call only returns Some for Call instructions");
-                    };
-                    (
-                        call_dst,
-                        None,
-                        Some((receiver, args.clone(), call_dst, method)),
-                    )
-                }
-            };
+            SuspensionKind::DirectYield => {
+                let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
+                    (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
+                    _ => unreachable!("classify_call only returns Some for Call instructions"),
+                };
+                let yield_value = if let Some(a) = arg {
+                    a
+                } else {
+                    // `Fiber.yield()` with no args: synthesise
+                    // a ConstNull just before the suspension.
+                    let new_vid = mir.new_value();
+                    let blk_mut = &mut mir.blocks[blk_id.0 as usize];
+                    blk_mut
+                        .instructions
+                        .insert(inst_idx, (new_vid, Instruction::ConstNull));
+                    new_vid
+                };
+                (yield_value, Some(call_dst), None)
+            }
+            SuspensionKind::CrossFnCall => {
+                let (call_dst, call_inst) =
+                    mir.blocks[blk_id.0 as usize].instructions[inst_idx].clone();
+                let Instruction::Call {
+                    receiver,
+                    method,
+                    args,
+                    ..
+                } = call_inst
+                else {
+                    unreachable!("classify_call only returns Some for Call instructions");
+                };
+                (
+                    call_dst,
+                    None,
+                    Some((receiver, args.clone(), call_dst, method)),
+                )
+            }
+        };
         // Re-find the suspension's index — the optional
         // ConstNull insert above may have shifted positions.
         let inst_idx = {
@@ -446,9 +449,7 @@ pub fn transform_to_state_machine(
             // `val_map.insert(result, ret)`. Save/load through
             // the slot table would just round-trip null.
             let exclude_dst = match susp_kind {
-                SuspensionKind::CrossFnCall => {
-                    cross_fn_meta.as_ref().map(|(_, _, dst, _)| *dst)
-                }
+                SuspensionKind::CrossFnCall => cross_fn_meta.as_ref().map(|(_, _, dst, _)| *dst),
                 _ => None,
             };
 
@@ -600,21 +601,19 @@ pub fn transform_to_state_machine(
                         redirect(true_target);
                         redirect(false_target);
                     }
-                    Terminator::Return(_)
-                    | Terminator::ReturnNull
-                    | Terminator::Unreachable => {}
+                    Terminator::Return(_) | Terminator::ReturnNull | Terminator::Unreachable => {}
                 }
             }
 
             // Apply redirect to the resume block.
             {
                 let _ = resume_term; // unused; we need &mut access below.
-                // SAFETY: temporarily detach the terminator,
-                // redirect, then reattach. Necessary because
-                // `redirect_term` needs mutable access to mir
-                // (for `new_block`) AND read access to mir
-                // (for `need_clone`); separating like this
-                // avoids overlapping borrows.
+                                     // SAFETY: temporarily detach the terminator,
+                                     // redirect, then reattach. Necessary because
+                                     // `redirect_term` needs mutable access to mir
+                                     // (for `new_block`) AND read access to mir
+                                     // (for `need_clone`); separating like this
+                                     // avoids overlapping borrows.
                 let mut t = std::mem::replace(
                     &mut mir.block_mut(new_block_id).terminator,
                     Terminator::Unreachable,
@@ -627,7 +626,11 @@ pub fn transform_to_state_machine(
             while let Some((orig, clone_id)) = to_fill.pop() {
                 let (mut insts, mut term, params) = {
                     let blk = mir.block(orig);
-                    (blk.instructions.clone(), blk.terminator.clone(), blk.params.clone())
+                    (
+                        blk.instructions.clone(),
+                        blk.terminator.clone(),
+                        blk.params.clone(),
+                    )
                 };
                 // Compute active remap (saved values not
                 // shadowed by `orig`'s params).
@@ -861,7 +864,11 @@ fn remap_instruction_uses(inst: &mut Instruction, remap: &HashMap<ValueId, Value
                 mp(a);
             }
         }
-        SubscriptSet { receiver, args, value } => {
+        SubscriptSet {
+            receiver,
+            args,
+            value,
+        } => {
             mp(receiver);
             for a in args.iter_mut() {
                 mp(a);
@@ -929,10 +936,7 @@ fn collect_uses(inst: &Instruction) -> Vec<ValueId> {
 /// uses(B) ∪ (live_out[B] − defs(B))` and `live_out[B] = ∪
 /// live_in[succ]` are iterated to a fixed point. Block params
 /// count as defs (they're SSA values introduced at block entry).
-fn compute_live_in(
-    mir: &MirFunction,
-    target_block: BlockId,
-) -> std::collections::HashSet<ValueId> {
+fn compute_live_in(mir: &MirFunction, target_block: BlockId) -> std::collections::HashSet<ValueId> {
     use std::collections::HashSet;
     let n = mir.blocks.len();
     let mut block_uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
@@ -1142,9 +1146,6 @@ f.call()
             .values()
             .flat_map(|v| v.iter().map(|(s, _)| *s))
             .collect();
-        assert_eq!(
-            saved_slots, load_slots,
-            "save/load slot sets must match"
-        );
+        assert_eq!(saved_slots, load_slots, "save/load slot sets must match");
     }
 }

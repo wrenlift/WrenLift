@@ -1174,8 +1174,7 @@ pub mod cl {
         /// `while (true) { … }` body keeps iterating after the
         /// abort fires. Cleared between emissions by
         /// `emit_aot_function`.
-        pub current_abort_exit_block:
-            std::cell::RefCell<Option<cranelift_codegen::ir::Block>>,
+        pub current_abort_exit_block: std::cell::RefCell<Option<cranelift_codegen::ir::Block>>,
 
         /// State-machine layout for the function currently being
         /// lowered. `Some(_)` flips the lowering onto the stackless-
@@ -1200,8 +1199,7 @@ pub mod cl {
         /// every yield-/done-terminator emit reads it to pass
         /// `fiber` to the runtime helper. `None` when the function
         /// isn't a state machine. Cleared between emissions.
-        pub current_fiber_ptr_var:
-            std::cell::RefCell<Option<cranelift_frontend::Variable>>,
+        pub current_fiber_ptr_var: std::cell::RefCell<Option<cranelift_frontend::Variable>>,
 
         /// Function-scoped resume-value variable. Holds the
         /// `resume_v` parameter of the state-machine poll
@@ -1211,8 +1209,7 @@ pub mod cl {
         /// the resume value and a re-entered child state
         /// machine would lose the value the user passed to
         /// `fiber.call`.
-        pub current_resume_v_var:
-            std::cell::RefCell<Option<cranelift_frontend::Variable>>,
+        pub current_resume_v_var: std::cell::RefCell<Option<cranelift_frontend::Variable>>,
     }
 
     /// AOT entry point — populate `builder.func` with the CLIF
@@ -1487,8 +1484,7 @@ pub mod cl {
                 let dispatch_block = builder.create_block();
                 builder.switch_to_block(dispatch_block);
                 let fiber_param = builder.append_block_param(dispatch_block, types::I64);
-                let resume_v_param =
-                    builder.append_block_param(dispatch_block, types::I64);
+                let resume_v_param = builder.append_block_param(dispatch_block, types::I64);
                 if let Some(var) = *cfg.current_fiber_ptr_var.borrow() {
                     builder.def_var(var, fiber_param);
                 }
@@ -1507,37 +1503,21 @@ pub mod cl {
                 // (closure_ptr_var → null deref on every
                 // GetUpvalue / SetUpvalue site).
                 if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
-                    let f = get_runtime_fn(
-                        module,
-                        builder,
-                        "wren_jit_roots_snapshot",
-                        0,
-                    )?;
+                    let f = get_runtime_fn(module, builder, "wren_jit_roots_snapshot", 0)?;
                     let call = builder.ins().call(f, &[]);
                     let snap = builder.inst_results(call)[0];
                     builder.def_var(snap_var, snap);
                 }
                 if let Some(closure_var) = *cfg.current_closure_ptr_var.borrow() {
-                    let f = get_runtime_fn(
-                        module,
-                        builder,
-                        "wren_load_jit_closure",
-                        0,
-                    )?;
+                    let f = get_runtime_fn(module, builder, "wren_load_jit_closure", 0)?;
                     let call = builder.ins().call(f, &[]);
                     let closure_bits = builder.inst_results(call)[0];
                     builder.def_var(closure_var, closure_bits);
                 }
-                let load_state = get_runtime_fn(
-                    module,
-                    builder,
-                    "wlift_aot_sm_load_state",
-                    1,
-                )?;
+                let load_state = get_runtime_fn(module, builder, "wlift_aot_sm_load_state", 1)?;
                 let call = builder.ins().call(load_state, &[fiber_param]);
                 let state_id_64 = builder.inst_results(call)[0];
-                let state_id =
-                    builder.ins().ireduce(types::I32, state_id_64);
+                let state_id = builder.ins().ireduce(types::I32, state_id_64);
                 // br_table over the resume entries. Cranelift
                 // requires a default block for out-of-range
                 // values; use the first resume entry as the
@@ -1550,9 +1530,7 @@ pub mod cl {
                     &layout
                         .resume_entries
                         .iter()
-                        .map(|bid| {
-                            builder.func.dfg.block_call(block_map[bid], &[])
-                        })
+                        .map(|bid| builder.func.dfg.block_call(block_map[bid], &[]))
                         .collect::<Vec<_>>(),
                 );
                 let _ = &mut jt_data;
@@ -1586,9 +1564,7 @@ pub mod cl {
                 // emitted, surfacing as `undefined value v47`).
                 let mut roots: Vec<BlockId> = vec![BlockId(0)];
                 if let Some(cfg) = aot_config {
-                    if let Some(layout) =
-                        cfg.current_state_machine_layout.borrow().as_ref()
-                    {
+                    if let Some(layout) = cfg.current_state_machine_layout.borrow().as_ref() {
                         roots.extend(layout.resume_entries.iter().copied());
                     }
                 }
@@ -1695,30 +1671,19 @@ pub mod cl {
                     let layout_clone = cfg.current_state_machine_layout.borrow().clone();
                     if let Some(layout) = layout_clone {
                         if let Some(loads) = layout.resume_loads.get(&bid) {
-                            let load_fn = get_runtime_fn(
-                                module,
-                                builder,
-                                "wlift_aot_sm_load_value",
-                                2,
-                            )?;
+                            let load_fn =
+                                get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
                             for (slot, fresh_vid) in loads {
-                                let slot_v = builder
-                                    .ins()
-                                    .iconst(types::I64, *slot as i64);
-                                let call =
-                                    builder.ins().call(load_fn, &[fiber, slot_v]);
+                                let slot_v = builder.ins().iconst(types::I64, *slot as i64);
+                                let call = builder.ins().call(load_fn, &[fiber, slot_v]);
                                 let v = builder.inst_results(call)[0];
-                                let var = *var_map
-                                    .entry(*fresh_vid)
-                                    .or_insert_with(|| {
-                                        let v = builder.declare_var(types::I64);
-                                        v
-                                    });
+                                let var = *var_map.entry(*fresh_vid).or_insert_with(|| {
+                                    let v = builder.declare_var(types::I64);
+                                    v
+                                });
                                 builder.def_var(var, v);
                                 val_map.insert(*fresh_vid, v);
-                                if mark_stack_map
-                                    && is_wren_value(*fresh_vid, &value_types)
-                                {
+                                if mark_stack_map && is_wren_value(*fresh_vid, &value_types) {
                                     builder.declare_value_needs_stack_map(v);
                                 }
                             }
@@ -1729,12 +1694,7 @@ pub mod cl {
                 // child frame slots either by the matching
                 // Init block (initial entry) or by a previous
                 // suspension's still-live frame (resume entry).
-                let invoke_fn = get_runtime_fn(
-                    module,
-                    builder,
-                    "wlift_aot_invoke_sm_method",
-                    6,
-                )?;
+                let invoke_fn = get_runtime_fn(module, builder, "wlift_aot_invoke_sm_method", 6)?;
                 let vm_fn = get_runtime_fn(module, builder, "wren_load_jit_vm", 0)?;
                 let vm_call = builder.ins().call(vm_fn, &[]);
                 let vm = builder.inst_results(vm_call)[0];
@@ -1748,28 +1708,19 @@ pub mod cl {
                 // slot keeps the Cranelift IR
                 // dominance-correct.
                 let _ = receiver;
-                let load_arg_fn =
-                    get_runtime_fn(module, builder, "wlift_aot_sm_load_arg", 2)?;
+                let load_arg_fn = get_runtime_fn(module, builder, "wlift_aot_sm_load_arg", 2)?;
                 let zero = builder.ins().iconst(types::I64, 0);
                 let recv_call = builder.ins().call(load_arg_fn, &[fiber, zero]);
                 let recv_v = builder.inst_results(recv_call)[0];
                 // Trace the loaded recv against the receiver MIR
                 // ValueId so a save→load mismatch becomes visible.
-                let trace_load_fn = get_runtime_fn(
-                    module,
-                    builder,
-                    "wlift_aot_trace_init_load",
-                    4,
-                )?;
-                let recv_id = builder
+                let trace_load_fn =
+                    get_runtime_fn(module, builder, "wlift_aot_trace_init_load", 4)?;
+                let recv_id = builder.ins().iconst(types::I64, receiver.0 as i64);
+                let _ = builder
                     .ins()
-                    .iconst(types::I64, receiver.0 as i64);
-                let _ = builder.ins().call(
-                    trace_load_fn,
-                    &[fiber, zero, recv_id, recv_v],
-                );
-                let symbols_gv =
-                    module.declare_data_in_func(cfg.symbols_data, builder.func);
+                    .call(trace_load_fn, &[fiber, zero, recv_id, recv_v]);
+                let symbols_gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
                 let symbols_addr = builder.ins().global_value(types::I64, symbols_gv);
                 let sym_slot = aot_intern_symbol(cfg, method_sym.index(), interner);
                 let sym_v = builder.ins().load(
@@ -1784,18 +1735,12 @@ pub mod cl {
                 } else {
                     builder.ins().iconst(types::I64, 0)
                 };
-                let invoke_call = builder.ins().call(
-                    invoke_fn,
-                    &[vm, fiber, recv_v, sym_v, num_args_v, resume_v],
-                );
+                let invoke_call = builder
+                    .ins()
+                    .call(invoke_fn, &[vm, fiber, recv_v, sym_v, num_args_v, resume_v]);
                 let ret = builder.inst_results(invoke_call)[0];
                 // 2) peek + brif.
-                let peek_fn = get_runtime_fn(
-                    module,
-                    builder,
-                    "wlift_aot_sm_peek_poll_kind",
-                    0,
-                )?;
+                let peek_fn = get_runtime_fn(module, builder, "wlift_aot_sm_peek_poll_kind", 0)?;
                 let peek_call = builder.ins().call(peek_fn, &[]);
                 let kind_64 = builder.inst_results(peek_call)[0];
                 let yield_const = builder.ins().iconst(types::I64, 1);
@@ -1813,11 +1758,9 @@ pub mod cl {
                 builder.switch_to_block(propagate_block);
                 let return_ty = builder.func.signature.returns[0].value_type;
                 let ret_propagate = if builder.func.dfg.value_type(ret) != return_ty {
-                    builder.ins().bitcast(
-                        return_ty,
-                        cranelift_codegen::ir::MemFlags::new(),
-                        ret,
-                    )
+                    builder
+                        .ins()
+                        .bitcast(return_ty, cranelift_codegen::ir::MemFlags::new(), ret)
                 } else {
                     ret
                 };
@@ -1833,19 +1776,9 @@ pub mod cl {
                 //    active-depth frame) at the slot the
                 //    transform allocated for `result`.
                 builder.switch_to_block(done_cl_block_local);
-                let pop_fn = get_runtime_fn(
-                    module,
-                    builder,
-                    "wlift_aot_sm_pop_frame",
-                    1,
-                )?;
+                let pop_fn = get_runtime_fn(module, builder, "wlift_aot_sm_pop_frame", 1)?;
                 let _ = builder.ins().call(pop_fn, &[fiber]);
-                let clear_fn = get_runtime_fn(
-                    module,
-                    builder,
-                    "wlift_aot_sm_clear_poll_kind",
-                    0,
-                )?;
+                let clear_fn = get_runtime_fn(module, builder, "wlift_aot_sm_clear_poll_kind", 0)?;
                 let _ = builder.ins().call(clear_fn, &[]);
                 // Bind the result. val_map.insert dominates the
                 // immediate done_block jump; ALSO save to a
@@ -1862,12 +1795,7 @@ pub mod cl {
                     .as_ref()
                     .and_then(|l| l.cross_fn_results.get(&done_block).copied());
                 if let Some((slot, _)) = result_slot {
-                    let save_fn = get_runtime_fn(
-                        module,
-                        builder,
-                        "wlift_aot_sm_save_value",
-                        3,
-                    )?;
+                    let save_fn = get_runtime_fn(module, builder, "wlift_aot_sm_save_value", 3)?;
                     let slot_v = builder.ins().iconst(types::I64, slot as i64);
                     let _ = builder.ins().call(save_fn, &[fiber, slot_v, ret]);
                 }
@@ -1948,12 +1876,8 @@ pub mod cl {
                     if let Some(cfg) = aot_config {
                         if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
                             let fiber = builder.use_var(fiber_var);
-                            let load_fn = get_runtime_fn(
-                                module,
-                                builder,
-                                "wlift_aot_sm_load_value",
-                                2,
-                            )?;
+                            let load_fn =
+                                get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
                             // Closure bodies have no implicit
                             // `this` BlockParam — `BlockParam(0)`
                             // is the first user arg. The caller
@@ -1978,15 +1902,13 @@ pub mod cl {
                             // `next` was actually `req`'s
                             // value) and exhausted the stack on
                             // every request.
-                            let is_closure_body =
-                                interner.resolve(mir.name) == "<closure>";
+                            let is_closure_body = interner.resolve(mir.name) == "<closure>";
                             let slot_offset = if is_closure_body { 1u16 } else { 0u16 };
                             for &(vid, ref inst) in &block.instructions {
                                 if let Instruction::BlockParam(idx) = inst {
-                                    let slot = builder.ins().iconst(
-                                        types::I64,
-                                        (*idx + slot_offset) as i64,
-                                    );
+                                    let slot = builder
+                                        .ins()
+                                        .iconst(types::I64, (*idx + slot_offset) as i64);
                                     let call = builder.ins().call(load_fn, &[fiber, slot]);
                                     let v = builder.inst_results(call)[0];
                                     val_map.insert(vid, v);
@@ -2046,12 +1968,7 @@ pub mod cl {
                     // don't pop" mode. Mirrors wren_call_N_inner's
                     // root_base / jit_roots_restore_len pair.
                     if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
-                        let f = get_runtime_fn(
-                            module,
-                            builder,
-                            "wren_jit_roots_snapshot",
-                            0,
-                        )?;
+                        let f = get_runtime_fn(module, builder, "wren_jit_roots_snapshot", 0)?;
                         let call = builder.ins().call(f, &[]);
                         let snap = builder.inst_results(call)[0];
                         builder.def_var(snap_var, snap);
@@ -2072,15 +1989,10 @@ pub mod cl {
                     if let Some(loads) = layout.resume_loads.get(&bid) {
                         if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
                             let fiber = builder.use_var(fiber_var);
-                            let load_fn = get_runtime_fn(
-                                module,
-                                builder,
-                                "wlift_aot_sm_load_value",
-                                2,
-                            )?;
+                            let load_fn =
+                                get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
                             for (slot, fresh_vid) in loads {
-                                let slot_v =
-                                    builder.ins().iconst(types::I64, *slot as i64);
+                                let slot_v = builder.ins().iconst(types::I64, *slot as i64);
                                 let call = builder.ins().call(load_fn, &[fiber, slot_v]);
                                 let v = builder.inst_results(call)[0];
                                 let var = *var_map
@@ -2088,9 +2000,7 @@ pub mod cl {
                                     .or_insert_with(|| builder.declare_var(types::I64));
                                 builder.def_var(var, v);
                                 val_map.insert(*fresh_vid, v);
-                                if mark_stack_map
-                                    && is_wren_value(*fresh_vid, &value_types)
-                                {
+                                if mark_stack_map && is_wren_value(*fresh_vid, &value_types) {
                                     builder.declare_value_needs_stack_map(v);
                                 }
                             }
@@ -2120,17 +2030,11 @@ pub mod cl {
                     // every downstream use of `result`, regardless
                     // of how the post-done CFG was duplicated or
                     // joined.
-                    if let Some((slot, call_dst)) =
-                        layout.cross_fn_results.get(&bid).copied()
-                    {
+                    if let Some((slot, call_dst)) = layout.cross_fn_results.get(&bid).copied() {
                         if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
                             let fiber = builder.use_var(fiber_var);
-                            let load_fn = get_runtime_fn(
-                                module,
-                                builder,
-                                "wlift_aot_sm_load_value",
-                                2,
-                            )?;
+                            let load_fn =
+                                get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
                             let slot_v = builder.ins().iconst(types::I64, slot as i64);
                             let call = builder.ins().call(load_fn, &[fiber, slot_v]);
                             let v = builder.inst_results(call)[0];
@@ -2168,14 +2072,11 @@ pub mod cl {
                             b
                         }
                     };
-                    let f =
-                        get_runtime_fn(module, builder, "wren_aot_check_error", 0)?;
+                    let f = get_runtime_fn(module, builder, "wren_aot_check_error", 0)?;
                     let call = builder.ins().call(f, &[]);
                     let err = builder.inst_results(call)[0];
                     let cont = builder.create_block();
-                    builder
-                        .ins()
-                        .brif(err, abort_exit, &[], cont, &[]);
+                    builder.ins().brif(err, abort_exit, &[], cont, &[]);
                     builder.switch_to_block(cont);
                 }
             }
@@ -2259,12 +2160,7 @@ pub mod cl {
                 if let Some(cfg) = aot_config {
                     if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
                         let snap = builder.use_var(snap_var);
-                        let f = get_runtime_fn(
-                            module,
-                            builder,
-                            "wren_jit_roots_restore",
-                            1,
-                        )?;
+                        let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
                         let _ = builder.ins().call(f, &[snap]);
                     }
 
@@ -2275,9 +2171,7 @@ pub mod cl {
                     // resumes from the saved state on next call,
                     // or `kind=Done` and marks the fiber finished.
                     #[cfg(feature = "aot")]
-                    if let Some(layout) =
-                        cfg.current_state_machine_layout.borrow().clone()
-                    {
+                    if let Some(layout) = cfg.current_state_machine_layout.borrow().clone() {
                         if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
                             let fiber = builder.use_var(fiber_var);
                             if let Some(next_state) = layout.yield_blocks.get(&bid) {
@@ -2300,13 +2194,8 @@ pub mod cl {
                                             Some(v) => *v,
                                             None => continue,
                                         };
-                                        let slot_v = builder
-                                            .ins()
-                                            .iconst(types::I64, *slot as i64);
-                                        let _ = builder.ins().call(
-                                            save_fn,
-                                            &[fiber, slot_v, v],
-                                        );
+                                        let slot_v = builder.ins().iconst(types::I64, *slot as i64);
+                                        let _ = builder.ins().call(save_fn, &[fiber, slot_v, v]);
                                     }
                                 }
                                 // Branch on kind: DirectYield
@@ -2346,12 +2235,9 @@ pub mod cl {
                                             "wlift_aot_sm_set_state",
                                             2,
                                         )?;
-                                        let ns = builder
-                                            .ins()
-                                            .iconst(types::I64, *next_state as i64);
-                                        let _ = builder
-                                            .ins()
-                                            .call(set_state_fn, &[fiber, ns]);
+                                        let ns =
+                                            builder.ins().iconst(types::I64, *next_state as i64);
+                                        let _ = builder.ins().call(set_state_fn, &[fiber, ns]);
                                         let push_fn = get_runtime_fn(
                                             module,
                                             builder,
@@ -2376,31 +2262,24 @@ pub mod cl {
                                             None => builder.ins().iconst(types::I64, 0),
                                         };
                                         let zero = builder.ins().iconst(types::I64, 0);
-                                        let _ = builder
-                                            .ins()
-                                            .call(save_arg_fn, &[fiber, zero, recv_v]);
-                                        let recv_id = builder
-                                            .ins()
-                                            .iconst(types::I64, receiver.0 as i64);
+                                        let _ =
+                                            builder.ins().call(save_arg_fn, &[fiber, zero, recv_v]);
+                                        let recv_id =
+                                            builder.ins().iconst(types::I64, receiver.0 as i64);
                                         let _ = builder
                                             .ins()
                                             .call(trace_init_fn, &[fiber, zero, recv_id, recv_v]);
                                         for (i, a) in args.iter().enumerate() {
                                             let av = match val_map.get(a) {
                                                 Some(v) => *v,
-                                                None => {
-                                                    builder.ins().iconst(types::I64, 0)
-                                                }
+                                                None => builder.ins().iconst(types::I64, 0),
                                             };
-                                            let slot = builder
-                                                .ins()
-                                                .iconst(types::I64, (i + 1) as i64);
-                                            let _ = builder
-                                                .ins()
-                                                .call(save_arg_fn, &[fiber, slot, av]);
-                                            let arg_id = builder
-                                                .ins()
-                                                .iconst(types::I64, a.0 as i64);
+                                            let slot =
+                                                builder.ins().iconst(types::I64, (i + 1) as i64);
+                                            let _ =
+                                                builder.ins().call(save_arg_fn, &[fiber, slot, av]);
+                                            let arg_id =
+                                                builder.ins().iconst(types::I64, a.0 as i64);
                                             let _ = builder
                                                 .ins()
                                                 .call(trace_init_fn, &[fiber, slot, arg_id, av]);
@@ -2431,21 +2310,15 @@ pub mod cl {
                                             "wlift_aot_sm_yield",
                                             2,
                                         )?;
-                                        let next_state_v = builder
-                                            .ins()
-                                            .iconst(types::I64, *next_state as i64);
-                                        let _ = builder
-                                            .ins()
-                                            .call(yield_fn, &[fiber, next_state_v]);
+                                        let next_state_v =
+                                            builder.ins().iconst(types::I64, *next_state as i64);
+                                        let _ =
+                                            builder.ins().call(yield_fn, &[fiber, next_state_v]);
                                     }
                                 }
                             } else {
-                                let done_fn = get_runtime_fn(
-                                    module,
-                                    builder,
-                                    "wlift_aot_sm_done",
-                                    1,
-                                )?;
+                                let done_fn =
+                                    get_runtime_fn(module, builder, "wlift_aot_sm_done", 1)?;
                                 let _ = builder.ins().call(done_fn, &[fiber]);
                             }
                         }
@@ -2458,13 +2331,7 @@ pub mod cl {
             // switched to a dead block — see
             // `skip_default_terminator` above).
             if !skip_default_terminator {
-                lower_terminator(
-                    &block.terminator,
-                    builder,
-                    &val_map,
-                    &block_map,
-                    &raw_bools,
-                )?;
+                lower_terminator(&block.terminator, builder, &val_map, &block_map, &raw_bools)?;
             } else {
                 // The dead-block terminator must still be
                 // well-formed for Cranelift's verifier. A bare
@@ -2486,12 +2353,7 @@ pub mod cl {
                 builder.switch_to_block(abort_exit);
                 if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
                     let snap = builder.use_var(snap_var);
-                    let f = get_runtime_fn(
-                        module,
-                        builder,
-                        "wren_jit_roots_restore",
-                        1,
-                    )?;
+                    let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
                     let _ = builder.ins().call(f, &[snap]);
                 }
                 let return_ty = builder.func.signature.returns[0].value_type;
@@ -2982,8 +2844,7 @@ pub mod cl {
                     let r = get(receiver);
                     let method_val = if let Some(cfg) = aot_config {
                         let slot = aot_intern_symbol(cfg, method.index(), interner);
-                        let sym_gv =
-                            module.declare_data_in_func(cfg.symbols_data, builder.func);
+                        let sym_gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
                         let sym_base = builder.ins().global_value(types::I64, sym_gv);
                         builder.ins().load(
                             types::I64,
@@ -2995,13 +2856,12 @@ pub mod cl {
                         builder.ins().iconst(types::I64, method.index() as i64)
                     };
                     let buf_size = (args.len() * 8) as u32;
-                    let stack_slot = builder.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
+                    let stack_slot =
+                        builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                             buf_size,
                             8,
-                        ),
-                    );
+                        ));
                     for (i, a) in args.iter().enumerate() {
                         let v = get(a);
                         builder.ins().stack_store(v, stack_slot, (i * 8) as i32);
@@ -4383,13 +4243,12 @@ pub mod cl {
                     // 7-upvalue middleware (well within range, but
                     // we hit the same path on bigger captures) miss
                     // its trailing slots and crash at first access.
-                    let slot = builder.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
+                    let slot =
+                        builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                             (n * 8) as u32,
                             8,
-                        ),
-                    );
+                        ));
                     for (i, uv) in upvalues.iter().enumerate() {
                         let v = get(uv);
                         builder.ins().stack_store(v, slot, (i * 8) as i32);

@@ -993,12 +993,8 @@ fn run_fiber_with_stop_depth(
             let is_sm = false;
             if !aot_fn.is_null() && mir_empty && is_sm {
                 if let Some(c) = closure {
-                    let result = crate::codegen::runtime_fns::call_closure_jit_or_sync(
-                        vm,
-                        c,
-                        &[],
-                        None,
-                    );
+                    let result =
+                        crate::codegen::runtime_fns::call_closure_jit_or_sync(vm, c, &[], None);
                     fiber = vm.fiber;
                     if !fiber.is_null() {
                         unsafe {
@@ -1035,8 +1031,7 @@ fn run_fiber_with_stop_depth(
                 // happens to live at that slot in the caller's
                 // module, and `Http_.readRequest(_)` silently
                 // dispatches against an unrelated class.
-                let callee_module =
-                    vm.engine.func_module(func_id).cloned();
+                let callee_module = vm.engine.func_module(func_id).cloned();
                 if let Some(c) = closure {
                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                         if ctx.vm.is_null() {

@@ -399,10 +399,7 @@ fn fiber_yield_state_machine() {
          System.print(\"c=%(f.call())\")\n",
     );
     assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
-    assert_eq!(
-        r.stdout,
-        "step 1\na=10\nstep 2\nb=20\nstep 3\nc=30\n"
-    );
+    assert_eq!(r.stdout, "step 1\na=10\nstep 2\nb=20\nstep 3\nc=30\n");
 }
 
 #[test]

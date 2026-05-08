@@ -954,11 +954,7 @@ impl ExecutionEngine {
     /// JIT functions take a different path: their metadata is
     /// staged in `baseline_metadata` / `optimized_metadata` and
     /// promoted to `jit_metadata` by `set_tier_state`.
-    pub fn set_aot_metadata(
-        &mut self,
-        func_id: FuncId,
-        metadata: Arc<NativeFrameMetadata>,
-    ) {
+    pub fn set_aot_metadata(&mut self, func_id: FuncId, metadata: Arc<NativeFrameMetadata>) {
         let idx = func_id.0 as usize;
         if idx < self.jit_metadata.len() {
             self.jit_metadata[idx] = Some(metadata);
