@@ -344,6 +344,12 @@ __wliftWrenImports = {
   wren_string_concat_2: wasm.wren_string_concat_2,
   wren_string_concat_3: wasm.wren_string_concat_3,
   wren_string_concat_4: wasm.wren_string_concat_4,
+  // Subscript get/set — arity-1 covers `list[i]`, `map[k]`,
+  // `arr[i] = v`, plus the user-class `[_]` / `[_]=(_)`
+  // dispatch fallback inside the host helper. Multi-arg
+  // subscripts reject through the gate.
+  wren_subscript_get_1: wasm.wren_subscript_get_1,
+  wren_subscript_set_1: wasm.wren_subscript_set_1,
   // SIMD intrinsic helpers — only the Simd-exclusive selectors
   // (`bitmask` / `allTrue` / `anyTrue`) are wired into the wasm
   // emitter today. The remaining f32x4 / i32x4 binops + cmps are

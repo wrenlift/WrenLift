@@ -1412,6 +1412,10 @@ class MainWlift {
       wren_string_concat_2: wasm.wren_string_concat_2,
       wren_string_concat_3: wasm.wren_string_concat_3,
       wren_string_concat_4: wasm.wren_string_concat_4,
+      // See `worker.js` — `list[i]` / `map[k]` / `arr[i] = v`
+      // through the wasm tier-up.
+      wren_subscript_get_1: wasm.wren_subscript_get_1,
+      wren_subscript_set_1: wasm.wren_subscript_set_1,
       // SIMD intrinsic helpers — see the matching block in
       // `worker.js` for the full rationale. `bitmask` / `allTrue`
       // / `anyTrue` are the only ones the wasm emitter routes

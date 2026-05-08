@@ -224,13 +224,26 @@ fn mir_needs_unsupported_helpers(
                 | Instruction::MakeClosure { .. }
                 | Instruction::GetUpvalue(_)
                 | Instruction::SetUpvalue(..)
-                | Instruction::SubscriptGet { .. }
-                | Instruction::SubscriptSet { .. }
                 | Instruction::GetStaticField(..)
                 | Instruction::SetStaticField(..)
                 | Instruction::SetModuleVar(..)
                 | Instruction::IsType(..)
                 | Instruction::GuardClass(..) => return true,
+                // Subscript get/set support arity-1 (`list[i]`,
+                // `map[k]`, `arr[i] = v`) — the host helper is
+                // single-index. Multi-arg subscripts reject.
+                Instruction::SubscriptGet { args, .. }
+                    if wren_lift::codegen::wasm::subscript_get_helper_name(args.len())
+                        .is_none() =>
+                {
+                    return true
+                }
+                Instruction::SubscriptSet { args, .. }
+                    if wren_lift::codegen::wasm::subscript_set_helper_name(args.len())
+                        .is_none() =>
+                {
+                    return true
+                }
                 // MakeList / MakeMap / StringConcat now have
                 // per-arity helpers (`wren_make_list_<N>` etc.)
                 // for `N` up to the cap that matches the host
@@ -1373,6 +1386,29 @@ pub fn wren_string_concat_3(a: u64, b: u64, c: u64) -> u64 {
 #[wasm_bindgen]
 pub fn wren_string_concat_4(a: u64, b: u64, c: u64, d: u64) -> u64 {
     string_concat_wasm(&[a, b, c, d])
+}
+
+/// Subscript get — `recv[idx]` for `List` / `Map` / `String` /
+/// `TypedArray`, falling through to `[_]` method dispatch for
+/// user classes. Forwards to the host's `wren_subscript_get`,
+/// which since the unified `vm_ref` fallback uses
+/// `current_vm()` on wasm.
+///
+/// Capped at single-index access (the only arity the host
+/// helper supports). Multi-arg subscripts (`m[r, c]`-style) are
+/// rejected by the wasm tier-up gate; they're rare in Wren and
+/// every concrete user is matrix indexing on `Mat4`, which uses
+/// `m.at(r, c)` instead.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_subscript_get_1(receiver: u64, index: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_subscript_get(receiver, index)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_subscript_set_1(receiver: u64, index: u64, value: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_subscript_set(receiver, index, value)
 }
 
 /// Combined helper: load the closure stored in

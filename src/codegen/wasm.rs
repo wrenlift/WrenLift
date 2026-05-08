@@ -132,6 +132,25 @@ pub fn string_concat_helper_name(parts: usize) -> Option<&'static str> {
     }
 }
 
+/// Subscript-get / -set arity ladder. Today only single-index
+/// access is supported (matches the host helper's signature);
+/// multi-arg subscripts (`m[r, c]` style) reject through the
+/// gate. Almost no real Wren code uses them — `Mat4` and friends
+/// expose `at(r, c)` instead.
+pub fn subscript_get_helper_name(args: usize) -> Option<&'static str> {
+    match args {
+        1 => Some("wren_subscript_get_1"),
+        _ => None,
+    }
+}
+
+pub fn subscript_set_helper_name(args: usize) -> Option<&'static str> {
+    match args {
+        1 => Some("wren_subscript_set_1"),
+        _ => None,
+    }
+}
+
 /// Compile a MIR function directly to a WASM module.
 ///
 /// No interner, no memory import — used by the codegen tests
@@ -629,12 +648,16 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     Instruction::SubscriptGet { args, .. } => {
-                        let params = vec![ValType::I64; args.len() + 1];
-                        self.register_import("wren_subscript_get", &params, &[ValType::I64]);
+                        if let Some(name) = subscript_get_helper_name(args.len()) {
+                            let params = vec![ValType::I64; args.len() + 1];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     Instruction::SubscriptSet { args, .. } => {
-                        let params = vec![ValType::I64; args.len() + 2];
-                        self.register_import("wren_subscript_set", &params, &[ValType::I64]);
+                        if let Some(name) = subscript_set_helper_name(args.len()) {
+                            let params = vec![ValType::I64; args.len() + 2];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     _ => {} // No import needed.
                 }
@@ -1414,11 +1437,17 @@ impl<'a> MirWasmEmitter<'a> {
                 self.emit_runtime_call_with_imm(func, dst, "wren_is_type", *a, sym.index() as i64)?;
             }
             Instruction::SubscriptGet { receiver, args } => {
+                let name = subscript_get_helper_name(args.len()).ok_or_else(|| {
+                    format!(
+                        "SubscriptGet of arity {} exceeds wasm tier-up cap",
+                        args.len()
+                    )
+                })?;
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 for a in args {
                     func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_subscript_get"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::SubscriptSet {
@@ -1426,12 +1455,18 @@ impl<'a> MirWasmEmitter<'a> {
                 args,
                 value,
             } => {
+                let name = subscript_set_helper_name(args.len()).ok_or_else(|| {
+                    format!(
+                        "SubscriptSet of arity {} exceeds wasm tier-up cap",
+                        args.len()
+                    )
+                })?;
                 func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
                 for a in args {
                     func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 }
                 func.instruction(&WasmInst::LocalGet(self.local(*value)));
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_subscript_set"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
 
