@@ -2930,6 +2930,7 @@ fn emit_aot_bootstrap_main(
                 .map_err(|e| AotError::Module(e.to_string()))?;
             let mut sps_desc = DataDescription::new();
             sps_desc.define(sps_bytes.into_boxed_slice());
+            sps_desc.set_align(std::mem::align_of::<crate::capi::WliftAotSafepointDesc>() as u64);
             module
                 .define_data(sps_id, &sps_desc)
                 .map_err(|e| AotError::Module(e.to_string()))?;
@@ -2943,6 +2944,7 @@ fn emit_aot_bootstrap_main(
                 .map_err(|e| AotError::Module(e.to_string()))?;
             let mut roots_desc = DataDescription::new();
             roots_desc.define(roots_bytes.into_boxed_slice());
+            roots_desc.set_align(std::mem::align_of::<i32>() as u64);
             module
                 .define_data(roots_id, &roots_desc)
                 .map_err(|e| AotError::Module(e.to_string()))?;

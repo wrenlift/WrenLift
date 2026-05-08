@@ -33,6 +33,16 @@ System.print("List ops:")
 var nums = [1, 2, 3, 4, 5]
 var doubled = nums.map {|x| x * 2}.toList
 System.print(doubled)
+var simdFloats = Float32Array.fromList([1, 2, 3, 4])
+var simdVec = Simd4f.load(simdFloats, 0) + Simd4f.splat(1)
+simdVec.store(simdFloats, 0)
+var simdInts = Int32Array.fromList([1, 2, 3, 4])
+var simdMask = (Simd4i.load(simdInts, 0) > Simd4i.splat(2)).bitmask
+if (simdFloats.toList.toString == "[2, 3, 4, 5]" && simdMask == 12) {
+    System.print("simd: ok")
+} else {
+    System.print("simd: BAD (%(simdFloats.toList) / %(simdMask))")
+}
 // Probe `web-time`-backed clocks: confirm Instant + SystemTime
 // don't panic at runtime under wasm32-unknown-unknown / wasi.
 var t0 = TimeCore.mono

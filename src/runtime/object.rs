@@ -41,6 +41,10 @@ pub enum ObjType {
     /// Float64Array all share this storage; element type lives in
     /// the `kind` byte on `ObjTypedArray`).
     TypedArray,
+    /// Fixed-width SIMD vector (Simd4f / Simd4i share this storage;
+    /// the concrete lane interpretation lives in the `kind` byte on
+    /// `ObjSimd`).
+    Simd,
 }
 
 /// Element type for `ObjTypedArray`. Stored as a `u8` on the
@@ -52,6 +56,7 @@ pub enum TypedArrayKind {
     U8 = 0,
     F32 = 1,
     F64 = 2,
+    I32 = 3,
 }
 
 impl TypedArrayKind {
@@ -60,6 +65,7 @@ impl TypedArrayKind {
             TypedArrayKind::U8 => 1,
             TypedArrayKind::F32 => 4,
             TypedArrayKind::F64 => 8,
+            TypedArrayKind::I32 => 4,
         }
     }
 
@@ -68,6 +74,7 @@ impl TypedArrayKind {
             0 => Some(TypedArrayKind::U8),
             1 => Some(TypedArrayKind::F32),
             2 => Some(TypedArrayKind::F64),
+            3 => Some(TypedArrayKind::I32),
             _ => None,
         }
     }
@@ -77,6 +84,33 @@ impl TypedArrayKind {
             TypedArrayKind::U8 => "ByteArray",
             TypedArrayKind::F32 => "Float32Array",
             TypedArrayKind::F64 => "Float64Array",
+            TypedArrayKind::I32 => "Int32Array",
+        }
+    }
+}
+
+/// Lane format for `ObjSimd`. Stored as a `u8` for the same
+/// JIT-friendly reason as `TypedArrayKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SimdKind {
+    F32x4 = 0,
+    I32x4 = 1,
+}
+
+impl SimdKind {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(SimdKind::F32x4),
+            1 => Some(SimdKind::I32x4),
+            _ => None,
+        }
+    }
+
+    pub fn class_name(self) -> &'static str {
+        match self {
+            SimdKind::F32x4 => "Simd4f",
+            SimdKind::I32x4 => "Simd4i",
         }
     }
 }
@@ -408,6 +442,7 @@ impl fmt::Debug for ObjList {
 /// * `ByteArray`     — `kind = U8`,  1 byte per element
 /// * `Float32Array`  — `kind = F32`, 4 bytes per element (IEEE 754)
 /// * `Float64Array`  — `kind = F64`, 8 bytes per element (IEEE 754)
+/// * `Int32Array`    — `kind = I32`, 4 bytes per element (two's complement)
 ///
 /// `data` is allocated via the global allocator with a layout
 /// whose size = `count * element_size()` and alignment = element
@@ -513,6 +548,22 @@ impl ObjTypedArray {
             unsafe { p.write_unaligned(v) };
         }
     }
+
+    pub fn get_i32(&self, i: usize) -> Option<i32> {
+        if i < self.count as usize {
+            let p = unsafe { self.data.add(i * 4) } as *const i32;
+            Some(unsafe { p.read_unaligned() })
+        } else {
+            None
+        }
+    }
+
+    pub fn set_i32(&mut self, i: usize, v: i32) {
+        if i < self.count as usize {
+            let p = unsafe { self.data.add(i * 4) } as *mut i32;
+            unsafe { p.write_unaligned(v) };
+        }
+    }
 }
 
 impl Drop for ObjTypedArray {
@@ -534,6 +585,63 @@ impl fmt::Debug for ObjTypedArray {
             self.kind_tag().class_name(),
             self.count
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ObjSimd — fixed-width SIMD vector
+// ---------------------------------------------------------------------------
+
+/// A fixed-width 4-lane SIMD vector with inline storage.
+///
+/// The payload is always 16 bytes and is stored as raw 32-bit lane
+/// bits so `Simd4f`/`Simd4i` can reinterpret without touching the
+/// underlying bytes.
+#[repr(C)]
+pub struct ObjSimd {
+    pub header: ObjHeader, // offset 0, 24 bytes
+    pub kind: u8,          // offset 24: SimdKind encoded as u8
+    _pad: [u8; 7],         // offset 25..32
+    pub lanes: [u32; 4],   // offset 32: raw lane bits
+                           // total: 48 bytes
+}
+
+impl ObjSimd {
+    pub fn new(kind: SimdKind, lanes: [u32; 4]) -> Self {
+        Self {
+            header: ObjHeader::new(ObjType::Simd),
+            kind: kind as u8,
+            _pad: [0; 7],
+            lanes,
+        }
+    }
+
+    pub fn kind_tag(&self) -> SimdKind {
+        SimdKind::from_u8(self.kind).unwrap()
+    }
+
+    pub fn lane_bits(&self, i: usize) -> Option<u32> {
+        self.lanes.get(i).copied()
+    }
+
+    pub fn get_f32(&self, i: usize) -> Option<f32> {
+        self.lane_bits(i).map(f32::from_bits)
+    }
+
+    pub fn get_i32(&self, i: usize) -> Option<i32> {
+        self.lane_bits(i).map(|bits| bits as i32)
+    }
+
+    pub fn set_lane_bits(&mut self, i: usize, bits: u32) {
+        if let Some(slot) = self.lanes.get_mut(i) {
+            *slot = bits;
+        }
+    }
+}
+
+impl fmt::Debug for ObjSimd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ObjSimd({:?}, lanes={:?})", self.kind_tag(), self.lanes)
     }
 }
 
@@ -1177,8 +1285,10 @@ pub trait NativeContext {
     /// Allocate a fresh typed array of the given kind and element
     /// count, zero-initialized. Returns a Value pointing at the
     /// new `ObjTypedArray` with `header.class` set to the VM's
-    /// corresponding ByteArray/Float32Array/Float64Array class.
+    /// corresponding ByteArray/Int32Array/Float32Array/Float64Array class.
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value;
+    /// Allocate a fresh SIMD vector of the given kind.
+    fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> Value;
 
     // -- Error handling --
     fn runtime_error(&mut self, msg: String);

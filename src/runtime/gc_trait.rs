@@ -23,6 +23,7 @@ pub trait GcAllocator {
     fn alloc_map(&mut self) -> *mut ObjMap;
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> *mut ObjRange;
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray;
+    fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd;
     fn alloc_fn(&mut self, name: SymbolId, arity: u8, upvalue_count: u16, fn_id: u32)
         -> *mut ObjFn;
     fn alloc_closure(&mut self, function: *mut ObjFn) -> *mut ObjClosure;
@@ -133,6 +134,10 @@ impl GcImpl {
         gc_dispatch!(self, alloc_typed_array, count, kind)
     }
     #[inline(always)]
+    pub fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
+        gc_dispatch!(self, alloc_simd, kind, lanes)
+    }
+    #[inline(always)]
     pub fn alloc_fn(
         &mut self,
         name: SymbolId,
@@ -220,6 +225,10 @@ impl GcAllocator for GcImpl {
     #[inline(always)]
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
         gc_dispatch!(self, alloc_typed_array, count, kind)
+    }
+    #[inline(always)]
+    fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
+        gc_dispatch!(self, alloc_simd, kind, lanes)
     }
     #[inline(always)]
     fn alloc_fn(

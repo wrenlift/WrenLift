@@ -33,8 +33,8 @@ pub const LIST_SIZE: i32 = 40;
 
 // -- ObjTypedArray (40 bytes) -----------------------------------------------
 //
-// Shared backing storage for ByteArray / Float32Array / Float64Array.
-// The `kind` byte (0=U8, 1=F32, 2=F64) drives element size + load/store
+// Shared backing storage for ByteArray / Int32Array / Float32Array / Float64Array.
+// The `kind` byte (0=U8, 1=F32, 2=F64, 3=I32) drives element size + load/store
 // width.
 
 pub const TYPED_ARRAY_COUNT: i32 = 24; // u32 — element count
@@ -51,6 +51,20 @@ pub const OBJ_TYPE_TYPED_ARRAY: u8 = 12;
 pub const TA_KIND_U8: u8 = 0;
 pub const TA_KIND_F32: u8 = 1;
 pub const TA_KIND_F64: u8 = 2;
+pub const TA_KIND_I32: u8 = 3;
+
+// -- ObjSimd (48 bytes) ----------------------------------------------------
+
+pub const SIMD_KIND: i32 = 24; // u8 — SimdKind tag
+pub const SIMD_LANES: i32 = 32; // [u32; 4] raw lane payload
+pub const SIMD_SIZE: i32 = 48;
+
+// ObjType discriminant for ObjSimd.
+pub const OBJ_TYPE_SIMD: u8 = 13;
+
+// SimdKind tag values. Must match `runtime::object::SimdKind`.
+pub const SIMD_KIND_F32X4: u8 = 0;
+pub const SIMD_KIND_I32X4: u8 = 1;
 
 // -- ObjClosure --------------------------------------------------------------
 //
@@ -213,6 +227,17 @@ mod tests {
         assert_eq!(TypedArrayKind::U8 as u8, TA_KIND_U8);
         assert_eq!(TypedArrayKind::F32 as u8, TA_KIND_F32);
         assert_eq!(TypedArrayKind::F64 as u8, TA_KIND_F64);
+        assert_eq!(TypedArrayKind::I32 as u8, TA_KIND_I32);
+    }
+
+    #[test]
+    fn verify_simd_layout() {
+        assert_eq!(std::mem::size_of::<ObjSimd>(), SIMD_SIZE as usize);
+        assert_eq!(memoffset_of!(ObjSimd, kind), SIMD_KIND as usize);
+        assert_eq!(memoffset_of!(ObjSimd, lanes), SIMD_LANES as usize);
+        assert_eq!(ObjType::Simd as u8, OBJ_TYPE_SIMD);
+        assert_eq!(SimdKind::F32x4 as u8, SIMD_KIND_F32X4);
+        assert_eq!(SimdKind::I32x4 as u8, SIMD_KIND_I32X4);
     }
 
     #[test]

@@ -109,6 +109,11 @@ fn smoke_runs_under_wasmtime() {
         captured
     );
     assert!(
+        captured.contains("simd: ok"),
+        "missing simd ops; captured:\n{}",
+        captured
+    );
+    assert!(
         captured.contains("time ok: mono delta >= 0 = true"),
         "monotonic Instant didn't survive in wasm; captured:\n{}",
         captured

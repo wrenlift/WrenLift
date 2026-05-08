@@ -23,7 +23,7 @@
 
 use crate::runtime::object::{
     MapKey, Method, NativeContext, ObjClass, ObjClosure, ObjHeader, ObjInstance, ObjList, ObjMap,
-    ObjString, ObjType,
+    ObjSimd, ObjString, ObjType, SimdKind,
 };
 use crate::runtime::value::Value;
 use std::cell::RefCell;
@@ -4470,8 +4470,29 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                     let kind = unsafe { (*arr).kind_tag() };
                     let v = match kind {
                         TypedArrayKind::U8 => unsafe { (*arr).get_u8(i).unwrap_or(0) as f64 },
+                        TypedArrayKind::I32 => unsafe { (*arr).get_i32(i).unwrap_or(0) as f64 },
                         TypedArrayKind::F32 => unsafe { (*arr).get_f32(i).unwrap_or(0.0) as f64 },
                         TypedArrayKind::F64 => unsafe { (*arr).get_f64(i).unwrap_or(0.0) },
+                    };
+                    return Value::num(v).to_bits();
+                }
+            }
+            ObjType::Simd => {
+                let simd = ptr as *const ObjSimd;
+                if let Some(n) = idx.as_num() {
+                    let raw = n as i64;
+                    let i = if raw < 0 { raw + 4 } else { raw };
+                    if !(0..4).contains(&i) {
+                        return Value::null().to_bits();
+                    }
+                    let i = i as usize;
+                    let v = match unsafe { (*simd).kind_tag() } {
+                        crate::runtime::object::SimdKind::F32x4 => {
+                            unsafe { (*simd).get_f32(i).unwrap_or(0.0) as f64 }
+                        }
+                        crate::runtime::object::SimdKind::I32x4 => {
+                            unsafe { (*simd).get_i32(i).unwrap_or(0) as f64 }
+                        }
                     };
                     return Value::num(v).to_bits();
                 }
@@ -4553,6 +4574,14 @@ pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u
                             TypedArrayKind::U8 => {
                                 if (0.0..=255.0).contains(&v) && v.fract() == 0.0 {
                                     unsafe { (*arr).set_u8(i, v as u8) };
+                                }
+                            }
+                            TypedArrayKind::I32 => {
+                                if v.fract() == 0.0
+                                    && v >= i32::MIN as f64
+                                    && v <= i32::MAX as f64
+                                {
+                                    unsafe { (*arr).set_i32(i, v as i32) };
                                 }
                             }
                             TypedArrayKind::F32 => unsafe { (*arr).set_f32(i, v as f32) },
@@ -5276,6 +5305,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_bit_not" => Some(wren_bit_not as *const () as usize),
         "wren_bit_shl" => Some(wren_bit_shl as *const () as usize),
         "wren_bit_shr" => Some(wren_bit_shr as *const () as usize),
+        "wren_alloc_simd4f" => Some(wren_alloc_simd4f as *const () as usize),
+        "wren_alloc_simd4i" => Some(wren_alloc_simd4i as *const () as usize),
         // Boxed comparisons
         "wren_cmp_lt" => Some(wren_cmp_lt as *const () as usize),
         "wren_cmp_gt" => Some(wren_cmp_gt as *const () as usize),
@@ -5583,6 +5614,34 @@ pub extern "C" fn wren_alloc_instance(class_val: u64) -> u64 {
             let instance = vm.gc.alloc_instance(class_ptr);
             Value::object(instance as *mut u8).to_bits()
         }
+        None => Value::null().to_bits(),
+    }
+}
+
+/// Allocate a `Simd4f` from raw lane bits.
+#[no_mangle]
+pub extern "C" fn wren_alloc_simd4f(l0: u64, l1: u64, l2: u64, l3: u64) -> u64 {
+    match unsafe { vm_ref() } {
+        Some(vm) => vm
+            .new_simd(
+                SimdKind::F32x4,
+                [l0 as u32, l1 as u32, l2 as u32, l3 as u32],
+            )
+            .to_bits(),
+        None => Value::null().to_bits(),
+    }
+}
+
+/// Allocate a `Simd4i` from raw lane bits.
+#[no_mangle]
+pub extern "C" fn wren_alloc_simd4i(l0: u64, l1: u64, l2: u64, l3: u64) -> u64 {
+    match unsafe { vm_ref() } {
+        Some(vm) => vm
+            .new_simd(
+                SimdKind::I32x4,
+                [l0 as u32, l1 as u32, l2 as u32, l3 as u32],
+            )
+            .to_bits(),
         None => Value::null().to_bits(),
     }
 }

@@ -89,6 +89,10 @@ impl GcAllocator for ArenaGc {
         self.alloc_boxed(ObjTypedArray::new(count, kind))
     }
 
+    fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
+        self.alloc_boxed(ObjSimd::new(kind, lanes))
+    }
+
     fn alloc_fn(
         &mut self,
         name: SymbolId,
@@ -208,6 +212,9 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         }
         ObjType::TypedArray => {
             let _ = Box::from_raw(header as *mut ObjTypedArray);
+        }
+        ObjType::Simd => {
+            let _ = Box::from_raw(header as *mut ObjSimd);
         }
     }
 }

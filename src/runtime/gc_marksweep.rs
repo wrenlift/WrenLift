@@ -113,7 +113,12 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {
+        ObjType::String
+        | ObjType::Fn
+        | ObjType::Range
+        | ObjType::Foreign
+        | ObjType::TypedArray
+        | ObjType::Simd => {
         }
 
         ObjType::List => {
@@ -247,6 +252,7 @@ unsafe fn object_size(header: *mut ObjHeader) -> usize {
         ObjType::Foreign => std::mem::size_of::<ObjForeign>(),
         ObjType::Module => std::mem::size_of::<ObjModule>(),
         ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
+        ObjType::Simd => std::mem::size_of::<ObjSimd>(),
     }
 }
 
@@ -291,6 +297,9 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::TypedArray => {
             let _ = Box::from_raw(header as *mut ObjTypedArray);
         }
+        ObjType::Simd => {
+            let _ = Box::from_raw(header as *mut ObjSimd);
+        }
     }
 }
 
@@ -324,6 +333,9 @@ impl GcAllocator for MarkSweepGc {
     }
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
         self.alloc_boxed(ObjTypedArray::new(count, kind))
+    }
+    fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
+        self.alloc_boxed(ObjSimd::new(kind, lanes))
     }
     fn alloc_fn(
         &mut self,

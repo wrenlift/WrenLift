@@ -1,15 +1,16 @@
-//! Built-in ByteArray / Float32Array / Float64Array classes —
+//! Built-in ByteArray / Int32Array / Float32Array / Float64Array classes —
 //! fixed-size contiguous numeric buffers backed by a raw
 //! `Vec<u8>` on the GC heap.
 //!
 //! One storage type (`ObjTypedArray`) with a `kind` byte carries
-//! all three; three separate Wren-facing classes provide
+//! all four; separate Wren-facing classes provide
 //! constructors and `is`-checks while sharing a single set of
 //! accessor method implementations (kind-dispatched internally).
 //!
 //! Surface:
 //!
 //!   ByteArray.new(count)       — zero-init n-byte buffer
+//!   Int32Array.new(count)      — zero-init n-element i32 buffer
 //!   Float32Array.new(count)    — zero-init n-element f32 buffer
 //!   Float64Array.new(count)    — zero-init n-element f64 buffer
 //!   Class.fromList(list)       — copy from a List<Num>
@@ -87,6 +88,28 @@ fn byte_from_value(ctx: &mut dyn NativeContext, v: Value, label: &str) -> Option
     }
 }
 
+fn i32_from_value(ctx: &mut dyn NativeContext, v: Value, label: &str) -> Option<i32> {
+    match v.as_num() {
+        Some(n)
+            if n.is_finite()
+                && n.fract() == 0.0
+                && n >= i32::MIN as f64
+                && n <= i32::MAX as f64 =>
+        {
+            Some(n as i32)
+        }
+        _ => {
+            ctx.runtime_error(format!(
+                "{}: value must be an integer in {}..={}.",
+                label,
+                i32::MIN,
+                i32::MAX
+            ));
+            None
+        }
+    }
+}
+
 // --- Construction ----------------------------------------------
 
 fn byte_array_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -101,6 +124,13 @@ fn float32_array_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         return Value::null();
     };
     ctx.alloc_typed_array(n, TypedArrayKind::F32)
+}
+
+fn int32_array_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let Some(n) = count_arg(ctx, args[1], "Int32Array.new") else {
+        return Value::null();
+    };
+    ctx.alloc_typed_array(n, TypedArrayKind::I32)
 }
 
 fn float64_array_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -154,6 +184,19 @@ fn from_list_generic(
                 }
                 unsafe { (*arr_ptr).set_u8(i, n as u8) };
             }
+            TypedArrayKind::I32 => {
+                if n.fract() != 0.0 || n < i32::MIN as f64 || n > i32::MAX as f64 {
+                    ctx.runtime_error(format!(
+                        "{}: list[{}] must be an integer in {}..={}.",
+                        label,
+                        i,
+                        i32::MIN,
+                        i32::MAX
+                    ));
+                    return Value::null();
+                }
+                unsafe { (*arr_ptr).set_i32(i, n as i32) };
+            }
             TypedArrayKind::F32 => unsafe { (*arr_ptr).set_f32(i, n as f32) },
             TypedArrayKind::F64 => unsafe { (*arr_ptr).set_f64(i, n) },
         }
@@ -167,6 +210,10 @@ fn byte_array_from_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 fn float32_array_from_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     from_list_generic(ctx, args, TypedArrayKind::F32, "Float32Array.fromList")
+}
+
+fn int32_array_from_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    from_list_generic(ctx, args, TypedArrayKind::I32, "Int32Array.fromList")
 }
 
 fn float64_array_from_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -207,6 +254,7 @@ fn ta_subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let i = i as usize;
     match arr.kind_tag() {
         TypedArrayKind::U8 => Value::num(arr.get_u8(i).unwrap_or(0) as f64),
+        TypedArrayKind::I32 => Value::num(arr.get_i32(i).unwrap_or(0) as f64),
         TypedArrayKind::F32 => Value::num(arr.get_f32(i).unwrap_or(0.0) as f64),
         TypedArrayKind::F64 => Value::num(arr.get_f64(i).unwrap_or(0.0)),
     }
@@ -225,6 +273,12 @@ fn ta_subscript_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 return Value::null();
             };
             unsafe { (*arr_ptr).set_u8(i, b) };
+        }
+        TypedArrayKind::I32 => {
+            let Some(n) = i32_from_value(ctx, args[2], "Int32Array[_]=") else {
+                return Value::null();
+            };
+            unsafe { (*arr_ptr).set_i32(i, n) };
         }
         TypedArrayKind::F32 => {
             let Some(n) = args[2].as_num() else {
@@ -280,6 +334,11 @@ fn ta_to_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 out.push(Value::num(arr.get_u8(i).unwrap_or(0) as f64));
             }
         }
+        TypedArrayKind::I32 => {
+            for i in 0..n {
+                out.push(Value::num(arr.get_i32(i).unwrap_or(0) as f64));
+            }
+        }
         TypedArrayKind::F32 => {
             for i in 0..n {
                 out.push(Value::num(arr.get_f32(i).unwrap_or(0.0) as f64));
@@ -308,6 +367,14 @@ pub fn bind(vm: &mut VM) {
         vm.primitive_static(cls, "new(_)", byte_array_new);
         vm.primitive_static(cls, "fromList(_)", byte_array_from_list);
         vm.primitive_static(cls, "fromString(_)", byte_array_from_string);
+        bind_shared_instance(vm, cls);
+    }
+
+    // Int32Array
+    {
+        let cls = vm.int32_array_class;
+        vm.primitive_static(cls, "new(_)", int32_array_new);
+        vm.primitive_static(cls, "fromList(_)", int32_array_from_list);
         bind_shared_instance(vm, cls);
     }
 

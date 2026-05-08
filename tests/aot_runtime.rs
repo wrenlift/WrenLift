@@ -120,6 +120,31 @@ fn class_method_call() {
 }
 
 #[test]
+fn simd_float32_interop() {
+    let r = compile_link_run(
+        "var floats = Float32Array.fromList([1, 2, 3, 4])\n\
+         var v = Simd4f.load(floats, 0) * Simd4f.splat(2)\n\
+         v.store(floats, 0)\n\
+         System.print(floats.toList)\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "[2, 4, 6, 8]\n");
+}
+
+#[test]
+fn simd_int32_interop() {
+    let r = compile_link_run(
+        "var ints = Int32Array.fromList([1, 2, 3, 4])\n\
+         var v = Simd4i.load(ints, 0) + Simd4i.splat(5)\n\
+         v.store(ints, 0)\n\
+         System.print(ints.toList)\n\
+         System.print((v > Simd4i.splat(7)).bitmask)\n",
+    );
+    assert_eq!(r.exit_code, 0, "stderr: {}", r.stderr);
+    assert_eq!(r.stdout, "[6, 7, 8, 9]\n12\n");
+}
+
+#[test]
 fn cha_direct_dispatch() {
     // Single-impl signature → AOT-CHA emits a class-checked
     // direct call into the method body, bypassing wren_call_N.

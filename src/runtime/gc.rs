@@ -422,7 +422,8 @@ impl Gc {
             | ObjType::Fn
             | ObjType::Range
             | ObjType::Foreign
-            | ObjType::TypedArray => {}
+            | ObjType::TypedArray
+            | ObjType::Simd => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -534,6 +535,10 @@ impl Gc {
 
     pub fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
         self.alloc(ObjTypedArray::new(count, kind))
+    }
+
+    pub fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
+        self.alloc(ObjSimd::new(kind, lanes))
     }
 
     pub fn alloc_fn(
@@ -863,6 +868,7 @@ impl Gc {
             ObjType::Foreign => self.promote_typed::<ObjForeign>(old_header),
             ObjType::Module => self.promote_typed::<ObjModule>(old_header),
             ObjType::TypedArray => self.promote_typed::<ObjTypedArray>(old_header),
+            ObjType::Simd => self.promote_typed::<ObjSimd>(old_header),
         };
 
         // Fix ObjUpvalue self-referential location pointer.
@@ -996,7 +1002,8 @@ impl Gc {
             | ObjType::Fn
             | ObjType::Range
             | ObjType::Foreign
-            | ObjType::TypedArray => {}
+            | ObjType::TypedArray
+            | ObjType::Simd => {}
             ObjType::List => {
                 let list = &*(header as *mut ObjList);
                 for (i, &val) in list.as_slice().iter().enumerate() {
@@ -1201,7 +1208,12 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {
+        ObjType::String
+        | ObjType::Fn
+        | ObjType::Range
+        | ObjType::Foreign
+        | ObjType::TypedArray
+        | ObjType::Simd => {
         }
 
         ObjType::List => {
@@ -1369,7 +1381,12 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
     }
 
     match (*header).obj_type {
-        ObjType::String | ObjType::Fn | ObjType::Range | ObjType::Foreign | ObjType::TypedArray => {
+        ObjType::String
+        | ObjType::Fn
+        | ObjType::Range
+        | ObjType::Foreign
+        | ObjType::TypedArray
+        | ObjType::Simd => {
         }
 
         ObjType::List => {
@@ -1490,6 +1507,7 @@ fn object_size(header: *mut ObjHeader) -> usize {
             ObjType::Foreign => std::mem::size_of::<ObjForeign>(),
             ObjType::Module => std::mem::size_of::<ObjModule>(),
             ObjType::TypedArray => std::mem::size_of::<ObjTypedArray>(),
+            ObjType::Simd => std::mem::size_of::<ObjSimd>(),
         }
     }
 }
@@ -1510,6 +1528,7 @@ unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
         ObjType::Foreign => std::ptr::drop_in_place(header as *mut ObjForeign),
         ObjType::Module => std::ptr::drop_in_place(header as *mut ObjModule),
         ObjType::TypedArray => std::ptr::drop_in_place(header as *mut ObjTypedArray),
+        ObjType::Simd => std::ptr::drop_in_place(header as *mut ObjSimd),
     }
 }
 
@@ -1559,6 +1578,9 @@ unsafe fn drop_object(header: *mut ObjHeader) {
         ObjType::TypedArray => {
             std::ptr::drop_in_place(header as *mut ObjTypedArray);
         }
+        ObjType::Simd => {
+            std::ptr::drop_in_place(header as *mut ObjSimd);
+        }
     }
 }
 
@@ -1595,6 +1617,10 @@ impl super::gc_trait::GcAllocator for Gc {
     #[inline(always)]
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> *mut ObjTypedArray {
         self.alloc_typed_array(count, kind)
+    }
+    #[inline(always)]
+    fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> *mut ObjSimd {
+        self.alloc_simd(kind, lanes)
     }
     #[inline(always)]
     fn alloc_fn(

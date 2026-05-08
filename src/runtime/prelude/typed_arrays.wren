@@ -35,6 +35,21 @@ class ByteArray {
   toString {}
 }
 
+/// `count`-element i32 buffer. Same shape as `ByteArray`;
+/// element width is 4 bytes.
+class Int32Array {
+  static new(count) {}
+  static fromList(list) {}
+  count {}
+  byteLength {}
+  [index] {}
+  [index]=(value) {}
+  iterate(iterator) {}
+  iteratorValue(iterator) {}
+  toList {}
+  toString {}
+}
+
 /// `count`-element f32 buffer. Same shape as `ByteArray`;
 /// element width is 4 bytes.
 class Float32Array {
@@ -62,4 +77,76 @@ class Float64Array {
   iteratorValue(iterator) {}
   toList {}
   toString {}
+}
+
+/// Fixed-width 4-lane SIMD value. Shared helpers live here; concrete
+/// element kind lives on `Simd4f` and `Simd4i`.
+class Simd {
+  count {}
+  byteLength {}
+  [index] {}
+  iterate(iterator) {}
+  iteratorValue(iterator) {}
+  replaceLane(index, value) {}
+  shuffle(i0, i1, i2, i3) {}
+  toString {}
+}
+
+/// 4-lane `f32` SIMD value with typed-array load/store interop.
+class Simd4f is Simd {
+  static new(x, y, z, w) {}
+  static splat(value) {}
+  static load(array, offset) {}
+  static select(mask, whenTrue, whenFalse) {}
+  store(array, offset) {}
+  toFloat32Array {}
+  reinterpretAsInt {}
+  +(other) {}
+  -(other) {}
+  *(other) {}
+  /(other) {}
+  - {}
+  min(other) {}
+  max(other) {}
+  abs {}
+  sqrt {}
+  ==(other) {}
+  !=(other) {}
+  <(other) {}
+  <=(other) {}
+  >(other) {}
+  >=(other) {}
+}
+
+/// 4-lane signed `i32` SIMD value with typed-array load/store interop.
+class Simd4i is Simd {
+  static new(x, y, z, w) {}
+  static splat(value) {}
+  static load(array, offset) {}
+  static select(mask, whenTrue, whenFalse) {}
+  store(array, offset) {}
+  toInt32Array {}
+  reinterpretAsFloat {}
+  +(other) {}
+  -(other) {}
+  *(other) {}
+  - {}
+  &(other) {}
+  |(other) {}
+  ^(other) {}
+  ~ {}
+  <<(count) {}
+  >>(count) {}
+  min(other) {}
+  max(other) {}
+  abs {}
+  allTrue {}
+  anyTrue {}
+  bitmask {}
+  ==(other) {}
+  !=(other) {}
+  <(other) {}
+  <=(other) {}
+  >(other) {}
+  >=(other) {}
 }

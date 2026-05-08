@@ -21,6 +21,30 @@
 //!
 //! [`resolve_with_prelude`]: super::resolve::resolve_with_prelude
 
+pub const CORE_PRELUDE_NAMES: &[&str] = &[
+    // Core classes (vm.rs::core::initialize).
+    "Object",
+    "Class",
+    "Bool",
+    "Num",
+    "String",
+    "List",
+    "Map",
+    "Range",
+    "Null",
+    "Fn",
+    "Fiber",
+    "System",
+    "Sequence",
+    "ByteArray",
+    "Int32Array",
+    "Float32Array",
+    "Float64Array",
+    "Simd",
+    "Simd4f",
+    "Simd4i",
+];
+
 pub const PRELUDE_NAMES: &[&str] = &[
     // Core classes (vm.rs::core::initialize).
     "Object",
@@ -37,8 +61,12 @@ pub const PRELUDE_NAMES: &[&str] = &[
     "System",
     "Sequence",
     "ByteArray",
+    "Int32Array",
     "Float32Array",
     "Float64Array",
+    "Simd",
+    "Simd4f",
+    "Simd4i",
     // Browser bridges injected by the wasm runtime's
     // `PRELUDE_IMPORT`.
     "Future",

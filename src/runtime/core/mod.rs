@@ -23,6 +23,7 @@ mod string;
 mod system;
 pub mod time;
 pub mod toml;
+mod simd;
 mod typed_array;
 pub mod uuid;
 
@@ -93,8 +94,14 @@ pub fn initialize(vm: &mut VM) {
     // Typed numeric buffers. Three classes share one storage
     // type (`ObjTypedArray`) — each tags its elements differently.
     vm.byte_array_class = vm.make_class("ByteArray", vm.sequence_class);
+    vm.int32_array_class = vm.make_class("Int32Array", vm.sequence_class);
     vm.float32_array_class = vm.make_class("Float32Array", vm.sequence_class);
     vm.float64_array_class = vm.make_class("Float64Array", vm.sequence_class);
+
+    // Fixed-width SIMD values.
+    vm.simd_class = vm.make_class("Simd", vm.sequence_class);
+    vm.simd4f_class = vm.make_class("Simd4f", vm.simd_class);
+    vm.simd4i_class = vm.make_class("Simd4i", vm.simd_class);
 
     // Wrapper sequence classes (lazy iterators).
     let seq = vm.sequence_class;
@@ -145,6 +152,7 @@ pub fn initialize(vm: &mut VM) {
     string::bind(vm);
     list::bind(vm);
     typed_array::bind(vm);
+    simd::bind(vm);
     map::bind(vm);
     range::bind(vm);
     fn_obj::bind(vm);
@@ -181,8 +189,12 @@ fn propagate_inherited_methods(vm: &mut super::vm::VM) {
         vm.string_class,
         vm.list_class,
         vm.byte_array_class,
+        vm.int32_array_class,
         vm.float32_array_class,
         vm.float64_array_class,
+        vm.simd_class,
+        vm.simd4f_class,
+        vm.simd4i_class,
         vm.map_class,
         vm.range_class,
         vm.map_sequence_class,
