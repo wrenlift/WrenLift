@@ -101,7 +101,7 @@ impl WasmModule {
 /// every later one. Arities beyond the cap return `None`;
 /// `mir_needs_unsupported_helpers` rejects the function so
 /// it stays BC-interpreted.
-pub(crate) fn make_list_helper_name(arity: usize) -> Option<&'static str> {
+pub fn make_list_helper_name(arity: usize) -> Option<&'static str> {
     match arity {
         0 => Some("wren_make_list_0"),
         1 => Some("wren_make_list_1"),
@@ -112,7 +112,7 @@ pub(crate) fn make_list_helper_name(arity: usize) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn make_map_helper_name(entries: usize) -> Option<&'static str> {
+pub fn make_map_helper_name(entries: usize) -> Option<&'static str> {
     match entries {
         0 => Some("wren_make_map_0"),
         1 => Some("wren_make_map_1"),
@@ -123,7 +123,7 @@ pub(crate) fn make_map_helper_name(entries: usize) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn string_concat_helper_name(parts: usize) -> Option<&'static str> {
+pub fn string_concat_helper_name(parts: usize) -> Option<&'static str> {
     match parts {
         2 => Some("wren_string_concat_2"),
         3 => Some("wren_string_concat_3"),
