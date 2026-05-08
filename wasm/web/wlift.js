@@ -62,35 +62,42 @@ import { createGpuBridge } from "./gpu-bridge.js";
 
 export async function createWlift(opts = {}) {
   const { mode = "worker", shared = false, wasm } = opts;
-  const wasmUrl = pickWasmUrl(wasm);
-  if (mode === "worker") return new WorkerWlift({ shared, wasmUrl }).init();
-  if (mode === "main")   return new MainWlift({ wasmUrl }).init();
+  const { primary, fallback } = pickWasmUrls(wasm);
+  if (mode === "worker") return new WorkerWlift({ shared, wasmUrl: primary, fallbackUrl: fallback }).init();
+  if (mode === "main")   return new MainWlift({ wasmUrl: primary, fallbackUrl: fallback }).init();
   throw new Error(`createWlift: unknown mode '${mode}', expected 'worker' or 'main'`);
 }
 
 // Pick which `wlift_wasm_bg.*.wasm` the loader hands wasm-bindgen.
+// Returns `{ primary, fallback }`:
+//
+//   * `primary` — the URL to try first (or `undefined` to let
+//     wasm-bindgen resolve its co-located default).
+//   * `fallback` — used only when the primary fails to load. Lets
+//     a deployment that hasn't yet staged the simd128 build keep
+//     working: detection picks `simd128Url`, but if the file 404s
+//     the loader retries with the baseline URL.
+//
 // Three input shapes are accepted on `opts.wasm`:
 //
-//   undefined       — let wasm-bindgen resolve the default URL next
-//                     to `wlift_wasm.js`. Same behaviour as before.
-//   string | URL    — use this URL verbatim (no feature detection).
-//   { url, simd128Url } — embedder ships two builds; pick the SIMD
-//                     one when the host validates a v128 module,
-//                     otherwise fall back to `url`. Either field is
-//                     optional; missing fields fall through to the
-//                     wasm-bindgen default.
-//
-// Returning `undefined` means "use the default" so we don't break
-// deployments that haven't shipped a second build.
-function pickWasmUrl(wasm) {
-  if (wasm === undefined || wasm === null) return undefined;
-  if (typeof wasm === "string" || wasm instanceof URL) return wasm;
+//   undefined       — both fields undefined; wasm-bindgen default.
+//   string | URL    — `primary` is that URL, no fallback.
+//   { url, simd128Url } — embedder ships two builds; pick simd128
+//                     when the host validates v128, otherwise the
+//                     baseline. The baseline `url` is always
+//                     stashed as `fallback` (so even with v128
+//                     support we recover from a missing file).
+function pickWasmUrls(wasm) {
+  if (wasm === undefined || wasm === null) return { primary: undefined, fallback: undefined };
+  if (typeof wasm === "string" || wasm instanceof URL) return { primary: wasm, fallback: undefined };
   if (typeof wasm === "object") {
     const { url, simd128Url } = wasm;
-    if (simd128Url && simd128Supported()) return simd128Url;
-    return url;
+    if (simd128Url && simd128Supported()) {
+      return { primary: simd128Url, fallback: url };
+    }
+    return { primary: url, fallback: undefined };
   }
-  return undefined;
+  return { primary: undefined, fallback: undefined };
 }
 
 // Feature-detect wasm SIMD (the v128 spec). Resolves to `true` when
@@ -120,6 +127,15 @@ export function simd128Supported() {
     _simdSupported = false;
   }
   return _simdSupported;
+}
+
+// Mirror onto `globalThis` so embedders can poke at the answer
+// from the browser DevTools console without re-importing the
+// module (`> simd128Supported()` works after the page has loaded
+// `./wlift.js`). Same name; idempotent if a previous load
+// already set it.
+if (typeof globalThis !== "undefined") {
+  globalThis.simd128Supported = simd128Supported;
 }
 
 // DOM `MouseEvent.button` is a numeric index (0/1/2 → left/middle/
@@ -576,7 +592,7 @@ export async function runProject(wlift, source, hatchfileText, opts = {}) {
 // ---------------------------------------------------------------------------
 
 class WorkerWlift {
-  constructor({ shared = false, wasmUrl } = {}) {
+  constructor({ shared = false, wasmUrl, fallbackUrl } = {}) {
     this.mode    = "worker";
     this.version = null;
     // SAB requires both crossOriginIsolated AND a SAB-aware
@@ -589,12 +605,20 @@ class WorkerWlift {
     this._memory = null;
     // Worker top-level `await init()` runs before any `postMessage`
     // can land, so a SIMD-flavoured wasm URL has to ride on the
-    // worker URL itself as a search param. The worker reads it back
-    // before passing the URL into wasm-bindgen's `default()`.
+    // worker URL itself as a search param. The worker reads it
+    // back before passing the URL into wasm-bindgen's `default()`,
+    // and on a primary-URL fetch failure transparently retries
+    // against `wasmUrlFallback` (the baseline cdylib) so a
+    // deployment that hasn't staged the simd128 build yet keeps
+    // working.
     const workerUrl = new URL("./worker.js", import.meta.url);
     if (wasmUrl !== undefined) {
       const asString = wasmUrl instanceof URL ? wasmUrl.href : String(wasmUrl);
       workerUrl.searchParams.set("wasmUrl", asString);
+    }
+    if (fallbackUrl !== undefined) {
+      const asString = fallbackUrl instanceof URL ? fallbackUrl.href : String(fallbackUrl);
+      workerUrl.searchParams.set("wasmUrlFallback", asString);
     }
     this.worker  = new Worker(workerUrl, { type: "module" });
     this.pending = new Map();
@@ -837,12 +861,13 @@ class WorkerWlift {
 // ---------------------------------------------------------------------------
 
 class MainWlift {
-  constructor({ wasmUrl } = {}) {
+  constructor({ wasmUrl, fallbackUrl } = {}) {
     this.mode    = "main";
     this.version = null;
     this._mod    = null;
     this._memory = null;
     this._wasmUrl = wasmUrl;
+    this._fallbackUrl = fallbackUrl;
   }
 
   async init() {
@@ -965,9 +990,29 @@ class MainWlift {
     // from the default `init()`. `exports.memory` is the live
     // `WebAssembly.Memory` instance — that's what main-mode
     // callers want for direct buffer access.
-    const wasm = this._wasmUrl
-      ? await mod.default(this._wasmUrl)
-      : await mod.default();
+    //
+    // Try the primary URL first (the simd128 build, when feature
+    // detection picked it). On failure — the most common case is
+    // a deployment that hasn't staged the second `.wasm` yet, so
+    // the fetch 404s — fall back to the baseline URL. Without
+    // this, the page would break for every visitor on the gap
+    // between rolling out the JS shim and rolling out the wasm
+    // artifact.
+    let wasm;
+    try {
+      wasm = this._wasmUrl
+        ? await mod.default(this._wasmUrl)
+        : await mod.default();
+    } catch (e) {
+      if (this._fallbackUrl) {
+        console.warn(
+          `[wlift] primary wasm URL failed (${e}); retrying with fallback ${this._fallbackUrl}`,
+        );
+        wasm = await mod.default(this._fallbackUrl);
+      } else {
+        throw e;
+      }
+    }
     this._mod    = mod;
     this._memory = wasm.memory;
     this.version = mod.version();
@@ -1346,6 +1391,40 @@ class MainWlift {
       wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
       wren_jit_slot_for_module_var: wasm.wren_jit_slot_for_module_var,
       wren_get_module_var: wasm.wren_get_module_var,
+      // SIMD intrinsic helpers — see the matching block in
+      // `worker.js` for the full rationale. `bitmask` / `allTrue`
+      // / `anyTrue` are the only ones the wasm emitter routes
+      // through today; the rest are exported here for symmetry
+      // with the worker-mode shim and a future emitter pass.
+      wren_simd4f_add: wasm.wren_simd4f_add,
+      wren_simd4f_sub: wasm.wren_simd4f_sub,
+      wren_simd4f_mul: wasm.wren_simd4f_mul,
+      wren_simd4f_div: wasm.wren_simd4f_div,
+      wren_simd4f_min: wasm.wren_simd4f_min,
+      wren_simd4f_max: wasm.wren_simd4f_max,
+      wren_simd4f_eq:  wasm.wren_simd4f_eq,
+      wren_simd4f_ne:  wasm.wren_simd4f_ne,
+      wren_simd4f_lt:  wasm.wren_simd4f_lt,
+      wren_simd4f_le:  wasm.wren_simd4f_le,
+      wren_simd4f_gt:  wasm.wren_simd4f_gt,
+      wren_simd4f_ge:  wasm.wren_simd4f_ge,
+      wren_simd4i_add: wasm.wren_simd4i_add,
+      wren_simd4i_sub: wasm.wren_simd4i_sub,
+      wren_simd4i_mul: wasm.wren_simd4i_mul,
+      wren_simd4i_min: wasm.wren_simd4i_min,
+      wren_simd4i_max: wasm.wren_simd4i_max,
+      wren_simd4i_and: wasm.wren_simd4i_and,
+      wren_simd4i_or:  wasm.wren_simd4i_or,
+      wren_simd4i_xor: wasm.wren_simd4i_xor,
+      wren_simd4i_eq:  wasm.wren_simd4i_eq,
+      wren_simd4i_ne:  wasm.wren_simd4i_ne,
+      wren_simd4i_lt:  wasm.wren_simd4i_lt,
+      wren_simd4i_le:  wasm.wren_simd4i_le,
+      wren_simd4i_gt:  wasm.wren_simd4i_gt,
+      wren_simd4i_ge:  wasm.wren_simd4i_ge,
+      wren_simd4i_bitmask:  wasm.wren_simd4i_bitmask,
+      wren_simd4i_all_true: wasm.wren_simd4i_all_true,
+      wren_simd4i_any_true: wasm.wren_simd4i_any_true,
       __wlift_jit_table: __wliftJitTable,
     };
     globalThis._wlift_jit_instantiate = (bytes) => {

@@ -692,7 +692,7 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
     // *the* DOM the Wren program manipulates — `Dom.text("#x")`
     // hits real `document.querySelector` either inline (main
     // mode) or via the worker→main postMessage round-trip.
-    import { createWlift, parseHatchfileToml, resolveDepsFromManifest, lintWren, hoverWren, completeWren } from "./wlift.js";
+    import { createWlift, simd128Supported, parseHatchfileToml, resolveDepsFromManifest, lintWren, hoverWren, completeWren } from "./wlift.js";
     import { ErrorKind } from "./wlift_wasm.js";
     // CodeMirror 6 — modular ESM via esm.sh. The dev server's
     // COOP/COEP headers cooperate with esm.sh's CORP responses,
@@ -1807,7 +1807,20 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       // — see resetCanvases for why.
       resetCanvases();
       try {
-        wlift = await createWlift({ mode });
+        // SIMD-flavoured wasm: request the v128-enabled cdylib
+        // when the host advertises it, otherwise fall through to
+        // the baseline build. `createWlift` returns `url` (the
+        // baseline) when `simd128Supported()` is false, so older
+        // browsers that haven't shipped the wasm SIMD spec keep
+        // working unchanged. Both URLs are relative to this
+        // playground's directory — `bench.yml` stages both into
+        // `site/playground/web/` on every deploy.
+        const wasmUrl = new URL("./wlift_wasm_bg.wasm", import.meta.url);
+        const simd128WasmUrl = new URL("./wlift_wasm_bg.simd128.wasm", import.meta.url);
+        wlift = await createWlift({
+          mode,
+          wasm: { url: wasmUrl, simd128Url: simd128WasmUrl },
+        });
       } catch (e) {
         statusEl.textContent = `failed: ${e}`;
         statusEl.classList.add("error");
@@ -1819,9 +1832,10 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       }
       statusEl.textContent = `ready · ${mode}`;
       statusEl.classList.add("ok");
+      const simdTag = simd128Supported() ? "simd128" : "scalar";
       versionEl.textContent = wlift.memory
-        ? `${wlift.version} · linear memory ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB (direct)`
-        : `${wlift.version} · linear memory hidden behind worker boundary`;
+        ? `${wlift.version} · ${simdTag} · linear memory ${(wlift.memory.buffer.byteLength / 1024 / 1024).toFixed(1)} MiB (direct)`
+        : `${wlift.version} · ${simdTag} · linear memory hidden behind worker boundary`;
       setRunMode("idle");
       // Initial boot + mode-switch: run by default. Example
       // dropdown switches respect the autorun toggle and pass

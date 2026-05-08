@@ -20,7 +20,7 @@ mod range;
 pub mod regex;
 mod sequence;
 mod simd;
-mod simd_kernels;
+pub mod simd_kernels;
 mod string;
 mod system;
 pub mod time;

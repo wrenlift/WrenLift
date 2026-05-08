@@ -264,19 +264,40 @@ globalThis._wlift_jit_reset = () => {
 // cross-module call. With ~22k recursive calls in fib(20) that
 // adds up; raw exports are direct wasm-to-wasm.
 //
-// `wasmUrl` search param: `WorkerWlift` writes a custom wasm URL
-// into the worker's own URL when the embedder picks a SIMD
-// (or any other) flavoured build via `createWlift({wasm: …})`.
-// We pass it straight through to wasm-bindgen's `default()`.
-// Absent param ⇒ wasm-bindgen falls back to its co-located default.
-const _wasmUrlParam = (() => {
+// `wasmUrl` / `wasmUrlFallback` search params: `WorkerWlift`
+// writes the embedder's chosen URLs onto the worker's own URL
+// when `createWlift({wasm: …})` was called. We try the primary
+// (`wasmUrl`) first, and on failure — the most common case is a
+// deployment that hasn't yet staged the simd128 build, so the
+// fetch 404s — fall back to `wasmUrlFallback` (the baseline
+// build). Absent params ⇒ wasm-bindgen resolves its co-located
+// default.
+const _wasmUrlParams = (() => {
   try {
-    return new URL(self.location.href).searchParams.get("wasmUrl") || undefined;
+    const params = new URL(self.location.href).searchParams;
+    return {
+      primary: params.get("wasmUrl") || undefined,
+      fallback: params.get("wasmUrlFallback") || undefined,
+    };
   } catch (_) {
-    return undefined;
+    return { primary: undefined, fallback: undefined };
   }
 })();
-const wasm = _wasmUrlParam ? await init(_wasmUrlParam) : await init();
+let wasm;
+try {
+  wasm = _wasmUrlParams.primary
+    ? await init(_wasmUrlParams.primary)
+    : await init();
+} catch (e) {
+  if (_wasmUrlParams.fallback) {
+    console.warn(
+      `[wlift worker] primary wasm URL failed (${e}); retrying with fallback ${_wasmUrlParams.fallback}`,
+    );
+    wasm = await init(_wasmUrlParams.fallback);
+  } else {
+    throw e;
+  }
+}
 __wliftWrenImports = {
   wren_num_add:   wasm.wren_num_add,
   wren_num_sub:   wasm.wren_num_sub,
@@ -296,6 +317,41 @@ __wliftWrenImports = {
   wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
   wren_jit_slot_for_module_var: wasm.wren_jit_slot_for_module_var,
   wren_get_module_var: wasm.wren_get_module_var,
+  // SIMD intrinsic helpers — only the Simd-exclusive selectors
+  // (`bitmask` / `allTrue` / `anyTrue`) are wired into the wasm
+  // emitter today. The remaining f32x4 / i32x4 binops + cmps are
+  // exported here so embedders can call them directly via the
+  // wasm-bindgen namespace and a future emitter pass can pick
+  // them up without touching the JS shim.
+  wren_simd4f_add: wasm.wren_simd4f_add,
+  wren_simd4f_sub: wasm.wren_simd4f_sub,
+  wren_simd4f_mul: wasm.wren_simd4f_mul,
+  wren_simd4f_div: wasm.wren_simd4f_div,
+  wren_simd4f_min: wasm.wren_simd4f_min,
+  wren_simd4f_max: wasm.wren_simd4f_max,
+  wren_simd4f_eq:  wasm.wren_simd4f_eq,
+  wren_simd4f_ne:  wasm.wren_simd4f_ne,
+  wren_simd4f_lt:  wasm.wren_simd4f_lt,
+  wren_simd4f_le:  wasm.wren_simd4f_le,
+  wren_simd4f_gt:  wasm.wren_simd4f_gt,
+  wren_simd4f_ge:  wasm.wren_simd4f_ge,
+  wren_simd4i_add: wasm.wren_simd4i_add,
+  wren_simd4i_sub: wasm.wren_simd4i_sub,
+  wren_simd4i_mul: wasm.wren_simd4i_mul,
+  wren_simd4i_min: wasm.wren_simd4i_min,
+  wren_simd4i_max: wasm.wren_simd4i_max,
+  wren_simd4i_and: wasm.wren_simd4i_and,
+  wren_simd4i_or:  wasm.wren_simd4i_or,
+  wren_simd4i_xor: wasm.wren_simd4i_xor,
+  wren_simd4i_eq:  wasm.wren_simd4i_eq,
+  wren_simd4i_ne:  wasm.wren_simd4i_ne,
+  wren_simd4i_lt:  wasm.wren_simd4i_lt,
+  wren_simd4i_le:  wasm.wren_simd4i_le,
+  wren_simd4i_gt:  wasm.wren_simd4i_gt,
+  wren_simd4i_ge:  wasm.wren_simd4i_ge,
+  wren_simd4i_bitmask:  wasm.wren_simd4i_bitmask,
+  wren_simd4i_all_true: wasm.wren_simd4i_all_true,
+  wren_simd4i_any_true: wasm.wren_simd4i_any_true,
   __wlift_jit_table: __wliftJitTable,
 };
 // Stash the namespace on the worker's globalThis so the worker-

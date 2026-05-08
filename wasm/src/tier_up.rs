@@ -138,11 +138,25 @@ extern "C" {
 /// (would LinkError at instantiation).
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
-    if mir_needs_unsupported_helpers(mir) {
+    // The wasm SIMD inliner needs the global interner so
+    // `emit_mir_with_interner` can resolve a Call's method
+    // SymbolId to its textual selector ("bitmask" / "+(_)" /
+    // etc.) and decide whether to route through a dedicated
+    // intrinsic helper. Pull it from the live VM — `current_vm`
+    // is set on every `interpret` / `run_fiber` boundary, so
+    // we're inside one whenever tier-up fires.
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if mir_needs_unsupported_helpers(mir, vm_ptr) {
         COMPILE_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let module = match wren_lift::codegen::wasm::emit_mir(mir) {
+    let module_result = if vm_ptr.is_null() {
+        wren_lift::codegen::wasm::emit_mir(mir)
+    } else {
+        let interner = unsafe { &(*vm_ptr).interner };
+        wren_lift::codegen::wasm::emit_mir_with_interner(mir, interner)
+    };
+    let module = match module_result {
         Ok(m) => m,
         Err(_) => {
             COMPILE_REJECT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -162,19 +176,49 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
 /// Walk MIR for any instruction whose `wren_*` runtime helper
 /// isn't bound yet. Currently supports the leaf-arithmetic subset
 /// (ConstNum / Box / Unbox / arithmetic / comparison / branches /
-/// Return) plus arity-1 `Call` and `GetModuleVar`. Anything that
-/// would require an unbound helper (`wren_make_*`, GC alloc,
-/// upvalue access, etc.) gets rejected so instantiation never
-/// trips LinkError.
+/// Return) plus arity-1 `Call`, the SIMD intrinsic Calls
+/// (`bitmask` / `allTrue` / `anyTrue`, regardless of arity), and
+/// `GetModuleVar`. Anything that would require an unbound helper
+/// (`wren_make_*`, GC alloc, upvalue access, etc.) gets rejected
+/// so instantiation never trips LinkError.
+///
+/// `vm_ptr` lets the gate resolve a Call's method `SymbolId` to
+/// its textual selector — needed for the SIMD-intrinsic exception.
+/// Pass null when the interner isn't available (e.g. wasi smoke);
+/// the gate falls back to the strict arity-1 rule.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn mir_needs_unsupported_helpers(mir: &wren_lift::mir::MirFunction) -> bool {
+fn mir_needs_unsupported_helpers(
+    mir: &wren_lift::mir::MirFunction,
+    vm_ptr: *mut wren_lift::runtime::vm::VM,
+) -> bool {
     use wren_lift::mir::Instruction;
+    let interner = if vm_ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &(*vm_ptr).interner })
+    };
+    let is_simd_intrinsic_call = |method: wren_lift::intern::SymbolId, arity: usize| -> bool {
+        let Some(interner) = interner else {
+            return false;
+        };
+        matches!(
+            (interner.resolve(method), arity),
+            ("bitmask", 0) | ("allTrue", 0) | ("anyTrue", 0)
+        )
+    };
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
-                // `Call` is supported for arity 1 (`wren_call_1`).
-                // Other arities reject until their helpers land.
-                Instruction::Call { args, .. } if args.len() != 1 => return true,
+                // `Call` is supported for arity 1 (`wren_call_1`)
+                // and for the recognised SIMD intrinsics
+                // regardless of arity (each routes to a dedicated
+                // `wren_simd*_*` helper). Everything else rejects
+                // until its helper lands.
+                Instruction::Call { method, args, .. }
+                    if args.len() != 1 && !is_simd_intrinsic_call(*method, args.len()) =>
+                {
+                    return true
+                }
                 Instruction::CallStaticSelf { .. }
                 | Instruction::SuperCall { .. }
                 | Instruction::MakeClosure { .. }
@@ -460,6 +504,236 @@ pub fn wren_cmp_ne(a: u64, b: u64) -> u64 {
 pub fn wren_not(a: u64) -> u64 {
     let av = Value::from_bits(a);
     Value::bool(!av.is_truthy_wren()).to_bits()
+}
+
+// ---------------------------------------------------------------------------
+// SIMD intrinsic helpers — wasm tier-up fast path.
+// ---------------------------------------------------------------------------
+//
+// The Cranelift backend inlines SIMD ops directly into emitted
+// machine code (`try_lower_simd_intrinsic_call`). The wasm
+// emitter can't read ObjSimd lanes inline because the JIT'd
+// wasm module has its own linear memory, separate from the
+// cdylib's heap. Instead, the wasm emitter calls one of these
+// per-intrinsic helpers — each takes NaN-boxed `Value`s, type-
+// checks the receiver / arg, applies the kernel from
+// `simd_kernels`, and allocates the result. The kernel itself
+// runs at v128 speed when the cdylib was built with
+// `+simd128`, falling through to a scalar loop otherwise.
+//
+// On a type mismatch we delegate to `wren_call_1_slow` (binops /
+// cmps) or `wren_call_0_slow` semantics (reductions) so the
+// observable result matches what the slow-path JIT would
+// produce. Method names are the standard Wren selectors —
+// "+(_)", "==(_)", "bitmask", etc.
+
+#[inline(always)]
+fn simd_lanes_if_kind(
+    bits: u64,
+    expected: wren_lift::runtime::object::SimdKind,
+) -> Option<[u32; 4]> {
+    use wren_lift::runtime::object::{ObjHeader, ObjSimd, ObjType};
+    let v = Value::from_bits(bits);
+    if !v.is_object() {
+        return None;
+    }
+    let ptr = v.as_object()?;
+    if ptr.is_null() {
+        return None;
+    }
+    let header = ptr as *const ObjHeader;
+    if unsafe { (*header).obj_type } != ObjType::Simd {
+        return None;
+    }
+    let simd = ptr as *const ObjSimd;
+    if unsafe { (*simd).kind_tag() } != expected {
+        return None;
+    }
+    Some(unsafe { (*simd).lanes })
+}
+
+#[inline(always)]
+fn make_simd4f(lanes: [u32; 4]) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    unsafe {
+        (*vm_ptr)
+            .new_simd(wren_lift::runtime::object::SimdKind::F32x4, lanes)
+            .to_bits()
+    }
+}
+
+#[inline(always)]
+fn make_simd4i(lanes: [u32; 4]) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    unsafe {
+        (*vm_ptr)
+            .new_simd(wren_lift::runtime::object::SimdKind::I32x4, lanes)
+            .to_bits()
+    }
+}
+
+/// Type-mismatch fallback for arity-1 SIMD intrinsics — defers
+/// to the same dispatch path `wren_call_1` uses so the result
+/// matches the slow-path JIT and the BC interpreter exactly.
+#[inline(always)]
+fn simd_intrinsic_fallback_1(recv_bits: u64, sig: &str, arg_bits: u64) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let recv = Value::from_bits(recv_bits);
+    let arg = Value::from_bits(arg_bits);
+    use wren_lift::runtime::object::NativeContext;
+    match vm.call_method_on(recv, sig, &[arg]) {
+        Some(v) => v.to_bits(),
+        None => Value::null().to_bits(),
+    }
+}
+
+#[inline(always)]
+fn simd_intrinsic_fallback_0(recv_bits: u64, sig: &str) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let recv = Value::from_bits(recv_bits);
+    use wren_lift::runtime::object::NativeContext;
+    match vm.call_method_on(recv, sig, &[]) {
+        Some(v) => v.to_bits(),
+        None => Value::null().to_bits(),
+    }
+}
+
+macro_rules! simd4f_binop {
+    ($name:ident, $sig:literal, $kernel:ident) => {
+        #[wasm_bindgen]
+        pub fn $name(a: u64, b: u64) -> u64 {
+            use wren_lift::runtime::core::simd_kernels as k;
+            use wren_lift::runtime::object::SimdKind;
+            let Some(la) = simd_lanes_if_kind(a, SimdKind::F32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            let Some(lb) = simd_lanes_if_kind(b, SimdKind::F32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            make_simd4f(k::$kernel(la, lb))
+        }
+    };
+}
+simd4f_binop!(wren_simd4f_add, "+(_)", f32x4_add);
+simd4f_binop!(wren_simd4f_sub, "-(_)", f32x4_sub);
+simd4f_binop!(wren_simd4f_mul, "*(_)", f32x4_mul);
+simd4f_binop!(wren_simd4f_div, "/(_)", f32x4_div);
+simd4f_binop!(wren_simd4f_min, "min(_)", f32x4_min);
+simd4f_binop!(wren_simd4f_max, "max(_)", f32x4_max);
+
+macro_rules! simd4f_cmp {
+    ($name:ident, $sig:literal, $kernel:ident) => {
+        #[wasm_bindgen]
+        pub fn $name(a: u64, b: u64) -> u64 {
+            use wren_lift::runtime::core::simd_kernels as k;
+            use wren_lift::runtime::object::SimdKind;
+            let Some(la) = simd_lanes_if_kind(a, SimdKind::F32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            let Some(lb) = simd_lanes_if_kind(b, SimdKind::F32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            make_simd4i(k::$kernel(la, lb))
+        }
+    };
+}
+simd4f_cmp!(wren_simd4f_eq, "==(_)", f32x4_eq);
+simd4f_cmp!(wren_simd4f_ne, "!=(_)", f32x4_ne);
+simd4f_cmp!(wren_simd4f_lt, "<(_)", f32x4_lt);
+simd4f_cmp!(wren_simd4f_le, "<=(_)", f32x4_le);
+simd4f_cmp!(wren_simd4f_gt, ">(_)", f32x4_gt);
+simd4f_cmp!(wren_simd4f_ge, ">=(_)", f32x4_ge);
+
+macro_rules! simd4i_binop {
+    ($name:ident, $sig:literal, $kernel:ident) => {
+        #[wasm_bindgen]
+        pub fn $name(a: u64, b: u64) -> u64 {
+            use wren_lift::runtime::core::simd_kernels as k;
+            use wren_lift::runtime::object::SimdKind;
+            let Some(la) = simd_lanes_if_kind(a, SimdKind::I32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            let Some(lb) = simd_lanes_if_kind(b, SimdKind::I32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            make_simd4i(k::$kernel(la, lb))
+        }
+    };
+}
+simd4i_binop!(wren_simd4i_add, "+(_)", i32x4_add);
+simd4i_binop!(wren_simd4i_sub, "-(_)", i32x4_sub);
+simd4i_binop!(wren_simd4i_mul, "*(_)", i32x4_mul);
+simd4i_binop!(wren_simd4i_min, "min(_)", i32x4_min);
+simd4i_binop!(wren_simd4i_max, "max(_)", i32x4_max);
+simd4i_binop!(wren_simd4i_and, "&(_)", i32x4_and);
+simd4i_binop!(wren_simd4i_or, "|(_)", i32x4_or);
+simd4i_binop!(wren_simd4i_xor, "^(_)", i32x4_xor);
+
+macro_rules! simd4i_cmp {
+    ($name:ident, $sig:literal, $kernel:ident) => {
+        #[wasm_bindgen]
+        pub fn $name(a: u64, b: u64) -> u64 {
+            use wren_lift::runtime::core::simd_kernels as k;
+            use wren_lift::runtime::object::SimdKind;
+            let Some(la) = simd_lanes_if_kind(a, SimdKind::I32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            let Some(lb) = simd_lanes_if_kind(b, SimdKind::I32x4) else {
+                return simd_intrinsic_fallback_1(a, $sig, b);
+            };
+            make_simd4i(k::$kernel(la, lb))
+        }
+    };
+}
+simd4i_cmp!(wren_simd4i_eq, "==(_)", i32x4_eq);
+simd4i_cmp!(wren_simd4i_ne, "!=(_)", i32x4_ne);
+simd4i_cmp!(wren_simd4i_lt, "<(_)", i32x4_lt);
+simd4i_cmp!(wren_simd4i_le, "<=(_)", i32x4_le);
+simd4i_cmp!(wren_simd4i_gt, ">(_)", i32x4_gt);
+simd4i_cmp!(wren_simd4i_ge, ">=(_)", i32x4_ge);
+
+#[wasm_bindgen]
+pub fn wren_simd4i_bitmask(recv: u64) -> u64 {
+    use wren_lift::runtime::core::simd_kernels as k;
+    use wren_lift::runtime::object::SimdKind;
+    let Some(lanes) = simd_lanes_if_kind(recv, SimdKind::I32x4) else {
+        return simd_intrinsic_fallback_0(recv, "bitmask");
+    };
+    Value::num(k::i32x4_bitmask(lanes) as f64).to_bits()
+}
+
+#[wasm_bindgen]
+pub fn wren_simd4i_all_true(recv: u64) -> u64 {
+    use wren_lift::runtime::core::simd_kernels as k;
+    use wren_lift::runtime::object::SimdKind;
+    let Some(lanes) = simd_lanes_if_kind(recv, SimdKind::I32x4) else {
+        return simd_intrinsic_fallback_0(recv, "allTrue");
+    };
+    Value::bool(k::i32x4_all_true(lanes)).to_bits()
+}
+
+#[wasm_bindgen]
+pub fn wren_simd4i_any_true(recv: u64) -> u64 {
+    use wren_lift::runtime::core::simd_kernels as k;
+    use wren_lift::runtime::object::SimdKind;
+    let Some(lanes) = simd_lanes_if_kind(recv, SimdKind::I32x4) else {
+        return simd_intrinsic_fallback_0(recv, "anyTrue");
+    };
+    Value::bool(k::i32x4_any_true(lanes)).to_bits()
 }
 
 /// Truthiness probe — emit_mir uses this for `if`/`while` tests

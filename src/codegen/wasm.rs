@@ -18,6 +18,7 @@ use wasm_encoder::{
     ImportSection, Instruction as WasmInst, Module, TypeSection, ValType,
 };
 
+use crate::intern::Interner;
 use crate::mir::{BlockId, Instruction, MirFunction, MirType, Terminator, ValueId};
 
 // ---------------------------------------------------------------------------
@@ -93,12 +94,37 @@ impl WasmModule {
 
 /// Compile a MIR function directly to a WASM module.
 pub fn emit_mir(mir: &MirFunction) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir);
+    let mut emitter = MirWasmEmitter::new(mir, None);
+    emitter.emit()
+}
+
+/// Same as [`emit_mir`] but with access to the global symbol
+/// interner. The wasm tier-up uses this overload to recognise
+/// SIMD intrinsic calls (`bitmask`, `+(_)` on a `Simd4f`, etc.)
+/// and route them through dedicated `wren_simd*_*` runtime
+/// helpers instead of the generic method-dispatch path.
+/// Without an interner the emitter can't resolve a method
+/// `SymbolId` to its name, so SIMD inlining is skipped — the
+/// emitted module still works, it just pays the slow-path cost
+/// for every SIMD method call.
+pub fn emit_mir_with_interner(
+    mir: &MirFunction,
+    interner: &Interner,
+) -> Result<WasmModule, String> {
+    let mut emitter = MirWasmEmitter::new(mir, Some(interner));
     emitter.emit()
 }
 
 struct MirWasmEmitter<'a> {
     mir: &'a MirFunction,
+    /// Symbol interner — resolves a `Call`'s method `SymbolId`
+    /// to its textual selector ("+(_)" / "bitmask" / etc.) so the
+    /// emitter can recognise SIMD intrinsic calls and route them
+    /// through dedicated runtime helpers. `None` for callers that
+    /// don't have an interner in scope (e.g. the wasm codegen
+    /// tests); SIMD inlining is skipped in that case and the
+    /// generic Call path runs.
+    interner: Option<&'a Interner>,
     /// MIR ValueId → WASM local index.
     local_map: HashMap<ValueId, u32>,
     /// Number of allocated WASM locals.
@@ -127,9 +153,10 @@ struct MirWasmEmitter<'a> {
 }
 
 impl<'a> MirWasmEmitter<'a> {
-    fn new(mir: &'a MirFunction) -> Self {
+    fn new(mir: &'a MirFunction, interner: Option<&'a Interner>) -> Self {
         Self {
             mir,
+            interner,
             local_map: HashMap::new(),
             num_locals: 0,
             local_types: Vec::new(),
@@ -355,7 +382,19 @@ impl<'a> MirWasmEmitter<'a> {
                     Instruction::Not(_) => {
                         self.register_import("wren_not", &[ValType::I64], &[ValType::I64])
                     }
-                    Instruction::Call { args, .. } => {
+                    Instruction::Call { method, args, .. } => {
+                        // SIMD intrinsics route through dedicated
+                        // helpers — see `simd_intrinsic_helper`.
+                        // Each is `(receiver, args...)` with the
+                        // arity baked into the signature; no
+                        // slot-lookup machinery needed.
+                        if let Some(helper) =
+                            self.simd_intrinsic_for_call(*method, args.len())
+                        {
+                            let params = vec![ValType::I64; args.len() + 1];
+                            self.register_import(helper, &params, &[ValType::I64]);
+                            continue;
+                        }
                         // JIT-to-JIT inter-fn calls go through a
                         // slot lookup + call_indirect on a shared
                         // funcref table. The lookup returns
@@ -539,6 +578,42 @@ impl<'a> MirWasmEmitter<'a> {
         self.runtime_imports.insert(name, idx);
         self.import_list
             .push((name, params.to_vec(), results.to_vec()));
+    }
+
+    /// Map a `Call`'s method selector + arity to the name of a
+    /// SIMD intrinsic helper, when one exists.
+    ///
+    /// Selectors here are the unique-to-Simd names (`bitmask`,
+    /// `allTrue`, `anyTrue`) — overlap selectors like `+(_)` or
+    /// `==(_)` would need a runtime receiver-class guard before
+    /// the intrinsic helper, which the wasm emitter doesn't
+    /// have today (the JIT'd module can't reach the cdylib's
+    /// linear memory). The SIMD-only selectors don't appear on
+    /// `Num` / `String` / `List` etc., so unconditional intrinsic
+    /// routing is safe — and a type mismatch falls back to
+    /// `call_method_on` inside the helper itself, matching the
+    /// slow-path JIT's semantics.
+    fn simd_intrinsic_helper(method_sig: &str, arity: usize) -> Option<&'static str> {
+        match (method_sig, arity) {
+            ("bitmask", 0) => Some("wren_simd4i_bitmask"),
+            ("allTrue", 0) => Some("wren_simd4i_all_true"),
+            ("anyTrue", 0) => Some("wren_simd4i_any_true"),
+            _ => None,
+        }
+    }
+
+    /// Resolve a `Call`'s method symbol to a SIMD-intrinsic
+    /// helper name, or `None` if it isn't a recognised
+    /// intrinsic (or the emitter doesn't have an interner —
+    /// e.g. the codegen tests).
+    fn simd_intrinsic_for_call(
+        &self,
+        method: crate::intern::SymbolId,
+        arity: usize,
+    ) -> Option<&'static str> {
+        let interner = self.interner?;
+        let sig = interner.resolve(method);
+        Self::simd_intrinsic_helper(sig, arity)
     }
 
     // -----------------------------------------------------------------------
@@ -1011,6 +1086,24 @@ impl<'a> MirWasmEmitter<'a> {
                 args,
                 pure_call: _,
             } => {
+                // SIMD intrinsics route straight to a per-method
+                // runtime helper that does its own type check +
+                // kernel call (with a `call_method_on` fallback on
+                // mismatch). Bypasses the slot-lookup / call_indirect
+                // dance entirely — there's no JIT'd target to
+                // dispatch into for a SIMD primitive, so we'd hit
+                // the slow path on every call anyway.
+                if let Some(helper) =
+                    self.simd_intrinsic_for_call(*method, args.len())
+                {
+                    func.instruction(&WasmInst::LocalGet(self.local(*receiver)));
+                    for a in args {
+                        func.instruction(&WasmInst::LocalGet(self.local(*a)));
+                    }
+                    func.instruction(&WasmInst::Call(self.runtime_imports[helper]));
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                    return Ok(());
+                }
                 // Slot lookup → branch → call_indirect (fast) |
                 // wren_call_<n>_slow (slow).
                 //
