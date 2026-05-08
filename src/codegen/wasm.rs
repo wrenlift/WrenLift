@@ -92,6 +92,46 @@ impl WasmModule {
 // MIR → WASM emitter
 // ---------------------------------------------------------------------------
 
+/// Per-arity helper-name resolvers. The wasm runtime exports
+/// a per-arity ladder (`wren_make_list_0` … `_4`,
+/// `wren_make_map_0` … `_4`, `wren_string_concat_2` … `_4`)
+/// because wasm imports are uniquely keyed by `(name,
+/// signature)` — collapsing to a single name across arities
+/// would silently reuse the first call site's signature for
+/// every later one. Arities beyond the cap return `None`;
+/// `mir_needs_unsupported_helpers` rejects the function so
+/// it stays BC-interpreted.
+pub(crate) fn make_list_helper_name(arity: usize) -> Option<&'static str> {
+    match arity {
+        0 => Some("wren_make_list_0"),
+        1 => Some("wren_make_list_1"),
+        2 => Some("wren_make_list_2"),
+        3 => Some("wren_make_list_3"),
+        4 => Some("wren_make_list_4"),
+        _ => None,
+    }
+}
+
+pub(crate) fn make_map_helper_name(entries: usize) -> Option<&'static str> {
+    match entries {
+        0 => Some("wren_make_map_0"),
+        1 => Some("wren_make_map_1"),
+        2 => Some("wren_make_map_2"),
+        3 => Some("wren_make_map_3"),
+        4 => Some("wren_make_map_4"),
+        _ => None,
+    }
+}
+
+pub(crate) fn string_concat_helper_name(parts: usize) -> Option<&'static str> {
+    match parts {
+        2 => Some("wren_string_concat_2"),
+        3 => Some("wren_string_concat_3"),
+        4 => Some("wren_string_concat_4"),
+        _ => None,
+    }
+}
+
 /// Compile a MIR function directly to a WASM module.
 ///
 /// No interner, no memory import — used by the codegen tests
@@ -539,12 +579,24 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     Instruction::MakeList(elems) => {
-                        let params = vec![ValType::I64; elems.len()];
-                        self.register_import("wren_make_list", &params, &[ValType::I64]);
+                        // Per-arity helper names (`wren_make_list_<N>`)
+                        // because wasm imports key on `(name, signature)`
+                        // — a single shared name would silently reuse the
+                        // first call site's arity for every later one.
+                        // Arities beyond the cap reject through
+                        // `mir_needs_unsupported_helpers` so the registry
+                        // never sees them; matching the host's 0..=4
+                        // ladder.
+                        if let Some(name) = make_list_helper_name(elems.len()) {
+                            let params = vec![ValType::I64; elems.len()];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     Instruction::MakeMap(pairs) => {
-                        let params = vec![ValType::I64; pairs.len() * 2];
-                        self.register_import("wren_make_map", &params, &[ValType::I64]);
+                        if let Some(name) = make_map_helper_name(pairs.len()) {
+                            let params = vec![ValType::I64; pairs.len() * 2];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     Instruction::MakeRange(..) => {
                         self.register_import(
@@ -554,8 +606,10 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     Instruction::StringConcat(parts) => {
-                        let params = vec![ValType::I64; parts.len()];
-                        self.register_import("wren_string_concat", &params, &[ValType::I64]);
+                        if let Some(name) = string_concat_helper_name(parts.len()) {
+                            let params = vec![ValType::I64; parts.len()];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     Instruction::ToString(_) => {
                         self.register_import("wren_to_string", &[ValType::I64], &[ValType::I64]);
@@ -1313,18 +1367,24 @@ impl<'a> MirWasmEmitter<'a> {
 
             // -- Collections --
             Instruction::MakeList(elems) => {
+                let name = make_list_helper_name(elems.len()).ok_or_else(|| {
+                    format!("MakeList of arity {} exceeds wasm tier-up cap", elems.len())
+                })?;
                 for e in elems {
                     func.instruction(&WasmInst::LocalGet(self.local(*e)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_make_list"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::MakeMap(pairs) => {
+                let name = make_map_helper_name(pairs.len()).ok_or_else(|| {
+                    format!("MakeMap of arity {} exceeds wasm tier-up cap", pairs.len())
+                })?;
                 for (k, v) in pairs {
                     func.instruction(&WasmInst::LocalGet(self.local(*k)));
                     func.instruction(&WasmInst::LocalGet(self.local(*v)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_make_map"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::MakeRange(from, to, inclusive) => {
@@ -1335,10 +1395,16 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::StringConcat(parts) => {
+                let name = string_concat_helper_name(parts.len()).ok_or_else(|| {
+                    format!(
+                        "StringConcat of arity {} exceeds wasm tier-up cap",
+                        parts.len()
+                    )
+                })?;
                 for p in parts {
                     func.instruction(&WasmInst::LocalGet(self.local(*p)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_string_concat"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::ToString(a) => {

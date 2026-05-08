@@ -224,11 +224,6 @@ fn mir_needs_unsupported_helpers(
                 | Instruction::MakeClosure { .. }
                 | Instruction::GetUpvalue(_)
                 | Instruction::SetUpvalue(..)
-                | Instruction::MakeList(_)
-                | Instruction::MakeMap(_)
-                | Instruction::MakeRange(..)
-                | Instruction::StringConcat(_)
-                | Instruction::ToString(_)
                 | Instruction::SubscriptGet { .. }
                 | Instruction::SubscriptSet { .. }
                 | Instruction::GetStaticField(..)
@@ -236,11 +231,34 @@ fn mir_needs_unsupported_helpers(
                 | Instruction::SetModuleVar(..)
                 | Instruction::IsType(..)
                 | Instruction::GuardClass(..) => return true,
-                // GetModuleVar / GetField / SetField accepted —
-                // their `wren_*` helpers are exported by the
-                // cdylib and resolve through the wasm-side
-                // shim. SetModuleVar / GetStaticField /
-                // SetStaticField still reject — no helpers yet.
+                // MakeList / MakeMap / StringConcat now have
+                // per-arity helpers (`wren_make_list_<N>` etc.)
+                // for `N` up to the cap that matches the host
+                // ladder. Larger arities still reject — they'd
+                // need an additional ladder rung or a buffered
+                // shape, which lands separately.
+                Instruction::MakeList(elems)
+                    if wren_lift::codegen::wasm::make_list_helper_name(elems.len()).is_none() =>
+                {
+                    return true
+                }
+                Instruction::MakeMap(pairs)
+                    if wren_lift::codegen::wasm::make_map_helper_name(pairs.len()).is_none() =>
+                {
+                    return true
+                }
+                Instruction::StringConcat(parts)
+                    if wren_lift::codegen::wasm::string_concat_helper_name(parts.len())
+                        .is_none() =>
+                {
+                    return true
+                }
+                // Below the cap, MakeList / MakeMap /
+                // StringConcat / ToString / MakeRange /
+                // GetModuleVar / GetField / SetField are all
+                // accepted — their `wren_*` helpers are exported
+                // by the cdylib and resolve through the wasm-
+                // side shim.
                 _ => {}
             }
         }
@@ -1143,6 +1161,218 @@ pub fn wren_set_field(recv_bits: u64, field_idx: u64, val_bits: u64) -> u64 {
     let inst = unsafe { &mut *(ptr as *mut ObjInstance) };
     inst.set_field(field_idx as usize, Value::from_bits(val_bits));
     val_bits
+}
+
+// ---------------------------------------------------------------------------
+// MakeList / MakeMap / StringConcat / ToString / MakeRange.
+//
+// Per-arity helpers because wasm imports are typed by signature
+// — a single `wren_make_list` import with variable arity would
+// collide with other call sites of the same name. The wasm
+// emitter picks `wren_make_list_<N>` based on the literal's
+// element count; arities beyond the cap reject through
+// `mir_needs_unsupported_helpers` and stay BC-interpreted.
+//
+// Each helper allocates through the live VM (acquired via
+// `current_vm()`), pushes inputs into the JIT root store before
+// the GC-triggering allocation so they survive a collection
+// inside `alloc_*`, then restores the root cursor before
+// returning.
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[inline(always)]
+fn current_vm_or_null() -> Option<&'static mut wren_lift::runtime::vm::VM> {
+    let p = wren_lift::runtime::tier::current_vm();
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *p })
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn make_list_wasm(elements: &[u64]) -> u64 {
+    use wren_lift::codegen::runtime_fns::{
+        finish_alloc, jit_root_at, jit_roots_restore_len, jit_roots_snapshot_len, push_jit_root,
+    };
+    let Some(vm) = current_vm_or_null() else {
+        return Value::null().to_bits();
+    };
+    let root_len_before = jit_roots_snapshot_len();
+    for &elem in elements {
+        push_jit_root(Value::from_bits(elem));
+    }
+    let list_ptr = vm.gc.alloc_list();
+    let list_val = Value::object(list_ptr as *mut u8);
+    push_jit_root(list_val);
+    unsafe {
+        (*list_ptr).header.class = vm.list_class;
+        for idx in 0..elements.len() {
+            let elem = jit_root_at(root_len_before + idx);
+            (*list_ptr).add(elem);
+        }
+    }
+    let val = jit_root_at(root_len_before + elements.len());
+    jit_roots_restore_len(root_len_before);
+    unsafe { finish_alloc(vm, val) }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_list_0() -> u64 {
+    make_list_wasm(&[])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_list_1(a: u64) -> u64 {
+    make_list_wasm(&[a])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_list_2(a: u64, b: u64) -> u64 {
+    make_list_wasm(&[a, b])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_list_3(a: u64, b: u64, c: u64) -> u64 {
+    make_list_wasm(&[a, b, c])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_list_4(a: u64, b: u64, c: u64, d: u64) -> u64 {
+    make_list_wasm(&[a, b, c, d])
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn make_map_wasm(pairs: &[(u64, u64)]) -> u64 {
+    use wren_lift::codegen::runtime_fns::{
+        finish_alloc, jit_root_at, jit_roots_restore_len, jit_roots_snapshot_len, push_jit_root,
+    };
+    let Some(vm) = current_vm_or_null() else {
+        return Value::null().to_bits();
+    };
+    let root_len_before = jit_roots_snapshot_len();
+    for &(k, v) in pairs {
+        push_jit_root(Value::from_bits(k));
+        push_jit_root(Value::from_bits(v));
+    }
+    let map_ptr = vm.gc.alloc_map();
+    let map_val = Value::object(map_ptr as *mut u8);
+    push_jit_root(map_val);
+    unsafe {
+        (*map_ptr).header.class = vm.map_class;
+        for idx in 0..pairs.len() {
+            let k = jit_root_at(root_len_before + idx * 2);
+            let v = jit_root_at(root_len_before + idx * 2 + 1);
+            (*map_ptr).set(k, v);
+        }
+    }
+    let val = jit_root_at(root_len_before + pairs.len() * 2);
+    jit_roots_restore_len(root_len_before);
+    unsafe { finish_alloc(vm, val) }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_map_0() -> u64 {
+    make_map_wasm(&[])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_map_1(k0: u64, v0: u64) -> u64 {
+    make_map_wasm(&[(k0, v0)])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_map_2(k0: u64, v0: u64, k1: u64, v1: u64) -> u64 {
+    make_map_wasm(&[(k0, v0), (k1, v1)])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_map_3(k0: u64, v0: u64, k1: u64, v1: u64, k2: u64, v2: u64) -> u64 {
+    make_map_wasm(&[(k0, v0), (k1, v1), (k2, v2)])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn wren_make_map_4(
+    k0: u64,
+    v0: u64,
+    k1: u64,
+    v1: u64,
+    k2: u64,
+    v2: u64,
+    k3: u64,
+    v3: u64,
+) -> u64 {
+    make_map_wasm(&[(k0, v0), (k1, v1), (k2, v2), (k3, v3)])
+}
+
+/// Build an inclusive / exclusive `Range` from `from..to`. The
+/// MIR builder lowers `a..b` and `a...b` into `MakeRange(a, b,
+/// inclusive_flag)`; the helper returns the boxed range and
+/// stays a single cross-instance call regardless of inputs.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_range(from: u64, to: u64, inclusive: u64) -> u64 {
+    let Some(vm) = current_vm_or_null() else {
+        return Value::null().to_bits();
+    };
+    let from_val = f64::from_bits(from);
+    let to_val = f64::from_bits(to);
+    let is_inclusive = inclusive != 0;
+    let range_ptr = vm.gc.alloc_range(from_val, to_val, is_inclusive);
+    unsafe {
+        (*range_ptr).header.class = vm.range_class;
+    }
+    let val = Value::object(range_ptr as *mut u8);
+    unsafe { wren_lift::codegen::runtime_fns::finish_alloc(vm, val) }
+}
+
+/// Convert any value to its string form. Used by string
+/// interpolation (`"%(x)"`) — every part lowers to a `ToString`
+/// before the `StringConcat` joins them, so this is a hot path
+/// for any tier-up'd code that builds strings dynamically.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_to_string(val: u64) -> u64 {
+    let Some(vm) = current_vm_or_null() else {
+        return Value::null().to_bits();
+    };
+    let v = Value::from_bits(val);
+    let s = wren_lift::runtime::vm_interp::value_to_string(vm, v);
+    let val = vm.new_string(s);
+    unsafe { wren_lift::codegen::runtime_fns::finish_alloc(vm, val) }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn string_concat_wasm(parts: &[u64]) -> u64 {
+    let Some(vm) = current_vm_or_null() else {
+        return Value::null().to_bits();
+    };
+    let mut buf = String::new();
+    for &p in parts {
+        let s = wren_lift::runtime::vm_interp::value_to_string(vm, Value::from_bits(p));
+        buf.push_str(&s);
+    }
+    let val = vm.new_string(buf);
+    unsafe { wren_lift::codegen::runtime_fns::finish_alloc(vm, val) }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_string_concat_2(a: u64, b: u64) -> u64 {
+    string_concat_wasm(&[a, b])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_string_concat_3(a: u64, b: u64, c: u64) -> u64 {
+    string_concat_wasm(&[a, b, c])
+}
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_string_concat_4(a: u64, b: u64, c: u64, d: u64) -> u64 {
+    string_concat_wasm(&[a, b, c, d])
 }
 
 /// Combined helper: load the closure stored in

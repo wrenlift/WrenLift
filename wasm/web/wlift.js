@@ -1395,6 +1395,23 @@ class MainWlift {
       // methods import these for `_foo` reads / writes.
       wren_get_field: wasm.wren_get_field,
       wren_set_field: wasm.wren_set_field,
+      // See `worker.js` for the rationale — per-arity ladder
+      // for List / Map / String construction.
+      wren_make_list_0: wasm.wren_make_list_0,
+      wren_make_list_1: wasm.wren_make_list_1,
+      wren_make_list_2: wasm.wren_make_list_2,
+      wren_make_list_3: wasm.wren_make_list_3,
+      wren_make_list_4: wasm.wren_make_list_4,
+      wren_make_map_0:  wasm.wren_make_map_0,
+      wren_make_map_1:  wasm.wren_make_map_1,
+      wren_make_map_2:  wasm.wren_make_map_2,
+      wren_make_map_3:  wasm.wren_make_map_3,
+      wren_make_map_4:  wasm.wren_make_map_4,
+      wren_make_range:  wasm.wren_make_range,
+      wren_to_string:   wasm.wren_to_string,
+      wren_string_concat_2: wasm.wren_string_concat_2,
+      wren_string_concat_3: wasm.wren_string_concat_3,
+      wren_string_concat_4: wasm.wren_string_concat_4,
       // SIMD intrinsic helpers — see the matching block in
       // `worker.js` for the full rationale. `bitmask` / `allTrue`
       // / `anyTrue` are the only ones the wasm emitter routes

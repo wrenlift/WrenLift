@@ -324,6 +324,26 @@ __wliftWrenImports = {
   // mir-helper gate used to reject the instruction wholesale.
   wren_get_field: wasm.wren_get_field,
   wren_set_field: wasm.wren_set_field,
+  // List / Map / Range / String constructors. The wasm
+  // emitter picks the per-arity name (`wren_make_list_<N>`
+  // etc.) based on the literal's element count; arities
+  // beyond the cap reject through `mir_needs_unsupported_helpers`
+  // and never appear in a JIT'd module's import list.
+  wren_make_list_0: wasm.wren_make_list_0,
+  wren_make_list_1: wasm.wren_make_list_1,
+  wren_make_list_2: wasm.wren_make_list_2,
+  wren_make_list_3: wasm.wren_make_list_3,
+  wren_make_list_4: wasm.wren_make_list_4,
+  wren_make_map_0:  wasm.wren_make_map_0,
+  wren_make_map_1:  wasm.wren_make_map_1,
+  wren_make_map_2:  wasm.wren_make_map_2,
+  wren_make_map_3:  wasm.wren_make_map_3,
+  wren_make_map_4:  wasm.wren_make_map_4,
+  wren_make_range:  wasm.wren_make_range,
+  wren_to_string:   wasm.wren_to_string,
+  wren_string_concat_2: wasm.wren_string_concat_2,
+  wren_string_concat_3: wasm.wren_string_concat_3,
+  wren_string_concat_4: wasm.wren_string_concat_4,
   // SIMD intrinsic helpers — only the Simd-exclusive selectors
   // (`bitmask` / `allTrue` / `anyTrue`) are wired into the wasm
   // emitter today. The remaining f32x4 / i32x4 binops + cmps are

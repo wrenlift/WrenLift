@@ -1654,17 +1654,32 @@ pub extern "C" fn wren_exit_shadow_frame() {
     pop_native_shadow_frame();
 }
 
-/// Get the VM pointer from the JIT context.
+/// Get the VM pointer from the JIT context, falling back to the
+/// wasm-side `runtime::tier::current_vm()` when the JIT context
+/// isn't set. The native JIT installs `read_jit_ctx().vm` on
+/// every dispatch boundary, so the fallback never fires there;
+/// the wasm tier-up never installs that thread-local but does
+/// set `current_vm` on `interpret` / `run_fiber` entry, so this
+/// keeps every `wren_*` helper that uses `vm_ref` working on
+/// both targets without a parallel wasm copy.
+///
 /// # Safety
-/// Caller must ensure the VM pointer is valid.
+/// Caller must ensure the VM pointer (whichever path is active)
+/// is valid for the duration of the borrow.
 #[inline(always)]
 unsafe fn vm_ref() -> Option<&'static mut crate::runtime::vm::VM> {
     let ctx = read_jit_ctx();
-    if ctx.vm.is_null() {
-        None
-    } else {
-        Some(&mut *(ctx.vm as *mut crate::runtime::vm::VM))
+    if !ctx.vm.is_null() {
+        return Some(unsafe { &mut *(ctx.vm as *mut crate::runtime::vm::VM) });
     }
+    #[cfg(all(target_arch = "wasm32", not(feature = "host")))]
+    {
+        let p = crate::runtime::tier::current_vm();
+        if !p.is_null() {
+            return Some(unsafe { &mut *p });
+        }
+    }
+    None
 }
 
 /// Refresh JitContext's module_vars pointer from the VM's engine.
