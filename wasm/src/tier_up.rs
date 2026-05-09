@@ -226,9 +226,10 @@ fn mir_needs_unsupported_helpers(
                 {
                     return true
                 }
-                Instruction::MakeClosure { .. }
-                | Instruction::GetUpvalue(_)
-                | Instruction::SetUpvalue(..) => return true,
+                // MakeClosure — per-arity helper
+                // (`wren_make_closure_<N>`) for capture counts
+                // 0..=4. Higher counts reject.
+                Instruction::MakeClosure { upvalues, .. } if upvalues.len() > 4 => return true,
                 // CallStaticSelf — per-arity ladder
                 // (`wren_call_static_self_0` … `_4`). Higher
                 // arities reject through the gate.
@@ -994,12 +995,20 @@ fn wren_call_1_inner(vm: &mut wren_lift::runtime::vm::VM, root_base: usize, meth
         let is_closure =
             unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
         if is_closure {
-            let closure_ptr = ptr as *const wren_lift::runtime::object::ObjClosure;
+            let closure_ptr = ptr as *mut wren_lift::runtime::object::ObjClosure;
             let fn_ptr = unsafe { (*closure_ptr).function };
             let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
             if let Some(slot) = vm.engine.wasm_jit_slot(target_fn) {
                 DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
-                return js_jit_call_1(slot, arg.to_bits());
+                // Install the receiver closure so the
+                // tier-up'd target's `wren_get_upvalue`
+                // resolves the right upvalue array, restore
+                // afterwards so a deeper nested call sees its
+                // caller's closure.
+                let prev = wren_lift::runtime::tier::enter_closure(closure_ptr);
+                let result = js_jit_call_1(slot, arg.to_bits());
+                wren_lift::runtime::tier::restore_closure(prev);
+                return result;
             }
         }
     }
@@ -1138,12 +1147,13 @@ fn wren_call_n_inner(
         let is_closure =
             unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
         if is_closure {
-            let closure_ptr = ptr as *const wren_lift::runtime::object::ObjClosure;
+            let closure_ptr = ptr as *mut wren_lift::runtime::object::ObjClosure;
             let fn_ptr = unsafe { (*closure_ptr).function };
             let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
             if let Some(slot) = vm.engine.wasm_jit_slot(target_fn) {
                 DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
-                return match arity {
+                let prev = wren_lift::runtime::tier::enter_closure(closure_ptr);
+                let result = match arity {
                     2 => js_jit_call_2(
                         slot,
                         jit_root_at(root_base + 1).to_bits(),
@@ -1164,6 +1174,8 @@ fn wren_call_n_inner(
                     ),
                     _ => Value::null().to_bits(),
                 };
+                wren_lift::runtime::tier::restore_closure(prev);
+                return result;
             }
         }
     }
@@ -1688,6 +1700,105 @@ pub fn wren_get_static_field(field_sym: u64) -> u64 {
 #[wasm_bindgen]
 pub fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
     wren_lift::codegen::runtime_fns::wren_set_static_field(field_sym, value)
+}
+
+// ---------------------------------------------------------------------------
+// Closure capture: MakeClosure / GetUpvalue / SetUpvalue.
+//
+// `wren_make_closure_<N>` allocates an `ObjClosure` whose
+// upvalue array carries the N captured values. The MIR builder
+// emits the captures in the order the resolver assigned them
+// (locals lifted from the enclosing scope; box once on first
+// capture, share through the rest of the chain).
+//
+// `wren_get_upvalue` / `wren_set_upvalue` operate on the
+// closure currently executing the JIT'd function — that
+// receiver isn't in the wasm function's parameter list (the
+// function takes only the user-visible args), so we read it
+// from the `runtime::tier::current_closure` cell. The BC
+// interpreter's tier-up dispatch and the JIT-to-JIT recursive
+// fast path in `wren_call_<N>_inner` both set the cell via
+// `enter_closure` / `restore_closure` around the
+// cross-instance call.
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_closure_0(fn_id: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_make_closure_0(fn_id)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_closure_1(fn_id: u64, uv0: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_make_closure_1(fn_id, uv0)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_closure_2(fn_id: u64, uv0: u64, uv1: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_make_closure_2(fn_id, uv0, uv1)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_closure_3(fn_id: u64, uv0: u64, uv1: u64, uv2: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_make_closure_3(fn_id, uv0, uv1, uv2)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_make_closure_4(fn_id: u64, uv0: u64, uv1: u64, uv2: u64, uv3: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_make_closure_4(fn_id, uv0, uv1, uv2, uv3)
+}
+
+/// Read upvalue `index` of the JIT'd-currently-executing
+/// closure. Falls back to NaN-boxed null when the cell isn't
+/// set (defensive — JIT'd code only runs through a tier-up
+/// dispatch that installs it).
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_get_upvalue(index: u64) -> u64 {
+    let closure = wren_lift::runtime::tier::current_closure();
+    if closure.is_null() {
+        return Value::null().to_bits();
+    }
+    let idx = index as usize;
+    unsafe {
+        let upvalues = &(*closure).upvalues;
+        if idx < upvalues.len() {
+            let uv = upvalues[idx];
+            (*uv).get().to_bits()
+        } else {
+            Value::null().to_bits()
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_set_upvalue(index: u64, value: u64) -> u64 {
+    let closure = wren_lift::runtime::tier::current_closure();
+    if closure.is_null() {
+        return value;
+    }
+    let idx = index as usize;
+    let v = Value::from_bits(value);
+    unsafe {
+        let upvalues = &(*closure).upvalues;
+        if idx < upvalues.len() {
+            let uv = upvalues[idx];
+            (*uv).set(v);
+            // Inter-generational write barrier — captured
+            // upvalues live on the closure's upvalue chain.
+            let vm_ptr = wren_lift::runtime::tier::current_vm();
+            if !vm_ptr.is_null() {
+                let vm = &mut *vm_ptr;
+                vm.gc
+                    .write_barrier(uv as *mut wren_lift::runtime::object::ObjHeader, v);
+            }
+        }
+    }
+    value
 }
 
 /// Combined helper: load the closure stored in

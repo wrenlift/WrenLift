@@ -379,6 +379,16 @@ __wliftWrenImports = {
   wren_guard_class:       wasm.wren_guard_class,
   wren_get_static_field:  wasm.wren_get_static_field,
   wren_set_static_field:  wasm.wren_set_static_field,
+  // Closure capture: per-capture-count `MakeClosure` ladder
+  // plus shared `GetUpvalue` / `SetUpvalue` that read the
+  // current closure from `runtime::tier::current_closure()`.
+  wren_make_closure_0: wasm.wren_make_closure_0,
+  wren_make_closure_1: wasm.wren_make_closure_1,
+  wren_make_closure_2: wasm.wren_make_closure_2,
+  wren_make_closure_3: wasm.wren_make_closure_3,
+  wren_make_closure_4: wasm.wren_make_closure_4,
+  wren_get_upvalue: wasm.wren_get_upvalue,
+  wren_set_upvalue: wasm.wren_set_upvalue,
   // SIMD intrinsic helpers — only the Simd-exclusive selectors
   // (`bitmask` / `allTrue` / `anyTrue`) are wired into the wasm
   // emitter today. The remaining f32x4 / i32x4 binops + cmps are

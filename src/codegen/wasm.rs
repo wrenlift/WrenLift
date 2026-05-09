@@ -180,6 +180,20 @@ pub fn super_call_helper_name(args: usize) -> Option<&'static str> {
     }
 }
 
+/// Per-capture-count helper for `Instruction::MakeClosure`.
+/// Same shared-name-collides-on-signature reason as MakeList:
+/// each capture count is its own wasm import signature.
+pub fn make_closure_helper_name(upvalues: usize) -> Option<&'static str> {
+    match upvalues {
+        0 => Some("wren_make_closure_0"),
+        1 => Some("wren_make_closure_1"),
+        2 => Some("wren_make_closure_2"),
+        3 => Some("wren_make_closure_3"),
+        4 => Some("wren_make_closure_4"),
+        _ => None,
+    }
+}
+
 /// Compile a MIR function directly to a WASM module.
 ///
 /// No interner, no memory import — used by the codegen tests
@@ -648,8 +662,13 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     Instruction::MakeClosure { upvalues, .. } => {
-                        let params = vec![ValType::I64; upvalues.len() + 1];
-                        self.register_import("wren_make_closure", &params, &[ValType::I64]);
+                        if let Some(name) = make_closure_helper_name(upvalues.len()) {
+                            // `(fn_id, uv0, ..., uv_{N-1}) -> i64`
+                            // — fn_id is the leading arg, then
+                            // one i64 per upvalue.
+                            let params = vec![ValType::I64; upvalues.len() + 1];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     Instruction::GetUpvalue(_) => {
                         self.register_import("wren_get_upvalue", &[ValType::I64], &[ValType::I64]);
@@ -1440,11 +1459,17 @@ impl<'a> MirWasmEmitter<'a> {
 
             // -- Closures --
             Instruction::MakeClosure { fn_id, upvalues } => {
+                let name = make_closure_helper_name(upvalues.len()).ok_or_else(|| {
+                    format!(
+                        "MakeClosure with {} captures exceeds wasm tier-up cap",
+                        upvalues.len()
+                    )
+                })?;
                 func.instruction(&WasmInst::I64Const(*fn_id as i64));
                 for uv in upvalues {
                     func.instruction(&WasmInst::LocalGet(self.local(*uv)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_make_closure"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::GetUpvalue(idx) => {

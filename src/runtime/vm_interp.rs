@@ -4092,7 +4092,16 @@ fn dispatch_closure_bc_inner(
             // `Op::Call`). So `arg_vals` is exactly the
             // positional args; pass through as-is.
             let args_bits: Vec<u64> = arg_vals.iter().map(|v| v.to_bits()).collect();
+            // Install the receiver closure into the wasm
+            // CURRENT_CLOSURE cell before crossing into JIT'd
+            // code, so `wren_get_upvalue` / `wren_set_upvalue`
+            // resolve the captured upvalue array. Restore the
+            // previous value after the dispatch returns —
+            // nested `tier::dispatch` calls would clobber the
+            // cell otherwise.
+            let prev_closure = crate::runtime::tier::enter_closure(closure_ptr);
             let result_bits = crate::runtime::tier::dispatch(slot, "", &args_bits);
+            crate::runtime::tier::restore_closure(prev_closure);
             let result_val = Value::from_bits(result_bits);
             set_reg(&mut values, return_dst.0 as u16, result_val);
             unsafe {

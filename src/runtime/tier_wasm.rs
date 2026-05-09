@@ -146,6 +146,33 @@ mod current_vm_cell {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+mod current_closure_cell {
+    use crate::runtime::object::ObjClosure;
+    use std::cell::UnsafeCell;
+
+    /// Receiver closure of the currently-running JIT'd wasm
+    /// function. Set by every dispatch boundary that crosses
+    /// into a JIT'd module — the BC interpreter's tier-up
+    /// dispatch, plus the JIT-to-JIT recursive fast path in
+    /// `wren_call_<N>`. Read by `wren_get_upvalue` /
+    /// `wren_set_upvalue` to resolve the closure's upvalue
+    /// array without an extra wasm-ABI argument per JIT'd
+    /// call. Mirrors the host's
+    /// `read_jit_ctx().closure` pattern.
+    pub(super) struct ClosureCell(UnsafeCell<*mut ObjClosure>);
+    unsafe impl Sync for ClosureCell {}
+    pub(super) static CURRENT: ClosureCell = ClosureCell(UnsafeCell::new(std::ptr::null_mut()));
+    impl ClosureCell {
+        pub(super) fn get(&self) -> *mut ObjClosure {
+            unsafe { *self.0.get() }
+        }
+        pub(super) fn set(&self, c: *mut ObjClosure) {
+            unsafe { *self.0.get() = c }
+        }
+    }
+}
+
 /// Read the current VM pointer. Returns null on host builds and
 /// outside any `interpret` / `run_fiber` window. JIT'd helpers
 /// like `wren_call` rely on this to find the live runtime
@@ -158,6 +185,49 @@ pub fn current_vm() -> *mut crate::runtime::vm::VM {
     #[cfg(not(target_arch = "wasm32"))]
     {
         std::ptr::null_mut()
+    }
+}
+
+/// Read the closure currently executing in JIT'd wasm. Null
+/// outside any tier-up dispatch window. Returns the live
+/// `ObjClosure` ptr so upvalue helpers can index into its
+/// upvalue array.
+#[cfg(target_arch = "wasm32")]
+pub fn current_closure() -> *mut crate::runtime::object::ObjClosure {
+    current_closure_cell::CURRENT.get()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn current_closure() -> *mut crate::runtime::object::ObjClosure {
+    std::ptr::null_mut()
+}
+
+/// Save / install the current closure pointer, return the
+/// previous value for the caller to restore on exit. Same RAII
+/// rationale as `enter_vm`: dispatch boundaries are short and
+/// nested, so an explicit save / restore pair is simpler than
+/// a guard with a closing borrow.
+#[allow(unused_variables)]
+pub fn enter_closure(
+    c: *mut crate::runtime::object::ObjClosure,
+) -> *mut crate::runtime::object::ObjClosure {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prev = current_closure_cell::CURRENT.get();
+        current_closure_cell::CURRENT.set(c);
+        prev
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
+#[allow(unused_variables)]
+pub fn restore_closure(prev: *mut crate::runtime::object::ObjClosure) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        current_closure_cell::CURRENT.set(prev);
     }
 }
 

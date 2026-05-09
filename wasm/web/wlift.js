@@ -1436,6 +1436,16 @@ class MainWlift {
       wren_guard_class:       wasm.wren_guard_class,
       wren_get_static_field:  wasm.wren_get_static_field,
       wren_set_static_field:  wasm.wren_set_static_field,
+      // Closure capture — per-arity MakeClosure ladder (0..=4
+      // upvalues) and the upvalue load/store pair. See `worker.js`
+      // and `wasm/src/tier_up.rs` for details.
+      wren_make_closure_0: wasm.wren_make_closure_0,
+      wren_make_closure_1: wasm.wren_make_closure_1,
+      wren_make_closure_2: wasm.wren_make_closure_2,
+      wren_make_closure_3: wasm.wren_make_closure_3,
+      wren_make_closure_4: wasm.wren_make_closure_4,
+      wren_get_upvalue:    wasm.wren_get_upvalue,
+      wren_set_upvalue:    wasm.wren_set_upvalue,
       // SIMD intrinsic helpers — see the matching block in
       // `worker.js` for the full rationale. `bitmask` / `allTrue`
       // / `anyTrue` are the only ones the wasm emitter routes
