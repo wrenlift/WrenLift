@@ -158,7 +158,13 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
         wren_lift::codegen::wasm::emit_mir(mir)
     } else {
         let interner = unsafe { &(*vm_ptr).interner };
-        wren_lift::codegen::wasm::emit_mir_with_interner(mir, interner)
+        // Bake the cdylib's `current_module_vars_cell::CURRENT`
+        // address into the JIT'd module so `GetModuleVar` lowers
+        // to inline `i32.load + i64.load` rather than crossing
+        // the wasm-bindgen boundary on every read. The
+        // dispatcher updates the cell on each BC→JIT entry.
+        let module_vars_ptr_addr = wren_lift::runtime::tier::current_module_vars_addr();
+        wren_lift::codegen::wasm::emit_mir_with_runtime_addrs(mir, interner, module_vars_ptr_addr)
     };
     let module = match module_result {
         Ok(m) => m,
@@ -230,6 +236,23 @@ fn mir_needs_unsupported_helpers(
                 // (`wren_make_closure_<N>`) for capture counts
                 // 0..=4. Higher counts reject.
                 Instruction::MakeClosure { upvalues, .. } if upvalues.len() > 4 => return true,
+                // GetUpvalue / SetUpvalue currently lower to an
+                // external `wren_get_upvalue` / `wren_set_upvalue`
+                // call per access — each one a wasm-bindgen
+                // boundary round-trip back into JS land. For a
+                // capturing closure on a hot path (e.g. fib's
+                // recursive self-reference, the SIMD batch's
+                // `STEP` capture) the per-access cost dominates
+                // the BC interpreter's local frame load, making
+                // tier-up a net loss. Reject capturing-closure
+                // bodies until the wasm emitter can inline
+                // upvalue loads directly against the
+                // `current_closure` cell + the closure's
+                // upvalue array. MakeClosure stays accepted so
+                // closure *construction* still tier-ups; only
+                // bodies that actually *read* an upvalue stay
+                // BC.
+                Instruction::GetUpvalue(_) | Instruction::SetUpvalue(..) => return true,
                 // CallStaticSelf — per-arity ladder
                 // (`wren_call_static_self_0` … `_4`). Higher
                 // arities reject through the gate.
@@ -1004,10 +1027,18 @@ fn wren_call_1_inner(vm: &mut wren_lift::runtime::vm::VM, root_base: usize, meth
                 // tier-up'd target's `wren_get_upvalue`
                 // resolves the right upvalue array, restore
                 // afterwards so a deeper nested call sees its
-                // caller's closure.
-                let prev = wren_lift::runtime::tier::enter_closure(closure_ptr);
+                // caller's closure. Same shape for the module-
+                // vars cell — the callee may live in a different
+                // module than the caller, and its inline
+                // `GetModuleVar` lowerings read from the cell.
+                let prev_closure = wren_lift::runtime::tier::enter_closure(closure_ptr);
+                let new_vars = unsafe {
+                    wren_lift::runtime::tier::module_vars_ptr_for_closure(vm, closure_ptr)
+                };
+                let prev_vars = wren_lift::runtime::tier::enter_module_vars(new_vars);
                 let result = js_jit_call_1(slot, arg.to_bits());
-                wren_lift::runtime::tier::restore_closure(prev);
+                wren_lift::runtime::tier::restore_module_vars(prev_vars);
+                wren_lift::runtime::tier::restore_closure(prev_closure);
                 return result;
             }
         }
@@ -1152,7 +1183,11 @@ fn wren_call_n_inner(
             let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
             if let Some(slot) = vm.engine.wasm_jit_slot(target_fn) {
                 DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
-                let prev = wren_lift::runtime::tier::enter_closure(closure_ptr);
+                let prev_closure = wren_lift::runtime::tier::enter_closure(closure_ptr);
+                let new_vars = unsafe {
+                    wren_lift::runtime::tier::module_vars_ptr_for_closure(vm, closure_ptr)
+                };
+                let prev_vars = wren_lift::runtime::tier::enter_module_vars(new_vars);
                 let result = match arity {
                     2 => js_jit_call_2(
                         slot,
@@ -1174,7 +1209,8 @@ fn wren_call_n_inner(
                     ),
                     _ => Value::null().to_bits(),
                 };
-                wren_lift::runtime::tier::restore_closure(prev);
+                wren_lift::runtime::tier::restore_module_vars(prev_vars);
+                wren_lift::runtime::tier::restore_closure(prev_closure);
                 return result;
             }
         }

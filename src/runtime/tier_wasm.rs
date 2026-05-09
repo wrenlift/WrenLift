@@ -202,6 +202,133 @@ pub fn current_closure() -> *mut crate::runtime::object::ObjClosure {
     std::ptr::null_mut()
 }
 
+#[cfg(target_arch = "wasm32")]
+mod current_module_vars_cell {
+    use std::cell::UnsafeCell;
+
+    /// Data pointer of the currently-executing module's
+    /// `vars: Vec<Value>`. Set by every dispatch boundary that
+    /// crosses into JIT'd wasm (BC → tier and tier → tier across
+    /// modules); read inline by JIT'd `Instruction::GetModuleVar`
+    /// / `SetModuleVar` lowerings via an `i32.const ADDR;
+    /// i32.load; i64.load offset=idx*8` triple — replacing the
+    /// per-access wasm-bindgen call into `wren_get_module_var`.
+    /// The static lives at a stable address in the cdylib's
+    /// linear memory; codegen bakes that address as an i32.const
+    /// literal in the JIT'd module.
+    pub(super) struct VarsCell(UnsafeCell<*mut u64>);
+    unsafe impl Sync for VarsCell {}
+    pub(super) static CURRENT: VarsCell = VarsCell(UnsafeCell::new(std::ptr::null_mut()));
+    impl VarsCell {
+        pub(super) fn get(&self) -> *mut u64 {
+            unsafe { *self.0.get() }
+        }
+        pub(super) fn set(&self, p: *mut u64) {
+            unsafe { *self.0.get() = p }
+        }
+    }
+}
+
+/// Read the data pointer for the currently-executing module's
+/// `vars` Vec. Null outside any tier-up dispatch window. JIT'd
+/// modules read this via inline `i32.load` against the static's
+/// fixed address — see [`current_module_vars_addr`].
+#[cfg(target_arch = "wasm32")]
+pub fn current_module_vars() -> *mut u64 {
+    current_module_vars_cell::CURRENT.get()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn current_module_vars() -> *mut u64 {
+    std::ptr::null_mut()
+}
+
+/// Address of the `current_module_vars_cell::CURRENT` static
+/// inside the cdylib's linear memory, returned as a wasm32 i32.
+/// Used by the wasm codegen to bake an `i32.const ADDR` into
+/// JIT'd modules so `Instruction::GetModuleVar(idx)` lowers to
+/// `(i32.const ADDR) (i32.load) (i64.load offset=idx*8)` — three
+/// inline instructions instead of an `(import "wren"
+/// "wren_get_module_var")` wasm-bindgen boundary call. Returns
+/// `None` on host builds (no cdylib memory to point at).
+#[cfg(target_arch = "wasm32")]
+pub fn current_module_vars_addr() -> Option<u32> {
+    Some(&current_module_vars_cell::CURRENT as *const _ as usize as u32)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn current_module_vars_addr() -> Option<u32> {
+    None
+}
+
+/// Save / install the current module-vars data pointer; return
+/// the previous value for the caller to restore on exit. Same
+/// RAII pattern as `enter_closure` / `enter_vm`. The dispatcher
+/// computes the new pointer by walking
+/// `closure.function.fn_id → engine.func_module(id) →
+/// engine.modules[name].vars.as_mut_ptr()` once per BC→JIT or
+/// cross-module JIT→JIT entry. In-module call_indirect calls
+/// inside a tier'd-up function don't go through the dispatcher,
+/// so the cell stays valid for the whole nested-call chain
+/// without per-call updates.
+#[allow(unused_variables)]
+pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prev = current_module_vars_cell::CURRENT.get();
+        current_module_vars_cell::CURRENT.set(p);
+        prev
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::ptr::null_mut()
+    }
+}
+
+#[allow(unused_variables)]
+pub fn restore_module_vars(prev: *mut u64) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        current_module_vars_cell::CURRENT.set(prev);
+    }
+}
+
+/// Walk `closure → function → fn_id → engine.func_module(id) →
+/// engine.modules[name].vars.as_mut_ptr()` to find the module
+/// vars data pointer for a closure that's about to enter JIT'd
+/// code. Returns null if any link is missing (closure outside
+/// any registered module — should never happen in practice but
+/// matches the existing `current_vm` null-on-not-set ergonomics).
+///
+/// # Safety
+/// `closure` must be a live `ObjClosure` and `vm` must be a live
+/// VM. Both invariants hold whenever this is called from the
+/// tier dispatch boundaries.
+#[cfg(target_arch = "wasm32")]
+pub unsafe fn module_vars_ptr_for_closure(
+    vm: &mut crate::runtime::vm::VM,
+    closure: *mut crate::runtime::object::ObjClosure,
+) -> *mut u64 {
+    if closure.is_null() {
+        return std::ptr::null_mut();
+    }
+    let fn_ptr = (*closure).function;
+    if fn_ptr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let func_id = FuncId((*fn_ptr).fn_id);
+    let module_name = match vm.engine.func_module(func_id) {
+        Some(name) => name.clone(),
+        None => return std::ptr::null_mut(),
+    };
+    // `engine.modules` keys on `String` (not `Rc<String>`), so
+    // pass an `&str` view of the Rc for the lookup.
+    match vm.engine.modules.get_mut(module_name.as_str()) {
+        Some(entry) => entry.vars.as_mut_ptr() as *mut u64,
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// Save / install the current closure pointer, return the
 /// previous value for the caller to restore on exit. Same RAII
 /// rationale as `enter_vm`: dispatch boundaries are short and

@@ -202,7 +202,7 @@ pub fn make_closure_helper_name(upvalues: usize) -> Option<&'static str> {
 /// that need to read the cdylib's heap are skipped on this
 /// path.
 pub fn emit_mir(mir: &MirFunction) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, None, false);
+    let mut emitter = MirWasmEmitter::new(mir, None, false, None);
     emitter.emit()
 }
 
@@ -225,7 +225,25 @@ pub fn emit_mir_with_interner(
     mir: &MirFunction,
     interner: &Interner,
 ) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true);
+    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true, None);
+    emitter.emit()
+}
+
+/// Same as [`emit_mir_with_interner`] but also bakes the address
+/// of the cdylib's `current_module_vars_cell::CURRENT` static
+/// into the JIT'd module so `Instruction::GetModuleVar` and
+/// `SetModuleVar` lower to inline `i32.load` / `i64.load` /
+/// `i64.store` triples instead of an `(import "wren"
+/// "wren_get_module_var")` wasm-bindgen boundary call. The
+/// module-vars-ptr cell is updated by the dispatcher on every
+/// BC→JIT entry (and cross-module JIT→JIT entry) — see
+/// `runtime::tier::enter_module_vars`.
+pub fn emit_mir_with_runtime_addrs(
+    mir: &MirFunction,
+    interner: &Interner,
+    module_vars_ptr_addr: Option<u32>,
+) -> Result<WasmModule, String> {
+    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true, module_vars_ptr_addr);
     emitter.emit()
 }
 
@@ -270,6 +288,15 @@ struct MirWasmEmitter<'a> {
     /// host-provided imports), on for the runtime tier-up path —
     /// see [`emit_mir`] vs [`emit_mir_with_interner`] above.
     imports_memory: bool,
+    /// Address of `runtime::tier::current_module_vars_cell::CURRENT`
+    /// in the cdylib's linear memory. When `Some`, `GetModuleVar`
+    /// and `SetModuleVar` lower to inline loads/stores against
+    /// that address (chasing through the *mut u64 data ptr it
+    /// holds). When `None`, both fall back to a wasm-bindgen
+    /// `(import "wren" "wren_get_module_var")` boundary call —
+    /// the path used for codegen tests under wasmtime, where no
+    /// cdylib memory is wired up.
+    module_vars_ptr_addr: Option<u32>,
     /// Call-site arity → type-section index of the matching
     /// `(i64*N) -> i64` type. The compiled function and its
     /// `call_indirect` callees can have different arities (e.g.
@@ -280,7 +307,12 @@ struct MirWasmEmitter<'a> {
 }
 
 impl<'a> MirWasmEmitter<'a> {
-    fn new(mir: &'a MirFunction, interner: Option<&'a Interner>, imports_memory: bool) -> Self {
+    fn new(
+        mir: &'a MirFunction,
+        interner: Option<&'a Interner>,
+        imports_memory: bool,
+        module_vars_ptr_addr: Option<u32>,
+    ) -> Self {
         Self {
             mir,
             interner,
@@ -293,6 +325,7 @@ impl<'a> MirWasmEmitter<'a> {
             module_var_slot_locals: HashMap::new(),
             value_to_module_var: HashMap::new(),
             imports_memory,
+            module_vars_ptr_addr,
             call_arity_types: HashMap::new(),
         }
     }
@@ -647,14 +680,22 @@ impl<'a> MirWasmEmitter<'a> {
                             &[ValType::I64],
                         );
                     }
-                    Instruction::GetModuleVar(_) => {
+                    // Inline path bakes the `module_vars_ptr_addr`
+                    // cell address as an `i32.const` and does an
+                    // inline `i32.load + i64.load` (or
+                    // `+ i64.store` for SetModuleVar) — no boundary
+                    // import needed. Fall back to the import call
+                    // only when codegen has no cdylib memory
+                    // address (e.g. the codegen tests under
+                    // wasmtime).
+                    Instruction::GetModuleVar(_) if self.module_vars_ptr_addr.is_none() => {
                         self.register_import(
                             "wren_get_module_var",
                             &[ValType::I64],
                             &[ValType::I64],
                         );
                     }
-                    Instruction::SetModuleVar(..) => {
+                    Instruction::SetModuleVar(..) if self.module_vars_ptr_addr.is_none() => {
                         self.register_import(
                             "wren_set_module_var",
                             &[ValType::I64, ValType::I64],
@@ -1287,15 +1328,66 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::GetModuleVar(idx) => {
-                func.instruction(&WasmInst::I64Const(*idx as i64));
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_get_module_var"]));
-                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                if let Some(addr) = self.module_vars_ptr_addr {
+                    // Inline:
+                    //   (i32.const ADDR)            ;; addr of CURRENT cell
+                    //   (i32.load)                  ;; data ptr (*mut u64)
+                    //   (i64.load offset=idx*8)     ;; vars[idx]
+                    //   (local.set dst)
+                    // Three wasm instructions vs the wasm-bindgen
+                    // boundary call the import path emitted —
+                    // the hot read in `fib`, `simd batch`, and
+                    // any other tier'd-up code that touches a
+                    // top-level `var` lands inline.
+                    let mem_offset = (*idx as u64) * 8;
+                    func.instruction(&WasmInst::I32Const(addr as i32));
+                    func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    func.instruction(&WasmInst::I64Load(wasm_encoder::MemArg {
+                        offset: mem_offset,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                } else {
+                    func.instruction(&WasmInst::I64Const(*idx as i64));
+                    func.instruction(&WasmInst::Call(self.runtime_imports["wren_get_module_var"]));
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                }
             }
             Instruction::SetModuleVar(idx, val) => {
-                func.instruction(&WasmInst::I64Const(*idx as i64));
-                func.instruction(&WasmInst::LocalGet(self.local(*val)));
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_set_module_var"]));
-                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                if let Some(addr) = self.module_vars_ptr_addr {
+                    // Inline:
+                    //   (i32.const ADDR) (i32.load)         ;; data ptr
+                    //   (local.get val)                      ;; new value
+                    //   (i64.store offset=idx*8)
+                    //   ;; result expression mirrors the host
+                    //   ;; helper which returns the stored value
+                    //   (local.get val) (local.set dst)
+                    let mem_offset = (*idx as u64) * 8;
+                    func.instruction(&WasmInst::I32Const(addr as i32));
+                    func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                    func.instruction(&WasmInst::I64Store(wasm_encoder::MemArg {
+                        offset: mem_offset,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                    func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                } else {
+                    func.instruction(&WasmInst::I64Const(*idx as i64));
+                    func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                    func.instruction(&WasmInst::Call(self.runtime_imports["wren_set_module_var"]));
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                }
             }
 
             // -- Calls --
