@@ -1610,7 +1610,31 @@ pub fn wren_subscript_set_1(receiver: u64, index: u64, value: u64) -> u64 {
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn wren_set_module_var(slot: u64, value: u64) -> u64 {
-    wren_lift::codegen::runtime_fns::wren_set_module_var(slot, value)
+    // The host impl reads `JitContext.module_vars` — a pointer
+    // populated by the Cranelift entry shim, but null on wasm.
+    // Mirror `wren_get_module_var`'s pattern instead: walk the
+    // `current_vm()` and mutate the module's `vars` vector
+    // directly. The cdylib's `module_vars: NonNull<u64>` cache
+    // points at this same Vec's backing storage, so updates here
+    // are visible to subsequent `wren_get_module_var` calls.
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return value;
+    }
+    let vm = unsafe { &*vm_ptr };
+    let module_ptr = cached_main_module(vm, vm_ptr);
+    if module_ptr.is_null() {
+        return value;
+    }
+    // SAFETY: cached_main_module returns a stable pointer into
+    // `vm.engine.modules`. We need `&mut` for the assignment;
+    // wasm32 is single-threaded so the aliasing rules hold.
+    let module = unsafe { &mut *(module_ptr as *mut wren_lift::runtime::engine::ModuleEntry) };
+    let idx = slot as usize;
+    if let Some(slot_ref) = module.vars.get_mut(idx) {
+        *slot_ref = Value::from_bits(value);
+    }
+    value
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
