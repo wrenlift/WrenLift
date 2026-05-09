@@ -1388,6 +1388,10 @@ class MainWlift {
       wren_not:      wasm.wren_not,
       wren_is_truthy:wasm.wren_is_truthy,
       wren_call_1_slow: wasm.wren_call_1,
+      // See `worker.js` — slow-path fallbacks for arity 2-4.
+      wren_call_2_slow: wasm.wren_call_2,
+      wren_call_3_slow: wasm.wren_call_3,
+      wren_call_4_slow: wasm.wren_call_4,
       wren_jit_slot_plus_one: wasm.wren_jit_slot_plus_one,
       wren_jit_slot_for_module_var: wasm.wren_jit_slot_for_module_var,
       wren_get_module_var: wasm.wren_get_module_var,
@@ -1501,6 +1505,8 @@ class MainWlift {
     globalThis._wlift_jit_call_0 = (slot)       => __wliftSafeCall(slot, (fn) => fn(),   "call_0");
     globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
     globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
+    globalThis._wlift_jit_call_3 = (slot, a, b, c)    => __wliftSafeCall(slot, (fn) => fn(a, b, c),    "call_3");
+    globalThis._wlift_jit_call_4 = (slot, a, b, c, d) => __wliftSafeCall(slot, (fn) => fn(a, b, c, d), "call_4");
 
     // Per-run reset — wlift_wasm calls this at the top of each
     // `run()` so JIT'd modules from prior VMs become

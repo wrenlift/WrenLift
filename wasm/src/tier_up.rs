@@ -107,6 +107,10 @@ extern "C" {
     fn js_jit_call_1(slot: u32, a: u64) -> u64;
     #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_2)]
     fn js_jit_call_2(slot: u32, a: u64, b: u64) -> u64;
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_3)]
+    fn js_jit_call_3(slot: u32, a: u64, b: u64, c: u64) -> u64;
+    #[wasm_bindgen(js_namespace = globalThis, js_name = _wlift_jit_call_4)]
+    fn js_jit_call_4(slot: u32, a: u64, b: u64, c: u64, d: u64) -> u64;
     /// JS-provided shim that resets the host's JIT-instance
     /// pool (the array `__wliftJitInstances` and the funcref
     /// table `__wliftJitTable`). Called from
@@ -209,13 +213,16 @@ fn mir_needs_unsupported_helpers(
     for block in &mir.blocks {
         for (_, inst) in &block.instructions {
             match inst {
-                // `Call` is supported for arity 1 (`wren_call_1`)
-                // and for the recognised SIMD intrinsics
-                // regardless of arity (each routes to a dedicated
-                // `wren_simd*_*` helper). Everything else rejects
-                // until its helper lands.
+                // `Call` supports arities 1..=4 via the
+                // `wren_call_<N>_slow` ladder (slow path) plus the
+                // per-arity `call_indirect` fast path. SIMD
+                // intrinsics route through dedicated helpers
+                // regardless of arity. Higher arities still
+                // reject — the slow-path ladder caps at 4.
                 Instruction::Call { method, args, .. }
-                    if args.len() != 1 && !is_simd_intrinsic_call(*method, args.len()) =>
+                    if !is_simd_intrinsic_call(*method, args.len())
+                        && wren_lift::codegen::wasm::call_slow_helper_name(args.len())
+                            .is_none() =>
                 {
                     return true
                 }
@@ -1005,6 +1012,167 @@ fn wren_call_1_inner(vm: &mut wren_lift::runtime::vm::VM, root_base: usize, meth
 
     use wren_lift::runtime::object::NativeContext;
     match vm.call_method_on(receiver, &method_name, &[arg]) {
+        Some(v) => v.to_bits(),
+        None => Value::null().to_bits(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Higher-arity Call helpers (2..=4 args).
+//
+// Same shape as `wren_call_1`: stage receiver + args into the
+// JIT root store before any path that might trigger GC, attempt
+// the JIT-slot fast path when the receiver is a closure with an
+// installed slot, fall through to full method dispatch on miss.
+// `*_slow` aliases let the wasm emitter pick between the fast
+// (call_indirect) and slow paths without two import names —
+// modules that import either link to the right symbol.
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_call_2_slow(receiver_bits: u64, method_id: u64, a0: u64, a1: u64) -> u64 {
+    wren_call_2(receiver_bits, method_id, a0, a1)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_call_2(receiver_bits: u64, method_id: u64, a0: u64, a1: u64) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let root_base = wren_lift::codegen::runtime_fns::jit_roots_snapshot_len();
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(receiver_bits));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a0));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a1));
+    let result = wren_call_n_inner(vm, root_base, method_id, 2);
+    wren_lift::codegen::runtime_fns::jit_roots_restore_len(root_base);
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_call_3_slow(receiver_bits: u64, method_id: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_call_3(receiver_bits, method_id, a0, a1, a2)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn wren_call_3(receiver_bits: u64, method_id: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let root_base = wren_lift::codegen::runtime_fns::jit_roots_snapshot_len();
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(receiver_bits));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a0));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a1));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a2));
+    let result = wren_call_n_inner(vm, root_base, method_id, 3);
+    wren_lift::codegen::runtime_fns::jit_roots_restore_len(root_base);
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn wren_call_4_slow(
+    receiver_bits: u64,
+    method_id: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> u64 {
+    wren_call_4(receiver_bits, method_id, a0, a1, a2, a3)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn wren_call_4(receiver_bits: u64, method_id: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    let vm_ptr = wren_lift::runtime::tier::current_vm();
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
+    let root_base = wren_lift::codegen::runtime_fns::jit_roots_snapshot_len();
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(receiver_bits));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a0));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a1));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a2));
+    wren_lift::codegen::runtime_fns::push_jit_root(Value::from_bits(a3));
+    let result = wren_call_n_inner(vm, root_base, method_id, 4);
+    wren_lift::codegen::runtime_fns::jit_roots_restore_len(root_base);
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wren_call_n_inner(
+    vm: &mut wren_lift::runtime::vm::VM,
+    root_base: usize,
+    method_id: u64,
+    arity: usize,
+) -> u64 {
+    use wren_lift::codegen::runtime_fns::jit_root_at;
+    // Re-read receiver / args through the root store so a GC
+    // mid-call sees forwarded pointers reflected in the locals
+    // we use here.
+    let receiver = jit_root_at(root_base);
+
+    // FAST PATH — receiver is a Closure with a JIT slot. Same
+    // rationale as `wren_call_1_inner`; without it, a recursive
+    // arity-N method alternates JIT→BC→JIT every level. Per-
+    // arity JS shim because each call site has a distinct
+    // wasm-bindgen-bound JS name.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    if receiver.is_object() {
+        let ptr = receiver.as_object().unwrap();
+        let header = ptr as *const wren_lift::runtime::object::ObjHeader;
+        let is_closure =
+            unsafe { (*header).obj_type == wren_lift::runtime::object::ObjType::Closure };
+        if is_closure {
+            let closure_ptr = ptr as *const wren_lift::runtime::object::ObjClosure;
+            let fn_ptr = unsafe { (*closure_ptr).function };
+            let target_fn = wren_lift::runtime::engine::FuncId(unsafe { (*fn_ptr).fn_id });
+            if let Some(slot) = vm.engine.wasm_jit_slot(target_fn) {
+                DISPATCH_FAST_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
+                return match arity {
+                    2 => js_jit_call_2(
+                        slot,
+                        jit_root_at(root_base + 1).to_bits(),
+                        jit_root_at(root_base + 2).to_bits(),
+                    ),
+                    3 => js_jit_call_3(
+                        slot,
+                        jit_root_at(root_base + 1).to_bits(),
+                        jit_root_at(root_base + 2).to_bits(),
+                        jit_root_at(root_base + 3).to_bits(),
+                    ),
+                    4 => js_jit_call_4(
+                        slot,
+                        jit_root_at(root_base + 1).to_bits(),
+                        jit_root_at(root_base + 2).to_bits(),
+                        jit_root_at(root_base + 3).to_bits(),
+                        jit_root_at(root_base + 4).to_bits(),
+                    ),
+                    _ => Value::null().to_bits(),
+                };
+            }
+        }
+    }
+
+    // SLOW PATH — full method dispatch via call_method_on.
+    let sym = wren_lift::intern::SymbolId::from_raw(method_id as u32);
+    let method_name = vm.interner.resolve(sym).to_string();
+    let mut args: Vec<Value> = Vec::with_capacity(arity);
+    for i in 0..arity {
+        args.push(jit_root_at(root_base + 1 + i));
+    }
+    use wren_lift::runtime::object::NativeContext;
+    match vm.call_method_on(receiver, &method_name, &args) {
         Some(v) => v.to_bits(),
         None => Value::null().to_bits(),
     }

@@ -151,6 +151,21 @@ pub fn subscript_set_helper_name(args: usize) -> Option<&'static str> {
     }
 }
 
+/// Per-arity slow-path helper for `Instruction::Call`. Used as
+/// the slot-lookup fallback (`wren_jit_slot_plus_one` returned
+/// 0). Each call site picks the helper matching its arity;
+/// arities beyond the cap reject through
+/// `mir_needs_unsupported_helpers`.
+pub fn call_slow_helper_name(args: usize) -> Option<&'static str> {
+    match args {
+        1 => Some("wren_call_1_slow"),
+        2 => Some("wren_call_2_slow"),
+        3 => Some("wren_call_3_slow"),
+        4 => Some("wren_call_4_slow"),
+        _ => None,
+    }
+}
+
 /// Compile a MIR function directly to a WASM module.
 ///
 /// No interner, no memory import — used by the codegen tests
@@ -227,6 +242,13 @@ struct MirWasmEmitter<'a> {
     /// host-provided imports), on for the runtime tier-up path —
     /// see [`emit_mir`] vs [`emit_mir_with_interner`] above.
     imports_memory: bool,
+    /// Call-site arity → type-section index of the matching
+    /// `(i64*N) -> i64` type. The compiled function and its
+    /// `call_indirect` callees can have different arities (e.g.
+    /// arity-1 caller invokes an arity-2 closure), so each
+    /// observed arity needs its own type entry. Populated during
+    /// `scan_imports`; consumed by the `Call` emit arm.
+    call_arity_types: HashMap<usize, u32>,
 }
 
 impl<'a> MirWasmEmitter<'a> {
@@ -243,6 +265,7 @@ impl<'a> MirWasmEmitter<'a> {
             module_var_slot_locals: HashMap::new(),
             value_to_module_var: HashMap::new(),
             imports_memory,
+            call_arity_types: HashMap::new(),
         }
     }
 
@@ -271,6 +294,26 @@ impl<'a> MirWasmEmitter<'a> {
         // bugs once a function with non-zero arity got tier-up'd.
         let params: Vec<ValType> = (0..self.mir.arity as usize).map(|_| ValType::I64).collect();
         types.ty().function(params, [ValType::I64]);
+        // Per-arity `(i64*N) -> i64` types for the JIT-target
+        // call_indirect at each Call site. The compiled
+        // function's own type already covers `self.mir.arity`,
+        // but a function can call closures with different
+        // arities — each needs its own indexed type. Skip the
+        // arity that matches the compiled function's own type
+        // and reuse `func_type_idx` for that case.
+        let mut next_type_idx = func_type_idx + 1;
+        for arity in self.call_arity_types.clone().keys().copied() {
+            let idx = if arity == self.mir.arity as usize {
+                func_type_idx
+            } else {
+                let params: Vec<ValType> = (0..arity).map(|_| ValType::I64).collect();
+                types.ty().function(params, [ValType::I64]);
+                let i = next_type_idx;
+                next_type_idx += 1;
+                i
+            };
+            self.call_arity_types.insert(arity, idx);
+        }
         module.section(&types);
 
         // Import section.
@@ -495,36 +538,34 @@ impl<'a> MirWasmEmitter<'a> {
                         }
                         // JIT-to-JIT inter-fn calls go through a
                         // slot lookup + call_indirect on a shared
-                        // funcref table. The lookup returns
-                        // `slot + 1` (so 0 means "no JIT, take the
-                        // slow path"), and the slow-path helper
-                        // handles non-JIT'd targets + generic
-                        // method dispatch. Single wasm-to-wasm call
-                        // per Call site for the hot path (no JS
-                        // hop).
-                        //
-                        // Both helpers stay arity-specific because
-                        // the slow-path helper takes the args
-                        // unboxed and the runtime dispatch needs
-                        // arity to format the method name.
+                        // funcref table. Per-arity slow-path helper
+                        // (`wren_call_<N>_slow`) since each arity
+                        // has its own wasm signature; the
+                        // call_indirect type signature is also
+                        // per-arity, declared in `emit()` after
+                        // the import block.
                         self.register_import(
                             "wren_jit_slot_plus_one",
                             &[ValType::I64],
                             &[ValType::I32],
                         );
-                        let slow_name = match args.len() {
-                            1 => "wren_call_1_slow",
-                            // Higher arities don't have slow-path
-                            // helpers yet — `mir_needs_unsupported_helpers`
-                            // rejects them. Reserve names so emit
-                            // compiles even if a stale module
-                            // sneaks through; the JIT'd module
-                            // would just LinkError at instantiate
-                            // time, surfacing the gap clearly.
-                            _ => "wren_call_n_slow",
+                        let Some(slow_name) = call_slow_helper_name(args.len()) else {
+                            // Beyond the cap — `mir_needs_unsupported_helpers`
+                            // rejects already, so this branch should
+                            // never run in practice. Skip the import
+                            // so a stale module surfaces a clear
+                            // LinkError instead of a silent
+                            // wrong-arity dispatch.
+                            continue;
                         };
                         let slow_params = vec![ValType::I64; args.len() + 2];
                         self.register_import(slow_name, &slow_params, &[ValType::I64]);
+                        // Record the call-site arity so `emit()`
+                        // declares an `(i64*N) -> i64` type entry
+                        // for the matching `call_indirect`. Insert
+                        // is idempotent — multiple Call sites at
+                        // the same arity share one type.
+                        self.call_arity_types.entry(args.len()).or_insert(u32::MAX);
                     }
                     Instruction::CallStaticSelf { args } => {
                         let name = match args.len() {
@@ -1263,10 +1304,9 @@ impl<'a> MirWasmEmitter<'a> {
                 // signature, `(i64*arity) -> i64`) — same shape
                 // as any tier-up'd target since they're all
                 // arity-`args.len()` closures.
-                let slow_name = match args.len() {
-                    1 => "wren_call_1_slow",
-                    _ => "wren_call_n_slow",
-                };
+                let slow_name = call_slow_helper_name(args.len()).ok_or_else(|| {
+                    format!("Call of arity {} exceeds wasm tier-up cap", args.len())
+                })?;
                 let scratch_slot_local = self
                     .call_slot_local
                     .expect("scan_locals should have reserved a call_slot_local");
@@ -1325,13 +1365,18 @@ impl<'a> MirWasmEmitter<'a> {
                     func.instruction(&WasmInst::LocalGet(slot_local));
                     func.instruction(&WasmInst::I32Const(1));
                     func.instruction(&WasmInst::I32Sub);
-                    // The call_indirect type is the compiled
-                    // function's type (`(i64*arity) -> i64`),
-                    // located at `func_type_idx` in the type
-                    // section. Table 0 = the imported
-                    // `__wlift_jit_table`.
+                    // Per-call-site arity type index, recorded
+                    // in `emit()`. Each arity gets its own
+                    // `(i64*N) -> i64` entry in the type
+                    // section so an arity-1 caller can
+                    // call_indirect into an arity-2 closure
+                    // without a wasm validation error. Table 0 =
+                    // the imported `__wlift_jit_table`.
+                    let call_type = *self.call_arity_types.get(&args.len()).expect(
+                        "scan_imports should have recorded a type entry for this call arity",
+                    );
                     func.instruction(&WasmInst::CallIndirect {
-                        type_index: self.import_list.len() as u32,
+                        type_index: call_type,
                         table_index: 0,
                     });
                 }
