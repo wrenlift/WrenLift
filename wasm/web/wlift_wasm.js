@@ -231,10 +231,10 @@ export function jit_dispatch_hook_hits() {
 }
 
 /**
- * Phase 1 — emit wasm bytes for the *first* MIR function
- * produced by compiling `source`. Lets the host smoke-test
- * codegen on real Wren code (e.g. a simple math function),
- * not just hand-built MIR.
+ * Emit wasm bytes for the *first* MIR function produced by
+ * compiling `source`. Lets the host smoke-test codegen on real
+ * Wren code (e.g. a simple math function), not just hand-built
+ * MIR.
  *
  * Returns an empty Vec on any compile / emit failure — the
  * host can `bytes.length === 0` to detect.
@@ -251,10 +251,9 @@ export function jit_emit_from_source(source) {
 }
 
 /**
- * Phase 2b smoke — emit the const-42 module, hand bytes to the
- * JS instantiate shim, call the resulting function via the
- * JS call-0 shim, return the raw u64. Returns `0` on any
- * failure (cleanest signal for the JS test code).
+ * Emit the const-42 module, hand bytes to the JS instantiate
+ * shim, call the resulting function via the JS call-0 shim,
+ * return the raw u64. Returns `0` on any failure.
  * @returns {bigint}
  */
 export function jit_smoke_run_const() {
@@ -263,9 +262,9 @@ export function jit_smoke_run_const() {
 }
 
 /**
- * Phase 1 smoke test — emit a hand-built MIR function that
- * returns `42` as a NaN-boxed `Value` and hand back the wasm
- * bytes. JS-side test:
+ * Smoke test — emit a hand-built MIR function that returns `42`
+ * as a NaN-boxed `Value` and hand back the wasm bytes. JS-side
+ * test:
  *
  * ```js
  * const bytes = wlift_wasm.jit_test_emit();
@@ -593,11 +592,9 @@ export function wren_call_1(receiver_bits, method_id, arg_bits) {
 
 /**
  * `wren_call_1_slow` — fallback for `wren_jit_slot_plus_one`'s
- * `0` case. Same body as the original `wren_call_1`, just renamed
- * so emit_mir can pick between fast (call_indirect) and slow
- * (this) without name collision. JIT'd code with `wren_call_1`
- * imports still works — it's an alias for the slow path so
- * pre-Phase-5 modules continue dispatching correctly.
+ * `0` case. Aliased to `wren_call_1` so emit_mir can pick
+ * between fast (call_indirect) and slow (this) without name
+ * collision; modules importing `wren_call_1` still link.
  * @param {bigint} receiver_bits
  * @param {bigint} method_id
  * @param {bigint} arg_bits
@@ -605,6 +602,134 @@ export function wren_call_1(receiver_bits, method_id, arg_bits) {
  */
 export function wren_call_1_slow(receiver_bits, method_id, arg_bits) {
     const ret = wasm.wren_call_1_slow(receiver_bits, method_id, arg_bits);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver_bits
+ * @param {bigint} method_id
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @returns {bigint}
+ */
+export function wren_call_2(receiver_bits, method_id, a0, a1) {
+    const ret = wasm.wren_call_2(receiver_bits, method_id, a0, a1);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver_bits
+ * @param {bigint} method_id
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @returns {bigint}
+ */
+export function wren_call_2_slow(receiver_bits, method_id, a0, a1) {
+    const ret = wasm.wren_call_2_slow(receiver_bits, method_id, a0, a1);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver_bits
+ * @param {bigint} method_id
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @returns {bigint}
+ */
+export function wren_call_3(receiver_bits, method_id, a0, a1, a2) {
+    const ret = wasm.wren_call_3(receiver_bits, method_id, a0, a1, a2);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver_bits
+ * @param {bigint} method_id
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @returns {bigint}
+ */
+export function wren_call_3_slow(receiver_bits, method_id, a0, a1, a2) {
+    const ret = wasm.wren_call_3_slow(receiver_bits, method_id, a0, a1, a2);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver_bits
+ * @param {bigint} method_id
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @param {bigint} a3
+ * @returns {bigint}
+ */
+export function wren_call_4(receiver_bits, method_id, a0, a1, a2, a3) {
+    const ret = wasm.wren_call_4(receiver_bits, method_id, a0, a1, a2, a3);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver_bits
+ * @param {bigint} method_id
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @param {bigint} a3
+ * @returns {bigint}
+ */
+export function wren_call_4_slow(receiver_bits, method_id, a0, a1, a2, a3) {
+    const ret = wasm.wren_call_4_slow(receiver_bits, method_id, a0, a1, a2, a3);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @returns {bigint}
+ */
+export function wren_call_static_self_0() {
+    const ret = wasm.wren_call_static_self_0();
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a0
+ * @returns {bigint}
+ */
+export function wren_call_static_self_1(a0) {
+    const ret = wasm.wren_call_static_self_1(a0);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @returns {bigint}
+ */
+export function wren_call_static_self_2(a0, a1) {
+    const ret = wasm.wren_call_static_self_2(a0, a1);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @returns {bigint}
+ */
+export function wren_call_static_self_3(a0, a1, a2) {
+    const ret = wasm.wren_call_static_self_3(a0, a1, a2);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @param {bigint} a3
+ * @returns {bigint}
+ */
+export function wren_call_static_self_4(a0, a1, a2, a3) {
+    const ret = wasm.wren_call_static_self_4(a0, a1, a2, a3);
     return BigInt.asUintN(64, ret);
 }
 
@@ -669,11 +794,68 @@ export function wren_cmp_ne(a, b) {
 }
 
 /**
+ * Read field `field_idx` of the receiver instance. The wasm
+ * emitter generates this for every `Instruction::GetField`,
+ * which is what `obj._foo` lowers to inside the class's own
+ * methods. Returns NaN-boxed null on a non-Instance receiver
+ * or out-of-range index — matches the BC interpreter's
+ * fallback rather than aborting, since the JIT'd path is
+ * expected to be hit only after the type-checking front end
+ * already validated the access.
+ * @param {bigint} recv_bits
+ * @param {bigint} field_idx
+ * @returns {bigint}
+ */
+export function wren_get_field(recv_bits, field_idx) {
+    const ret = wasm.wren_get_field(recv_bits, field_idx);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
  * @param {bigint} slot_idx
  * @returns {bigint}
  */
 export function wren_get_module_var(slot_idx) {
     const ret = wasm.wren_get_module_var(slot_idx);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Read a class-level static field by symbol id. Static fields
+ * belong to the enclosing class object; the symbol id is
+ * baked at MIR build time.
+ * @param {bigint} field_sym
+ * @returns {bigint}
+ */
+export function wren_get_static_field(field_sym) {
+    const ret = wasm.wren_get_static_field(field_sym);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Read upvalue `index` of the JIT'd-currently-executing
+ * closure. Falls back to NaN-boxed null when the cell isn't
+ * set (defensive — JIT'd code only runs through a tier-up
+ * dispatch that installs it).
+ * @param {bigint} index
+ * @returns {bigint}
+ */
+export function wren_get_upvalue(index) {
+    const ret = wasm.wren_get_upvalue(index);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Class assertion — passes the value through if it matches
+ * the cached class, else `runtime_error`s. Used by MIR's
+ * type-narrowing prologue when the front end deduces a
+ * receiver class.
+ * @param {bigint} value
+ * @param {bigint} _class
+ * @returns {bigint}
+ */
+export function wren_guard_class(value, _class) {
+    const ret = wasm.wren_guard_class(value, _class);
     return BigInt.asUintN(64, ret);
 }
 
@@ -689,6 +871,17 @@ export function wren_get_module_var(slot_idx) {
 export function wren_is_truthy(a) {
     const ret = wasm.wren_is_truthy(a);
     return ret >>> 0;
+}
+
+/**
+ * Type check — `x is Klass`. Returns NaN-boxed `Bool`.
+ * @param {bigint} val
+ * @param {bigint} class_sym
+ * @returns {bigint}
+ */
+export function wren_is_type(val, class_sym) {
+    const ret = wasm.wren_is_type(val, class_sym);
+    return BigInt.asUintN(64, ret);
 }
 
 /**
@@ -714,14 +907,12 @@ export function wren_jit_roots_snapshot_len() {
 }
 
 /**
- * Phase 5d combined helper — load the closure stored in
+ * Combined helper: load the closure stored in
  * `module_vars["main"][idx]` *and* return its JIT slot+1 in a
- * single cross-instance call. The function-prologue lookup
- * emitted by `codegen::wasm::emit_function` was previously
- * two hops (`wren_get_module_var` then `wren_jit_slot_plus_one`);
- * merging them halves the prologue's cross-instance overhead,
- * which matters because the prologue runs once per outer call
- * (fib(20) → ~22k invocations).
+ * single cross-instance call. Halves the prologue's
+ * cross-instance overhead vs. calling `wren_get_module_var` and
+ * `wren_jit_slot_plus_one` separately, which matters because
+ * the prologue runs once per outer call.
  *
  * Returns 0 if the module / var / closure isn't JIT'd, mirroring
  * the `slot + 1` encoding of `wren_jit_slot_plus_one`.
@@ -734,37 +925,6 @@ export function wren_jit_slot_for_module_var(slot_idx) {
 }
 
 /**
- * One-arg method call — `receiver.method(arg)`.
- *
- * Phase 4 step 2: emit_mir lowers `Call` instructions to
- * `wren_call_<argc>` imports. The 1-arg variant is enough to
- * unlock self-recursive numeric code (`fib.call(n)`,
- * `factorial.call(n)`, etc.). Higher arities follow the same
- * template; the runtime's `call_method_on` handles any arity.
- *
- * Method dispatch:
- *   * `method_id` is the `SymbolId` index emit_mir baked in
- *     when compiling — `mir.name.index() as i64`. Resolves
- *     against the live VM's interner (must be the same VM
- *     that compiled the MIR; we can't migrate slots across
- *     VMs).
- *   * `call_method_on` short-circuits to `call_closure_sync`
- *     when the receiver is a Closure and the method name
- *     starts with `call`. That's the hot path for
- *     `fib.call(n)`-style recursion.
- *
- * **GC SAFETY (Phase 4 step 4 territory):** the JIT'd caller
- * holds NaN-boxed `Value`s in wasm locals while this runs.
- * The wlift GC has no visibility into wasm locals — if a
- * callee allocates and triggers a GC pass, those locals can
- * dangle. fib + similar pure-arithmetic recursive code
- * doesn't allocate and is safe. **Do not tier up code that
- * allocates inside its hot loop until step 4 lands.** The
- * MIR reject list catches most allocating instructions
- * (MakeList / MakeMap / StringConcat / ToString); the gap is
- * callees reached via `Call` that themselves allocate.
- * `wren_jit_slot_plus_one(receiver) -> i32` — Phase 5 helper.
- *
  * Look up the JIT slot for a closure receiver, returning
  * `slot + 1` (so `0` means "no JIT, take the slow path"). Used
  * by emit_mir's `Call` lowering to decide between
@@ -774,12 +934,200 @@ export function wren_jit_slot_for_module_var(slot_idx) {
  * The `+ 1` encoding lets the caller emit a single
  * `i32.eqz`-based branch rather than a sentinel comparison
  * against `-1` or similar.
+ *
+ * GC safety note for the slow-path companion `wren_call_1`:
+ * JIT'd callers hold NaN-boxed `Value`s in wasm locals, which
+ * the GC's root scan can't see. The slow path roots receiver +
+ * arg via `JIT_ROOTS_STORE` before any path that might trigger
+ * a GC. Pure-arithmetic recursive code doesn't allocate and is
+ * safe; do not tier up code that allocates inside its hot loop
+ * without similar rooting.
  * @param {bigint} receiver_bits
  * @returns {number}
  */
 export function wren_jit_slot_plus_one(receiver_bits) {
     const ret = wasm.wren_jit_slot_plus_one(receiver_bits);
     return ret >>> 0;
+}
+
+/**
+ * @param {bigint} fn_id
+ * @returns {bigint}
+ */
+export function wren_make_closure_0(fn_id) {
+    const ret = wasm.wren_make_closure_0(fn_id);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} fn_id
+ * @param {bigint} uv0
+ * @returns {bigint}
+ */
+export function wren_make_closure_1(fn_id, uv0) {
+    const ret = wasm.wren_make_closure_1(fn_id, uv0);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} fn_id
+ * @param {bigint} uv0
+ * @param {bigint} uv1
+ * @returns {bigint}
+ */
+export function wren_make_closure_2(fn_id, uv0, uv1) {
+    const ret = wasm.wren_make_closure_2(fn_id, uv0, uv1);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} fn_id
+ * @param {bigint} uv0
+ * @param {bigint} uv1
+ * @param {bigint} uv2
+ * @returns {bigint}
+ */
+export function wren_make_closure_3(fn_id, uv0, uv1, uv2) {
+    const ret = wasm.wren_make_closure_3(fn_id, uv0, uv1, uv2);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} fn_id
+ * @param {bigint} uv0
+ * @param {bigint} uv1
+ * @param {bigint} uv2
+ * @param {bigint} uv3
+ * @returns {bigint}
+ */
+export function wren_make_closure_4(fn_id, uv0, uv1, uv2, uv3) {
+    const ret = wasm.wren_make_closure_4(fn_id, uv0, uv1, uv2, uv3);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @returns {bigint}
+ */
+export function wren_make_list_0() {
+    const ret = wasm.wren_make_list_0();
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @returns {bigint}
+ */
+export function wren_make_list_1(a) {
+    const ret = wasm.wren_make_list_1(a);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_make_list_2(a, b) {
+    const ret = wasm.wren_make_list_2(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @param {bigint} c
+ * @returns {bigint}
+ */
+export function wren_make_list_3(a, b, c) {
+    const ret = wasm.wren_make_list_3(a, b, c);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @param {bigint} c
+ * @param {bigint} d
+ * @returns {bigint}
+ */
+export function wren_make_list_4(a, b, c, d) {
+    const ret = wasm.wren_make_list_4(a, b, c, d);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @returns {bigint}
+ */
+export function wren_make_map_0() {
+    const ret = wasm.wren_make_map_0();
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} k0
+ * @param {bigint} v0
+ * @returns {bigint}
+ */
+export function wren_make_map_1(k0, v0) {
+    const ret = wasm.wren_make_map_1(k0, v0);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} k0
+ * @param {bigint} v0
+ * @param {bigint} k1
+ * @param {bigint} v1
+ * @returns {bigint}
+ */
+export function wren_make_map_2(k0, v0, k1, v1) {
+    const ret = wasm.wren_make_map_2(k0, v0, k1, v1);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} k0
+ * @param {bigint} v0
+ * @param {bigint} k1
+ * @param {bigint} v1
+ * @param {bigint} k2
+ * @param {bigint} v2
+ * @returns {bigint}
+ */
+export function wren_make_map_3(k0, v0, k1, v1, k2, v2) {
+    const ret = wasm.wren_make_map_3(k0, v0, k1, v1, k2, v2);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} k0
+ * @param {bigint} v0
+ * @param {bigint} k1
+ * @param {bigint} v1
+ * @param {bigint} k2
+ * @param {bigint} v2
+ * @param {bigint} k3
+ * @param {bigint} v3
+ * @returns {bigint}
+ */
+export function wren_make_map_4(k0, v0, k1, v1, k2, v2, k3, v3) {
+    const ret = wasm.wren_make_map_4(k0, v0, k1, v1, k2, v2, k3, v3);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Build an inclusive / exclusive `Range` from `from..to`. The
+ * MIR builder lowers `a..b` and `a...b` into `MakeRange(a, b,
+ * inclusive_flag)`; the helper returns the boxed range and
+ * stays a single cross-instance call regardless of inputs.
+ * @param {bigint} from
+ * @param {bigint} to
+ * @param {bigint} inclusive
+ * @returns {bigint}
+ */
+export function wren_make_range(from, to, inclusive) {
+    const ret = wasm.wren_make_range(from, to, inclusive);
+    return BigInt.asUintN(64, ret);
 }
 
 /**
@@ -851,6 +1199,466 @@ export function wren_num_sub(a, b) {
 }
 
 /**
+ * Companion to `wren_get_field` — write `val_bits` into field
+ * `field_idx` of the receiver. Returns the written value (so
+ * the wasm emitter can plumb the result of `obj._foo = v`
+ * through the next instruction's local-set without a separate
+ * load), or null on a non-Instance / out-of-range write.
+ * @param {bigint} recv_bits
+ * @param {bigint} field_idx
+ * @param {bigint} val_bits
+ * @returns {bigint}
+ */
+export function wren_set_field(recv_bits, field_idx, val_bits) {
+    const ret = wasm.wren_set_field(recv_bits, field_idx, val_bits);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} slot
+ * @param {bigint} value
+ * @returns {bigint}
+ */
+export function wren_set_module_var(slot, value) {
+    const ret = wasm.wren_set_module_var(slot, value);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} field_sym
+ * @param {bigint} value
+ * @returns {bigint}
+ */
+export function wren_set_static_field(field_sym, value) {
+    const ret = wasm.wren_set_static_field(field_sym, value);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} index
+ * @param {bigint} value
+ * @returns {bigint}
+ */
+export function wren_set_upvalue(index, value) {
+    const ret = wasm.wren_set_upvalue(index, value);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_add(a, b) {
+    const ret = wasm.wren_simd4f_add(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_div(a, b) {
+    const ret = wasm.wren_simd4f_div(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_eq(a, b) {
+    const ret = wasm.wren_simd4f_eq(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_ge(a, b) {
+    const ret = wasm.wren_simd4f_ge(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_gt(a, b) {
+    const ret = wasm.wren_simd4f_gt(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_le(a, b) {
+    const ret = wasm.wren_simd4f_le(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_lt(a, b) {
+    const ret = wasm.wren_simd4f_lt(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_max(a, b) {
+    const ret = wasm.wren_simd4f_max(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_min(a, b) {
+    const ret = wasm.wren_simd4f_min(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_mul(a, b) {
+    const ret = wasm.wren_simd4f_mul(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_ne(a, b) {
+    const ret = wasm.wren_simd4f_ne(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4f_sub(a, b) {
+    const ret = wasm.wren_simd4f_sub(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_add(a, b) {
+    const ret = wasm.wren_simd4i_add(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} recv
+ * @returns {bigint}
+ */
+export function wren_simd4i_all_true(recv) {
+    const ret = wasm.wren_simd4i_all_true(recv);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_and(a, b) {
+    const ret = wasm.wren_simd4i_and(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} recv
+ * @returns {bigint}
+ */
+export function wren_simd4i_any_true(recv) {
+    const ret = wasm.wren_simd4i_any_true(recv);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} recv
+ * @returns {bigint}
+ */
+export function wren_simd4i_bitmask(recv) {
+    const ret = wasm.wren_simd4i_bitmask(recv);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_eq(a, b) {
+    const ret = wasm.wren_simd4i_eq(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_ge(a, b) {
+    const ret = wasm.wren_simd4i_ge(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_gt(a, b) {
+    const ret = wasm.wren_simd4i_gt(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_le(a, b) {
+    const ret = wasm.wren_simd4i_le(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_lt(a, b) {
+    const ret = wasm.wren_simd4i_lt(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_max(a, b) {
+    const ret = wasm.wren_simd4i_max(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_min(a, b) {
+    const ret = wasm.wren_simd4i_min(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_mul(a, b) {
+    const ret = wasm.wren_simd4i_mul(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_ne(a, b) {
+    const ret = wasm.wren_simd4i_ne(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_or(a, b) {
+    const ret = wasm.wren_simd4i_or(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_sub(a, b) {
+    const ret = wasm.wren_simd4i_sub(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_simd4i_xor(a, b) {
+    const ret = wasm.wren_simd4i_xor(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @returns {bigint}
+ */
+export function wren_string_concat_2(a, b) {
+    const ret = wasm.wren_string_concat_2(a, b);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @param {bigint} c
+ * @returns {bigint}
+ */
+export function wren_string_concat_3(a, b, c) {
+    const ret = wasm.wren_string_concat_3(a, b, c);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} a
+ * @param {bigint} b
+ * @param {bigint} c
+ * @param {bigint} d
+ * @returns {bigint}
+ */
+export function wren_string_concat_4(a, b, c, d) {
+    const ret = wasm.wren_string_concat_4(a, b, c, d);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Subscript get — `recv[idx]` for `List` / `Map` / `String` /
+ * `TypedArray`, falling through to `[_]` method dispatch for
+ * user classes. Forwards to the host's `wren_subscript_get`,
+ * which since the unified `vm_ref` fallback uses
+ * `current_vm()` on wasm.
+ *
+ * Capped at single-index access (the only arity the host
+ * helper supports). Multi-arg subscripts (`m[r, c]`-style) are
+ * rejected by the wasm tier-up gate; they're rare in Wren and
+ * every concrete user is matrix indexing on `Mat4`, which uses
+ * `m.at(r, c)` instead.
+ * @param {bigint} receiver
+ * @param {bigint} index
+ * @returns {bigint}
+ */
+export function wren_subscript_get_1(receiver, index) {
+    const ret = wasm.wren_subscript_get_1(receiver, index);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} receiver
+ * @param {bigint} index
+ * @param {bigint} value
+ * @returns {bigint}
+ */
+export function wren_subscript_set_1(receiver, index, value) {
+    const ret = wasm.wren_subscript_set_1(receiver, index, value);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Super-method dispatch — `super.foo(args)`. The MIR builder
+ * always includes `this` as the first arg, so the per-arity
+ * ladder starts at 1. `_<N>` takes `(method, this, a0..a_{N-2})`.
+ * @param {bigint} method
+ * @param {bigint} _this
+ * @returns {bigint}
+ */
+export function wren_super_call_1(method, _this) {
+    const ret = wasm.wren_super_call_1(method, _this);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} method
+ * @param {bigint} _this
+ * @param {bigint} a0
+ * @returns {bigint}
+ */
+export function wren_super_call_2(method, _this, a0) {
+    const ret = wasm.wren_super_call_2(method, _this, a0);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} method
+ * @param {bigint} _this
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @returns {bigint}
+ */
+export function wren_super_call_3(method, _this, a0, a1) {
+    const ret = wasm.wren_super_call_3(method, _this, a0, a1);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * @param {bigint} method
+ * @param {bigint} _this
+ * @param {bigint} a0
+ * @param {bigint} a1
+ * @param {bigint} a2
+ * @returns {bigint}
+ */
+export function wren_super_call_4(method, _this, a0, a1, a2) {
+    const ret = wasm.wren_super_call_4(method, _this, a0, a1, a2);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
+ * Convert any value to its string form. Used by string
+ * interpolation (`"%(x)"`) — every part lowers to a `ToString`
+ * before the `StringConcat` joins them, so this is a hot path
+ * for any tier-up'd code that builds strings dynamically.
+ * @param {bigint} val
+ * @returns {bigint}
+ */
+export function wren_to_string(val) {
+    const ret = wasm.wren_to_string(val);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
  * JS-callable: flip a socket to `Closed` and reject any parked
  * `recv()` futures. Idempotent — closing twice is a no-op.
  * @param {number} handle
@@ -916,86 +1724,94 @@ function __wbg_get_imports() {
         __wbg__wbg_cb_unref_6b5b6b8576d35cb1: function(arg0) {
             arg0._wbg_cb_unref();
         },
-        __wbg__wlift_dom_add_class_cff7ce5749bda8b2: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_dom_add_class_a4e95975316db63a: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_dom_add_class(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_dom_get_attribute_a60d5afe6268a6e8: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_dom_get_attribute_76e7a4f0c8d7f4e4: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_dom_get_attribute(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_dom_query_all_974332d80ef3febe: function(arg0, arg1, arg2) {
+        __wbg__wlift_dom_query_all_cbaf5cd278251bef: function(arg0, arg1, arg2) {
             globalThis._wlift_dom_query_all(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
-        __wbg__wlift_dom_remove_class_2d9ca4a1199e7cfd: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_dom_remove_class_3a8133e0f6e14cc0: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_dom_remove_class(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_dom_set_attribute_f37999638ed06f7e: function(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
+        __wbg__wlift_dom_set_attribute_fc7189855388eb68: function(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
             globalThis._wlift_dom_set_attribute(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4), getStringFromWasm0(arg5, arg6));
         },
-        __wbg__wlift_dom_set_html_543ab22a3e323b26: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_dom_set_html_51ba7baa78ed4177: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_dom_set_html(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_dom_set_text_a659bbf8d9719299: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_dom_set_text_7fc38ef82fa98f4c: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_dom_set_text(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_dom_text_6d119a35df8b8b48: function(arg0, arg1, arg2) {
+        __wbg__wlift_dom_text_67297edb549e42f4: function(arg0, arg1, arg2) {
             globalThis._wlift_dom_text(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
-        __wbg__wlift_fetch_bytes_0d863e7c4ed078e6: function(arg0, arg1, arg2) {
-            globalThis._wlift_fetch_bytes(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
-        },
-        __wbg__wlift_fetch_ea0f744df833158f: function(arg0, arg1, arg2) {
+        __wbg__wlift_fetch_05d1e37695659f7a: function(arg0, arg1, arg2) {
             globalThis._wlift_fetch(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
-        __wbg__wlift_jit_call_0_3c4a5763627598cf: function(arg0) {
+        __wbg__wlift_fetch_bytes_c9dac9d634b408e9: function(arg0, arg1, arg2) {
+            globalThis._wlift_fetch_bytes(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
+        },
+        __wbg__wlift_jit_call_0_041e9948039fc314: function(arg0) {
             const ret = globalThis._wlift_jit_call_0(arg0 >>> 0);
             return ret;
         },
-        __wbg__wlift_jit_call_1_909b55db88f8ace7: function(arg0, arg1) {
+        __wbg__wlift_jit_call_1_60b68b9d2046de96: function(arg0, arg1) {
             const ret = globalThis._wlift_jit_call_1(arg0 >>> 0, BigInt.asUintN(64, arg1));
             return ret;
         },
-        __wbg__wlift_jit_call_2_4f430a796b9fc356: function(arg0, arg1, arg2) {
+        __wbg__wlift_jit_call_2_86db47b4078968f6: function(arg0, arg1, arg2) {
             const ret = globalThis._wlift_jit_call_2(arg0 >>> 0, BigInt.asUintN(64, arg1), BigInt.asUintN(64, arg2));
             return ret;
         },
-        __wbg__wlift_jit_instantiate_1a1facf843addf1f: function(arg0, arg1) {
+        __wbg__wlift_jit_call_3_4a3d7a192863867f: function(arg0, arg1, arg2, arg3) {
+            const ret = globalThis._wlift_jit_call_3(arg0 >>> 0, BigInt.asUintN(64, arg1), BigInt.asUintN(64, arg2), BigInt.asUintN(64, arg3));
+            return ret;
+        },
+        __wbg__wlift_jit_call_4_f01b74e7202f8d8a: function(arg0, arg1, arg2, arg3, arg4) {
+            const ret = globalThis._wlift_jit_call_4(arg0 >>> 0, BigInt.asUintN(64, arg1), BigInt.asUintN(64, arg2), BigInt.asUintN(64, arg3), BigInt.asUintN(64, arg4));
+            return ret;
+        },
+        __wbg__wlift_jit_instantiate_2635ef06505be425: function(arg0, arg1) {
             const ret = globalThis._wlift_jit_instantiate(getArrayU8FromWasm0(arg0, arg1));
             return ret;
         },
-        __wbg__wlift_jit_reset_8583ff9d77c43989: function() {
+        __wbg__wlift_jit_reset_92b4153c59b7c741: function() {
             globalThis._wlift_jit_reset();
         },
-        __wbg__wlift_next_frame_edc6ca9b5eadc327: function(arg0) {
+        __wbg__wlift_next_frame_4f1e3065583eb132: function(arg0) {
             globalThis._wlift_next_frame(arg0 >>> 0);
         },
-        __wbg__wlift_perf_log_7b0935b5b8ba7abc: function(arg0, arg1, arg2) {
+        __wbg__wlift_perf_log_f1f865cb2a2aa075: function(arg0, arg1, arg2) {
             globalThis._wlift_perf_log(getStringFromWasm0(arg0, arg1), arg2);
         },
-        __wbg__wlift_set_timeout_8c02d3b8b01dd0ef: function(arg0, arg1) {
+        __wbg__wlift_set_timeout_c1025b755b6f5396: function(arg0, arg1) {
             globalThis._wlift_set_timeout(arg0 >>> 0, arg1);
         },
-        __wbg__wlift_storage_clear_34759c102bff75a0: function(arg0, arg1, arg2) {
+        __wbg__wlift_storage_clear_802411d986878bcb: function(arg0, arg1, arg2) {
             globalThis._wlift_storage_clear(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
-        __wbg__wlift_storage_get_9eab12e270e0ad2c: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_storage_get_d9ce76682fe25439: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_storage_get(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_storage_remove_bf39ed76a1faef7c: function(arg0, arg1, arg2, arg3, arg4) {
+        __wbg__wlift_storage_remove_3534ebdeaa44883a: function(arg0, arg1, arg2, arg3, arg4) {
             globalThis._wlift_storage_remove(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
         },
-        __wbg__wlift_storage_set_3b6a14135ad38ea5: function(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
+        __wbg__wlift_storage_set_2bc68ffbbd5f7439: function(arg0, arg1, arg2, arg3, arg4, arg5, arg6) {
             globalThis._wlift_storage_set(arg0 >>> 0, getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4), getStringFromWasm0(arg5, arg6));
         },
-        __wbg__wlift_ws_close_a31a7765ea554764: function(arg0) {
+        __wbg__wlift_ws_close_4adf1a35a5f59fe0: function(arg0) {
             globalThis._wlift_ws_close(arg0 >>> 0);
         },
-        __wbg__wlift_ws_open_e2ed087e890ec926: function(arg0, arg1, arg2) {
+        __wbg__wlift_ws_open_34cfcd00f0205788: function(arg0, arg1, arg2) {
             globalThis._wlift_ws_open(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
-        __wbg__wlift_ws_send_7863a03c6ea13828: function(arg0, arg1, arg2) {
+        __wbg__wlift_ws_send_e2404b160dfe0e46: function(arg0, arg1, arg2) {
             globalThis._wlift_ws_send(arg0 >>> 0, getStringFromWasm0(arg1, arg2));
         },
-        __wbg__wlift_yield_to_event_loop_038733db998cc2d7: function() {
+        __wbg__wlift_yield_to_event_loop_b23071b2190c8e7a: function() {
             const ret = globalThis._wlift_yield_to_event_loop();
             return ret;
         },
@@ -1109,7 +1925,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined_______true_(a, state0.b, arg0, arg1);
+                        return wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined_______true_(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -1135,7 +1951,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined_______true_(a, state0.b, arg0, arg1);
+                        return wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined_______true_(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -1154,14 +1970,14 @@ function __wbg_get_imports() {
             const ret = Date.now();
             return ret;
         },
+        __wbg_now_180b8a0ef585a750: function() {
+            const ret = performance.now();
+            return ret;
+        },
         __wbg_now_ad1121946ba97ea0: function() { return handleError(function () {
             const ret = Date.now();
             return ret;
         }, arguments); },
-        __wbg_now_c16a1d2e10f66992: function() {
-            const ret = performance.now();
-            return ret;
-        },
         __wbg_now_e7c6795a7f81e10f: function(arg0) {
             const ret = arg0.now();
             return ret;
@@ -1249,12 +2065,12 @@ function __wbg_get_imports() {
             const ret = arg0.then(arg1, arg2);
             return ret;
         },
-        __wbg_wliftDynamicPluginDispatch_5eb4e9291437b815: function(arg0, arg1) {
+        __wbg_wliftDynamicPluginDispatch_de0abd32eb750ac8: function(arg0, arg1) {
             globalThis.wliftDynamicPluginDispatch(arg0 >>> 0, arg1 >>> 0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 118, function: Function { arguments: [Externref], shim_idx: 119, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_20bf61ce484b8279___closure__destroy___dyn_core_2b72ad5d24e5930c___ops__function__FnMut__wasm_bindgen_20bf61ce484b8279___JsValue____Output___core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___, wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 113, function: Function { arguments: [Externref], shim_idx: 114, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_8c0a071a5af61b22___closure__destroy___dyn_core_2b72ad5d24e5930c___ops__function__FnMut__wasm_bindgen_8c0a071a5af61b22___JsValue____Output___core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_8c0a071a5af61b22___JsError___, wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___wasm_bindgen_8c0a071a5af61b22___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_8c0a071a5af61b22___JsError___true_);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -1288,15 +2104,15 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_(arg0, arg1, arg2) {
-    const ret = wasm.wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___wasm_bindgen_20bf61ce484b8279___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_20bf61ce484b8279___JsError___true_(arg0, arg1, arg2);
+function wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___wasm_bindgen_8c0a071a5af61b22___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_8c0a071a5af61b22___JsError___true_(arg0, arg1, arg2) {
+    const ret = wasm.wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___wasm_bindgen_8c0a071a5af61b22___JsValue__core_2b72ad5d24e5930c___result__Result_____wasm_bindgen_8c0a071a5af61b22___JsError___true_(arg0, arg1, arg2);
     if (ret[1]) {
         throw takeFromExternrefTable0(ret[0]);
     }
 }
 
-function wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined_______true_(arg0, arg1, arg2, arg3) {
-    wasm.wasm_bindgen_20bf61ce484b8279___convert__closures_____invoke___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined___js_sys_d983f9b75f30b74___Function_fn_wasm_bindgen_20bf61ce484b8279___JsValue_____wasm_bindgen_20bf61ce484b8279___sys__Undefined_______true_(arg0, arg1, arg2, arg3);
+function wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined_______true_(arg0, arg1, arg2, arg3) {
+    wasm.wasm_bindgen_8c0a071a5af61b22___convert__closures_____invoke___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined___js_sys_816999f89b7bc8dc___Function_fn_wasm_bindgen_8c0a071a5af61b22___JsValue_____wasm_bindgen_8c0a071a5af61b22___sys__Undefined_______true_(arg0, arg1, arg2, arg3);
 }
 
 const RunResultFinalization = (typeof FinalizationRegistry === 'undefined')
