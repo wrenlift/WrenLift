@@ -501,16 +501,24 @@ impl<'a> MirWasmEmitter<'a> {
         // shared i32 scratch local for the call_indirect slot. Each
         // Call site overwrites it ephemerally so one local is
         // enough — keeping `emit_instruction` `&self`. The inline
-        // `GetUpvalue` lowering reuses the same scratch to cache
-        // the closure ptr across its null-guard (`local.tee` +
-        // `i32.eqz` + `local.get` in the else arm), so `GetUpvalue`
-        // also forces the slot to be reserved.
+        // `GetUpvalue` / `SetUpvalue` lowerings reuse the same
+        // scratch (Get caches the closure ptr across its null-
+        // guard; Set caches the upvalue ptr between the location
+        // store and the GC write-barrier call), so they also
+        // force the slot to be reserved.
         let has_call_or_inline_upvalue = self
             .mir
             .blocks
             .iter()
             .flat_map(|b| b.instructions.iter())
-            .any(|(_, inst)| matches!(inst, Instruction::Call { .. } | Instruction::GetUpvalue(_)));
+            .any(|(_, inst)| {
+                matches!(
+                    inst,
+                    Instruction::Call { .. }
+                        | Instruction::GetUpvalue(_)
+                        | Instruction::SetUpvalue(..)
+                )
+            });
         if has_call_or_inline_upvalue {
             let idx = self.num_locals;
             self.num_locals += 1;
@@ -752,11 +760,29 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import("wren_get_upvalue", &[ValType::I64], &[ValType::I64]);
                     }
                     Instruction::SetUpvalue(..) => {
-                        self.register_import(
-                            "wren_set_upvalue",
-                            &[ValType::I64, ValType::I64],
-                            &[ValType::I64],
-                        );
+                        // Inline path emits the chase + i64.store
+                        // inline and calls `wren_write_barrier`
+                        // (NOT `wren_set_upvalue`) for the GC inter-
+                        // generational hand-off. Register
+                        // `wren_set_upvalue` only when the inline
+                        // path is disabled (codegen tests under
+                        // wasmtime); register `wren_write_barrier`
+                        // for the inline path's barrier call.
+                        if self.runtime_addrs.current_closure_addr.is_some()
+                            && self.runtime_addrs.upvalues_data_offset != 0
+                        {
+                            self.register_import(
+                                "wren_write_barrier",
+                                &[ValType::I64, ValType::I64],
+                                &[ValType::I64],
+                            );
+                        } else {
+                            self.register_import(
+                                "wren_set_upvalue",
+                                &[ValType::I64, ValType::I64],
+                                &[ValType::I64],
+                            );
+                        }
                     }
                     Instruction::MakeList(elems) => {
                         // Per-arity helper names (`wren_make_list_<N>`)
@@ -1772,6 +1798,125 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::SetUpvalue(idx, val) => {
+                if let (Some(closure_addr), upv_data_off) = (
+                    self.runtime_addrs.current_closure_addr,
+                    self.runtime_addrs.upvalues_data_offset,
+                ) {
+                    if upv_data_off != 0 {
+                        // Inline:
+                        //
+                        //   i32.const $current_closure_addr
+                        //   i32.load                          ;; closure ptr
+                        //   i32.eqz                           ;; null guard
+                        //   if (result i64)
+                        //     i64.const Value::null bits      ;; no-op return
+                        //   else
+                        //     ;; chase to *mut Value (location):
+                        //     i32.const $current_closure_addr
+                        //     i32.load
+                        //     i32.load offset=$upv_data_off   ;; data ptr
+                        //     i32.load offset=idx*4           ;; *mut ObjUpvalue
+                        //     local.tee $upv_scratch          ;; cache for barrier
+                        //     i32.load offset=$location_off   ;; *mut Value
+                        //     local.get $val                  ;; new Value bits
+                        //     i64.store offset=0              ;; *location = val
+                        //
+                        //     ;; GC inter-generational write barrier — passes
+                        //     ;; uv ptr NaN-boxed as an object Value (TAG_OBJ
+                        //     ;; | (ptr & PTR_MASK)) so wren_write_barrier
+                        //     ;; can extract via `Value::as_object`.
+                        //     local.get $upv_scratch
+                        //     i64.extend_i32_u
+                        //     i64.const TAG_OBJ
+                        //     i64.or                          ;; src bits
+                        //     local.get $val                  ;; val bits
+                        //     call $wren_write_barrier
+                        //     drop                            ;; barrier returns u64
+                        //
+                        //     ;; SetUpvalue's expression result is the written
+                        //     ;; Value — feed it into local.set $dst.
+                        //     local.get $val
+                        //   end
+                        //   local.set $dst
+                        let location_offset =
+                            std::mem::offset_of!(crate::runtime::object::ObjUpvalue, location)
+                                as u64;
+                        let upv_array_offset = (*idx as u64) * 4;
+                        // TAG_OBJ = SIGN_BIT | QNAN = 0xFFFC_0000_0000_0000.
+                        // wasm32 ptrs are <= 32 bits so the low 32 bits hold
+                        // the address with no PTR_MASK truncation needed.
+                        const TAG_OBJ: i64 = 0xFFFC_0000_0000_0000u64 as i64;
+                        let null_bits = crate::runtime::value::Value::null().to_bits() as i64;
+
+                        let scratch = self
+                            .call_slot_local
+                            .expect("scan_locals should have reserved a call_slot_local");
+
+                        // Closure-cell null guard.
+                        func.instruction(&WasmInst::I32Const(closure_addr as i32));
+                        func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        func.instruction(&WasmInst::I32Eqz);
+                        func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(
+                            ValType::I64,
+                        )));
+                        func.instruction(&WasmInst::I64Const(null_bits));
+                        func.instruction(&WasmInst::Else);
+                        {
+                            // Re-load closure ptr (avoids needing a 2nd
+                            // scratch local — the cell load is just
+                            // i32.const + i32.load).
+                            func.instruction(&WasmInst::I32Const(closure_addr as i32));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: upv_data_off as u64,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: upv_array_offset,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::LocalTee(scratch));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: location_offset,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                            func.instruction(&WasmInst::I64Store(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                            // GC write barrier: NaN-box the upvalue ptr
+                            // and pass it as the source Value to
+                            // wren_write_barrier.
+                            func.instruction(&WasmInst::LocalGet(scratch));
+                            func.instruction(&WasmInst::I64ExtendI32U);
+                            func.instruction(&WasmInst::I64Const(TAG_OBJ));
+                            func.instruction(&WasmInst::I64Or);
+                            func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                            func.instruction(&WasmInst::Call(
+                                self.runtime_imports["wren_write_barrier"],
+                            ));
+                            func.instruction(&WasmInst::Drop);
+                            // Return the written value.
+                            func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                        }
+                        func.instruction(&WasmInst::End);
+                        func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                        return Ok(());
+                    }
+                }
                 func.instruction(&WasmInst::I64Const(*idx as i64));
                 func.instruction(&WasmInst::LocalGet(self.local(*val)));
                 func.instruction(&WasmInst::Call(self.runtime_imports["wren_set_upvalue"]));

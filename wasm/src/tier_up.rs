@@ -240,16 +240,16 @@ fn mir_needs_unsupported_helpers(
                 // (`wren_make_closure_<N>`) for capture counts
                 // 0..=4. Higher counts reject.
                 Instruction::MakeClosure { upvalues, .. } if upvalues.len() > 4 => return true,
-                // GetUpvalue now lowers to an inline 5-load chain
-                // through the cdylib's `current_closure` cell plus
-                // the upvalue array (see
-                // `codegen/wasm::Instruction::GetUpvalue`), so it
-                // tier-ups freely. SetUpvalue still routes through
-                // the `wren_set_upvalue` boundary call — the host
-                // helper writes through `ObjUpvalue.location` AND
-                // runs a GC inter-generational write barrier, both
-                // of which need to land before SetUpvalue inlines.
-                Instruction::SetUpvalue(..) => return true,
+                // GetUpvalue / SetUpvalue both lower inline now —
+                // the chase walks the cdylib's `current_closure`
+                // cell + the upvalue array, the write goes
+                // through `*location`, and SetUpvalue calls
+                // `wren_write_barrier` after the store for the
+                // GC inter-generational hand-off (see
+                // `codegen/wasm::Instruction::SetUpvalue`). No
+                // `wren_set_upvalue` boundary call on the hot
+                // path, so closure-mutating bodies tier-up at
+                // the same threshold as everything else.
                 // CallStaticSelf — per-arity ladder
                 // (`wren_call_static_self_0` … `_4`). Higher
                 // arities reject through the gate.
