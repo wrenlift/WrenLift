@@ -701,11 +701,27 @@ impl<'a> MirWasmEmitter<'a> {
                         );
                     }
                     Instruction::SetField(..) => {
+                        // Inline path emits the i64.store inline +
+                        // a `wren_write_barrier` call for the GC
+                        // hand-off; falls back to `wren_set_field`
+                        // on the slow path for non-Instance
+                        // receivers (and on the no-runtime-addrs
+                        // codegen-test path). Always register the
+                        // slow-path import; register the barrier
+                        // import only when the inline path is
+                        // active.
                         self.register_import(
                             "wren_set_field",
                             &[ValType::I64, ValType::I64, ValType::I64],
                             &[ValType::I64],
                         );
+                        if self.runtime_addrs.module_vars_ptr_addr.is_some() {
+                            self.register_import(
+                                "wren_write_barrier",
+                                &[ValType::I64, ValType::I64],
+                                &[ValType::I64],
+                            );
+                        }
                     }
                     Instruction::GetStaticField(..) => {
                         self.register_import(
@@ -1475,11 +1491,98 @@ impl<'a> MirWasmEmitter<'a> {
                 }
             }
             Instruction::SetField(recv, idx, val) => {
-                func.instruction(&WasmInst::LocalGet(self.local(*recv)));
-                func.instruction(&WasmInst::I64Const(*idx as i64));
-                func.instruction(&WasmInst::LocalGet(self.local(*val)));
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_set_field"]));
-                func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                if self.runtime_addrs.module_vars_ptr_addr.is_some() {
+                    // Inline:
+                    //
+                    //   local.get $recv
+                    //   i32.wrap_i64
+                    //   i32.load8_u offset=$obj_type_offset
+                    //   i32.const 9                    ;; ObjType::Instance
+                    //   i32.eq
+                    //   if (result i64)
+                    //     ;; fast: chase + store
+                    //     local.get $recv
+                    //     i32.wrap_i64
+                    //     i32.load offset=$fields_offset    ;; data ptr
+                    //     local.get $val
+                    //     i64.store offset=idx*8            ;; fields[idx] = val
+                    //     ;; GC inter-generational write barrier
+                    //     local.get $recv                   ;; recv is already a
+                    //                                       ;; NaN-boxed object
+                    //                                       ;; Value, no extend/or
+                    //                                       ;; needed (cf. SetUpvalue
+                    //                                       ;; which had a raw ptr).
+                    //     local.get $val
+                    //     call $wren_write_barrier
+                    //     drop
+                    //     local.get $val                    ;; expression result
+                    //   else
+                    //     ;; slow path: full helper for non-Instance
+                    //     ;; receivers (foreign-class objects with a
+                    //     ;; different layout at the same offset).
+                    //     local.get $recv
+                    //     i64.const idx
+                    //     local.get $val
+                    //     call $wren_set_field
+                    //   end
+                    //   local.set $dst
+                    const OBJ_TYPE_INSTANCE: i32 = 9;
+                    let fields_offset =
+                        std::mem::offset_of!(crate::runtime::object::ObjInstance, fields) as u64;
+                    let obj_type_offset =
+                        std::mem::offset_of!(crate::runtime::object::ObjHeader, obj_type) as u64;
+                    let mem_offset = (*idx as u64) * 8;
+
+                    func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                    func.instruction(&WasmInst::I32WrapI64);
+                    func.instruction(&WasmInst::I32Load8U(wasm_encoder::MemArg {
+                        offset: obj_type_offset,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                    func.instruction(&WasmInst::I32Const(OBJ_TYPE_INSTANCE));
+                    func.instruction(&WasmInst::I32Eq);
+                    func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(ValType::I64)));
+                    {
+                        // Fast path.
+                        func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                        func.instruction(&WasmInst::I32WrapI64);
+                        func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                            offset: fields_offset,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                        func.instruction(&WasmInst::I64Store(wasm_encoder::MemArg {
+                            offset: mem_offset,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                        // Barrier.
+                        func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                        func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                        func.instruction(&WasmInst::Call(
+                            self.runtime_imports["wren_write_barrier"],
+                        ));
+                        func.instruction(&WasmInst::Drop);
+                        func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                    }
+                    func.instruction(&WasmInst::Else);
+                    {
+                        func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                        func.instruction(&WasmInst::I64Const(*idx as i64));
+                        func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                        func.instruction(&WasmInst::Call(self.runtime_imports["wren_set_field"]));
+                    }
+                    func.instruction(&WasmInst::End);
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                } else {
+                    func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                    func.instruction(&WasmInst::I64Const(*idx as i64));
+                    func.instruction(&WasmInst::LocalGet(self.local(*val)));
+                    func.instruction(&WasmInst::Call(self.runtime_imports["wren_set_field"]));
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                }
             }
             Instruction::GetModuleVar(idx) => {
                 if let Some(addr) = self.runtime_addrs.module_vars_ptr_addr {
