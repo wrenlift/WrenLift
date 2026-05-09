@@ -276,11 +276,48 @@ pub fn transform_to_state_machine(
         // each suspension is handled (split + new blocks
         // appended), a re-scan at the top of the loop is the
         // simplest way to walk every suspension exactly once.
+        //
+        // Crucially, the search must walk only blocks that are
+        // forward-reachable from {bb0, prior resume entries}.
+        // A previous iteration's tail-duplication leaves the
+        // ORIGINAL post-resume blocks orphaned (they have a
+        // suspension Call but no MIR predecessors); the runtime
+        // path goes through the cloned versions. Iterating
+        // `mir.blocks` order picks up the orphan first, splits
+        // it, and the actual reachable clone keeps its raw
+        // suspension Call without the SM Init/Resume split.
+        // Multi-root forward-reach picks the cloned block
+        // (reachable from a prior resume entry) and skips the
+        // orphan.
+        let reachable: std::collections::HashSet<BlockId> = {
+            use std::collections::HashSet;
+            let mut visited: HashSet<BlockId> = HashSet::new();
+            let mut stack: Vec<BlockId> = layout.resume_entries.clone();
+            let n = mir.blocks.len();
+            while let Some(b) = stack.pop() {
+                if !visited.insert(b) {
+                    continue;
+                }
+                if (b.0 as usize) < n {
+                    for s in mir.blocks[b.0 as usize].terminator.successors() {
+                        stack.push(s);
+                    }
+                }
+            }
+            visited
+        };
         let mut found: Option<(BlockId, usize, SuspensionKind)> = None;
         'outer: for block in &mir.blocks {
             if layout.block_kinds.contains_key(&block.id) {
                 // Already split this block as the *yielding*
                 // half of a previous iteration — skip.
+                continue;
+            }
+            if !reachable.contains(&block.id) {
+                // Orphaned by a prior tail-duplication; the
+                // reachable clone (later in `mir.blocks`) has
+                // the same suspension Call and will be split
+                // instead.
                 continue;
             }
             for (i, (_dst, inst)) in block.instructions.iter().enumerate() {
@@ -396,7 +433,14 @@ pub fn transform_to_state_machine(
             // resume blocks from prior SM iterations, which have
             // no MIR predecessors after their own splits) counts
             // as pre-yield.
-            let mut pre_yield_defs = collect_pre_yield_defs(mir, new_block_id);
+            // Multi-root forward walk: bb0 + every prior yield's
+            // resume entry. The current yield's resume entry
+            // hasn't been pushed onto `layout.resume_entries`
+            // yet (that happens after live_across), so the walk
+            // naturally stops at the current yield's split
+            // boundary without polluting pre-yield with post-
+            // current-yield defs.
+            let mut pre_yield_defs = collect_pre_yield_defs(mir, &layout.resume_entries);
             // Include ValueIds that an earlier SM iteration
             // already promoted to a per-resume load. Those have
             // no MIR-level def (the load is materialised inline
@@ -535,7 +579,7 @@ pub fn transform_to_state_machine(
             // a fresh BlockId and rewrite the resume's
             // terminator to point at it.
             let resume_term = mir.block(new_block_id).terminator.clone();
-            let need_clone =
+            let direct_uses_saved =
                 |b: BlockId, mir_ref: &MirFunction, remap: &HashMap<ValueId, ValueId>| -> bool {
                     let blk = mir_ref.block(b);
                     // If every saved value is shadowed by this
@@ -567,6 +611,144 @@ pub fn transform_to_state_machine(
                     }
                     false
                 };
+
+            // Pre-compute the TRANSITIVE clone set, walking
+            // forward from `new_block_id` (the resume entry) and
+            // propagating the active saved-value set down each
+            // path. A block param `(v, _)` shadows saved value
+            // `v` for the block's body and successors — entries
+            // beyond the param see the param's fresh binding,
+            // not the saved value, so saved-value uses past a
+            // shadow shouldn't drag the shadow itself into the
+            // clone set.
+            //
+            // Without per-path tracking, a fixed-point on the
+            // raw direct-user set walks predecessor-ward into
+            // loop headers (whose params shadow loop-carried
+            // saved values), then their predecessors, and ends
+            // up cloning the entire CFG — Cranelift then sees
+            // duplicate block-param ValueIds in the clones and
+            // bails on SSA.
+            //
+            // The previous walker (need_clone called per
+            // successor with no recursion through value-neutral
+            // intermediates) had the OPPOSITE bug: a value-
+            // neutral intermediate block (e.g.
+            // Catalog.refreshLoop's bb6 hidden behind an
+            // unrelated bb) hides a downstream direct user, so
+            // the walker stops at the intermediate and the
+            // user's clone never happens. The fix below is to
+            // walk forward from the resume entry, track per-
+            // block active saved values, identify direct users
+            // within the active region, then take the
+            // forward-transitive closure (so intermediates that
+            // reach a direct user without being shadowed get
+            // cloned too).
+            let needs_clone_transitive: std::collections::HashSet<BlockId> = {
+                use std::collections::{HashMap as HMap, HashSet};
+                let saved: HashSet<ValueId> = remap.keys().copied().collect();
+                // Per-block: union-of-active across every
+                // forward-from-resume path.
+                let mut active_at: HMap<BlockId, HashSet<ValueId>> = HMap::new();
+                let mut to_visit: Vec<(BlockId, HashSet<ValueId>)> =
+                    vec![(new_block_id, saved.clone())];
+                while let Some((b, mut act)) = to_visit.pop() {
+                    let blk = mir.block(b);
+                    for (p, _) in &blk.params {
+                        act.remove(p);
+                    }
+                    let new_set = if let Some(existing) = active_at.get(&b) {
+                        let merged: HashSet<ValueId> = existing.union(&act).copied().collect();
+                        if merged.len() == existing.len() {
+                            continue;
+                        }
+                        merged
+                    } else {
+                        act.clone()
+                    };
+                    active_at.insert(b, new_set.clone());
+                    for s in blk.terminator.successors() {
+                        to_visit.push((s, new_set.clone()));
+                    }
+                }
+                // Direct users: blocks in `active_at` whose body
+                // or terminator references any active saved
+                // value.
+                let mut direct: HashSet<BlockId> = HashSet::new();
+                for (b, active) in &active_at {
+                    if active.is_empty() {
+                        continue;
+                    }
+                    let blk = mir.block(*b);
+                    let mut any_use = false;
+                    'inst: for (_, inst) in &blk.instructions {
+                        for u in inst.operands() {
+                            if active.contains(&u) {
+                                any_use = true;
+                                break 'inst;
+                            }
+                        }
+                    }
+                    if !any_use {
+                        for u in blk.terminator.operands() {
+                            if active.contains(&u) {
+                                any_use = true;
+                                break;
+                            }
+                        }
+                    }
+                    if any_use {
+                        direct.insert(*b);
+                    }
+                }
+                // Forward-transitive within the active region:
+                // a block reaches a direct user (and so its
+                // terminator must redirect to the clone) only
+                // when the path itself stays within the active
+                // region — saved values must be live at both
+                // the block and its successor for the
+                // redirect to matter. Once the path crosses a
+                // shadow (active=empty), the saved values are
+                // re-bound and downstream uses go through
+                // the param's binding, not the saved value;
+                // cloning the shadow block would just create
+                // an unreachable duplicate (and worse, would
+                // duplicate the param's ValueId across the
+                // clone, breaking SSA).
+                let mut needs: HashSet<BlockId> = direct.clone();
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for (b, active_b) in &active_at {
+                        if needs.contains(b) {
+                            continue;
+                        }
+                        if active_b.is_empty() {
+                            continue;
+                        }
+                        for s in mir.block(*b).terminator.successors() {
+                            if needs.contains(&s) {
+                                if let Some(active_s) = active_at.get(&s) {
+                                    if !active_s.is_empty() {
+                                        needs.insert(*b);
+                                        changed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                needs
+            };
+            // Suppress the unused warning since `direct_uses_saved`
+            // remains as a helper for diagnostic clarity even
+            // though `needs_clone_transitive` subsumes its role.
+            let _ = direct_uses_saved;
+            let need_clone = |b: BlockId,
+                              _mir_ref: &MirFunction,
+                              _remap: &HashMap<ValueId, ValueId>|
+             -> bool { needs_clone_transitive.contains(&b) };
 
             // Helper: redirect a terminator's successors that
             // need cloning to use the cloned BlockId. Also
@@ -1031,12 +1213,25 @@ fn compute_live_in(mir: &MirFunction, target_block: BlockId) -> std::collections
 /// reach.
 fn collect_pre_yield_defs(
     mir: &MirFunction,
-    _resume_block: BlockId,
+    pre_yield_roots: &[BlockId],
 ) -> std::collections::HashSet<ValueId> {
     use std::collections::HashSet;
     let n = mir.blocks.len();
     let mut pre_yield_blocks: HashSet<BlockId> = HashSet::new();
-    let mut stack = vec![BlockId(0)];
+    // Multi-root forward walk: bb0 catches the original pre-
+    // yield-1 region; each prior yield's resume entry catches
+    // the post-resume / pre-current-yield region (cloned blocks
+    // post-yield-1, etc.). Without seeding from prior resume
+    // entries, defs in the cloned post-yield-1 region don't
+    // appear in `pre_yield_defs`, so a later yield's saves
+    // include their original ValueIds — which on the cloned
+    // path haven't been defined (the clone uses fresh ValueIds
+    // per `remap`). The current yield's resume entry is NOT in
+    // the seed set (the caller passes `layout.resume_entries`
+    // BEFORE pushing the new entry), so the walk stops at the
+    // current yield's `Return` boundary and doesn't pollute
+    // pre-yield with post-current-yield defs.
+    let mut stack: Vec<BlockId> = pre_yield_roots.to_vec();
     while let Some(b) = stack.pop() {
         if !pre_yield_blocks.insert(b) {
             continue;
