@@ -261,6 +261,69 @@ pub fn current_module_vars_addr() -> Option<u32> {
     None
 }
 
+/// Address of the `current_closure_cell::CURRENT` static inside
+/// the cdylib's linear memory. Same role as
+/// [`current_module_vars_addr`] but for the in-flight closure
+/// pointer — JIT'd `Instruction::GetUpvalue(idx)` reads through
+/// this address (`i32.load → closure ptr → upvalues data ptr →
+/// upvalues[idx] → location → *location`) instead of crossing
+/// the wasm-bindgen boundary into `wren_get_upvalue`.
+#[cfg(target_arch = "wasm32")]
+pub fn current_closure_addr() -> Option<u32> {
+    Some(&current_closure_cell::CURRENT as *const _ as usize as u32)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn current_closure_addr() -> Option<u32> {
+    None
+}
+
+/// Byte offset within `ObjClosure` at which `Vec::as_ptr()`
+/// (the upvalue array's heap data pointer) is stored. Discovered
+/// once at first call by constructing a dummy `ObjClosure` and
+/// linearly probing for the matching `usize` value, then cached.
+///
+/// Rust's `Vec` doesn't have a stable repr(C) layout, so we
+/// can't assume `(ptr, cap, len)` order — the host JIT pins this
+/// against `Vec::as_ptr()` at runtime via the
+/// `verify_closure_layout` test, and the wasm tier-up does the
+/// same here at startup. Single allocation + one Vec scan; cost
+/// amortizes immediately.
+#[cfg(target_arch = "wasm32")]
+pub fn closure_upvalues_data_offset() -> u32 {
+    use crate::runtime::object::ObjClosure;
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let dummy = ObjClosure::new(std::ptr::null_mut(), 1);
+        let base = &dummy as *const _ as usize;
+        let target = dummy.upvalues.as_ptr() as usize;
+        let max = std::mem::size_of::<ObjClosure>();
+        let step = std::mem::align_of::<usize>();
+        let mut offset = 0;
+        while offset + std::mem::size_of::<usize>() <= max {
+            // SAFETY: `base + offset` is inside the live
+            // `dummy` ObjClosure (offset bounded by sizeof);
+            // alignment is `align_of::<usize>()` which
+            // satisfies `*const usize` requirements.
+            let probed = unsafe { *(base.wrapping_add(offset) as *const usize) };
+            if probed == target {
+                return offset as u32;
+            }
+            offset += step;
+        }
+        panic!(
+            "could not find Vec data ptr offset in ObjClosure; \
+             Rust's Vec internal layout may have changed"
+        );
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn closure_upvalues_data_offset() -> u32 {
+    0
+}
+
 /// Save / install the current module-vars data pointer; return
 /// the previous value for the caller to restore on exit. Same
 /// RAII pattern as `enter_closure` / `enter_vm`. The dispatcher

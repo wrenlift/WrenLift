@@ -163,8 +163,12 @@ fn compile_callback(mir: &wren_lift::mir::MirFunction) -> Option<u32> {
         // to inline `i32.load + i64.load` rather than crossing
         // the wasm-bindgen boundary on every read. The
         // dispatcher updates the cell on each BC→JIT entry.
-        let module_vars_ptr_addr = wren_lift::runtime::tier::current_module_vars_addr();
-        wren_lift::codegen::wasm::emit_mir_with_runtime_addrs(mir, interner, module_vars_ptr_addr)
+        let addrs = wren_lift::codegen::wasm::RuntimeAddrs {
+            module_vars_ptr_addr: wren_lift::runtime::tier::current_module_vars_addr(),
+            current_closure_addr: wren_lift::runtime::tier::current_closure_addr(),
+            upvalues_data_offset: wren_lift::runtime::tier::closure_upvalues_data_offset(),
+        };
+        wren_lift::codegen::wasm::emit_mir_with_runtime_addrs(mir, interner, addrs)
     };
     let module = match module_result {
         Ok(m) => m,
@@ -236,23 +240,16 @@ fn mir_needs_unsupported_helpers(
                 // (`wren_make_closure_<N>`) for capture counts
                 // 0..=4. Higher counts reject.
                 Instruction::MakeClosure { upvalues, .. } if upvalues.len() > 4 => return true,
-                // GetUpvalue / SetUpvalue currently lower to an
-                // external `wren_get_upvalue` / `wren_set_upvalue`
-                // call per access — each one a wasm-bindgen
-                // boundary round-trip back into JS land. For a
-                // capturing closure on a hot path (e.g. fib's
-                // recursive self-reference, the SIMD batch's
-                // `STEP` capture) the per-access cost dominates
-                // the BC interpreter's local frame load, making
-                // tier-up a net loss. Reject capturing-closure
-                // bodies until the wasm emitter can inline
-                // upvalue loads directly against the
-                // `current_closure` cell + the closure's
-                // upvalue array. MakeClosure stays accepted so
-                // closure *construction* still tier-ups; only
-                // bodies that actually *read* an upvalue stay
-                // BC.
-                Instruction::GetUpvalue(_) | Instruction::SetUpvalue(..) => return true,
+                // GetUpvalue now lowers to an inline 5-load chain
+                // through the cdylib's `current_closure` cell plus
+                // the upvalue array (see
+                // `codegen/wasm::Instruction::GetUpvalue`), so it
+                // tier-ups freely. SetUpvalue still routes through
+                // the `wren_set_upvalue` boundary call — the host
+                // helper writes through `ObjUpvalue.location` AND
+                // runs a GC inter-generational write barrier, both
+                // of which need to land before SetUpvalue inlines.
+                Instruction::SetUpvalue(..) => return true,
                 // CallStaticSelf — per-arity ladder
                 // (`wren_call_static_self_0` … `_4`). Higher
                 // arities reject through the gate.

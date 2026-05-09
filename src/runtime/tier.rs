@@ -426,6 +426,12 @@ pub fn current_module_vars() -> *mut u64 {
 pub fn current_module_vars_addr() -> Option<u32> {
     None
 }
+pub fn current_closure_addr() -> Option<u32> {
+    None
+}
+pub fn closure_upvalues_data_offset() -> u32 {
+    0
+}
 
 #[allow(unused_variables)]
 pub fn enter_vm(vm: *mut crate::runtime::vm::VM) -> *mut crate::runtime::vm::VM {

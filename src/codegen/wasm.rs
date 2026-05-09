@@ -202,7 +202,7 @@ pub fn make_closure_helper_name(upvalues: usize) -> Option<&'static str> {
 /// that need to read the cdylib's heap are skipped on this
 /// path.
 pub fn emit_mir(mir: &MirFunction) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, None, false, None);
+    let mut emitter = MirWasmEmitter::new(mir, None, false, RuntimeAddrs::none());
     emitter.emit()
 }
 
@@ -225,25 +225,56 @@ pub fn emit_mir_with_interner(
     mir: &MirFunction,
     interner: &Interner,
 ) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true, None);
+    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true, RuntimeAddrs::none());
     emitter.emit()
 }
 
-/// Same as [`emit_mir_with_interner`] but also bakes the address
-/// of the cdylib's `current_module_vars_cell::CURRENT` static
-/// into the JIT'd module so `Instruction::GetModuleVar` and
-/// `SetModuleVar` lower to inline `i32.load` / `i64.load` /
-/// `i64.store` triples instead of an `(import "wren"
-/// "wren_get_module_var")` wasm-bindgen boundary call. The
-/// module-vars-ptr cell is updated by the dispatcher on every
-/// BC→JIT entry (and cross-module JIT→JIT entry) — see
-/// `runtime::tier::enter_module_vars`.
+/// Cdylib-memory addresses + offsets that the wasm tier-up bakes
+/// into JIT'd modules so per-access `wren_get_module_var` /
+/// `wren_get_upvalue` boundary calls collapse to inline pointer
+/// chases. Set by `wlift_wasm::tier_up::compile_callback` from the
+/// matching `runtime::tier::*_addr` getters; codegen tests under
+/// wasmtime keep the import path by passing `RuntimeAddrs::none()`.
+#[derive(Clone, Copy, Default)]
+pub struct RuntimeAddrs {
+    /// Address of `runtime::tier::current_module_vars_cell::CURRENT`
+    /// (a `*mut u64` cell). When `Some`, `GetModuleVar` /
+    /// `SetModuleVar` lower to inline `i32.load + i64.load` /
+    /// `+ i64.store`.
+    pub module_vars_ptr_addr: Option<u32>,
+    /// Address of `runtime::tier::current_closure_cell::CURRENT`
+    /// (a `*mut ObjClosure` cell). When `Some` together with a
+    /// non-zero `upvalues_data_offset`, `GetUpvalue` lowers to a
+    /// 5-load chain through the closure's upvalue array.
+    pub current_closure_addr: Option<u32>,
+    /// Byte offset within `ObjClosure` at which
+    /// `upvalues.as_ptr()` (the heap data pointer) lives. Set
+    /// from `runtime::tier::closure_upvalues_data_offset()`,
+    /// which discovers it at first call by linear-probing a
+    /// dummy ObjClosure.
+    pub upvalues_data_offset: u32,
+}
+
+impl RuntimeAddrs {
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// Same as [`emit_mir_with_interner`] but also bakes runtime cell
+/// addresses + struct offsets into the JIT'd module so
+/// `Instruction::GetModuleVar` / `SetModuleVar` / `GetUpvalue`
+/// lower to inline `i32.load` / `i64.load` / `i64.store` chains
+/// instead of `(import "wren" "wren_get_module_var")` wasm-bindgen
+/// boundary calls. The dispatcher updates the cells on every
+/// BC→JIT entry — see `runtime::tier::enter_module_vars` /
+/// `enter_closure`.
 pub fn emit_mir_with_runtime_addrs(
     mir: &MirFunction,
     interner: &Interner,
-    module_vars_ptr_addr: Option<u32>,
+    addrs: RuntimeAddrs,
 ) -> Result<WasmModule, String> {
-    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true, module_vars_ptr_addr);
+    let mut emitter = MirWasmEmitter::new(mir, Some(interner), true, addrs);
     emitter.emit()
 }
 
@@ -288,15 +319,13 @@ struct MirWasmEmitter<'a> {
     /// host-provided imports), on for the runtime tier-up path —
     /// see [`emit_mir`] vs [`emit_mir_with_interner`] above.
     imports_memory: bool,
-    /// Address of `runtime::tier::current_module_vars_cell::CURRENT`
-    /// in the cdylib's linear memory. When `Some`, `GetModuleVar`
-    /// and `SetModuleVar` lower to inline loads/stores against
-    /// that address (chasing through the *mut u64 data ptr it
-    /// holds). When `None`, both fall back to a wasm-bindgen
-    /// `(import "wren" "wren_get_module_var")` boundary call —
-    /// the path used for codegen tests under wasmtime, where no
-    /// cdylib memory is wired up.
-    module_vars_ptr_addr: Option<u32>,
+    /// Cdylib-memory addresses + offsets baked into the JIT'd
+    /// module so `GetModuleVar` / `SetModuleVar` / `GetUpvalue`
+    /// inline against the imported memory instead of crossing
+    /// the wasm-bindgen boundary. When all fields are `None` /
+    /// `0` (the default — used by codegen tests under wasmtime)
+    /// every access falls back to the import-call path.
+    runtime_addrs: RuntimeAddrs,
     /// Call-site arity → type-section index of the matching
     /// `(i64*N) -> i64` type. The compiled function and its
     /// `call_indirect` callees can have different arities (e.g.
@@ -311,7 +340,7 @@ impl<'a> MirWasmEmitter<'a> {
         mir: &'a MirFunction,
         interner: Option<&'a Interner>,
         imports_memory: bool,
-        module_vars_ptr_addr: Option<u32>,
+        runtime_addrs: RuntimeAddrs,
     ) -> Self {
         Self {
             mir,
@@ -325,7 +354,7 @@ impl<'a> MirWasmEmitter<'a> {
             module_var_slot_locals: HashMap::new(),
             value_to_module_var: HashMap::new(),
             imports_memory,
-            module_vars_ptr_addr,
+            runtime_addrs,
             call_arity_types: HashMap::new(),
         }
     }
@@ -471,14 +500,18 @@ impl<'a> MirWasmEmitter<'a> {
         // If the function has any Call sites, reserve a single
         // shared i32 scratch local for the call_indirect slot. Each
         // Call site overwrites it ephemerally so one local is
-        // enough — keeping `emit_instruction` `&self`.
-        let has_call = self
+        // enough — keeping `emit_instruction` `&self`. The inline
+        // `GetUpvalue` lowering reuses the same scratch to cache
+        // the closure ptr across its null-guard (`local.tee` +
+        // `i32.eqz` + `local.get` in the else arm), so `GetUpvalue`
+        // also forces the slot to be reserved.
+        let has_call_or_inline_upvalue = self
             .mir
             .blocks
             .iter()
             .flat_map(|b| b.instructions.iter())
-            .any(|(_, inst)| matches!(inst, Instruction::Call { .. }));
-        if has_call {
+            .any(|(_, inst)| matches!(inst, Instruction::Call { .. } | Instruction::GetUpvalue(_)));
+        if has_call_or_inline_upvalue {
             let idx = self.num_locals;
             self.num_locals += 1;
             self.local_types.push(ValType::I32);
@@ -688,14 +721,18 @@ impl<'a> MirWasmEmitter<'a> {
                     // only when codegen has no cdylib memory
                     // address (e.g. the codegen tests under
                     // wasmtime).
-                    Instruction::GetModuleVar(_) if self.module_vars_ptr_addr.is_none() => {
+                    Instruction::GetModuleVar(_)
+                        if self.runtime_addrs.module_vars_ptr_addr.is_none() =>
+                    {
                         self.register_import(
                             "wren_get_module_var",
                             &[ValType::I64],
                             &[ValType::I64],
                         );
                     }
-                    Instruction::SetModuleVar(..) if self.module_vars_ptr_addr.is_none() => {
+                    Instruction::SetModuleVar(..)
+                        if self.runtime_addrs.module_vars_ptr_addr.is_none() =>
+                    {
                         self.register_import(
                             "wren_set_module_var",
                             &[ValType::I64, ValType::I64],
@@ -1318,7 +1355,7 @@ impl<'a> MirWasmEmitter<'a> {
 
             // -- Object operations --
             Instruction::GetField(recv, idx) => {
-                if self.module_vars_ptr_addr.is_some() {
+                if self.runtime_addrs.module_vars_ptr_addr.is_some() {
                     // Inline path. ObjInstance layout (#[repr(C)]):
                     //   header   : ObjHeader  // offset 0, with
                     //                          // obj_type: u8 at byte 0
@@ -1419,7 +1456,7 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::GetModuleVar(idx) => {
-                if let Some(addr) = self.module_vars_ptr_addr {
+                if let Some(addr) = self.runtime_addrs.module_vars_ptr_addr {
                     // Inline:
                     //   (i32.const ADDR)            ;; addr of CURRENT cell
                     //   (i32.load)                  ;; data ptr (*mut u64)
@@ -1450,7 +1487,7 @@ impl<'a> MirWasmEmitter<'a> {
                 }
             }
             Instruction::SetModuleVar(idx, val) => {
-                if let Some(addr) = self.module_vars_ptr_addr {
+                if let Some(addr) = self.runtime_addrs.module_vars_ptr_addr {
                     // Inline:
                     //   (i32.const ADDR) (i32.load)         ;; data ptr
                     //   (local.get val)                      ;; new value
@@ -1656,6 +1693,80 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::GetUpvalue(idx) => {
+                if let (Some(closure_addr), upv_data_off) = (
+                    self.runtime_addrs.current_closure_addr,
+                    self.runtime_addrs.upvalues_data_offset,
+                ) {
+                    if upv_data_off != 0 {
+                        // Inline:
+                        //
+                        //   i32.const $current_closure_addr  ;; cell addr
+                        //   i32.load                         ;; closure ptr
+                        //   ;; null guard so the upvalue chain doesn't deref a
+                        //   ;; null cell on a stray top-level call window.
+                        //   local.tee $closure
+                        //   i32.eqz
+                        //   if (result i64)
+                        //     i64.const Value::null bits
+                        //   else
+                        //     local.get $closure
+                        //     i32.load offset=$upvalues_data_offset
+                        //     i32.load offset=idx*4         ;; *mut ObjUpvalue
+                        //     i32.load offset=$location_off ;; *mut Value
+                        //     i64.load offset=0             ;; Value bits
+                        //   end
+                        //   local.set $dst
+                        let location_offset =
+                            std::mem::offset_of!(crate::runtime::object::ObjUpvalue, location)
+                                as u64;
+                        let upv_array_offset = (*idx as u64) * 4;
+                        let null_bits = crate::runtime::value::Value::null().to_bits() as i64;
+
+                        let scratch = self
+                            .call_slot_local
+                            .expect("scan_locals should have reserved a call_slot_local");
+
+                        func.instruction(&WasmInst::I32Const(closure_addr as i32));
+                        func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        func.instruction(&WasmInst::LocalTee(scratch));
+                        func.instruction(&WasmInst::I32Eqz);
+                        func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(
+                            ValType::I64,
+                        )));
+                        func.instruction(&WasmInst::I64Const(null_bits));
+                        func.instruction(&WasmInst::Else);
+                        {
+                            func.instruction(&WasmInst::LocalGet(scratch));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: upv_data_off as u64,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: upv_array_offset,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                                offset: location_offset,
+                                align: 2,
+                                memory_index: 0,
+                            }));
+                            func.instruction(&WasmInst::I64Load(wasm_encoder::MemArg {
+                                offset: 0,
+                                align: 3,
+                                memory_index: 0,
+                            }));
+                        }
+                        func.instruction(&WasmInst::End);
+                        func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                        return Ok(());
+                    }
+                }
                 func.instruction(&WasmInst::I64Const(*idx as i64));
                 func.instruction(&WasmInst::Call(self.runtime_imports["wren_get_upvalue"]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
