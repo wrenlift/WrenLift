@@ -334,12 +334,20 @@ pub fn closure_upvalues_data_offset() -> u32 {
 /// inside a tier'd-up function don't go through the dispatcher,
 /// so the cell stays valid for the whole nested-call chain
 /// without per-call updates.
+/// Save / install the module-vars data pointer. The hot path
+/// in a steady-state outer loop (BC repeatedly calling into the
+/// same tier'd-up function) writes the same pointer the cell
+/// already holds, so skip the store when `prev == p`. The
+/// returned `prev` is what the matching `restore_module_vars`
+/// will compare against to decide whether to reinstall.
 #[allow(unused_variables)]
 pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
     #[cfg(target_arch = "wasm32")]
     {
         let prev = current_module_vars_cell::CURRENT.get();
-        current_module_vars_cell::CURRENT.set(p);
+        if prev != p {
+            current_module_vars_cell::CURRENT.set(p);
+        }
         prev
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -352,7 +360,9 @@ pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
 pub fn restore_module_vars(prev: *mut u64) {
     #[cfg(target_arch = "wasm32")]
     {
-        current_module_vars_cell::CURRENT.set(prev);
+        if current_module_vars_cell::CURRENT.get() != prev {
+            current_module_vars_cell::CURRENT.set(prev);
+        }
     }
 }
 
@@ -397,6 +407,10 @@ pub unsafe fn module_vars_ptr_for_closure(
 /// rationale as `enter_vm`: dispatch boundaries are short and
 /// nested, so an explicit save / restore pair is simpler than
 /// a guard with a closing borrow.
+/// Save / install the receiver closure pointer. Steady-state
+/// dispatch into the same tier'd-up closure repeatedly writes
+/// the same pointer the cell already holds; skip the store on
+/// match.
 #[allow(unused_variables)]
 pub fn enter_closure(
     c: *mut crate::runtime::object::ObjClosure,
@@ -404,7 +418,9 @@ pub fn enter_closure(
     #[cfg(target_arch = "wasm32")]
     {
         let prev = current_closure_cell::CURRENT.get();
-        current_closure_cell::CURRENT.set(c);
+        if prev != c {
+            current_closure_cell::CURRENT.set(c);
+        }
         prev
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -417,7 +433,9 @@ pub fn enter_closure(
 pub fn restore_closure(prev: *mut crate::runtime::object::ObjClosure) {
     #[cfg(target_arch = "wasm32")]
     {
-        current_closure_cell::CURRENT.set(prev);
+        if current_closure_cell::CURRENT.get() != prev {
+            current_closure_cell::CURRENT.set(prev);
+        }
     }
 }
 

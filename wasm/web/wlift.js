@@ -1509,30 +1509,21 @@ class MainWlift {
       __wliftJitTable.set(slot, fn);
       return slot;
     };
-    // Defensive shim — if the wasm function returns undefined
-    // (mismatched signature, unbound import filled with stub,
-    // wrong slot), surface the failure as `null`-bits rather
-    // than letting wasm-bindgen throw "Cannot convert undefined
-    // to BigInt" deep in the dispatch path. The console.warn
-    // makes the misuse visible without crashing the whole run.
-    const __wliftSafeCall = (slot, fn, label) => {
-      const target = __wliftJitInstances[slot];
-      if (typeof target !== "function") {
-        console.warn(`[wlift jit] ${label}: slot ${slot} is not a function (${typeof target})`);
-        return 0x7FFC000000000000n; // Value::null() — TAG_NULL = QNAN
-      }
-      const r = fn(target);
-      if (typeof r !== "bigint") {
-        console.warn(`[wlift jit] ${label}: slot ${slot} returned non-BigInt (${typeof r}, ${r}); falling back to null`);
-        return 0x7FFC000000000000n;
-      }
-      return r;
-    };
-    globalThis._wlift_jit_call_0 = (slot)       => __wliftSafeCall(slot, (fn) => fn(),   "call_0");
-    globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
-    globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
-    globalThis._wlift_jit_call_3 = (slot, a, b, c)    => __wliftSafeCall(slot, (fn) => fn(a, b, c),    "call_3");
-    globalThis._wlift_jit_call_4 = (slot, a, b, c, d) => __wliftSafeCall(slot, (fn) => fn(a, b, c, d), "call_4");
+    // Hot-path JIT dispatch. Every BC→tier-up entry crosses this
+    // shim, so the per-arity callbacks are kept as bare
+    // `__wliftJitInstances[slot](...)` indirect calls — V8's
+    // inline-cache picks the call site up as monomorphic after
+    // a handful of iterations and the wasm function reference
+    // dispatches without a wrapper hop. The earlier defensive
+    // wrapper (typeof checks + console.warn on undefined) was
+    // useful during the wasm-bindgen ABI churn but in steady
+    // state it's pure per-call overhead — a slot mismatch is
+    // a Rust-side bug, not a runtime failure to recover from.
+    globalThis._wlift_jit_call_0 = (slot)             => __wliftJitInstances[slot]();
+    globalThis._wlift_jit_call_1 = (slot, a)          => __wliftJitInstances[slot](a);
+    globalThis._wlift_jit_call_2 = (slot, a, b)       => __wliftJitInstances[slot](a, b);
+    globalThis._wlift_jit_call_3 = (slot, a, b, c)    => __wliftJitInstances[slot](a, b, c);
+    globalThis._wlift_jit_call_4 = (slot, a, b, c, d) => __wliftJitInstances[slot](a, b, c, d);
 
     // Per-run reset — wlift_wasm calls this at the top of each
     // `run()` so JIT'd modules from prior VMs become

@@ -230,25 +230,14 @@ globalThis._wlift_jit_instantiate = (bytes) => {
   __wliftJitTable.set(slot, fn);
   return slot;
 };
-// Defensive call shims — see `wlift.js` for the rationale.
-const __wliftSafeCall = (slot, invoke, label) => {
-  const target = __wliftJitInstances[slot];
-  if (typeof target !== "function") {
-    console.warn(`[wlift jit] ${label}: slot ${slot} is not a function (${typeof target})`);
-    return 0x7FFC000000000000n;
-  }
-  const r = invoke(target);
-  if (typeof r !== "bigint") {
-    console.warn(`[wlift jit] ${label}: slot ${slot} returned non-BigInt (${typeof r}, ${r})`);
-    return 0x7FFC000000000000n;
-  }
-  return r;
-};
-globalThis._wlift_jit_call_0 = (slot)       => __wliftSafeCall(slot, (fn) => fn(),   "call_0");
-globalThis._wlift_jit_call_1 = (slot, a)    => __wliftSafeCall(slot, (fn) => fn(a),  "call_1");
-globalThis._wlift_jit_call_2 = (slot, a, b) => __wliftSafeCall(slot, (fn) => fn(a, b), "call_2");
-globalThis._wlift_jit_call_3 = (slot, a, b, c)    => __wliftSafeCall(slot, (fn) => fn(a, b, c),    "call_3");
-globalThis._wlift_jit_call_4 = (slot, a, b, c, d) => __wliftSafeCall(slot, (fn) => fn(a, b, c, d), "call_4");
+// Hot-path JIT dispatch — see `wlift.js` for the rationale.
+// Bare indirect calls into the funcref array; V8's monomorphic
+// IC handles each call site after warm-up.
+globalThis._wlift_jit_call_0 = (slot)             => __wliftJitInstances[slot]();
+globalThis._wlift_jit_call_1 = (slot, a)          => __wliftJitInstances[slot](a);
+globalThis._wlift_jit_call_2 = (slot, a, b)       => __wliftJitInstances[slot](a, b);
+globalThis._wlift_jit_call_3 = (slot, a, b, c)    => __wliftJitInstances[slot](a, b, c);
+globalThis._wlift_jit_call_4 = (slot, a, b, c, d) => __wliftJitInstances[slot](a, b, c, d);
 
 // Per-run reset — see wlift.js for rationale. Worker-mode
 // install lives here.
