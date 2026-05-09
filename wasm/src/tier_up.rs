@@ -1640,6 +1640,21 @@ pub fn wren_subscript_set_1(receiver: u64, index: u64, value: u64) -> u64 {
 // dependent crate aren't necessarily passed through by
 // `wasm-pack`).
 
+/// GC inter-generational write barrier — forwarder so the
+/// inline `SetUpvalue` / future inline `SetField` paths can
+/// `(import "wren" "wren_write_barrier")` from the JIT'd
+/// module. Identical body to the host's `runtime_fns::
+/// wren_write_barrier`; the wasm-bindgen wrapper exists only
+/// to surface the symbol through wasm-pack's JS-boundary export
+/// table (the underlying `pub extern "C"` function is no-mangle
+/// on host but mangled on wasm32 to avoid colliding with this
+/// wrapper, see commit 97092d1).
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_write_barrier(source: u64, value: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_write_barrier(source, value)
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 #[wasm_bindgen]
 pub fn wren_set_module_var(slot: u64, value: u64) -> u64 {

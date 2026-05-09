@@ -355,6 +355,7 @@ __wliftWrenImports = {
   // call sibling static helpers, walk up to a base class, or
   // probe `x is Klass` reach the JIT path on wasm.
   wren_set_module_var: wasm.wren_set_module_var,
+  wren_write_barrier:  wasm.wren_write_barrier,
   wren_call_static_self_0: wasm.wren_call_static_self_0,
   wren_call_static_self_1: wasm.wren_call_static_self_1,
   wren_call_static_self_2: wasm.wren_call_static_self_2,

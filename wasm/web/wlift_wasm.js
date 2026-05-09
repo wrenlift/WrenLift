@@ -1659,6 +1659,25 @@ export function wren_to_string(val) {
 }
 
 /**
+ * GC inter-generational write barrier — forwarder so the
+ * inline `SetUpvalue` / future inline `SetField` paths can
+ * `(import "wren" "wren_write_barrier")` from the JIT'd
+ * module. Identical body to the host's `runtime_fns::
+ * wren_write_barrier`; the wasm-bindgen wrapper exists only
+ * to surface the symbol through wasm-pack's JS-boundary export
+ * table (the underlying `pub extern "C"` function is no-mangle
+ * on host but mangled on wasm32 to avoid colliding with this
+ * wrapper, see commit 97092d1).
+ * @param {bigint} source
+ * @param {bigint} value
+ * @returns {bigint}
+ */
+export function wren_write_barrier(source, value) {
+    const ret = wasm.wren_write_barrier(source, value);
+    return BigInt.asUintN(64, ret);
+}
+
+/**
  * JS-callable: flip a socket to `Closed` and reject any parked
  * `recv()` futures. Idempotent — closing twice is a no-op.
  * @param {number} handle
