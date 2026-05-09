@@ -226,16 +226,20 @@ fn mir_needs_unsupported_helpers(
                 {
                     return true
                 }
-                Instruction::CallStaticSelf { .. }
-                | Instruction::SuperCall { .. }
-                | Instruction::MakeClosure { .. }
+                Instruction::MakeClosure { .. }
                 | Instruction::GetUpvalue(_)
-                | Instruction::SetUpvalue(..)
-                | Instruction::GetStaticField(..)
-                | Instruction::SetStaticField(..)
-                | Instruction::SetModuleVar(..)
-                | Instruction::IsType(..)
-                | Instruction::GuardClass(..) => return true,
+                | Instruction::SetUpvalue(..) => return true,
+                // CallStaticSelf — per-arity ladder
+                // (`wren_call_static_self_0` … `_4`). Higher
+                // arities reject through the gate.
+                Instruction::CallStaticSelf { args } if args.len() > 4 => return true,
+                // SuperCall — per-arity ladder
+                // (`wren_super_call_1` … `_4`). MIR always
+                // prepends `this` so args.len() >= 1; cap at 4
+                // (this + 3 positional).
+                Instruction::SuperCall { args, .. } if !(1..=4).contains(&args.len()) => {
+                    return true
+                }
                 // Subscript get/set support arity-1 (`list[i]`,
                 // `map[k]`, `arr[i] = v`) — the host helper is
                 // single-index. Multi-arg subscripts reject.
@@ -1577,6 +1581,113 @@ pub fn wren_subscript_get_1(receiver: u64, index: u64) -> u64 {
 #[wasm_bindgen]
 pub fn wren_subscript_set_1(receiver: u64, index: u64, value: u64) -> u64 {
     wren_lift::codegen::runtime_fns::wren_subscript_set(receiver, index, value)
+}
+
+// ---------------------------------------------------------------------------
+// Same-class / super dispatch + class-level state + type checks.
+//
+// Thin `#[wasm_bindgen]` forwarders to the host helpers in
+// `runtime_fns`. The host impls all use `vm_ref` which since
+// today's earlier change falls back to `current_vm()` on wasm,
+// so the same logic covers both targets — these wrappers exist
+// purely to surface the symbols through wasm-bindgen's JS-
+// boundary export table (raw `#[no_mangle]` symbols on a
+// dependent crate aren't necessarily passed through by
+// `wasm-pack`).
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_set_module_var(slot: u64, value: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_set_module_var(slot, value)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_call_static_self_0() -> u64 {
+    wren_lift::codegen::runtime_fns::wren_call_static_self_0()
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_call_static_self_1(a0: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_call_static_self_1(a0)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_call_static_self_2(a0: u64, a1: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_call_static_self_2(a0, a1)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_call_static_self_3(a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_call_static_self_3(a0, a1, a2)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_call_static_self_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_call_static_self_4(a0, a1, a2, a3)
+}
+
+/// Super-method dispatch — `super.foo(args)`. The MIR builder
+/// always includes `this` as the first arg, so the per-arity
+/// ladder starts at 1. `_<N>` takes `(method, this, a0..a_{N-2})`.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_super_call_1(method: u64, this: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_super_call_1(method, this)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_super_call_2(method: u64, this: u64, a0: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_super_call_2(method, this, a0)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_super_call_3(method, this, a0, a1)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_super_call_4(method: u64, this: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_super_call_4(method, this, a0, a1, a2)
+}
+
+/// Type check — `x is Klass`. Returns NaN-boxed `Bool`.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_is_type(val: u64, class_sym: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_is_type(val, class_sym)
+}
+
+/// Class assertion — passes the value through if it matches
+/// the cached class, else `runtime_error`s. Used by MIR's
+/// type-narrowing prologue when the front end deduces a
+/// receiver class.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_guard_class(value: u64, class: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_guard_class(value, class)
+}
+
+/// Read a class-level static field by symbol id. Static fields
+/// belong to the enclosing class object; the symbol id is
+/// baked at MIR build time.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_get_static_field(field_sym: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_get_static_field(field_sym)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[wasm_bindgen]
+pub fn wren_set_static_field(field_sym: u64, value: u64) -> u64 {
+    wren_lift::codegen::runtime_fns::wren_set_static_field(field_sym, value)
 }
 
 /// Combined helper: load the closure stored in

@@ -1420,6 +1420,22 @@ class MainWlift {
       // through the wasm tier-up.
       wren_subscript_get_1: wasm.wren_subscript_get_1,
       wren_subscript_set_1: wasm.wren_subscript_set_1,
+      // See `worker.js` — same-class / super / static-state /
+      // type-check helpers.
+      wren_set_module_var: wasm.wren_set_module_var,
+      wren_call_static_self_0: wasm.wren_call_static_self_0,
+      wren_call_static_self_1: wasm.wren_call_static_self_1,
+      wren_call_static_self_2: wasm.wren_call_static_self_2,
+      wren_call_static_self_3: wasm.wren_call_static_self_3,
+      wren_call_static_self_4: wasm.wren_call_static_self_4,
+      wren_super_call_1: wasm.wren_super_call_1,
+      wren_super_call_2: wasm.wren_super_call_2,
+      wren_super_call_3: wasm.wren_super_call_3,
+      wren_super_call_4: wasm.wren_super_call_4,
+      wren_is_type:           wasm.wren_is_type,
+      wren_guard_class:       wasm.wren_guard_class,
+      wren_get_static_field:  wasm.wren_get_static_field,
+      wren_set_static_field:  wasm.wren_set_static_field,
       // SIMD intrinsic helpers — see the matching block in
       // `worker.js` for the full rationale. `bitmask` / `allTrue`
       // / `anyTrue` are the only ones the wasm emitter routes

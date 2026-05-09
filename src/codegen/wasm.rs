@@ -166,6 +166,20 @@ pub fn call_slow_helper_name(args: usize) -> Option<&'static str> {
     }
 }
 
+/// Per-arity helper for `Instruction::SuperCall`. The MIR
+/// builder always prepends `this` to the args list, so the
+/// ladder starts at 1 (just `this`) and goes up to 4 (`this`
+/// plus three positional args).
+pub fn super_call_helper_name(args: usize) -> Option<&'static str> {
+    match args {
+        1 => Some("wren_super_call_1"),
+        2 => Some("wren_super_call_2"),
+        3 => Some("wren_super_call_3"),
+        4 => Some("wren_super_call_4"),
+        _ => None,
+    }
+}
+
 /// Compile a MIR function directly to a WASM module.
 ///
 /// No interner, no memory import — used by the codegen tests
@@ -579,8 +593,17 @@ impl<'a> MirWasmEmitter<'a> {
                         self.register_import(name, &params, &[ValType::I64]);
                     }
                     Instruction::SuperCall { args, .. } => {
-                        let params = vec![ValType::I64; args.len() + 1];
-                        self.register_import("wren_super_call", &params, &[ValType::I64]);
+                        if let Some(name) = super_call_helper_name(args.len()) {
+                            // Helper takes `(method, args...)` —
+                            // `args` already includes `this` as
+                            // the first element (MIR-builder
+                            // convention), so the wasm signature
+                            // is `(i64 method, i64 this,
+                            // i64 a0, ...)`, which matches the
+                            // host's per-arity ladder shape.
+                            let params = vec![ValType::I64; args.len() + 1];
+                            self.register_import(name, &params, &[ValType::I64]);
+                        }
                     }
                     Instruction::GetField(..) => {
                         self.register_import(
@@ -1399,11 +1422,14 @@ impl<'a> MirWasmEmitter<'a> {
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::SuperCall { method, args } => {
+                let name = super_call_helper_name(args.len()).ok_or_else(|| {
+                    format!("SuperCall of arity {} exceeds wasm tier-up cap", args.len())
+                })?;
                 func.instruction(&WasmInst::I64Const(method.index() as i64));
                 for a in args {
                     func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 }
-                func.instruction(&WasmInst::Call(self.runtime_imports["wren_super_call"]));
+                func.instruction(&WasmInst::Call(self.runtime_imports[name]));
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
             Instruction::CallKnownFunc { .. } => {

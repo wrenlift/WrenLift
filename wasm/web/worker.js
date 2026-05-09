@@ -360,6 +360,25 @@ __wliftWrenImports = {
   // subscripts reject through the gate.
   wren_subscript_get_1: wasm.wren_subscript_get_1,
   wren_subscript_set_1: wasm.wren_subscript_set_1,
+  // Same-class / super dispatch ladders, class-level state,
+  // and runtime type checks. See `wasm/src/tier_up.rs` for
+  // the matching forwarders. These let class methods that
+  // call sibling static helpers, walk up to a base class, or
+  // probe `x is Klass` reach the JIT path on wasm.
+  wren_set_module_var: wasm.wren_set_module_var,
+  wren_call_static_self_0: wasm.wren_call_static_self_0,
+  wren_call_static_self_1: wasm.wren_call_static_self_1,
+  wren_call_static_self_2: wasm.wren_call_static_self_2,
+  wren_call_static_self_3: wasm.wren_call_static_self_3,
+  wren_call_static_self_4: wasm.wren_call_static_self_4,
+  wren_super_call_1: wasm.wren_super_call_1,
+  wren_super_call_2: wasm.wren_super_call_2,
+  wren_super_call_3: wasm.wren_super_call_3,
+  wren_super_call_4: wasm.wren_super_call_4,
+  wren_is_type:           wasm.wren_is_type,
+  wren_guard_class:       wasm.wren_guard_class,
+  wren_get_static_field:  wasm.wren_get_static_field,
+  wren_set_static_field:  wasm.wren_set_static_field,
   // SIMD intrinsic helpers — only the Simd-exclusive selectors
   // (`bitmask` / `allTrue` / `anyTrue`) are wired into the wasm
   // emitter today. The remaining f32x4 / i32x4 binops + cmps are
