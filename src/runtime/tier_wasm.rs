@@ -373,6 +373,14 @@ pub fn restore_module_vars(prev: *mut u64) {
 /// any registered module — should never happen in practice but
 /// matches the existing `current_vm` null-on-not-set ergonomics).
 ///
+/// Steady-state hot path (BC repeatedly dispatching the same
+/// tier'd-up closure — fib's recursion, Adder.add's outer loop)
+/// is short-circuited by a single-entry "last closure → vars
+/// ptr" cache: ~13.5k recursive `fib(20)` calls all hit the
+/// same closure, so the second call onward returns the cached
+/// pointer without a HashMap probe. Cache invalidates whenever
+/// a different closure is seen.
+///
 /// # Safety
 /// `closure` must be a live `ObjClosure` and `vm` must be a live
 /// VM. Both invariants hold whenever this is called from the
@@ -385,6 +393,15 @@ pub unsafe fn module_vars_ptr_for_closure(
     if closure.is_null() {
         return std::ptr::null_mut();
     }
+    // Fast path: did we look up this exact closure last time?
+    // wasm32 is single-threaded so the cell is a plain static
+    // UnsafeCell — no atomics, no thread-locals.
+    {
+        let cached = last_module_vars_cache::CURRENT.get();
+        if cached.0 == closure {
+            return cached.1;
+        }
+    }
     let fn_ptr = (*closure).function;
     if fn_ptr.is_null() {
         return std::ptr::null_mut();
@@ -396,9 +413,38 @@ pub unsafe fn module_vars_ptr_for_closure(
     };
     // `engine.modules` keys on `String` (not `Rc<String>`), so
     // pass an `&str` view of the Rc for the lookup.
-    match vm.engine.modules.get_mut(module_name.as_str()) {
+    let result = match vm.engine.modules.get_mut(module_name.as_str()) {
         Some(entry) => entry.vars.as_mut_ptr() as *mut u64,
         None => std::ptr::null_mut(),
+    };
+    last_module_vars_cache::CURRENT.set((closure, result));
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+mod last_module_vars_cache {
+    use crate::runtime::object::ObjClosure;
+    use std::cell::UnsafeCell;
+
+    /// Single-entry "last closure → module vars data ptr"
+    /// cache. Invalidates when a different closure is seen.
+    /// Steady-state outer loops where the same closure is
+    /// dispatched each iteration get a cache hit on every
+    /// subsequent call, skipping the per-dispatch HashMap probe
+    /// in `module_vars_ptr_for_closure`.
+    pub(super) struct Cache(UnsafeCell<(*mut ObjClosure, *mut u64)>);
+    unsafe impl Sync for Cache {}
+    pub(super) static CURRENT: Cache = Cache(UnsafeCell::new((
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    )));
+    impl Cache {
+        pub(super) fn get(&self) -> (*mut ObjClosure, *mut u64) {
+            unsafe { *self.0.get() }
+        }
+        pub(super) fn set(&self, v: (*mut ObjClosure, *mut u64)) {
+            unsafe { *self.0.get() = v }
+        }
     }
 }
 
