@@ -1318,7 +1318,83 @@ impl<'a> MirWasmEmitter<'a> {
 
             // -- Object operations --
             Instruction::GetField(recv, idx) => {
-                self.emit_runtime_call_with_imm(func, dst, "wren_get_field", *recv, *idx as i64)?;
+                if self.module_vars_ptr_addr.is_some() {
+                    // Inline path. ObjInstance layout (#[repr(C)]):
+                    //   header   : ObjHeader  // offset 0, with
+                    //                          // obj_type: u8 at byte 0
+                    //   num_fields : u32        // offset 24
+                    //   fields_owned : bool     // offset 28
+                    //   fields   : *mut Value   // offset 32
+                    //
+                    // Wasm pseudocode:
+                    //
+                    //   local.get $recv         ;; i64 NaN-boxed value
+                    //   i32.wrap_i64            ;; low 32 bits = wasm32 ptr
+                    //   i32.load8_u offset=0    ;; obj_type byte
+                    //   i32.const 9             ;; ObjType::Instance
+                    //   i32.eq
+                    //   if (result i64)
+                    //     local.get $recv
+                    //     i32.wrap_i64
+                    //     i32.load  offset=32   ;; fields data ptr
+                    //     i64.load  offset=idx*8;; field value
+                    //   else
+                    //     local.get $recv
+                    //     i64.const idx
+                    //     call $wren_get_field  ;; defensive slow path
+                    //   end
+                    //
+                    // The guard catches non-Instance receivers
+                    // (foreign-class objects like ObjSimd /
+                    // ObjList that have a different layout at
+                    // offset 32) and routes them through the host
+                    // helper, which mirrors the host's
+                    // null-on-mismatch semantics. ObjType::Instance's
+                    // discriminant is 9 — see `runtime::object`.
+                    const OBJ_TYPE_INSTANCE: i32 = 9;
+                    let mem_offset = (*idx as u64) * 8;
+                    func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                    func.instruction(&WasmInst::I32WrapI64);
+                    func.instruction(&WasmInst::I32Load8U(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                    func.instruction(&WasmInst::I32Const(OBJ_TYPE_INSTANCE));
+                    func.instruction(&WasmInst::I32Eq);
+                    func.instruction(&WasmInst::If(wasm_encoder::BlockType::Result(ValType::I64)));
+                    {
+                        // Fast path.
+                        func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                        func.instruction(&WasmInst::I32WrapI64);
+                        func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
+                            offset: 32,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        func.instruction(&WasmInst::I64Load(wasm_encoder::MemArg {
+                            offset: mem_offset,
+                            align: 3,
+                            memory_index: 0,
+                        }));
+                    }
+                    func.instruction(&WasmInst::Else);
+                    {
+                        func.instruction(&WasmInst::LocalGet(self.local(*recv)));
+                        func.instruction(&WasmInst::I64Const(*idx as i64));
+                        func.instruction(&WasmInst::Call(self.runtime_imports["wren_get_field"]));
+                    }
+                    func.instruction(&WasmInst::End);
+                    func.instruction(&WasmInst::LocalSet(self.local(dst)));
+                } else {
+                    self.emit_runtime_call_with_imm(
+                        func,
+                        dst,
+                        "wren_get_field",
+                        *recv,
+                        *idx as i64,
+                    )?;
+                }
             }
             Instruction::SetField(recv, idx, val) => {
                 func.instruction(&WasmInst::LocalGet(self.local(*recv)));
