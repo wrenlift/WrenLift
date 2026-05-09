@@ -1346,17 +1346,32 @@ impl<'a> MirWasmEmitter<'a> {
                     //
                     // The guard catches non-Instance receivers
                     // (foreign-class objects like ObjSimd /
-                    // ObjList that have a different layout at
-                    // offset 32) and routes them through the host
-                    // helper, which mirrors the host's
+                    // ObjList that have a different layout at the
+                    // same offset) and routes them through the
+                    // host helper, which mirrors the host's
                     // null-on-mismatch semantics. ObjType::Instance's
                     // discriminant is 9 — see `runtime::object`.
+                    //
+                    // `mem::offset_of!(ObjInstance, fields)`
+                    // resolves to the layout for the target arch
+                    // the codegen is being COMPILED for: 32 on
+                    // host x86_64 (8-byte pointers, host tests),
+                    // ~20 on wasm32 (4-byte pointers, runtime
+                    // tier-up via wlift_wasm cdylib). Same idea
+                    // for `header.obj_type` — at offset 0 on both
+                    // arches but stating it explicitly avoids a
+                    // future ObjHeader reshuffle silently breaking
+                    // the inline path.
                     const OBJ_TYPE_INSTANCE: i32 = 9;
+                    let fields_offset =
+                        std::mem::offset_of!(crate::runtime::object::ObjInstance, fields) as u64;
+                    let obj_type_offset =
+                        std::mem::offset_of!(crate::runtime::object::ObjHeader, obj_type) as u64;
                     let mem_offset = (*idx as u64) * 8;
                     func.instruction(&WasmInst::LocalGet(self.local(*recv)));
                     func.instruction(&WasmInst::I32WrapI64);
                     func.instruction(&WasmInst::I32Load8U(wasm_encoder::MemArg {
-                        offset: 0,
+                        offset: obj_type_offset,
                         align: 0,
                         memory_index: 0,
                     }));
@@ -1368,7 +1383,7 @@ impl<'a> MirWasmEmitter<'a> {
                         func.instruction(&WasmInst::LocalGet(self.local(*recv)));
                         func.instruction(&WasmInst::I32WrapI64);
                         func.instruction(&WasmInst::I32Load(wasm_encoder::MemArg {
-                            offset: 32,
+                            offset: fields_offset,
                             align: 2,
                             memory_index: 0,
                         }));

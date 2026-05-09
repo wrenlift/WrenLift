@@ -1087,7 +1087,7 @@ pub unsafe extern "C" fn wlift_gpu_buffer_write_floats_n(vm: *mut VM) {
                 return;
             }
         };
-        let bytes_to_write = count.checked_mul(4).unwrap_or(usize::MAX);
+        let bytes_to_write = count.saturating_mul(4);
         if bytes_to_write > bytes.len() {
             ctx(vm).runtime_error(format!(
                 "{}: count {} exceeds Float32Array length {}.",

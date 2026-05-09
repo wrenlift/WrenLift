@@ -390,6 +390,75 @@ pub struct TierSnapshot {
     pub bailouts: u32,
 }
 
+// ── Wasm-tier API: host stubs ─────────────────────────────────────────────
+//
+// These mirror the public surface of `runtime::tier_wasm` so wlift_wasm's
+// shared rlib path (host build of the wasm-bindgen cdylib's rlib counterpart)
+// links cleanly. The tier.rs path is selected when `feature = "host"`,
+// regardless of target arch — `cargo clippy --workspace --all-features`
+// triggers feature unification and pulls host wren_lift even when
+// wlift_wasm is being type-checked. Without these stubs the compile fails
+// with `cannot find function current_vm in module tier`. Each stub here
+// is the no-op shape: null pointer / None / 0 / no-op — host code never
+// actually drives the wasm tier dispatch path.
+
+use crate::mir::MirFunction;
+
+/// See `tier_wasm::CompileCallback` — wlift_wasm registers a function that
+/// returns an `Option<u32>` slot index in the host's JIT instance table.
+pub type CompileCallback = fn(&MirFunction) -> Option<u32>;
+
+/// See `tier_wasm::DispatchCallback`.
+pub type DispatchCallback = fn(slot: u32, fn_export_name: &str, args: &[u64]) -> u64;
+
+pub fn set_compile_callback(_cb: CompileCallback) {}
+pub fn set_dispatch_callback(_cb: DispatchCallback) {}
+
+pub fn current_vm() -> *mut crate::runtime::vm::VM {
+    std::ptr::null_mut()
+}
+pub fn current_closure() -> *mut crate::runtime::object::ObjClosure {
+    std::ptr::null_mut()
+}
+pub fn current_module_vars() -> *mut u64 {
+    std::ptr::null_mut()
+}
+pub fn current_module_vars_addr() -> Option<u32> {
+    None
+}
+
+#[allow(unused_variables)]
+pub fn enter_vm(vm: *mut crate::runtime::vm::VM) -> *mut crate::runtime::vm::VM {
+    std::ptr::null_mut()
+}
+pub fn exit_vm(_prev: *mut crate::runtime::vm::VM) {}
+
+#[allow(unused_variables)]
+pub fn enter_closure(
+    c: *mut crate::runtime::object::ObjClosure,
+) -> *mut crate::runtime::object::ObjClosure {
+    std::ptr::null_mut()
+}
+pub fn restore_closure(_prev: *mut crate::runtime::object::ObjClosure) {}
+
+#[allow(unused_variables)]
+pub fn enter_module_vars(p: *mut u64) -> *mut u64 {
+    std::ptr::null_mut()
+}
+pub fn restore_module_vars(_prev: *mut u64) {}
+
+pub fn bump_dispatch_hook_hits() {}
+pub fn dispatch_hook_hits() -> u64 {
+    0
+}
+
+pub fn try_compile(_mir: &MirFunction) -> Option<u32> {
+    None
+}
+pub fn dispatch(_slot: u32, _fn_export_name: &str, _args: &[u64]) -> u64 {
+    crate::runtime::value::Value::null().to_bits()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
