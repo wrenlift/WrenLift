@@ -60,6 +60,7 @@ host = [
     "dep:rand",
     "dep:rand_core",
     "dep:mimalloc",
+    "dep:krio-fiber",
 ]
 cranelift = [
     "host",
@@ -149,6 +150,14 @@ target-lexicon = { version = "0.13", optional = true }
 # relies on for OSR-aware installs. Pulls in `std::thread` so it sits
 # under `host` even though the crate itself is pure Rust.
 beadie = { version = "0.3", optional = true }
+# Stackful fiber runtime (Wren/Lua-style). Used by the AOT path on
+# native targets — replaces the stackless state-machine MIR
+# transform with per-fiber mmap stacks + a target-specific
+# context-switch primitive. Yield-from-any-depth comes for free
+# because the entire physical stack is preserved across a switch.
+# Sibling project: ../krio. Unix-only stack guard pages; heap
+# fallback elsewhere. WASM uses a separate Promise/Future bridge.
+krio-fiber = { path = "../krio/crates/krio-fiber", optional = true }
 
 # Wasm-specific: getrandom needs the `js` feature on wasm32-unknown-
 # unknown so `rand` can pull entropy from `crypto.getRandomValues`.
