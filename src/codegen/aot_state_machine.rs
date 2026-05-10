@@ -546,6 +546,15 @@ pub fn transform_to_state_machine(
         // through the clone. Blocks that don't use saved
         // values (or shadow them all) stay untouched and serve
         // both paths.
+        //
+        // `clones` is hoisted out so the metadata-propagation
+        // pass that runs AFTER the match block (which sets
+        // layout.block_kinds[blk_id] / [call_check_id]) can
+        // mirror the now-finalized state-machine metadata onto
+        // each clone. Without that ordering, the current
+        // yielding block's clone would have a stale
+        // `resume_check_block` placeholder.
+        let mut clones: HashMap<BlockId, BlockId> = HashMap::new();
         if !remap.is_empty() {
             // First, handle the resume block itself: its
             // instructions and terminator may directly use
@@ -570,7 +579,8 @@ pub fn transform_to_state_machine(
             // we encounter block-param shadows, but the
             // common case is "all saved values active" so this
             // memo collision is unlikely to over-clone.
-            let mut clones: HashMap<BlockId, BlockId> = HashMap::new();
+            // (`clones` is the outer-scoped one declared just
+            // above the `if !remap.is_empty()` guard.)
             // Worklist of (orig_block_id, clone_block_id) pairs whose
             // bodies still need to be filled.
             let mut to_fill: Vec<(BlockId, BlockId)> = Vec::new();
@@ -871,167 +881,10 @@ pub fn transform_to_state_machine(
                 blk.instructions = insts;
                 blk.terminator = term;
             }
-
-            // Propagate state-machine metadata to cloned blocks
-            // whose source was already in `layout.block_kinds`
-            // (i.e., earlier yields' yielding blocks +
-            // CrossFnCallResume sites). Without this, the clones
-            // get plain MIR lowering and the SM dispatch doesn't
-            // re-fire on the cloned-region path:
-            //
-            //  - A `CrossFnCallInit` clone with no kind metadata
-            //    just runs the pre-call setup and falls through,
-            //    SKIPPING the cross-fn invocation.
-            //  - A `DirectYield` clone reached on the cloned path
-            //    saves the ORIGINAL ValueIds (un-remapped),
-            //    referencing values that aren't bound on this
-            //    path → "uses value vN from non-dominating instM"
-            //    in cranelift's verifier.
-            //
-            // For each (orig, clone) pair we mirror the metadata
-            // with operand-remap applied. `resume_check_block` /
-            // `done_block` get redirected to their cloned
-            // counterparts when those exist; otherwise they stay
-            // pointing at the original (which is the shared
-            // resume entry the dispatcher's br_table targets).
-            for (orig, clone) in &clones {
-                let map_v = |v: ValueId| -> ValueId { remap.get(&v).copied().unwrap_or(v) };
-                let map_b = |b: BlockId| -> BlockId { clones.get(&b).copied().unwrap_or(b) };
-                // The CURRENT yielding block isn't in
-                // `layout.block_kinds`/`yield_blocks`/`yield_saves`
-                // yet (those are inserted after tail-dup). Mirror
-                // the same metadata onto the clone using the
-                // local `susp_kind` / `cross_fn_meta` / `saves` /
-                // direct_yield_result variables. The state_id is
-                // assigned by the match block below; we use the
-                // soon-to-be-assigned value (= current
-                // resume_entries count, since this is the next
-                // yield's state).
-                if *orig == blk_id {
-                    let next_state_id = layout.resume_entries.len() as u32;
-                    let cloned_saves: Vec<(u32, ValueId)> =
-                        saves.iter().map(|(slot, v)| (*slot, map_v(*v))).collect();
-                    if !cloned_saves.is_empty() {
-                        layout.yield_saves.insert(*clone, cloned_saves);
-                    }
-                    layout.yield_blocks.insert(*clone, next_state_id);
-                    match (susp_kind, cross_fn_meta.as_ref()) {
-                        (SuspensionKind::DirectYield, _) => {
-                            layout.block_kinds.insert(*clone, BlockKind::DirectYield);
-                            if let Some(dst) = direct_yield_result {
-                                let _ = dst;
-                                // direct_yield_results is keyed
-                                // on resume entry (shared); no
-                                // per-clone entry needed.
-                            }
-                        }
-                        (
-                            SuspensionKind::CrossFnCall,
-                            Some((receiver, args, result, method_sym)),
-                        ) => {
-                            // Will share the resume_check_block
-                            // with the original (registered in
-                            // the match block below). The clone
-                            // jumps to the same call_check on
-                            // suspend.
-                            layout.block_kinds.insert(
-                                *clone,
-                                BlockKind::CrossFnCallInit {
-                                    resume_check_block: blk_id, // will be retargeted by match below
-                                    receiver: map_v(*receiver),
-                                    args: args.iter().copied().map(map_v).collect(),
-                                    result: map_v(*result),
-                                    method_sym: *method_sym,
-                                },
-                            );
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                let Some(kind) = layout.block_kinds.get(orig).cloned() else {
-                    continue;
-                };
-                match kind {
-                    BlockKind::DirectYield => {
-                        layout.block_kinds.insert(*clone, BlockKind::DirectYield);
-                    }
-                    BlockKind::CrossFnCallInit {
-                        resume_check_block,
-                        receiver,
-                        args,
-                        result,
-                        method_sym,
-                    } => {
-                        layout.block_kinds.insert(
-                            *clone,
-                            BlockKind::CrossFnCallInit {
-                                resume_check_block: map_b(resume_check_block),
-                                receiver: map_v(receiver),
-                                args: args.into_iter().map(map_v).collect(),
-                                result: map_v(result),
-                                method_sym,
-                            },
-                        );
-                    }
-                    BlockKind::CrossFnCallResume {
-                        done_block,
-                        receiver,
-                        args,
-                        result,
-                        method_sym,
-                    } => {
-                        layout.block_kinds.insert(
-                            *clone,
-                            BlockKind::CrossFnCallResume {
-                                done_block: map_b(done_block),
-                                receiver: map_v(receiver),
-                                args: args.into_iter().map(map_v).collect(),
-                                result: map_v(result),
-                                method_sym,
-                            },
-                        );
-                        // Cranelift's CrossFnCallResume lowering
-                        // reads `cross_fn_results[bid]` to load
-                        // the call's runtime result back into
-                        // val_map under the cloned `result`
-                        // ValueId. Without the entry the
-                        // post-call binding never happens and
-                        // any downstream use of `result` reads
-                        // an undefined Cranelift Value.
-                        if let Some((slot, dst)) = layout.cross_fn_results.get(orig).copied() {
-                            layout.cross_fn_results.insert(*clone, (slot, map_v(dst)));
-                        }
-                        // Resume-loads are keyed on the resume
-                        // entry (the CrossFnCallResume block).
-                        // The clone's resume_loads are the same
-                        // slot/ValueId pairs — the cranelift
-                        // lowering generates fresh loads at the
-                        // clone's entry from the same fiber slot
-                        // table.
-                        if let Some(loads) = layout.resume_loads.get(orig).cloned() {
-                            layout.resume_loads.insert(*clone, loads);
-                        }
-                    }
-                }
-                // Yielding blocks (DirectYield + CrossFnCallInit)
-                // need their state_id and saves carried over so
-                // the cloned-region path correctly stamps the
-                // suspension state and saves the right ValueIds.
-                if let Some(state_id) = layout.yield_blocks.get(orig).copied() {
-                    layout.yield_blocks.insert(*clone, state_id);
-                }
-                if let Some(saves) = layout.yield_saves.get(orig).cloned() {
-                    let cloned_saves: Vec<(u32, ValueId)> = saves
-                        .into_iter()
-                        .map(|(slot, v)| (slot, map_v(v)))
-                        .collect();
-                    layout.yield_saves.insert(*clone, cloned_saves);
-                }
-                if let Some(dst) = layout.direct_yield_results.get(orig).copied() {
-                    layout.direct_yield_results.insert(*clone, map_v(dst));
-                }
-            }
+            // (Metadata propagation moved out of this block —
+            // see after the match block below, where
+            // layout.block_kinds[blk_id] / [call_check_id]
+            // are already populated.)
         }
 
         // `saves` is keyed unconditionally on the yielding block.
@@ -1130,6 +983,147 @@ pub fn transform_to_state_machine(
                 }
             }
             _ => unreachable!("classify_call invariants kept the susp_kind and meta in sync"),
+        }
+
+        // Propagate state-machine metadata to cloned blocks.
+        // Runs AFTER the match block above so the current
+        // yielding block's `block_kinds` / `yield_blocks` /
+        // `yield_saves` entries plus the freshly-allocated
+        // `call_check_id` (for CrossFnCall) are visible.
+        // Without that ordering, the current yielding block's
+        // clone gets a placeholder `resume_check_block` that's
+        // never patched, and lowering treats the clone's
+        // CrossFnCallInit setup as branching to itself instead
+        // of the matching call_check.
+        //
+        // Two distinct value-renames apply:
+        //   * `remap` — yield N's saved-values rename. Pre-yield
+        //     operands (receiver, args, save values) get
+        //     remapped to yield_N_load_vid when the value is
+        //     saved across this yield.
+        //   * `extra_remap` — clone-specific fresh-vid map for
+        //     `result` and `resume_loads`. val_map at cranelift
+        //     lowering is a per-function map (not per-block) —
+        //     when the original CrossFnCallResume binds
+        //     `val_map[v49] = ret_at_orig` and the clone later
+        //     binds `val_map[v49] = ret_at_clone`, the second
+        //     overwrites and any block lowered AFTER the clone
+        //     that uses v49 (via `val_map.get`) gets
+        //     ret_at_clone — which doesn't dominate the use
+        //     site. Fresh ValueIds per clone keep val_map entries
+        //     disjoint.
+        if !clones.is_empty() {
+            let mut extra_remap: HashMap<ValueId, ValueId> = HashMap::new();
+            for orig in clones.keys() {
+                if let Some(loads) = layout.resume_loads.get(orig) {
+                    for (_slot, vid) in loads {
+                        extra_remap.entry(*vid).or_insert_with(|| mir.new_value());
+                    }
+                }
+                if let Some(kind) = layout.block_kinds.get(orig) {
+                    let result_opt = match kind {
+                        BlockKind::CrossFnCallInit { result, .. }
+                        | BlockKind::CrossFnCallResume { result, .. } => Some(*result),
+                        BlockKind::DirectYield => None,
+                    };
+                    if let Some(r) = result_opt {
+                        extra_remap.entry(r).or_insert_with(|| mir.new_value());
+                    }
+                }
+            }
+            // Apply extra_remap to clone bodies. Clone bodies
+            // were filled with yield N's saved-values remap in
+            // the to_fill loop; extra_remap renames any
+            // leftover references to original load/result
+            // ValueIds (i.e., values not in yield N's saved
+            // set — earlier-yields' load values that weren't
+            // live across this yield, or the current
+            // yielding block's call result).
+            if !extra_remap.is_empty() {
+                let clone_ids: Vec<BlockId> = clones.values().copied().collect();
+                for clone_id in clone_ids {
+                    let blk = mir.block_mut(clone_id);
+                    for (_, inst) in &mut blk.instructions {
+                        remap_instruction_uses(inst, &extra_remap);
+                    }
+                    remap_terminator_uses(&mut blk.terminator, &extra_remap);
+                }
+            }
+            for (orig, clone) in &clones {
+                let map_v_arg = |v: ValueId| -> ValueId { remap.get(&v).copied().unwrap_or(v) };
+                let map_v_result =
+                    |v: ValueId| -> ValueId { extra_remap.get(&v).copied().unwrap_or(v) };
+                let map_b = |b: BlockId| -> BlockId { clones.get(&b).copied().unwrap_or(b) };
+                if let Some(loads) = layout.resume_loads.get(orig).cloned() {
+                    let fresh_loads: Vec<(u32, ValueId)> = loads
+                        .into_iter()
+                        .map(|(slot, v)| (slot, map_v_result(v)))
+                        .collect();
+                    layout.resume_loads.insert(*clone, fresh_loads);
+                }
+                let Some(kind) = layout.block_kinds.get(orig).cloned() else {
+                    continue;
+                };
+                match kind {
+                    BlockKind::DirectYield => {
+                        layout.block_kinds.insert(*clone, BlockKind::DirectYield);
+                    }
+                    BlockKind::CrossFnCallInit {
+                        resume_check_block,
+                        receiver,
+                        args,
+                        result,
+                        method_sym,
+                    } => {
+                        layout.block_kinds.insert(
+                            *clone,
+                            BlockKind::CrossFnCallInit {
+                                resume_check_block: map_b(resume_check_block),
+                                receiver: map_v_arg(receiver),
+                                args: args.into_iter().map(map_v_arg).collect(),
+                                result: map_v_result(result),
+                                method_sym,
+                            },
+                        );
+                    }
+                    BlockKind::CrossFnCallResume {
+                        done_block,
+                        receiver,
+                        args,
+                        result,
+                        method_sym,
+                    } => {
+                        layout.block_kinds.insert(
+                            *clone,
+                            BlockKind::CrossFnCallResume {
+                                done_block: map_b(done_block),
+                                receiver: map_v_arg(receiver),
+                                args: args.into_iter().map(map_v_arg).collect(),
+                                result: map_v_result(result),
+                                method_sym,
+                            },
+                        );
+                        if let Some((slot, dst)) = layout.cross_fn_results.get(orig).copied() {
+                            layout
+                                .cross_fn_results
+                                .insert(*clone, (slot, map_v_result(dst)));
+                        }
+                    }
+                }
+                if let Some(state_id) = layout.yield_blocks.get(orig).copied() {
+                    layout.yield_blocks.insert(*clone, state_id);
+                }
+                if let Some(saves) = layout.yield_saves.get(orig).cloned() {
+                    let cloned_saves: Vec<(u32, ValueId)> = saves
+                        .into_iter()
+                        .map(|(slot, v)| (slot, map_v_arg(v)))
+                        .collect();
+                    layout.yield_saves.insert(*clone, cloned_saves);
+                }
+                if let Some(dst) = layout.direct_yield_results.get(orig).copied() {
+                    layout.direct_yield_results.insert(*clone, map_v_arg(dst));
+                }
+            }
         }
     }
 
