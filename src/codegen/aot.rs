@@ -1279,12 +1279,12 @@ fn emit_aot_function(
                 eprintln!("=== AOT dump for {} (mir.name={}) ===", symbol, mir_name);
                 if let Some((sm_mir, sm_layout)) = sm_payload.as_ref() {
                     eprintln!("--- SM-transformed MIR ---");
-                    eprintln!("{:#?}", sm_mir);
+                    eprintln!("{}", sm_mir.pretty_print(interner));
                     eprintln!("--- SM layout ---");
                     eprintln!("{:#?}", sm_layout);
                 } else {
                     eprintln!("--- MIR (non-SM) ---");
-                    eprintln!("{:#?}", mir_to_lower);
+                    eprintln!("{}", mir_to_lower.pretty_print(interner));
                 }
             }
         }
