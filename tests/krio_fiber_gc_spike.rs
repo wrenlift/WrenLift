@@ -34,7 +34,7 @@
 
 #![cfg(feature = "host")]
 
-use krio_fiber::{Fiber, FiberStep, yield_now};
+use krio_fiber::{yield_now, Fiber, FiberStep};
 
 /// Count the frames in a suspended fiber's saved_fp chain. Real GC
 /// walker does this exact loop, but stops at each frame to scan
@@ -114,7 +114,10 @@ fn walker_terminates_through_mixed_frame_layouts() {
     fiber.resume();
     assert_eq!(fiber.state(), krio_fiber::FiberState::Suspended);
     let depth = count_frames(&fiber).expect("chain walks");
-    assert!(depth >= 1, "expected at least one walked frame, got {depth}");
+    assert!(
+        depth >= 1,
+        "expected at least one walked frame, got {depth}"
+    );
     fiber.resume();
     assert_eq!(fiber.state(), krio_fiber::FiberState::Done);
 }

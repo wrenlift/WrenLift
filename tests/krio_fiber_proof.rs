@@ -16,7 +16,7 @@
 
 #![cfg(feature = "host")]
 
-use krio_fiber::{Fiber, FiberStep, yield_value};
+use krio_fiber::{yield_value, Fiber, FiberStep};
 
 /// Mirror of `hatch-proc::proc.spec::closure_50`. Tight loop, two
 /// suspending `_fn.call()` sites per iteration, value-carrying yield.

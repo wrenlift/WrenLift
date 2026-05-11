@@ -408,13 +408,13 @@ fn try_krio_yield(value: Value) -> Option<Value> {
     Some(received.map(Value::from_bits).unwrap_or_else(Value::null))
 }
 
-/// Thread-local handoff: the fiber-side `try_krio_yield` stashes
-/// its drained roots here; the host-side `try_krio_call` picks
-/// them up and parks them on the ObjFiber after `resume_with`
-/// returns. Necessary because the fiber doesn't know which
-/// ObjFiber it belongs to (krio's id is internal), and even if it
-/// did, mutating `*mut ObjFiber` from inside the fiber while the
-/// host holds `&mut self` would be UB.
+// Thread-local handoff: the fiber-side `try_krio_yield` stashes
+// its drained roots here; the host-side `try_krio_call` picks
+// them up and parks them on the ObjFiber after `resume_with`
+// returns. Necessary because the fiber doesn't know which
+// ObjFiber it belongs to (krio's id is internal), and even if it
+// did, mutating `*mut ObjFiber` from inside the fiber while the
+// host holds `&mut self` would be UB.
 #[cfg(feature = "host")]
 thread_local! {
     static KRIO_YIELD_ROOTS_HANDOFF: std::cell::RefCell<Vec<Value>> =

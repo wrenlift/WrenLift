@@ -359,7 +359,6 @@ pub struct VM {
     // here, but it accumulated dangling pointers after the GC
     // swept short-lived fibers. Pass 3 now enumerates via
     // `GcImpl::for_each_fiber` which only sees live fibers.)
-
     /// Pool of reusable register files to avoid per-call heap allocation.
     pub register_pool: Vec<Vec<Value>>,
 
@@ -530,7 +529,7 @@ impl VM {
             gc_requested: false,
             #[cfg(feature = "host")]
             krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
-                .map(|v| v != "0" && v != "")
+                .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
@@ -3091,8 +3090,12 @@ impl VM {
                 Some(b) => b.as_ref(),
                 None => continue,
             };
-            let Some(saved_fp_ptr) = krio.saved_fp() else { continue };
-            let Some(saved_ret_ptr) = krio.saved_ret() else { continue };
+            let Some(saved_fp_ptr) = krio.saved_fp() else {
+                continue;
+            };
+            let Some(saved_ret_ptr) = krio.saved_ret() else {
+                continue;
+            };
             let mut fp = saved_fp_ptr as usize;
             let initial_saved_ret = saved_ret_ptr as usize;
             // The first frame's return address is the saved x30 /
@@ -3125,7 +3128,8 @@ impl VM {
                             {
                                 for root in &sp.live_roots {
                                     if let RootLocation::Spill(spill_offset) = root.location {
-                                        let addr = (fp as isize + spill_offset as isize) as *mut u64;
+                                        let addr =
+                                            (fp as isize + spill_offset as isize) as *mut u64;
                                         let bits = unsafe { *addr };
                                         let val = Value::from_bits(bits);
                                         if val.is_object() {
