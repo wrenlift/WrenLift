@@ -776,7 +776,14 @@ impl Gc {
     /// Auto-select minor or major GC based on interval.
     pub fn collect(&mut self, roots: &mut [Value]) {
         let start = crate::portable_time::Instant::now();
-        if self.minor_since_major >= self.config.major_gc_interval {
+        // Off-heap pressure forces a major. Minor GCs only sweep
+        // the nursery; promoted ObjFibers (which carry the 1 MiB
+        // krio mmap stacks) sit in old gen until major. Without
+        // this, a `System.gc()` between requests reclaims nothing
+        // because every dead fiber was already promoted by the
+        // previous safepoint's minor sweep.
+        let external_pressure = self.external_bytes_since_gc > 16 * 1024 * 1024;
+        if external_pressure || self.minor_since_major >= self.config.major_gc_interval {
             self.collect_major(roots);
         } else {
             self.collect_minor(roots);
