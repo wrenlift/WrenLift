@@ -135,11 +135,9 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                     unsafe {
                         (*fiber).krio_fiber = Some(Box::new(krio));
                     }
-                    // Register for GC Pass-3 walking: every krio-
-                    // backed fiber's mmap stack may contain Wren
-                    // Value roots that aren't reachable through
-                    // the existing mir_frames / aot_frames trace.
-                    ctx.register_krio_fiber(fiber);
+                    // GC Pass 3 enumerates krio-backed fibers via
+                    // GcImpl::for_each_fiber at scan time, so no
+                    // per-fiber registration is needed here.
                 }
             }
 
@@ -457,6 +455,31 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     let fiber_roots = std::mem::take(unsafe { &mut (*target).krio_jit_roots });
     crate::codegen::runtime_fns::set_jit_roots(fiber_roots);
 
+    // Host-side vm.fiber swap, wrapping resume_with. The krio
+    // body has its own swap inside (captured at body entry), but
+    // that swap only restores when the body fully exits — between
+    // yields it leaves vm.fiber pointing at `target`. Without the
+    // host-side wrap, after the first yield the host's interpreter
+    // loop runs with vm.fiber = target instead of its own fiber,
+    // misdispatching subsequent opcodes. This bug surfaced on
+    // proc.spec's "two fibers reading different processes
+    // interleave" and the equivalent in events.spec.
+    //
+    // SAFETY: we own a raw *mut VM via the VM's own ObjFiber graph
+    // — the fiber wouldn't exist without a live VM, and the VM is
+    // single-threaded. The deref is bounded to the body of this
+    // function.
+    let vm_ptr: *mut crate::runtime::vm::VM = crate::runtime::vm::current_vm_ptr();
+    let prev_vm_fiber = if !vm_ptr.is_null() {
+        unsafe {
+            let prev = (*vm_ptr).fiber;
+            (*vm_ptr).fiber = target;
+            prev
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+
     unsafe {
         (*target).state = FiberState::Suspended; // running, but not New
     }
@@ -468,6 +491,16 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // context switch onto the fiber's stack.
     let krio_ptr: *mut krio_fiber::Fiber = unsafe { (*target).krio_fiber.as_deref_mut().unwrap() };
     let step = unsafe { (*krio_ptr).resume_with::<u64>(input.to_bits()) };
+
+    // Restore host's vm.fiber. Even if the body's own restore line
+    // already ran (natural-completion path), re-asserting it here
+    // is fine: prev_vm_fiber is the value vm.fiber had on entry to
+    // this function, which is the canonical "host caller" identity.
+    if !vm_ptr.is_null() {
+        unsafe {
+            (*vm_ptr).fiber = prev_vm_fiber;
+        }
+    }
 
     // Drain the fiber's roots: if it yielded, the fiber-side
     // `try_krio_yield` stashed them into the handoff thread-local
@@ -778,6 +811,21 @@ fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             match state {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
+                    // Suspended-only routing through krio. A
+                    // suspended krio-backed fiber's continuation
+                    // lives on the mmap stack and the stackless
+                    // path can't drive it. New fibers fall through
+                    // to set_fiber_action_call so the existing
+                    // is_try / resume_caller plumbing handles them
+                    // — extending krio coverage to New broke many
+                    // specs and isn't necessary for the current
+                    // failing tests (which only have Suspended-state
+                    // try() calls on already-yielded fibers).
+                    if matches!(state, FiberState::Suspended) {
+                        if let Some(v) = try_krio_call(f, Value::null()) {
+                            return v;
+                        }
+                    }
                     ctx.set_fiber_action_call(f, Value::null());
                 }
                 FiberState::Done => {
@@ -803,6 +851,11 @@ fn fiber_try_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             match state {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
+                    if matches!(state, FiberState::Suspended) {
+                        if let Some(v) = try_krio_call(f, args[1]) {
+                            return v;
+                        }
+                    }
                     ctx.set_fiber_action_call(f, args[1]);
                 }
                 FiberState::Done => {

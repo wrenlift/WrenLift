@@ -4005,7 +4005,15 @@ pub fn run_fiber(vm: &mut VM) -> Result<Value, RuntimeError> {
     // VM through stack args; no thread-local needed.
     #[cfg(target_arch = "wasm32")]
     let prev_vm = crate::runtime::tier::enter_vm(vm as *mut VM);
+    // Host: publish the VM pointer in a thread-local so
+    // foreign-method handlers can recover it without threading
+    // it through every call (used by the krio-fiber integration's
+    // host-side vm.fiber swap). Save/restore for re-entrance.
+    #[cfg(feature = "host")]
+    let prev_host_vm = crate::runtime::vm::__set_thread_local_current_vm(vm as *mut VM);
     let result = run_fiber_with_stop_depth(vm, None);
+    #[cfg(feature = "host")]
+    crate::runtime::vm::__set_thread_local_current_vm(prev_host_vm);
     #[cfg(target_arch = "wasm32")]
     crate::runtime::tier::exit_vm(prev_vm);
     result

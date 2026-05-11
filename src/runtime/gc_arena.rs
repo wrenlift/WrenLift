@@ -43,6 +43,18 @@ impl ArenaGc {
         }
     }
 
+    /// Iterate every currently-allocated `ObjFiber`. See
+    /// `GcImpl::for_each_fiber` for the contract. Arena doesn't
+    /// collect, so every object ever allocated still lives.
+    pub fn for_each_fiber<F: FnMut(*mut ObjFiber)>(&self, mut f: F) {
+        for &header in &self.objects {
+            let obj_type = unsafe { (*header).obj_type };
+            if obj_type == ObjType::Fiber {
+                f(header as *mut ObjFiber);
+            }
+        }
+    }
+
     fn alloc_boxed<T>(&mut self, obj: T) -> *mut T {
         let size = std::mem::size_of::<T>();
         let ptr = Box::into_raw(Box::new(obj));

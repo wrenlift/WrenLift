@@ -344,6 +344,33 @@ impl Gc {
         self.old_count
     }
 
+    /// Iterate every currently-allocated `ObjFiber` across both
+    /// generations. See `GcImpl::for_each_fiber` for the contract.
+    pub fn for_each_fiber<F: FnMut(*mut ObjFiber)>(&self, mut f: F) {
+        // Young: nursery_objects is a flat Vec of bump-allocated
+        // pointers; every entry is live (the GC sweeps it after
+        // promotion).
+        for &header in &self.nursery_objects {
+            let obj_type = unsafe { (*header).obj_type };
+            if obj_type == ObjType::Fiber {
+                f(header as *mut ObjFiber);
+            }
+        }
+        // Old: intrusive linked list rooted at `old_objects`,
+        // chained via `ObjHeader::next`.
+        let mut current = self.old_objects;
+        while !current.is_null() {
+            // SAFETY: every pointer in the chain was returned by
+            // `Box::leak`/equivalent and remains live until the
+            // next major sweep, which can't run while we hold &self.
+            let obj_type = unsafe { (*current).obj_type };
+            if obj_type == ObjType::Fiber {
+                f(current as *mut ObjFiber);
+            }
+            current = unsafe { (*current).next };
+        }
+    }
+
     pub fn should_collect(&self) -> bool {
         // Trigger when:
         //   - the nursery is past 75% of its allocated arena (the

@@ -227,6 +227,44 @@ pub struct HotMethodSymbols {
 // VM
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "host")]
+thread_local! {
+    /// Pointer to the active VM. Set by `VM::set_thread_local_current`
+    /// at the top-level dispatch entry (interpret, run_fiber) so
+    /// foreign-method handlers can recover the VM without threading
+    /// it through every call. Only the krio-fiber integration reads
+    /// this today; if you need it for anything else, sanity-check
+    /// the single-thread invariant first.
+    static CURRENT_VM: std::cell::Cell<*mut VM> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Read the active VM pointer. Returns null if no VM is currently
+/// dispatching on this thread (e.g. called from a unit test or
+/// before VM construction). Host-feature-gated; on wasm/no-host,
+/// always returns null.
+#[cfg(feature = "host")]
+pub fn current_vm_ptr() -> *mut VM {
+    CURRENT_VM.with(|c| c.get())
+}
+#[cfg(not(feature = "host"))]
+pub fn current_vm_ptr() -> *mut VM {
+    std::ptr::null_mut()
+}
+
+/// Install the active VM pointer in the per-thread cell, returning
+/// the prior value so callers can restore on exit. Doubly-underscored
+/// because direct use is reserved for `vm_interp::run_fiber` (and
+/// the few other top-level dispatch entries that need to publish
+/// the VM identity to foreign-method handlers).
+#[cfg(feature = "host")]
+pub fn __set_thread_local_current_vm(new: *mut VM) -> *mut VM {
+    CURRENT_VM.with(|c| {
+        let prev = c.get();
+        c.set(new);
+        prev
+    })
+}
+
 pub struct VM {
     // -- Memory --
     pub gc: GcImpl,
@@ -317,20 +355,10 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
 
-    /// Every ObjFiber that has a krio_fiber backing is pushed here at
-    /// `Fiber.new` time. The GC walker iterates this on each cycle
-    /// (`scan_native_stack_roots` Pass 3) to find every fiber whose
-    /// stack contains Wren-Value roots that aren't reachable via the
-    /// normal marker (the AOT-compiled body's spill slots).
-    ///
-    /// Raw pointers can dangle if the GC sweeps a fiber while it's
-    /// still in this list (e.g. user dropped their last reference to
-    /// a fiber before resuming it). Iteration validates the ObjType
-    /// header before dereferencing, so a swept-and-reused slot just
-    /// gets skipped or treated as whatever type it now is — no
-    /// memory error.
-    #[cfg(feature = "host")]
-    pub krio_backed_fibers: Vec<*mut ObjFiber>,
+    // (Earlier iterations used a side-table `krio_backed_fibers`
+    // here, but it accumulated dangling pointers after the GC
+    // swept short-lived fibers. Pass 3 now enumerates via
+    // `GcImpl::for_each_fiber` which only sees live fibers.)
 
     /// Pool of reusable register files to avoid per-call heap allocation.
     pub register_pool: Vec<Vec<Value>>,
@@ -504,8 +532,6 @@ impl VM {
             krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
                 .map(|v| v != "0" && v != "")
                 .unwrap_or(false),
-            #[cfg(feature = "host")]
-            krio_backed_fibers: Vec::new(),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
@@ -3037,33 +3063,30 @@ impl VM {
         // backed fiber's frame chain from its saved fp + ret using
         // the *same* safepoint-driven spill scan as Pass 2.
         //
-        // Dangling-pointer guard: a fiber that's been GC'd would
-        // still be in `krio_backed_fibers` until the next prune. The
-        // type-tag check on `header.obj_type` filters those out;
-        // worst case a slot has been reused as a different obj type,
-        // and we skip it.
+        // Enumeration goes through the GC's live-object list rather
+        // than a side table. That guarantees every fiber the walker
+        // sees is currently allocated, so the deref of saved_fp /
+        // saved_ret can't hit freed memory. (A side table accumulates
+        // pointers to swept ObjFibers — observed as SIGSEGV on
+        // hatch-buffers + similar specs that churn through many
+        // short-lived try-fibers.)
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        for &fiber_ptr in &self.krio_backed_fibers {
-            if fiber_ptr.is_null() {
-                continue;
+        let mut pass3_fibers: Vec<*mut ObjFiber> = Vec::new();
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        self.gc.for_each_fiber(|f| {
+            // Only suspended krio-backed fibers have meaningful
+            // saved state to walk. (New / Done / Error / non-krio
+            // are skipped at the per-fiber check below.)
+            if unsafe { (*f).state } != crate::runtime::object::FiberState::Suspended {
+                return;
             }
-            // Validate the header before dereferencing the rest.
-            let obj_type = unsafe { (*(fiber_ptr as *const ObjHeader)).obj_type };
-            if obj_type != ObjType::Fiber {
-                continue;
+            if unsafe { (*f).krio_fiber.is_none() } {
+                return;
             }
-            // Only suspended fibers have meaningful saved state.
-            // New / Running / Done / Error are uninteresting:
-            //   New     — no saved registers, the synthetic startup
-            //             frame contains zero placeholders.
-            //   Running — currently executing on the host (covered
-            //             by Pass 2 via the host's fp).
-            //   Done    — the body returned; stack is logically dead.
-            //   Error   — same.
-            let state = unsafe { (*fiber_ptr).state };
-            if state != crate::runtime::object::FiberState::Suspended {
-                continue;
-            }
+            pass3_fibers.push(f);
+        });
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        for fiber_ptr in pass3_fibers {
             let krio = match unsafe { (*fiber_ptr).krio_fiber.as_ref() } {
                 Some(b) => b.as_ref(),
                 None => continue,
@@ -3581,12 +3604,10 @@ impl NativeContext for VM {
     fn krio_fiber_active(&self) -> bool {
         self.krio_fiber_active
     }
-    #[cfg(feature = "host")]
-    fn register_krio_fiber(&mut self, fiber: *mut ObjFiber) {
-        if !fiber.is_null() {
-            self.krio_backed_fibers.push(fiber);
-        }
-    }
+    // register_krio_fiber is left as the trait default no-op;
+    // Pass 3 now enumerates via GcImpl::for_each_fiber instead of
+    // a side table, so the foreign-method side doesn't need to
+    // tell the VM about new fibers.
 
     fn fiber_stack_traces_enabled(&self) -> bool {
         self.config.fiber_stack_traces

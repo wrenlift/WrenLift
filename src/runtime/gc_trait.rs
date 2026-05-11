@@ -203,6 +203,21 @@ impl GcImpl {
             gc.validate_write_barriers();
         }
     }
+
+    /// Iterate every currently-allocated `ObjFiber` in the heap.
+    ///
+    /// Used by the krio-fiber AOT integration's GC Pass 3 to find
+    /// every fiber whose stack might hold Wren-Value roots. Going
+    /// through the GC's own object list (rather than a separate
+    /// side table) avoids dangling-pointer issues: every fiber the
+    /// closure sees is, by definition, currently allocated.
+    ///
+    /// The callback runs synchronously while we hold a `&self`
+    /// borrow on the GC, so the closure mustn't trigger an
+    /// allocation or another GC pass.
+    pub fn for_each_fiber<F: FnMut(*mut super::object::ObjFiber)>(&self, f: F) {
+        gc_dispatch!(self, for_each_fiber, f)
+    }
 }
 
 impl GcAllocator for GcImpl {
