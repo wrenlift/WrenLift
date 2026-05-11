@@ -76,7 +76,33 @@ unsafe fn current_module_name(ctx: &mut dyn NativeContext) -> std::rc::Rc<String
 
 fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     // args[0] = Fiber class (receiver), args[1] = closure
-    let closure_ptr = unsafe { as_closure(args[1]) };
+    fiber_new_inner(ctx, args[1], None)
+}
+
+/// `Fiber.new(closure, stackKb)` — explicit stack size hint for the
+/// krio backing. Use when the body calls into foreign Rust code that
+/// stages large values on the stack (`Http.get` → `flate2::GzDecoder`,
+/// etc.). The default 256 KiB is fine for pure-Wren bodies; ask for
+/// 1024 here for HTTP / decompression / similar.
+fn fiber_new_with_stack(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let stack_kb = match args[2].as_num() {
+        Some(n) if n > 0.0 && n.is_finite() => Some((n as usize) * 1024),
+        _ => {
+            ctx.runtime_error(
+                "Fiber.new(closure, stackKb): stackKb must be a positive number.".to_string(),
+            );
+            return Value::null();
+        }
+    };
+    fiber_new_inner(ctx, args[1], stack_kb)
+}
+
+fn fiber_new_inner(
+    ctx: &mut dyn NativeContext,
+    closure_val: Value,
+    parent_stack_request: Option<usize>,
+) -> Value {
+    let closure_ptr = unsafe { as_closure(closure_val) };
     match closure_ptr {
         Some(closure) => {
             // Capture spawn-site stack trace if opt-in is enabled
@@ -129,19 +155,24 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 if !vm_ptr.is_null() {
                     let target_ptr_usize = fiber as usize;
                     let vm_ptr_usize = vm_ptr as usize;
-                    // 1 MiB stack — krio's 64 KiB default is too tight
-                    // for Wren bodies that call into foreign Rust code
-                    // (e.g. `Http.get` pulls in flate2's GzDecoder which
-                    // stages a ~256 KiB InflateState on the stack before
-                    // boxing it to the heap, SIGBUS'ing on macOS arm64's
-                    // xzm large-object allocator at frame bottom). Worth
-                    // tuning down via `WLIFT_KRIO_STACK_KB` once we know
-                    // typical Wren bodies don't need this much.
+                    // 256 KiB default. Wren bodies that don't enter
+                    // heavy foreign code touch well under 100 KiB, so a
+                    // 1 MiB reservation per fiber wastes virtual address
+                    // space and (more importantly on macOS arm64) widens
+                    // the window where the allocator's zone manager can
+                    // stumble on the fiber's mmap region. Heavy paths
+                    // — `Http.get` pulls in `flate2::GzDecoder` which
+                    // stages a ~256 KiB `InflateState` on the stack
+                    // before boxing — should be created via
+                    // `Fiber.new(closure, stackKb)` with an explicit
+                    // larger size. `WLIFT_KRIO_STACK_KB=N` overrides
+                    // the default for the whole process.
                     let stack_bytes = std::env::var("WLIFT_KRIO_STACK_KB")
                         .ok()
                         .and_then(|s| s.parse::<usize>().ok())
                         .map(|kb| kb * 1024)
-                        .unwrap_or(1024 * 1024);
+                        .or(parent_stack_request)
+                        .unwrap_or(256 * 1024);
                     let krio = krio_fiber::Fiber::with_stack_size(stack_bytes, move || {
                         krio_fiber_body(vm_ptr_usize, target_ptr_usize);
                     });
@@ -951,6 +982,7 @@ pub fn bind(vm: &mut VM) {
 
     // Static methods
     vm.primitive_static(class, "new(_)", fiber_new);
+    vm.primitive_static(class, "new(_,_)", fiber_new_with_stack);
     vm.primitive_static(class, "abort(_)", fiber_abort);
     vm.primitive_static(class, "current", fiber_current);
     vm.primitive_static(class, "suspend()", fiber_suspend);
