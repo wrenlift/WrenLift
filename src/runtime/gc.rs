@@ -420,16 +420,16 @@ impl Gc {
         // still amortise GC across a meaningful chunk of work.
         const NURSERY_BYTE_CEILING: usize = 64 * 1024 * 1024;
         // Off-heap memory threshold. Krio fiber stacks dominate this
-        // axis under AOT (1 MiB per fiber by default); without an
-        // external-bytes check the nursery accounting never sees them
-        // and an idle web server's RSS climbs unbounded per request.
-        // 128 MiB caps RSS growth at ~128 fiber-equivalents between
-        // collections — high enough that the test runner's per-test
-        // fiber churn doesn't trip a GC mid-spec (which exposes the
-        // Pass-3 stack-walk fragility documented in the integration
-        // plan), low enough to bound steady-state web traffic at
-        // hundreds of MB rather than gigabytes.
-        const EXTERNAL_BYTE_CEILING: usize = 128 * 1024 * 1024;
+        // axis under AOT (256 KiB per fiber at the default); without
+        // an external-bytes check the nursery accounting never sees
+        // them and a web server's RSS climbs unbounded per request.
+        // 32 MiB ≈ 128 fiber-equivalents — frequent enough that
+        // sustained browser navigation stays bounded around the
+        // working set, infrequent enough that the test runner's
+        // per-test fiber churn doesn't trip mid-spec (which exposes
+        // the Pass-3 stack-walk fragility documented in the
+        // integration plan memo).
+        const EXTERNAL_BYTE_CEILING: usize = 32 * 1024 * 1024;
         // Wall-clock heartbeat. A real browser drip-feeds requests
         // (favicon, prefetch, dev tools) at a rate where neither
         // nursery nor external thresholds trip for minutes, so the
@@ -798,12 +798,15 @@ impl Gc {
     pub fn collect(&mut self, roots: &mut [Value]) {
         let start = crate::portable_time::Instant::now();
         // Off-heap pressure forces a major. Minor GCs only sweep
-        // the nursery; promoted ObjFibers (which carry the 1 MiB
-        // krio mmap stacks) sit in old gen until major. Without
-        // this, a `System.gc()` between requests reclaims nothing
-        // because every dead fiber was already promoted by the
-        // previous safepoint's minor sweep.
-        let external_pressure = self.external_bytes_since_gc > 16 * 1024 * 1024;
+        // the nursery; promoted ObjFibers (which carry the krio
+        // mmap stacks) sit in old gen until major. Without this,
+        // a `System.gc()` between requests reclaims nothing because
+        // every dead fiber was already promoted by the previous
+        // safepoint's minor sweep. 4 MiB ≈ 16 fiber-equivalents
+        // at the 256 KiB default — fires often enough that
+        // sustained browser navigation never accumulates more than
+        // a few-dozen dormant stacks in old gen.
+        let external_pressure = self.external_bytes_since_gc > 4 * 1024 * 1024;
         if external_pressure || self.minor_since_major >= self.config.major_gc_interval {
             self.collect_major(roots);
         } else {
