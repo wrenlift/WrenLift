@@ -317,6 +317,21 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
 
+    /// Every ObjFiber that has a krio_fiber backing is pushed here at
+    /// `Fiber.new` time. The GC walker iterates this on each cycle
+    /// (`scan_native_stack_roots` Pass 3) to find every fiber whose
+    /// stack contains Wren-Value roots that aren't reachable via the
+    /// normal marker (the AOT-compiled body's spill slots).
+    ///
+    /// Raw pointers can dangle if the GC sweeps a fiber while it's
+    /// still in this list (e.g. user dropped their last reference to
+    /// a fiber before resuming it). Iteration validates the ObjType
+    /// header before dereferencing, so a swept-and-reused slot just
+    /// gets skipped or treated as whatever type it now is — no
+    /// memory error.
+    #[cfg(feature = "host")]
+    pub krio_backed_fibers: Vec<*mut ObjFiber>,
+
     /// Pool of reusable register files to avoid per-call heap allocation.
     pub register_pool: Vec<Vec<Value>>,
 
@@ -489,6 +504,8 @@ impl VM {
             krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
                 .map(|v| v != "0" && v != "")
                 .unwrap_or(false),
+            #[cfg(feature = "host")]
+            krio_backed_fibers: Vec::new(),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
@@ -3011,6 +3028,104 @@ impl VM {
             }
         }
 
+        // Pass 3: suspended krio-fiber stacks. The integration runs
+        // each fiber's body on its own mmap stack; when the fiber is
+        // suspended, its frames live entirely off the host thread's
+        // stack chain (Pass 2 misses them by construction — that walk
+        // starts from the host's `x29`/`rbp`, which has been swapped
+        // out across the context switch). Walk each suspended krio-
+        // backed fiber's frame chain from its saved fp + ret using
+        // the *same* safepoint-driven spill scan as Pass 2.
+        //
+        // Dangling-pointer guard: a fiber that's been GC'd would
+        // still be in `krio_backed_fibers` until the next prune. The
+        // type-tag check on `header.obj_type` filters those out;
+        // worst case a slot has been reused as a different obj type,
+        // and we skip it.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        for &fiber_ptr in &self.krio_backed_fibers {
+            if fiber_ptr.is_null() {
+                continue;
+            }
+            // Validate the header before dereferencing the rest.
+            let obj_type = unsafe { (*(fiber_ptr as *const ObjHeader)).obj_type };
+            if obj_type != ObjType::Fiber {
+                continue;
+            }
+            // Only suspended fibers have meaningful saved state.
+            // New / Running / Done / Error are uninteresting:
+            //   New     — no saved registers, the synthetic startup
+            //             frame contains zero placeholders.
+            //   Running — currently executing on the host (covered
+            //             by Pass 2 via the host's fp).
+            //   Done    — the body returned; stack is logically dead.
+            //   Error   — same.
+            let state = unsafe { (*fiber_ptr).state };
+            if state != crate::runtime::object::FiberState::Suspended {
+                continue;
+            }
+            let krio = match unsafe { (*fiber_ptr).krio_fiber.as_ref() } {
+                Some(b) => b.as_ref(),
+                None => continue,
+            };
+            let Some(saved_fp_ptr) = krio.saved_fp() else { continue };
+            let Some(saved_ret_ptr) = krio.saved_ret() else { continue };
+            let mut fp = saved_fp_ptr as usize;
+            let initial_saved_ret = saved_ret_ptr as usize;
+            // The first frame's return address is the saved x30 /
+            // implicit ret from the krio_fiber_switch call site;
+            // subsequent frames use the standard chain (fp[1] = ret).
+            let mut current_ret = initial_saved_ret;
+            let max_frames = 256;
+            let mut walked = 0;
+            while fp != 0 && walked < max_frames {
+                walked += 1;
+                if fp & 7 != 0 {
+                    break;
+                }
+                if current_ret != 0 {
+                    let code_range = self
+                        .engine
+                        .code_ranges
+                        .iter()
+                        .find(|r| current_ret >= r.start && current_ret < r.end);
+                    if let Some(cr) = code_range {
+                        let meta = self
+                            .engine
+                            .jit_metadata
+                            .get(cr.func_id.0 as usize)
+                            .and_then(|m| m.as_ref());
+                        if let Some(meta) = meta {
+                            let offset = current_ret.wrapping_sub(cr.start) as u32;
+                            if let Some(sp) =
+                                meta.safepoints.iter().find(|sp| sp.code_offset == offset)
+                            {
+                                for root in &sp.live_roots {
+                                    if let RootLocation::Spill(spill_offset) = root.location {
+                                        let addr = (fp as isize + spill_offset as isize) as *mut u64;
+                                        let bits = unsafe { *addr };
+                                        let val = Value::from_bits(bits);
+                                        if val.is_object() {
+                                            found_roots.push(val);
+                                            slot_addrs.push(addr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Step to caller's frame using the standard chain.
+                let next_fp = unsafe { *(fp as *const usize) };
+                let next_ret = unsafe { *((fp + 8) as *const usize) };
+                if next_fp == 0 || next_fp <= fp {
+                    break;
+                }
+                fp = next_fp;
+                current_ret = next_ret;
+            }
+        }
+
         (found_roots, slot_addrs)
     }
 
@@ -3465,6 +3580,12 @@ impl NativeContext for VM {
     #[cfg(feature = "host")]
     fn krio_fiber_active(&self) -> bool {
         self.krio_fiber_active
+    }
+    #[cfg(feature = "host")]
+    fn register_krio_fiber(&mut self, fiber: *mut ObjFiber) {
+        if !fiber.is_null() {
+            self.krio_backed_fibers.push(fiber);
+        }
     }
 
     fn fiber_stack_traces_enabled(&self) -> bool {

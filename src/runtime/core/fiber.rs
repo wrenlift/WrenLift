@@ -135,6 +135,11 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                     unsafe {
                         (*fiber).krio_fiber = Some(Box::new(krio));
                     }
+                    // Register for GC Pass-3 walking: every krio-
+                    // backed fiber's mmap stack may contain Wren
+                    // Value roots that aren't reachable through
+                    // the existing mir_frames / aot_frames trace.
+                    ctx.register_krio_fiber(fiber);
                 }
             }
 

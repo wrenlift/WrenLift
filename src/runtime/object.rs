@@ -1427,6 +1427,11 @@ pub trait NativeContext {
     fn krio_fiber_active(&self) -> bool {
         false
     }
+    /// Register `fiber` as a krio-backed fiber the GC walker
+    /// should visit on each cycle. Called by `fiber_new` after
+    /// attaching a `krio_fiber: Some(...)` backing. No-op when the
+    /// integration is off.
+    fn register_krio_fiber(&mut self, _fiber: *mut ObjFiber) {}
 
     // -- Module reload (for Hatch module) --
     /// Re-parse and re-install a previously loaded module, preserving
