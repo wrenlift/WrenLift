@@ -1702,12 +1702,19 @@ impl VM {
                 // built workspace — fall back to stripping the leading
                 // `./` / `../` segments and rewriting `/` → `.` to
                 // match `pack_bundled_native_libs`'s `relative.join(".")`.
+                //
+                // When `wlift` is running with a filesystem resolver
+                // active (the `main.wren` case), the resolver appends
+                // a `.wren` suffix via `with_wren_suffix` even when the
+                // path doesn't exist on disk — so the stripped form
+                // must drop `.wren` to match the bundle's bare name.
                 if resolved.is_none()
                     && (canonical.starts_with("./") || canonical.starts_with("../"))
                 {
                     let stripped = canonical
                         .trim_start_matches("./")
                         .trim_start_matches("../")
+                        .trim_end_matches(".wren")
                         .replace('/', ".");
                     if !stripped.is_empty() {
                         resolved = self.find_imported_var_from(name, &stripped);
@@ -4960,8 +4967,28 @@ fn compute_reachable_hatch_modules(
         // the legacy path where they weren't.
         let stripped = crate::parse::cfg::apply(raw, None);
         for imp in extract_archive_imports(&stripped) {
-            if sources.contains_key(imp.as_str()) && !reachable.contains(&imp) {
-                queue.push(imp);
+            // Bundled sibling modules are stored under bare names
+            // (`css`, `forms`, `lib.catalog`) but importers spell them
+            // as `./css`, `./lib/catalog`, etc. Normalise to the
+            // bundle's keying before testing reachability — otherwise
+            // every relative-path sibling drops out of `install_order`
+            // and its importer ends up with null var slots at runtime.
+            let candidates = [
+                imp.clone(),
+                imp.trim_start_matches("./")
+                    .trim_start_matches("../")
+                    .trim_end_matches(".wren")
+                    .replace('/', ".")
+                    .to_string(),
+            ];
+            for cand in candidates {
+                if cand.is_empty() {
+                    continue;
+                }
+                if sources.contains_key(cand.as_str()) && !reachable.contains(&cand) {
+                    queue.push(cand);
+                    break;
+                }
             }
         }
     }
