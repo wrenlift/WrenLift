@@ -527,10 +527,13 @@ impl VM {
             last_error: None,
             loading_modules: HashSet::new(),
             gc_requested: false,
+            // Native (host) fibers always run on krio backings; the
+            // legacy stackless dispatch only fires for the BC interp's
+            // own scheduling needs. `WLIFT_KRIO_FIBER=0` opts back out
+            // for regression testing; nothing else should set it.
             #[cfg(feature = "host")]
-            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(false),
+            krio_fiber_active: !std::env::var_os("WLIFT_KRIO_FIBER")
+                .is_some_and(|v| v == "0" || v.is_empty()),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),

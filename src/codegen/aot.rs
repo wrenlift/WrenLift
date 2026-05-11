@@ -990,15 +990,17 @@ fn aot_direct_yield_method_names() -> &'static [&'static str] {
 /// set is tainted, and any function calling a tainted-named
 /// method is itself tainted.
 pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String> {
-    // Under the krio-fiber AOT integration (WLIFT_KRIO_FIBER), every
-    // fiber body compiles as plain native code that runs on a
-    // per-fiber mmap stack; suspension is a context switch via
-    // `krio_fiber::yield_value` rather than the stackless
-    // state-machine transform. Returning an empty taint set
-    // short-circuits the SM-transform path at every call site
-    // that consults it (`is_state_machine = tainted_names.contains(...)`
-    // resolves to false uniformly).
-    if std::env::var_os("WLIFT_KRIO_FIBER").is_some_and(|v| v != "0" && !v.is_empty()) {
+    // Native AOT uses krio-fiber for yield/resume: every fiber body
+    // compiles as plain native code that runs on a per-fiber mmap
+    // stack, and suspension is a synchronous context switch via
+    // `krio_fiber::yield_value`. The legacy state-machine transform
+    // exists in this tree but is unused on native — the BC interp /
+    // tiered / JIT modes don't invoke it, the WASM target has its
+    // own scheduler-based async path, and AOT now skips it
+    // unconditionally. `WLIFT_FORCE_AOT_SM=1` opts back into the SM
+    // transform for regression testing the old path; nothing else
+    // should set it.
+    if !std::env::var_os("WLIFT_FORCE_AOT_SM").is_some_and(|v| v != "0" && !v.is_empty()) {
         return HashSet::new();
     }
     let mut tainted: HashSet<String> = aot_direct_yield_method_names()
