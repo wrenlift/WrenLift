@@ -62,12 +62,6 @@ fn time_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     std::thread::sleep(Duration::from_secs_f64(secs));
     #[cfg(not(feature = "host"))]
     let _ = secs;
-    // Idle-loop GC poll. The accept loop's `Clock.sleepMs(1)` is the
-    // canonical "I have nothing to do" pause point; under AOT the
-    // surrounding code emits no `finish_alloc` calls during idle, so
-    // without this hook GC never runs and the OldArena's released
-    // chunks (once nothing pins them) stay pinned forever.
-    ctx.poll_gc();
     Value::null()
 }
 
