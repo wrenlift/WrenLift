@@ -385,6 +385,28 @@ fn fiber_yield_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn try_krio_yield(value: Value) -> Option<Value> {
     krio_fiber::current_fiber_id()?;
 
+    // Caller-aware split: krio's context switch is the right
+    // answer for a top-level Fiber.yield (no Wren caller — the
+    // implicit main fiber, wrapped by wlift_aot_invoke_module_body).
+    // For nested fibers (anything driven by sched.tick / .try /
+    // .call), yield must propagate through pending_fiber_action so
+    // the interpreter switches vm.fiber back to the Wren caller —
+    // otherwise the body just resumes immediately from the
+    // module-body wrapper and the scheduler never gets control
+    // back. The hatch site's catalog.refreshLoop's busy yield-poll
+    // would burn 94% CPU without this split.
+    let vm_ptr = crate::runtime::vm::current_vm_ptr();
+    if !vm_ptr.is_null() {
+        let current_fiber = unsafe { (*vm_ptr).fiber };
+        if !current_fiber.is_null() && unsafe { !(*current_fiber).caller.is_null() } {
+            // Nested fiber — defer to the stackless path. The BC
+            // interpreter's run_fiber loop handles
+            // pending_fiber_action::Yield by switching vm.fiber to
+            // (*fiber).caller; that's the right semantic.
+            return None;
+        }
+    }
+
     // Save the fiber's JIT roots and clear the thread-local store
     // before switching back to the host. The matching restore on
     // the next resume reinstalls them. Mirrors try_krio_call's
@@ -836,11 +858,9 @@ fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
                     // Suspended-only routing through krio. Full
-                    // routing (covering New too) is needed for the
-                    // hatch site's spawned per-connection fibers
-                    // to yield correctly, but it regresses
-                    // buffers/window/zip with silent test-runner
-                    // bailouts — see project_krio_fiber_*.md.
+                    // routing for fresh fibers regresses buffers /
+                    // window / zip and breaks site boot — needs
+                    // further design work (see plan memo).
                     if matches!(state, FiberState::Suspended) {
                         if let Some(v) = try_krio_call(f, Value::null()) {
                             return v;
