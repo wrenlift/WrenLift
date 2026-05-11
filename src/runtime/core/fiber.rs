@@ -129,7 +129,20 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 if !vm_ptr.is_null() {
                     let target_ptr_usize = fiber as usize;
                     let vm_ptr_usize = vm_ptr as usize;
-                    let krio = krio_fiber::Fiber::new(move || {
+                    // 1 MiB stack — krio's 64 KiB default is too tight
+                    // for Wren bodies that call into foreign Rust code
+                    // (e.g. `Http.get` pulls in flate2's GzDecoder which
+                    // stages a ~256 KiB InflateState on the stack before
+                    // boxing it to the heap, SIGBUS'ing on macOS arm64's
+                    // xzm large-object allocator at frame bottom). Worth
+                    // tuning down via `WLIFT_KRIO_STACK_KB` once we know
+                    // typical Wren bodies don't need this much.
+                    let stack_bytes = std::env::var("WLIFT_KRIO_STACK_KB")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .map(|kb| kb * 1024)
+                        .unwrap_or(1024 * 1024);
+                    let krio = krio_fiber::Fiber::with_stack_size(stack_bytes, move || {
                         krio_fiber_body(vm_ptr_usize, target_ptr_usize);
                     });
                     unsafe {
@@ -466,6 +479,19 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // caller fall back to the stackless path.
     if unsafe { (*target).krio_fiber.is_none() } {
         return None;
+    }
+    // Suspended-only routing wrinkle: when a fiber's first `.try()`
+    // went through the stackless path (set_fiber_action_call), its
+    // krio body never entered. Wren-side it's now `Suspended` with
+    // BC-resumable mir_frames; krio-side the body is still `New` and
+    // would start from scratch — losing the suspended BC state and
+    // re-running the closure. Detect this mismatch and fall back to
+    // the stackless path so the BC interp's resume path stays whole.
+    {
+        let krio_ref = unsafe { (*target).krio_fiber.as_deref() }.unwrap();
+        if matches!(krio_ref.state(), krio_fiber::FiberState::New) {
+            return None;
+        }
     }
 
     // Save the caller's JIT roots and install this fiber's saved
