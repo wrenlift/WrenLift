@@ -1109,6 +1109,20 @@ pub struct ObjFiber {
     /// read the child's `state_id` (top of stack) instead of the
     /// body's (which is at `aot_active_depth`).
     pub aot_active_depth: usize,
+
+    /// Stackful coroutine backing under the krio-fiber integration
+    /// (off by default; enabled with `WLIFT_KRIO_FIBER=1`). When
+    /// present, this fiber's body runs on a per-fiber mmap stack via
+    /// `krio_fiber::Fiber::resume`; suspension is a synchronous
+    /// context switch rather than the stackless `pending_fiber_action`
+    /// dance. Boxed because krio_fiber's trampoline holds raw
+    /// pointers that must stay at a stable address even if the
+    /// `ObjFiber` itself moves.
+    ///
+    /// `None` for fibers created under the existing stackless path
+    /// (BC interp, JIT, WASM), or anywhere the toggle is off.
+    #[cfg(feature = "host")]
+    pub krio_fiber: Option<Box<krio_fiber::Fiber>>,
 }
 
 /// One state-machine frame on `ObjFiber.aot_frames`. Holds the
@@ -1151,6 +1165,8 @@ impl ObjFiber {
             deadline_ms: None,
             aot_frames: Vec::new(),
             aot_active_depth: 0,
+            #[cfg(feature = "host")]
+            krio_fiber: None,
         }
     }
 

@@ -328,13 +328,107 @@ fn fiber_suspend(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 }
 
 fn fiber_yield_0(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
+    if let Some(v) = try_krio_yield(Value::null()) {
+        return v;
+    }
     ctx.set_fiber_action_yield(Value::null());
     Value::null()
 }
 
 fn fiber_yield_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    if let Some(v) = try_krio_yield(args[1]) {
+        return v;
+    }
     ctx.set_fiber_action_yield(args[1]);
     Value::null()
+}
+
+/// If the current thread is executing inside a `krio_fiber::Fiber`,
+/// route the yield through krio's synchronous context switch and
+/// return whatever value the host pumps back via `resume_with`. The
+/// `pending_fiber_action` path is skipped entirely on this branch —
+/// the krio context switch unwinds the fiber's physical call stack
+/// instead of relying on the interpreter loop's stackless trampoline.
+///
+/// Returns `None` if no krio fiber is active, so the caller falls
+/// back to the existing `set_fiber_action_yield` path. This makes the
+/// change a no-op when `WLIFT_KRIO_FIBER` is off OR when the fiber
+/// was allocated under the stackless path (krio fiber backing is
+/// per-ObjFiber, not global).
+#[cfg(feature = "host")]
+fn try_krio_yield(value: Value) -> Option<Value> {
+    if krio_fiber::current_fiber_id().is_none() {
+        return None;
+    }
+    // Pump the yield value to the host via krio's untyped slot, then
+    // suspend. On resume the host calls `resume_with::<u64>(bits)`
+    // with the value the next `Fiber.call(v)` passed in.
+    let received: Option<u64> = krio_fiber::yield_value(value.to_bits());
+    Some(received.map(Value::from_bits).unwrap_or_else(Value::null))
+}
+
+#[cfg(not(feature = "host"))]
+fn try_krio_yield(_value: Value) -> Option<Value> {
+    None
+}
+
+/// If the target fiber has a krio-fiber backing, drive it directly
+/// via `resume_with(value)` and return the value the fiber yielded
+/// (or `null` if it completed). Skips the `pending_fiber_action`
+/// dance entirely.
+///
+/// Returns `None` if the target has no krio backing — caller falls
+/// back to the existing stackless path.
+///
+/// # Safety
+/// `target` is dereferenced; caller ensures it's a valid ObjFiber
+/// pointer (the caller already validated via `as_fiber`).
+#[cfg(feature = "host")]
+fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
+    let krio = unsafe { (*target).krio_fiber.as_mut() }?;
+    // Mark the target as the now-active fiber. The Wren-level
+    // caller is whoever invoked `target.call(_)`; we don't track
+    // it as a `caller` chain for krio fibers because suspension is
+    // a synchronous context switch — when the target yields, control
+    // returns to this very call site rather than to a separate
+    // `caller` fiber. The interpreter loop's caller-resumption
+    // machinery is unused on this path.
+    unsafe {
+        (*target).state = FiberState::Suspended; // running, but not New
+    }
+    let step = krio.resume_with::<u64>(input.to_bits());
+    let result = match step {
+        krio_fiber::FiberStep::Yielded => krio
+            .take_yield_any()
+            .and_then(|b| b.downcast::<u64>().ok())
+            .map(|b| Value::from_bits(*b))
+            .unwrap_or_else(Value::null),
+        krio_fiber::FiberStep::Done => {
+            unsafe {
+                (*target).state = FiberState::Done;
+            }
+            Value::null()
+        }
+        krio_fiber::FiberStep::Errored => {
+            unsafe {
+                (*target).state = FiberState::Error;
+            }
+            Value::null()
+        }
+    };
+    // Mark the fiber as suspended again if it yielded so a future
+    // `target.call(_)` resumes it. Done/Errored already set above.
+    if matches!(step, krio_fiber::FiberStep::Yielded) {
+        unsafe {
+            (*target).state = FiberState::Suspended;
+        }
+    }
+    Some(result)
+}
+
+#[cfg(not(feature = "host"))]
+fn try_krio_call(_target: *mut ObjFiber, _input: Value) -> Option<Value> {
+    None
 }
 
 // --- Instance methods ---
@@ -346,6 +440,9 @@ fn fiber_call_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             let state = unsafe { (*f).state };
             match state {
                 FiberState::New | FiberState::Suspended => {
+                    if let Some(v) = try_krio_call(f, Value::null()) {
+                        return v;
+                    }
                     ctx.set_fiber_action_call(f, Value::null());
                 }
                 FiberState::Done => {
@@ -370,6 +467,9 @@ fn fiber_call_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             let state = unsafe { (*f).state };
             match state {
                 FiberState::New | FiberState::Suspended => {
+                    if let Some(v) = try_krio_call(f, args[1]) {
+                        return v;
+                    }
                     ctx.set_fiber_action_call(f, args[1]);
                 }
                 FiberState::Done => {
