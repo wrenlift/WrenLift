@@ -1123,6 +1123,18 @@ pub struct ObjFiber {
     /// (BC interp, JIT, WASM), or anywhere the toggle is off.
     #[cfg(feature = "host")]
     pub krio_fiber: Option<Box<krio_fiber::Fiber>>,
+
+    /// Final return value of a krio-backed fiber's body. Written by
+    /// the krio body closure just before it returns; read by
+    /// `try_krio_call` on `FiberStep::Done` to surface the closure's
+    /// last-expression value as the return of `Fiber.call(_)`.
+    ///
+    /// Stays `Value::null()` for fibers without a krio backing.
+    /// Cleared (back to null) every time the host re-enters the
+    /// fiber, so a subsequent abnormal exit doesn't return a stale
+    /// value.
+    #[cfg(feature = "host")]
+    pub krio_return_value: Value,
 }
 
 /// One state-machine frame on `ObjFiber.aot_frames`. Holds the
@@ -1167,6 +1179,8 @@ impl ObjFiber {
             aot_active_depth: 0,
             #[cfg(feature = "host")]
             krio_fiber: None,
+            #[cfg(feature = "host")]
+            krio_return_value: Value::null(),
         }
     }
 
@@ -1374,6 +1388,28 @@ pub trait NativeContext {
     /// recorded at registration. `None` for isolated-test functions
     /// registered without a module binding.
     fn func_module(&self, func_id: u32) -> Option<std::rc::Rc<String>>;
+
+    // -- krio-fiber integration (off by default; see VM::krio_fiber_active) --
+    /// Raw pointer to the VM, for callers that need it from inside a
+    /// captured closure (e.g. the krio-fiber body that runs Wren code
+    /// on the fiber's stack). `*mut u8` rather than `*mut VM` to
+    /// avoid pulling the concrete VM type into the trait object's
+    /// vtable — callers cast it back to `*mut VM` themselves with the
+    /// usual unsafe contract (single-threaded, no aliasing while the
+    /// fiber runs).
+    ///
+    /// Returns null when the krio-fiber integration toggle is off,
+    /// so callers that always want the raw pointer can rely on this
+    /// as a feature gate AND a pointer at the same time.
+    fn krio_vm_raw_ptr(&mut self) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    /// `true` when `WLIFT_KRIO_FIBER` was set at VM construction.
+    /// `fiber_new` checks this to decide whether to allocate a
+    /// krio-fiber backing for the new fiber.
+    fn krio_fiber_active(&self) -> bool {
+        false
+    }
 
     // -- Module reload (for Hatch module) --
     /// Re-parse and re-install a previously loaded module, preserving

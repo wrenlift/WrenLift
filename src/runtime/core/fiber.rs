@@ -115,6 +115,29 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                 (*fiber).deadline_ms = parent_deadline;
             }
 
+            // krio-fiber backing: when WLIFT_KRIO_FIBER is on, attach
+            // a per-fiber mmap stack and a body closure that runs the
+            // Wren-level fiber body on that stack. Fiber.call drives
+            // krio.resume_with(input); Fiber.yield inside calls
+            // krio_fiber::yield_value to switch back synchronously.
+            // The fiber's mir_frames is already prepared above by
+            // setup_fiber_from_closure — the body just needs to point
+            // `vm.fiber` at us and run the existing interpreter loop.
+            #[cfg(feature = "host")]
+            if ctx.krio_fiber_active() {
+                let vm_ptr = ctx.krio_vm_raw_ptr();
+                if !vm_ptr.is_null() {
+                    let target_ptr_usize = fiber as usize;
+                    let vm_ptr_usize = vm_ptr as usize;
+                    let krio = krio_fiber::Fiber::new(move || {
+                        krio_fiber_body(vm_ptr_usize, target_ptr_usize);
+                    });
+                    unsafe {
+                        (*fiber).krio_fiber = Some(Box::new(krio));
+                    }
+                }
+            }
+
             // Populate the child's context map (allocates) only if parent
             // had entries. Keeps the zero-context case allocation-free.
             if !parent_ctx_entries.is_empty() {
@@ -404,10 +427,15 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             .map(|b| Value::from_bits(*b))
             .unwrap_or_else(Value::null),
         krio_fiber::FiberStep::Done => {
+            // The body stashed the closure's last-expression value
+            // into krio_return_value just before exiting; surface
+            // it as the return of this Fiber.call(_).
+            let v = unsafe { (*target).krio_return_value };
             unsafe {
                 (*target).state = FiberState::Done;
+                (*target).krio_return_value = Value::null();
             }
-            Value::null()
+            v
         }
         krio_fiber::FiberStep::Errored => {
             unsafe {
@@ -429,6 +457,82 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
 #[cfg(not(feature = "host"))]
 fn try_krio_call(_target: *mut ObjFiber, _input: Value) -> Option<Value> {
     None
+}
+
+/// Body of a krio-backed fiber. Runs on the fiber's per-fiber mmap
+/// stack the first time the host calls `resume_with` (the initial
+/// `Fiber.call(v)`); subsequent resumes re-enter via the saved
+/// context-switch point — they don't invoke this function again.
+///
+/// Captures the VM and target ObjFiber as `usize`s (rather than
+/// borrowed references) because:
+///   1. The closure is `'static + FnOnce()` per krio's API.
+///   2. The host's `&mut VM` aliasing rules permit re-entrance
+///      because the fiber's `resume_with` is synchronous — the
+///      host yields its borrow while the fiber runs.
+///
+/// # Safety
+/// `vm_ptr` must be a valid `*mut VM` for the lifetime of the
+/// fiber (the VM outlives every ObjFiber it allocates). `target_ptr`
+/// must be a valid `*mut ObjFiber` whose mir_frames were prepared
+/// by `setup_fiber_from_closure` before this body runs.
+#[cfg(feature = "host")]
+fn krio_fiber_body(vm_ptr_usize: usize, target_ptr_usize: usize) {
+    use crate::runtime::object::FiberState;
+    use crate::runtime::vm::VM;
+
+    let vm_ptr = vm_ptr_usize as *mut VM;
+    let target_ptr = target_ptr_usize as *mut ObjFiber;
+
+    // Pull the initial input the host passed via `resume_with`.
+    // For `Fiber.call(v)`, v is the closure's first argument; for
+    // `Fiber.call()` (no arg) it's null. We bind it into the
+    // closure's first arg slot before running the interpreter.
+    let initial_bits: u64 = krio_fiber::take_input::<u64>().unwrap_or(0);
+    let initial_val = Value::from_bits(initial_bits);
+
+    unsafe {
+        // Inject the initial input into the closure's first arg
+        // slot. The MIR frame was set up by setup_fiber_from_closure
+        // but its register file is empty; the interpreter will size
+        // it from the function's metadata on first dispatch. We
+        // stash the initial value on the stack instead, which the
+        // closure's entry sees as arg 0.
+        (*target_ptr).stack.clear();
+        (*target_ptr).stack.push(initial_val);
+        (*target_ptr).state = FiberState::Running;
+
+        // Swap the VM's active fiber to `target_ptr` so the
+        // interpreter loop runs the right body. The previous
+        // fiber's identity is preserved on the host stack (krio
+        // returns to the resume_with call site, which is in a
+        // foreign-method handler running on behalf of `prev`),
+        // so we restore it before returning.
+        let prev_fiber = (*vm_ptr).fiber;
+        (*vm_ptr).fiber = target_ptr;
+
+        // Run the fiber to completion on this physical stack. If
+        // the Wren body calls `Fiber.yield(_)`, try_krio_yield
+        // routes through krio_fiber::yield_value, which performs a
+        // synchronous context switch — control returns to the
+        // host's resume_with call site, and run_fiber pauses here.
+        // On the next resume_with, control re-enters the switch
+        // and run_fiber continues from inside the foreign-method
+        // dispatch frame.
+        //
+        // When the Wren body returns naturally (no more yields),
+        // run_fiber returns. The Ok value is the closure's last-
+        // expression value, which Wren surfaces as the return of
+        // the final `Fiber.call(_)`. Stash it on the ObjFiber so
+        // try_krio_call can return it after the body exits.
+        let result = crate::runtime::vm_interp::run_fiber(&mut *vm_ptr);
+        (*target_ptr).krio_return_value = result.unwrap_or(Value::null());
+
+        (*vm_ptr).fiber = prev_fiber;
+        if (*target_ptr).state == FiberState::Running {
+            (*target_ptr).state = FiberState::Done;
+        }
+    }
 }
 
 // --- Instance methods ---

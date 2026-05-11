@@ -3454,6 +3454,19 @@ impl NativeContext for VM {
         self.fiber
     }
 
+    #[cfg(feature = "host")]
+    fn krio_vm_raw_ptr(&mut self) -> *mut u8 {
+        if self.krio_fiber_active {
+            self as *mut VM as *mut u8
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+    #[cfg(feature = "host")]
+    fn krio_fiber_active(&self) -> bool {
+        self.krio_fiber_active
+    }
+
     fn fiber_stack_traces_enabled(&self) -> bool {
         self.config.fiber_stack_traces
     }

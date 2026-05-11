@@ -990,6 +990,17 @@ fn aot_direct_yield_method_names() -> &'static [&'static str] {
 /// set is tainted, and any function calling a tainted-named
 /// method is itself tainted.
 pub fn compute_aot_tainted_method_names(modules: &[AotModule]) -> HashSet<String> {
+    // Under the krio-fiber AOT integration (WLIFT_KRIO_FIBER), every
+    // fiber body compiles as plain native code that runs on a
+    // per-fiber mmap stack; suspension is a context switch via
+    // `krio_fiber::yield_value` rather than the stackless
+    // state-machine transform. Returning an empty taint set
+    // short-circuits the SM-transform path at every call site
+    // that consults it (`is_state_machine = tainted_names.contains(...)`
+    // resolves to false uniformly).
+    if std::env::var_os("WLIFT_KRIO_FIBER").is_some_and(|v| v != "0" && !v.is_empty()) {
+        return HashSet::new();
+    }
     let mut tainted: HashSet<String> = aot_direct_yield_method_names()
         .iter()
         .map(|s| (*s).to_string())
