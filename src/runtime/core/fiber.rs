@@ -473,25 +473,26 @@ fn try_krio_yield(_value: Value) -> Option<Value> {
 /// `target` is dereferenced; caller ensures it's a valid ObjFiber
 /// pointer (the caller already validated via `as_fiber`).
 #[cfg(feature = "host")]
+/// Public wrapper around `try_krio_call` so the AOT/JIT fiber-action
+/// helper in `runtime_fns::handle_jit_fiber_action` can route fresh-
+/// fiber Calls through krio without duplicating its body.
+#[cfg(feature = "host")]
+pub fn try_krio_call_pub(target: *mut ObjFiber, input: Value) -> Option<Value> {
+    try_krio_call(target, input)
+}
+
+/// True when this VM was constructed with krio backings active.
+#[cfg(feature = "host")]
+pub fn current_vm_krio_active(vm: &crate::runtime::vm::VM) -> bool {
+    vm.krio_fiber_active
+}
+
 fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // Establish that target has a krio backing before we start
     // doing any save/restore work. Early-return None lets the
     // caller fall back to the stackless path.
     if unsafe { (*target).krio_fiber.is_none() } {
         return None;
-    }
-    // Suspended-only routing wrinkle: when a fiber's first `.try()`
-    // went through the stackless path (set_fiber_action_call), its
-    // krio body never entered. Wren-side it's now `Suspended` with
-    // BC-resumable mir_frames; krio-side the body is still `New` and
-    // would start from scratch — losing the suspended BC state and
-    // re-running the closure. Detect this mismatch and fall back to
-    // the stackless path so the BC interp's resume path stays whole.
-    {
-        let krio_ref = unsafe { (*target).krio_fiber.as_deref() }.unwrap();
-        if matches!(krio_ref.state(), krio_fiber::FiberState::New) {
-            return None;
-        }
     }
 
     // Save the caller's JIT roots and install this fiber's saved
@@ -883,14 +884,16 @@ fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             match state {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
-                    // Suspended-only routing through krio. Full
-                    // routing for fresh fibers regresses buffers /
-                    // window / zip and breaks site boot — needs
-                    // further design work (see plan memo).
-                    if matches!(state, FiberState::Suspended) {
-                        if let Some(v) = try_krio_call(f, Value::null()) {
-                            return v;
-                        }
+                    // Full krio routing for both fresh and suspended
+                    // fibers. Required on AOT: handle_jit_fiber_action's
+                    // Yield arm is a no-op (the Mechanism B leak), so
+                    // any fiber whose body calls Fiber.yield needs the
+                    // krio context-switch to actually suspend. Falling
+                    // through to set_fiber_action_call on a New fiber
+                    // runs the body on the main stack and yields are
+                    // silently dropped.
+                    if let Some(v) = try_krio_call(f, Value::null()) {
+                        return v;
                     }
                     ctx.set_fiber_action_call(f, Value::null());
                 }
@@ -917,10 +920,8 @@ fn fiber_try_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             match state {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
-                    if matches!(state, FiberState::Suspended) {
-                        if let Some(v) = try_krio_call(f, args[1]) {
-                            return v;
-                        }
+                    if let Some(v) = try_krio_call(f, args[1]) {
+                        return v;
                     }
                     ctx.set_fiber_action_call(f, args[1]);
                 }

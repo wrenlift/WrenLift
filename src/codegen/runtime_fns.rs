@@ -2294,6 +2294,33 @@ fn handle_jit_fiber_action(
                 }
             }
 
+            // krio fast path. AOT-compiled `fiber.try() / .call()`
+            // sites bypass the `fiber_try_*` / `fiber_call_*` foreign
+            // methods entirely and emit a direct call to this helper —
+            // so the krio routing that lives in those foreign methods
+            // never runs for AOT'd bodies. Without it, the body
+            // executes on the host stack via `run_fiber` below, and
+            // any `Fiber.yield` inside it falls through to the Yield
+            // arm of this same function (which historically returned
+            // the value without suspending — the Mechanism B leak).
+            // Routing through krio here lets the body run on its own
+            // mmap stack so yield can context-switch back.
+            #[cfg(feature = "host")]
+            {
+                if is_call
+                    && unsafe { (*target).krio_fiber.is_some() }
+                    && crate::runtime::core::fiber::current_vm_krio_active(vm)
+                {
+                    if let Some(v) =
+                        crate::runtime::core::fiber::try_krio_call_pub(target, value)
+                    {
+                        set_jit_context(saved_jit_ctx);
+                        set_jit_depth(saved_jit_depth);
+                        return v.to_bits();
+                    }
+                }
+            }
+
             // AOT state-machine path. The target fiber's body
             // FuncId is registered with `aot_state_machine[id] =
             // true` when its closure was lowered as a stackless

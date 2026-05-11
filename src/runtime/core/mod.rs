@@ -5,7 +5,7 @@
 // Pure-Rust core modules — always available, wasm and native alike.
 mod bool;
 mod cls;
-mod fiber;
+pub mod fiber;
 mod fn_obj;
 pub mod hatch;
 pub mod io;
