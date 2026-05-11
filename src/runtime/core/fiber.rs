@@ -536,7 +536,31 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             // The body stashed the closure's last-expression value
             // into krio_return_value just before exiting; surface
             // it as the return of this Fiber.call(_).
-            let v = unsafe { (*target).krio_return_value };
+            //
+            // Try-fiber abort path: when the body called
+            // Fiber.abort or hit a runtime error, vm_interp.rs's
+            // try-handling (line ~2418) parked the message on
+            // `(*fiber).error` and returned `Ok(err_val)` from
+            // run_fiber. The krio body forwards that into
+            // `krio_return_value`, so the normal `stored` read
+            // picks it up. The `(*target).error` fallback covers
+            // the case where the body aborted but the err value
+            // didn't propagate through run_fiber's Result (e.g.
+            // an error path that returned `Ok(Value::null())` or
+            // `Err` with the message parked elsewhere) — Wren
+            // callers expect `f.try()` to return the same string
+            // they see in `f.error`.
+            let stored = unsafe { (*target).krio_return_value };
+            let v = if stored.is_null() {
+                let err = unsafe { (*target).error };
+                if !err.is_null() {
+                    err
+                } else {
+                    stored
+                }
+            } else {
+                stored
+            };
             unsafe {
                 (*target).state = FiberState::Done;
                 (*target).krio_return_value = Value::null();
@@ -811,16 +835,16 @@ fn fiber_try_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
             match state {
                 FiberState::New | FiberState::Suspended => {
                     unsafe { (*f).is_try = true };
-                    // Suspended-only routing through krio. A
+                    // Suspended-only routing through krio: a
                     // suspended krio-backed fiber's continuation
                     // lives on the mmap stack and the stackless
-                    // path can't drive it. New fibers fall through
-                    // to set_fiber_action_call so the existing
-                    // is_try / resume_caller plumbing handles them
-                    // — extending krio coverage to New broke many
-                    // specs and isn't necessary for the current
-                    // failing tests (which only have Suspended-state
-                    // try() calls on already-yielded fibers).
+                    // path can't drive it. Fresh fibers fall
+                    // through to set_fiber_action_call where the
+                    // existing has_error / is_try / resume_caller
+                    // plumbing handles them — extending krio
+                    // coverage to New regresses buffers / window /
+                    // zip in subtle ways (silent test runner
+                    // bailout) that need more investigation.
                     if matches!(state, FiberState::Suspended) {
                         if let Some(v) = try_krio_call(f, Value::null()) {
                             return v;
