@@ -1354,6 +1354,11 @@ pub trait NativeContext {
 
     // -- Fiber operations --
     fn alloc_fiber(&mut self) -> *mut ObjFiber;
+    /// Charge off-heap bytes (e.g. a krio fiber's mmap stack) against
+    /// the GC's collection-trigger pressure. The Wren heap arena is
+    /// tiny relative to a 1 MiB krio stack, so `should_collect`'s
+    /// nursery accounting misses them entirely without this hook.
+    fn track_external_alloc(&mut self, bytes: usize);
     fn get_fiber_class(&self) -> *mut ObjClass;
     fn get_fn_class(&self) -> *mut ObjClass;
     fn set_fiber_action_call(&mut self, target: *mut ObjFiber, value: Value);

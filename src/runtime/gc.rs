@@ -300,6 +300,16 @@ pub struct Gc {
     minor_since_major: u32,
     config: GcConfig,
 
+    /// Bytes allocated outside the Wren heap (krio fiber stacks,
+    /// foreign-backed buffers, etc.) since the last collection.
+    /// `should_collect` treats this as nursery pressure so heavy
+    /// off-heap allocators trigger GC at a rate proportional to
+    /// their actual memory cost, not just their tiny in-arena
+    /// header. Reset to zero after every collection — the GC sweep
+    /// drops the underlying Boxes, so what survives is whatever
+    /// the next batch of allocations rebuilds.
+    external_bytes_since_gc: usize,
+
     pub stats: GcStats,
 }
 
@@ -328,8 +338,19 @@ impl Gc {
             gc_threshold: threshold,
             minor_since_major: 0,
             config,
+            external_bytes_since_gc: 0,
             stats: GcStats::default(),
         }
+    }
+
+    /// Track memory allocated outside the Wren heap. Used by the
+    /// `Fiber.new` foreign method to charge krio mmap stacks
+    /// against `should_collect`'s pressure check — without this the
+    /// GC's nursery accounting only sees the tiny ObjFiber header
+    /// (~hundreds of bytes) and never triggers, while each fiber's
+    /// 1 MiB stack accumulates unbounded.
+    pub fn track_external(&mut self, bytes: usize) {
+        self.external_bytes_since_gc = self.external_bytes_since_gc.saturating_add(bytes);
     }
 
     pub fn object_count(&self) -> usize {
@@ -389,9 +410,21 @@ impl Gc {
         // big enough that allocation-heavy benchmarks (binary_trees)
         // still amortise GC across a meaningful chunk of work.
         const NURSERY_BYTE_CEILING: usize = 64 * 1024 * 1024;
+        // Off-heap memory threshold. Krio fiber stacks dominate this
+        // axis under AOT (1 MiB per fiber by default); without an
+        // external-bytes check the nursery accounting never sees them
+        // and an idle web server's RSS climbs unbounded per request.
+        // 128 MiB caps RSS growth at ~128 fiber-equivalents between
+        // collections — high enough that the test runner's per-test
+        // fiber churn doesn't trip a GC mid-spec (which exposes the
+        // Pass-3 stack-walk fragility documented in the integration
+        // plan), low enough to bound steady-state web traffic at
+        // hundreds of MB rather than gigabytes.
+        const EXTERNAL_BYTE_CEILING: usize = 128 * 1024 * 1024;
         let nursery_used = self.nursery.used();
         nursery_used > self.nursery.capacity() * 3 / 4
             || nursery_used > NURSERY_BYTE_CEILING
+            || self.external_bytes_since_gc > EXTERNAL_BYTE_CEILING
             || self.old_count >= self.gc_threshold
     }
 
@@ -748,6 +781,11 @@ impl Gc {
         } else {
             self.collect_minor(roots);
         }
+        // Off-heap charge resets every cycle. The sweep dropped any
+        // unreachable ObjFibers, which munmaps their krio stacks via
+        // the Box destructor; what survives gets re-charged the next
+        // time fresh fibers are allocated.
+        self.external_bytes_since_gc = 0;
         self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
     }
 

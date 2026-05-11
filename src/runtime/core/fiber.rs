@@ -148,6 +148,12 @@ fn fiber_new(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                     unsafe {
                         (*fiber).krio_fiber = Some(Box::new(krio));
                     }
+                    // Charge the krio mmap stack against GC pressure.
+                    // Without this the Wren heap accounting only sees
+                    // the few-hundred-byte ObjFiber header and never
+                    // triggers a collection, while each fiber's stack
+                    // accumulates 1 MiB of resident memory per request.
+                    ctx.track_external_alloc(stack_bytes);
                     // GC Pass 3 enumerates krio-backed fibers via
                     // GcImpl::for_each_fiber at scan time, so no
                     // per-fiber registration is needed here.

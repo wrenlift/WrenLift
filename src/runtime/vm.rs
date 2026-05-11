@@ -3578,6 +3578,10 @@ impl NativeContext for VM {
         self.gc.alloc_fiber()
     }
 
+    fn track_external_alloc(&mut self, bytes: usize) {
+        self.gc.track_external(bytes);
+    }
+
     fn get_fiber_class(&self) -> *mut ObjClass {
         self.fiber_class
     }

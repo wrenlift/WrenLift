@@ -191,6 +191,17 @@ impl GcImpl {
     pub fn should_collect(&self) -> bool {
         gc_dispatch!(self, should_collect)
     }
+    /// Charge off-heap bytes against the generational GC's pressure
+    /// counter. No-op on arena / mark-sweep backends — they don't
+    /// have a separate nursery threshold to push against. Used by
+    /// the `Fiber.new` foreign method so krio mmap stacks actually
+    /// drive `should_collect`.
+    #[inline(always)]
+    pub fn track_external(&mut self, bytes: usize) {
+        if let GcImpl::Generational(gc) = self {
+            gc.track_external(bytes);
+        }
+    }
     #[inline(always)]
     pub fn stats(&self) -> &GcStats {
         gc_dispatch!(self, stats)
