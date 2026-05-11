@@ -2157,6 +2157,93 @@ pub unsafe extern "C" fn wlift_aot_exit(saved: *const u64) {
     set_jit_context(prev);
 }
 
+/// Invoke an AOT-compiled module top-level body inside a krio
+/// fiber, so any `Fiber.yield` reached from inside the body (or any
+/// fiber spawned by it) routes through `try_krio_yield` instead of
+/// leaking into Mechanism B.
+///
+/// Under `WLIFT_KRIO_FIBER=1`, the AOT bootstrap calls this helper
+/// per module body. When the toggle is off, falls through to a
+/// direct function-pointer call so behavior is unchanged from the
+/// pre-krio path.
+///
+/// The body's natural completion returns control to the bootstrap.
+/// Yields (e.g. a spawned per-connection fiber suspending in its
+/// poll loop) cause control to bounce back to here; the helper
+/// resumes immediately so the spawned fiber's polling loop
+/// continues. CPU-burn during long-idle periods is mitigated by
+/// the existing `Clock.sleepMs(1)` backoffs in @hatch:web's listen
+/// loop, which actually call `std::thread::sleep` (not a yield).
+///
+/// # Safety
+/// `fn_ptr` must be a valid pointer to an AOT-emitted top-level
+/// function with signature `extern "C" fn() -> u64`. The bootstrap
+/// guarantees this by emitting the call against the module's
+/// declared function.
+#[cfg(all(feature = "aot", feature = "host"))]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_invoke_module_body(fn_ptr: *const u8) -> u64 {
+    if fn_ptr.is_null() {
+        return crate::runtime::value::Value::null().to_bits();
+    }
+    // Fast path: when krio-fiber is off, the wrapping has no
+    // semantic effect — just call directly. Avoids the mmap + asm
+    // switch cost on the hot AOT path.
+    let active = std::env::var_os("WLIFT_KRIO_FIBER")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    if !active {
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(fn_ptr) };
+        return f();
+    }
+
+    // Top-level krio fiber. Use a larger stack than the default
+    // 64KB — module top-levels build out class graphs, constant
+    // pools, route registries, etc. before reaching app.listen,
+    // and a 64KB ceiling has tripped on the larger hatch apps.
+    let fn_ptr_usize = fn_ptr as usize;
+    const TOP_LEVEL_STACK_BYTES: usize = 1024 * 1024;
+    let mut fiber = krio_fiber::Fiber::with_stack_size(TOP_LEVEL_STACK_BYTES, move || {
+        // SAFETY: the bootstrap guarantees fn_ptr is a valid
+        // top-level fn ptr that returns a Wren-Value-shaped u64.
+        let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(fn_ptr_usize) };
+        let _ = f();
+    });
+    // Drive until the body returns. Yields from inside (typically
+    // from spawned fibers' read polling) bounce back to here; we
+    // resume immediately. The body's own backoff sleeps via
+    // Clock.sleepMs use std::thread::sleep, which doesn't yield,
+    // so this loop only ticks when there's productive work.
+    loop {
+        let step = fiber.resume();
+        match step {
+            krio_fiber::FiberStep::Yielded => continue,
+            krio_fiber::FiberStep::Done => break,
+            krio_fiber::FiberStep::Errored => {
+                if let Some(payload) = fiber.take_error() {
+                    // Re-panic on the host side so the existing
+                    // error reporting paths fire. Without this the
+                    // panic message is silently dropped at the
+                    // krio trampoline.
+                    std::panic::resume_unwind(payload);
+                }
+                break;
+            }
+        }
+    }
+    crate::runtime::value::Value::null().to_bits()
+}
+
+#[cfg(all(feature = "aot", not(feature = "host")))]
+#[no_mangle]
+pub unsafe extern "C" fn wlift_aot_invoke_module_body(fn_ptr: *const u8) -> u64 {
+    if fn_ptr.is_null() {
+        return crate::runtime::value::Value::null().to_bits();
+    }
+    let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(fn_ptr) };
+    f()
+}
+
 // ---------------------------------------------------------------------------
 // Call handles
 // ---------------------------------------------------------------------------

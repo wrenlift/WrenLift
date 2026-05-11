@@ -2593,6 +2593,20 @@ fn emit_aot_bootstrap_main(
         None,
     )?;
     let exit_ctx = declare_import(module, "wlift_aot_exit", &[ptr_ty], None)?;
+    // Module body invocation indirection: under WLIFT_KRIO_FIBER=1
+    // this helper wraps the per-module top-level call in a krio
+    // fiber so Fiber.yield from inside the body (or fibers spawned
+    // by it) routes through krio::yield_value instead of leaking
+    // into Mechanism B (vm_interp's handle_jit_fiber_action Yield
+    // arm, which can't unwind an AOT body). With the toggle off,
+    // the helper short-circuits to a direct fn-pointer call so the
+    // hot-path overhead is one branch.
+    let invoke_module_body = declare_import(
+        module,
+        "wlift_aot_invoke_module_body",
+        &[ptr_ty],
+        Some(types::I64),
+    )?;
 
     // Emit per-module name + per-const text byte arrays as Data
     // symbols. Each gets a trailing 0 so it's also valid as a
@@ -3113,6 +3127,7 @@ fn emit_aot_bootstrap_main(
         let install_native_lib_ref = module.declare_func_in_func(install_native_lib, builder.func);
         let enter_ref = module.declare_func_in_func(enter_ctx, builder.func);
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
+        let invoke_module_body_ref = module.declare_func_in_func(invoke_module_body, builder.func);
 
         // entry: vm = wrenNewVM(NULL); brif vm == 0 → err else body.
         builder.switch_to_block(entry_block);
@@ -3472,8 +3487,15 @@ fn emit_aot_bootstrap_main(
                 ],
             );
 
-            let fn_ref = module.declare_func_in_func(m.fn_id, builder.func);
-            let _ = builder.ins().call(fn_ref, &[]);
+            // Resolve the module-body function pointer and hand it
+            // to the krio-aware invoker. The helper either calls
+            // through directly (toggle off) or wraps the call in a
+            // top-level krio fiber so Fiber.yield from inside
+            // unwinds correctly. Without this indirection, top-level
+            // yields hit Mechanism B and the body hot-spins.
+            let fn_ref_for_addr = module.declare_func_in_func(m.fn_id, builder.func);
+            let fn_addr = builder.ins().func_addr(ptr_ty, fn_ref_for_addr);
+            let _ = builder.ins().call(invoke_module_body_ref, &[fn_addr]);
 
             let _ = builder.ins().call(exit_ref, &[saved_addr]);
         }
