@@ -882,9 +882,62 @@ impl Gc {
         //    so they survive. sweep_old resets marks for surviving objects.
         self.sweep_old();
 
+        // 4. Release old-arena chunks that no surviving object lives in.
+        //    Without this the bump allocator's `Vec<Vec<u8>>` grows
+        //    monotonically — each request promotes some short-lived
+        //    objects into old gen, sweep runs Drop on them, but the
+        //    underlying chunk bytes stay allocated. After hundreds
+        //    of /api hits on the hatch site, the arena holds hundreds
+        //    of MB of zeroed slots.
+        self.release_empty_old_chunks();
+
         self.stats.major_collections += 1;
         self.minor_since_major = 0;
         self.adjust_threshold();
+    }
+
+    /// Free `OldArena` chunks that hold no surviving objects. Called
+    /// after `sweep_old`. Always preserves the last chunk so the
+    /// bump-allocator's `alloc_ptr` stays valid; future allocations
+    /// detect the full last chunk and push a fresh one as usual.
+    fn release_empty_old_chunks(&mut self) {
+        let n_chunks = self.old_arena.chunks.len();
+        if n_chunks <= 1 {
+            return;
+        }
+        let mut live = vec![false; n_chunks];
+        // Mark every chunk that contains a surviving object header.
+        let mut current = self.old_objects;
+        while !current.is_null() {
+            let addr = current as usize;
+            for (i, chunk) in self.old_arena.chunks.iter().enumerate() {
+                let start = chunk.as_ptr() as usize;
+                let end = start + chunk.len();
+                if addr >= start && addr < end {
+                    live[i] = true;
+                    break;
+                }
+            }
+            current = unsafe { (*current).next };
+        }
+        // Keep the last chunk regardless — `alloc_ptr` is relative
+        // to it and dropping it would force a special-case reset.
+        // The next major GC will reclaim it if it stays empty.
+        live[n_chunks - 1] = true;
+        // Filter in-place. `Vec::drain(..)` runs `Vec<u8>::drop` on
+        // unreleased chunks, freeing the underlying buffer to the
+        // system allocator.
+        let mut new_chunks = Vec::with_capacity(n_chunks);
+        let mut freed_bytes = 0;
+        for (i, chunk) in self.old_arena.chunks.drain(..).enumerate() {
+            if live[i] {
+                new_chunks.push(chunk);
+            } else {
+                freed_bytes += chunk.capacity();
+            }
+        }
+        self.old_arena.chunks = new_chunks;
+        self.stats.total_freed = self.stats.total_freed.saturating_add(freed_bytes);
     }
 
     fn adjust_threshold(&mut self) {
