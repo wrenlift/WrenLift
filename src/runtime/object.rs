@@ -1135,6 +1135,21 @@ pub struct ObjFiber {
     /// value.
     #[cfg(feature = "host")]
     pub krio_return_value: Value,
+
+    /// Saved JIT_ROOTS_STORE contents for this fiber while it's
+    /// suspended. AOT-compiled code pushes/pops Values into a
+    /// thread-local roots store at every alloc / call site so the
+    /// GC can scan them; under krio that store has to be swapped
+    /// in/out at every context switch because two fibers running
+    /// on the same thread would otherwise scribble on each other's
+    /// roots and the indices read by `wren_jit_root_at` would
+    /// resolve into the wrong fiber's slots.
+    ///
+    /// Empty Vec means "fiber has no live roots" — equivalent to
+    /// installing an empty roots store on resume. Re-snapshotted
+    /// every time the fiber yields.
+    #[cfg(feature = "host")]
+    pub krio_jit_roots: Vec<Value>,
 }
 
 /// One state-machine frame on `ObjFiber.aot_frames`. Holds the
@@ -1181,6 +1196,8 @@ impl ObjFiber {
             krio_fiber: None,
             #[cfg(feature = "host")]
             krio_return_value: Value::null(),
+            #[cfg(feature = "host")]
+            krio_jit_roots: Vec::new(),
         }
     }
 

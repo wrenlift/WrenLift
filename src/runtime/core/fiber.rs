@@ -380,14 +380,42 @@ fn fiber_yield_1(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 /// per-ObjFiber, not global).
 #[cfg(feature = "host")]
 fn try_krio_yield(value: Value) -> Option<Value> {
-    if krio_fiber::current_fiber_id().is_none() {
-        return None;
-    }
+    let current_id = krio_fiber::current_fiber_id()?;
+    let _ = current_id;
+    // Save the fiber's JIT roots and clear the thread-local store
+    // before switching back to the host. The matching restore on
+    // the next resume reinstalls them. Mirrors try_krio_call's
+    // host-side save/restore — the two halves form the pair that
+    // keeps each fiber's roots disjoint from the host's and from
+    // sibling fibers' on the same thread.
+    let fiber_roots = crate::codegen::runtime_fns::take_jit_roots();
+    // We can't directly identify the active ObjFiber from here
+    // (current_fiber_id is krio's, not ours), so stash the roots
+    // in a thread-local handoff slot that the host's try_krio_call
+    // drains after resume_with returns.
+    KRIO_YIELD_ROOTS_HANDOFF.with(|cell| cell.replace(fiber_roots));
+
     // Pump the yield value to the host via krio's untyped slot, then
     // suspend. On resume the host calls `resume_with::<u64>(bits)`
     // with the value the next `Fiber.call(v)` passed in.
     let received: Option<u64> = krio_fiber::yield_value(value.to_bits());
+
+    // Back on the fiber stack — host has reinstalled this fiber's
+    // saved roots into JIT_ROOTS_STORE before resuming us.
     Some(received.map(Value::from_bits).unwrap_or_else(Value::null))
+}
+
+/// Thread-local handoff: the fiber-side `try_krio_yield` stashes
+/// its drained roots here; the host-side `try_krio_call` picks
+/// them up and parks them on the ObjFiber after `resume_with`
+/// returns. Necessary because the fiber doesn't know which
+/// ObjFiber it belongs to (krio's id is internal), and even if it
+/// did, mutating `*mut ObjFiber` from inside the fiber while the
+/// host holds `&mut self` would be UB.
+#[cfg(feature = "host")]
+thread_local! {
+    static KRIO_YIELD_ROOTS_HANDOFF: std::cell::RefCell<Vec<Value>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(not(feature = "host"))]
@@ -408,24 +436,64 @@ fn try_krio_yield(_value: Value) -> Option<Value> {
 /// pointer (the caller already validated via `as_fiber`).
 #[cfg(feature = "host")]
 fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
-    let krio = unsafe { (*target).krio_fiber.as_mut() }?;
-    // Mark the target as the now-active fiber. The Wren-level
-    // caller is whoever invoked `target.call(_)`; we don't track
-    // it as a `caller` chain for krio fibers because suspension is
-    // a synchronous context switch — when the target yields, control
-    // returns to this very call site rather than to a separate
-    // `caller` fiber. The interpreter loop's caller-resumption
-    // machinery is unused on this path.
+    // Establish that target has a krio backing before we start
+    // doing any save/restore work. Early-return None lets the
+    // caller fall back to the stackless path.
+    if unsafe { (*target).krio_fiber.is_none() } {
+        return None;
+    }
+
+    // Save the caller's JIT roots and install this fiber's saved
+    // roots (or an empty Vec if first call). The thread-local
+    // JIT_ROOTS_STORE is shared across fibers on the same thread;
+    // without this swap, the fiber's AOT-compiled body would index
+    // into the host's roots and read off the end of the array.
+    let host_roots = crate::codegen::runtime_fns::take_jit_roots();
+    let fiber_roots = std::mem::take(unsafe { &mut (*target).krio_jit_roots });
+    crate::codegen::runtime_fns::set_jit_roots(fiber_roots);
+
     unsafe {
         (*target).state = FiberState::Suspended; // running, but not New
     }
-    let step = krio.resume_with::<u64>(input.to_bits());
+    // SAFETY of the raw split: `krio` is reborrowed mutably from
+    // `target`'s field. The fiber's body inside `resume_with` may
+    // freely interact with the rest of `*target` and the VM via
+    // raw pointers — the host's borrow ends at the resume_with
+    // call boundary because the body's first statement is a
+    // context switch onto the fiber's stack.
+    let krio_ptr: *mut krio_fiber::Fiber = unsafe { (*target).krio_fiber.as_deref_mut().unwrap() };
+    let step = unsafe { (*krio_ptr).resume_with::<u64>(input.to_bits()) };
+
+    // Drain the fiber's roots: if it yielded, the fiber-side
+    // `try_krio_yield` stashed them into the handoff thread-local
+    // just before suspending; if it returned naturally, the
+    // body emptied JIT_ROOTS_STORE on exit (or it's still got
+    // whatever leaked into it, which we collect for the next
+    // re-entry).
+    let saved_fiber_roots = if matches!(step, krio_fiber::FiberStep::Yielded) {
+        KRIO_YIELD_ROOTS_HANDOFF.with(|cell| cell.replace(Vec::new()))
+    } else {
+        crate::codegen::runtime_fns::take_jit_roots()
+    };
+    unsafe {
+        (*target).krio_jit_roots = saved_fiber_roots;
+    }
+    // Reinstall the host's roots.
+    crate::codegen::runtime_fns::set_jit_roots(host_roots);
+
     let result = match step {
-        krio_fiber::FiberStep::Yielded => krio
-            .take_yield_any()
-            .and_then(|b| b.downcast::<u64>().ok())
-            .map(|b| Value::from_bits(*b))
-            .unwrap_or_else(Value::null),
+        krio_fiber::FiberStep::Yielded => {
+            let krio = unsafe { &mut *krio_ptr };
+            let v = krio
+                .take_yield_any()
+                .and_then(|b| b.downcast::<u64>().ok())
+                .map(|b| Value::from_bits(*b))
+                .unwrap_or_else(Value::null);
+            unsafe {
+                (*target).state = FiberState::Suspended;
+            }
+            v
+        }
         krio_fiber::FiberStep::Done => {
             // The body stashed the closure's last-expression value
             // into krio_return_value just before exiting; surface
@@ -444,13 +512,6 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             Value::null()
         }
     };
-    // Mark the fiber as suspended again if it yielded so a future
-    // `target.call(_)` resumes it. Done/Errored already set above.
-    if matches!(step, krio_fiber::FiberStep::Yielded) {
-        unsafe {
-            (*target).state = FiberState::Suspended;
-        }
-    }
     Some(result)
 }
 
