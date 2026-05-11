@@ -307,6 +307,16 @@ pub struct VM {
     /// Flag set by System.gc() — actual collection happens at next safepoint.
     pub gc_requested: bool,
 
+    /// Use krio-fiber stackful coroutines as the AOT fiber backing
+    /// instead of the SM-transform-based stackless approach. Read
+    /// once at VM construction from `WLIFT_KRIO_FIBER` env var so
+    /// hot-path checks are a plain bool field. Off by default; the
+    /// existing stackless path remains the supported default until
+    /// the integration is validated against the full spec audit.
+    /// See `project_krio_fiber_integration_plan.md`.
+    #[cfg(feature = "host")]
+    pub krio_fiber_active: bool,
+
     /// Pool of reusable register files to avoid per-call heap allocation.
     pub register_pool: Vec<Vec<Value>>,
 
@@ -475,6 +485,10 @@ impl VM {
             last_error: None,
             loading_modules: HashSet::new(),
             gc_requested: false,
+            #[cfg(feature = "host")]
+            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
+                .map(|v| v != "0" && v != "")
+                .unwrap_or(false),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
