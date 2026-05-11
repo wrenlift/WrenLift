@@ -1359,6 +1359,13 @@ pub trait NativeContext {
     /// tiny relative to a 1 MiB krio stack, so `should_collect`'s
     /// nursery accounting misses them entirely without this hook.
     fn track_external_alloc(&mut self, bytes: usize);
+    /// Foreign-method-side safepoint: if the GC's `should_collect`
+    /// trips, run a collection now. Useful for idle-prone foreign
+    /// methods (`Time.sleep`, `Fiber.yield`) that would otherwise
+    /// gate the runtime against ever firing a GC during a quiescent
+    /// AOT accept loop (no Wren-side allocations → no `finish_alloc`
+    /// safepoint → no GC check).
+    fn poll_gc(&mut self);
     fn get_fiber_class(&self) -> *mut ObjClass;
     fn get_fn_class(&self) -> *mut ObjClass;
     fn set_fiber_action_call(&mut self, target: *mut ObjFiber, value: Value);

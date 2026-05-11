@@ -310,6 +310,14 @@ pub struct Gc {
     /// the next batch of allocations rebuilds.
     external_bytes_since_gc: usize,
 
+    /// Wall-clock instant of the last completed major collection.
+    /// Used by `should_collect` to escalate to a major after a
+    /// trickle of light allocations (favicon polls, prefetch hits)
+    /// has had enough time to add up — the external-bytes ceiling
+    /// alone would let a real browser's drip-feed of requests sit
+    /// between collections for minutes.
+    last_major_collect_at: crate::portable_time::Instant,
+
     pub stats: GcStats,
 }
 
@@ -339,6 +347,7 @@ impl Gc {
             minor_since_major: 0,
             config,
             external_bytes_since_gc: 0,
+            last_major_collect_at: crate::portable_time::Instant::now(),
             stats: GcStats::default(),
         }
     }
@@ -421,11 +430,23 @@ impl Gc {
         // plan), low enough to bound steady-state web traffic at
         // hundreds of MB rather than gigabytes.
         const EXTERNAL_BYTE_CEILING: usize = 128 * 1024 * 1024;
+        // Wall-clock heartbeat. A real browser drip-feeds requests
+        // (favicon, prefetch, dev tools) at a rate where neither
+        // nursery nor external thresholds trip for minutes, so the
+        // arena's dead chunks never get released. Once the gap from
+        // the last major hits 30 s AND we've allocated anything off-
+        // heap since, force a major so steady-state RSS tracks the
+        // working set, not the high-water mark.
+        const MAJOR_INTERVAL_NS: u64 = 30 * 1_000_000_000;
         let nursery_used = self.nursery.used();
+        let time_since_major_ns = self.last_major_collect_at.elapsed().as_nanos() as u64;
+        let time_triggered = time_since_major_ns > MAJOR_INTERVAL_NS
+            && (self.external_bytes_since_gc > 0 || nursery_used > 0);
         nursery_used > self.nursery.capacity() * 3 / 4
             || nursery_used > NURSERY_BYTE_CEILING
             || self.external_bytes_since_gc > EXTERNAL_BYTE_CEILING
             || self.old_count >= self.gc_threshold
+            || time_triggered
     }
 
     /// Debug: validate that every old→young reference has a corresponding
@@ -893,6 +914,7 @@ impl Gc {
 
         self.stats.major_collections += 1;
         self.minor_since_major = 0;
+        self.last_major_collect_at = crate::portable_time::Instant::now();
         self.adjust_threshold();
     }
 

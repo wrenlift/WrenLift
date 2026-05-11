@@ -3582,6 +3582,14 @@ impl NativeContext for VM {
         self.gc.track_external(bytes);
     }
 
+    fn poll_gc(&mut self) {
+        if self.gc.should_collect() {
+            self.collect_garbage();
+            self.method_cache.invalidate();
+            self.engine.invalidate_inline_caches();
+        }
+    }
+
     fn get_fiber_class(&self) -> *mut ObjClass {
         self.fiber_class
     }
