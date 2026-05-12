@@ -168,16 +168,33 @@ impl ClassPool {
         self.free = first_chunk;
     }
 
-    /// `madvise(MADV_FREE_REUSABLE)` slabs whose chunks are all on
-    /// the free list. Returns total bytes hinted. O(n_chunks_total)
-    /// — cold path (only called from the major GC tail).
-    pub fn pressure_release(&self) -> usize {
-        // First, count free chunks per slab by walking the free
-        // list. We use the slab list as the index: for each free
-        // chunk, find which slab it falls in.
-        let mut total = 0usize;
+    /// `munmap` slabs whose chunks are all on the free list,
+    /// removing them from both the intrusive slab list and the
+    /// pool's free list. Returns total bytes released to the OS.
+    /// O(n_chunks_total) — cold path called from the major GC tail.
+    ///
+    /// Takes `&mut self` because we splice both lists. The caller
+    /// holds the per-class mutex while running this.
+    pub fn pressure_release(&mut self) -> usize {
+        if self.slabs.load(Ordering::Relaxed).is_null() {
+            return 0;
+        }
         let chunks_per_slab = (self.slab_bytes / self.chunk_size) - 1; // minus header
-        let mut slab = self.slabs.load(Ordering::Relaxed);
+        let mut total = 0usize;
+        // First pass: walk the slab list and identify which slabs
+        // are fully free. We can't munmap during iteration because
+        // we'd dereference freed memory to follow `next`. Collect
+        // the to-free slab pointers first.
+        //
+        // We can't allocate a `Vec<*mut SlabHdr>` here — that'd
+        // re-enter us. Instead, do this in two passes over the
+        // slab list, using `count_free_in_slab` per slab.
+        //
+        // 1. First pass: walk slabs, splice out fully-free ones
+        //    from BOTH the slab list and the chunk free list.
+        let mut prev_slab: *mut *mut SlabHdr =
+            self.slabs.as_ptr() as *mut *mut SlabHdr;
+        let mut slab = unsafe { *prev_slab };
         while !slab.is_null() {
             let slab_base = slab as usize;
             let slab_end = slab_base + self.slab_bytes;
@@ -193,19 +210,74 @@ impl ClassPool {
                     cur = ptr::read(cur as *const *mut u8);
                 }
             }
+            let next_slab = unsafe { (*slab).next };
             if count == chunks_per_slab {
+                // Fully free. Splice out of the slab list…
                 unsafe {
-                    // Don't madvise over the header itself —
-                    // we still read its `next` pointer in this
-                    // very loop. Madvise from the first chunk
-                    // onward.
-                    let chunks_start = (slab_base + self.chunk_size) as *mut u8;
-                    let chunks_bytes = self.slab_bytes - self.chunk_size;
-                    madvise_free(chunks_start, chunks_bytes);
+                    *prev_slab = next_slab;
                 }
-                total += self.slab_bytes - self.chunk_size;
+                // …remove every chunk of this slab from the free
+                // list. Walk the free list, skipping nodes whose
+                // address is in this slab's range, rebuilding into
+                // a new head.
+                let mut new_head: *mut u8 = ptr::null_mut();
+                let mut new_tail_link: *mut *mut u8 = &mut new_head;
+                let mut cur = self.free;
+                while !cur.is_null() {
+                    let p = cur as usize;
+                    let nxt = unsafe { ptr::read(cur as *const *mut u8) };
+                    if !(p >= slab_base && p < slab_end) {
+                        unsafe {
+                            *new_tail_link = cur;
+                            new_tail_link = cur as *mut *mut u8;
+                        }
+                    }
+                    cur = nxt;
+                }
+                unsafe {
+                    *new_tail_link = ptr::null_mut();
+                }
+                self.free = new_head;
+                // …and munmap. `prev_slab` still points at the
+                // location holding `next_slab` (the slot we just
+                // wrote to), so the next loop iter follows the
+                // chain correctly without revisiting `slab`.
+                unsafe {
+                    munmap(slab as *mut u8, self.slab_bytes);
+                }
+                total += self.slab_bytes;
+                slab = next_slab;
+            } else {
+                // Slab still has in-use chunks. For long-lived
+                // slabs that are mostly empty, hint the unused
+                // chunks as reclaimable so the kernel can drop
+                // their physical pages without us giving up the
+                // mapping. macOS uses `MADV_FREE_REUSABLE` which
+                // also deducts from the process's footprint.
+                //
+                // `madvise` requires page-aligned start + length;
+                // for chunk_size < page_size, `slab_base +
+                // chunk_size` is mid-page and the syscall fails
+                // with EINVAL silently. Round up to the next page
+                // boundary.
+                let page = page_size();
+                let chunks_start_raw = slab_base + self.chunk_size;
+                let chunks_start = (chunks_start_raw + page - 1) & !(page - 1);
+                if chunks_start < slab_end {
+                    let chunks_bytes = slab_end - chunks_start;
+                    // Round length down to page multiple (slab_end
+                    // is already page-aligned since slab_bytes is
+                    // a multiple of the largest typical page).
+                    let aligned_bytes = chunks_bytes & !(page - 1);
+                    if aligned_bytes > 0 {
+                        unsafe {
+                            madvise_free(chunks_start as *mut u8, aligned_bytes);
+                        }
+                    }
+                }
+                prev_slab = unsafe { &mut (*slab).next };
+                slab = next_slab;
             }
-            slab = unsafe { (*slab).next };
         }
         total
     }
@@ -232,6 +304,25 @@ impl Drop for ClassPool {
 // Page-level primitives (Unix-only for now; Windows would use
 // `VirtualAlloc` / `VirtualFree`).
 // ---------------------------------------------------------------------------
+
+/// System page size, cached after the first call. Looked up
+/// via `sysconf(_SC_PAGESIZE)` rather than hard-coded so we get
+/// the right value on macOS arm64 (16 KiB) vs Linux (4 KiB).
+fn page_size() -> usize {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static CACHED: AtomicUsize = AtomicUsize::new(0);
+    let n = CACHED.load(Ordering::Relaxed);
+    if n != 0 {
+        return n;
+    }
+    #[cfg(unix)]
+    let s = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    #[cfg(not(unix))]
+    let s = 4096usize;
+    let s = if s == 0 { 4096 } else { s };
+    CACHED.store(s, Ordering::Relaxed);
+    s
+}
 
 #[cfg(unix)]
 unsafe fn mmap_anon(bytes: usize) -> Option<NonNull<u8>> {

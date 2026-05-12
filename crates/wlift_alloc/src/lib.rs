@@ -220,7 +220,7 @@ unsafe fn wlift_realloc_impl(
 pub fn pressure_release() -> usize {
     let mut total = 0usize;
     for class in &state().classes {
-        let pool = class.lock();
+        let mut pool = class.lock();
         total += pool.pressure_release();
     }
     total += large::pressure_release();
