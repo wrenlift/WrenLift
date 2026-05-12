@@ -16,18 +16,17 @@
     allow(dead_code, unused_imports, unused_variables, unreachable_patterns)
 )]
 
-// No `#[global_allocator]` override here: cdylib plugins enable
-// `wren_lift/host` for `VM` struct layout compatibility, so any
-// allocator pulled in via `host` would be statically linked into
-// every plugin as well. Each cdylib + the binary would then hold
-// independent heaps, and cross-FFI buffer growth (e.g. plugin
-// code allocating an `ObjList::elements` that the host's GC
-// later frees) would corrupt on dealloc. Linux production keeps
-// `MALLOC_ARENA_MAX=2` + a 768mb VM budget to bound glibc's
-// per-thread arena commit instead. A future allocator swap needs
-// to avoid the dual-static problem — either libc symbol
-// interposition or a shared-library allocator that the binary
-// and plugins resolve through the dynamic linker.
+// Global allocator override is opt-in via the `wlift_alloc`
+// feature, which the wlift / hatch binaries enable but plugins
+// (which enable `host` for struct layout compatibility) do not.
+// Plugins keep the system allocator at compile time and route
+// cross-FFI buffer ownership through the `wlift_malloc` C
+// symbols exported from the binary — single instance regardless
+// of how each cdylib was linked. See
+// `crates/wlift_alloc/src/lib.rs` for the design notes.
+#[cfg(feature = "wlift_alloc")]
+#[global_allocator]
+static GLOBAL: wlift_alloc::Wlift = wlift_alloc::Wlift;
 
 pub mod ast;
 pub mod capi;

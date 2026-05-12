@@ -1,0 +1,23 @@
+[package]
+name = "wlift_alloc"
+version = "0.1.0"
+edition = "2024"
+description = "wren_lift's in-tree allocator. Size-class slabs + mmap-backed large pool, with a stable C ABI so the wlift binary and every cdylib plugin share one instance and cross-FFI buffer ownership stays correct."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+libc = "0.2"
+# `spin::Mutex` is a pure-atomic spin lock — no OS handles, no
+# lazy initialization, no allocation. `std::sync::Mutex` looks
+# `const`-constructible but the first lock acquisition allocates
+# a pthread mutex via `OnceBox`, which would re-enter our global
+# allocator and stack-overflow during early startup.
+spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
+
+[features]
+default = []
+# Opt-in debug counters (alloc count, peak bytes, large-pool stats).
+# Cheap when off; gated behind atomics that bypass under `cfg(not(feature = "stats"))`.
+stats = []

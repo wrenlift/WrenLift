@@ -4564,6 +4564,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "spin"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+
+[[package]]
 name = "spirv"
 version = "0.3.0+sdk-1.3.268.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6514,6 +6520,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlift_alloc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "spin",
+]
+
+[[package]]
 name = "wlift_audio"
 version = "0.1.3"
 dependencies = [
@@ -6663,6 +6677,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "web-time",
+ "wlift_alloc",
  "zip",
  "zstd",
 ]

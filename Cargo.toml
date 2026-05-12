@@ -12,6 +12,7 @@ members = [
     "plugins/wlift_gpu_web",
     "wasm",
     "crates/wlift_lsp",
+    "crates/wlift_alloc",
 ]
 resolver = "2"
 
@@ -61,6 +62,18 @@ host = [
     "dep:rand_core",
     "dep:mimalloc",
     "dep:krio-fiber",
+]
+# Pull in wlift_alloc as the process's `#[global_allocator]`. The
+# wlift binary opts in via `required-features = ["wlift_alloc"]`;
+# cdylib plugins enable `host` but NOT this feature, so they keep
+# the system allocator at compile time. At runtime, plugins should
+# call the `wlift_malloc` / `wlift_free` C symbols exported by the
+# binary (interposed at dynamic-link time) for cross-FFI buffers,
+# avoiding the dual-static-allocator hazard documented in
+# `project_plugin_feature_abi.md`.
+wlift_alloc = [
+    "host",
+    "dep:wlift_alloc",
 ]
 cranelift = [
     "host",
@@ -158,6 +171,13 @@ beadie = { version = "0.3", optional = true }
 # Sibling project: ../krio. Unix-only stack guard pages; heap
 # fallback elsewhere. WASM uses a separate Promise/Future bridge.
 krio-fiber = { path = "../krio/crates/krio-fiber", optional = true }
+
+# In-tree allocator. See the `wlift_alloc` feature above for the
+# binary-only opt-in mechanism. Plugins pull this in directly
+# (separate Cargo.toml dependency) so they can call the
+# `wlift_malloc` / `wlift_free` C ABI for cross-FFI buffers, but
+# they don't install it as a global allocator.
+wlift_alloc = { path = "crates/wlift_alloc", optional = true }
 
 # Wasm-specific: getrandom needs the `js` feature on wasm32-unknown-
 # unknown so `rand` can pull entropy from `crypto.getRandomValues`.

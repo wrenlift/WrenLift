@@ -915,6 +915,18 @@ impl Gc {
         //    of MB of zeroed slots.
         self.release_empty_old_chunks();
 
+        // 5. Ask the allocator to hand free pages back to the OS.
+        //    The in-tree `wlift_alloc` walks empty slabs and runs
+        //    `madvise(MADV_FREE_REUSABLE)` on macOS / `MADV_FREE`
+        //    on Linux so the process's resident + footprint
+        //    metrics drop after a sweep that freed real bytes.
+        //    No-op when the binary was built without the
+        //    `wlift_alloc` feature (system allocator path).
+        #[cfg(feature = "wlift_alloc")]
+        {
+            wlift_alloc::pressure_release();
+        }
+
         self.stats.major_collections += 1;
         self.minor_since_major = 0;
         self.last_major_collect_at = crate::portable_time::Instant::now();
