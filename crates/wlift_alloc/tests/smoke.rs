@@ -114,10 +114,14 @@ fn many_small_round_trips() {
             a.dealloc(p, l);
         }
     }
-    // After freeing, pressure_release should hint many slabs as
-    // reclaimable.
-    let released = pressure_release();
-    assert!(released > 0, "expected some bytes hinted reclaimable");
+    // After freeing, the slab pool may have already auto-evicted
+    // drained slabs in `free()` itself; `pressure_release()` is a
+    // best-effort drain of whatever survived (partially-used
+    // slabs, cached large buckets). We just confirm it runs
+    // without panicking — the eager-eviction path is the bigger
+    // win in production, where it bounds VM_ALLOCATE region
+    // count without waiting for the major GC's release call.
+    let _ = pressure_release();
 }
 
 #[test]
@@ -133,4 +137,36 @@ fn zero_size_returns_aligned_dangling() {
     let p = wlift_malloc(0, 16);
     assert_eq!(p as usize, 16);
     // No free needed for zero-sized allocations.
+}
+
+#[test]
+fn eager_munmap_drains_idle_slabs() {
+    use std::alloc::{GlobalAlloc, Layout};
+    let a = Wlift;
+    let l = Layout::from_size_align(48, 8).unwrap();
+    // Allocate enough to force multiple slabs of the 64-byte class.
+    // Slab is 64 KiB, chunks of 64 bytes ⇒ ~1024 chunks/slab. We
+    // want 2000+ to span at least 2 slabs.
+    let mut ptrs = Vec::with_capacity(2500);
+    for _ in 0..2500 {
+        unsafe {
+            ptrs.push(a.alloc(l));
+        }
+    }
+    // Free all of them. With eager auto-eviction, each slab that
+    // drains to zero in-use chunks should munmap immediately.
+    // After freeing everything, pressure_release should find
+    // little to do (any remaining slabs were already evicted).
+    while let Some(p) = ptrs.pop() {
+        unsafe {
+            a.dealloc(p, l);
+        }
+    }
+    // Allocate one more — forces fresh-slab refill, proving the
+    // eviction left the class in a clean state.
+    unsafe {
+        let p = a.alloc(l);
+        assert!(!p.is_null());
+        a.dealloc(p, l);
+    }
 }

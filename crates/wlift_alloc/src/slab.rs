@@ -32,15 +32,18 @@ use std::ptr::{self, NonNull};
 /// slab; the first chunk starts at offset `chunk_size` so the
 /// header doesn't collide with caller data.
 ///
-/// We deliberately keep this to a single `*mut` (8 B on
-/// 64-bit) so it fits inside the smallest size class (16 B).
-/// `chunk_size` and `slab_bytes` are class-wide constants
-/// stored on `ClassPool`, not per-slab — there's no need to
-/// duplicate them here.
+/// We pack 16 bytes — fits the 16-byte size class with no
+/// padding. `next` threads the per-class slab list; `in_use`
+/// is the chunk count outstanding (so `free()` can detect
+/// the last release and munmap immediately, before the slab
+/// accumulates into the long-tail of partially-empty regions).
 #[repr(C)]
 struct SlabHdr {
     next: *mut SlabHdr,
+    in_use: usize,
 }
+
+const _: () = assert!(core::mem::size_of::<SlabHdr>() == 16);
 
 /// Public alias so the rest of the crate can talk about slabs
 /// without exposing the in-arena header layout.
@@ -95,11 +98,19 @@ impl ClassPool {
             // free-list link, written at slab construction or by a
             // previous `free` call.
             self.free = ptr::read(chunk as *const *mut u8);
+            // Credit the owning slab. Slabs are SLAB_BYTES-aligned
+            // (see `add_slab`), so the header is at
+            // `chunk & ~(SLAB_BYTES - 1)` — O(1) with a bit-mask.
+            let slab = slab_of(chunk, self.slab_bytes);
+            (*slab).in_use += 1;
         }
         chunk
     }
 
-    /// Push `ptr` onto the free list. O(1).
+    /// Push `ptr` onto the free list. O(1). If the slab's
+    /// `in_use` drops to zero, immediately splice the slab out
+    /// of both lists and `munmap` it — that's how we keep the
+    /// VM_ALLOCATE region count bounded under bursty load.
     ///
     /// # Safety
     /// `ptr` must be a previously-returned allocation from
@@ -107,22 +118,93 @@ impl ClassPool {
     /// Its first `mem::size_of::<*mut u8>()` bytes are overwritten
     /// with the next-free-list link.
     pub unsafe fn free(&mut self, ptr: *mut u8) {
+        let slab = unsafe { slab_of(ptr, self.slab_bytes) };
         unsafe {
+            (*slab).in_use -= 1;
+            if (*slab).in_use == 0 {
+                // Last chunk of this slab freed — drop the whole
+                // mapping. First, walk our free list and remove
+                // every chunk that lies within this slab's range
+                // (they're about to become invalid).
+                self.evict_slab(slab);
+                return;
+            }
             ptr::write(ptr as *mut *mut u8, self.free);
         }
         self.free = ptr;
     }
 
+    /// Remove every chunk of `slab` from the free list, splice
+    /// the slab out of the intrusive list, and `munmap`. Called
+    /// from `free()` when the slab's last in-use chunk releases.
+    ///
+    /// # Safety
+    /// `slab` must be a member of `self.slabs`. After this
+    /// returns, dereferencing any chunk pointer that pointed
+    /// into `slab` is undefined behaviour.
+    unsafe fn evict_slab(&mut self, slab: *mut SlabHdr) {
+        let slab_base = slab as usize;
+        let slab_end = slab_base + self.slab_bytes;
+        // Walk the free list, keeping only chunks outside this
+        // slab's range.
+        let mut new_head: *mut u8 = ptr::null_mut();
+        let mut new_tail_link: *mut *mut u8 = &mut new_head;
+        let mut cur = self.free;
+        while !cur.is_null() {
+            let p = cur as usize;
+            let nxt = unsafe { ptr::read(cur as *const *mut u8) };
+            if !(p >= slab_base && p < slab_end) {
+                unsafe {
+                    *new_tail_link = cur;
+                    new_tail_link = cur as *mut *mut u8;
+                }
+            }
+            cur = nxt;
+        }
+        unsafe {
+            *new_tail_link = ptr::null_mut();
+        }
+        self.free = new_head;
+        // Splice slab out of the intrusive list.
+        let mut prev_link: *mut *mut SlabHdr =
+            self.slabs.as_ptr() as *mut *mut SlabHdr;
+        loop {
+            let cur = unsafe { *prev_link };
+            if cur.is_null() {
+                break;
+            }
+            if cur == slab {
+                unsafe {
+                    *prev_link = (*cur).next;
+                }
+                break;
+            }
+            prev_link = unsafe { &mut (*cur).next };
+        }
+        // Munmap the SLAB_BYTES + alignment slop. `mmap_anon_aligned`
+        // stored the original allocation base via the slab's
+        // unused upper bits — wait, simpler: each slab is
+        // exactly `self.slab_bytes` long, and we own the entire
+        // aligned region.
+        unsafe {
+            munmap(slab as *mut u8, self.slab_bytes);
+        }
+    }
+
     /// `mmap` a fresh slab, lay out the header + chunks, chain the
     /// chunks onto the free list, and push the slab onto the
-    /// intrusive slab list.
+    /// intrusive slab list. The mmap is over-allocated and trimmed
+    /// so the returned slab is aligned on `slab_bytes` — enabling
+    /// O(1) chunk-to-slab lookup via bit-mask in `slab_of()`.
     fn add_slab(&mut self) {
         assert!(self.chunk_size >= std::mem::size_of::<*mut u8>());
         assert!(self.chunk_size >= std::mem::size_of::<SlabHdr>());
         assert!(self.slab_bytes % self.chunk_size == 0);
-        let base = unsafe { mmap_anon(self.slab_bytes) }.unwrap_or_else(|| {
-            panic!("wlift_alloc: mmap({}B) failed", self.slab_bytes)
-        });
+        assert!(self.slab_bytes.is_power_of_two());
+        let base = unsafe { mmap_anon_aligned(self.slab_bytes, self.slab_bytes) }
+            .unwrap_or_else(|| {
+                panic!("wlift_alloc: mmap({}B aligned) failed", self.slab_bytes)
+            });
         // Write the header at offset 0.
         let hdr = base.as_ptr() as *mut SlabHdr;
         unsafe {
@@ -130,6 +212,7 @@ impl ClassPool {
                 hdr,
                 SlabHdr {
                     next: self.slabs.load(Ordering::Relaxed),
+                    in_use: 0,
                 },
             );
         }
@@ -304,6 +387,66 @@ impl Drop for ClassPool {
 // Page-level primitives (Unix-only for now; Windows would use
 // `VirtualAlloc` / `VirtualFree`).
 // ---------------------------------------------------------------------------
+
+/// Find the slab header containing `chunk`. Works because slabs
+/// are allocated SLAB_BYTES-aligned (see `mmap_anon_aligned`),
+/// so masking off the low bits of any chunk pointer yields its
+/// slab's base address — O(1) lookup with no per-chunk metadata.
+#[inline]
+unsafe fn slab_of(chunk: *mut u8, slab_bytes: usize) -> *mut SlabHdr {
+    debug_assert!(slab_bytes.is_power_of_two());
+    let mask = !(slab_bytes - 1);
+    ((chunk as usize) & mask) as *mut SlabHdr
+}
+
+/// `mmap` an anonymous region of `bytes` aligned on `align`.
+/// Over-allocates by `align` bytes, then `munmap`s the slop on
+/// either side. The kernel may pick any address, but the slop-
+/// trim ensures the returned base is `align`-aligned.
+#[cfg(unix)]
+unsafe fn mmap_anon_aligned(bytes: usize, align: usize) -> Option<NonNull<u8>> {
+    debug_assert!(align.is_power_of_two());
+    // Over-allocate.
+    let total = bytes + align;
+    let raw = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if raw == libc::MAP_FAILED {
+        return None;
+    }
+    let raw_addr = raw as usize;
+    // Align up to the next multiple of `align`.
+    let aligned = (raw_addr + align - 1) & !(align - 1);
+    let head_slop = aligned - raw_addr;
+    let tail_slop = total - head_slop - bytes;
+    // Trim the slop on both sides so we own exactly `bytes`
+    // starting at `aligned`. The kernel handles `munmap` of
+    // zero-size as a no-op, so we don't need to special-case
+    // when slop is 0.
+    if head_slop > 0 {
+        unsafe {
+            libc::munmap(raw, head_slop);
+        }
+    }
+    if tail_slop > 0 {
+        unsafe {
+            libc::munmap((aligned + bytes) as *mut libc::c_void, tail_slop);
+        }
+    }
+    NonNull::new(aligned as *mut u8)
+}
+
+#[cfg(not(unix))]
+unsafe fn mmap_anon_aligned(_bytes: usize, _align: usize) -> Option<NonNull<u8>> {
+    None
+}
 
 /// System page size, cached after the first call. Looked up
 /// via `sysconf(_SC_PAGESIZE)` rather than hard-coded so we get
