@@ -478,6 +478,15 @@ pub unsafe extern "C" fn wlift_aot_enter(
     // interpreter modes leave the flag at its default `false` so
     // they don't fire GC at points Cranelift's stack-map metadata
     // doesn't cover.
+    //
+    // Defaults OFF for AOT because enabling it surfaces stack-map
+    // coverage holes — the AOT codegen doesn't yet emit stack
+    // maps for every alloc-site, so `vm.collect_garbage()` can
+    // free a value that's live in a register the GC didn't scan,
+    // and the next access segfaults. Set `WLIFT_AOT_GC=1` for
+    // memory-tight production deploys where you've validated the
+    // workload; the hatch site catalog warmup currently trips
+    // the missing-stack-map crash.
     crate::codegen::runtime_fns::set_aot_gc_enabled(std::env::var_os("WLIFT_AOT_GC").is_some());
 }
 
