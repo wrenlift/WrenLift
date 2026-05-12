@@ -3114,12 +3114,24 @@ impl VM {
             let mut current_ret = initial_saved_ret;
             let max_frames = 256;
             let mut walked = 0;
+            // User-space virtual addresses on 64-bit Unix top out at
+            // 2^47 (47-bit address space). Anything with bits
+            // outside that range is either an OS-reserved kernel
+            // pointer or — more often in our case — leaked NaN-
+            // tagged Wren `Value` bits that drifted onto a register-
+            // sized stack slot. Dereferencing them faults the
+            // kernel and crashes the GC mid-mark. Treat any
+            // pointer outside the 47-bit range as "end of trustable
+            // chain" and stop walking. The frames below that point
+            // miss root scanning, which is the worst the GC sees;
+            // we'd rather under-scan than segfault.
+            const USER_VA_LIMIT: usize = 1usize << 47;
             while fp != 0 && walked < max_frames {
                 walked += 1;
-                if fp & 7 != 0 {
+                if fp & 7 != 0 || fp >= USER_VA_LIMIT {
                     break;
                 }
-                if current_ret != 0 {
+                if current_ret != 0 && current_ret < USER_VA_LIMIT {
                     let code_range = self
                         .engine
                         .code_ranges
@@ -3155,7 +3167,7 @@ impl VM {
                 // Step to caller's frame using the standard chain.
                 let next_fp = unsafe { *(fp as *const usize) };
                 let next_ret = unsafe { *((fp + 8) as *const usize) };
-                if next_fp == 0 || next_fp <= fp {
+                if next_fp == 0 || next_fp <= fp || next_fp >= USER_VA_LIMIT {
                     break;
                 }
                 fp = next_fp;
@@ -3448,8 +3460,20 @@ impl VM {
 
         // Write back stack map roots directly to native stack spill slots.
         // This ensures GC-forwarded pointers are visible when JIT code resumes.
+        //
+        // Validate each slot address against the same 47-bit user-VA
+        // limit `scan_native_stack_roots` uses — if the walker
+        // produced a slot at an address outside that range, the
+        // safepoint metadata was wrong and writing back would
+        // segfault the GC mid-collection (and we'd lose the rest of
+        // the write-backs that ARE valid).
+        const USER_VA_LIMIT: usize = 1usize << 47;
         for i in 0..native_stack_count {
             let updated = roots[native_stack_start + i];
+            let addr = stack_slot_addrs[i] as usize;
+            if addr == 0 || addr & 7 != 0 || addr >= USER_VA_LIMIT {
+                continue;
+            }
             unsafe { std::ptr::write(stack_slot_addrs[i], updated.to_bits()) };
         }
 
