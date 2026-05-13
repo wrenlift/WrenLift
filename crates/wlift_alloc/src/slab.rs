@@ -166,8 +166,7 @@ impl ClassPool {
         }
         self.free = new_head;
         // Splice slab out of the intrusive list.
-        let mut prev_link: *mut *mut SlabHdr =
-            self.slabs.as_ptr() as *mut *mut SlabHdr;
+        let mut prev_link: *mut *mut SlabHdr = self.slabs.as_ptr() as *mut *mut SlabHdr;
         loop {
             let cur = unsafe { *prev_link };
             if cur.is_null() {
@@ -202,9 +201,7 @@ impl ClassPool {
         assert!(self.slab_bytes % self.chunk_size == 0);
         assert!(self.slab_bytes.is_power_of_two());
         let base = unsafe { mmap_anon_aligned(self.slab_bytes, self.slab_bytes) }
-            .unwrap_or_else(|| {
-                panic!("wlift_alloc: mmap({}B aligned) failed", self.slab_bytes)
-            });
+            .unwrap_or_else(|| panic!("wlift_alloc: mmap({}B aligned) failed", self.slab_bytes));
         // Write the header at offset 0.
         let hdr = base.as_ptr() as *mut SlabHdr;
         unsafe {
@@ -275,8 +272,7 @@ impl ClassPool {
         //
         // 1. First pass: walk slabs, splice out fully-free ones
         //    from BOTH the slab list and the chunk free list.
-        let mut prev_slab: *mut *mut SlabHdr =
-            self.slabs.as_ptr() as *mut *mut SlabHdr;
+        let mut prev_slab: *mut *mut SlabHdr = self.slabs.as_ptr() as *mut *mut SlabHdr;
         let mut slab = unsafe { *prev_slab };
         while !slab.is_null() {
             let slab_base = slab as usize;

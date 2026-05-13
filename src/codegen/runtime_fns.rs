@@ -2311,9 +2311,7 @@ fn handle_jit_fiber_action(
                     && unsafe { (*target).krio_fiber.is_some() }
                     && crate::runtime::core::fiber::current_vm_krio_active(vm)
                 {
-                    if let Some(v) =
-                        crate::runtime::core::fiber::try_krio_call_pub(target, value)
-                    {
+                    if let Some(v) = crate::runtime::core::fiber::try_krio_call_pub(target, value) {
                         set_jit_context(saved_jit_ctx);
                         set_jit_depth(saved_jit_depth);
                         return v.to_bits();

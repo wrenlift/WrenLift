@@ -170,7 +170,7 @@ beadie = { version = "0.3", optional = true }
 # because the entire physical stack is preserved across a switch.
 # Sibling project: ../krio. Unix-only stack guard pages; heap
 # fallback elsewhere. WASM uses a separate Promise/Future bridge.
-krio-fiber = { path = "../krio/crates/krio-fiber", optional = true }
+krio-fiber = { git = "https://github.com/darmie/krio.git", rev = "e61bca9da7b7f6793397b4f43ff1a7c397391149", optional = true }
 
 # In-tree allocator. See the `wlift_alloc` feature above for the
 # binary-only opt-in mechanism. Plugins pull this in directly

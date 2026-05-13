@@ -3114,6 +3114,16 @@ impl VM {
             let mut current_ret = initial_saved_ret;
             let max_frames = 256;
             let mut walked = 0;
+            // Track whether we actually recorded any spill slots from
+            // this fiber's stack. If so, we must pin the fiber as a
+            // root: the write-back loop in `collect_garbage` will
+            // later write the forwarded value back to those slot
+            // addresses, and if the fiber gets swept this cycle its
+            // krio Box drops + the stack is munmap'd, so the writes
+            // fault on freed pages. Pinning only fibers we scanned
+            // (rather than every Suspended fiber) avoids zombies for
+            // fibers that have no usable stack to walk.
+            let mut recorded_slot_for_fiber = false;
             // User-space virtual addresses on 64-bit Unix top out at
             // 2^47 (47-bit address space). Anything with bits
             // outside that range is either an OS-reserved kernel
@@ -3157,6 +3167,7 @@ impl VM {
                                         if val.is_object() {
                                             found_roots.push(val);
                                             slot_addrs.push(addr);
+                                            recorded_slot_for_fiber = true;
                                         }
                                     }
                                 }
@@ -3172,6 +3183,18 @@ impl VM {
                 }
                 fp = next_fp;
                 current_ret = next_ret;
+            }
+            // Pin the fiber as a root iff we recorded any spill-slot
+            // addresses from its stack. Without this, a Suspended
+            // fiber with no other roots could get swept this cycle,
+            // its krio stack munmap'd, and the write-back loop would
+            // fault on the freed page. We pair the pin with a null
+            // slot_addrs entry — the write-back loop already skips
+            // null addresses, and we don't want to forward the
+            // ObjFiber pointer via the spill-slot path.
+            if recorded_slot_for_fiber {
+                found_roots.push(Value::object(fiber_ptr as *mut u8));
+                slot_addrs.push(std::ptr::null_mut());
             }
         }
 

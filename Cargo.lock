@@ -2614,10 +2614,12 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "krio-core"
 version = "0.1.0"
+source = "git+https://github.com/darmie/krio.git?rev=e61bca9da7b7f6793397b4f43ff1a7c397391149#e61bca9da7b7f6793397b4f43ff1a7c397391149"
 
 [[package]]
 name = "krio-fiber"
 version = "0.1.0"
+source = "git+https://github.com/darmie/krio.git?rev=e61bca9da7b7f6793397b4f43ff1a7c397391149#e61bca9da7b7f6793397b4f43ff1a7c397391149"
 dependencies = [
  "krio-core",
  "libc",
