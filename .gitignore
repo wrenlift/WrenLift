@@ -26,3 +26,4 @@ docs/*-plan.md
 
 # AOT bench output — regenerated on every `bench/run-aot.sh` run.
 bench/.aot-out/
+baseline.md

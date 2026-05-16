@@ -601,6 +601,7 @@ unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
     }
 }
 
+#[cfg(feature = "host")]
 fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // Establish that target has a krio backing before we start
     // doing any save/restore work. Early-return None lets the

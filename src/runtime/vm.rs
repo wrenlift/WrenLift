@@ -3636,13 +3636,21 @@ impl VM {
         // Write back stack map roots directly to native stack spill slots.
         // This ensures GC-forwarded pointers are visible when JIT code resumes.
         //
-        // Validate each slot address against the same 47-bit user-VA
+        // Validate each slot address against the same user-VA
         // limit `scan_native_stack_roots` uses — if the walker
         // produced a slot at an address outside that range, the
         // safepoint metadata was wrong and writing back would
         // segfault the GC mid-collection (and we'd lose the rest of
         // the write-backs that ARE valid).
+        //
+        // 47-bit limit on 64-bit hosts matches the canonical x86_64
+        // / aarch64 user-VA split; on 32-bit (wasm32) the upper
+        // bound is just `usize::MAX` since the entire address space
+        // is user-accessible.
+        #[cfg(target_pointer_width = "64")]
         const USER_VA_LIMIT: usize = 1usize << 47;
+        #[cfg(not(target_pointer_width = "64"))]
+        const USER_VA_LIMIT: usize = usize::MAX;
         for i in 0..native_stack_count {
             let updated = roots[native_stack_start + i];
             let addr = stack_slot_addrs[i] as usize;

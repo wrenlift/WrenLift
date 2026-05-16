@@ -367,17 +367,19 @@ pub unsafe extern "C" fn wlift_aot_init_prelude(
     if vm.is_null() || modvars.is_null() {
         return 70;
     }
-    // Flip on the krio-fiber backing. AOT bodies' `Fiber.yield`
-    // path requires stackful fibers (the legacy stackless state-
-    // machine MIR transform was retired for native AOT in commit
-    // b5fc505). `VM::new`'s default is off, which is correct for
-    // tiered / JIT / interpreter modes — those have the legacy
-    // stackless dispatch and don't need per-fiber mmap'd stacks.
-    // The AOT bootstrap fires `wlift_aot_init_prelude` once per
-    // module before any user code runs, so enabling here is the
-    // earliest safe point.
-    unsafe {
-        (*vm).krio_fiber_active = true;
+    // Krio-fiber backing for AOT yields. Default off — AOT now
+    // routes yields through the stackless state-machine MIR
+    // transform (option A). Opt back into krio with
+    // `WLIFT_USE_KRIO_FIBERS=1` for A/B comparison and as a
+    // regression fallback until SM is proven on the full hatch
+    // spec corpus. The taint-set computation
+    // (`compute_aot_tainted_method_names`) gates on the same env
+    // var, so flipping the flag swaps both halves of the runtime
+    // in lockstep.
+    if std::env::var_os("WLIFT_USE_KRIO_FIBERS").is_some_and(|v| v == "1") {
+        unsafe {
+            (*vm).krio_fiber_active = true;
+        }
     }
     // Publish the VM pointer to the per-thread `CURRENT_VM` slot so
     // foreign-method handlers (notably `try_krio_call` / `try_krio_yield`)
