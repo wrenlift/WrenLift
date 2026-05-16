@@ -132,7 +132,15 @@ pub struct ObjHeader {
     pub gc_mark: u8, // offset 1
     /// GC generation. 0 = young (nursery), 1 = old.
     pub generation: u8, // offset 2
-    // 5 bytes padding (implicit)
+    /// Misc per-object flags. Bit 0 = `ARENA_ALLOCATED`: set when
+    /// this object's storage was bump-allocated into a fiber's
+    /// `wlift_region::Region` rather than the GC heap, so the
+    /// runtime's escape-barrier helpers (`Fiber.try` return,
+    /// foreign-method return, cross-fiber field write) know to
+    /// deep-copy to the GC heap before the source fiber's region
+    /// can drop. Bits 1-7 reserved.
+    pub flags: u8, // offset 3
+    // 4 bytes padding (implicit)
     /// Intrusive linked list of all heap objects (for GC sweep).
     pub next: *mut ObjHeader, // offset 8
     /// The class of this object (for method dispatch). Null for meta-objects.
@@ -140,12 +148,16 @@ pub struct ObjHeader {
                               // total: 24 bytes
 }
 
+/// Per-object header-flag bits. See [`ObjHeader::flags`].
+pub const FLAG_ARENA_ALLOCATED: u8 = 1 << 0;
+
 impl ObjHeader {
     pub fn new(obj_type: ObjType) -> Self {
         Self {
             obj_type,
             gc_mark: 0,
             generation: 0,
+            flags: 0,
             next: std::ptr::null_mut(),
             class: std::ptr::null_mut(),
         }

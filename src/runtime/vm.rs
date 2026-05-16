@@ -2369,6 +2369,8 @@ impl VM {
                 if let Some(ptr) = region.try_alloc(ObjString::new(s.clone())) {
                     unsafe {
                         (*ptr).header.class = self.string_class;
+                        (*ptr).header.flags |=
+                            crate::runtime::object::FLAG_ARENA_ALLOCATED;
                     }
                     return Value::object(ptr as *mut u8);
                 }
@@ -2394,6 +2396,77 @@ impl VM {
             (*obj).header.class = self.string_class;
         }
         Value::object(obj as *mut u8)
+    }
+
+    /// Escape barrier — deep-copy `val` to the GC heap if its
+    /// backing object lives in a fiber's `Region`. Returns a Value
+    /// that's safe to retain past the source fiber's
+    /// `release_fiber_resources` call.
+    ///
+    /// Called at every boundary where an arena-allocated Value
+    /// might cross into longer-lived storage:
+    ///
+    /// - `Fiber.try`'s return value (the parent receives whatever
+    ///   the child yielded / returned, and the parent's stack
+    ///   outlives the child's region).
+    /// - Foreign-method return-to-Wren (the Wren caller may stash
+    ///   the value in a cache that outlives the fiber).
+    /// - Cross-fiber field writes / map sets / list adds where the
+    ///   target object lives on the GC heap and the value lives in
+    ///   the current fiber's region.
+    ///
+    /// Recursive: a List or Map of arena-allocated Strings has each
+    /// string copied. For Phase 2, only String is implemented;
+    /// List / Map / Closure copies are deferred to Phase 2.5 when
+    /// those types start routing through the arena.
+    ///
+    /// No-op for non-object Values, GC-heap-allocated objects, and
+    /// when the arena feature is off.
+    ///
+    /// # Safety
+    /// `val.as_object()` (if Some) must point at a valid object
+    /// header. The runtime upholds this on every call site that
+    /// produces Values.
+    #[cfg(feature = "host")]
+    pub unsafe fn escape_to_gc_if_arena(&mut self, val: Value) -> Value {
+        let Some(obj) = val.as_object() else {
+            return val;
+        };
+        let header = obj as *const crate::runtime::object::ObjHeader;
+        let flags = unsafe { (*header).flags };
+        if flags & crate::runtime::object::FLAG_ARENA_ALLOCATED == 0 {
+            return val;
+        }
+        // Arena-allocated. Deep-copy onto the GC heap based on
+        // object type. Allocate directly via `self.gc.alloc_*`
+        // (not via `self.new_*`) so the copy lands on the GC heap
+        // regardless of the active fiber's region — re-routing
+        // back into the SAME arena would defeat the barrier and
+        // re-entering `new_string` here could shuffle other VM
+        // state in ways the caller (mid-fiber-teardown) isn't
+        // prepared for.
+        match unsafe { (*header).obj_type } {
+            crate::runtime::object::ObjType::String => {
+                let s = unsafe { &*(obj as *const crate::runtime::object::ObjString) };
+                let gc_copy = self.gc.alloc_string(s.value.clone());
+                unsafe {
+                    (*gc_copy).header.class = self.string_class;
+                }
+                Value::object(gc_copy as *mut u8)
+            }
+            // List / Map / Closure escape paths land in Phase 2.5
+            // (once those types route through the arena). For now
+            // they're never arena-allocated, so the early-return
+            // on `flags` covers them.
+            _ => val,
+        }
+    }
+
+    /// No-op on wasm: no fiber arenas, no Value ever has
+    /// `FLAG_ARENA_ALLOCATED` set, so the barrier is unreachable.
+    #[cfg(not(feature = "host"))]
+    pub unsafe fn escape_to_gc_if_arena(&mut self, val: Value) -> Value {
+        val
     }
 
     /// Write to output (captured buffer if set, otherwise stdout).

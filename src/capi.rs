@@ -379,6 +379,17 @@ pub unsafe extern "C" fn wlift_aot_init_prelude(
     unsafe {
         (*vm).krio_fiber_active = true;
     }
+    // Publish the VM pointer to the per-thread `CURRENT_VM` slot so
+    // foreign-method handlers (notably `try_krio_call` / `try_krio_yield`)
+    // can recover it without it being threaded through every call.
+    // The BC interpreter sets this from `run_fiber`, but the AOT path
+    // calls the body directly — without setting it here, the host-side
+    // `vm.fiber` swap inside `try_krio_call` is silently skipped (the
+    // null-`vm_ptr` else branch), so the body's own `vm.fiber = target`
+    // assignment leaks out and the next allocation routes through the
+    // wrong fiber's arena.
+    #[cfg(feature = "host")]
+    crate::runtime::vm::__set_thread_local_current_vm(vm as *mut crate::runtime::vm::VM);
     let vm_ref = unsafe { &*vm };
     for (i, name) in crate::sema::PRELUDE_NAMES.iter().enumerate() {
         if i >= modvars_count {

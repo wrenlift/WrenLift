@@ -585,7 +585,19 @@ unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
         // silently — leaving the Box drop here makes the unmap
         // happen now, surfacing any caller's stale pointer on its
         // next access.
-        (*target).region = None;
+        //
+        // DEBUG TOGGLE: setting `WLIFT_FIBER_ARENA_HOLD=1` keeps
+        // the region attached to the dead `ObjFiber` until the GC
+        // reaps the fiber itself. Used during Phase 2 escape-
+        // barrier development to isolate "this is an escape that
+        // I missed" from "the drop point is wrong" — if holding
+        // the region cures a crash, the bug is a missed barrier
+        // somewhere; if it doesn't, the bug is elsewhere.
+        if std::env::var_os("WLIFT_FIBER_ARENA_HOLD").is_some_and(|v| v == "1") {
+            // Hold — let the ObjFiber's eventual GC sweep drop it.
+        } else {
+            (*target).region = None;
+        }
     }
 }
 
@@ -681,7 +693,23 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             unsafe {
                 (*target).state = FiberState::Suspended;
             }
-            v
+            // Escape barrier: if the child yielded a value that
+            // points into its own region (Suspended fibers keep
+            // their region alive across yields, so the strict
+            // "region will drop" condition doesn't apply here yet
+            // — but the parent might suspend US too before resuming
+            // the child, by which point the child may have been
+            // reaped). Copying is also forward-compatible with the
+            // Phase 2.5 escape paths for List / Map.
+            //
+            // No-op when the arena feature is off or the child
+            // didn't use it for this Value (early-return on the
+            // FLAG_ARENA_ALLOCATED check inside the helper).
+            if !vm_ptr.is_null() {
+                unsafe { (*vm_ptr).escape_to_gc_if_arena(v) }
+            } else {
+                v
+            }
         }
         krio_fiber::FiberStep::Done => {
             // The body stashed the closure's last-expression value
@@ -712,6 +740,16 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             } else {
                 stored
             };
+            // Escape barrier (the critical case): we're about to
+            // drop the child's region in `release_fiber_resources`.
+            // If `v` points into that region, the parent would be
+            // left with a dangling pointer. Deep-copy to the GC
+            // heap first.
+            let v = if !vm_ptr.is_null() {
+                unsafe { (*vm_ptr).escape_to_gc_if_arena(v) }
+            } else {
+                v
+            };
             unsafe {
                 release_fiber_resources(target, FiberState::Done);
                 (*target).krio_return_value = Value::null();
@@ -719,6 +757,20 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             v
         }
         krio_fiber::FiberStep::Errored => {
+            // Escape barrier: the `(*target).error` Value may live
+            // in the child's region — same dangling-pointer hazard
+            // as the Done arm. Copy out before the region drops.
+            // `release_fiber_resources` clears the error slot
+            // separately, so we have to read + copy here, then
+            // re-store the GC-heap copy onto the target before the
+            // region releases.
+            if !vm_ptr.is_null() {
+                let err = unsafe { (*target).error };
+                let err = unsafe { (*vm_ptr).escape_to_gc_if_arena(err) };
+                unsafe {
+                    (*target).error = err;
+                }
+            }
             unsafe {
                 release_fiber_resources(target, FiberState::Error);
             }
