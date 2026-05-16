@@ -527,13 +527,30 @@ impl VM {
             last_error: None,
             loading_modules: HashSet::new(),
             gc_requested: false,
-            // Native (host) fibers always run on krio backings; the
-            // legacy stackless dispatch only fires for the BC interp's
-            // own scheduling needs. `WLIFT_KRIO_FIBER=0` opts back out
-            // for regression testing; nothing else should set it.
+            // krio (stackful fiber) backings are required by the
+            // AOT path — they replace the stackless state-machine
+            // MIR transform that previously implemented Wren's
+            // `Fiber.yield`. The AOT install path flips this on at
+            // module-startup time via the dedicated entry point.
+            // Tiered / JIT / interpreter modes don't need krio:
+            // Wren-side fiber state lives in `ObjFiber.mir_frames`
+            // (heap), so the legacy stackless dispatch handles
+            // `Fiber.yield` without the per-fiber mmap'd stack.
+            //
+            // Default to OFF. Krio-on-by-default regressed the
+            // tiered hatch-site path with a malloc SIGABRT in
+            // `vm_interp::run_fiber_with_stop_depth`'s `Vec<Value>`
+            // drop — the GC's native-stack walker treats a stale
+            // return address (left on a krio stack across a fiber
+            // yield) as a Cranelift safepoint, applies that
+            // function's spill offsets to an unrelated frame
+            // pointer, and writes Wren Value bits into a Rust
+            // local's `data_ptr` field. AOT bodies opt in via
+            // `WLIFT_KRIO_FIBER=1`; production deployments that
+            // need the AOT path set it explicitly.
             #[cfg(feature = "host")]
-            krio_fiber_active: !std::env::var_os("WLIFT_KRIO_FIBER")
-                .is_some_and(|v| v == "0" || v.is_empty()),
+            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
+                .is_some_and(|v| v == "1"),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),

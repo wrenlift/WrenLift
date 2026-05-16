@@ -367,6 +367,18 @@ pub unsafe extern "C" fn wlift_aot_init_prelude(
     if vm.is_null() || modvars.is_null() {
         return 70;
     }
+    // Flip on the krio-fiber backing. AOT bodies' `Fiber.yield`
+    // path requires stackful fibers (the legacy stackless state-
+    // machine MIR transform was retired for native AOT in commit
+    // b5fc505). `VM::new`'s default is off, which is correct for
+    // tiered / JIT / interpreter modes — those have the legacy
+    // stackless dispatch and don't need per-fiber mmap'd stacks.
+    // The AOT bootstrap fires `wlift_aot_init_prelude` once per
+    // module before any user code runs, so enabling here is the
+    // earliest safe point.
+    unsafe {
+        (*vm).krio_fiber_active = true;
+    }
     let vm_ref = unsafe { &*vm };
     for (i, name) in crate::sema::PRELUDE_NAMES.iter().enumerate() {
         if i >= modvars_count {

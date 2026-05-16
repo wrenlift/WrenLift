@@ -926,6 +926,45 @@ impl Gc {
         {
             wlift_alloc::pressure_release();
         }
+        // System-allocator pressure relief. Sweep just freed a batch
+        // of `ObjList` / `ObjMap` / `ObjString` heap allocations via
+        // libc `free`, but libsystem_malloc keeps the underlying
+        // pages reserved on macOS' default zone — the page-level
+        // `madvise(MADV_FREE_REUSABLE)` step only fires when we
+        // explicitly call `malloc_zone_pressure_relief`. Without
+        // this, sustained AOT request traffic shows footprint
+        // growing 2-3 MB/sec for the first few minutes (until the
+        // working set saturates the allocator's free pool), even
+        // though RSS oscillates as live data is reclaimed. Linux
+        // glibc gets the equivalent via `malloc_trim`. Both calls
+        // are best-effort — on musl and other allocators they're
+        // no-ops, which is fine; the underlying allocator stays
+        // responsible for its own pressure handling.
+        #[cfg(all(feature = "host", not(feature = "wlift_alloc"), target_os = "macos"))]
+        {
+            unsafe extern "C" {
+                fn malloc_zone_pressure_relief(
+                    zone: *mut std::ffi::c_void,
+                    goal: usize,
+                ) -> usize;
+            }
+            unsafe {
+                let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+            }
+        }
+        #[cfg(all(
+            feature = "host",
+            not(feature = "wlift_alloc"),
+            target_os = "linux"
+        ))]
+        {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> std::ffi::c_int;
+            }
+            unsafe {
+                let _ = malloc_trim(0);
+            }
+        }
 
         self.stats.major_collections += 1;
         self.minor_since_major = 0;

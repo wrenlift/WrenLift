@@ -524,6 +524,40 @@ pub fn current_vm_krio_active(vm: &crate::runtime::vm::VM) -> bool {
     vm.krio_fiber_active
 }
 
+/// Set a fiber to its terminal state (Done / Error) and drop the
+/// expensive per-fiber state the runtime no longer needs.
+///
+/// `krio_fiber` owns a 256 KiB-1 MiB mmap'd stack; under AOT mode
+/// the `finish_alloc` safepoint is a no-op so GC may not fire for
+/// minutes (or until catalog refresh's explicit `System.gc()`
+/// 5-minute cadence), and the ObjFiber that owns the krio Box stays
+/// pinned until then. Sustained request traffic on the hatch site
+/// otherwise accumulated ~6 VM_ALLOCATE regions per nav with no
+/// recovery — visible as monotonic footprint growth.
+///
+/// `mir_frames`, `stack`, and `frames` are the Wren-side register
+/// files and call-frame metadata; their `Vec<Value>` buffers also
+/// linger on libsystem_malloc's free list with the page kept
+/// resident until the next pressure relief, which on macOS only
+/// happens at major-GC boundaries. Clearing them eagerly returns
+/// those Vecs' backing storage to the allocator now.
+///
+/// Safe to call when the krio body has returned (its trampoline
+/// has unwound the per-fiber stack) and the fiber is transitioning
+/// to a terminal state where no further code will read those
+/// fields. The remaining `ObjFiber` shell is small (≈few hundred
+/// bytes) and is reaped by a later GC pass.
+#[cfg(feature = "host")]
+unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
+    unsafe {
+        (*target).state = terminal;
+        (*target).krio_fiber = None;
+        (*target).mir_frames = Vec::new();
+        (*target).stack = Vec::new();
+        (*target).frames = Vec::new();
+    }
+}
+
 fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // Establish that target has a krio backing before we start
     // doing any save/restore work. Early-return None lets the
@@ -648,14 +682,14 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
                 stored
             };
             unsafe {
-                (*target).state = FiberState::Done;
+                release_fiber_resources(target, FiberState::Done);
                 (*target).krio_return_value = Value::null();
             }
             v
         }
         krio_fiber::FiberStep::Errored => {
             unsafe {
-                (*target).state = FiberState::Error;
+                release_fiber_resources(target, FiberState::Error);
             }
             Value::null()
         }
