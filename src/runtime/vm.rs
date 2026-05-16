@@ -355,6 +355,22 @@ pub struct VM {
     #[cfg(feature = "host")]
     pub krio_fiber_active: bool,
 
+    /// Use per-fiber bump-allocator regions for short-lived Wren
+    /// allocations (`wren_make_string`, eventually `wren_make_list`
+    /// + `wren_make_map`). When on, every fiber gets an
+    /// `Option<Box<Region>>` attached at construction; allocations
+    /// route to the region first, and the region drops in
+    /// `release_fiber_resources` when the fiber terminates. Off by
+    /// default until the escape barriers are wired across every
+    /// path that lets a Value cross fiber boundaries (cache stores,
+    /// channel publishes, foreign-method returns). Enable with
+    /// `WLIFT_FIBER_ARENA=1`.
+    ///
+    /// Read once at VM construction so per-allocation checks are a
+    /// plain bool field, mirroring `krio_fiber_active`.
+    #[cfg(feature = "host")]
+    pub fiber_arena_active: bool,
+
     // (Earlier iterations used a side-table `krio_backed_fibers`
     // here, but it accumulated dangling pointers after the GC
     // swept short-lived fibers. Pass 3 now enumerates via
@@ -550,6 +566,12 @@ impl VM {
             // need the AOT path set it explicitly.
             #[cfg(feature = "host")]
             krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
+                .is_some_and(|v| v == "1"),
+            // Per-fiber arena. Off by default — see field comment
+            // for the escape-barrier requirements that gate flipping
+            // the default on. `WLIFT_FIBER_ARENA=1` opts in.
+            #[cfg(feature = "host")]
+            fiber_arena_active: std::env::var_os("WLIFT_FIBER_ARENA")
                 .is_some_and(|v| v == "1"),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
@@ -2325,7 +2347,47 @@ impl VM {
 
     // -- Helpers for core library primitives --
 
-    /// Allocate a GC-managed string and return it as a Value.
+    /// Allocate a string. When `WLIFT_FIBER_ARENA=1` and the
+    /// currently active fiber owns a `Region`, the `ObjString` is
+    /// placed in the region — every page the region holds is
+    /// released by `munmap` in `release_fiber_resources` when the
+    /// fiber terminates, no GC consultation required. Otherwise
+    /// (the default), allocation falls back to the GC heap.
+    ///
+    /// The region's `try_alloc` registers an `ObjString` `Drop` in
+    /// the region's destructor list so the `String`'s libc-heap
+    /// bytes are freed before the region's pages are unmapped.
+    #[cfg(feature = "host")]
+    pub fn new_string(&mut self, s: String) -> Value {
+        if self.fiber_arena_active && !self.fiber.is_null() {
+            // Safety: `self.fiber` is the VM-owned currently active
+            // fiber pointer. While we hold `&mut self`, no other
+            // borrow of the fiber exists. The region (if present)
+            // lives inside the ObjFiber and stays valid for the
+            // fiber's lifetime.
+            if let Some(region) = unsafe { (*self.fiber).region.as_deref_mut() } {
+                if let Some(ptr) = region.try_alloc(ObjString::new(s.clone())) {
+                    unsafe {
+                        (*ptr).header.class = self.string_class;
+                    }
+                    return Value::object(ptr as *mut u8);
+                }
+                // Region cap exceeded — fall through to the GC heap.
+                // `s` was cloned above so it's still usable.
+            }
+        }
+        let obj = self.gc.alloc_string(s);
+        unsafe {
+            (*obj).header.class = self.string_class;
+        }
+        Value::object(obj as *mut u8)
+    }
+
+    /// Non-host builds (wasm): the runtime has no fiber arenas —
+    /// always allocate in the GC heap. Kept as a separate cfg arm
+    /// rather than a runtime branch so the wasm bundle drops the
+    /// dead `wlift_region` import entirely.
+    #[cfg(not(feature = "host"))]
     pub fn new_string(&mut self, s: String) -> Value {
         let obj = self.gc.alloc_string(s);
         unsafe {
@@ -3693,6 +3755,10 @@ impl NativeContext for VM {
     #[cfg(feature = "host")]
     fn krio_fiber_active(&self) -> bool {
         self.krio_fiber_active
+    }
+    #[cfg(feature = "host")]
+    fn fiber_arena_active(&self) -> bool {
+        self.fiber_arena_active
     }
     // register_krio_fiber is left as the trait default no-op;
     // Pass 3 now enumerates via GcImpl::for_each_fiber instead of

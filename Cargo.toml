@@ -13,6 +13,7 @@ members = [
     "wasm",
     "crates/wlift_lsp",
     "crates/wlift_alloc",
+    "crates/wlift_region",
 ]
 resolver = "2"
 
@@ -62,6 +63,7 @@ host = [
     "dep:rand_core",
     "dep:mimalloc",
     "dep:krio-fiber",
+    "dep:wlift_region",
 ]
 # Pull in wlift_alloc as the process's `#[global_allocator]`. The
 # wlift binary opts in via `required-features = ["wlift_alloc"]`;
@@ -178,6 +180,16 @@ krio-fiber = { git = "https://github.com/darmie/krio.git", rev = "e61bca9da7b7f6
 # `wlift_malloc` / `wlift_free` C ABI for cross-FFI buffers, but
 # they don't install it as a global allocator.
 wlift_alloc = { path = "crates/wlift_alloc", optional = true }
+
+# Per-fiber bump-allocator regions. Pulled in by the `host`
+# feature; the runtime decides at fiber-construction time whether
+# to actually create a region (gated on `WLIFT_FIBER_ARENA=1` env
+# var until the design has settled). When the region is present,
+# `wren_make_string` (and later `wren_make_list` / `wren_make_map`)
+# tries the arena before the GC heap; the arena drops when the
+# fiber transitions to a terminal state, freeing every allocation
+# the fiber made without consulting the GC.
+wlift_region = { path = "crates/wlift_region", optional = true }
 
 # Wasm-specific: getrandom needs the `js` feature on wasm32-unknown-
 # unknown so `rand` can pull entropy from `crypto.getRandomValues`.

@@ -1124,6 +1124,24 @@ pub struct ObjFiber {
     #[cfg(feature = "host")]
     pub krio_fiber: Option<Box<krio_fiber::Fiber>>,
 
+    /// Per-fiber bump-allocator region. Allocations made by the
+    /// fiber (via `wren_make_string` / `wren_make_list` / etc.) route
+    /// here first instead of the GC heap; the region drops in
+    /// `release_fiber_resources` when the fiber transitions to a
+    /// terminal state, releasing every allocation in one
+    /// `munmap`-per-page sweep — no GC walk, no Cranelift stack
+    /// maps consulted.
+    ///
+    /// `None` unless `WLIFT_FIBER_ARENA=1` was set at VM
+    /// construction. Off by default until the escape-barrier
+    /// discipline (cross-fiber field writes, foreign-method
+    /// returns, caches that outlive the fiber) is wired across
+    /// every runtime path. Boxed for a stable address — the
+    /// allocator handing out interior pointers can't tolerate the
+    /// `ObjFiber` itself moving during GC.
+    #[cfg(feature = "host")]
+    pub region: Option<Box<wlift_region::Region>>,
+
     /// Final return value of a krio-backed fiber's body. Written by
     /// the krio body closure just before it returns; read by
     /// `try_krio_call` on `FiberStep::Done` to surface the closure's
@@ -1194,6 +1212,8 @@ impl ObjFiber {
             aot_active_depth: 0,
             #[cfg(feature = "host")]
             krio_fiber: None,
+            #[cfg(feature = "host")]
+            region: None,
             #[cfg(feature = "host")]
             krio_return_value: Value::null(),
             #[cfg(feature = "host")]
@@ -1437,6 +1457,14 @@ pub trait NativeContext {
     /// `fiber_new` checks this to decide whether to allocate a
     /// krio-fiber backing for the new fiber.
     fn krio_fiber_active(&self) -> bool {
+        false
+    }
+    /// `true` when `WLIFT_FIBER_ARENA` was set at VM construction.
+    /// `fiber_new` checks this to decide whether to attach a
+    /// per-fiber `wlift_region::Region` to the new fiber so that
+    /// short-lived Wren allocations made during the fiber's
+    /// execution bypass the GC heap.
+    fn fiber_arena_active(&self) -> bool {
         false
     }
     /// Register `fiber` as a krio-backed fiber the GC walker

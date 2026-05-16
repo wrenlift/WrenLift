@@ -6588,6 +6588,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlift_region"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "wlift_sqlite"
 version = "0.1.6"
 dependencies = [
@@ -6680,6 +6687,7 @@ dependencies = [
  "wasmtime-wasi",
  "web-time",
  "wlift_alloc",
+ "wlift_region",
  "zip",
  "zstd",
 ]

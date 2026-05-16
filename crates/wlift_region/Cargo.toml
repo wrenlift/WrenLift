@@ -1,0 +1,12 @@
+[package]
+name = "wlift_region"
+version = "0.1.0"
+edition = "2021"
+description = "Bump-allocator regions for short-lived per-fiber allocations in the WrenLift runtime."
+
+[lib]
+name = "wlift_region"
+path = "src/lib.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

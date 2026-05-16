@@ -191,6 +191,26 @@ fn fiber_new_inner(
                 }
             }
 
+            // Per-fiber bump-allocator region: short-lived
+            // allocations (Wren strings/lists/maps) made inside
+            // this fiber route through the region instead of the
+            // GC heap. `release_fiber_resources` (in
+            // `try_krio_call`'s Done arm) drops the region, freeing
+            // every page in one `munmap` per page — no GC walk,
+            // no Cranelift stack-map consultation, no
+            // libsystem_malloc free-list residue. Off unless
+            // `WLIFT_FIBER_ARENA=1` was set at VM construction;
+            // the routing is also a no-op when `region` is `None`
+            // so the GC heap stays the supported default until
+            // the escape barriers (cross-fiber field writes,
+            // cache stores, etc.) are wired across every path.
+            #[cfg(feature = "host")]
+            if ctx.fiber_arena_active() {
+                unsafe {
+                    (*fiber).region = Some(Box::new(wlift_region::Region::new()));
+                }
+            }
+
             // Populate the child's context map (allocates) only if parent
             // had entries. Keeps the zero-context case allocation-free.
             if !parent_ctx_entries.is_empty() {
@@ -555,6 +575,17 @@ unsafe fn release_fiber_resources(target: *mut ObjFiber, terminal: FiberState) {
         (*target).mir_frames = Vec::new();
         (*target).stack = Vec::new();
         (*target).frames = Vec::new();
+        // Drop the bump-allocator region last. By this point the
+        // fiber's `mir_frames` and `stack` have been cleared, so
+        // any remaining region-allocated Value with a Wren-side
+        // reference would have to come from a caller that crossed
+        // the fiber boundary without going through the escape
+        // barrier. That's a bug and we'd rather find it via a
+        // post-drop dangling-pointer crash in tests than ship it
+        // silently — leaving the Box drop here makes the unmap
+        // happen now, surfacing any caller's stale pointer on its
+        // next access.
+        (*target).region = None;
     }
 }
 
