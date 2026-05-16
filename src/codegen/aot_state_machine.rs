@@ -1021,9 +1021,42 @@ pub fn transform_to_state_machine(
                     }
                 }
                 if let Some(kind) = layout.block_kinds.get(orig) {
+                    // Result fresh-remap rule:
+                    //
+                    // The call's runtime return is bound into
+                    // `val_map[result]` by the Resume block's
+                    // CrossFnCallResume lowering (the `val_map.insert(
+                    // result, ret)` in `'cross_fn_resume`). For Init
+                    // blocks that share a *non-cloned* Resume, the
+                    // clone funnels into the same Resume binding;
+                    // allocating a fresh result vid here leaves the
+                    // clone's body referencing a ValueId that no
+                    // Resume ever binds. Symptom: "undefined value
+                    // vN" verifier failures on multi-clone Init
+                    // funnels (closure_11 in @hatch:web hit this on
+                    // an iterator-over-map pattern with the iter call
+                    // tainted via call(N)).
+                    //
+                    // Allocate fresh result vid only when the paired
+                    // Resume is *also* cloned (so the clone has its
+                    // own Resume → own val_map[result] binding).
+                    // CrossFnCallResume itself is always cloned with
+                    // a fresh result so its load-scope stays disjoint
+                    // from other Resumes' load scopes (same reason
+                    // each Resume's load fresh-vids are disjoint).
                     let result_opt = match kind {
-                        BlockKind::CrossFnCallInit { result, .. }
-                        | BlockKind::CrossFnCallResume { result, .. } => Some(*result),
+                        BlockKind::CrossFnCallInit {
+                            result,
+                            resume_check_block,
+                            ..
+                        } => {
+                            if clones.contains_key(resume_check_block) {
+                                Some(*result)
+                            } else {
+                                None
+                            }
+                        }
+                        BlockKind::CrossFnCallResume { result, .. } => Some(*result),
                         BlockKind::DirectYield => None,
                     };
                     if let Some(r) = result_opt {
@@ -1124,6 +1157,72 @@ pub fn transform_to_state_machine(
                     layout.direct_yield_results.insert(*clone, map_v_arg(dst));
                 }
             }
+        }
+    }
+
+    // Post-pass: prune blocks unreachable from any resume entry.
+    //
+    // The clone walker can leave orphan blocks behind in two
+    // situations:
+    //
+    // 1. A block was cloned by yield N (with yield N's remap baked
+    //    in), but no edge actually reaches the clone — yield N's
+    //    redirect chain stopped at a different intermediate. The
+    //    clone references yield N's fresh load vids, which are
+    //    bound only at yield N's resume entry's prologue. Since
+    //    the orphan is unreachable, its uses are never satisfied —
+    //    but Cranelift's RPO walker still lowers it, and the
+    //    verifier rejects with "undefined value vN in terminator".
+    //
+    // 2. The original yielding block has been split (its terminator
+    //    is now `Return(yield_value)`), so its post-yield successors
+    //    are unreachable through the original block. They survive
+    //    only as the parent of any clones built off them. If the
+    //    cloning process didn't pick up every path, the original
+    //    post-yield block stays in `mir.blocks` with no live
+    //    predecessors.
+    //
+    // Both cases produce the same symptom: orphan blocks with stale
+    // ValueId references. Replacing their bodies with a single
+    // `Unreachable` terminator removes all such references — the
+    // Cranelift lowering emits a `trap` for `Terminator::Unreachable`,
+    // which doesn't consult val_map, so the verifier is satisfied.
+    //
+    // We compute reachability forward from every resume entry (the
+    // dispatcher's br_table targets are the only entry points at
+    // runtime — `bb0` itself is `resume_entries[0]`).
+    {
+        use std::collections::HashSet;
+        let mut reachable: HashSet<BlockId> = HashSet::new();
+        let mut stack: Vec<BlockId> = layout.resume_entries.clone();
+        let n = mir.blocks.len();
+        while let Some(b) = stack.pop() {
+            if !reachable.insert(b) {
+                continue;
+            }
+            if (b.0 as usize) < n {
+                for s in mir.blocks[b.0 as usize].terminator.successors() {
+                    stack.push(s);
+                }
+            }
+        }
+        for (i, blk) in mir.blocks.iter_mut().enumerate() {
+            let bid = BlockId(i as u32);
+            if reachable.contains(&bid) {
+                continue;
+            }
+            // Orphan. Replace body + terminator with a trap-equivalent
+            // Unreachable, drop any layout metadata so the lowering
+            // doesn't try to consult it.
+            blk.instructions.clear();
+            blk.params.clear();
+            blk.terminator = Terminator::Unreachable;
+            layout.yield_blocks.remove(&bid);
+            layout.yield_saves.remove(&bid);
+            layout.resume_loads.remove(&bid);
+            layout.block_kinds.remove(&bid);
+            layout.direct_yield_results.remove(&bid);
+            layout.cross_fn_results.remove(&bid);
         }
     }
 
