@@ -446,6 +446,18 @@ fn compute_reachable_archive_modules(
 /// import on its own line, so a line-by-line scan is enough; the
 /// archive walker doesn't need full parser fidelity here, just the
 /// names to drive the reachability BFS.
+///
+/// Bundle module names are normalised: `collect_wren_files` joins
+/// path components with `.` and drops the `.wren` suffix, so
+/// `lib/catalog.wren` ships as the module `lib.catalog`. User
+/// source uses relative-path imports (`import "./lib/catalog"`),
+/// so we apply the same normalisation here — strip the leading
+/// `./` and replace `/` with `.` — to keep the reachability BFS
+/// against the bundled `sources` map honouring the published
+/// shape. Without this, every relative-path import to a sibling
+/// module fails the reachability check; the AOT walker silently
+/// drops the imported module, and the runtime falls back to the
+/// BC interpreter for its methods (bypassing the SM transform).
 fn extract_archive_imports(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in src.lines() {
@@ -466,10 +478,34 @@ fn extract_archive_imports(src: &str) -> Vec<String> {
             continue;
         };
         if let Some(end) = rest.find('"') {
-            out.push(rest[..end].to_string());
+            let raw = &rest[..end];
+            out.push(normalize_archive_import_name(raw));
         }
     }
     out
+}
+
+/// Map an import string (as written in source) to the bundled
+/// module-name shape (`lib.catalog`). Bare names — `@hatch:web`,
+/// `examples.chat` — pass through untouched. Relative path forms
+/// (`./lib/catalog`, `lib/catalog`, `lib/catalog.wren`) get the
+/// leading `./` and trailing `.wren` stripped and `/` replaced
+/// with `.`. `../` segments are left in place — the archive
+/// walker treats `..` as a literal component, matching what
+/// `collect_wren_files`'s relative path produces for siblings
+/// across `../`.
+fn normalize_archive_import_name(raw: &str) -> String {
+    if raw.starts_with('@') || raw.contains(':') {
+        return raw.to_string();
+    }
+    let mut s = raw.to_string();
+    if let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    if let Some(rest) = s.strip_suffix(".wren") {
+        s = rest.to_string();
+    }
+    s.replace('/', ".")
 }
 
 /// Test-only re-exports for sibling AOT crates. Real consumers

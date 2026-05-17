@@ -1945,6 +1945,26 @@ pub fn call_closure_jit_or_sync(
                 if !fn_ptr.is_null() && !vm.fiber.is_null() {
                     let fiber = vm.fiber;
                     let saved_depth = unsafe { (*fiber).aot_active_depth };
+                    // Detect whether the caller is itself running
+                    // inside a state-machine poll. The caller is
+                    // SM if `aot_frames` already holds at least
+                    // one frame; an empty frame stack means we're
+                    // called from a non-SM context — typically the
+                    // top-level AOT body running on the host stack.
+                    //
+                    // The distinction matters for yield handling:
+                    //   * SM caller → propagate kind=Yield up via
+                    //     `pending_fiber_action`. The caller's own
+                    //     poll fn surfaces a matching kind=Yield to
+                    //     ITS caller and so on until the outermost
+                    //     driver picks it up.
+                    //   * Non-SM caller → no driver above us. The
+                    //     yield can't unwind through the host stack,
+                    //     so we busy-resume the poll until it
+                    //     reaches kind=Done. Matches the krio
+                    //     wrapper's behaviour for top-level Wren
+                    //     fibers: yield + immediate-resume.
+                    let caller_is_sm = unsafe { !(*fiber).aot_frames.is_empty() };
                     unsafe {
                         (*fiber)
                             .aot_frames
@@ -1964,13 +1984,6 @@ pub fn call_closure_jit_or_sync(
                             crate::capi::wlift_aot_sm_save_arg(fiber, i as u64, a.to_bits());
                         }
                     }
-                    // Resume value is null on the first invocation
-                    // (state == 0); subsequent re-entries from the
-                    // outer fiber driver come back through this
-                    // path with the value the resumer threaded in,
-                    // but for that case the SM body re-reads its
-                    // saved args anyway.
-                    let resume_v = Value::null().to_bits();
                     mutate_jit_ctx(|ctx| {
                         if ctx.vm.is_null() {
                             ctx.vm = vm as *mut _ as *mut u8;
@@ -1983,33 +1996,54 @@ pub fn call_closure_jit_or_sync(
                     });
                     let poll: extern "C" fn(*mut crate::runtime::object::ObjFiber, u64) -> u64 =
                         unsafe { std::mem::transmute(fn_ptr) };
-                    let ret_bits = poll(fiber, resume_v);
-                    let kind = crate::capi::wlift_aot_sm_take_poll_kind();
+
+                    // Initial resume value is null (state == 0);
+                    // re-entries from busy-resume below thread the
+                    // previous yield's value back as the resume_v.
+                    let mut resume_v = Value::null().to_bits();
+                    let final_ret_bits = loop {
+                        let ret_bits = poll(fiber, resume_v);
+                        let kind = crate::capi::wlift_aot_sm_take_poll_kind();
+                        if kind == crate::capi::AotSmPollKind::Yield {
+                            if caller_is_sm {
+                                // Propagate up — outer SM driver
+                                // re-enters us on resume.
+                                unsafe {
+                                    (*fiber).aot_active_depth = saved_depth;
+                                }
+                                restore_rooted_jit_context(
+                                    saved_ctx,
+                                    saved_ctx_root_len,
+                                );
+                                let yield_val = Value::from_bits(ret_bits);
+                                vm.pending_fiber_action =
+                                    Some(crate::runtime::vm::FiberAction::Yield {
+                                        value: yield_val,
+                                    });
+                                return Value::null().to_bits();
+                            }
+                            // Non-SM caller: busy-resume. Thread
+                            // the yielded value back as resume_v so
+                            // Wren `var x = Fiber.yield(...)` sees
+                            // its own argument round-trip. Matches
+                            // the krio wrapper's
+                            // `FiberStep::Yielded => continue` arm.
+                            resume_v = ret_bits;
+                            continue;
+                        }
+                        break ret_bits;
+                    };
                     unsafe {
                         (*fiber).aot_active_depth = saved_depth;
                     }
                     restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
-                    if kind == crate::capi::AotSmPollKind::Yield {
-                        // Yield: surface to the BC interp's
-                        // pending_fiber_action loop so the
-                        // running fiber suspends. The handle
-                        // path on the next dispatch boundary
-                        // unwinds back to the fiber's caller.
-                        let yield_val = Value::from_bits(ret_bits);
-                        vm.pending_fiber_action =
-                            Some(crate::runtime::vm::FiberAction::Yield { value: yield_val });
-                        return Value::null().to_bits();
-                    }
-                    // Done: leave the child frame on the stack
-                    // (the SM transform writes its result via
-                    // `wlift_aot_sm_done(fiber)`, which is what
-                    // the caller's continuation reads).
+                    // Done: pop the child frame.
                     unsafe {
                         if !(*fiber).aot_frames.is_empty() {
                             (*fiber).aot_frames.pop();
                         }
                     }
-                    return ret_bits;
+                    return final_ret_bits;
                 }
             }
         }
