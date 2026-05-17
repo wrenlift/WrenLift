@@ -222,12 +222,91 @@ impl std::fmt::Display for StateMachineError {
 
 impl std::error::Error for StateMachineError {}
 
+/// A single yield site, recorded during the planning pass before
+/// any liveness, slot allocation, or cloning runs. Holds the post-
+/// split block ids plus the call's metadata (yield value, cross-fn
+/// receiver/args/result, etc.). Phase 2 fills in `saves` / `loads`
+/// after liveness; phase 3 uses both for the per-clone remap.
+#[derive(Debug, Clone)]
+struct YieldPlan {
+    /// Block that ended in the suspension Call. After Phase 1's
+    /// split, terminator is `Return(yield_value)` (DirectYield) or
+    /// `Branch(call_check_block)` (CrossFnCall).
+    yielding_block: BlockId,
+    /// Block the dispatcher's `br_table` lands on for state == K.
+    /// DirectYield: the post-split tail. CrossFnCall: the synthetic
+    /// `call_check_block`.
+    resume_block: BlockId,
+    /// 1-indexed state id (state 0 = bb0 / initial entry).
+    state_id: u32,
+    /// Per-kind metadata captured before the split.
+    kind: YieldPlanKind,
+    /// Live-across saves (filled in Phase 2). `(slot, orig_vid)`
+    /// pairs; the slot is unique within this function.
+    saves: Vec<(u32, ValueId)>,
+    /// Paired loads for the resume entry (filled in Phase 2).
+    /// `(slot, fresh_vid)`; downstream uses of `orig_vid` get
+    /// remapped to `fresh_vid` along paths through this yield.
+    loads: Vec<(u32, ValueId)>,
+}
+
+#[derive(Debug, Clone)]
+enum YieldPlanKind {
+    DirectYield {
+        /// The value `Fiber.yield(_)` returns to the caller.
+        /// Kept in metadata for completeness; the planning pass
+        /// has already written it as the yielding block's
+        /// `Return(yield_value)` terminator.
+        #[allow(dead_code)]
+        yield_value: ValueId,
+        /// The Call's destination ValueId (i.e. `var x = Fiber.yield(...)`
+        /// binds `x` here). Backend rebinds this to `resume_v` at the
+        /// resume block's entry.
+        result: ValueId,
+    },
+    CrossFnCall {
+        /// The synthetic call-check block (also the br_table target).
+        call_check_block: BlockId,
+        /// The post-call tail block — call_check's MIR Branch target.
+        done_block: BlockId,
+        receiver: ValueId,
+        args: Vec<ValueId>,
+        result: ValueId,
+        method_sym: SymbolId,
+    },
+}
+
 /// Run the transform. Mutates `mir` in place: blocks containing
 /// suspension Calls get split; new "resume" blocks are appended;
 /// yield Calls are removed and replaced with a `Return(value)`
 /// where `value` is the yield argument (the value the caller
 /// observes). The returned `StateMachineLayout` carries the
 /// per-state mapping the AOT lowering needs.
+///
+/// The transform is a four-phase pipeline:
+///
+/// 1. **Plan**: walk MIR, find every suspension Call. Split the
+///    block at each call. For CrossFnCall, allocate the synthetic
+///    call_check block and re-route. Record a `YieldPlan` per
+///    site with the post-split block ids + per-kind metadata. No
+///    liveness, no slot allocation, no remap, no cloning.
+///
+/// 2. **Liveness + slot allocation**: now that every block split
+///    is done, compute `live_in` at each resume block. The live
+///    set = saved values for that yield. Allocate slots + fresh
+///    load vids per yield.
+///
+/// 3. **Path-sensitive cloning**: forward dataflow over the post-
+///    split MIR computes the set of distinct reaching substitution
+///    maps at each block. A block reached by N distinct subs maps
+///    is cloned N-1 times; each clone gets its own remap applied.
+///    Predecessor edges are redirected to the matching clone.
+///
+/// 4. **Layout metadata mirror + orphan prune**: populate
+///    `StateMachineLayout` for the original yielding/resume blocks
+///    and mirror onto every clone. Unreachable blocks (originals
+///    whose predecessors all redirected away) get replaced with
+///    `Unreachable` to remove stale ValueId references.
 ///
 /// A function with zero suspension Calls returns a layout with a
 /// single `resume_entries[0]` and no yield blocks — the AOT
@@ -237,17 +316,57 @@ pub fn transform_to_state_machine(
     mir: &mut MirFunction,
     interner: &Interner,
     // Whole-program tainted method-name set. Calls to methods
-    // in this set are treated as cross-fn suspensions in
-    // addition to direct `Fiber.yield(_)`. v2-cap1 / cap-2
-    // callers can pass an empty set and only direct yields
-    // will be recognised as suspensions.
+    // in this set are treated as cross-fn suspensions in addition
+    // to direct `Fiber.yield(_)`. Callers can pass an empty set
+    // and only direct yields will be recognised as suspensions.
     tainted_names: &std::collections::HashSet<String>,
 ) -> Result<StateMachineLayout, StateMachineError> {
-    // First, find every suspension call site as (block_id,
-    // instruction_index). Walk in block order; instructions
-    // inside a block are split sequentially (the second yield in
-    // a block becomes "first yield in the new block we just
-    // split off"), so we re-scan after each split.
+    // ===== Phase 1: PLAN =====
+    //
+    // Walk MIR; find every suspension Call; split at each call;
+    // record a YieldPlan per site. No liveness, no slot allocation,
+    // no remap, no cloning yet. After this phase, the MIR has the
+    // final CFG structure (modulo the per-clone duplication done
+    // in Phase 3) and every YieldPlan knows its yielding_block
+    // and resume_block.
+    let mut plans: Vec<YieldPlan> = Vec::new();
+    plan_yields(mir, interner, tainted_names, &mut plans)?;
+
+    // ===== Phase 2: LIVENESS + SLOT ALLOCATION =====
+    //
+    // For each plan's resume_block, compute live_in on the now-
+    // complete CFG. Live values become saves; allocate slots and
+    // fresh load vids. Liveness must run AFTER every split so a
+    // value live across multiple yields is detected at each site.
+    //
+    // Slot numbering: per-function pool starting at `arity` so
+    // SM-method arg slots (0..arity) don't collide with save slots.
+    let mut next_slot: u32 = mir.arity as u32;
+    compute_saves_loads(mir, &mut plans, &mut next_slot);
+
+    // ===== Phase 3: PATH-SENSITIVE CLONING =====
+    //
+    // Forward dataflow over the post-split MIR computes the set
+    // of distinct reaching substitution maps at each block. The
+    // substitution map at block B records, for every saved value
+    // v, which fresh load vid v should be remapped to on the path
+    // that reaches B. Blocks with N > 1 distinct reaching maps
+    // are cloned N times (one clone per map); predecessors are
+    // redirected to the matching clone.
+    //
+    // Returns the `clone_index`: for each block B, a vec of
+    // `(subs_key, clone_id)` pairs. `clone_index[B][0].1` is the
+    // primary (= original block, kept reachable on the first
+    // matching path). For blocks with only one reaching subs,
+    // clone_index[B] has a single entry.
+    let clone_index = clone_per_reaching_subs(mir, &plans);
+
+    // ===== Phase 4: BUILD LAYOUT (mirror onto clones) =====
+    //
+    // Populate StateMachineLayout entries for every yielding /
+    // resume block, then mirror onto each clone with the clone's
+    // subs applied to saves / cross-fn results / direct-yield
+    // results.
     let mut layout = StateMachineLayout {
         resume_entries: vec![mir.entry_block()],
         yield_blocks: HashMap::new(),
@@ -257,908 +376,9 @@ pub fn transform_to_state_machine(
         direct_yield_results: HashMap::new(),
         cross_fn_results: HashMap::new(),
     };
-    // Per-suspension save slot allocation. The vec is shared
-    // across all suspensions — slots get reused as later yields
-    // overwrite earlier saves. `next_slot` tracks the high-water
-    // mark so concurrent saves never alias. State-machine method
-    // arg slots come out of the same pool: the caller writes
-    // args into the new frame's slots 0..N, the callee's entry
-    // block loads from those same slots, and live-across saves
-    // (within the callee) start at slot N. Because each frame
-    // has its own slot table on `aot_frames`, the per-function
-    // numbering doesn't collide with callers.
-    let mut next_slot: u32 = mir.arity as u32;
+    build_layout(mir, &plans, &clone_index, &mut layout);
 
-    loop {
-        // Find the next un-handled suspension: a Call whose
-        // method is either a direct yield or a cross-fn call to
-        // a tainted method. Because we mutate the MIR after
-        // each suspension is handled (split + new blocks
-        // appended), a re-scan at the top of the loop is the
-        // simplest way to walk every suspension exactly once.
-        //
-        // Crucially, the search must walk only blocks that are
-        // forward-reachable from {bb0, prior resume entries}.
-        // A previous iteration's tail-duplication leaves the
-        // ORIGINAL post-resume blocks orphaned (they have a
-        // suspension Call but no MIR predecessors); the runtime
-        // path goes through the cloned versions. Iterating
-        // `mir.blocks` order picks up the orphan first, splits
-        // it, and the actual reachable clone keeps its raw
-        // suspension Call without the SM Init/Resume split.
-        // Multi-root forward-reach picks the cloned block
-        // (reachable from a prior resume entry) and skips the
-        // orphan.
-        let reachable: std::collections::HashSet<BlockId> = {
-            use std::collections::HashSet;
-            let mut visited: HashSet<BlockId> = HashSet::new();
-            let mut stack: Vec<BlockId> = layout.resume_entries.clone();
-            let n = mir.blocks.len();
-            while let Some(b) = stack.pop() {
-                if !visited.insert(b) {
-                    continue;
-                }
-                if (b.0 as usize) < n {
-                    for s in mir.blocks[b.0 as usize].terminator.successors() {
-                        stack.push(s);
-                    }
-                }
-            }
-            visited
-        };
-        let mut found: Option<(BlockId, usize, SuspensionKind)> = None;
-        'outer: for block in &mir.blocks {
-            if layout.block_kinds.contains_key(&block.id) {
-                // Already split this block as the *yielding*
-                // half of a previous iteration — skip.
-                continue;
-            }
-            if !reachable.contains(&block.id) {
-                // Orphaned by a prior tail-duplication; the
-                // reachable clone (later in `mir.blocks`) has
-                // the same suspension Call and will be split
-                // instead.
-                continue;
-            }
-            for (i, (_dst, inst)) in block.instructions.iter().enumerate() {
-                if let Some(kind) = classify_call(inst, interner, tainted_names) {
-                    found = Some((block.id, i, kind));
-                    break 'outer;
-                }
-            }
-        }
-        let Some((blk_id, inst_idx, susp_kind)) = found else {
-            break;
-        };
-
-        // Materialise the per-kind data needed before the
-        // split. DirectYield carries just the yield value;
-        // CrossFnCall carries the call's metadata so the
-        // lowering can emit the push/save/invoke sequence.
-        #[allow(clippy::type_complexity)]
-        let (yield_value, direct_yield_result, cross_fn_meta): (
-            ValueId,
-            Option<ValueId>,
-            Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>,
-        ) = match susp_kind {
-            SuspensionKind::DirectYield => {
-                let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
-                    (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
-                    _ => unreachable!("classify_call only returns Some for Call instructions"),
-                };
-                let yield_value = if let Some(a) = arg {
-                    a
-                } else {
-                    // `Fiber.yield()` with no args: synthesise
-                    // a ConstNull just before the suspension.
-                    let new_vid = mir.new_value();
-                    let blk_mut = &mut mir.blocks[blk_id.0 as usize];
-                    blk_mut
-                        .instructions
-                        .insert(inst_idx, (new_vid, Instruction::ConstNull));
-                    new_vid
-                };
-                (yield_value, Some(call_dst), None)
-            }
-            SuspensionKind::CrossFnCall => {
-                let (call_dst, call_inst) =
-                    mir.blocks[blk_id.0 as usize].instructions[inst_idx].clone();
-                let Instruction::Call {
-                    receiver,
-                    method,
-                    args,
-                    ..
-                } = call_inst
-                else {
-                    unreachable!("classify_call only returns Some for Call instructions");
-                };
-                (
-                    call_dst,
-                    None,
-                    Some((receiver, args.clone(), call_dst, method)),
-                )
-            }
-        };
-        // Re-find the suspension's index — the optional
-        // ConstNull insert above may have shifted positions.
-        let inst_idx = {
-            let blk = &mir.blocks[blk_id.0 as usize];
-            blk.instructions
-                .iter()
-                .position(|(_, inst)| classify_call(inst, interner, tainted_names).is_some())
-                .expect("suspension still present after ConstNull insert")
-        };
-
-        // Liveness pass.
-        //
-        // The earlier "uses minus reachable defs" shortcut was
-        // unsound: a def in block X cancelled a use in block Y
-        // even when X didn't dominate Y, so values used on a
-        // path that bypasses their def saw undefined SSA at
-        // lowering. Cranelift caught one such pattern in
-        // `@hatch:proc`'s closure_50 with "uses value v494 from
-        // non-dominating inst555". With proper backward live-
-        // variable analysis the same v494 ends up in the save
-        // set, restored fresh at the resume entry.
-        //
-        // We compute liveness AFTER splitting the block so the
-        // post-yield tail is its own CFG node — `live_in` at the
-        // resume block's entry is exactly the set of values that
-        // flow across the yield boundary. The split fragment
-        // below does the real split; the rest of the original
-        // transform (allocate slots, fresh ValueIds, remap, tail-
-        // duplicate) runs against the freshly-split MIR.
-
-        // --- Split the block. ---
-        let new_block_id = mir.new_block();
-        let original_terminator = {
-            let blk = &mut mir.blocks[blk_id.0 as usize];
-            let mut tail = blk.instructions.split_off(inst_idx);
-            // tail[0] is the suspension Call — drop it.
-            tail.remove(0);
-            let original_terminator =
-                std::mem::replace(&mut blk.terminator, Terminator::Return(yield_value));
-            let new_block = &mut mir.blocks[new_block_id.0 as usize];
-            new_block.instructions = tail;
-            new_block.terminator = original_terminator.clone();
-            original_terminator
-        };
-        let _ = original_terminator;
-
-        // --- Standard backward liveness on the now-split MIR. ---
-        let live_across: Vec<ValueId> = {
-            let live_in_at_resume = compute_live_in(mir, new_block_id);
-            // Forward-reach from the resume block defines what's
-            // post-yield; everything else (including earlier
-            // resume blocks from prior SM iterations, which have
-            // no MIR predecessors after their own splits) counts
-            // as pre-yield.
-            // Multi-root forward walk: bb0 + every prior yield's
-            // resume entry. The current yield's resume entry
-            // hasn't been pushed onto `layout.resume_entries`
-            // yet (that happens after live_across), so the walk
-            // naturally stops at the current yield's split
-            // boundary without polluting pre-yield with post-
-            // current-yield defs.
-            let mut pre_yield_defs = collect_pre_yield_defs(mir, &layout.resume_entries);
-            // Include ValueIds that an earlier SM iteration
-            // already promoted to a per-resume load. Those have
-            // no MIR-level def (the load is materialised inline
-            // by the cranelift lowering at the prior resume
-            // entry), so a vanilla def-block scan misses them
-            // and they fall out of subsequent iterations'
-            // save sets — exactly what made `live.spec`'s
-            // closure_12 yield-3 forget to re-save the iter-1
-            // load value, leaving Cranelift to compile a use of
-            // an undefined SSA value with the dominance
-            // verifier complaining loudly.
-            for loads in layout.resume_loads.values() {
-                for (_slot, fresh_vid) in loads {
-                    pre_yield_defs.insert(*fresh_vid);
-                }
-            }
-
-            // CrossFnCall results from earlier-processed yields:
-            // each `CrossFnCallResume` block synthetically defines
-            // its `result` ValueId in cranelift via
-            // `val_map.insert(result, ret)` (the runtime call's
-            // return). The result has no MIR-level def, so a
-            // vanilla def-block scan would miss it — but it IS
-            // available at every block downstream of the matching
-            // resume. Including it here lets a later yield save
-            // the result across its own suspension, generating a
-            // load that dominates any tail-duplicated successor.
-            //
-            // Without this: when the post-resume block tree is
-            // cloned for a different resume entry (the
-            // tail-duplication for a later yield's saved values),
-            // the clone references the original `result` ValueId
-            // but the Cranelift binding only dominates the
-            // original done-block, not the clone. Surfaces as
-            // "undefined value v15" on `App.serve_(_)`'s SSE
-            // branch under WLIFT_AOT_CALL_N taint expansion —
-            // `Http_.handle(req)`'s result is used after
-            // `writer.call(emit)` resumes, but the resume's
-            // tail-dup clone has no dominating def.
-            for kind in layout.block_kinds.values() {
-                if let BlockKind::CrossFnCallResume { result, .. } = kind {
-                    pre_yield_defs.insert(*result);
-                }
-            }
-
-            // CrossFnCall result for the CURRENT yield: the
-            // suspension Call's `result` ValueId has no pre-call
-            // definition (the call was dropped above during the
-            // split), and the lowering rebinds it to the runtime
-            // `ret` of `wlift_aot_invoke_sm_method` via
-            // `val_map.insert(result, ret)`. Save/load through
-            // the slot table would just round-trip null.
-            let exclude_dst = match susp_kind {
-                SuspensionKind::CrossFnCall => cross_fn_meta.as_ref().map(|(_, _, dst, _)| *dst),
-                _ => None,
-            };
-
-            // Stable order so slot assignment is deterministic.
-            let mut live: Vec<ValueId> = live_in_at_resume
-                .into_iter()
-                .filter(|v| Some(*v) != exclude_dst)
-                .filter(|v| pre_yield_defs.contains(v))
-                .collect();
-            live.sort_by_key(|v| v.0);
-            live
-        };
-
-        // Allocate save slots + fresh ValueIds for the loads.
-        let saves: Vec<(u32, ValueId)> = live_across
-            .iter()
-            .map(|v| {
-                let slot = next_slot;
-                next_slot += 1;
-                (slot, *v)
-            })
-            .collect();
-        let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
-        let loads: Vec<(u32, ValueId)> = saves
-            .iter()
-            .map(|(slot, original)| {
-                let fresh = mir.new_value();
-                remap.insert(*original, fresh);
-                (*slot, fresh)
-            })
-            .collect();
-
-        // The block split already happened above (right before
-        // the liveness pass) — `blk_id` now ends in
-        // `Return(yield_value)`, the post-yield tail lives in
-        // `new_block_id`. Continue with the tail-duplication +
-        // remap pass.
-
-        // Tail-duplication remap. The resume block's
-        // successors may also be reachable from the
-        // non-yielding side of the CFG (e.g. an `if-else` whose
-        // join block follows the yield's branch). Rewriting
-        // those successors in place would break the
-        // non-yielding path, which still expects the original
-        // ValueIds. Clone any successor that *uses a saved
-        // value directly* (i.e. without a block-param
-        // shadowing it), substitute `original → fresh` in the
-        // clone, and re-route the yielding path's terminator
-        // through the clone. Blocks that don't use saved
-        // values (or shadow them all) stay untouched and serve
-        // both paths.
-        //
-        // `clones` is hoisted out so the metadata-propagation
-        // pass that runs AFTER the match block (which sets
-        // layout.block_kinds[blk_id] / [call_check_id]) can
-        // mirror the now-finalized state-machine metadata onto
-        // each clone. Without that ordering, the current
-        // yielding block's clone would have a stale
-        // `resume_check_block` placeholder.
-        let mut clones: HashMap<BlockId, BlockId> = HashMap::new();
-        if !remap.is_empty() {
-            // First, handle the resume block itself: its
-            // instructions and terminator may directly use
-            // saved values. The resume block has no
-            // block-param shadows (we just created it from a
-            // mid-block split). Remap in place.
-            {
-                let blk = mir.block_mut(new_block_id);
-                for (_, inst) in &mut blk.instructions {
-                    remap_instruction_uses(inst, &remap);
-                }
-                remap_terminator_uses(&mut blk.terminator, &remap);
-            }
-            // Now walk the resume block's successors,
-            // duplicating any that use saved values. Maintain
-            // a memo so a cloned block is reused when reached
-            // via multiple paths from the resume.
-            //
-            // Memo key: `(original_block_id, set_of_active_remap_keys)`.
-            // For simplicity in v2-cap2, we use just the block
-            // id — the active remap shrinks monotonically as
-            // we encounter block-param shadows, but the
-            // common case is "all saved values active" so this
-            // memo collision is unlikely to over-clone.
-            // (`clones` is the outer-scoped one declared just
-            // above the `if !remap.is_empty()` guard.)
-            // Worklist of (orig_block_id, clone_block_id) pairs whose
-            // bodies still need to be filled.
-            let mut to_fill: Vec<(BlockId, BlockId)> = Vec::new();
-            // Seed: the resume block's terminator successors.
-            // For each successor that needs cloning, allocate
-            // a fresh BlockId and rewrite the resume's
-            // terminator to point at it.
-            let resume_term = mir.block(new_block_id).terminator.clone();
-            let direct_uses_saved =
-                |b: BlockId, mir_ref: &MirFunction, remap: &HashMap<ValueId, ValueId>| -> bool {
-                    let blk = mir_ref.block(b);
-                    // If every saved value is shadowed by this
-                    // block's params, no clone needed — block
-                    // params bind the value freshly per call.
-                    let active: Vec<ValueId> = remap
-                        .keys()
-                        .filter(|orig| !blk.params.iter().any(|(p, _)| p == *orig))
-                        .copied()
-                        .collect();
-                    if active.is_empty() {
-                        return false;
-                    }
-                    // Block uses any active saved value
-                    // directly (in instruction or terminator)?
-                    let active_set: std::collections::HashSet<ValueId> =
-                        active.iter().copied().collect();
-                    for (_, inst) in &blk.instructions {
-                        for u in inst.operands() {
-                            if active_set.contains(&u) {
-                                return true;
-                            }
-                        }
-                    }
-                    for u in blk.terminator.operands() {
-                        if active_set.contains(&u) {
-                            return true;
-                        }
-                    }
-                    false
-                };
-
-            // Pre-compute the TRANSITIVE clone set, walking
-            // forward from `new_block_id` (the resume entry) and
-            // propagating the active saved-value set down each
-            // path. A block param `(v, _)` shadows saved value
-            // `v` for the block's body and successors — entries
-            // beyond the param see the param's fresh binding,
-            // not the saved value, so saved-value uses past a
-            // shadow shouldn't drag the shadow itself into the
-            // clone set.
-            //
-            // Without per-path tracking, a fixed-point on the
-            // raw direct-user set walks predecessor-ward into
-            // loop headers (whose params shadow loop-carried
-            // saved values), then their predecessors, and ends
-            // up cloning the entire CFG — Cranelift then sees
-            // duplicate block-param ValueIds in the clones and
-            // bails on SSA.
-            //
-            // The previous walker (need_clone called per
-            // successor with no recursion through value-neutral
-            // intermediates) had the OPPOSITE bug: a value-
-            // neutral intermediate block (e.g.
-            // Catalog.refreshLoop's bb6 hidden behind an
-            // unrelated bb) hides a downstream direct user, so
-            // the walker stops at the intermediate and the
-            // user's clone never happens. The fix below is to
-            // walk forward from the resume entry, track per-
-            // block active saved values, identify direct users
-            // within the active region, then take the
-            // forward-transitive closure (so intermediates that
-            // reach a direct user without being shadowed get
-            // cloned too).
-            let needs_clone_transitive: std::collections::HashSet<BlockId> = {
-                use std::collections::{HashMap as HMap, HashSet};
-                let saved: HashSet<ValueId> = remap.keys().copied().collect();
-                // Per-block: union-of-active across every
-                // forward-from-resume path.
-                let mut active_at: HMap<BlockId, HashSet<ValueId>> = HMap::new();
-                let mut to_visit: Vec<(BlockId, HashSet<ValueId>)> =
-                    vec![(new_block_id, saved.clone())];
-                while let Some((b, mut act)) = to_visit.pop() {
-                    let blk = mir.block(b);
-                    for (p, _) in &blk.params {
-                        act.remove(p);
-                    }
-                    let new_set = if let Some(existing) = active_at.get(&b) {
-                        let merged: HashSet<ValueId> = existing.union(&act).copied().collect();
-                        if merged.len() == existing.len() {
-                            continue;
-                        }
-                        merged
-                    } else {
-                        act.clone()
-                    };
-                    active_at.insert(b, new_set.clone());
-                    for s in blk.terminator.successors() {
-                        to_visit.push((s, new_set.clone()));
-                    }
-                }
-                // Direct users: blocks in `active_at` whose body
-                // or terminator references any active saved
-                // value.
-                let mut direct: HashSet<BlockId> = HashSet::new();
-                for (b, active) in &active_at {
-                    if active.is_empty() {
-                        continue;
-                    }
-                    let blk = mir.block(*b);
-                    let mut any_use = false;
-                    'inst: for (_, inst) in &blk.instructions {
-                        for u in inst.operands() {
-                            if active.contains(&u) {
-                                any_use = true;
-                                break 'inst;
-                            }
-                        }
-                    }
-                    if !any_use {
-                        for u in blk.terminator.operands() {
-                            if active.contains(&u) {
-                                any_use = true;
-                                break;
-                            }
-                        }
-                    }
-                    if any_use {
-                        direct.insert(*b);
-                    }
-                }
-                // The current yielding block itself isn't yet in
-                // `mir.blocks` with its `yield_saves` populated —
-                // those entries get inserted at the end of this
-                // outer loop iteration, after the tail-dup. But
-                // `saves` (= `(slot, ValueId)` pairs being
-                // recorded shortly) reference the same saved
-                // values that drive the active region. If the
-                // current yielding block is reachable on the
-                // active path AND it has any saved values, its
-                // pre-Return lowering will save those values —
-                // which on the cloned path are bound to fresh
-                // ValueIds, not the originals. Force it into the
-                // clone set so the metadata-propagation pass
-                // below mirrors `yield_saves`/`block_kinds`/etc
-                // onto the clone with remap applied.
-                if !saves.is_empty() {
-                    if let Some(active_at_blk) = active_at.get(&blk_id) {
-                        if !active_at_blk.is_empty() {
-                            direct.insert(blk_id);
-                        }
-                    }
-                }
-                // Forward-transitive within the active region:
-                // a block reaches a direct user (and so its
-                // terminator must redirect to the clone) only
-                // when the path itself stays within the active
-                // region — saved values must be live at both
-                // the block and its successor for the
-                // redirect to matter. Once the path crosses a
-                // shadow (active=empty), the saved values are
-                // re-bound and downstream uses go through
-                // the param's binding, not the saved value;
-                // cloning the shadow block would just create
-                // an unreachable duplicate (and worse, would
-                // duplicate the param's ValueId across the
-                // clone, breaking SSA).
-                let mut needs: HashSet<BlockId> = direct.clone();
-                let mut changed = true;
-                while changed {
-                    changed = false;
-                    for (b, active_b) in &active_at {
-                        if needs.contains(b) {
-                            continue;
-                        }
-                        if active_b.is_empty() {
-                            continue;
-                        }
-                        for s in mir.block(*b).terminator.successors() {
-                            if needs.contains(&s) {
-                                if let Some(active_s) = active_at.get(&s) {
-                                    if !active_s.is_empty() {
-                                        needs.insert(*b);
-                                        changed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                needs
-            };
-            // Suppress the unused warning since `direct_uses_saved`
-            // remains as a helper for diagnostic clarity even
-            // though `needs_clone_transitive` subsumes its role.
-            let _ = direct_uses_saved;
-            let need_clone = |b: BlockId,
-                              _mir_ref: &MirFunction,
-                              _remap: &HashMap<ValueId, ValueId>|
-             -> bool { needs_clone_transitive.contains(&b) };
-
-            // Helper: redirect a terminator's successors that
-            // need cloning to use the cloned BlockId. Also
-            // collects new clones to be filled.
-            fn redirect_term(
-                term: &mut Terminator,
-                clones: &mut HashMap<BlockId, BlockId>,
-                to_fill: &mut Vec<(BlockId, BlockId)>,
-                mir: &mut MirFunction,
-                remap: &HashMap<ValueId, ValueId>,
-                need_clone: &impl Fn(BlockId, &MirFunction, &HashMap<ValueId, ValueId>) -> bool,
-            ) {
-                let mut redirect = |succ: &mut BlockId| {
-                    if need_clone(*succ, mir, remap) {
-                        let clone_id = if let Some(c) = clones.get(succ) {
-                            *c
-                        } else {
-                            let c = mir.new_block();
-                            clones.insert(*succ, c);
-                            to_fill.push((*succ, c));
-                            c
-                        };
-                        *succ = clone_id;
-                    }
-                };
-                match term {
-                    Terminator::Branch { target, .. } => redirect(target),
-                    Terminator::CondBranch {
-                        true_target,
-                        false_target,
-                        ..
-                    } => {
-                        redirect(true_target);
-                        redirect(false_target);
-                    }
-                    Terminator::Return(_) | Terminator::ReturnNull | Terminator::Unreachable => {}
-                }
-            }
-
-            // Apply redirect to the resume block.
-            {
-                let _ = resume_term; // unused; we need &mut access below.
-                                     // SAFETY: temporarily detach the terminator,
-                                     // redirect, then reattach. Necessary because
-                                     // `redirect_term` needs mutable access to mir
-                                     // (for `new_block`) AND read access to mir
-                                     // (for `need_clone`); separating like this
-                                     // avoids overlapping borrows.
-                let mut t = std::mem::replace(
-                    &mut mir.block_mut(new_block_id).terminator,
-                    Terminator::Unreachable,
-                );
-                redirect_term(&mut t, &mut clones, &mut to_fill, mir, &remap, &need_clone);
-                mir.block_mut(new_block_id).terminator = t;
-            }
-
-            // Fill clones until the worklist is drained.
-            while let Some((orig, clone_id)) = to_fill.pop() {
-                let (mut insts, mut term, params) = {
-                    let blk = mir.block(orig);
-                    (
-                        blk.instructions.clone(),
-                        blk.terminator.clone(),
-                        blk.params.clone(),
-                    )
-                };
-                // Compute active remap (saved values not
-                // shadowed by `orig`'s params).
-                let active_remap: HashMap<ValueId, ValueId> = remap
-                    .iter()
-                    .filter(|(o, _)| !params.iter().any(|(p, _)| p == *o))
-                    .map(|(o, n)| (*o, *n))
-                    .collect();
-                for (_, inst) in &mut insts {
-                    remap_instruction_uses(inst, &active_remap);
-                }
-                remap_terminator_uses(&mut term, &active_remap);
-                // Recursively redirect this clone's terminator
-                // successors that still need cloning.
-                redirect_term(
-                    &mut term,
-                    &mut clones,
-                    &mut to_fill,
-                    mir,
-                    &active_remap,
-                    &need_clone,
-                );
-                // Populate the clone block. We don't carry
-                // over `params` because the clone is reached
-                // via the same call args as the original (the
-                // predecessor's branch is what invokes it).
-                // But: the predecessor's branch passes block
-                // args to satisfy `params`; if the clone has
-                // the same params, the args still flow in
-                // correctly. Keep the params unchanged.
-                let blk = mir.block_mut(clone_id);
-                blk.params = params;
-                blk.instructions = insts;
-                blk.terminator = term;
-            }
-            // (Metadata propagation moved out of this block —
-            // see after the match block below, where
-            // layout.block_kinds[blk_id] / [call_check_id]
-            // are already populated.)
-        }
-
-        // `saves` is keyed unconditionally on the yielding block.
-        // `resume_loads` keying is deferred to the per-kind
-        // branch below so it can use the right block id (the
-        // `br_table` target — `new_block_id` for DirectYield,
-        // the synthetic `call_check_id` for CrossFnCall).
-        if !saves.is_empty() {
-            layout.yield_saves.insert(blk_id, saves);
-        }
-        // Record kinds + register the resume entry for the
-        // dispatcher's `br_table`. DirectYield uses the
-        // post-suspension block (`new_block_id`) as the resume
-        // entry; CrossFnCall introduces an extra synthetic
-        // block (`call_check`) between the yielding init and
-        // the post-call code, so the dispatcher re-runs
-        // `invoke_sm_method` on each resume rather than
-        // skipping past it.
-        match (susp_kind, cross_fn_meta) {
-            (SuspensionKind::DirectYield, _) => {
-                let next_state = layout.resume_entries.len() as u32;
-                layout.resume_entries.push(new_block_id);
-                layout.yield_blocks.insert(blk_id, next_state);
-                layout.block_kinds.insert(blk_id, BlockKind::DirectYield);
-                if let Some(dst) = direct_yield_result {
-                    layout.direct_yield_results.insert(new_block_id, dst);
-                }
-                if !loads.is_empty() {
-                    layout.resume_loads.insert(new_block_id, loads);
-                }
-            }
-            (SuspensionKind::CrossFnCall, Some((receiver, args, result, method_sym))) => {
-                // Allocate the synthetic call_check block. Its
-                // MIR terminator is a Branch to the done_block
-                // (the post-call block) so `compute_rpo` walks
-                // call_check before its done_block — without
-                // that ordering, `done_block`'s terminator
-                // would reference `result`'s ValueId before
-                // call_check's lowering bound it in val_map.
-                // The actual lowering of call_check overrides
-                // both instructions and terminator via the
-                // 'cross_fn_resume hook in cranelift_backend.
-                let call_check_id = mir.new_block();
-                {
-                    let blk = mir.block_mut(call_check_id);
-                    blk.terminator = Terminator::Branch {
-                        target: new_block_id,
-                        args: Vec::new(),
-                    };
-                }
-                // Re-route the yielding block's terminator
-                // through call_check so the same ordering
-                // argument applies to it. Lowering's
-                // CrossFnCallInit hook will override (jumping
-                // to call_check directly after pre-call
-                // setup); the MIR Branch is purely for rpo
-                // structure.
-                {
-                    let blk = mir.block_mut(blk_id);
-                    blk.terminator = Terminator::Branch {
-                        target: call_check_id,
-                        args: Vec::new(),
-                    };
-                }
-                let next_state = layout.resume_entries.len() as u32;
-                layout.resume_entries.push(call_check_id);
-                layout.yield_blocks.insert(blk_id, next_state);
-                layout.block_kinds.insert(
-                    blk_id,
-                    BlockKind::CrossFnCallInit {
-                        resume_check_block: call_check_id,
-                        receiver,
-                        args: args.clone(),
-                        result,
-                        method_sym,
-                    },
-                );
-                layout.block_kinds.insert(
-                    call_check_id,
-                    BlockKind::CrossFnCallResume {
-                        done_block: new_block_id,
-                        receiver,
-                        args,
-                        result,
-                        method_sym,
-                    },
-                );
-                // Insert resume_loads ONLY under call_check (the
-                // dispatcher's `br_table` target). The done
-                // block is a successor of call_check via the
-                // done branch in the cranelift lowering, so the
-                // load emitted at call_check dominates every
-                // post-call use.
-                if !loads.is_empty() {
-                    layout.resume_loads.insert(call_check_id, loads);
-                }
-            }
-            _ => unreachable!("classify_call invariants kept the susp_kind and meta in sync"),
-        }
-
-        // Propagate state-machine metadata to cloned blocks.
-        // Runs AFTER the match block above so the current
-        // yielding block's `block_kinds` / `yield_blocks` /
-        // `yield_saves` entries plus the freshly-allocated
-        // `call_check_id` (for CrossFnCall) are visible.
-        // Without that ordering, the current yielding block's
-        // clone gets a placeholder `resume_check_block` that's
-        // never patched, and lowering treats the clone's
-        // CrossFnCallInit setup as branching to itself instead
-        // of the matching call_check.
-        //
-        // Two distinct value-renames apply:
-        //   * `remap` — yield N's saved-values rename. Pre-yield
-        //     operands (receiver, args, save values) get
-        //     remapped to yield_N_load_vid when the value is
-        //     saved across this yield.
-        //   * `extra_remap` — clone-specific fresh-vid map for
-        //     `result` and `resume_loads`. val_map at cranelift
-        //     lowering is a per-function map (not per-block) —
-        //     when the original CrossFnCallResume binds
-        //     `val_map[v49] = ret_at_orig` and the clone later
-        //     binds `val_map[v49] = ret_at_clone`, the second
-        //     overwrites and any block lowered AFTER the clone
-        //     that uses v49 (via `val_map.get`) gets
-        //     ret_at_clone — which doesn't dominate the use
-        //     site. Fresh ValueIds per clone keep val_map entries
-        //     disjoint.
-        if !clones.is_empty() {
-            let mut extra_remap: HashMap<ValueId, ValueId> = HashMap::new();
-            for orig in clones.keys() {
-                if let Some(loads) = layout.resume_loads.get(orig) {
-                    for (_slot, vid) in loads {
-                        extra_remap.entry(*vid).or_insert_with(|| mir.new_value());
-                    }
-                }
-                if let Some(kind) = layout.block_kinds.get(orig) {
-                    // Result fresh-remap rule:
-                    //
-                    // The call's runtime return is bound into
-                    // `val_map[result]` by the Resume block's
-                    // CrossFnCallResume lowering (the `val_map.insert(
-                    // result, ret)` in `'cross_fn_resume`). For Init
-                    // blocks that share a *non-cloned* Resume, the
-                    // clone funnels into the same Resume binding;
-                    // allocating a fresh result vid here leaves the
-                    // clone's body referencing a ValueId that no
-                    // Resume ever binds. Symptom: "undefined value
-                    // vN" verifier failures on multi-clone Init
-                    // funnels (closure_11 in @hatch:web hit this on
-                    // an iterator-over-map pattern with the iter call
-                    // tainted via call(N)).
-                    //
-                    // Allocate fresh result vid only when the paired
-                    // Resume is *also* cloned (so the clone has its
-                    // own Resume → own val_map[result] binding).
-                    // CrossFnCallResume itself is always cloned with
-                    // a fresh result so its load-scope stays disjoint
-                    // from other Resumes' load scopes (same reason
-                    // each Resume's load fresh-vids are disjoint).
-                    let result_opt = match kind {
-                        BlockKind::CrossFnCallInit {
-                            result,
-                            resume_check_block,
-                            ..
-                        } => {
-                            if clones.contains_key(resume_check_block) {
-                                Some(*result)
-                            } else {
-                                None
-                            }
-                        }
-                        BlockKind::CrossFnCallResume { result, .. } => Some(*result),
-                        BlockKind::DirectYield => None,
-                    };
-                    if let Some(r) = result_opt {
-                        extra_remap.entry(r).or_insert_with(|| mir.new_value());
-                    }
-                }
-            }
-            // Apply extra_remap to clone bodies. Clone bodies
-            // were filled with yield N's saved-values remap in
-            // the to_fill loop; extra_remap renames any
-            // leftover references to original load/result
-            // ValueIds (i.e., values not in yield N's saved
-            // set — earlier-yields' load values that weren't
-            // live across this yield, or the current
-            // yielding block's call result).
-            if !extra_remap.is_empty() {
-                let clone_ids: Vec<BlockId> = clones.values().copied().collect();
-                for clone_id in clone_ids {
-                    let blk = mir.block_mut(clone_id);
-                    for (_, inst) in &mut blk.instructions {
-                        remap_instruction_uses(inst, &extra_remap);
-                    }
-                    remap_terminator_uses(&mut blk.terminator, &extra_remap);
-                }
-            }
-            for (orig, clone) in &clones {
-                let map_v_arg = |v: ValueId| -> ValueId { remap.get(&v).copied().unwrap_or(v) };
-                let map_v_result =
-                    |v: ValueId| -> ValueId { extra_remap.get(&v).copied().unwrap_or(v) };
-                let map_b = |b: BlockId| -> BlockId { clones.get(&b).copied().unwrap_or(b) };
-                if let Some(loads) = layout.resume_loads.get(orig).cloned() {
-                    let fresh_loads: Vec<(u32, ValueId)> = loads
-                        .into_iter()
-                        .map(|(slot, v)| (slot, map_v_result(v)))
-                        .collect();
-                    layout.resume_loads.insert(*clone, fresh_loads);
-                }
-                let Some(kind) = layout.block_kinds.get(orig).cloned() else {
-                    continue;
-                };
-                match kind {
-                    BlockKind::DirectYield => {
-                        layout.block_kinds.insert(*clone, BlockKind::DirectYield);
-                    }
-                    BlockKind::CrossFnCallInit {
-                        resume_check_block,
-                        receiver,
-                        args,
-                        result,
-                        method_sym,
-                    } => {
-                        layout.block_kinds.insert(
-                            *clone,
-                            BlockKind::CrossFnCallInit {
-                                resume_check_block: map_b(resume_check_block),
-                                receiver: map_v_arg(receiver),
-                                args: args.into_iter().map(map_v_arg).collect(),
-                                result: map_v_result(result),
-                                method_sym,
-                            },
-                        );
-                    }
-                    BlockKind::CrossFnCallResume {
-                        done_block,
-                        receiver,
-                        args,
-                        result,
-                        method_sym,
-                    } => {
-                        layout.block_kinds.insert(
-                            *clone,
-                            BlockKind::CrossFnCallResume {
-                                done_block: map_b(done_block),
-                                receiver: map_v_arg(receiver),
-                                args: args.into_iter().map(map_v_arg).collect(),
-                                result: map_v_result(result),
-                                method_sym,
-                            },
-                        );
-                        if let Some((slot, dst)) = layout.cross_fn_results.get(orig).copied() {
-                            layout
-                                .cross_fn_results
-                                .insert(*clone, (slot, map_v_result(dst)));
-                        }
-                    }
-                }
-                if let Some(state_id) = layout.yield_blocks.get(orig).copied() {
-                    layout.yield_blocks.insert(*clone, state_id);
-                }
-                if let Some(saves) = layout.yield_saves.get(orig).cloned() {
-                    let cloned_saves: Vec<(u32, ValueId)> = saves
-                        .into_iter()
-                        .map(|(slot, v)| (slot, map_v_arg(v)))
-                        .collect();
-                    layout.yield_saves.insert(*clone, cloned_saves);
-                }
-                if let Some(dst) = layout.direct_yield_results.get(orig).copied() {
-                    layout.direct_yield_results.insert(*clone, map_v_arg(dst));
-                }
-            }
-        }
-    }
+    // ===== Phase 5: ORPHAN PRUNE (below) =====
 
     // Post-pass: prune blocks unreachable from any resume entry.
     //
@@ -1227,6 +447,820 @@ pub fn transform_to_state_machine(
     }
 
     Ok(layout)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — PLAN
+// ---------------------------------------------------------------------------
+
+/// Walk the MIR; find every suspension Call; split at each call.
+/// For CrossFnCall, also allocate the synthetic call_check block
+/// and re-route the yielding block's terminator through it. No
+/// liveness, no slot allocation, no remap, no cloning.
+///
+/// After this phase, every yielding block has a placeholder
+/// terminator (Return(yield_value) for DirectYield, Branch(call_check)
+/// for CrossFnCall) and the post-split tail lives in `resume_block`
+/// (DirectYield) or `done_block` (CrossFnCall, reached via call_check).
+fn plan_yields(
+    mir: &mut MirFunction,
+    interner: &Interner,
+    tainted_names: &std::collections::HashSet<String>,
+    plans: &mut Vec<YieldPlan>,
+) -> Result<(), StateMachineError> {
+    let mut planned_yields: std::collections::HashSet<BlockId> = std::collections::HashSet::new();
+
+    loop {
+        // Find the next unplanned suspension in any block reachable
+        // from bb0 OR any prior resume_block. After splitting a
+        // yielding block, its terminator is Return / Branch(call_check),
+        // so the post-split tail isn't reachable via bb0 alone — it
+        // becomes a resume_block (or downstream of one), which is
+        // entered at runtime via the dispatcher's br_table. Seeding
+        // reachability from every prior resume_block ensures we find
+        // suspensions in those tails.
+        let reachable: std::collections::HashSet<BlockId> = {
+            use std::collections::HashSet;
+            let mut visited: HashSet<BlockId> = HashSet::new();
+            let mut stack: Vec<BlockId> = vec![mir.entry_block()];
+            for plan in plans.iter() {
+                stack.push(plan.resume_block);
+            }
+            let n = mir.blocks.len();
+            while let Some(b) = stack.pop() {
+                if !visited.insert(b) {
+                    continue;
+                }
+                if (b.0 as usize) < n {
+                    for s in mir.blocks[b.0 as usize].terminator.successors() {
+                        stack.push(s);
+                    }
+                }
+            }
+            visited
+        };
+        let mut found: Option<(BlockId, usize, SuspensionKind)> = None;
+        'outer: for block in &mir.blocks {
+            if planned_yields.contains(&block.id) {
+                continue;
+            }
+            if !reachable.contains(&block.id) {
+                continue;
+            }
+            for (i, (_dst, inst)) in block.instructions.iter().enumerate() {
+                if let Some(kind) = classify_call(inst, interner, tainted_names) {
+                    found = Some((block.id, i, kind));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((blk_id, inst_idx, susp_kind)) = found else {
+            break;
+        };
+
+        // Capture the call's metadata before mutating.
+        let (yield_value, direct_result, cross_meta): (
+            ValueId,
+            Option<ValueId>,
+            Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>,
+        ) = match susp_kind {
+            SuspensionKind::DirectYield => {
+                let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
+                    (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
+                    _ => unreachable!("classify_call only returns Some for Call"),
+                };
+                let yield_value = if let Some(a) = arg {
+                    a
+                } else {
+                    // `Fiber.yield()` with no args: synth a ConstNull
+                    // just before the call so the Return has an operand.
+                    let new_vid = mir.new_value();
+                    mir.blocks[blk_id.0 as usize]
+                        .instructions
+                        .insert(inst_idx, (new_vid, Instruction::ConstNull));
+                    new_vid
+                };
+                (yield_value, Some(call_dst), None)
+            }
+            SuspensionKind::CrossFnCall => {
+                let (call_dst, call_inst) =
+                    mir.blocks[blk_id.0 as usize].instructions[inst_idx].clone();
+                let Instruction::Call {
+                    receiver,
+                    method,
+                    args,
+                    ..
+                } = call_inst
+                else {
+                    unreachable!("classify_call only returns Some for Call");
+                };
+                (call_dst, None, Some((receiver, args, call_dst, method)))
+            }
+        };
+
+        // Re-find inst_idx — the ConstNull insert above may have
+        // shifted positions.
+        let inst_idx = {
+            let blk = &mir.blocks[blk_id.0 as usize];
+            blk.instructions
+                .iter()
+                .position(|(_, inst)| classify_call(inst, interner, tainted_names).is_some())
+                .expect("suspension still present after ConstNull insert")
+        };
+
+        // Split: allocate a new block for the post-call tail.
+        let post_call_block = mir.new_block();
+        let original_terminator = {
+            let blk = &mut mir.blocks[blk_id.0 as usize];
+            let mut tail = blk.instructions.split_off(inst_idx);
+            tail.remove(0); // drop the suspension Call
+            let orig_term =
+                std::mem::replace(&mut blk.terminator, Terminator::Unreachable /* placeholder */);
+            let new_block = &mut mir.blocks[post_call_block.0 as usize];
+            new_block.instructions = tail;
+            new_block.terminator = orig_term.clone();
+            orig_term
+        };
+        let _ = original_terminator;
+
+        // Per-kind wiring.
+        match (susp_kind, cross_meta) {
+            (SuspensionKind::DirectYield, _) => {
+                // yielding_block: Return(yield_value).
+                mir.blocks[blk_id.0 as usize].terminator = Terminator::Return(yield_value);
+                let state_id = (plans.len() + 1) as u32;
+                plans.push(YieldPlan {
+                    yielding_block: blk_id,
+                    resume_block: post_call_block,
+                    state_id,
+                    kind: YieldPlanKind::DirectYield {
+                        yield_value,
+                        result: direct_result
+                            .expect("DirectYield always has a result vid"),
+                    },
+                    saves: Vec::new(),
+                    loads: Vec::new(),
+                });
+            }
+            (SuspensionKind::CrossFnCall, Some((receiver, args, result, method_sym))) => {
+                // Allocate the synthetic call_check block (the
+                // br_table target / dispatcher resume entry).
+                let call_check_block = mir.new_block();
+                // yielding_block: Branch(call_check_block).
+                mir.blocks[blk_id.0 as usize].terminator = Terminator::Branch {
+                    target: call_check_block,
+                    args: Vec::new(),
+                };
+                // call_check_block: Branch(done_block).
+                // The MIR Branch is just a structural successor so
+                // rpo orders call_check before done_block. The
+                // cranelift lowering of CrossFnCallResume overrides
+                // both instructions and terminator.
+                mir.blocks[call_check_block.0 as usize].terminator = Terminator::Branch {
+                    target: post_call_block,
+                    args: Vec::new(),
+                };
+                let state_id = (plans.len() + 1) as u32;
+                plans.push(YieldPlan {
+                    yielding_block: blk_id,
+                    resume_block: call_check_block,
+                    state_id,
+                    kind: YieldPlanKind::CrossFnCall {
+                        call_check_block,
+                        done_block: post_call_block,
+                        receiver,
+                        args,
+                        result,
+                        method_sym,
+                    },
+                    saves: Vec::new(),
+                    loads: Vec::new(),
+                });
+            }
+            _ => unreachable!("classify_call invariants kept susp_kind and meta in sync"),
+        }
+        planned_yields.insert(blk_id);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — LIVENESS + SLOT ALLOCATION
+// ---------------------------------------------------------------------------
+
+/// For each yield's resume_block, compute live_in on the now-
+/// complete CFG. The live set, filtered by "defined pre-yield"
+/// (forward-reach from bb0 + every prior resume_block), is the
+/// saved set for that yield. Allocate slots + fresh load vids.
+fn compute_saves_loads(mir: &mut MirFunction, plans: &mut [YieldPlan], next_slot: &mut u32) {
+    // Run liveness once over the whole function — we need live_in
+    // for every resume_block. The per-block live_in is the
+    // standard backward-dataflow fixed point.
+    let all_live_in = compute_all_live_in(mir);
+
+    // For "pre-yield defs" filter: a value v is "pre-yield"
+    // (savable) only if its def is reachable from bb0 in the
+    // post-split CFG (i.e., it exists before the yield runs at
+    // runtime). The simplest sound choice is to take v defined
+    // in ANY block — the dataflow in Phase 3 redirects clones
+    // such that uses only see defs that actually dominate them.
+    // But we need to be precise enough that we don't try to save
+    // the result of a Call we just dropped, or a fresh resume-load
+    // vid that won't exist when the save runs.
+    //
+    // Concretely, exclude:
+    //  - The result vid of the CURRENT yield (no pre-yield def
+    //    for that: the call producing it was dropped on split).
+    //  - Already-planned cross-fn call results (lowering rebinds
+    //    them via val_map at the matching Resume block, not via
+    //    MIR-level defs — they're not savable as MIR ValueIds).
+    //    BUT: they ARE valid SSA values at lowering time, so a
+    //    later yield CAN save them; the saved runtime value is
+    //    whatever the matching Resume bound. Don't exclude them.
+    //  - Block params: ARE valid SSA values; CAN be saved. Don't
+    //    exclude.
+    //
+    // The pre-yield-def set is computed by forward-reach from bb0
+    // collecting every block's params + instruction defs. The
+    // result includes block-params globally (every block's params
+    // count as defs regardless of which subset of paths reach
+    // them — Phase 3's per-path dataflow handles the per-path
+    // visibility).
+    let pre_yield_defs: std::collections::HashSet<ValueId> = {
+        use std::collections::HashSet;
+        let mut defs: HashSet<ValueId> = HashSet::new();
+        for blk in mir.blocks.iter() {
+            for (vid, _) in &blk.params {
+                defs.insert(*vid);
+            }
+            for (vid, _) in &blk.instructions {
+                defs.insert(*vid);
+            }
+        }
+        defs
+    };
+
+    for plan in plans.iter_mut() {
+        // The result vid of the current yield isn't in the saved
+        // set: there's no pre-yield MIR-level def (the call was
+        // dropped during split). The Cranelift lowering rebinds
+        // it at the resume's prologue (via resume_v param for
+        // DirectYield, via runtime ret for CrossFnCall).
+        let exclude_result = match &plan.kind {
+            YieldPlanKind::DirectYield { result, .. } => Some(*result),
+            YieldPlanKind::CrossFnCall { result, .. } => Some(*result),
+        };
+
+        let live_in_at_resume = all_live_in
+            .get(&plan.resume_block)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut live: Vec<ValueId> = live_in_at_resume
+            .into_iter()
+            .filter(|v| Some(*v) != exclude_result)
+            .filter(|v| pre_yield_defs.contains(v))
+            .collect();
+        live.sort_by_key(|v| v.0);
+
+        // Allocate one slot + fresh-load vid per live value.
+        let saves: Vec<(u32, ValueId)> = live
+            .iter()
+            .map(|v| {
+                let slot = *next_slot;
+                *next_slot += 1;
+                (slot, *v)
+            })
+            .collect();
+        let loads: Vec<(u32, ValueId)> = saves
+            .iter()
+            .map(|(slot, _)| (*slot, mir.new_value()))
+            .collect();
+        plan.saves = saves;
+        plan.loads = loads;
+    }
+}
+
+/// Compute live_in for every block in a single pass (vs. one
+/// fixed-point per resume_block).
+fn compute_all_live_in(
+    mir: &MirFunction,
+) -> std::collections::HashMap<BlockId, std::collections::HashSet<ValueId>> {
+    use std::collections::{HashMap as HMap, HashSet};
+    let n = mir.blocks.len();
+    let mut block_uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut block_defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut successors: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+
+    for (i, blk) in mir.blocks.iter().enumerate() {
+        let mut local_defs = HashSet::new();
+        for (vid, _) in &blk.params {
+            local_defs.insert(*vid);
+        }
+        for (vid, inst) in &blk.instructions {
+            for u in collect_uses(inst) {
+                if !local_defs.contains(&u) {
+                    block_uses[i].insert(u);
+                }
+            }
+            local_defs.insert(*vid);
+        }
+        for u in collect_terminator_uses(&blk.terminator) {
+            if !local_defs.contains(&u) {
+                block_uses[i].insert(u);
+            }
+        }
+        block_defs[i] = local_defs;
+        successors[i] = blk.terminator.successors();
+    }
+
+    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..n).rev() {
+            let mut live_out: HashSet<ValueId> = HashSet::new();
+            for succ in &successors[i] {
+                let s = succ.0 as usize;
+                if s < n {
+                    for v in &live_in[s] {
+                        live_out.insert(*v);
+                    }
+                }
+            }
+            let mut new_live_in = block_uses[i].clone();
+            for v in &live_out {
+                if !block_defs[i].contains(v) {
+                    new_live_in.insert(*v);
+                }
+            }
+            if new_live_in != live_in[i] {
+                live_in[i] = new_live_in;
+                changed = true;
+            }
+        }
+    }
+
+    let mut out: HMap<BlockId, HashSet<ValueId>> = HMap::new();
+    for (i, set) in live_in.into_iter().enumerate() {
+        out.insert(BlockId(i as u32), set);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — PATH-SENSITIVE CLONING
+// ---------------------------------------------------------------------------
+
+/// A canonical sorted-Vec form of `HashMap<ValueId, ValueId>` so
+/// it can be used as a HashMap key. Each entry: (orig_vid,
+/// fresh_load_vid) for some yield's saved value.
+type SubsKey = Vec<(ValueId, ValueId)>;
+
+fn subs_to_key(subs: &HashMap<ValueId, ValueId>) -> SubsKey {
+    let mut v: SubsKey = subs.iter().map(|(k, v)| (*k, *v)).collect();
+    v.sort_by_key(|(k, _)| k.0);
+    v
+}
+
+fn key_to_subs(key: &SubsKey) -> HashMap<ValueId, ValueId> {
+    key.iter().copied().collect()
+}
+
+/// Forward dataflow + per-(block, subs) cloning.
+///
+/// Returns a per-block index: for each original block B,
+/// `clone_index[B]` is a Vec of (subs_key, clone_block_id). One
+/// entry per distinct reaching subs. Index 0 is the "primary" —
+/// the original block kept in place with its operands remapped
+/// per that subs (or, if subs is empty, no remap applied).
+fn clone_per_reaching_subs(
+    mir: &mut MirFunction,
+    plans: &[YieldPlan],
+) -> HashMap<BlockId, Vec<(SubsKey, BlockId)>> {
+    use std::collections::{HashMap as HMap, HashSet};
+
+    // -- Build per-yield "subs delta" applied at the resume_block.
+    // After the resume_block's loads, the subs becomes K's loads
+    // (overriding any incoming subs for vids in K's saves).
+    let mut yield_loads_subs: HMap<BlockId, HashMap<ValueId, ValueId>> = HMap::new();
+    let mut yielding_block_of_plan: HMap<BlockId, usize> = HMap::new(); // yielding_block -> plan idx
+    let mut resume_block_of_plan: HMap<BlockId, usize> = HMap::new(); // resume_block -> plan idx
+    for (idx, plan) in plans.iter().enumerate() {
+        let mut loads_subs: HashMap<ValueId, ValueId> = HashMap::new();
+        for (i, (_slot, orig)) in plan.saves.iter().enumerate() {
+            let (_slot2, fresh) = plan.loads[i];
+            loads_subs.insert(*orig, fresh);
+        }
+        yield_loads_subs.insert(plan.resume_block, loads_subs);
+        yielding_block_of_plan.insert(plan.yielding_block, idx);
+        resume_block_of_plan.insert(plan.resume_block, idx);
+    }
+
+    // -- Forward dataflow: per-block set of reaching subs keys.
+    //
+    // Three kinds of blocks need special handling:
+    //
+    // 1. YIELDING blocks (terminator is Return for DirectYield or
+    //    Branch(call_check) for CrossFnCall). The MIR successor —
+    //    if any — is a STRUCTURAL marker for rpo ordering, NOT a
+    //    runtime edge. At runtime, control leaves the yielding
+    //    block via "stamp kind=Yield + return"; the resume_block
+    //    is re-entered via the dispatcher's br_table on the next
+    //    fiber.call. So subs from yielding blocks do NOT propagate
+    //    to MIR successors.
+    //
+    // 2. RESUME blocks (= plan.resume_block: post-split tail for
+    //    DirectYield, call_check for CrossFnCall). Entered ONLY via
+    //    the dispatcher's br_table (initial entry = empty subs).
+    //    The lowering applies K's loads at the resume block's
+    //    prologue. So outgoing subs from a resume block = K's loads
+    //    (subs reset). reaching_subs[R] is set to {empty} (the
+    //    dispatcher's entry, before loads); we don't merge in any
+    //    MIR-level reaching subs.
+    //
+    // 3. ORDINARY blocks: propagate incoming subs unchanged.
+    //
+    // Block params: NOT treated as subs-resetters; they're shadowing
+    // saved values within the block's body but the per-clone remap
+    // step is correct because remap_instruction_uses only renames
+    // operands matching the subs key — block params have their own
+    // SSA defs and aren't touched by the remap.
+    let mut reaching_subs: HMap<BlockId, HashSet<SubsKey>> = HMap::new();
+    // Seed bb0 (initial entry, empty subs).
+    let mut worklist: Vec<(BlockId, SubsKey)> = vec![(mir.entry_block(), Vec::new())];
+    // Seed every resume_block with {} (dispatcher entry, before
+    // K's loads apply).
+    for plan in plans {
+        worklist.push((plan.resume_block, Vec::new()));
+    }
+    while let Some((blk, in_key)) = worklist.pop() {
+        // Block params SHADOW incoming subs for matching keys.
+        // The predecessor's branch arg re-binds the vid for this
+        // block's scope, so within-block uses + downstream
+        // propagation should not still treat v as the load's
+        // fresh vid. Without this clearing, a loop header reached
+        // both from the original back-edge (subs=empty) and from
+        // the cloned region (subs={v1→v19}) ends up with two
+        // distinct reaching subs and gets cloned — even though
+        // bb1's param v1 SSA-shadows both and there is no
+        // downstream observable difference. The doubled clone
+        // collides with val_map[v1] at lowering time.
+        let block_params = &mir.blocks[blk.0 as usize].params;
+        let effective_in_key: SubsKey = if block_params.is_empty() {
+            in_key
+        } else {
+            let mut m = key_to_subs(&in_key);
+            for (p, _) in block_params {
+                m.remove(p);
+            }
+            subs_to_key(&m)
+        };
+        let entry = reaching_subs.entry(blk).or_default();
+        if !entry.insert(effective_in_key.clone()) {
+            continue;
+        }
+        // YIELDING block: do not propagate subs to MIR successors.
+        if yielding_block_of_plan.contains_key(&blk) {
+            continue;
+        }
+        // Compute outgoing subs.
+        let out_subs: SubsKey = if let Some(loads_subs) = yield_loads_subs.get(&blk) {
+            // resume_block: outgoing = K's loads only (subs reset
+            // at the resume's prologue).
+            let mut combined: HashMap<ValueId, ValueId> = HashMap::new();
+            for (k, v) in loads_subs.iter() {
+                combined.insert(*k, *v);
+            }
+            subs_to_key(&combined)
+        } else {
+            effective_in_key.clone()
+        };
+        let succs = mir.blocks[blk.0 as usize].terminator.successors();
+        for s in succs {
+            worklist.push((s, out_subs.clone()));
+        }
+    }
+
+    // -- Decide cloning. For each block with N distinct reaching
+    // subs, allocate (N-1) clones; the original keeps the FIRST
+    // subs in sorted order as its applied remap (or empty subs if
+    // present in the set).
+    let mut clone_index: HashMap<BlockId, Vec<(SubsKey, BlockId)>> = HashMap::new();
+    let original_block_count = mir.blocks.len();
+    for blk_idx in 0..original_block_count {
+        let bid = BlockId(blk_idx as u32);
+        let Some(keys_set) = reaching_subs.get(&bid).cloned() else {
+            // Unreachable block — skip; orphan-prune handles it.
+            continue;
+        };
+        let mut keys: Vec<SubsKey> = keys_set.into_iter().collect();
+        // Sort: empty first, then by (key length, key content) for
+        // determinism.
+        keys.sort_by(|a, b| match a.len().cmp(&b.len()) {
+            std::cmp::Ordering::Equal => a.cmp(b),
+            other => other,
+        });
+        let mut entries: Vec<(SubsKey, BlockId)> = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            let clone_bid = if i == 0 {
+                bid
+            } else {
+                mir.new_block()
+            };
+            entries.push((key.clone(), clone_bid));
+        }
+        clone_index.insert(bid, entries);
+    }
+
+    // -- Populate clone bodies. Each clone gets a copy of the
+    // original's params + instructions + terminator with the
+    // applicable subs map applied to operands.
+    //
+    // For a RESUME block, the applied subs is K's loads — the
+    // lowering emits `wlift_aot_sm_load_value(slot)` calls at the
+    // resume's prologue and binds val_map[fresh_load_vid] = ret,
+    // so any pre-yield use of an original saved vid downstream of
+    // the prologue must be rewritten to use the fresh load vid.
+    // The dataflow's `reaching_subs[resume]` is the entry-side
+    // (dispatcher = empty) subs, which we IGNORE here in favour of
+    // K's loads.
+    //
+    // For ORDINARY blocks, applied subs = reaching subs (one of
+    // the clone-index entries for that block).
+    for (orig_bid, entries) in clone_index.iter() {
+        let (params, insts, term) = {
+            let b = mir.block(*orig_bid);
+            (b.params.clone(), b.instructions.clone(), b.terminator.clone())
+        };
+        // Block params shadow saved values for the block's body.
+        // A subs entry whose key matches a block param represents
+        // a saved value that the predecessor's branch arg has
+        // already re-bound — uses inside the block see the param,
+        // not the load. Drop those keys before applying the subs.
+        let param_vids: std::collections::HashSet<ValueId> =
+            params.iter().map(|(v, _)| *v).collect();
+        let filter_subs = |s: &HashMap<ValueId, ValueId>| -> HashMap<ValueId, ValueId> {
+            s.iter()
+                .filter(|(k, _)| !param_vids.contains(k))
+                .map(|(k, v)| (*k, *v))
+                .collect()
+        };
+
+        // RESUME blocks have only one clone-entry (the dispatcher
+        // arrival), so we don't iterate over `entries` for them.
+        let is_resume = yield_loads_subs.contains_key(orig_bid);
+        if is_resume {
+            // Apply K's loads subs to the (single) resume block.
+            let raw_subs = yield_loads_subs.get(orig_bid).cloned().unwrap_or_default();
+            let subs = filter_subs(&raw_subs);
+            if !subs.is_empty() {
+                let blk = mir.block_mut(*orig_bid);
+                for (_, inst) in &mut blk.instructions {
+                    remap_instruction_uses(inst, &subs);
+                }
+                remap_terminator_uses(&mut blk.terminator, &subs);
+            }
+            continue;
+        }
+        for (key, clone_bid) in entries.iter() {
+            let raw_subs = key_to_subs(key);
+            let subs = filter_subs(&raw_subs);
+            if *clone_bid == *orig_bid {
+                if !subs.is_empty() {
+                    let blk = mir.block_mut(*clone_bid);
+                    for (_, inst) in &mut blk.instructions {
+                        remap_instruction_uses(inst, &subs);
+                    }
+                    remap_terminator_uses(&mut blk.terminator, &subs);
+                }
+                continue;
+            }
+            let mut clone_insts = insts.clone();
+            let mut clone_term = term.clone();
+            if !subs.is_empty() {
+                for (_, inst) in &mut clone_insts {
+                    remap_instruction_uses(inst, &subs);
+                }
+                remap_terminator_uses(&mut clone_term, &subs);
+            }
+            let blk = mir.block_mut(*clone_bid);
+            blk.params = params.clone();
+            blk.instructions = clone_insts;
+            blk.terminator = clone_term;
+        }
+    }
+
+    // -- Redirect terminator successors so each predecessor's
+    // outgoing edge points to the matching clone.
+    //
+    // For each block B' (primary or clone) with terminator
+    // successor T:
+    //   outgoing_subs from B' = (subs applied to B') if B' is not
+    //     a resume_block, else (yield K's loads).
+    //   pick the clone of T whose key matches outgoing_subs.
+    //
+    // The keys in clone_index[T] cover every reachable outgoing
+    // subs from any predecessor, so the match always finds one
+    // (assuming the dataflow was sound and the input MIR was
+    // structurally connected from bb0).
+    let mut redirects: Vec<(BlockId, Terminator)> = Vec::new();
+    for (orig_bid, entries) in clone_index.iter() {
+        for (subs_key, clone_bid) in entries.iter() {
+            // Compute this clone's outgoing subs — same rules as
+            // the dataflow propagation step.
+            let mut out_subs: HashMap<ValueId, ValueId> = if yield_loads_subs
+                .contains_key(orig_bid)
+            {
+                yield_loads_subs.get(orig_bid).cloned().unwrap_or_default()
+            } else {
+                key_to_subs(subs_key)
+            };
+            // Block params shadow saved values; drop from outgoing.
+            let block_params = &mir.blocks[orig_bid.0 as usize].params;
+            for (p, _) in block_params {
+                out_subs.remove(p);
+            }
+            let out_key = subs_to_key(&out_subs);
+            // Redirect successors of *clone_bid.
+            let mut term = mir.block(*clone_bid).terminator.clone();
+            redirect_term_to_clone(&mut term, &out_key, &clone_index);
+            redirects.push((*clone_bid, term));
+        }
+    }
+    for (bid, term) in redirects {
+        mir.block_mut(bid).terminator = term;
+    }
+
+    clone_index
+}
+
+
+fn redirect_term_to_clone(
+    term: &mut Terminator,
+    out_key: &SubsKey,
+    clone_index: &HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
+) {
+    let pick = |orig: BlockId| -> BlockId {
+        let Some(entries) = clone_index.get(&orig) else {
+            return orig; // unreachable / not in dataflow — keep as-is.
+        };
+        for (k, cid) in entries {
+            if k == out_key {
+                return *cid;
+            }
+        }
+        // Fallback: no exact match (shouldn't happen if dataflow
+        // was sound). Keep the primary (entry 0) — orphan-prune
+        // will clear stale references if it's truly unreachable.
+        entries[0].1
+    };
+    match term {
+        Terminator::Branch { target, .. } => {
+            *target = pick(*target);
+        }
+        Terminator::CondBranch {
+            true_target,
+            false_target,
+            ..
+        } => {
+            *true_target = pick(*true_target);
+            *false_target = pick(*false_target);
+        }
+        Terminator::Return(_) | Terminator::ReturnNull | Terminator::Unreachable => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — BUILD LAYOUT (mirror onto clones)
+// ---------------------------------------------------------------------------
+
+fn build_layout(
+    _mir: &MirFunction,
+    plans: &[YieldPlan],
+    clone_index: &HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
+    layout: &mut StateMachineLayout,
+) {
+    for plan in plans {
+        // Per-clone resume entry — but resume_blocks have exactly
+        // one entry per the dataflow ({} from dispatcher → K's loads).
+        // So clone_index[resume_block] has one entry. We use the
+        // primary clone as the canonical resume entry.
+        let resume_entry = primary_clone(plan.resume_block, clone_index);
+
+        layout.resume_entries.push(resume_entry);
+
+        // Find every clone of the yielding_block; each may have a
+        // different subs (so the saves operands differ per clone).
+        // The state_id is shared (dispatcher hits this state_id
+        // regardless of which clone yielded — runtime save table
+        // is in the FRAME, identified by slot number, not vid).
+        let yblk_clones = clones_of(plan.yielding_block, clone_index);
+        for (subs_key, clone_bid) in yblk_clones.iter() {
+            let subs = key_to_subs(subs_key);
+            // yield_blocks: state_id mapping.
+            layout.yield_blocks.insert(*clone_bid, plan.state_id);
+            // yield_saves: saves with operand remapped.
+            let saves: Vec<(u32, ValueId)> = plan
+                .saves
+                .iter()
+                .map(|(slot, vid)| (*slot, subs.get(vid).copied().unwrap_or(*vid)))
+                .collect();
+            if !saves.is_empty() {
+                layout.yield_saves.insert(*clone_bid, saves);
+            }
+            // block_kinds: per-kind metadata with operands remapped.
+            match &plan.kind {
+                YieldPlanKind::DirectYield { .. } => {
+                    layout
+                        .block_kinds
+                        .insert(*clone_bid, BlockKind::DirectYield);
+                }
+                YieldPlanKind::CrossFnCall {
+                    call_check_block,
+                    receiver,
+                    args,
+                    result,
+                    method_sym,
+                    ..
+                } => {
+                    layout.block_kinds.insert(
+                        *clone_bid,
+                        BlockKind::CrossFnCallInit {
+                            resume_check_block: primary_clone(*call_check_block, clone_index),
+                            receiver: subs.get(receiver).copied().unwrap_or(*receiver),
+                            args: args
+                                .iter()
+                                .map(|a| subs.get(a).copied().unwrap_or(*a))
+                                .collect(),
+                            result: *result, // result vid is shared across clones
+                            method_sym: *method_sym,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Resume-side metadata: one entry per resume_block (its
+        // single clone). The dispatcher hits state_id and the
+        // br_table jumps here.
+        let resume_bid = resume_entry;
+        // resume_loads: paired (slot, fresh_load_vid). Same for
+        // every entry — not subs-dependent.
+        if !plan.loads.is_empty() {
+            layout.resume_loads.insert(resume_bid, plan.loads.clone());
+        }
+        // direct_yield_results / cross_fn block_kinds at resume side.
+        match &plan.kind {
+            YieldPlanKind::DirectYield { result, .. } => {
+                layout.direct_yield_results.insert(resume_bid, *result);
+            }
+            YieldPlanKind::CrossFnCall {
+                done_block,
+                receiver,
+                args,
+                result,
+                method_sym,
+                ..
+            } => {
+                // The CrossFnCallResume's done_block primary is the
+                // post-call tail's first clone. The cross_fn_results
+                // is populated by the cranelift lowering once it
+                // runs; here we just record kind + done_block.
+                layout.block_kinds.insert(
+                    resume_bid,
+                    BlockKind::CrossFnCallResume {
+                        done_block: primary_clone(*done_block, clone_index),
+                        receiver: *receiver, // saved through slots; lowering reads from slots
+                        args: args.clone(),
+                        result: *result,
+                        method_sym: *method_sym,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn primary_clone(
+    orig: BlockId,
+    clone_index: &HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
+) -> BlockId {
+    clone_index
+        .get(&orig)
+        .and_then(|entries| entries.first().map(|(_, cid)| *cid))
+        .unwrap_or(orig)
+}
+
+fn clones_of<'a>(
+    orig: BlockId,
+    clone_index: &'a HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
+) -> Vec<(SubsKey, BlockId)> {
+    clone_index
+        .get(&orig)
+        .cloned()
+        .unwrap_or_else(|| vec![(Vec::new(), orig)])
 }
 
 /// Replace every `ValueId` operand of `inst` with the mapping in
@@ -1384,158 +1418,6 @@ fn remap_terminator_uses(term: &mut Terminator, remap: &HashMap<ValueId, ValueId
 /// in sync with future `Instruction` enum additions.
 fn collect_uses(inst: &Instruction) -> Vec<ValueId> {
     inst.operands()
-}
-
-/// Standard backward live-variable analysis. Returns the set of
-/// ValueIds live at the entry of `target_block`. Used by the SM
-/// transform's split point to figure out which pre-yield values
-/// must be saved across a suspension and reloaded on resume.
-///
-/// Block-level uses/defs are collected once, then `live_in[B] =
-/// uses(B) ∪ (live_out[B] − defs(B))` and `live_out[B] = ∪
-/// live_in[succ]` are iterated to a fixed point. Block params
-/// count as defs (they're SSA values introduced at block entry).
-fn compute_live_in(mir: &MirFunction, target_block: BlockId) -> std::collections::HashSet<ValueId> {
-    use std::collections::HashSet;
-    let n = mir.blocks.len();
-    let mut block_uses: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut block_defs: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut successors: Vec<Vec<BlockId>> = vec![Vec::new(); n];
-
-    for (i, blk) in mir.blocks.iter().enumerate() {
-        let mut local_defs = HashSet::new();
-        // Block params are defs at entry.
-        for (vid, _) in &blk.params {
-            local_defs.insert(*vid);
-        }
-        // Walk instructions in order: a use precedes the
-        // instruction's own def, so a use is "real" only if not
-        // already locally defined by a previous instruction.
-        for (vid, inst) in &blk.instructions {
-            for u in collect_uses(inst) {
-                if !local_defs.contains(&u) {
-                    block_uses[i].insert(u);
-                }
-            }
-            local_defs.insert(*vid);
-        }
-        for u in collect_terminator_uses(&blk.terminator) {
-            if !local_defs.contains(&u) {
-                block_uses[i].insert(u);
-            }
-        }
-        block_defs[i] = local_defs;
-        successors[i] = blk.terminator.successors();
-    }
-
-    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        // Reverse-postorder-ish: iterate from the last block
-        // backwards. Doesn't affect correctness, just shaves a
-        // few worklist passes vs. forward order.
-        for i in (0..n).rev() {
-            let mut live_out: HashSet<ValueId> = HashSet::new();
-            for succ in &successors[i] {
-                let s = succ.0 as usize;
-                if s < n {
-                    for v in &live_in[s] {
-                        live_out.insert(*v);
-                    }
-                }
-            }
-            let mut new_live_in = block_uses[i].clone();
-            for v in &live_out {
-                if !block_defs[i].contains(v) {
-                    new_live_in.insert(*v);
-                }
-            }
-            if new_live_in != live_in[i] {
-                live_in[i] = new_live_in;
-                changed = true;
-            }
-        }
-    }
-
-    live_in[target_block.0 as usize].clone()
-}
-
-/// Set of ValueIds defined "before" the current yield — i.e.
-/// values that exist when the yield happens and would be lost
-/// across the suspension if we didn't save them. Computed as
-/// forward-reach from `bb0` over the post-transform CFG: the
-/// SM transform splits each yielding block so its terminator is
-/// `Return(yield_value)` (no successor), and resume entries have
-/// empty MIR predecessors (the dispatcher's `br_table` edge is
-/// added at lowering, after this transform runs). So a plain
-/// forward-from-`bb0` walk via terminator successors lands
-/// exactly on the blocks that lexically precede every yield in
-/// the original control flow.
-///
-/// The earlier "forward-from-resume" formulation broke on loops:
-/// `while (cond) { Fiber.yield() }` makes the loop's body block
-/// (which defines values used at the resume entry as branch
-/// args) forward-reachable from the resume, mistakenly classing
-/// it as post-yield-only. Surfaced as `undefined value v6 in
-/// terminator` in `@hatch:web`'s `App.handle(_)` once
-/// WLIFT_AOT_CALL_N taint expansion brought the inner-loop call
-/// into the SM mesh.
-///
-/// Block params get added unconditionally because a param's
-/// value comes from its predecessor's branch arg — a loop-back
-/// param's initial value originates pre-yield even though the
-/// param appears in a "post-yield-only" block per the structural
-/// reach.
-fn collect_pre_yield_defs(
-    mir: &MirFunction,
-    pre_yield_roots: &[BlockId],
-) -> std::collections::HashSet<ValueId> {
-    use std::collections::HashSet;
-    let n = mir.blocks.len();
-    let mut pre_yield_blocks: HashSet<BlockId> = HashSet::new();
-    // Multi-root forward walk: bb0 catches the original pre-
-    // yield-1 region; each prior yield's resume entry catches
-    // the post-resume / pre-current-yield region (cloned blocks
-    // post-yield-1, etc.). Without seeding from prior resume
-    // entries, defs in the cloned post-yield-1 region don't
-    // appear in `pre_yield_defs`, so a later yield's saves
-    // include their original ValueIds — which on the cloned
-    // path haven't been defined (the clone uses fresh ValueIds
-    // per `remap`). The current yield's resume entry is NOT in
-    // the seed set (the caller passes `layout.resume_entries`
-    // BEFORE pushing the new entry), so the walk stops at the
-    // current yield's `Return` boundary and doesn't pollute
-    // pre-yield with post-current-yield defs.
-    let mut stack: Vec<BlockId> = pre_yield_roots.to_vec();
-    while let Some(b) = stack.pop() {
-        if !pre_yield_blocks.insert(b) {
-            continue;
-        }
-        if (b.0 as usize) < n {
-            for s in mir.blocks[b.0 as usize].terminator.successors() {
-                stack.push(s);
-            }
-        }
-    }
-    let mut pre_yield_defs: HashSet<ValueId> = HashSet::new();
-    for blk in mir.blocks.iter() {
-        for (vid, _) in &blk.params {
-            pre_yield_defs.insert(*vid);
-        }
-    }
-    for (i, blk) in mir.blocks.iter().enumerate() {
-        if !pre_yield_blocks.contains(&BlockId(i as u32)) {
-            continue;
-        }
-        for (vid, _) in &blk.params {
-            pre_yield_defs.insert(*vid);
-        }
-        for (vid, _) in &blk.instructions {
-            pre_yield_defs.insert(*vid);
-        }
-    }
-    pre_yield_defs
 }
 
 /// Collect ValueId reads from a terminator. Uses `Terminator::operands`
