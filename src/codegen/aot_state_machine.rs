@@ -687,10 +687,60 @@ fn compute_saves_loads(mir: &mut MirFunction, plans: &mut [YieldPlan], next_slot
     // count as defs regardless of which subset of paths reach
     // them — Phase 3's per-path dataflow handles the per-path
     // visibility).
-    let pre_yield_defs: std::collections::HashSet<ValueId> = {
-        use std::collections::HashSet;
-        let mut defs: HashSet<ValueId> = HashSet::new();
+    // Per-plan pre_yield_defs: vids that are definitely defined
+    // by the time plan K's yielding_block runs.
+    //
+    // Vids defined in a block reachable BACKWARD from K's
+    // yielding_block (via CFG predecessors) ARE pre-yield: they're
+    // computed on some path leading into yield K. Block params
+    // also count (the predecessor's branch arg defines them).
+    //
+    // Cross-fn / direct-yield results from OTHER plans are pre-
+    // yield ONLY IF that plan's resume_block is on a path from
+    // bb0 to K's yielding_block (i.e., the other yield has
+    // already fired by the time K fires). Without this scoping,
+    // a later yield's result vid gets pulled into an earlier
+    // yield's save set — the save reads val_map[result] which
+    // isn't bound until the later yield's Resume, producing
+    // garbage at runtime or a verifier reject.
+    let mut predecessors: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for blk in mir.blocks.iter() {
+        for s in blk.terminator.successors() {
+            predecessors.entry(s).or_default().push(blk.id);
+        }
+    }
+    let plan_idx_by_resume: HashMap<BlockId, usize> = plans
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.resume_block, i))
+        .collect();
+    let plan_kinds: Vec<YieldPlanKind> = plans.iter().map(|p| p.kind.clone()).collect();
+    let plan_yielding_blocks: Vec<BlockId> = plans.iter().map(|p| p.yielding_block).collect();
+
+    for (k, plan) in plans.iter_mut().enumerate() {
+        // Backward CFG walk from this plan's yielding_block.
+        let backward: std::collections::HashSet<BlockId> = {
+            use std::collections::HashSet;
+            let mut visited: HashSet<BlockId> = HashSet::new();
+            let mut stack = vec![plan.yielding_block];
+            while let Some(b) = stack.pop() {
+                if !visited.insert(b) {
+                    continue;
+                }
+                if let Some(preds) = predecessors.get(&b) {
+                    for p in preds {
+                        stack.push(*p);
+                    }
+                }
+            }
+            visited
+        };
+        // Defs from the backward-reachable region.
+        let mut defs: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
         for blk in mir.blocks.iter() {
+            if !backward.contains(&blk.id) {
+                continue;
+            }
             for (vid, _) in &blk.params {
                 defs.insert(*vid);
             }
@@ -698,11 +748,33 @@ fn compute_saves_loads(mir: &mut MirFunction, plans: &mut [YieldPlan], next_slot
                 defs.insert(*vid);
             }
         }
-        defs
-    };
+        // Block params of every block — block params are
+        // SSA-introduced at entry and are pre-yield for any
+        // block that includes them via reachability.
+        // Result vids of other plans whose resume_block sits on
+        // a path from bb0 reaching this plan's yielding_block.
+        // We approximate this by: result is pre-yield iff the
+        // other plan's resume_block is in `backward`.
+        for (j, kind) in plan_kinds.iter().enumerate() {
+            if j == k {
+                continue;
+            }
+            let resume = plans_resume(&plan_idx_by_resume, j).unwrap_or(plan_yielding_blocks[j]);
+            if !backward.contains(&resume) {
+                continue;
+            }
+            match kind {
+                YieldPlanKind::DirectYield { result, .. } => {
+                    defs.insert(*result);
+                }
+                YieldPlanKind::CrossFnCall { result, .. } => {
+                    defs.insert(*result);
+                }
+            }
+        }
+        let pre_yield_defs = defs;
 
-    for plan in plans.iter_mut() {
-        // The result vid of the current yield isn't in the saved
+        // The result vid of the CURRENT yield isn't in the saved
         // set: there's no pre-yield MIR-level def (the call was
         // dropped during split). The Cranelift lowering rebinds
         // it at the resume's prologue (via resume_v param for
@@ -740,6 +812,17 @@ fn compute_saves_loads(mir: &mut MirFunction, plans: &mut [YieldPlan], next_slot
         plan.saves = saves;
         plan.loads = loads;
     }
+}
+
+/// Helper: look up plan j's resume_block via the index map.
+fn plans_resume(
+    plan_idx_by_resume: &HashMap<BlockId, usize>,
+    j: usize,
+) -> Option<BlockId> {
+    plan_idx_by_resume
+        .iter()
+        .find(|(_, idx)| **idx == j)
+        .map(|(bid, _)| *bid)
 }
 
 /// Compute live_in for every block in a single pass (vs. one
