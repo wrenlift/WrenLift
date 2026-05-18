@@ -1528,13 +1528,29 @@ pub unsafe extern "C" fn wlift_aot_trace_init_load(
     );
 }
 
-/// Read a value from slot `slot` of the *topmost* frame (the
+/// Read a value from slot `slot` of the *callee* frame (the
 /// child frame the parent pushed for a cross-fn call). Used by
 /// the parent's call_check block on resume — the receiver and
 /// args were stashed there at the matching Init block, and
 /// reading them via val_map / Cranelift SSA isn't safe because
 /// the dispatcher's `br_table` enters the call_check block
 /// without going through Init.
+///
+/// **Why `aot_active_depth + 1`, not `frames.last()`:** on an
+/// initial entry, the parent pushed exactly one frame and the
+/// callee is on top. But on RESUME after a yield, the call chain
+/// has stayed on the stack — `frames.last()` now points at the
+/// deepest leaf (the innermost yielding callee), not at THIS
+/// parent's direct callee. Loading slot 0 from there returns the
+/// wrong receiver: e.g. `Fiber.new { r.readAll }`'s parent finds
+/// the innermost-closure's slot-0 (which is an inner closure
+/// object) instead of `r` (the Reader instance), and the next
+/// dispatch resolves `Closure.readAll` → method-not-found →
+/// fiber marked Done with null. Surfaces on the second
+/// `fib.try()` of any nested-yield body.
+///
+/// The parent's frame is at `aot_active_depth`; its direct
+/// callee is therefore at `aot_active_depth + 1`.
 ///
 /// # Safety
 ///
@@ -1552,7 +1568,8 @@ pub unsafe extern "C" fn wlift_aot_sm_load_arg(
     let slot = slot as usize;
     unsafe {
         let frames = &(*fiber).aot_frames;
-        let frame = match frames.last() {
+        let callee_idx = (*fiber).aot_active_depth + 1;
+        let frame = match frames.get(callee_idx).or_else(|| frames.last()) {
             Some(f) => f,
             None => return crate::runtime::value::Value::null().to_bits(),
         };
