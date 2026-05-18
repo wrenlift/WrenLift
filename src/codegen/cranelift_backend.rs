@@ -2256,6 +2256,45 @@ pub mod cl {
                     let closure_bits = builder.inst_results(call)[0];
                     builder.def_var(closure_var, closure_bits);
                 }
+                // Materialise function args (BlockParam vids) HERE
+                // in the dispatch block, not in bb0. The dispatcher's
+                // `br_table` can jump to any resume entry without
+                // going through bb0 — defining the arg vids only at
+                // bb0 leaves them undefined on the resume paths
+                // and Cranelift's verifier rejects with "uses value
+                // vN from non-dominating instM" once any post-resume
+                // code references a BlockParam-bound arg.
+                //
+                // Reading the args here in dispatch dominates every
+                // resume entry (since dispatch is the function
+                // entry), so subsequent val_map lookups for arg vids
+                // are SSA-correct.
+                //
+                // Closure bodies use slot+1 (slot 0 holds the closure
+                // receiver written by CrossFnCallInit's save_arg, not
+                // a user param); methods use slot directly.
+                {
+                    let bb0 = mir.entry_block();
+                    let entry = &mir.blocks[bb0.0 as usize];
+                    let is_closure_body = interner.resolve(mir.name) == "<closure>";
+                    let slot_offset = if is_closure_body { 1u16 } else { 0u16 };
+                    let load_fn =
+                        get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
+                    for &(vid, ref inst) in &entry.instructions {
+                        if let Instruction::BlockParam(idx) = inst {
+                            let slot = builder
+                                .ins()
+                                .iconst(types::I64, (*idx + slot_offset) as i64);
+                            let call = builder.ins().call(load_fn, &[fiber_param, slot]);
+                            let v = builder.inst_results(call)[0];
+                            val_map.insert(vid, v);
+                            if *idx == 0 {
+                                receiver_val = Some(v);
+                            }
+                        }
+                    }
+                }
+
                 let load_state = get_runtime_fn(module, builder, "wlift_aot_sm_load_state", 1)?;
                 let call = builder.ins().call(load_state, &[fiber_param]);
                 let state_id_64 = builder.inst_results(call)[0];
@@ -2609,60 +2648,15 @@ pub mod cl {
                     // doesn't pass any block args. Don't append
                     // block params — the (fiber, resume_v)
                     // signature lives on the dispatch block.
-                    // Instead, materialise each `BlockParam(i)`
-                    // by loading from `wlift_aot_sm_load_value(
-                    // fiber, i)`: the caller wrote the args
-                    // there before invocation, and arg `0` is
-                    // the receiver for instance methods.
-                    if let Some(cfg) = aot_config {
-                        if let Some(fiber_var) = *cfg.current_fiber_ptr_var.borrow() {
-                            let fiber = builder.use_var(fiber_var);
-                            let load_fn =
-                                get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
-                            // Closure bodies have no implicit
-                            // `this` BlockParam — `BlockParam(0)`
-                            // is the first user arg. The caller
-                            // (CrossFnCallInit's save_arg
-                            // sequence) writes the closure
-                            // receiver at slot 0 and user args
-                            // at slot 1..N regardless of whether
-                            // the callee is a method or a
-                            // closure, so closure bodies need to
-                            // read user args at slot+1 to skip
-                            // the receiver slot.
-                            //
-                            // Without this, every `Fn.new {|req,
-                            // next| ...}` body under
-                            // WLIFT_AOT_CALL_N saw `req` ← the
-                            // closure itself and `next` ← the
-                            // actual req — `step_`'s `mw.call(
-                            // req, next)` chain through
-                            // `@hatch:web`'s middleware
-                            // recursed infinitely between two
-                            // closures (each thinking its
-                            // `next` was actually `req`'s
-                            // value) and exhausted the stack on
-                            // every request.
-                            let is_closure_body = interner.resolve(mir.name) == "<closure>";
-                            let slot_offset = if is_closure_body { 1u16 } else { 0u16 };
-                            for &(vid, ref inst) in &block.instructions {
-                                if let Instruction::BlockParam(idx) = inst {
-                                    let slot = builder
-                                        .ins()
-                                        .iconst(types::I64, (*idx + slot_offset) as i64);
-                                    let call = builder.ins().call(load_fn, &[fiber, slot]);
-                                    let v = builder.inst_results(call)[0];
-                                    val_map.insert(vid, v);
-                                    if *idx == 0 {
-                                        receiver_val = Some(v);
-                                    }
-                                    if mark_stack_map && is_wren_value(vid, &value_types) {
-                                        builder.declare_value_needs_stack_map(v);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    //
+                    // BlockParam(idx) vids are already bound in
+                    // val_map by the dispatch block's load_value
+                    // sequence; that one dominates every resume
+                    // entry too, so we don't re-emit loads here.
+                    // (Re-emitting would overwrite val_map[vid]
+                    // with a Value defined inside bb0, which the
+                    // resume-only paths don't dominate — exactly
+                    // the bug we're fixing.)
                 } else {
                     // i64 path: add mir.arity params to match the caller ABI
                     // (includes receiver even if dead).
