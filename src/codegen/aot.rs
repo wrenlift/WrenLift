@@ -1369,6 +1369,19 @@ fn emit_aot_function(
         builder.finalize();
     }
 
+    // Diagnostic: dump the cranelift IR for matching functions, even
+    // on successful compile — helpful for understanding runtime hangs
+    // where MIR alone isn't enough. Gated on WLIFT_AOT_DUMP_FN matching
+    // and WLIFT_AOT_DUMP_IR=1 (separate from the on-error WLIFT_AOT_DUMP).
+    if std::env::var_os("WLIFT_AOT_DUMP_IR").is_some() {
+        if let Ok(want) = std::env::var("WLIFT_AOT_DUMP_FN") {
+            let mir_name = interner.resolve(mir.name).to_string();
+            if symbol.contains(&want) || mir_name.contains(&want) {
+                eprintln!("=== AOT IR for {symbol} (mir.name={mir_name}) ===");
+                eprintln!("{}", ctx.func.display());
+            }
+        }
+    }
     module.define_function(func_id, &mut ctx).map_err(|e| {
         if std::env::var_os("WLIFT_AOT_DUMP").is_some() {
             eprintln!("=== AOT define_function failed for {symbol} ===");

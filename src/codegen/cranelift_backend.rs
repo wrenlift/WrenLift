@@ -5726,6 +5726,25 @@ pub mod cl {
         result
     }
 
+    /// Convert a raw-bool (Cranelift i8/i64 0-or-1) into the
+    /// NaN-boxed Wren bool the rest of the lowering expects when a
+    /// value flows through a block param. The receiving block param
+    /// is typed i64 and downstream uses assume Wren-Value semantics;
+    /// passing a raw 0 misclassifies as truthy under the standard
+    /// `v != TAG_FALSE && v != TAG_NULL` truthiness check.
+    fn box_raw_bool_if_needed(
+        builder: &mut FunctionBuilder,
+        v: Value,
+        is_raw_bool: bool,
+    ) -> Value {
+        if !is_raw_bool {
+            return v;
+        }
+        let tag_true = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+        let tag_false = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+        builder.ins().select(v, tag_true, tag_false)
+    }
+
     /// Lower a MIR terminator to Cranelift IR.
     fn lower_terminator(
         term: &Terminator,
@@ -5776,8 +5795,22 @@ pub mod cl {
                 builder.ins().return_(&[null]);
             }
             Terminator::Branch { target, args } => {
+                // Box raw-bool args into NaN-boxed Wren bools before
+                // passing as block params. Block params are typed
+                // i64 (Wren Value) and downstream uses (e.g.
+                // CondBranch's truthiness check) assume that. Without
+                // boxing, a raw 0 (raw false) passes the
+                // "v != TAG_FALSE && v != TAG_NULL" check and gets
+                // misclassified as truthy — turning `while (cond)`
+                // into an infinite loop after the second function
+                // call when `cond` flows through a phi-style block
+                // param. Surfaced as Reader.readLine hanging on the
+                // second call once _lineBuf had any leftover bytes.
                 let cl_block = block_map[target];
-                let cl_args: Vec<BlockArg> = args.iter().map(|a| BlockArg::Value(get(a))).collect();
+                let cl_args: Vec<BlockArg> = args
+                    .iter()
+                    .map(|a| BlockArg::Value(box_raw_bool_if_needed(builder, get(a), raw_bools.contains(a))))
+                    .collect();
                 builder.ins().jump(cl_block, &cl_args);
             }
             Terminator::CondBranch {
@@ -5790,10 +5823,14 @@ pub mod cl {
                 let cond = get(condition);
                 let t_block = block_map[true_target];
                 let f_block = block_map[false_target];
-                let t_args: Vec<BlockArg> =
-                    true_args.iter().map(|a| BlockArg::Value(get(a))).collect();
-                let f_args: Vec<BlockArg> =
-                    false_args.iter().map(|a| BlockArg::Value(get(a))).collect();
+                let t_args: Vec<BlockArg> = true_args
+                    .iter()
+                    .map(|a| BlockArg::Value(box_raw_bool_if_needed(builder, get(a), raw_bools.contains(a))))
+                    .collect();
+                let f_args: Vec<BlockArg> = false_args
+                    .iter()
+                    .map(|a| BlockArg::Value(box_raw_bool_if_needed(builder, get(a), raw_bools.contains(a))))
+                    .collect();
 
                 // If the condition is a raw boolean (from CmpLtF64 etc.),
                 // use it directly — no NaN-box truthiness check needed.
