@@ -657,7 +657,26 @@ fn compute_saves_loads(mir: &mut MirFunction, plans: &mut [YieldPlan], next_slot
     // Run liveness once over the whole function — we need live_in
     // for every resume_block. The per-block live_in is the
     // standard backward-dataflow fixed point.
-    let all_live_in = compute_all_live_in(mir);
+    //
+    // For yielding blocks, the suspension Call was dropped during
+    // Phase 1's split — its operands no longer appear in the MIR.
+    // But the runtime save_arg sequence (at CrossFnCallInit's
+    // lowering) reads val_map[receiver] + val_map[args[i]], so
+    // those vids ARE used at the yielding block. Without feeding
+    // them back into the liveness pass, a value flowing from
+    // pre-yield-K into yield K+1's call args goes uncounted —
+    // saves[K] misses it, downstream use sees an undefined
+    // val_map entry. Surfaces as App.serve_-shape closures'
+    // "uses value vN from non-dominating instM" verifier reject.
+    let mut extra_uses: HashMap<BlockId, Vec<ValueId>> = HashMap::new();
+    for plan in plans.iter() {
+        if let YieldPlanKind::CrossFnCall { receiver, args, .. } = &plan.kind {
+            let entry = extra_uses.entry(plan.yielding_block).or_default();
+            entry.push(*receiver);
+            entry.extend(args.iter().copied());
+        }
+    }
+    let all_live_in = compute_all_live_in_with_extra(mir, &extra_uses);
 
     // For "pre-yield defs" filter: a value v is "pre-yield"
     // (savable) only if its def is reachable from bb0 in the
@@ -825,10 +844,14 @@ fn plans_resume(
         .map(|(bid, _)| *bid)
 }
 
-/// Compute live_in for every block in a single pass (vs. one
-/// fixed-point per resume_block).
-fn compute_all_live_in(
+/// Compute live_in for every block, accepting an `extra_uses`
+/// table for vids referenced by metadata (not by MIR instructions).
+/// CrossFnCallInit's receiver/args fall in this category — the Call
+/// they came from was dropped during Phase 1's split, so liveness
+/// over the post-split MIR alone misses them.
+fn compute_all_live_in_with_extra(
     mir: &MirFunction,
+    extra_uses: &HashMap<BlockId, Vec<ValueId>>,
 ) -> std::collections::HashMap<BlockId, std::collections::HashSet<ValueId>> {
     use std::collections::{HashMap as HMap, HashSet};
     let n = mir.blocks.len();
@@ -852,6 +875,13 @@ fn compute_all_live_in(
         for u in collect_terminator_uses(&blk.terminator) {
             if !local_defs.contains(&u) {
                 block_uses[i].insert(u);
+            }
+        }
+        if let Some(extra) = extra_uses.get(&blk.id) {
+            for u in extra {
+                if !local_defs.contains(u) {
+                    block_uses[i].insert(*u);
+                }
             }
         }
         block_defs[i] = local_defs;
