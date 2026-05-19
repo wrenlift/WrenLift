@@ -1167,40 +1167,9 @@ pub fn set_aot_gc_enabled(v: bool) {
     AOT_GC_ENABLED.with(|c| c.set(v));
 }
 
-/// End-of-alloc-helper safepoint. Pushes `val` as a transient JIT
-/// root, runs GC if nursery pressure trips `should_collect()`,
-/// pops the transient root, and returns the (possibly forwarded)
-/// value's NaN-boxed bits.
-///
-/// Why this lives here: AOT-compiled bodies never re-enter the
-/// bytecode interpreter, so the per-tick safepoint at
-/// [`vm_interp::run_fiber`] is unreachable. Without a runtime
-/// safepoint inside the alloc helpers, GC never fires under AOT
-/// and the heap grows unboundedly.
-///
-/// Why the root is transient (push-then-pop): the caller already
-/// has a Cranelift-emitted stack map covering this call site —
-/// any live Wren `Value`s in the caller's frame are spilled to
-/// stack slots that the GC scanner reads via the registered code
-/// range. Leaving the alloc result permanently in `JIT_ROOTS_STORE`
-/// (which an earlier draft did) makes every allocation
-/// indefinitely reachable, so GC reclaims nothing and memory
-/// climbs linearly with allocation count — hello hit 7.5M live
-/// roots after a few seconds of boot, because every short-lived
-/// string/list/closure stayed pinned. Pop-on-return delegates
-/// long-term lifetime tracking to the stack maps where it
-/// belongs.
-///
-/// Safety relies on the AOT install path having registered every
-/// AOT function's code range + safepoint metadata via
-/// `wlift_aot_register_code_range`, so the GC stack walker's
-/// fp-chain pass in `vm.scan_native_stack_roots` can find AOT
-/// frames and scan their spilled live roots. Without that
-/// registration this helper would free live spill slots and
-/// crash the AOT body the next time it touched a register.
-///
-/// # Safety
-/// `vm` must be the current thread's running VM.
+/// End-of-alloc-helper safepoint. Pushes `val` as a JIT root,
+/// runs GC if nursery pressure trips `should_collect()`, then
+/// reads back the (possibly forwarded) value's NaN-boxed bits.
 ///
 /// AOT-mode contract: the value is pushed onto `JIT_ROOTS_STORE`
 /// and **stays** there. The AOT lowering pairs each function with
@@ -1212,10 +1181,26 @@ pub fn set_aot_gc_enabled(v: bool) {
 /// every allocated value is unconditionally tracked through the
 /// roots Vec, end of story.
 ///
+/// **Long-running-function caveat:** functions that never return
+/// (e.g. `app.listen`'s accept loop) never hit the exit-time
+/// restore, so `JIT_ROOTS_STORE` accumulates one entry per
+/// allocation forever. Eventual memory ceiling is the working
+/// set + the cumulative sum of every allocation the function ever
+/// made. The fix lives in `aot_finish_alloc_back_edge_release`
+/// (called at every loop back-edge in long-running functions):
+/// it shrinks `JIT_ROOTS_STORE` back to the function-entry
+/// snapshot, on the theory that Cranelift's stack maps cover
+/// anything still live across the iteration. Any false-negative
+/// in the stack maps surfaces as a UAF crash here — preferable to
+/// a silent leak because the gap can be fixed.
+///
 /// JIT / interpreter mode keeps the no-op behaviour — the
 /// bytecode interpreter loop's safepoint already runs GC at safe
 /// boundaries and the JIT path's existing root-tracking machinery
 /// handles the rest.
+///
+/// # Safety
+/// `vm` must be the current thread's running VM.
 #[inline]
 pub unsafe fn finish_alloc(vm: &mut crate::runtime::vm::VM, val: Value) -> u64 {
     if !aot_gc_enabled() {
