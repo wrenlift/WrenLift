@@ -3183,6 +3183,7 @@ impl VM {
                     .code_ranges
                     .iter()
                     .find(|r| saved_ret >= r.start && saved_ret < r.end);
+                let trace = std::env::var_os("WLIFT_GC_TRACE_STACK").is_some();
                 if let Some(cr) = code_range {
                     let meta = self
                         .engine
@@ -3191,14 +3192,49 @@ impl VM {
                         .and_then(|m| m.as_ref());
                     if let Some(meta) = meta {
                         let offset = saved_ret.wrapping_sub(cr.start) as u32;
-                        if let Some(sp) = meta.safepoints.iter().find(|sp| sp.code_offset == offset)
-                        {
+                        let sp_match = meta.safepoints.iter().find(|sp| sp.code_offset == offset);
+                        if trace {
+                            let total_sps = meta.safepoints.len();
+                            eprintln!(
+                                "  [gc] AOT frame fp={:#x} ret={:#x} cr=[{:#x},{:#x}) offset={} sps={} matched={} live_roots={}",
+                                saved_fp,
+                                saved_ret,
+                                cr.start,
+                                cr.end,
+                                offset,
+                                total_sps,
+                                sp_match.is_some(),
+                                sp_match.map(|s| s.live_roots.len()).unwrap_or(0),
+                            );
+                            if sp_match.is_none() && total_sps > 0 {
+                                let mut sps_dump: Vec<u32> =
+                                    meta.safepoints.iter().map(|s| s.code_offset).collect();
+                                sps_dump.sort();
+                                let nearest = sps_dump
+                                    .iter()
+                                    .copied()
+                                    .filter(|o| *o <= offset)
+                                    .max();
+                                let next = sps_dump.iter().copied().find(|o| *o > offset);
+                                eprintln!(
+                                    "    [gc] unmatched offset={}, nearest≤={:?} next>={:?} (first={:?} last={:?})",
+                                    offset, nearest, next, sps_dump.first(), sps_dump.last()
+                                );
+                            }
+                        }
+                        if let Some(sp) = sp_match {
                             for root in &sp.live_roots {
                                 if let RootLocation::Spill(spill_offset) = root.location {
                                     let addr =
                                         (saved_fp as isize + spill_offset as isize) as *mut u64;
                                     let bits = unsafe { *addr };
                                     let val = Value::from_bits(bits);
+                                    if trace && val.is_object() {
+                                        eprintln!(
+                                            "    [gc] spill@fp+{}: bits={:#x} obj=true",
+                                            spill_offset, bits
+                                        );
+                                    }
                                     if val.is_object() {
                                         found_roots.push(val);
                                         slot_addrs.push(addr);
@@ -3206,7 +3242,17 @@ impl VM {
                                 }
                             }
                         }
+                    } else if trace {
+                        eprintln!(
+                            "  [gc] AOT frame fp={:#x} ret={:#x} cr=[{:#x},{:#x}) — NO METADATA",
+                            saved_fp, saved_ret, cr.start, cr.end
+                        );
                     }
+                } else if trace && saved_ret != 0 {
+                    eprintln!(
+                        "  [gc] skip frame fp={:#x} ret={:#x} (not in any code_range)",
+                        saved_fp, saved_ret
+                    );
                 }
                 fp = saved_fp;
             }

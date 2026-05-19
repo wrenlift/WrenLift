@@ -1929,6 +1929,21 @@ pub fn call_closure_jit_or_sync(
                 }
                 if !fn_ptr.is_null() && !vm.fiber.is_null() {
                     let fiber = vm.fiber;
+                    // Root the fiber + closure on JIT_ROOTS_STORE
+                    // for the duration of the poll busy-loop. The
+                    // poll body may fire GC, which promotes nursery
+                    // fibers/closures to old gen and rewrites root
+                    // entries to the forwarded addresses. Without
+                    // rooting, the Rust locals here hold stale
+                    // post-promotion pointers and writes like
+                    // `(*fiber).aot_active_depth = saved_depth`
+                    // land on freed nursery memory — surfaces as
+                    // crash-on-second-request when the fiber's
+                    // state field reads garbage.
+                    let fiber_root_idx = jit_roots_snapshot_len();
+                    push_jit_root(Value::object(fiber as *mut u8));
+                    let closure_root_idx = jit_roots_snapshot_len();
+                    push_jit_root(Value::object(closure_ptr as *mut u8));
                     let saved_depth = unsafe { (*fiber).aot_active_depth };
                     // Detect whether the caller is itself running
                     // inside a state-machine poll. The caller is
@@ -1989,6 +2004,16 @@ pub fn call_closure_jit_or_sync(
                     let final_ret_bits = loop {
                         let ret_bits = poll(fiber, resume_v);
                         let kind = crate::capi::wlift_aot_sm_take_poll_kind();
+                        // Refresh `fiber` from JIT_ROOTS_STORE after
+                        // each poll so a promotion mid-iteration
+                        // doesn't leave us with a stale pointer for
+                        // the next iteration's `(*fiber).aot_active_depth`
+                        // read or for the kind=Yield propagation
+                        // below.
+                        let fiber = jit_root_at(fiber_root_idx)
+                            .as_object()
+                            .map(|p| p as *mut crate::runtime::object::ObjFiber)
+                            .unwrap_or(fiber);
                         if kind == crate::capi::AotSmPollKind::Yield {
                             if caller_is_sm {
                                 // Propagate up — outer SM driver
@@ -1996,6 +2021,10 @@ pub fn call_closure_jit_or_sync(
                                 unsafe {
                                     (*fiber).aot_active_depth = saved_depth;
                                 }
+                                // Pop closure + fiber roots before
+                                // returning.
+                                let _ = pop_jit_root();
+                                let _ = pop_jit_root();
                                 restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
                                 let yield_val = Value::from_bits(ret_bits);
                                 vm.pending_fiber_action =
@@ -2015,6 +2044,16 @@ pub fn call_closure_jit_or_sync(
                         }
                         break ret_bits;
                     };
+                    // Final refresh + cleanup. Read forwarded
+                    // fiber/closure back from JIT_ROOTS_STORE
+                    // before any remaining dereferences.
+                    let fiber = jit_root_at(fiber_root_idx)
+                        .as_object()
+                        .map(|p| p as *mut crate::runtime::object::ObjFiber)
+                        .unwrap_or(fiber);
+                    let _ = closure_root_idx; // intentionally unused; closure isn't dereferenced after poll
+                    let _ = pop_jit_root();
+                    let _ = pop_jit_root();
                     unsafe {
                         (*fiber).aot_active_depth = saved_depth;
                     }
@@ -2373,6 +2412,27 @@ fn handle_jit_fiber_action(
                         set_jit_depth(saved_jit_depth);
                         return Value::null().to_bits();
                     }
+                    // Root `target` and `caller` (both *mut ObjFiber)
+                    // on JIT_ROOTS_STORE before the poll. The poll
+                    // may trigger GC, which promotes nursery
+                    // objects to old gen and rewrites root entries
+                    // to the forwarded addresses. Without rooting,
+                    // these Rust locals hold stale nursery
+                    // pointers post-GC and the post-poll
+                    // `(*target).state = Suspended` writes to
+                    // freed memory — the REAL (forwarded) fiber
+                    // stays stuck in `Running` and the next
+                    // `f.try()` fires "Fiber has already been
+                    // called." on the listen loop.
+                    let target_root_idx = jit_roots_snapshot_len();
+                    push_jit_root(Value::object(target as *mut u8));
+                    let caller_root_idx = if !caller.is_null() {
+                        let idx = jit_roots_snapshot_len();
+                        push_jit_root(Value::object(caller as *mut u8));
+                        Some(idx)
+                    } else {
+                        None
+                    };
                     // First-call frame setup. If this is the
                     // initial `fiber.call`, push the root
                     // state-machine frame for the body. On
@@ -2417,6 +2477,28 @@ fn handle_jit_fiber_action(
                         unsafe { std::mem::transmute(fn_ptr) };
                     let ret_bits = poll(target, value.to_bits());
                     let kind = crate::capi::wlift_aot_sm_take_poll_kind();
+                    // Read back forwarded pointers from JIT_ROOTS_STORE
+                    // before any further dereferences. Any GC fired
+                    // inside `poll` has rewritten these entries to
+                    // point at the new (post-promotion) addresses.
+                    let target = jit_root_at(target_root_idx)
+                        .as_object()
+                        .map(|p| p as *mut crate::runtime::object::ObjFiber)
+                        .unwrap_or(target);
+                    let caller = caller_root_idx
+                        .map(|idx| {
+                            jit_root_at(idx)
+                                .as_object()
+                                .map(|p| p as *mut crate::runtime::object::ObjFiber)
+                                .unwrap_or(caller)
+                        })
+                        .unwrap_or(caller);
+                    // Pop in reverse-push order so the snapshot
+                    // length restores to its pre-poll value.
+                    if caller_root_idx.is_some() {
+                        let _ = pop_jit_root();
+                    }
+                    let _ = pop_jit_root();
                     // Restore caller-side context regardless of outcome.
                     if !caller.is_null() {
                         unsafe {
@@ -2507,8 +2589,40 @@ fn handle_jit_fiber_action(
             } else {
                 Vec::new()
             };
+            // Root target / caller across run_fiber the same way the
+            // SM-poll branch above does — run_fiber drives the BC
+            // interpreter which can fire GC, and any nursery-
+            // promoted fiber pointer held only as a Rust local
+            // here would go stale post-promotion.
+            let target_root_idx = jit_roots_snapshot_len();
+            push_jit_root(Value::object(target as *mut u8));
+            let caller_root_idx = if !caller.is_null() {
+                let idx = jit_roots_snapshot_len();
+                push_jit_root(Value::object(caller as *mut u8));
+                Some(idx)
+            } else {
+                None
+            };
             vm.fiber = target;
             let result = crate::runtime::vm_interp::run_fiber(vm);
+            // Refresh forwarded fiber pointers from JIT_ROOTS_STORE
+            // before any dereferences. Pop in reverse-push order.
+            let target = jit_root_at(target_root_idx)
+                .as_object()
+                .map(|p| p as *mut crate::runtime::object::ObjFiber)
+                .unwrap_or(target);
+            let caller = caller_root_idx
+                .map(|idx| {
+                    jit_root_at(idx)
+                        .as_object()
+                        .map(|p| p as *mut crate::runtime::object::ObjFiber)
+                        .unwrap_or(caller)
+                })
+                .unwrap_or(caller);
+            if caller_root_idx.is_some() {
+                let _ = pop_jit_root();
+            }
+            let _ = pop_jit_root();
             // Restore the caller's frames and re-activate it.
             if !caller.is_null() {
                 // Check if the child fiber yielded a value back to us.

@@ -7,7 +7,25 @@
 # slightly larger exported-symbol table but no runtime perf hit.
 
 [target.'cfg(target_os = "macos")']
-rustflags = ["-C", "link-arg=-Wl,-export_dynamic"]
+rustflags = [
+    "-C", "link-arg=-Wl,-export_dynamic",
+    # Frame pointers required for the GC stack walker.
+    # `scan_native_stack_roots` Pass 2 chases x29/rbp through every
+    # frame to find AOT-compiled Wren frames whose return address
+    # lies inside a registered code range. With Rust's default of
+    # `force-frame-pointers=no`, Rust functions on the call path
+    # between two Wren frames (dispatch_method, alloc helpers,
+    # GC entry itself) don't update x29, so the chain reads junk
+    # and the walker bails out before reaching the AOT caller —
+    # the caller's stack slot for a freshly-promoted nursery object
+    # never gets forwarded and the next dereference reads freed
+    # memory. Enable globally so the host crate, the staticlib, and
+    # every plugin agree on the calling convention.
+    "-C", "force-frame-pointers=yes",
+]
 
 [target.'cfg(all(unix, not(target_os = "macos")))']
-rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
+rustflags = [
+    "-C", "link-arg=-Wl,--export-dynamic",
+    "-C", "force-frame-pointers=yes",
+]
