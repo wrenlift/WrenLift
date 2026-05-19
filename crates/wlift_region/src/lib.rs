@@ -402,7 +402,9 @@ mod tests {
     #[test]
     fn fresh_region_serves_small_alloc() {
         let mut r = Region::new();
-        let p = r.try_alloc_bytes(16).expect("first alloc fits the initial page");
+        let p = r
+            .try_alloc_bytes(16)
+            .expect("first alloc fits the initial page");
         assert_eq!(p.as_ptr() as usize % ALLOC_ALIGN, 0);
         assert_eq!(r.bytes_used(), 16);
     }

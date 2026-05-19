@@ -2278,8 +2278,7 @@ pub mod cl {
                     let entry = &mir.blocks[bb0.0 as usize];
                     let is_closure_body = interner.resolve(mir.name) == "<closure>";
                     let slot_offset = if is_closure_body { 1u16 } else { 0u16 };
-                    let load_fn =
-                        get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
+                    let load_fn = get_runtime_fn(module, builder, "wlift_aot_sm_load_value", 2)?;
                     for &(vid, ref inst) in &entry.instructions {
                         if let Instruction::BlockParam(idx) = inst {
                             let slot = builder
@@ -5732,11 +5731,7 @@ pub mod cl {
     /// is typed i64 and downstream uses assume Wren-Value semantics;
     /// passing a raw 0 misclassifies as truthy under the standard
     /// `v != TAG_FALSE && v != TAG_NULL` truthiness check.
-    fn box_raw_bool_if_needed(
-        builder: &mut FunctionBuilder,
-        v: Value,
-        is_raw_bool: bool,
-    ) -> Value {
+    fn box_raw_bool_if_needed(builder: &mut FunctionBuilder, v: Value, is_raw_bool: bool) -> Value {
         if !is_raw_bool {
             return v;
         }
@@ -5809,7 +5804,13 @@ pub mod cl {
                 let cl_block = block_map[target];
                 let cl_args: Vec<BlockArg> = args
                     .iter()
-                    .map(|a| BlockArg::Value(box_raw_bool_if_needed(builder, get(a), raw_bools.contains(a))))
+                    .map(|a| {
+                        BlockArg::Value(box_raw_bool_if_needed(
+                            builder,
+                            get(a),
+                            raw_bools.contains(a),
+                        ))
+                    })
                     .collect();
                 builder.ins().jump(cl_block, &cl_args);
             }
@@ -5825,11 +5826,23 @@ pub mod cl {
                 let f_block = block_map[false_target];
                 let t_args: Vec<BlockArg> = true_args
                     .iter()
-                    .map(|a| BlockArg::Value(box_raw_bool_if_needed(builder, get(a), raw_bools.contains(a))))
+                    .map(|a| {
+                        BlockArg::Value(box_raw_bool_if_needed(
+                            builder,
+                            get(a),
+                            raw_bools.contains(a),
+                        ))
+                    })
                     .collect();
                 let f_args: Vec<BlockArg> = false_args
                     .iter()
-                    .map(|a| BlockArg::Value(box_raw_bool_if_needed(builder, get(a), raw_bools.contains(a))))
+                    .map(|a| {
+                        BlockArg::Value(box_raw_bool_if_needed(
+                            builder,
+                            get(a),
+                            raw_bools.contains(a),
+                        ))
+                    })
                     .collect();
 
                 // If the condition is a raw boolean (from CmpLtF64 etc.),

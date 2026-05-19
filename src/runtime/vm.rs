@@ -358,13 +358,13 @@ pub struct VM {
     /// Use per-fiber bump-allocator regions for short-lived Wren
     /// allocations (`wren_make_string`, eventually `wren_make_list`
     /// + `wren_make_map`). When on, every fiber gets an
-    /// `Option<Box<Region>>` attached at construction; allocations
-    /// route to the region first, and the region drops in
-    /// `release_fiber_resources` when the fiber terminates. Off by
-    /// default until the escape barriers are wired across every
-    /// path that lets a Value cross fiber boundaries (cache stores,
-    /// channel publishes, foreign-method returns). Enable with
-    /// `WLIFT_FIBER_ARENA=1`.
+    ///   `Option<Box<Region>>` attached at construction; allocations
+    ///   route to the region first, and the region drops in
+    ///   `release_fiber_resources` when the fiber terminates. Off by
+    ///   default until the escape barriers are wired across every
+    ///   path that lets a Value cross fiber boundaries (cache stores,
+    ///   channel publishes, foreign-method returns). Enable with
+    ///   `WLIFT_FIBER_ARENA=1`.
     ///
     /// Read once at VM construction so per-allocation checks are a
     /// plain bool field, mirroring `krio_fiber_active`.
@@ -565,14 +565,12 @@ impl VM {
             // `WLIFT_KRIO_FIBER=1`; production deployments that
             // need the AOT path set it explicitly.
             #[cfg(feature = "host")]
-            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER")
-                .is_some_and(|v| v == "1"),
+            krio_fiber_active: std::env::var_os("WLIFT_KRIO_FIBER").is_some_and(|v| v == "1"),
             // Per-fiber arena. Off by default — see field comment
             // for the escape-barrier requirements that gate flipping
             // the default on. `WLIFT_FIBER_ARENA=1` opts in.
             #[cfg(feature = "host")]
-            fiber_arena_active: std::env::var_os("WLIFT_FIBER_ARENA")
-                .is_some_and(|v| v == "1"),
+            fiber_arena_active: std::env::var_os("WLIFT_FIBER_ARENA").is_some_and(|v| v == "1"),
             register_pool: Vec::new(),
             sync_fiber_pool: Vec::new(),
             method_cache: super::vm_interp::MethodCache::new(),
@@ -2369,8 +2367,7 @@ impl VM {
                 if let Some(ptr) = region.try_alloc(ObjString::new(s.clone())) {
                     unsafe {
                         (*ptr).header.class = self.string_class;
-                        (*ptr).header.flags |=
-                            crate::runtime::object::FLAG_ARENA_ALLOCATED;
+                        (*ptr).header.flags |= crate::runtime::object::FLAG_ARENA_ALLOCATED;
                     }
                     return Value::object(ptr as *mut u8);
                 }

@@ -943,20 +943,13 @@ impl Gc {
         #[cfg(all(feature = "host", not(feature = "wlift_alloc"), target_os = "macos"))]
         {
             unsafe extern "C" {
-                fn malloc_zone_pressure_relief(
-                    zone: *mut std::ffi::c_void,
-                    goal: usize,
-                ) -> usize;
+                fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
             }
             unsafe {
                 let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
             }
         }
-        #[cfg(all(
-            feature = "host",
-            not(feature = "wlift_alloc"),
-            target_os = "linux"
-        ))]
+        #[cfg(all(feature = "host", not(feature = "wlift_alloc"), target_os = "linux"))]
         {
             unsafe extern "C" {
                 fn malloc_trim(pad: usize) -> std::ffi::c_int;

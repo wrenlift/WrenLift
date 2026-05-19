@@ -519,11 +519,9 @@ fn plan_yields(
         };
 
         // Capture the call's metadata before mutating.
-        let (yield_value, direct_result, cross_meta): (
-            ValueId,
-            Option<ValueId>,
-            Option<(ValueId, Vec<ValueId>, ValueId, SymbolId)>,
-        ) = match susp_kind {
+        type CrossMeta = (ValueId, Vec<ValueId>, ValueId, SymbolId);
+        let (yield_value, direct_result, cross_meta): (ValueId, Option<ValueId>, Option<CrossMeta>) =
+            match susp_kind {
             SuspensionKind::DirectYield => {
                 let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
                     (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
@@ -574,8 +572,10 @@ fn plan_yields(
             let blk = &mut mir.blocks[blk_id.0 as usize];
             let mut tail = blk.instructions.split_off(inst_idx);
             tail.remove(0); // drop the suspension Call
-            let orig_term =
-                std::mem::replace(&mut blk.terminator, Terminator::Unreachable /* placeholder */);
+            let orig_term = std::mem::replace(
+                &mut blk.terminator,
+                Terminator::Unreachable, /* placeholder */
+            );
             let new_block = &mut mir.blocks[post_call_block.0 as usize];
             new_block.instructions = tail;
             new_block.terminator = orig_term.clone();
@@ -595,8 +595,7 @@ fn plan_yields(
                     state_id,
                     kind: YieldPlanKind::DirectYield {
                         yield_value,
-                        result: direct_result
-                            .expect("DirectYield always has a result vid"),
+                        result: direct_result.expect("DirectYield always has a result vid"),
                     },
                     saves: Vec::new(),
                     loads: Vec::new(),
@@ -834,10 +833,7 @@ fn compute_saves_loads(mir: &mut MirFunction, plans: &mut [YieldPlan], next_slot
 }
 
 /// Helper: look up plan j's resume_block via the index map.
-fn plans_resume(
-    plan_idx_by_resume: &HashMap<BlockId, usize>,
-    j: usize,
-) -> Option<BlockId> {
+fn plans_resume(plan_idx_by_resume: &HashMap<BlockId, usize>, j: usize) -> Option<BlockId> {
     plan_idx_by_resume
         .iter()
         .find(|(_, idx)| **idx == j)
@@ -1079,11 +1075,7 @@ fn clone_per_reaching_subs(
         });
         let mut entries: Vec<(SubsKey, BlockId)> = Vec::with_capacity(keys.len());
         for (i, key) in keys.iter().enumerate() {
-            let clone_bid = if i == 0 {
-                bid
-            } else {
-                mir.new_block()
-            };
+            let clone_bid = if i == 0 { bid } else { mir.new_block() };
             entries.push((key.clone(), clone_bid));
         }
         clone_index.insert(bid, entries);
@@ -1154,7 +1146,11 @@ fn clone_per_reaching_subs(
     for (orig_bid, entries) in clone_index.iter() {
         let (params, insts, term) = {
             let b = mir.block(*orig_bid);
-            (b.params.clone(), b.instructions.clone(), b.terminator.clone())
+            (
+                b.params.clone(),
+                b.instructions.clone(),
+                b.terminator.clone(),
+            )
         };
         // Block params shadow saved values for the block's body —
         // drop those keys from incoming subs so the param's binding
@@ -1260,8 +1256,7 @@ fn clone_per_reaching_subs(
         for (subs_key, clone_bid) in entries.iter() {
             // Compute this clone's outgoing subs — same rules as
             // the dataflow propagation step.
-            let mut out_subs: HashMap<ValueId, ValueId> = if yield_loads_subs
-                .contains_key(orig_bid)
+            let mut out_subs: HashMap<ValueId, ValueId> = if yield_loads_subs.contains_key(orig_bid)
             {
                 yield_loads_subs.get(orig_bid).cloned().unwrap_or_default()
             } else {
@@ -1285,7 +1280,6 @@ fn clone_per_reaching_subs(
 
     (clone_index, clone_rename)
 }
-
 
 fn redirect_term_to_clone(
     term: &mut Terminator,
@@ -1400,10 +1394,7 @@ fn build_layout(
                         BlockKind::CrossFnCallInit {
                             resume_check_block: primary_clone(*call_check_block, clone_index),
                             receiver: resolve(*receiver, &subs, subs_key),
-                            args: args
-                                .iter()
-                                .map(|a| resolve(*a, &subs, subs_key))
-                                .collect(),
+                            args: args.iter().map(|a| resolve(*a, &subs, subs_key)).collect(),
                             result: *result, // result vid is shared across clones
                             method_sym: *method_sym,
                         },
@@ -1463,9 +1454,9 @@ fn primary_clone(
         .unwrap_or(orig)
 }
 
-fn clones_of<'a>(
+fn clones_of(
     orig: BlockId,
-    clone_index: &'a HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
+    clone_index: &HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
 ) -> Vec<(SubsKey, BlockId)> {
     clone_index
         .get(&orig)

@@ -391,7 +391,7 @@ pub unsafe extern "C" fn wlift_aot_init_prelude(
     // assignment leaks out and the next allocation routes through the
     // wrong fiber's arena.
     #[cfg(feature = "host")]
-    crate::runtime::vm::__set_thread_local_current_vm(vm as *mut crate::runtime::vm::VM);
+    crate::runtime::vm::__set_thread_local_current_vm(vm);
     let vm_ref = unsafe { &*vm };
     for (i, name) in crate::sema::PRELUDE_NAMES.iter().enumerate() {
         if i >= modvars_count {

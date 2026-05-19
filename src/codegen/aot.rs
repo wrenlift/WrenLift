@@ -2316,7 +2316,10 @@ pub fn compile_walk_to_object_with_manifest(
                 &src.module_name == source_path
                     || src.module_name == source_path_normalized
                     || src.module_aliases.iter().any(|a| a == source_path)
-                    || src.module_aliases.iter().any(|a| a == &source_path_normalized)
+                    || src
+                        .module_aliases
+                        .iter()
+                        .any(|a| a == &source_path_normalized)
             });
             if let Some(src_idx) = matched_idx {
                 let src = &manifests[src_idx];

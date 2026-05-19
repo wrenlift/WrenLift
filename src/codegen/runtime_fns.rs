@@ -2011,10 +2011,7 @@ pub fn call_closure_jit_or_sync(
                                 unsafe {
                                     (*fiber).aot_active_depth = saved_depth;
                                 }
-                                restore_rooted_jit_context(
-                                    saved_ctx,
-                                    saved_ctx_root_len,
-                                );
+                                restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
                                 let yield_val = Value::from_bits(ret_bits);
                                 vm.pending_fiber_action =
                                     Some(crate::runtime::vm::FiberAction::Yield {
