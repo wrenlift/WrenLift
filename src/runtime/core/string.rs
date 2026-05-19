@@ -6,6 +6,25 @@ fn receiver_str(args: &[Value]) -> &str {
     super::as_string(args[0])
 }
 
+/// Cached UTF-8 char count for `args[0]` — same shape as
+/// `receiver_str` but routes through `ObjString::char_count_cached`
+/// so repeated subscripts and `.count` getters in tight loops over
+/// long strings stay O(1) per call. Falls back to a one-shot
+/// `chars().count()` if the receiver isn't an `ObjString` (which
+/// shouldn't happen — the string surface dispatches on
+/// `String.method(_)`).
+fn receiver_char_count(args: &[Value]) -> usize {
+    use crate::runtime::object::{ObjHeader, ObjString, ObjType};
+    if let Some(ptr) = args[0].as_object() {
+        let header = unsafe { &*(ptr as *const ObjHeader) };
+        if header.obj_type == ObjType::String {
+            let s = unsafe { &*(ptr as *const ObjString) };
+            return s.char_count_cached();
+        }
+    }
+    super::as_string(args[0]).chars().count()
+}
+
 // ---------------------------------------------------------------------------
 // Static methods
 // ---------------------------------------------------------------------------
@@ -73,7 +92,7 @@ fn subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         let header = unsafe { &*(ptr as *const super::super::object::ObjHeader) };
         if header.obj_type == super::super::object::ObjType::Range {
             let range = unsafe { &*(ptr as *const super::super::object::ObjRange) };
-            let char_count = s.chars().count() as i64;
+            let char_count = receiver_char_count(args) as i64;
             let (start, end) = match normalize_range(range, char_count) {
                 Some(pair) => pair,
                 None => {
@@ -102,7 +121,7 @@ fn subscript(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 
     let mut index = args[1].as_num().unwrap() as i64;
-    let char_count = s.chars().count() as i64;
+    let char_count = receiver_char_count(args) as i64;
 
     if index < 0 {
         index += char_count;
@@ -340,7 +359,7 @@ fn iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 fn count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    Value::num(receiver_str(args).chars().count() as f64)
+    Value::num(receiver_char_count(args) as f64)
 }
 
 fn is_empty(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -493,7 +512,15 @@ fn code_point_seq_iterator_value(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn code_point_seq_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    use crate::runtime::object::{ObjHeader, ObjString, ObjType};
     let string = instance_field(args[0], 0);
+    if let Some(ptr) = string.as_object() {
+        let header = unsafe { &*(ptr as *const ObjHeader) };
+        if header.obj_type == ObjType::String {
+            let s = unsafe { &*(ptr as *const ObjString) };
+            return Value::num(s.char_count_cached() as f64);
+        }
+    }
     let s = super::as_string(string);
     Value::num(s.chars().count() as f64)
 }

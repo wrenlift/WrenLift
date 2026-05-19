@@ -187,6 +187,13 @@ pub struct ObjString {
     pub value: String,
     /// Null-terminated copy for C API (lazily populated).
     pub c_str: std::cell::RefCell<Option<std::ffi::CString>>,
+    /// Cached UTF-8 char count. `u32::MAX` means "not yet computed";
+    /// the lazy populator (`char_count_cached`) only fills it on the
+    /// first call. Without the cache, `str[i]` in tight loops over
+    /// long strings is O(N) per subscript and the template engine's
+    /// per-char walk over the catalog's ~100 KB docstrings becomes
+    /// O(N²) — surfaces as 100 % CPU during a page render.
+    pub char_count: std::cell::Cell<u32>,
 }
 
 impl ObjString {
@@ -197,7 +204,25 @@ impl ObjString {
             hash,
             value: s,
             c_str: std::cell::RefCell::new(None),
+            char_count: std::cell::Cell::new(u32::MAX),
         }
+    }
+
+    /// Cached UTF-8 char count. Computes once and reuses; the cache
+    /// is invalidated implicitly when the string is moved/promoted
+    /// since the underlying `value: String` and the `char_count`
+    /// cell move together. Length-bounded to `u32::MAX - 1` chars,
+    /// which is fine for any realistic in-memory string (4 GB of
+    /// chars is more than the entire Wren heap).
+    pub fn char_count_cached(&self) -> usize {
+        let cached = self.char_count.get();
+        if cached != u32::MAX {
+            return cached as usize;
+        }
+        let count = self.value.chars().count();
+        let stored = count.min((u32::MAX - 1) as usize) as u32;
+        self.char_count.set(stored);
+        stored as usize
     }
 
     /// Returns a pointer to a null-terminated C string.

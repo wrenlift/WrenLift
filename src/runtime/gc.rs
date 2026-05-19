@@ -2300,7 +2300,7 @@ mod tests {
     #[test]
     fn test_should_collect_nursery_pressure() {
         let mut gc = Gc::with_config(GcConfig {
-            nursery_size: 256, // small nursery
+            nursery_size: 512, // small nursery; sized so a few ObjStrings push past 75%
             ..test_config()
         });
         assert!(!gc.should_collect());
@@ -2308,6 +2308,8 @@ mod tests {
         gc.alloc_string("a".into());
         gc.alloc_string("b".into());
         gc.alloc_string("c".into());
+        gc.alloc_string("d".into());
+        gc.alloc_string("e".into());
         assert!(gc.should_collect());
     }
 

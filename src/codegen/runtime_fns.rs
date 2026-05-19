@@ -4571,7 +4571,11 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                 // `str[i]` — single char at a char index.
                 if let Some(n) = idx.as_num() {
                     let mut i = n as i64;
-                    let char_count = s.chars().count() as i64;
+                    // Use cached char count; template engines walk
+                    // long strings via repeated `str[i]` and a fresh
+                    // `chars().count()` each time turns the loop into
+                    // O(N²).
+                    let char_count = unsafe { (*string).char_count_cached() } as i64;
                     if i < 0 {
                         i += char_count;
                     }
@@ -4597,7 +4601,7 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
                     if unsafe { (*idx_header).obj_type } == ObjType::Range {
                         use crate::runtime::object::ObjRange;
                         let range = unsafe { &*(idx_ptr as *const ObjRange) };
-                        let len = s.chars().count() as i64;
+                        let len = unsafe { (*string).char_count_cached() } as i64;
                         let normalize = |mut v: i64| -> i64 {
                             if v < 0 {
                                 v += len
