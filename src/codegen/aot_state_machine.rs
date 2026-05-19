@@ -1102,16 +1102,63 @@ fn clone_per_reaching_subs(
     //
     // For ORDINARY blocks, applied subs = reaching subs (one of
     // the clone-index entries for that block).
+    //
+    // **Step 3a — Allocate fresh ValueIds per non-primary clone.**
+    // The original block and its clone share the same MIR ValueIds
+    // for block params and instruction defs. Cranelift's val_map
+    // is single-binding, so the second-lowered block (typically the
+    // clone) overwrites the first — every downstream use then reads
+    // the wrong Value. Surfaces as Reader.readLine hanging on the
+    // second invocation: the inner search loop's `i` param (defined
+    // by bb10 AND its clone bb49) makes val_map[v_i] flip-flop, the
+    // back-edge `jump bb10(v_i+1, ...)` materialises an arg pointing
+    // at the wrong block's param Value, and at runtime the loop
+    // sees stale data and never finds the newline.
+    //
+    // Build a rename table keyed by `(orig_vid, subs_key)`. The
+    // subs_key identifies which clone region a vid belongs to —
+    // two clones of two different original blocks but reached on
+    // the SAME path (= same subs_key) share the rename so cross-
+    // block references in that region resolve to each other's
+    // fresh vids.
+    type CloneRename = HashMap<(ValueId, SubsKey), ValueId>;
+    let mut clone_rename: CloneRename = HashMap::new();
+    for (orig_bid, entries) in clone_index.iter() {
+        let (params, insts) = {
+            let b = mir.block(*orig_bid);
+            (b.params.clone(), b.instructions.clone())
+        };
+        for (subs_key, clone_bid) in entries.iter() {
+            if *clone_bid == *orig_bid {
+                // Primary keeps the original vids — no rename
+                // entries needed (downstream uses of these vids
+                // should resolve to the original block's binding).
+                continue;
+            }
+            for (orig_vid, _) in &params {
+                let fresh = mir.new_value();
+                clone_rename.insert((*orig_vid, subs_key.clone()), fresh);
+            }
+            for (orig_vid, _) in &insts {
+                let fresh = mir.new_value();
+                clone_rename.insert((*orig_vid, subs_key.clone()), fresh);
+            }
+        }
+    }
+    let lookup_rename = |v: ValueId, key: &SubsKey| -> Option<ValueId> {
+        clone_rename.get(&(v, key.clone())).copied()
+    };
+
+    // **Step 3b — Populate clone bodies and apply renames.**
     for (orig_bid, entries) in clone_index.iter() {
         let (params, insts, term) = {
             let b = mir.block(*orig_bid);
             (b.params.clone(), b.instructions.clone(), b.terminator.clone())
         };
-        // Block params shadow saved values for the block's body.
-        // A subs entry whose key matches a block param represents
-        // a saved value that the predecessor's branch arg has
-        // already re-bound — uses inside the block see the param,
-        // not the load. Drop those keys before applying the subs.
+        // Block params shadow saved values for the block's body —
+        // drop those keys from incoming subs so the param's binding
+        // (whatever the predecessor passed as branch arg) is used
+        // inside the block instead of the resume-load fresh vid.
         let param_vids: std::collections::HashSet<ValueId> =
             params.iter().map(|(v, _)| *v).collect();
         let filter_subs = |s: &HashMap<ValueId, ValueId>| -> HashMap<ValueId, ValueId> {
@@ -1121,11 +1168,13 @@ fn clone_per_reaching_subs(
                 .collect()
         };
 
-        // RESUME blocks have only one clone-entry (the dispatcher
-        // arrival), so we don't iterate over `entries` for them.
+        // RESUME blocks have one canonical clone-entry (the
+        // dispatcher arrival). Apply K's loads subs and skip the
+        // per-entry loop. Resume blocks are also never themselves
+        // cloned per-path, so they keep original vids — no
+        // clone_rename lookups needed.
         let is_resume = yield_loads_subs.contains_key(orig_bid);
         if is_resume {
-            // Apply K's loads subs to the (single) resume block.
             let raw_subs = yield_loads_subs.get(orig_bid).cloned().unwrap_or_default();
             let subs = filter_subs(&raw_subs);
             if !subs.is_empty() {
@@ -1141,6 +1190,10 @@ fn clone_per_reaching_subs(
             let raw_subs = key_to_subs(key);
             let subs = filter_subs(&raw_subs);
             if *clone_bid == *orig_bid {
+                // Primary clone: keep original vids; apply subs to
+                // body and terminator. No clone_rename lookups
+                // (primary IS the original — its vids are the
+                // unrenamed ones).
                 if !subs.is_empty() {
                     let blk = mir.block_mut(*clone_bid);
                     for (_, inst) in &mut blk.instructions {
@@ -1150,16 +1203,39 @@ fn clone_per_reaching_subs(
                 }
                 continue;
             }
-            let mut clone_insts = insts.clone();
-            let mut clone_term = term.clone();
-            if !subs.is_empty() {
-                for (_, inst) in &mut clone_insts {
-                    remap_instruction_uses(inst, &subs);
+            // Non-primary clone: build the combined rename map.
+            //
+            // For body USES: apply subs first (load-vid renames),
+            // then look up clone_rename for any vid that has a fresh
+            // alias in this clone region (params + insts of THIS
+            // block, plus params + insts of UPSTREAM blocks in the
+            // same clone region — both have entries under the same
+            // subs_key).
+            let mut combined: HashMap<ValueId, ValueId> = subs.clone();
+            for ((orig_vid, k), fresh_vid) in clone_rename.iter() {
+                if k == key {
+                    combined.insert(*orig_vid, *fresh_vid);
                 }
-                remap_terminator_uses(&mut clone_term, &subs);
             }
+
+            // Rename block params + instruction defs to this
+            // clone's fresh vids.
+            let new_params: Vec<(ValueId, crate::mir::MirType)> = params
+                .iter()
+                .map(|(v, ty)| (lookup_rename(*v, key).unwrap_or(*v), *ty))
+                .collect();
+            let mut clone_insts: Vec<(ValueId, Instruction)> = insts.clone();
+            for (dst, inst) in &mut clone_insts {
+                remap_instruction_uses(inst, &combined);
+                if let Some(fresh) = lookup_rename(*dst, key) {
+                    *dst = fresh;
+                }
+            }
+            let mut clone_term = term.clone();
+            remap_terminator_uses(&mut clone_term, &combined);
+
             let blk = mir.block_mut(*clone_bid);
-            blk.params = params.clone();
+            blk.params = new_params;
             blk.instructions = clone_insts;
             blk.terminator = clone_term;
         }
