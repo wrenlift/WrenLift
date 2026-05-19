@@ -13,6 +13,98 @@ use super::object::*;
 use super::value::Value;
 use crate::intern::SymbolId;
 
+// --- Diagnostic: pre-free buffer aliasing detector ---------------------------
+//
+// Catches the case where an `ObjString.value` buffer pointer
+// has already been freed (typically by an SM-frame `Vec<Value>`
+// growth/pop) before this drop runs. macOS `malloc_size` returns
+// 0 for free chunks, so we can detect the bad state and panic
+// with the buffer pointer + first few bytes — far more useful
+// than libmalloc's terse `BUG_IN_CLIENT_OF_LIBMALLOC` abort.
+//
+// Gated on `WLIFT_GC_TRACE_ALIAS=1` so the malloc_size call
+// doesn't sit in the hot path under normal runs.
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn malloc_size(ptr: *const std::ffi::c_void) -> usize;
+}
+
+#[cfg(target_os = "macos")]
+fn trace_alias_enabled() -> bool {
+    std::env::var_os("WLIFT_GC_TRACE_ALIAS").is_some_and(|v| v == "1")
+}
+
+/// Log every ObjString allocation + drop, tagged with buffer
+/// pointer, so `grep` against `WLIFT_GC_TRACE_ALIAS=1` output
+/// reconstructs the lifecycle of any buffer the alias detector
+/// flags. Only emits for strings ≥ 16 bytes — small interned
+/// strings dominate the volume but never surface the alias.
+fn trace_str_buf_event(
+    _event: &'static str,
+    _header: *const ObjHeader,
+    _buf: *const u8,
+    _len: usize,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        if !trace_alias_enabled() {
+            return;
+        }
+        if _len < 16 {
+            return;
+        }
+        eprintln!(
+            "STR-{_event} obj={:p} buf=0x{:x} len={}",
+            _header, _buf as usize, _len
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
+    if !trace_alias_enabled() {
+        return;
+    }
+    if (*header).obj_type != ObjType::String {
+        return;
+    }
+    let s = &*(header as *mut ObjString);
+    let buf = s.value.as_ptr() as *const std::ffi::c_void;
+    let len = s.value.len();
+    let cap = s.value.capacity();
+    if cap == 0 || buf.is_null() {
+        return;
+    }
+    let sz = malloc_size(buf);
+    if sz == 0 {
+        // Buffer already free. Snapshot first 24 bytes (a Vec<Value>
+        // header's worth) so we can tell whether the contents look
+        // like NaN-boxed Values rather than UTF-8 text.
+        let mut snap = [0u8; 24];
+        let to_copy = len.min(24);
+        if to_copy > 0 {
+            std::ptr::copy_nonoverlapping(buf as *const u8, snap.as_mut_ptr(), to_copy);
+        }
+        eprintln!(
+            "ALIAS-DETECT [{where_}] ObjString@{:p} buf=0x{:x} len={} cap={} malloc_size=0 \
+             first24={:02x?}",
+            header,
+            buf as usize,
+            len,
+            cap,
+            &snap[..to_copy]
+        );
+        panic!(
+            "ObjString buffer 0x{:x} already free at {} — buffer-aliasing bug",
+            buf as usize, where_
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn pre_drop_check_string(_header: *mut ObjHeader, _where_: &'static str) {}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -609,7 +701,11 @@ impl Gc {
     // -- Typed allocation wrappers ------------------------------------------
 
     pub fn alloc_string(&mut self, s: String) -> *mut ObjString {
-        self.alloc(ObjString::new(s))
+        let buf = s.as_ptr();
+        let len = s.len();
+        let ptr = self.alloc(ObjString::new(s));
+        trace_str_buf_event("ALLOC", ptr as *const ObjHeader, buf, len);
+        ptr
     }
 
     pub fn alloc_list(&mut self) -> *mut ObjList {
@@ -657,7 +753,19 @@ impl Gc {
     }
 
     pub fn alloc_fiber(&mut self) -> *mut ObjFiber {
-        self.alloc(ObjFiber::new())
+        // Pin fibers in old gen for the same reason as ObjClass:
+        // AOT-compiled code passes `*mut ObjFiber` as a raw value
+        // through SM-poll calls and reads `(*fiber).aot_frames`
+        // directly. A nursery-then-promoted fiber would invalidate
+        // every such pointer at the next minor GC and produce
+        // buffer aliasing where the new old-gen fiber's
+        // `aot_frames[i].saved_values` Vec shares its heap buffer
+        // with the stale nursery fiber's identical Vec header (via
+        // `ptr::read` bitwise copy in `promote_typed`). Routing
+        // straight to old-gen keeps the fiber address stable for
+        // its lifetime, so the AOT code's raw pointer stays valid
+        // and only one Vec ever owns each saved_values buffer.
+        self.alloc_old(ObjFiber::new())
     }
 
     pub fn alloc_class(&mut self, name: SymbolId, superclass: *mut ObjClass) -> *mut ObjClass {
@@ -1046,6 +1154,7 @@ impl Gc {
                     // Dead → remove from intern table, drop owned Rust types.
                     self.unlink_intern(obj);
                     let size = object_size(obj);
+                    pre_drop_check_string(obj, "process_nursery");
                     drop_in_place_by_type(obj);
                     self.stats.objects_freed += 1;
                     self.stats.total_freed += size;
@@ -1113,6 +1222,17 @@ impl Gc {
         (*header).next = self.old_objects;
         self.old_objects = header;
         self.old_count += 1;
+        if (*header).obj_type == ObjType::String {
+            let s = &*(header as *const ObjString);
+            trace_str_buf_event("PROMOTE", header, s.value.as_ptr(), s.value.len());
+            #[cfg(target_os = "macos")]
+            if trace_alias_enabled() {
+                eprintln!(
+                    "STR-PROMOTE-FROM old_hdr={:p} -> new_hdr={:p}",
+                    old_header, header
+                );
+            }
+        }
         header
     }
 
@@ -1130,6 +1250,7 @@ impl Gc {
                 let size = object_size(current);
                 self.unlink_intern(current);
                 unsafe {
+                    pre_drop_check_string(current, "sweep_old");
                     drop_object(current);
                 }
                 self.old_count -= 1;
@@ -1716,6 +1837,10 @@ fn object_size(header: *mut ObjHeader) -> usize {
 
 /// Drop owned Rust types in-place (for nursery objects — arena memory freed separately).
 unsafe fn drop_in_place_by_type(header: *mut ObjHeader) {
+    if (*header).obj_type == ObjType::String {
+        let s = &*(header as *const ObjString);
+        trace_str_buf_event("DROP-N", header, s.value.as_ptr(), s.value.len());
+    }
     match (*header).obj_type {
         ObjType::String => std::ptr::drop_in_place(header as *mut ObjString),
         ObjType::List => std::ptr::drop_in_place(header as *mut ObjList),
@@ -1740,6 +1865,10 @@ unsafe fn drop_object(header: *mut ObjHeader) {
     // arena-allocated (not individually heap-allocated). drop_in_place
     // calls the destructor (freeing internal Vecs, Strings, etc.) without
     // trying to free the object's memory itself.
+    if (*header).obj_type == ObjType::String {
+        let s = &*(header as *const ObjString);
+        trace_str_buf_event("DROP-O", header, s.value.as_ptr(), s.value.len());
+    }
     match (*header).obj_type {
         ObjType::String => {
             std::ptr::drop_in_place(header as *mut ObjString);

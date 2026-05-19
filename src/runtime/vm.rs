@@ -3210,11 +3210,8 @@ impl VM {
                                 let mut sps_dump: Vec<u32> =
                                     meta.safepoints.iter().map(|s| s.code_offset).collect();
                                 sps_dump.sort();
-                                let nearest = sps_dump
-                                    .iter()
-                                    .copied()
-                                    .filter(|o| *o <= offset)
-                                    .max();
+                                let nearest =
+                                    sps_dump.iter().copied().filter(|o| *o <= offset).max();
                                 let next = sps_dump.iter().copied().find(|o| *o > offset);
                                 eprintln!(
                                     "    [gc] unmatched offset={}, nearest≤={:?} next>={:?} (first={:?} last={:?})",

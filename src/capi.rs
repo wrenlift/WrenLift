@@ -1413,10 +1413,35 @@ pub unsafe extern "C" fn wlift_aot_sm_save_arg(
             Some(f) => f,
             None => return,
         };
+        let trace = std::env::var_os("WLIFT_GC_TRACE_ALIAS").is_some_and(|v| v == "1");
+        let old_ptr = if trace {
+            frame.saved_values.as_ptr() as usize
+        } else {
+            0
+        };
+        let old_cap = if trace {
+            frame.saved_values.capacity()
+        } else {
+            0
+        };
         if slot >= frame.saved_values.len() {
             frame
                 .saved_values
                 .resize(slot + 1, crate::runtime::value::Value::null());
+        }
+        if trace {
+            let new_ptr = frame.saved_values.as_ptr() as usize;
+            let new_cap = frame.saved_values.capacity();
+            // Only the reallocation case (old_cap > 0 + ptr moved) really
+            // frees memory. The first-time grow has old_cap = 0 + a
+            // dangling sentinel ptr — uninteresting and very noisy.
+            if old_cap > 0 && new_ptr != old_ptr {
+                eprintln!(
+                    "SM-VEC-GROW fiber={:p} slot={} old=0x{:x} cap={} -> new=0x{:x} cap={} \
+                     (old freed)",
+                    fiber, slot, old_ptr, old_cap, new_ptr, new_cap
+                );
+            }
         }
         frame.saved_values[slot] = crate::runtime::value::Value::from_bits(value_bits);
     }
@@ -1599,6 +1624,14 @@ pub unsafe extern "C" fn wlift_aot_sm_push_frame(fiber: *mut crate::runtime::obj
         return;
     }
     unsafe {
+        let trace = std::env::var_os("WLIFT_GC_TRACE_ALIAS").is_some_and(|v| v == "1");
+        if trace {
+            eprintln!(
+                "SM-VEC-PUSH fiber={:p} depth={}",
+                fiber,
+                (*fiber).aot_frames.len()
+            );
+        }
         (*fiber)
             .aot_frames
             .push(crate::runtime::object::AotFrameState::default());
@@ -1623,6 +1656,20 @@ pub unsafe extern "C" fn wlift_aot_sm_pop_frame(fiber: *mut crate::runtime::obje
         return;
     }
     unsafe {
+        let trace = std::env::var_os("WLIFT_GC_TRACE_ALIAS").is_some_and(|v| v == "1");
+        if trace {
+            let depth = (*fiber).aot_frames.len();
+            if let Some(frame) = (*fiber).aot_frames.last() {
+                let buf = frame.saved_values.as_ptr() as usize;
+                let cap = frame.saved_values.capacity();
+                if cap > 0 {
+                    eprintln!(
+                        "SM-VEC-POP fiber={:p} depth={} freeing buf=0x{:x} cap={}",
+                        fiber, depth, buf, cap
+                    );
+                }
+            }
+        }
         (*fiber).aot_frames.pop();
     }
 }

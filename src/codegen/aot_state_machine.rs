@@ -520,8 +520,11 @@ fn plan_yields(
 
         // Capture the call's metadata before mutating.
         type CrossMeta = (ValueId, Vec<ValueId>, ValueId, SymbolId);
-        let (yield_value, direct_result, cross_meta): (ValueId, Option<ValueId>, Option<CrossMeta>) =
-            match susp_kind {
+        let (yield_value, direct_result, cross_meta): (
+            ValueId,
+            Option<ValueId>,
+            Option<CrossMeta>,
+        ) = match susp_kind {
             SuspensionKind::DirectYield => {
                 let (call_dst, arg) = match &mir.blocks[blk_id.0 as usize].instructions[inst_idx] {
                     (dst, Instruction::Call { args, .. }) => (*dst, args.first().copied()),
