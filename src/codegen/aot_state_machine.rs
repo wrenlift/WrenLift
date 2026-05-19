@@ -359,7 +359,7 @@ pub fn transform_to_state_machine(
     // primary (= original block, kept reachable on the first
     // matching path). For blocks with only one reaching subs,
     // clone_index[B] has a single entry.
-    let clone_index = clone_per_reaching_subs(mir, &plans);
+    let (clone_index, clone_rename) = clone_per_reaching_subs(mir, &plans);
 
     // ===== Phase 4: BUILD LAYOUT (mirror onto clones) =====
     //
@@ -376,7 +376,7 @@ pub fn transform_to_state_machine(
         direct_yield_results: HashMap::new(),
         cross_fn_results: HashMap::new(),
     };
-    build_layout(mir, &plans, &clone_index, &mut layout);
+    build_layout(mir, &plans, &clone_index, &clone_rename, &mut layout);
 
     // ===== Phase 5: ORPHAN PRUNE (below) =====
 
@@ -948,10 +948,12 @@ fn key_to_subs(key: &SubsKey) -> HashMap<ValueId, ValueId> {
 /// entry per distinct reaching subs. Index 0 is the "primary" —
 /// the original block kept in place with its operands remapped
 /// per that subs (or, if subs is empty, no remap applied).
+type CloneRename = HashMap<(ValueId, SubsKey), ValueId>;
+
 fn clone_per_reaching_subs(
     mir: &mut MirFunction,
     plans: &[YieldPlan],
-) -> HashMap<BlockId, Vec<(SubsKey, BlockId)>> {
+) -> (HashMap<BlockId, Vec<(SubsKey, BlockId)>>, CloneRename) {
     use std::collections::{HashMap as HMap, HashSet};
 
     // -- Build per-yield "subs delta" applied at the resume_block.
@@ -1121,7 +1123,6 @@ fn clone_per_reaching_subs(
     // the SAME path (= same subs_key) share the rename so cross-
     // block references in that region resolve to each other's
     // fresh vids.
-    type CloneRename = HashMap<(ValueId, SubsKey), ValueId>;
     let mut clone_rename: CloneRename = HashMap::new();
     for (orig_bid, entries) in clone_index.iter() {
         let (params, insts) = {
@@ -1282,7 +1283,7 @@ fn clone_per_reaching_subs(
         mir.block_mut(bid).terminator = term;
     }
 
-    clone_index
+    (clone_index, clone_rename)
 }
 
 
@@ -1329,8 +1330,24 @@ fn build_layout(
     _mir: &MirFunction,
     plans: &[YieldPlan],
     clone_index: &HashMap<BlockId, Vec<(SubsKey, BlockId)>>,
+    clone_rename: &CloneRename,
     layout: &mut StateMachineLayout,
 ) {
+    // Resolve a vid in a clone's scope: first try the resume-load
+    // subs (which rebind orig vids to fresh load vids on resume
+    // paths), then try the clone_rename (fresh vids allocated per
+    // clone region for block params + inst defs of OTHER blocks
+    // reached on the same path). Falls back to the original vid.
+    let resolve = |vid: ValueId, subs: &HashMap<ValueId, ValueId>, key: &SubsKey| -> ValueId {
+        if let Some(v) = subs.get(&vid) {
+            return *v;
+        }
+        if let Some(v) = clone_rename.get(&(vid, key.clone())) {
+            return *v;
+        }
+        vid
+    };
+
     for plan in plans {
         // Per-clone resume entry — but resume_blocks have exactly
         // one entry per the dataflow ({} from dispatcher → K's loads).
@@ -1350,11 +1367,15 @@ fn build_layout(
             let subs = key_to_subs(subs_key);
             // yield_blocks: state_id mapping.
             layout.yield_blocks.insert(*clone_bid, plan.state_id);
-            // yield_saves: saves with operand remapped.
+            // yield_saves: saves with operand remapped via both
+            // resume-load subs AND per-clone fresh-vid rename. A
+            // save vid that names a block param of some upstream
+            // block cloned on this path must resolve to that
+            // clone's fresh param vid, not the primary's vid.
             let saves: Vec<(u32, ValueId)> = plan
                 .saves
                 .iter()
-                .map(|(slot, vid)| (*slot, subs.get(vid).copied().unwrap_or(*vid)))
+                .map(|(slot, vid)| (*slot, resolve(*vid, &subs, subs_key)))
                 .collect();
             if !saves.is_empty() {
                 layout.yield_saves.insert(*clone_bid, saves);
@@ -1378,10 +1399,10 @@ fn build_layout(
                         *clone_bid,
                         BlockKind::CrossFnCallInit {
                             resume_check_block: primary_clone(*call_check_block, clone_index),
-                            receiver: subs.get(receiver).copied().unwrap_or(*receiver),
+                            receiver: resolve(*receiver, &subs, subs_key),
                             args: args
                                 .iter()
-                                .map(|a| subs.get(a).copied().unwrap_or(*a))
+                                .map(|a| resolve(*a, &subs, subs_key))
                                 .collect(),
                             result: *result, // result vid is shared across clones
                             method_sym: *method_sym,
