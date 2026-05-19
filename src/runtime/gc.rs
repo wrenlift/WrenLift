@@ -248,11 +248,15 @@ impl Default for GcConfig {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(64);
+        let major_gc_interval = std::env::var("WLIFT_GC_MAJOR_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(8);
         Self {
             nursery_size: nursery_mb * 1024 * 1024,
             initial_threshold: 256,
             heap_grow_factor: 2.0,
-            major_gc_interval: 8,
+            major_gc_interval,
         }
     }
 }
@@ -402,6 +406,12 @@ impl Gc {
     }
 
     pub fn should_collect(&self) -> bool {
+        // Diagnostic stress mode: collect at EVERY check (every
+        // finish_alloc) to surface stale-Rust-local bugs at the
+        // earliest possible point. Off in normal operation.
+        if std::env::var_os("WLIFT_GC_STRESS").is_some() {
+            return true;
+        }
         // Trigger when:
         //   - the nursery is past 75% of its allocated arena (the
         //     fast path for short-lived churn — we can absorb up

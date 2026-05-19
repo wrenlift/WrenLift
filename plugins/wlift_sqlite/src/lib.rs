@@ -412,21 +412,39 @@ pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
         // without freeing the in-progress map — the list's element
         // array is itself reachable through the root, so the map
         // is transitively rooted.
+        //
+        // Critical: each allocation may move the result list and
+        // the in-progress map under a moving nursery. Re-derive the
+        // raw `*mut ObjList` / `*mut ObjMap` pointers from the
+        // GC-tracked `api_stack[0]` slot (for the list) and the
+        // most-recent list element (for the map) AFTER every
+        // allocator call. Holding the raw pointer across a `alloc_*`
+        // is a use-after-promotion bug — the list/map gets a
+        // forwarded address while the local pointer still points
+        // at the now-freed nursery slot.
         let context = ctx(vm);
         let result = context.alloc_list(Vec::new());
         set_return(vm, result);
-        let result_ptr = result.as_object().unwrap() as *mut ObjList;
 
         for row_vals in rows {
+            // Refresh the list pointer from api_stack[0] in case
+            // an earlier iteration's allocator moved it.
+            let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
             let map = context.alloc_map();
-            let map_ptr = map.as_object().unwrap() as *mut ObjMap;
-            // Root the map via the result list before populating
-            // its fields. `map` as a local Rust binding isn't a
-            // GC root; the list's element array is.
+            // alloc_map may have moved `result` — refresh again.
+            let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
             (*result_ptr).add(map);
+            let last_idx = (*result_ptr).len() - 1;
             for (i, val) in row_vals.into_iter().enumerate() {
                 let key = context.alloc_string(col_names[i].clone());
                 let wv = sql_to_wren(context, val);
+                // Both alloc_string and sql_to_wren may have moved
+                // the list and the in-progress map. Re-derive the
+                // map pointer from the list's last element each
+                // iteration.
+                let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
+                let map_ptr =
+                    (*result_ptr).as_slice()[last_idx].as_object().unwrap() as *mut ObjMap;
                 (*map_ptr).set(key, wv);
             }
         }
