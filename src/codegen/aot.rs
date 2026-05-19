@@ -2304,9 +2304,19 @@ pub fn compile_walk_to_object_with_manifest(
             // spec sibling AND `@hatch:fmt` from a transitive
             // dep) record every alias so transitive importers
             // find the same canonical manifest.
+            //
+            // Archive-bundled modules carry their MANIFEST name as
+            // `module_name` (e.g. `"css"`) but the importing source
+            // refers to them with the relative path it was written
+            // with (e.g. `"./css"`). Normalize the import path the
+            // same way the archive walker normalizes manifest names
+            // so the match succeeds.
+            let source_path_normalized = normalize_archive_import_name(source_path);
             let matched_idx = manifests.iter().take(idx).position(|src| {
                 &src.module_name == source_path
+                    || src.module_name == source_path_normalized
                     || src.module_aliases.iter().any(|a| a == source_path)
+                    || src.module_aliases.iter().any(|a| a == &source_path_normalized)
             });
             if let Some(src_idx) = matched_idx {
                 let src = &manifests[src_idx];
