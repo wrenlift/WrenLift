@@ -3725,27 +3725,38 @@ impl NativeContext for VM {
     }
 
     fn alloc_string(&mut self, s: String) -> Value {
-        self.new_string(s)
+        let v = self.new_string(s);
+        // Root the fresh allocation through `finish_alloc` so any
+        // GC fired before the foreign primitive returns to AOT
+        // code (where Cranelift stack maps take over) doesn't reap
+        // it. No-op in JIT / interpreter mode (finish_alloc gates
+        // on `aot_gc_enabled()`).
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value {
-        self.new_list(elements)
+        let v = self.new_list(elements);
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value {
-        self.new_range(from, to, inclusive)
+        let v = self.new_range(from, to, inclusive);
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
     fn alloc_map(&mut self) -> Value {
-        self.new_map()
+        let v = self.new_map();
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
     fn alloc_typed_array(&mut self, count: u32, kind: TypedArrayKind) -> Value {
-        self.new_typed_array(count, kind)
+        let v = self.new_typed_array(count, kind);
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
     fn alloc_simd(&mut self, kind: SimdKind, lanes: [u32; 4]) -> Value {
-        self.new_simd(kind, lanes)
+        let v = self.new_simd(kind, lanes);
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
     fn runtime_error(&mut self, msg: String) {

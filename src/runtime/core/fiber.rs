@@ -226,7 +226,21 @@ fn fiber_new_inner(
                 }
             }
 
-            Value::object(fiber as *mut u8)
+            // Root the fresh fiber in JIT_ROOTS_STORE so a GC fired
+            // before the AOT caller's stack-map safepoint reads it
+            // back doesn't reap the fresh allocation. Without this,
+            // sustained load on AOT-compiled servers (the hatch site
+            // accept loop spawns a new ObjFiber per request) crashes
+            // within a few requests as "Fiber has already been
+            // called." — the slab was freed + reused. No-op in JIT
+            // / interpreter mode (push gates on `aot_gc_enabled()`
+            // via `finish_alloc`).
+            let fiber_val = Value::object(fiber as *mut u8);
+            #[cfg(feature = "host")]
+            if crate::codegen::runtime_fns::aot_gc_enabled() {
+                crate::codegen::runtime_fns::push_jit_root(fiber_val);
+            }
+            fiber_val
         }
         None => {
             ctx.runtime_error("Fiber.new expects a function.".to_string());
