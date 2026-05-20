@@ -66,28 +66,111 @@ unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
     if !trace_alias_enabled() {
         return;
     }
-    if (*header).obj_type != ObjType::String {
-        return;
+    let ty = (*header).obj_type;
+    eprintln!("PRE-DROP [{where_}] obj={:p} type={:?}", header, ty);
+    match ty {
+        ObjType::String => {
+            let s = &*(header as *mut ObjString);
+            check_buf_allocated(
+                header,
+                s.value.as_ptr() as *const std::ffi::c_void,
+                s.value.len(),
+                s.value.capacity(),
+                "ObjString.value",
+                where_,
+            );
+        }
+        ObjType::List => {
+            let l = &*(header as *mut ObjList);
+            check_buf_allocated(
+                header,
+                l.elements as *const std::ffi::c_void,
+                l.count as usize * std::mem::size_of::<Value>(),
+                l.capacity as usize * std::mem::size_of::<Value>(),
+                "ObjList.elements",
+                where_,
+            );
+        }
+        ObjType::TypedArray => {
+            let a = &*(header as *mut ObjTypedArray);
+            let elem_size = a.kind_tag().element_size();
+            check_buf_allocated(
+                header,
+                a.data as *const std::ffi::c_void,
+                a.count as usize * elem_size,
+                a.count as usize * elem_size,
+                "ObjTypedArray.data",
+                where_,
+            );
+        }
+        ObjType::Instance => {
+            let i = &*(header as *mut ObjInstance);
+            if i.fields_owned {
+                check_buf_allocated(
+                    header,
+                    i.fields as *const std::ffi::c_void,
+                    i.num_fields as usize * std::mem::size_of::<Value>(),
+                    i.num_fields as usize * std::mem::size_of::<Value>(),
+                    "ObjInstance.fields",
+                    where_,
+                );
+            }
+        }
+        ObjType::Fiber => {
+            let f = &*(header as *mut ObjFiber);
+            // ObjFiber's drop runs drop_in_place which recursively
+            // drops every owned Vec. The historical alias case was
+            // `aot_frames[i].saved_values` — check each one for a
+            // freed-buffer state before we hand the object to drop.
+            for (i, frame) in f.aot_frames.iter().enumerate() {
+                if frame.saved_values.capacity() == 0 {
+                    continue;
+                }
+                let buf = frame.saved_values.as_ptr() as *const std::ffi::c_void;
+                let sz = malloc_size(buf);
+                if sz == 0 {
+                    let cap = frame.saved_values.capacity();
+                    eprintln!(
+                        "ALIAS-DETECT [{where_}] ObjFiber@{:p} aot_frames[{i}].saved_values \
+                         buf=0x{:x} cap={} malloc_size=0",
+                        header, buf as usize, cap
+                    );
+                    panic!(
+                        "ObjFiber aot_frames[{i}].saved_values buffer 0x{:x} already free at \
+                         {} — buffer-aliasing bug",
+                        buf as usize, where_
+                    );
+                }
+            }
+        }
+        _ => {}
     }
-    let s = &*(header as *mut ObjString);
-    let buf = s.value.as_ptr() as *const std::ffi::c_void;
-    let len = s.value.len();
-    let cap = s.value.capacity();
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn check_buf_allocated(
+    header: *mut ObjHeader,
+    buf: *const std::ffi::c_void,
+    len: usize,
+    cap: usize,
+    field: &'static str,
+    where_: &'static str,
+) {
     if cap == 0 || buf.is_null() {
         return;
     }
     let sz = malloc_size(buf);
     if sz == 0 {
-        // Buffer already free. Snapshot first 24 bytes (a Vec<Value>
-        // header's worth) so we can tell whether the contents look
-        // like NaN-boxed Values rather than UTF-8 text.
+        // Buffer already free. Snapshot first 24 bytes so we can
+        // tell whether the contents look like NaN-boxed Values
+        // (Vec<Value>/list buffer poisoning) or text (String reuse).
         let mut snap = [0u8; 24];
         let to_copy = len.min(24);
         if to_copy > 0 {
             std::ptr::copy_nonoverlapping(buf as *const u8, snap.as_mut_ptr(), to_copy);
         }
         eprintln!(
-            "ALIAS-DETECT [{where_}] ObjString@{:p} buf=0x{:x} len={} cap={} malloc_size=0 \
+            "ALIAS-DETECT [{where_}] {field}@{:p} buf=0x{:x} len={} cap={} malloc_size=0 \
              first24={:02x?}",
             header,
             buf as usize,
@@ -96,7 +179,7 @@ unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
             &snap[..to_copy]
         );
         panic!(
-            "ObjString buffer 0x{:x} already free at {} — buffer-aliasing bug",
+            "{field} buffer 0x{:x} already free at {} — buffer-aliasing bug",
             buf as usize, where_
         );
     }
