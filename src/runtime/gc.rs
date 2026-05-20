@@ -118,10 +118,38 @@ unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
         }
         ObjType::Fiber => {
             let f = &*(header as *mut ObjFiber);
-            // ObjFiber's drop runs drop_in_place which recursively
-            // drops every owned Vec. The historical alias case was
-            // `aot_frames[i].saved_values` — check each one for a
-            // freed-buffer state before we hand the object to drop.
+            check_vec_buf(header, f.stack.as_ptr() as _, f.stack.capacity(), "ObjFiber.stack", where_);
+            check_vec_buf(
+                header,
+                f.frames.as_ptr() as _,
+                f.frames.capacity(),
+                "ObjFiber.frames",
+                where_,
+            );
+            check_vec_buf(
+                header,
+                f.mir_frames.as_ptr() as _,
+                f.mir_frames.capacity(),
+                "ObjFiber.mir_frames",
+                where_,
+            );
+            for (i, mf) in f.mir_frames.iter().enumerate() {
+                check_vec_buf(
+                    header,
+                    mf.values.as_ptr() as _,
+                    mf.values.capacity(),
+                    "ObjFiber.mir_frames[].values",
+                    where_,
+                );
+                let _ = i;
+            }
+            check_vec_buf(
+                header,
+                f.aot_frames.as_ptr() as _,
+                f.aot_frames.capacity(),
+                "ObjFiber.aot_frames",
+                where_,
+            );
             for (i, frame) in f.aot_frames.iter().enumerate() {
                 if frame.saved_values.capacity() == 0 {
                     continue;
@@ -144,6 +172,30 @@ unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn check_vec_buf(
+    header: *mut ObjHeader,
+    buf: *const u8,
+    cap: usize,
+    field: &'static str,
+    where_: &'static str,
+) {
+    if cap == 0 || buf.is_null() {
+        return;
+    }
+    let sz = malloc_size(buf as *const std::ffi::c_void);
+    if sz == 0 {
+        eprintln!(
+            "ALIAS-DETECT [{where_}] {field}@{:p} buf=0x{:x} cap={} malloc_size=0",
+            header, buf as usize, cap
+        );
+        panic!(
+            "{field} buffer 0x{:x} already free at {} — buffer-aliasing bug",
+            buf as usize, where_
+        );
     }
 }
 
