@@ -922,6 +922,14 @@ impl Gc {
             unsafe { (*class).num_fields as usize }
         };
 
+        // See the comment in `alloc<T>` — under AOT GC we skip the
+        // nursery for every object so promotion never bit-copies an
+        // owned buffer into an aliased state. ObjInstance also owns a
+        // `fields` allocation that has the same vulnerability.
+        if crate::codegen::runtime_fns::aot_gc_enabled() {
+            return self.alloc_old(ObjInstance::new(class));
+        }
+
         // Fast path: bump-allocate both instance and fields in nursery.
         if self.nursery.has_space_for_instance(num_fields) {
             let inst_ptr = self
@@ -962,6 +970,22 @@ impl Gc {
     // -- Core allocation (bump in nursery, overflow to old gen) --------------
 
     fn alloc<T>(&mut self, obj: T) -> *mut T {
+        // Under WLIFT_AOT_GC=1, skip the nursery for all objects.
+        // `promote_typed` uses `ptr::read` to bit-copy the source T
+        // into old gen; for any T that owns a heap buffer (String,
+        // Vec, HashMap, Box, raw `*mut`), the nursery FORWARDED copy
+        // and the new old-gen copy briefly share the same backing
+        // allocation. AOT-emitted code can hold a raw pointer to
+        // either copy across safepoints; the next mutation of the
+        // owned buffer through one alias surfaces a libmalloc abort
+        // when the other side eventually drops. Until full Cranelift
+        // stack maps cover every alloc site (so the GC can rewrite
+        // the AOT code's spill slots after a real promotion), the
+        // safe configuration is "no promotion." Costs a bump-arena
+        // fast path but avoids the entire alias class.
+        if crate::codegen::runtime_fns::aot_gc_enabled() {
+            return self.alloc_old(obj);
+        }
         let size = std::mem::size_of::<T>();
 
         if self.nursery.has_space_for::<T>() {
