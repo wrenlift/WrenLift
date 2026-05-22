@@ -2491,6 +2491,15 @@ pub mod cl {
                 let zero = builder.ins().iconst(types::I64, 0);
                 let recv_call = builder.ins().call(load_arg_fn, &[fiber, zero]);
                 let recv_v = builder.inst_results(recv_call)[0];
+                // recv_v lives across trace_load_fn (a no-op when
+                // tracing disabled) and the actual invoke_call below.
+                // Both can safepoint; without a stack-map declaration
+                // here the spill of recv_v keeps the pre-GC pointer
+                // and the invoke runs with a stale receiver. The
+                // load returned a Wren Value, so it's always GC-relevant.
+                if env_stack_maps() {
+                    builder.declare_value_needs_stack_map(recv_v);
+                }
                 // Trace the loaded recv against the receiver MIR
                 // ValueId so a save→load mismatch becomes visible.
                 let trace_load_fn =
@@ -2518,6 +2527,14 @@ pub mod cl {
                     .ins()
                     .call(invoke_fn, &[vm, fiber, recv_v, sym_v, num_args_v, resume_v]);
                 let ret = builder.inst_results(invoke_call)[0];
+                // ret is the cross-fn callee's return Value. It lives
+                // across pop_frame / clear_poll_kind / save_value
+                // below in the done branch (and across the brif's
+                // bitcast in the propagate branch). Any of those can
+                // safepoint, so declare it.
+                if env_stack_maps() {
+                    builder.declare_value_needs_stack_map(ret);
+                }
                 // 2) peek + brif.
                 let peek_fn = get_runtime_fn(module, builder, "wlift_aot_sm_peek_poll_kind", 0)?;
                 let peek_call = builder.ins().call(peek_fn, &[]);
