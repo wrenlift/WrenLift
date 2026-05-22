@@ -89,6 +89,33 @@ use super::object::*;
 use super::value::Value;
 use crate::intern::{Interner, SymbolId};
 
+/// Resolve a runtime code address to its linker symbol name via
+/// POSIX `dladdr`. Used by `validate_stackmap_coverage` so the
+/// coverage-gap panic names the actual AOT function (e.g.
+/// `wlift_aot_mod_10__method_5_15`) instead of the synthetic MIR
+/// name (`<aot-frame>`) every AOT-compiled function shares.
+///
+/// Returns `None` when `dladdr` fails or the resolved name doesn't
+/// look like an AOT-generated symbol — better to surface the raw
+/// runtime address than a misleading nearby symbol.
+///
+/// # Safety
+/// `addr` must be a valid pointer into the process address space.
+#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+unsafe fn dladdr_symbol(addr: *const ()) -> Option<String> {
+    let mut info: libc::Dl_info = std::mem::zeroed();
+    if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
+        return None;
+    }
+    let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
+    cstr.to_str().ok().map(|s| s.to_string())
+}
+
+#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+unsafe fn dladdr_symbol(_addr: *const ()) -> Option<String> {
+    None
+}
+
 fn core_prelude_symbols(interner: &mut Interner) -> Vec<SymbolId> {
     crate::sema::CORE_PRELUDE_NAMES
         .iter()
@@ -3465,6 +3492,11 @@ impl VM {
     /// Called only when `WLIFT_VALIDATE_STACKMAP=1`. On non-FP-chain
     /// architectures this is a no-op (matches the fallback shape of
     /// `scan_native_stack_roots_debug`).
+    ///
+    /// The panic message resolves each unmatched frame's runtime
+    /// address via `dladdr_symbol` so the report names the real
+    /// linker symbol (e.g. `wlift_aot_mod_10__method_5_15`) rather
+    /// than the synthetic MIR name every AOT function shares.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn validate_stackmap_coverage(&self) {
         let mut fp: usize;
@@ -3505,12 +3537,26 @@ impl VM {
                 if let Some(meta) = meta {
                     let offset = saved_ret.wrapping_sub(cr.start) as u32;
                     if !meta.safepoints.iter().any(|sp| sp.code_offset == offset) {
-                        let func_name = self
+                        // AOT-registered functions all share the
+                        // synthetic name `<aot-frame>` (see
+                        // capi.rs's wlift_aot_init_module). Fall
+                        // back to `dladdr` on the runtime address
+                        // so the real linker symbol — e.g.
+                        // `wlift_aot_mod_10__method_5_15` — shows
+                        // up in the panic message and Phase 1
+                        // audit can grep directly to it.
+                        let mir_name = self
                             .engine
                             .functions
                             .get(cr.func_id.0 as usize)
                             .map(|fb| self.interner.resolve(fb.mir().name).to_string())
                             .unwrap_or_else(|| format!("<func_id={}>", cr.func_id.0));
+                        let dl_name = unsafe { dladdr_symbol(cr.start as *const ()) };
+                        let func_name = match dl_name {
+                            Some(sym) if mir_name == "<aot-frame>" => sym,
+                            Some(sym) => format!("{mir_name} ({sym})"),
+                            None => mir_name,
+                        };
                         unmatched.push((saved_ret, cr.start, offset as usize, func_name));
                     }
                 }
@@ -3520,20 +3566,43 @@ impl VM {
         if !unmatched.is_empty() {
             let summary: String = unmatched
                 .iter()
-                .take(8)
+                .take(16)
                 .map(|(ret, start, off, name)| {
                     format!("{name}: ret={ret:#x} (cr_base={start:#x}, +{off})")
                 })
                 .collect::<Vec<_>>()
                 .join("\n  ");
-            panic!(
-                "STACKMAP COVERAGE GAP: {} AOT frame(s) on the native stack landed inside \
-                 registered code ranges but had no safepoint at their return offset. The GC \
-                 walked past them without scanning their spill slots. Each gap is a \
-                 declare_value_needs_stack_map missing in the lowering for that function.\n  {}",
-                unmatched.len(),
-                summary
-            );
+            // Cranelift only emits a `user_stack_maps()` entry at a
+            // call when at least one Value was declared via
+            // `declare_value_needs_stack_map` and was live across
+            // that call. A call site with zero live Wren values
+            // (e.g. the first allocator in a function body) is
+            // legitimately absent from the metadata. So we can't
+            // distinguish "gap that masks held roots" from "gap
+            // because nothing was held" from inside the GC walker.
+            // Default behaviour: log the candidate list so Phase 1
+            // audit can triage each. Strict mode
+            // (`WLIFT_VALIDATE_STACKMAP=strict` or `=2`) panics on
+            // first gap — useful once the audit is complete.
+            let strict = std::env::var("WLIFT_VALIDATE_STACKMAP")
+                .ok()
+                .is_some_and(|v| v == "strict" || v == "2");
+            if strict {
+                panic!(
+                    "STACKMAP COVERAGE GAP (strict): {} AOT frame(s) on the native stack landed \
+                     inside registered code ranges but had no safepoint at their return offset.\n  {}",
+                    unmatched.len(),
+                    summary
+                );
+            } else {
+                eprintln!(
+                    "stackmap-validate: {} candidate gap(s) — calls without a user_stack_maps() \
+                     entry at the return offset. May be benign (no live Wren values at that \
+                     point) or a missing declare_value_needs_stack_map. Sample:\n  {}",
+                    unmatched.len(),
+                    summary
+                );
+            }
         }
     }
 

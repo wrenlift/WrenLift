@@ -140,6 +140,18 @@ fn fiber_new_inner(
                 (*fiber).spawn_trace = spawn_trace;
                 (*fiber).deadline_ms = parent_deadline;
             }
+            // The just-pushed mir_frame holds `closure` as a raw
+            // pointer — a young object in an old-gen fiber (fibers
+            // are pinned in old gen per `alloc_fiber`). Without a
+            // write barrier, the next minor GC won't trace the
+            // closure through the fiber's mir_frames and the
+            // frame's `closure` field will dangle. The validator
+            // direction-1 check catches this; the barrier closes
+            // it.
+            ctx.write_barrier(
+                Value::object(fiber as *mut u8),
+                Value::object(closure as *mut u8),
+            );
 
             // krio-fiber backing: when WLIFT_KRIO_FIBER is on, attach
             // a per-fiber mmap stack and a body closure that runs the
