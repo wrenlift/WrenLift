@@ -686,12 +686,56 @@ impl Gc {
             || time_triggered
     }
 
-    /// Debug: validate that every old→young reference has a corresponding
-    /// remembered set entry. Panics on first missing write barrier.
-    #[cfg(debug_assertions)]
+    /// Diagnostic: does `header` look like a freed old-gen object?
+    /// Returns true when `header.generation` claims `GEN_OLD` but the
+    /// pointer isn't in the live `old_objects` linked list — i.e. the
+    /// memory was freed by a previous `sweep_old` and AOT codegen
+    /// kept a stale pointer that still happens to read GEN_OLD from
+    /// its un-cleared header byte. Used by the per-call
+    /// `wren_write_barrier` validator under `WLIFT_VALIDATE_BARRIERS`.
+    /// O(N) walk; only call when the validator is opted in.
+    pub fn is_stale_old_source(&self, header: *mut ObjHeader) -> bool {
+        if header.is_null() {
+            return false;
+        }
+        let gen = unsafe { (*header).generation };
+        if gen != GEN_OLD {
+            return false;
+        }
+        let mut current = self.old_objects;
+        while !current.is_null() {
+            if current == header {
+                return false;
+            }
+            current = unsafe { (*current).next };
+        }
+        true
+    }
+
+    /// Validate the remembered set + write barriers in both directions:
+    ///
+    /// 1. **Missed barrier**: every old→young reference must have a
+    ///    `remembered_set` entry pointing at the source old-gen object.
+    ///    Original purpose of this function — catches lowerings that
+    ///    forgot to emit `wren_write_barrier(source, value)`.
+    ///
+    /// 2. **Stale source**: every entry in `remembered_set` must point
+    ///    at an object that's still in the `old_objects` linked list.
+    ///    Catches AOT codegen calling `wren_write_barrier` with a
+    ///    `source` that a previous sweep already freed — the kind of
+    ///    bug that surfaces later as a SIGSEGV in `trace_object`
+    ///    iterating the remembered set on the next minor GC.
+    ///
+    /// Both checks panic on first violation. Called from
+    /// `collect_garbage` when `WLIFT_VALIDATE_BARRIERS=1`; safe to
+    /// run in release builds (the check is O(N+R) where N is
+    /// old-gen count and R is remembered-set size — runs once per
+    /// GC, not per write).
     pub fn validate_write_barriers(&self) {
         use std::collections::HashSet;
         let remembered: HashSet<usize> = self.remembered_set.iter().map(|&p| p as usize).collect();
+
+        // Direction 1: every old-gen object's young references are in remembered_set.
         let mut current = self.old_objects;
         while !current.is_null() {
             unsafe {
@@ -699,9 +743,30 @@ impl Gc {
                 current = (*current).next;
             }
         }
+
+        // Direction 2: every remembered_set entry is still in old_objects.
+        // Build the in-list set once and check membership of every entry.
+        let live_old: HashSet<usize> = {
+            let mut s = HashSet::new();
+            let mut o = self.old_objects;
+            while !o.is_null() {
+                s.insert(o as usize);
+                o = unsafe { (*o).next };
+            }
+            s
+        };
+        for &entry in &self.remembered_set {
+            if !live_old.contains(&(entry as usize)) {
+                let ty = unsafe { (*entry).obj_type };
+                panic!(
+                    "STALE-SOURCE BARRIER BUG: remembered_set entry {:?} ({:?}) is not in \
+                     old_objects — AOT codegen called wren_write_barrier with a freed source",
+                    entry, ty
+                );
+            }
+        }
     }
 
-    #[cfg(debug_assertions)]
     unsafe fn check_old_obj_barriers(
         &self,
         header: *mut ObjHeader,

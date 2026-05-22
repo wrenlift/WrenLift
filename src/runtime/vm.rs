@@ -3456,6 +3456,90 @@ impl VM {
         (Vec::new(), 0, 0)
     }
 
+    /// Walk the native frame chain and panic on the first AOT frame
+    /// that lands inside a registered code range but has no safepoint
+    /// entry at the return offset. Surfaces stack-map coverage gaps
+    /// at GC time — every reported gap is a `declare_value_needs_stack_map`
+    /// missing somewhere in the lowering.
+    ///
+    /// Called only when `WLIFT_VALIDATE_STACKMAP=1`. On non-FP-chain
+    /// architectures this is a no-op (matches the fallback shape of
+    /// `scan_native_stack_roots_debug`).
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn validate_stackmap_coverage(&self) {
+        let mut fp: usize;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack))
+        };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack))
+        };
+
+        let max_frames = 256;
+        let mut walked = 0;
+        // (saved_ret, cr.start, offset, resolved function name)
+        let mut unmatched: Vec<(usize, usize, usize, String)> = Vec::new();
+        while fp != 0 && walked < max_frames {
+            walked += 1;
+            if fp & 7 != 0 {
+                break;
+            }
+            let saved_fp = unsafe { *(fp as *const usize) };
+            let saved_ret = unsafe { *((fp + 8) as *const usize) };
+            if saved_ret == 0 {
+                break;
+            }
+            if let Some(cr) = self
+                .engine
+                .code_ranges
+                .iter()
+                .find(|r| saved_ret >= r.start && saved_ret < r.end)
+            {
+                let meta = self
+                    .engine
+                    .jit_metadata
+                    .get(cr.func_id.0 as usize)
+                    .and_then(|m| m.as_ref());
+                if let Some(meta) = meta {
+                    let offset = saved_ret.wrapping_sub(cr.start) as u32;
+                    if !meta.safepoints.iter().any(|sp| sp.code_offset == offset) {
+                        let func_name = self
+                            .engine
+                            .functions
+                            .get(cr.func_id.0 as usize)
+                            .map(|fb| self.interner.resolve(fb.mir().name).to_string())
+                            .unwrap_or_else(|| format!("<func_id={}>", cr.func_id.0));
+                        unmatched.push((saved_ret, cr.start, offset as usize, func_name));
+                    }
+                }
+            }
+            fp = saved_fp;
+        }
+        if !unmatched.is_empty() {
+            let summary: String = unmatched
+                .iter()
+                .take(8)
+                .map(|(ret, start, off, name)| {
+                    format!("{name}: ret={ret:#x} (cr_base={start:#x}, +{off})")
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            panic!(
+                "STACKMAP COVERAGE GAP: {} AOT frame(s) on the native stack landed inside \
+                 registered code ranges but had no safepoint at their return offset. The GC \
+                 walked past them without scanning their spill slots. Each gap is a \
+                 declare_value_needs_stack_map missing in the lowering for that function.\n  {}",
+                unmatched.len(),
+                summary
+            );
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn validate_stackmap_coverage(&self) {}
+
     pub fn collect_garbage(&mut self) {
         let mut roots: Vec<Value> = Vec::new();
 
@@ -3546,6 +3630,14 @@ impl VM {
                 jit_entries.len(),
                 self.engine.code_ranges.len(),
             );
+            // Per-frame coverage check: walk the FP chain a second
+            // time and panic if any frame landed in a registered
+            // code range but the metadata lookup found no safepoint
+            // at the return offset. That's the exact "stack-map
+            // gap" we're chasing — the GC walked past an AOT frame
+            // whose Values it can't see, so any nursery references
+            // in spill slots won't be marked live.
+            self.validate_stackmap_coverage();
         }
 
         // 8. JitContext GC-managed pointers (closure, defining_class).
@@ -3597,7 +3689,12 @@ impl VM {
         }
         let file_watch_end = roots.len();
 
-        #[cfg(debug_assertions)]
+        // `WLIFT_VALIDATE_BARRIERS=1` opts the GC into a pre-collect
+        // sanity check covering both directions of the remembered-set
+        // invariant — missed barriers (old→young not recorded) and
+        // stale sources (recorded entries pointing at freed objects).
+        // O(N+R) per GC; gated on the env var so production builds
+        // pay nothing when unset.
         if std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some() {
             self.gc.validate_write_barriers();
         }

@@ -207,11 +207,26 @@ impl GcImpl {
         gc_dispatch!(self, stats)
     }
 
-    #[cfg(debug_assertions)]
+    /// Pre-collect sanity check on the remembered set. No-op for
+    /// Arena / MarkSweep (those don't have one). Generational runs
+    /// both directions — missed barriers + stale sources. Release-safe
+    /// because every call site is gated on `WLIFT_VALIDATE_BARRIERS`.
     #[inline(always)]
     pub fn validate_write_barriers(&self) {
         if let GcImpl::Generational(gc) = self {
             gc.validate_write_barriers();
+        }
+    }
+
+    /// Diagnostic: detect a `wren_write_barrier` source pointer that
+    /// reads `GEN_OLD` but isn't in the live old_objects list — a
+    /// stale-source bug from AOT codegen holding a freed pointer.
+    /// No-op for Arena / MarkSweep (no concept of sweep-after-promotion).
+    #[inline(always)]
+    pub fn is_stale_old_source(&self, header: *mut ObjHeader) -> bool {
+        match self {
+            GcImpl::Generational(gc) => gc.is_stale_old_source(header),
+            _ => false,
         }
     }
 

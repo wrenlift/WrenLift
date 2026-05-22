@@ -1793,7 +1793,24 @@ pub extern "C" fn wren_set_module_var(slot: u64, value: u64) -> u64 {
     value
 }
 
+/// Cached read of `WLIFT_VALIDATE_BARRIERS`. The env var is checked
+/// once at first access; this avoids paying a `getenv`-equivalent
+/// syscall on every barrier call when the validator is off.
+fn validate_barriers_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("WLIFT_VALIDATE_BARRIERS").is_some())
+}
+
 /// Record an old->young edge for a just-performed object write.
+///
+/// Under `WLIFT_VALIDATE_BARRIERS=1`, also runs a per-call check that
+/// `source` is not a stale (freed-but-bytes-still-read-as-GEN_OLD)
+/// pointer. This is the surface where AOT codegen holding a raw
+/// object pointer across a safepoint manifests as a corrupt
+/// `remembered_set` on the next GC; catching it here points lldb's
+/// backtrace at the offending AOT function frame directly instead
+/// of at `trace_object` deep inside `collect_minor`.
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_write_barrier(source: u64, value: u64) -> u64 {
     let source = Value::from_bits(source);
@@ -1801,7 +1818,18 @@ pub extern "C" fn wren_write_barrier(source: u64, value: u64) -> u64 {
     if let Some(ptr) = source.as_object() {
         unsafe {
             if let Some(vm) = vm_ref() {
-                vm.gc.write_barrier(ptr as *mut ObjHeader, value);
+                let hdr = ptr as *mut ObjHeader;
+                if validate_barriers_enabled() && vm.gc.is_stale_old_source(hdr) {
+                    let ty = (*hdr).obj_type;
+                    panic!(
+                        "STALE-SOURCE: wren_write_barrier called with source {:p} ({:?}) — \
+                         header.generation says OLD but pointer not in old_objects. AOT codegen \
+                         held a freed pointer across a safepoint. Attach lldb to the parent \
+                         frames for the calling AOT function name.",
+                        hdr, ty
+                    );
+                }
+                vm.gc.write_barrier(hdr, value);
             }
         }
     }
