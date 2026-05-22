@@ -1947,15 +1947,25 @@ impl VM {
                         Method::Closure(closure_ptr)
                     };
                     let idx = bind_sym.index() as usize;
-                    let cls = &mut *class_ptr;
-                    if idx >= cls.methods.len() {
-                        cls.methods.resize(idx + 1, None);
+                    {
+                        let cls = &mut *class_ptr;
+                        if idx >= cls.methods.len() {
+                            cls.methods.resize(idx + 1, None);
+                        }
+                        cls.methods[idx] = Some(method);
+                        if !method_mir.attributes.is_empty() {
+                            cls.method_attributes
+                                .insert(bind_sym, method_mir.attributes);
+                        }
                     }
-                    cls.methods[idx] = Some(method);
-                    if !method_mir.attributes.is_empty() {
-                        cls.method_attributes
-                            .insert(bind_sym, method_mir.attributes);
-                    }
+                    // class is pinned in old gen; closure may be
+                    // young. Without the barrier the next minor
+                    // GC won't trace closure through class.methods
+                    // and the slot dangles.
+                    self.gc.write_barrier(
+                        class_ptr as *mut ObjHeader,
+                        Value::object(closure_ptr as *mut u8),
+                    );
                 }
             }
 
