@@ -4719,10 +4719,22 @@ pub mod cl {
                     let result = builder.ins().call(f, &args);
                     Ok(Some(builder.inst_results(result)[0]))
                 } else {
-                    // >4 elements: create empty + add each
+                    // >4 elements: create empty + add each.
+                    //
+                    // The intermediate `list` value lives across every
+                    // `wren_list_add` call below. The outer
+                    // `lower_mir_impl` only declares the *result* of
+                    // this MakeList — i.e. the post-loop value — so
+                    // without an explicit declaration here, a GC fired
+                    // from inside any `wren_list_add` strands the
+                    // register-held `list` pointer and the next
+                    // iteration writes through a stale ObjList header.
                     let f_make = get_runtime_fn(module, builder, "wren_make_list", 0)?;
                     let make_result = builder.ins().call(f_make, &[]);
                     let list = builder.inst_results(make_result)[0];
+                    if env_stack_maps() {
+                        builder.declare_value_needs_stack_map(list);
+                    }
 
                     let f_add = get_runtime_fn(module, builder, "wren_list_add", 2)?;
                     for e in elems {
@@ -4733,9 +4745,17 @@ pub mod cl {
             }
 
             Instruction::MakeMap(pairs) => {
+                // Same reasoning as MakeList: `map` lives across
+                // every `wren_map_set` call below, so declare it
+                // explicitly to keep the GC's stack-map walker
+                // aware of the live receiver pointer across each
+                // helper safepoint.
                 let f_make = get_runtime_fn(module, builder, "wren_make_map", 0)?;
                 let make_result = builder.ins().call(f_make, &[]);
                 let map = builder.inst_results(make_result)[0];
+                if env_stack_maps() {
+                    builder.declare_value_needs_stack_map(map);
+                }
 
                 let f_set = get_runtime_fn(module, builder, "wren_map_set", 3)?;
                 for (k, v) in pairs {
