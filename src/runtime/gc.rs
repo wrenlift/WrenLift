@@ -1372,6 +1372,31 @@ impl Gc {
     }
 
     /// Read an object out of the nursery arena and Box it in old gen.
+    ///
+    /// After `ptr::read`'s bit-copy, both source (nursery) and
+    /// destination (old gen) briefly think they own the same heap
+    /// buffers (String backing, Vec backing, HashMap buckets, raw
+    /// `*mut` allocations). The nursery copy is then marked
+    /// FORWARDED and its bytes get overwritten by future
+    /// allocations after `nursery.reset()` — but in the window
+    /// between, any code that reads through the source's heap
+    /// pointers shares state with the destination, and a mutation
+    /// through the destination (Vec grow, HashMap rehash, etc.)
+    /// frees the buffer the source still references. The next time
+    /// the source's `next` field is consulted to forward a Value,
+    /// or the source's bytes get reinterpreted, the alias surfaces
+    /// as a double-free or hash on a dangling string.
+    ///
+    /// Fix: after `ptr::read`, call `forget_heap_on_source` to
+    /// `mem::take` every owning heap field on the source. The
+    /// extracted value is then `mem::forget`'d so its buffer
+    /// stays allocated (owned by the destination), and the
+    /// source is left with a Default/empty value that its drop
+    /// — if ever run — would treat as a no-op. For raw pointer
+    /// owners (ObjList.elements, ObjTypedArray.data,
+    /// ObjInstance.fields when fields_owned), null the pointer
+    /// and zero the count so the custom Drop's bounds check
+    /// short-circuits.
     unsafe fn promote_typed<T>(&mut self, old_header: *mut ObjHeader) -> *mut ObjHeader {
         let obj: T = std::ptr::read(old_header as *const T);
         let new_ptr = self.old_arena.alloc(obj);
@@ -1381,6 +1406,7 @@ impl Gc {
         (*header).next = self.old_objects;
         self.old_objects = header;
         self.old_count += 1;
+        forget_heap_on_source(old_header);
         if (*header).obj_type == ObjType::String {
             let s = &*(header as *const ObjString);
             trace_str_buf_event("PROMOTE", header, s.value.as_ptr(), s.value.len());
@@ -1827,6 +1853,79 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
 fn update_roots_inline(roots: &mut [Value], nursery: &Nursery) {
     for val in roots.iter_mut() {
         update_value_inline(val, nursery);
+    }
+}
+
+/// Clear every owning heap field on the FORWARDED source so the
+/// destination (post-`ptr::read`) is the sole owner of every
+/// String/Vec/HashMap/raw buffer the type holds. Called from
+/// `promote_typed` immediately after the bit-copy. See the
+/// long comment on `promote_typed` for why this is necessary.
+///
+/// For `mem::take`-able fields (String, Vec, HashMap), extract
+/// the value and `mem::forget` it — that leaves the source with
+/// an empty Default and prevents Rust from running the source's
+/// drop on the original buffer the destination now owns.
+///
+/// For raw-pointer fields with manual Drop impls (ObjList,
+/// ObjTypedArray, ObjInstance.fields when `fields_owned`), null
+/// the pointer + zero the count so the Drop's bounds check
+/// short-circuits before it calls `dealloc`.
+unsafe fn forget_heap_on_source(header: *mut ObjHeader) {
+    match (*header).obj_type {
+        ObjType::String => {
+            let s = &mut *(header as *mut ObjString);
+            std::mem::forget(std::mem::take(&mut s.value));
+            // c_str's lazy CString cache is also heap-allocated;
+            // drop the source's reference without freeing so
+            // the destination keeps the populated cache (if any).
+            std::mem::forget(std::mem::take(&mut *s.c_str.borrow_mut()));
+        }
+        ObjType::List => {
+            let l = &mut *(header as *mut ObjList);
+            l.elements = std::ptr::null_mut();
+            l.count = 0;
+            l.capacity = 0;
+        }
+        ObjType::Map => {
+            let m = &mut *(header as *mut ObjMap);
+            std::mem::forget(std::mem::take(&mut m.entries));
+        }
+        ObjType::Closure => {
+            let c = &mut *(header as *mut ObjClosure);
+            std::mem::forget(std::mem::take(&mut c.upvalues));
+        }
+        ObjType::Instance => {
+            let i = &mut *(header as *mut ObjInstance);
+            if i.fields_owned {
+                i.fields = std::ptr::null_mut();
+                i.num_fields = 0;
+                i.fields_owned = false;
+            }
+        }
+        ObjType::Foreign => {
+            let f = &mut *(header as *mut ObjForeign);
+            std::mem::forget(std::mem::take(&mut f.data));
+        }
+        ObjType::Module => {
+            let m = &mut *(header as *mut ObjModule);
+            std::mem::forget(std::mem::take(&mut m.variables));
+            std::mem::forget(std::mem::take(&mut m.variable_names));
+        }
+        ObjType::TypedArray => {
+            let a = &mut *(header as *mut ObjTypedArray);
+            a.data = std::ptr::null_mut();
+            a.count = 0;
+        }
+        ObjType::Fiber | ObjType::Class => {
+            // Allocated straight to old gen via alloc_old; never
+            // promoted via this path. Falling through is fine.
+        }
+        ObjType::Range | ObjType::Fn | ObjType::Upvalue | ObjType::Simd => {
+            // No heap-owned fields: Range/Fn/Upvalue carry only
+            // primitives + raw pointers we don't own here, Simd
+            // is inline lane data.
+        }
     }
 }
 
