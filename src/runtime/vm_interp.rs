@@ -2424,6 +2424,8 @@ fn run_fiber_with_stop_depth(
                                         (*fiber).is_try = false;
                                         (*fiber).state = FiberState::Done;
                                     }
+                                    // Old-gen fiber, young err string.
+                                    vm.gc.write_barrier(fiber as *mut ObjHeader, err_val);
                                     let caller = unsafe { (*fiber).caller };
                                     if !caller.is_null() {
                                         unsafe {
@@ -4641,6 +4643,8 @@ pub unsafe fn route_method_error_through_fiber_try(
         (*fiber).error = err_val;
         (*fiber).is_try = false;
         (*fiber).state = FiberState::Done;
+        // Old-gen fiber, young err string.
+        vm.gc.write_barrier(fiber as *mut ObjHeader, err_val);
         let caller = (*fiber).caller;
         if !caller.is_null() {
             (*fiber).caller = std::ptr::null_mut();

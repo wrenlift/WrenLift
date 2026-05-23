@@ -4269,15 +4269,28 @@ pub extern "C" fn wren_make_list_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     make_list_impl(&[a0, a1, a2, a3])
 }
 
-/// Allocate a new empty map.
 /// Set a key-value pair on a map object.
+///
+/// Routes through `gc.write_barrier` for both the key and the value
+/// after the insert so that old→young edges land in the remembered
+/// set. Without these, a minor GC fired between this insert and a
+/// later traversal of the map would treat the young key/value as
+/// unreachable and sweep it, leaving the map's entries dangling
+/// (surfaces later as a SIGSEGV in `update_old_gen_pointers_inline`
+/// when the hasher dereferences the stale string).
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_map_set(map_val: u64, key: u64, value: u64) {
     let map = Value::from_bits(map_val);
+    let key_v = Value::from_bits(key);
+    let value_v = Value::from_bits(value);
     if let Some(ptr) = map.as_object() {
         let map_ptr = ptr as *mut ObjMap;
         unsafe {
-            (*map_ptr).set(Value::from_bits(key), Value::from_bits(value));
+            (*map_ptr).set(key_v, value_v);
+            if let Some(vm) = vm_ref() {
+                vm.gc.write_barrier(map_ptr as *mut ObjHeader, key_v);
+                vm.gc.write_barrier(map_ptr as *mut ObjHeader, value_v);
+            }
         }
     }
 }

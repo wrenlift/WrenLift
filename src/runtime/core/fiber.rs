@@ -796,6 +796,11 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
                 let err = unsafe { (*vm_ptr).escape_to_gc_if_arena(err) };
                 unsafe {
                     (*target).error = err;
+                    // target fiber is old-gen pinned; err may be a
+                    // young object. Without the barrier the next
+                    // minor GC won't trace err through fiber.error
+                    // and the slot dangles.
+                    (*vm_ptr).gc.write_barrier(target as *mut ObjHeader, err);
                 }
             }
             unsafe {
@@ -1024,6 +1029,8 @@ fn fiber_transfer_error(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
                     unsafe {
                         (*f).error = args[1];
                     }
+                    // Fiber is old-gen pinned; args[1] may be young.
+                    ctx.write_barrier(Value::object(f as *mut u8), args[1]);
                     ctx.set_fiber_action_transfer(f, args[1]);
                 }
                 _ => {
