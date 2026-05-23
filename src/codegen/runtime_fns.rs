@@ -4233,13 +4233,25 @@ fn make_list_impl(elements: &[u64]) -> u64 {
 }
 
 /// Add a single element to an existing list.
+///
+/// Routes through `gc.write_barrier` after the add so the
+/// remembered set captures any old→young edge created by the
+/// insert. Without this, a minor GC fired between this call and
+/// a later traversal would sweep the young element and leave the
+/// list's `elements[i]` dangling — surfaces later as the
+/// `WRITE BARRIER BUG: old List → young raw, desc: list[N]`
+/// validator panic.
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_list_add(list_val: u64, elem: u64) {
     let list = Value::from_bits(list_val);
+    let elem_v = Value::from_bits(elem);
     if let Some(ptr) = list.as_object() {
         let list_ptr = ptr as *mut crate::runtime::object::ObjList;
         unsafe {
-            (*list_ptr).add(Value::from_bits(elem));
+            (*list_ptr).add(elem_v);
+            if let Some(vm) = vm_ref() {
+                vm.gc.write_barrier(list_ptr as *mut ObjHeader, elem_v);
+            }
         }
     }
 }
