@@ -285,32 +285,18 @@ System.print(it.label)
 }
 
 // ---------------------------------------------------------------------------
-// Mixed allocation — closer to real-world site code.
-//
-// **KNOWN-FAILING**: surfaces a Cranelift stack-map / write-back
-// interaction bug. Constructor lowering spills the receiver to
-// `[sp]` and Cranelift emits a stack-map entry pointing at that
-// slot, but after a GC fired from the constructor's body, the
-// receiver in the spill slot ends up holding what looks like the
-// call's *result* rather than the (now-forwarded) receiver. The
-// next field-store dereferences a stale `*mut ObjInstance` and
-// crashes.
-//
-// Reproduces deterministically under
-//   `WLIFT_AOT_GC=1 WLIFT_GC_STRESS=1`
-// — exit=139 (SIGSEGV) at `wlift_aot_main__method_0_0+228` /
-// `str x1, [x0, #0x8]` after `ldr x0, [x0, #0x20]` returns 6.
-//
-// Not a stale-source `wren_write_barrier` bug (validator stays
-// silent). Not a missing `declare_value_needs_stack_map`
-// (`WLIFT_GC_TRACE_STACK=1` confirms the slot at `fp-48` is
-// matched and scanned). Either the write-back at vm.rs:3870+
-// isn't applying for this slot, or the receiver's Cranelift IR
-// value isn't the same SSA that the regalloc spilled.
-//
-// Investigation handoff for the next session.
+// Mixed allocation — closer to real-world site code. Exercises the
+// nested-call path (constructor body → wren_call_0 → toString) that
+// surfaced the Pass-1 covered_fps bug: the AOT path's `push_jit_frame`
+// uses the MIR func_id, but AOT metadata is registered under a
+// separate AOT func_id. Pass 1 silently failed the metadata lookup
+// while leaving the constructor's fp marked covered, so Pass 2 also
+// skipped the constructor. The receiver promoted from nursery to
+// old-gen never got its spill slot written back; the next nursery
+// reset reused the stale address for the concat-result string, and
+// the second field store dereferenced what it thought was the
+// receiver's `fields` ptr at a String header.
 #[test]
-#[ignore = "Cranelift stack-map / write-back interaction bug; see file comment"]
 fn stress_mixed_alloc_chain() {
     let source = r#"
 class Item {

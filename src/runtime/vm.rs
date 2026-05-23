@@ -3122,9 +3122,19 @@ impl VM {
             if jit_fp == 0 {
                 continue;
             }
-            covered_fps.insert(jit_fp);
 
-            // Look up the function's metadata by func_id.
+            // Look up the function's metadata by func_id. Defer adding
+            // `jit_fp` to `covered_fps` until after we know we can
+            // actually scan this frame — otherwise the AOT path (which
+            // calls `push_jit_frame` with the MIR func_id while
+            // metadata is stored under a separate AOT func_id) marks
+            // the frame covered, returns None from the metadata
+            // lookup, skips its own scan, and then Pass 2 ALSO skips
+            // the frame (because its caller's saved_fp matches the
+            // covered jit_fp). The result: the AOT body's spill slots
+            // never get scanned for that GC, and nursery-allocated
+            // values held in them get freed under our feet on the
+            // next nursery reset.
             let meta = self
                 .engine
                 .jit_metadata
@@ -3155,6 +3165,8 @@ impl VM {
                     // which would corrupt non-object spill slots).
                     continue;
                 };
+
+            covered_fps.insert(jit_fp);
 
             for root in roots_to_scan {
                 if let RootLocation::Spill(spill_offset) = root.location {
@@ -3872,6 +3884,16 @@ impl VM {
             let addr = stack_slot_addrs[i] as usize;
             if addr == 0 || addr & 7 != 0 || addr >= USER_VA_LIMIT {
                 continue;
+            }
+            if std::env::var_os("WLIFT_GC_TRACE_WRITEBACK").is_some() {
+                let before = unsafe { *stack_slot_addrs[i] };
+                let after = updated.to_bits();
+                if before != after {
+                    eprintln!(
+                        "  [gc] writeback slot=@{:#x} before={:#x} after={:#x}",
+                        addr, before, after
+                    );
+                }
             }
             unsafe { std::ptr::write(stack_slot_addrs[i], updated.to_bits()) };
         }
