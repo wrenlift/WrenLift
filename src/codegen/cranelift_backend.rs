@@ -3,6 +3,38 @@
 /// Translates MIR directly to Cranelift IR, bypassing the custom MachInst layer.
 /// This provides correct register allocation and instruction encoding for x86_64
 /// without the SCRATCH_GP / spill-slot conflicts of the hand-written emitter.
+///
+/// # AOT GC contract
+///
+/// Every Wren `Value` held live across a runtime helper call must be visible
+/// to the stack-map walker, otherwise the GC can promote (move) or sweep
+/// (free) the object the slot points at and the lowering will dereference
+/// stale memory after the call returns.
+///
+/// Two ways to satisfy this:
+///
+/// 1. **Blanket cover.** If the value is the result of an `Instruction::*`
+///    MIR op, the generic dispatch at this file's instruction-lowering
+///    site calls `declare_value_needs_stack_map` for you. You get this
+///    for free — no per-op work needed.
+///
+/// 2. **Explicit declaration.** If the value is a lowering-internal
+///    intermediate (e.g., a value built inline before a helper call —
+///    `stack_load`s, computed pointers, NaN-mask results that feed
+///    into a helper arg), Cranelift cannot guess it should appear in
+///    the stack map. Call `builder.declare_value_needs_stack_map(v)`
+///    on every such intermediate that may carry a heap pointer
+///    across the next safepoint. Gated on `env_stack_maps()` so JIT
+///    / non-stackmap modes don't pay the cost.
+///
+/// `runtime_fns::wren_write_barrier`, `wren_map_set`, `wren_list_add`,
+/// and the SM cross-fn invoke helpers all rely on the runtime
+/// scanning the caller's slot. If you skip the declare, the GC
+/// validator (`WLIFT_VALIDATE_BARRIERS=1` /
+/// `WLIFT_VALIDATE_STACKMAP=1`) will panic naming the function and
+/// safepoint offset — much faster than a cold SIGSEGV hunt. Run the
+/// `aot_gc_coverage` property suite whenever you change a lowering
+/// that adds or moves a helper call.
 #[cfg(feature = "cranelift")]
 pub mod cl {
     use crate::intern::Interner;
