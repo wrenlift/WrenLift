@@ -35,6 +35,16 @@ fn trace_alias_enabled() -> bool {
     std::env::var_os("WLIFT_GC_TRACE_ALIAS").is_some_and(|v| v == "1")
 }
 
+/// Cached read of `WLIFT_GC_STRESS`. Resolves on first access and
+/// stays fixed thereafter — `should_collect` runs once per alloc on
+/// the AOT hot path, so even a one-syscall `getenv` here would
+/// dominate the per-request cost.
+fn stress_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("WLIFT_GC_STRESS").is_some())
+}
+
 /// Log every ObjString allocation + drop, tagged with buffer
 /// pointer, so `grep` against `WLIFT_GC_TRACE_ALIAS=1` output
 /// reconstructs the lifecycle of any buffer the alias detector
@@ -636,7 +646,13 @@ impl Gc {
         // Diagnostic stress mode: collect at EVERY check (every
         // finish_alloc) to surface stale-Rust-local bugs at the
         // earliest possible point. Off in normal operation.
-        if std::env::var_os("WLIFT_GC_STRESS").is_some() {
+        //
+        // The env-var read is cached because this function is
+        // called from `finish_alloc`, the AOT hot path: a single
+        // `getenv` syscall here cost the hatch site GPU URL ~30×
+        // throughput vs uncached. The lookup is done once at first
+        // call.
+        if stress_enabled() {
             return true;
         }
         // Trigger when:
