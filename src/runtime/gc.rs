@@ -1131,6 +1131,10 @@ impl Gc {
     /// Auto-select minor or major GC based on interval.
     pub fn collect(&mut self, roots: &mut [Value]) {
         let start = crate::portable_time::Instant::now();
+        crate::runtime::gc_ringbuf::record(
+            crate::runtime::gc_ringbuf::Ev::GcBegin,
+            [roots.len() as u64, self.nursery_objects.len() as u64, self.old_count as u64, 0, 0, 0],
+        );
         // Off-heap pressure forces a major. Minor GCs only sweep
         // the nursery; promoted ObjFibers (which carry the krio
         // mmap stacks) sit in old gen until major. Without this,
@@ -1152,6 +1156,10 @@ impl Gc {
         // time fresh fibers are allocated.
         self.external_bytes_since_gc = 0;
         self.stats.gc_time_ns += start.elapsed().as_nanos() as u64;
+        crate::runtime::gc_ringbuf::record(
+            crate::runtime::gc_ringbuf::Ev::GcEnd,
+            [self.old_count as u64, 0, 0, 0, 0, 0],
+        );
     }
 
     /// Minor GC: mark from roots, promote live nursery objects to old gen,
@@ -1359,7 +1367,16 @@ impl Gc {
             unsafe {
                 if (*obj).gc_mark != WHITE {
                     // Live → promote to old gen.
+                    let old_ty = (*obj).obj_type as u64;
+                    crate::runtime::gc_ringbuf::record(
+                        crate::runtime::gc_ringbuf::Ev::PromoteBegin,
+                        [obj as u64, old_ty, 0, 0, 0, 0],
+                    );
                     let new_ptr = self.promote_object(obj);
+                    crate::runtime::gc_ringbuf::record(
+                        crate::runtime::gc_ringbuf::Ev::PromoteEnd,
+                        [obj as u64, new_ptr as u64, old_ty, 0, 0, 0],
+                    );
                     // Store forwarding pointer in old nursery location's `next` field.
                     // The nursery bytes still exist (not overwritten until reset).
                     (*obj).gc_mark = FORWARDED;
@@ -1368,6 +1385,11 @@ impl Gc {
                     self.stats.objects_promoted += 1;
                 } else {
                     // Dead → remove from intern table, drop owned Rust types.
+                    let dead_ty = (*obj).obj_type as u64;
+                    crate::runtime::gc_ringbuf::record(
+                        crate::runtime::gc_ringbuf::Ev::Drop,
+                        [obj as u64, dead_ty, 0, 0, 0, 0],
+                    );
                     self.unlink_intern(obj);
                     let size = object_size(obj);
                     pre_drop_check_string(obj, "process_nursery");
@@ -1993,6 +2015,20 @@ fn update_value_inline(val: &mut Value, nursery: &Nursery) {
                 let header = ptr as *mut ObjHeader;
                 unsafe {
                     if (*header).gc_mark == FORWARDED {
+                        let next_raw = (*header).next as u64;
+                        // Detect the gpu/api corruption: a forwarded header's
+                        // `next` should be a raw old-gen pointer (typically
+                        // ~0xb0_0000_0000 range on macOS arm64). If it has
+                        // the NaN-box TAG_OBJ bits set (0xFFFC...), the
+                        // bytes have been overwritten by something storing a
+                        // Wren Value. Marker `0xDEAD` distinguishes from
+                        // normal PromoteEnd events.
+                        if (next_raw & 0xFFFC_0000_0000_0000) == 0xFFFC_0000_0000_0000 {
+                            crate::runtime::gc_ringbuf::record(
+                                crate::runtime::gc_ringbuf::Ev::PromoteEnd,
+                                [header as u64, next_raw, (*header).obj_type as u64, 0xDEAD, 0, 0],
+                            );
+                        }
                         *val = Value::object((*header).next as *mut u8);
                     }
                 }
@@ -2036,14 +2072,38 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
 
         ObjType::Map => {
             let map = &mut *(header as *mut ObjMap);
+            crate::runtime::gc_ringbuf::record(
+                crate::runtime::gc_ringbuf::Ev::MapDrainBegin,
+                [header as u64, map.entries.len() as u64, 0, 0, 0, 0],
+            );
             let entries: Vec<(MapKey, Value)> = map.entries.drain().collect();
             for (key, val) in entries {
                 let mut k = key.value();
                 let mut v = val;
+                let k_before = k.to_bits();
                 update_value_inline(&mut k, nursery);
                 update_value_inline(&mut v, nursery);
+                crate::runtime::gc_ringbuf::record(
+                    crate::runtime::gc_ringbuf::Ev::MapKeyForward,
+                    [
+                        header as u64,
+                        k_before,
+                        k.to_bits(),
+                        v.to_bits(),
+                        0,
+                        0,
+                    ],
+                );
                 map.entries.insert(MapKey::new(k), v);
+                crate::runtime::gc_ringbuf::record(
+                    crate::runtime::gc_ringbuf::Ev::MapKeyInsert,
+                    [header as u64, k.to_bits(), 0, 0, 0, 0],
+                );
             }
+            crate::runtime::gc_ringbuf::record(
+                crate::runtime::gc_ringbuf::Ev::MapDrainEnd,
+                [header as u64, 0, 0, 0, 0, 0],
+            );
         }
 
         ObjType::Closure => {

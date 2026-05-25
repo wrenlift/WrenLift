@@ -512,6 +512,7 @@ impl VM {
             crate::codegen::runtime_fns::JitContext::default(),
         );
         crate::codegen::runtime_fns::clear_jit_roots();
+        crate::runtime::gc_ringbuf::init_if_enabled();
 
         let mut vm = Self {
             gc: GcImpl::new(config.gc_strategy),
