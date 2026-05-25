@@ -2102,8 +2102,25 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         ctx.closure = closure_ptr as *mut u8;
         ctx.defining_class = std::ptr::null_mut();
     });
+    // Root `fiber` across the poll: the body may fire GC, which
+    // promotes nursery fibers to old gen and rewrites root entries
+    // to the forwarded addresses. Without this, the post-poll
+    // `(*fiber).aot_active_depth = saved_depth` write lands on
+    // freed nursery memory — same bug class as the SM branch in
+    // call_closure_jit_or_sync (lines ~1971-1974 there).
+    let fiber_root_idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    crate::codegen::runtime_fns::push_jit_root(
+        crate::runtime::value::Value::object(fiber as *mut u8),
+    );
     let result = poll(fiber, resume_v);
     let kind_after_poll = AOT_SM_POLL_KIND.with(|c| c.get() as u32);
+    // Refresh `fiber` from JIT_ROOTS_STORE before any further
+    // dereference. Pop the root after.
+    let fiber = crate::codegen::runtime_fns::jit_root_at(fiber_root_idx)
+        .as_object()
+        .map(|p| p as *mut crate::runtime::object::ObjFiber)
+        .unwrap_or(fiber);
+    let _ = crate::codegen::runtime_fns::pop_jit_root();
     crate::codegen::runtime_fns::set_jit_context(saved_ctx);
     unsafe {
         (*fiber).aot_active_depth = saved_depth;
