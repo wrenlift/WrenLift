@@ -339,7 +339,10 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
         if !matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
             continue;
         }
-        let (lib, key) = match section.name.split_once(crate::hatch::NATIVE_LIB_PLATFORM_SEP) {
+        let (lib, key) = match section
+            .name
+            .split_once(crate::hatch::NATIVE_LIB_PLATFORM_SEP)
+        {
             Some((l, k)) => (l, k),
             None => (section.name.as_str(), ""),
         };

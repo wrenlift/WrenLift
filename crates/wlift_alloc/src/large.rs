@@ -104,7 +104,7 @@ fn bucket_bytes(idx: usize) -> usize {
 }
 
 static BUCKETS: [Mutex<LargeBucket>; NUM_BUCKETS] = [
-    Mutex::new(LargeBucket::new(1 << MIN_LOG2)),       //   2 KiB
+    Mutex::new(LargeBucket::new(1 << MIN_LOG2)), //   2 KiB
     Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 1))), //   4 KiB
     Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 2))), //   8 KiB
     Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 3))), //  16 KiB
