@@ -2342,6 +2342,25 @@ pub mod cl {
                             if *idx == 0 {
                                 receiver_val = Some(v);
                             }
+                            // Function args loaded here are Wren
+                            // Values that persist across the entire
+                            // SM body's safepoint chain. Without
+                            // declaring them, Cranelift's safepoint
+                            // pass doesn't spill+reload them and
+                            // every subsequent use reads a stale
+                            // register copy. Declare unconditionally
+                            // on the entry block — for SM-tainted
+                            // bodies, function args are always
+                            // i64-shaped Wren Value bits coming back
+                            // from the slot save. (`is_wren_value`
+                            // checks `value_types` keyed by ValueId,
+                            // but the entry block's BlockParam ids
+                            // can fall outside the populated range
+                            // for SM bodies, dropping the gate
+                            // unconditionally.)
+                            if mark_stack_map {
+                                builder.declare_value_needs_stack_map(v);
+                            }
                         }
                     }
                 }
