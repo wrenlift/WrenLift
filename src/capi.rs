@@ -2144,7 +2144,21 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     // reads upvalues from the wrong array — at best stale, at
     // worst NULL+offset SIGSEGVing on first GetUpvalue. Same
     // shape as `call_closure_jit_or_sync`'s SM branch.
+    //
+    // Root the snapshot's closure + defining_class on the JIT
+    // roots stack across the poll: the body's GC promotes nursery
+    // closures to old-gen and rewrites root entries to the new
+    // addresses, so the restore reads the forwarded pointer
+    // rather than the pre-GC nursery one. Without rooting, the
+    // post-poll `set_jit_context(saved_ctx)` re-installs the
+    // caller's stale closure pointer, every subsequent
+    // `wren_load_jit_closure` on the caller side reads through a
+    // freed nursery header, and a downstream inline GetUpvalue
+    // either SEGVs or returns garbage — same bug class as the
+    // call_closure_jit_or_sync save/restore pair.
     let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
+    let saved_ctx_root_len =
+        crate::codegen::runtime_fns::root_saved_jit_context(saved_ctx);
     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
         if ctx.vm.is_null() {
             ctx.vm = vm as *mut u8;
@@ -2172,7 +2186,11 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
         .map(|p| p as *mut crate::runtime::object::ObjFiber)
         .unwrap_or(fiber);
     let _ = crate::codegen::runtime_fns::pop_jit_root();
-    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+    // Pulls the post-GC forwarded closure + defining_class off
+    // the JIT roots stack, overlays them onto the saved snapshot,
+    // and reinstalls the result as the live context. Pops the two
+    // root entries `root_saved_jit_context` pushed.
+    crate::codegen::runtime_fns::restore_rooted_jit_context(saved_ctx, saved_ctx_root_len);
     unsafe {
         (*fiber).aot_active_depth = saved_depth;
     }

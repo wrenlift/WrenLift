@@ -1327,8 +1327,12 @@ pub fn update_jit_context_roots(closure: Value, defining_class: Value) {
     });
 }
 
+/// Push the GC-managed pointers of `ctx` (closure + defining_class)
+/// onto the JIT roots stack so they survive any GC fired by code
+/// running after this call. Returns the snapshot length to pass to
+/// [`restore_rooted_jit_context`] for the matching restore.
 #[inline(always)]
-fn root_saved_jit_context(ctx: JitContext) -> usize {
+pub(crate) fn root_saved_jit_context(ctx: JitContext) -> usize {
     let root_len_before = jit_roots_snapshot_len();
     push_jit_root(if ctx.closure.is_null() {
         Value::null()
@@ -1343,8 +1347,13 @@ fn root_saved_jit_context(ctx: JitContext) -> usize {
     root_len_before
 }
 
+/// Read the (possibly GC-updated) closure + defining_class back
+/// from the JIT roots stack, overlay them onto `saved_ctx`, then
+/// restore the resulting context as the live JitContext. Pair with
+/// [`root_saved_jit_context`] across any callsite that can trigger
+/// GC and clobber the snapshot's pointers.
 #[inline(always)]
-fn restore_rooted_jit_context(mut saved_ctx: JitContext, root_len_before: usize) {
+pub(crate) fn restore_rooted_jit_context(mut saved_ctx: JitContext, root_len_before: usize) {
     saved_ctx.closure = jit_root_at(root_len_before)
         .as_object()
         .unwrap_or(std::ptr::null_mut());

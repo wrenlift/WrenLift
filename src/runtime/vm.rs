@@ -4122,9 +4122,72 @@ impl VM {
                                     unsafe { *slot_ptr = new_bits };
                                     slots_patched += 1;
                                     if trace {
+                                        // `saved_ret` points into the
+                                        // AOT caller's code, just past
+                                        // its call into the Rust helper
+                                        // whose frame we're scanning.
+                                        // That call site is the one
+                                        // missing a `user_stack_maps()`
+                                        // entry — the GC walker
+                                        // couldn't find the receiver
+                                        // root, so the value sat in the
+                                        // helper's stack slot as a
+                                        // stale FORWARDED pointer.
+                                        // call_off = saved_ret - cr.start
+                                        // is the byte offset *after* the
+                                        // BL inside the AOT caller; the
+                                        // BL itself is at -4.
+                                        let cr = self.engine.code_ranges.iter().find(|r| {
+                                            saved_ret >= r.start && saved_ret < r.end
+                                        });
+                                        let (fname, base) = match cr {
+                                            Some(cr) => {
+                                                let func_id = cr.func_id.0 as usize;
+                                                let n = self
+                                                    .engine
+                                                    .functions
+                                                    .get(func_id)
+                                                    .map(|fb| {
+                                                        self.interner
+                                                            .resolve(fb.mir().name)
+                                                            .to_string()
+                                                    })
+                                                    .unwrap_or_else(|| {
+                                                        format!("<func#{func_id}>")
+                                                    });
+                                                let dl = unsafe {
+                                                    let mut info: libc::Dl_info =
+                                                        std::mem::zeroed();
+                                                    if libc::dladdr(
+                                                        cr.start as *const _,
+                                                        &mut info,
+                                                    ) != 0
+                                                        && !info.dli_sname.is_null()
+                                                    {
+                                                        std::ffi::CStr::from_ptr(
+                                                            info.dli_sname,
+                                                        )
+                                                        .to_str()
+                                                        .ok()
+                                                        .map(|s| s.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                };
+                                                (dl.unwrap_or(n), cr.start)
+                                            }
+                                            None => ("<unknown>".to_string(), 0),
+                                        };
+                                        let call_off = saved_ret.wrapping_sub(base);
                                         eprintln!(
-                                            "  [fp-fixup] slot=@{:#x} src=0x{:x} -> dst=0x{:x} type={}",
-                                            slot_addr, bits & PTR_MASK, new_header as u64, src_ty
+                                            "  [fp-fixup] caller_fn={} call_after=+{} slot=@fp{:+} \
+                                             src=0x{:x} -> dst=0x{:x} type={}",
+                                            fname,
+                                            call_off,
+                                            slot_addr as isize - fp as isize,
+                                            bits & PTR_MASK,
+                                            new_header as u64,
+                                            src_ty
                                         );
                                     }
                                 }
