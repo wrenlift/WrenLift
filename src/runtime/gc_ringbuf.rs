@@ -97,9 +97,13 @@ pub fn init_if_enabled() {
             RING_PTR = addr as *mut Ring;
             ENABLED.store(1, Ordering::Relaxed);
             libc::close(fd);
+            // Copy the raw pointer into a local before formatting
+            // so we don't take a reference to the mutable static
+            // (UB on Rust 2024).
+            let ring_ptr = RING_PTR;
             eprintln!(
                 "[gc-ringbuf] enabled, mmap'd at {:p}, file={}, size={} bytes",
-                RING_PTR, path, size
+                ring_ptr, path, size
             );
         }
     });

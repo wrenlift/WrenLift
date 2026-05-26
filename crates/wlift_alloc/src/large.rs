@@ -104,7 +104,7 @@ fn bucket_bytes(idx: usize) -> usize {
 }
 
 static BUCKETS: [Mutex<LargeBucket>; NUM_BUCKETS] = [
-    Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 0))), //   2 KiB
+    Mutex::new(LargeBucket::new(1 << MIN_LOG2)),       //   2 KiB
     Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 1))), //   4 KiB
     Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 2))), //   8 KiB
     Mutex::new(LargeBucket::new(1 << (MIN_LOG2 + 3))), //  16 KiB
@@ -183,16 +183,16 @@ pub unsafe fn dealloc(ptr: *mut u8, _size_hint: usize) {
     let total = unsafe { (*(base as *const LargeHdr)).total };
     // If the region fits a bucket and there's room to cache,
     // park it. Otherwise munmap.
-    if let Some(idx) = bucket_for(total) {
-        if bucket_bytes(idx) == total {
-            let mut b = BUCKETS[idx].lock();
-            if b.len < BUCKET_CAP {
-                let slot = b.len;
-                b.cached[slot] = base;
-                b.len = slot + 1;
-                CACHED_BYTES.fetch_add(total, Ordering::Relaxed);
-                return;
-            }
+    if let Some(idx) = bucket_for(total)
+        && bucket_bytes(idx) == total
+    {
+        let mut b = BUCKETS[idx].lock();
+        if b.len < BUCKET_CAP {
+            let slot = b.len;
+            b.cached[slot] = base;
+            b.len = slot + 1;
+            CACHED_BYTES.fetch_add(total, Ordering::Relaxed);
+            return;
         }
     }
     unsafe {

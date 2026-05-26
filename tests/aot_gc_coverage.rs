@@ -4,15 +4,13 @@
 //! specific MIR-instruction class (allocators, mutators,
 //! call chains, fibers, …) in a tight loop, then runs the
 //! resulting binary under:
-//!   - `WLIFT_AOT_GC=1`              — opt into the AOT GC path
-//!   - `WLIFT_GC_STRESS=1`           — force collection at every
-//!                                     `finish_alloc` so any
-//!                                     stale-reference bug
-//!                                     surfaces immediately
-//!   - `WLIFT_VALIDATE_BARRIERS=1`   — pre-collect remembered-set
-//!                                     check in both directions
-//!                                     (missed barriers + stale
-//!                                     sources)
+//!
+//! - `WLIFT_AOT_GC=1` — opt into the AOT GC path.
+//! - `WLIFT_GC_STRESS=1` — force collection at every
+//!   `finish_alloc` so any stale-reference bug surfaces
+//!   immediately.
+//! - `WLIFT_VALIDATE_BARRIERS=1` — pre-collect remembered-set
+//!   check in both directions (missed barriers + stale sources).
 //!
 //! A clean exit means every alloc-site survives a GC fired at
 //! that exact instruction's safepoint, with full barrier
@@ -29,7 +27,7 @@
 //! without the `aot` feature.
 #![cfg(all(feature = "aot", any(target_os = "macos", target_os = "linux")))]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use wren_lift::codegen::aot::{

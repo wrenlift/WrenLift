@@ -716,6 +716,7 @@ impl Gc {
     /// its un-cleared header byte. Used by the per-call
     /// `wren_write_barrier` validator under `WLIFT_VALIDATE_BARRIERS`.
     /// O(N) walk; only call when the validator is opted in.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn is_stale_old_source(&self, header: *mut ObjHeader) -> bool {
         if header.is_null() {
             return false;

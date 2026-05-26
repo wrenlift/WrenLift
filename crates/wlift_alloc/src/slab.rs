@@ -38,16 +38,12 @@ use std::ptr::{self, NonNull};
 /// the last release and munmap immediately, before the slab
 /// accumulates into the long-tail of partially-empty regions).
 #[repr(C)]
-struct SlabHdr {
+pub struct SlabHdr {
     next: *mut SlabHdr,
     in_use: usize,
 }
 
 const _: () = assert!(core::mem::size_of::<SlabHdr>() == 16);
-
-/// Public alias so the rest of the crate can talk about slabs
-/// without exposing the in-arena header layout.
-pub type Slab = SlabHdr;
 
 /// Per-size-class state. Holds the free-list head + the intrusive
 /// list of slabs backing it. Lives behind a `Mutex` in the global
@@ -166,7 +162,7 @@ impl ClassPool {
         }
         self.free = new_head;
         // Splice slab out of the intrusive list.
-        let mut prev_link: *mut *mut SlabHdr = self.slabs.as_ptr() as *mut *mut SlabHdr;
+        let mut prev_link: *mut *mut SlabHdr = self.slabs.as_ptr();
         loop {
             let cur = unsafe { *prev_link };
             if cur.is_null() {
@@ -198,7 +194,7 @@ impl ClassPool {
     fn add_slab(&mut self) {
         assert!(self.chunk_size >= std::mem::size_of::<*mut u8>());
         assert!(self.chunk_size >= std::mem::size_of::<SlabHdr>());
-        assert!(self.slab_bytes % self.chunk_size == 0);
+        assert!(self.slab_bytes.is_multiple_of(self.chunk_size));
         assert!(self.slab_bytes.is_power_of_two());
         let base = unsafe { mmap_anon_aligned(self.slab_bytes, self.slab_bytes) }
             .unwrap_or_else(|| panic!("wlift_alloc: mmap({}B aligned) failed", self.slab_bytes));
@@ -272,7 +268,7 @@ impl ClassPool {
         //
         // 1. First pass: walk slabs, splice out fully-free ones
         //    from BOTH the slab list and the chunk free list.
-        let mut prev_slab: *mut *mut SlabHdr = self.slabs.as_ptr() as *mut *mut SlabHdr;
+        let mut prev_slab: *mut *mut SlabHdr = self.slabs.as_ptr();
         let mut slab = unsafe { *prev_slab };
         while !slab.is_null() {
             let slab_base = slab as usize;
@@ -461,25 +457,6 @@ fn page_size() -> usize {
     let s = if s == 0 { 4096 } else { s };
     CACHED.store(s, Ordering::Relaxed);
     s
-}
-
-#[cfg(unix)]
-unsafe fn mmap_anon(bytes: usize) -> Option<NonNull<u8>> {
-    let p = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            bytes,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
-            -1,
-            0,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        None
-    } else {
-        NonNull::new(p as *mut u8)
-    }
 }
 
 #[cfg(unix)]

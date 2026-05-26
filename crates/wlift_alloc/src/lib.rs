@@ -51,19 +51,14 @@ use spin::Mutex;
 mod large;
 mod slab;
 #[cfg(feature = "stats")]
-mod stats;
-
-pub use slab::Slab;
+pub mod stats;
 
 // Size classes in bytes. Allocations round up to the next class.
 // 7 classes is a balance between internal fragmentation (no class
 // would imply ~50% slop on power-of-two misses) and metadata
-// overhead (each class costs a Mutex + free-list head).
+// overhead (each class costs a Mutex + free-list head). Anything
+// above the last entry routes to the large pool.
 const SIZE_CLASSES: &[usize] = &[16, 32, 64, 128, 256, 512, 1024];
-
-/// Largest size routed through the slab pool. Allocations strictly
-/// above this go through [`large`] which `mmap`s directly.
-const MAX_SLAB_BYTES: usize = 1024;
 
 /// Per-slab chunk count is `SLAB_BYTES / class_size`. 64 KiB hits
 /// the macOS small-arena boundary so the kernel can reclaim slabs
@@ -74,12 +69,7 @@ const SLAB_BYTES: usize = 64 * 1024;
 /// allocations that should go to the large pool.
 #[inline]
 fn classify(n: usize) -> Option<usize> {
-    for &c in SIZE_CLASSES {
-        if n <= c {
-            return Some(c);
-        }
-    }
-    None
+    SIZE_CLASSES.iter().find(|&&c| n <= c).copied()
 }
 
 /// Process-wide allocator state. One instance, lives in a
