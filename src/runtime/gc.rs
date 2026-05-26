@@ -296,6 +296,22 @@ impl OldArena {
         }
     }
 
+    /// Whether `ptr` lies inside any currently-allocated arena chunk.
+    /// O(chunks) — small (a few dozen at most). Used by the
+    /// conservative FP-chain forwarding fixup to gate writes on the
+    /// forwarding *target* being in the live old-gen arena, since
+    /// stale FORWARDED markers can survive a nursery reset and the
+    /// `next` field might point at memory freed by a subsequent
+    /// major-GC sweep.
+    pub fn contains(&self, ptr: *const u8) -> bool {
+        let addr = ptr as usize;
+        self.chunks.iter().any(|chunk| {
+            let start = chunk.as_ptr() as usize;
+            let end = start + chunk.len();
+            addr >= start && addr < end
+        })
+    }
+
     pub fn alloc<T>(&mut self, val: T) -> *mut T {
         let align = std::mem::align_of::<T>();
         let size = std::mem::size_of::<T>();
@@ -919,6 +935,25 @@ impl Gc {
 
     pub fn nursery_capacity(&self) -> usize {
         self.nursery.capacity()
+    }
+
+    /// Whether `ptr` falls within the active nursery arena. Exposed
+    /// for the conservative FP-chain forwarding fixup in
+    /// `VM::conservative_fp_chain_forward_fixup`, which needs to
+    /// avoid following `gc_mark==FORWARDED` on old-gen objects (whose
+    /// `next` is the intrusive sweep-list, not a forwarding pointer).
+    pub fn nursery_contains(&self, ptr: *const u8) -> bool {
+        self.nursery.contains(ptr)
+    }
+
+    /// Whether `ptr` falls inside the live old-gen arena. Used as a
+    /// validity gate for forwarding targets in
+    /// `VM::conservative_fp_chain_forward_fixup` — a stale FORWARDED
+    /// marker can survive a nursery reset, and the `next` field
+    /// might point at memory freed by a later major-GC sweep, in
+    /// which case dereferencing it would SEGV mid-collection.
+    pub fn old_arena_contains(&self, ptr: *const u8) -> bool {
+        self.old_arena.contains(ptr)
     }
 
     // -- Typed allocation wrappers ------------------------------------------

@@ -3939,7 +3939,213 @@ impl VM {
                 fw.callback = roots[file_watch_start + i];
             }
         }
+
+        // Conservative FP-chain forwarding fixup: after the regular
+        // writebacks, walk the native FP chain and scan each AOT
+        // frame's stack window for any 8-byte-aligned slot whose
+        // bits match a NaN-boxed object Value pointing at a
+        // FORWARDED nursery object. Replace such slots with the
+        // forwarded pointer. Catches values that Cranelift's stack
+        // map missed — typically values held in callee-saved
+        // registers across calls (invisible to the GC walker) or
+        // values whose declared-but-not-spilled live range Cranelift
+        // pruned away. The fixup is a no-op when nothing is in the
+        // nursery (e.g. Arena / MarkSweep GCs) so it's safe to call
+        // unconditionally; the `WLIFT_AOT_FP_FIXUP=0` env var opts
+        // out for measurement / regression bisection.
+        if std::env::var("WLIFT_AOT_FP_FIXUP").as_deref() != Ok("0") {
+            self.conservative_fp_chain_forward_fixup();
+        }
     }
+
+    /// See call site in `collect_garbage` for the design rationale.
+    /// SAFETY of writes is gated on three checks per candidate slot:
+    /// (1) bits match the NaN-boxed object tag, (2) the pointed-to
+    /// header has `gc_mark == FORWARDED` (3 per `gc::FORWARDED`),
+    /// (3) the forwarded target is aligned, in user VA, has the
+    /// same `obj_type`, and is not itself FORWARDED. A random scalar
+    /// has to clear all three to be miswritten — a 1-in-2^64 odds
+    /// path in practice.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    fn conservative_fp_chain_forward_fixup(&self) {
+        const TAG_OBJ_MASK: u64 = 0xFFFC_0000_0000_0000;
+        const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+        const FORWARDED_MARK: u8 = 3;
+        // Toggle with `WLIFT_AOT_FP_FIXUP_TRACE=1` to dump per-GC
+        // (aot_frames_scanned, slots_scanned, slots_patched) and a
+        // per-patch line. Useful for diagnosing platforms where the
+        // walk finds zero frames (e.g. a Linux-vs-Mac VA-limit
+        // difference) or where patches are unexpectedly absent.
+        let trace = std::env::var_os("WLIFT_AOT_FP_FIXUP_TRACE").is_some();
+        let mut aot_frames_scanned = 0u32;
+        let mut slots_scanned = 0u32;
+        let mut slots_patched = 0u32;
+        // Maximum bytes scanned per frame. Typical AOT frame is
+        // 100-500 bytes; 4 KiB gives a wide safety margin without
+        // risking unbounded scan of a malformed chain.
+        const MAX_FRAME_BYTES: usize = 4096;
+        const MAX_FRAMES: usize = 128;
+
+        let mut fp: usize;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack))
+        };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack))
+        };
+
+        // Track the previous (callee) frame's fp so each iteration
+        // can bound its scan window by the next frame down — without
+        // this we read past the bottom of the actual frame and hit
+        // unmapped guard pages on Linux. Seeded with the initial
+        // x29 read above; the topmost AOT frame's locals begin just
+        // above that callee_fp.
+        let mut callee_fp = fp;
+        let mut walked = 0;
+        while fp != 0 && walked < MAX_FRAMES {
+            walked += 1;
+            if fp & 7 != 0 {
+                // Misaligned fp: corrupt or non-standard frame —
+                // bail rather than risk a fault. Don't gate on
+                // `fp >= USER_VA_LIMIT` here: on Linux/aarch64
+                // both the thread stack and the loaded code can
+                // sit above the 47-bit Mac-style limit (Linux
+                // defaults to a 48-bit user VA), and applying the
+                // check at the loop head bails immediately, never
+                // reaching the AOT frames we need to scan. The
+                // existing GC stack walker at scan_native_stack_roots
+                // omits the same check for the same reason.
+                break;
+            }
+            let saved_fp = unsafe { *(fp as *const usize) };
+            let saved_ret = unsafe { *((fp + 8) as *const usize) };
+            if saved_ret == 0 {
+                break;
+            }
+            // Sanity-check the chain link before trusting saved_fp
+            // as the callee_fp boundary for the next scan: stacks
+            // grow down so a valid caller fp must be strictly
+            // higher than the current fp, and we cap the gap at 1
+            // MiB. Anything bigger is almost certainly the saved_fp
+            // word holding data rather than a chain link.
+            if saved_fp <= fp || saved_fp - fp > 1 << 20 {
+                break;
+            }
+
+            // Only scan frames that lie within a registered AOT
+            // code range — same gate the regular walker uses. Skips
+            // rust/libc frames whose stack contents we shouldn't
+            // touch.
+            let in_aot = self
+                .engine
+                .code_ranges
+                .iter()
+                .any(|r| saved_ret >= r.start && saved_ret < r.end);
+            if !in_aot {
+                callee_fp = fp;
+                fp = saved_fp;
+                continue;
+            }
+
+            // Stack grows DOWN: this frame's locals live in
+            // [callee_fp + 16, fp). The +16 skips this frame's own
+            // saved (x29, x30) pair on aarch64 (the callee_fp we
+            // tracked from the prior iteration points at the next
+            // frame down's saved-pair). Cap the scan to
+            // MAX_FRAME_BYTES so a runaway frame can't make us read
+            // unbounded stack.
+            let scan_top = fp;
+            let scan_bottom = (callee_fp + 16).max(fp.saturating_sub(MAX_FRAME_BYTES));
+            if scan_bottom >= scan_top {
+                callee_fp = fp;
+                fp = saved_fp;
+                continue;
+            }
+            aot_frames_scanned += 1;
+            let mut slot_addr = scan_bottom;
+            while slot_addr + 8 <= scan_top {
+                slots_scanned += 1;
+                let slot_ptr = slot_addr as *mut u64;
+                let bits = unsafe { *slot_ptr };
+                if bits & TAG_OBJ_MASK == TAG_OBJ_MASK {
+                    let obj_addr = (bits & PTR_MASK) as usize;
+                    // `nursery_contains` is the authoritative gate
+                    // — it bounds the read against the actual GC
+                    // nursery buffer. VA-limit checks are too
+                    // brittle across platforms (Linux/aarch64
+                    // routinely lives above the 47-bit Mac line).
+                    if obj_addr != 0
+                        && obj_addr & 7 == 0
+                        && self.gc.nursery_contains(obj_addr as *const u8)
+                    {
+                        let header = obj_addr as *const ObjHeader;
+                        let gc_mark = unsafe { (*header).gc_mark };
+                        if gc_mark == FORWARDED_MARK {
+                            let new_header = unsafe { (*header).next as usize };
+                            // Validate the dst header before
+                            // dereferencing it (we can't undo a SEGV
+                            // mid-collection):
+                            //   - alignment + non-null
+                            //   - in the old-gen arena (so the
+                            //     bytes are still mapped after a
+                            //     major-GC sweep cycle could have
+                            //     freed individual entries — a stale
+                            //     FORWARDED.next from a prior cycle
+                            //     might point at unmapped memory
+                            //     otherwise)
+                            // The arena check is the load-bearing
+                            // one for Linux: nursery resets reuse
+                            // FORWARDED slots, and the `next` field
+                            // can survive long after the dst was
+                            // freed elsewhere.
+                            if new_header != 0
+                                && new_header & 7 == 0
+                                && self.gc.old_arena_contains(new_header as *const u8)
+                            {
+                                let src_ty = unsafe { (*header).obj_type as u8 };
+                                let dst_hdr = new_header as *const ObjHeader;
+                                let dst_ty = unsafe { (*dst_hdr).obj_type as u8 };
+                                let dst_mark = unsafe { (*dst_hdr).gc_mark };
+                                let dst_gen = unsafe { (*dst_hdr).generation };
+                                // dst.generation must be GEN_OLD (1):
+                                // promote_typed sets it explicitly
+                                // before storing the forwarding
+                                // pointer back on the source.
+                                if src_ty == dst_ty
+                                    && dst_mark != FORWARDED_MARK
+                                    && dst_mark <= 2
+                                    && dst_gen == 1
+                                {
+                                    let new_bits = TAG_OBJ_MASK | new_header as u64;
+                                    unsafe { *slot_ptr = new_bits };
+                                    slots_patched += 1;
+                                    if trace {
+                                        eprintln!(
+                                            "  [fp-fixup] slot=@{:#x} src=0x{:x} -> dst=0x{:x} type={}",
+                                            slot_addr, bits & PTR_MASK, new_header as u64, src_ty
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                slot_addr += 8;
+            }
+            callee_fp = fp;
+            fp = saved_fp;
+        }
+        if trace {
+            eprintln!(
+                "[fp-fixup] aot_frames={aot_frames_scanned} slots_scanned={slots_scanned} patched={slots_patched}"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    fn conservative_fp_chain_forward_fixup(&self) {}
 }
 
 // ---------------------------------------------------------------------------

@@ -230,6 +230,33 @@ impl GcImpl {
         }
     }
 
+    /// Whether `ptr` lies within the generational nursery arena.
+    /// Always `false` for Arena / MarkSweep — those allocators don't
+    /// have a separate nursery. Used by the conservative FP-chain
+    /// forwarding fixup to gate writes on the source being a nursery
+    /// object (an old-gen object's `gc_mark==FORWARDED` would only
+    /// fire transiently mid-collection and the `next` field there
+    /// is the intrusive sweep list, not a forwarding pointer).
+    #[inline(always)]
+    pub fn nursery_contains(&self, ptr: *const u8) -> bool {
+        match self {
+            GcImpl::Generational(gc) => gc.nursery_contains(ptr),
+            _ => false,
+        }
+    }
+
+    /// Whether `ptr` lies inside the live old-gen arena (any chunk).
+    /// Always `false` for Arena / MarkSweep. Used by the same
+    /// FP-chain forwarding fixup to validate the *target* of a
+    /// FORWARDED redirect before dereferencing it.
+    #[inline(always)]
+    pub fn old_arena_contains(&self, ptr: *const u8) -> bool {
+        match self {
+            GcImpl::Generational(gc) => gc.old_arena_contains(ptr),
+            _ => false,
+        }
+    }
+
     /// Iterate every currently-allocated `ObjFiber` in the heap.
     ///
     /// Used by the krio-fiber AOT integration's GC Pass 3 to find
