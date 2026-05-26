@@ -2593,7 +2593,9 @@ fn emit_aot_bootstrap_main(
     bundle: &AotBundleMeta,
 ) -> Result<(), AotError> {
     use cranelift_codegen::ir::condcodes::IntCC;
-    use cranelift_codegen::ir::{InstBuilder, MemFlags, StackSlotData, StackSlotKind};
+    use cranelift_codegen::ir::{
+        InstBuilder, MemFlagsData as MemFlags, StackSlotData, StackSlotKind,
+    };
     use cranelift_module::DataDescription;
 
     let ptr_ty = module.target_config().pointer_type();

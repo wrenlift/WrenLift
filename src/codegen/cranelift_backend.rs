@@ -46,7 +46,8 @@ pub mod cl {
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::{
-        AbiParam, BlockArg, Function, InstBuilder, MemFlags, Signature, Type, Value,
+        AbiParam, BlockArg, Function, InstBuilder, MemFlagsData as MemFlags, Signature, Type,
+        Value,
     };
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_codegen::Context;
@@ -84,7 +85,7 @@ pub mod cl {
         not_object_block: cranelift_codegen::ir::Block,
     ) -> (cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) {
         use cranelift_codegen::ir::condcodes::IntCC;
-        use cranelift_codegen::ir::{InstBuilder, MemFlags};
+        use cranelift_codegen::ir::{InstBuilder, MemFlagsData as MemFlags};
         let tag_obj = builder.ins().iconst(types::I64, TAG_OBJ as i64);
         let high = builder.ins().band(recv, tag_obj);
         let is_obj = builder.ins().icmp(IntCC::Equal, high, tag_obj);
@@ -2214,6 +2215,15 @@ pub mod cl {
                 // we just stash the returned Variable so the
                 // entry-block setup + every upvalue lowering site
                 // can look it up.
+                //
+                // NOTE: closure_ptr_var holds a raw closure pointer
+                // (output of `wren_load_jit_closure`), not a
+                // NaN-boxed Wren Value, so `declare_var_needs_stack_map`
+                // wouldn't help — the GC walker skips spill slots
+                // whose bits don't match the NaN-box tag. Refresh
+                // logic for the cached pointer across GC lives in
+                // the JitContext save/restore in `wlift_aot_invoke_sm_method`
+                // (see `root_saved_jit_context` / `restore_rooted_jit_context`).
                 let var = builder.declare_var(types::I64);
                 *cfg.current_closure_ptr_var.borrow_mut() = Some(var);
             }
@@ -2239,7 +2249,17 @@ pub mod cl {
             if cfg.current_state_machine_layout.borrow().is_some() {
                 let fiber_var = builder.declare_var(types::I64);
                 *cfg.current_fiber_ptr_var.borrow_mut() = Some(fiber_var);
+                // Fibers are allocated straight to old gen and never
+                // FORWARDED, so the pointer is stable — no stack-map
+                // declaration needed on `fiber_var`.
                 let resume_v_var = builder.declare_var(types::I64);
+                // `resume_v` is the second poll-fn param: an
+                // arbitrary Wren Value the resumer passed via
+                // `fiber.call(value)`. It can be a List / Map / String
+                // and therefore FORWARDED across a minor GC.
+                if env_stack_maps() {
+                    builder.declare_var_needs_stack_map(resume_v_var);
+                }
                 *cfg.current_resume_v_var.borrow_mut() = Some(resume_v_var);
             }
         }
@@ -2545,7 +2565,7 @@ pub mod cl {
                 let sym_slot = aot_intern_symbol(cfg, method_sym.index(), interner);
                 let sym_v = builder.ins().load(
                     types::I64,
-                    cranelift_codegen::ir::MemFlags::trusted(),
+                    cranelift_codegen::ir::MemFlagsData::trusted(),
                     symbols_addr,
                     (sym_slot as i32) * 8,
                 );
@@ -2588,7 +2608,7 @@ pub mod cl {
                 let ret_propagate = if builder.func.dfg.value_type(ret) != return_ty {
                     builder
                         .ins()
-                        .bitcast(return_ty, cranelift_codegen::ir::MemFlags::new(), ret)
+                        .bitcast(return_ty, cranelift_codegen::ir::MemFlagsData::new(), ret)
                 } else {
                     ret
                 };

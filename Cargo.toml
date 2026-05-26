@@ -150,7 +150,7 @@ zstd = { version = "0.13", optional = true }
 rand = { version = "0.9", optional = true }
 rand_core = { version = "0.6", features = ["std"], optional = true }
 ureq = { version = "2", features = ["tls"], optional = true }
-cranelift-codegen = { version = "0.130", optional = true }
+cranelift-codegen = { version = "0.133", optional = true }
 # Host-only allocator override. mimalloc replaces the system
 # malloc as Rust's `#[global_allocator]` (declared in `lib.rs`),
 # yielding a tighter peak-RSS profile than glibc's per-thread
@@ -166,13 +166,13 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 # see on Fly's debian-trixie x86_64). Gated behind the `jemalloc`
 # feature so wasm / non-host builds don't try to link the C bits.
 tikv-jemallocator = { version = "0.6", default-features = false, optional = true }
-cranelift-frontend = { version = "0.130", optional = true }
-cranelift-module = { version = "0.130", optional = true }
-cranelift-jit = { version = "0.130", optional = true }
-cranelift-native = { version = "0.130", optional = true }
+cranelift-frontend = { version = "0.133", optional = true }
+cranelift-module = { version = "0.133", optional = true }
+cranelift-jit = { version = "0.133", optional = true }
+cranelift-native = { version = "0.133", optional = true }
 # AOT object emission — pinned to the same 0.130 series as the
 # rest of cranelift so the `Module` trait impls stay ABI-aligned.
-cranelift-object = { version = "0.130", optional = true }
+cranelift-object = { version = "0.133", optional = true }
 # `target-lexicon` is a transitive of cranelift-codegen, but the
 # AOT entry point parses target triples at the top of the build
 # pipeline so we depend on it directly behind the `aot` feature.
@@ -249,3 +249,26 @@ object = { version = "0.36", default-features = false, features = ["read"] }
 # from-source path.
 [profile.release]
 strip = "none"
+
+# EXPERIMENTAL: point Cranelift at the darmie/wasmtime fork
+# (branch `fix/cranelift-object-darwin-platform`) so the build
+# picks up:
+#
+#   * upstream `decb45f` ("cranelift: include every SSA value
+#     bound to a variable in stack maps") — fixes earlier-def
+#     drops in re-defined Variables, closes a class of AOT
+#     stack-map gaps; and
+#   * fork commit `cranelift-object: emit PLATFORM_MACOS for
+#     Darwin triples on macOS hosts` — fixes ld64 rejecting
+#     PLATFORM_UNKNOWN object files when emitting on macOS.
+#
+# Fork is Cranelift 0.133 vs the pinned 0.130, so AOT codegen
+# absorbs API drift (`MemFlags` → `MemFlagsData` rename). Revert
+# this block + restore the 0.130 pins to fall back to crates.io.
+[patch.crates-io]
+cranelift-codegen = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
+cranelift-frontend = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
+cranelift-module = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
+cranelift-jit = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
+cranelift-native = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
+cranelift-object = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
