@@ -77,6 +77,17 @@ wlift_alloc = [
     "host",
     "dep:wlift_alloc",
 ]
+# jemalloc as the process's `#[global_allocator]`. Mutually
+# exclusive with `wlift_alloc` (multiple `#[global_allocator]`
+# declarations don't compile); the lib.rs picks jemalloc when
+# both are enabled, falling back to wlift_alloc, then system
+# malloc. Build the wlift binary with `--features jemalloc` on
+# Linux servers where glibc's per-arena fragmentation is the
+# dominant memory pathology.
+jemalloc = [
+    "host",
+    "dep:tikv-jemallocator",
+]
 cranelift = [
     "host",
     "dep:cranelift-codegen",
@@ -149,6 +160,12 @@ cranelift-codegen = { version = "0.130", optional = true }
 # anything else that doesn't enable the `host` feature continues
 # to use the system allocator.
 mimalloc = { version = "0.1", default-features = false, optional = true }
+# jemalloc alternative — battle-tested production allocator that
+# returns pages to the OS aggressively (unlike glibc's per-thread
+# arena pool, which is the root cause of the 500MB-RSS plateau we
+# see on Fly's debian-trixie x86_64). Gated behind the `jemalloc`
+# feature so wasm / non-host builds don't try to link the C bits.
+tikv-jemallocator = { version = "0.6", default-features = false, optional = true }
 cranelift-frontend = { version = "0.130", optional = true }
 cranelift-module = { version = "0.130", optional = true }
 cranelift-jit = { version = "0.130", optional = true }

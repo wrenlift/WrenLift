@@ -24,7 +24,16 @@
 // symbols exported from the binary — single instance regardless
 // of how each cdylib was linked. See
 // `crates/wlift_alloc/src/lib.rs` for the design notes.
-#[cfg(feature = "wlift_alloc")]
+// Global-allocator selection. jemalloc wins if both `jemalloc` and
+// `wlift_alloc` are enabled — battle-tested production allocator
+// with eager page release. `wlift_alloc` is the in-tree fallback;
+// the system allocator is the implicit default when neither flag
+// is on.
+#[cfg(all(feature = "jemalloc", not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "wlift_alloc", not(feature = "jemalloc")))]
 #[global_allocator]
 static GLOBAL: wlift_alloc::Wlift = wlift_alloc::Wlift;
 
