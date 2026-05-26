@@ -323,13 +323,54 @@ fn walk_hatch_archive(bytes: &[u8]) -> Result<AotWalkResult, AotError> {
     let hatch = crate::hatch::load(bytes)
         .map_err(|e| AotError::Frontend(format!("loading hatch archive: {}", e)))?;
 
-    // Collect bundled native libs (NativeLib sections) — bytes
-    // get extracted to a temp file at startup by the bootstrap.
-    let mut native_libs: Vec<(String, Vec<u8>)> = Vec::new();
+    // Collect bundled native libs (NativeLib sections) — bytes get
+    // extracted to a temp file at startup by the bootstrap. The
+    // packer emits one section per platform with a `__<key>` suffix
+    // (e.g. `wlift_sqlite__linux-arm64`); pick the variant that
+    // matches the build host and strip the suffix so the bootstrap
+    // calls `wlift_aot_install_native_lib(name="wlift_sqlite", …)`
+    // — `vm.native_lib_paths` lookups during foreign-class binding
+    // search by the bare libname. Carrying every platform's bytes
+    // through would also balloon the AOT binary by tens of MB for
+    // no reason. Mirrors `extract_hatch_native_sections` in vm.rs.
+    let mut by_lib: std::collections::HashMap<&str, Vec<(&str, &crate::hatch::Section)>> =
+        std::collections::HashMap::new();
     for section in &hatch.sections {
-        if matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
-            native_libs.push((section.name.clone(), section.data.clone()));
+        if !matches!(section.kind, crate::hatch::SectionKind::NativeLib) {
+            continue;
         }
+        let (lib, key) = match section.name.split_once(crate::hatch::NATIVE_LIB_PLATFORM_SEP) {
+            Some((l, k)) => (l, k),
+            None => (section.name.as_str(), ""),
+        };
+        by_lib.entry(lib).or_default().push((key, section));
+    }
+    let host_os = std::env::consts::OS;
+    let host_arch = crate::hatch::canonical_arch_name_pub(std::env::consts::ARCH);
+    let host_os_arch = format!("{}-{}", host_os, host_arch);
+    let preference = [host_os_arch.as_str(), host_os, "any", "path"];
+    let mut native_libs: Vec<(String, Vec<u8>)> = Vec::new();
+    for (lib, candidates) in by_lib {
+        // Legacy single-section bundle (pre-platform-suffix packer).
+        if candidates.len() == 1 && candidates[0].0.is_empty() {
+            native_libs.push((lib.to_string(), candidates[0].1.data.clone()));
+            continue;
+        }
+        let mut picked: Option<&crate::hatch::Section> = None;
+        'outer: for want in &preference {
+            for (key, section) in &candidates {
+                if key == want {
+                    picked = Some(*section);
+                    break 'outer;
+                }
+            }
+        }
+        if let Some(section) = picked {
+            native_libs.push((lib.to_string(), section.data.clone()));
+        }
+        // No host-matching variant — skip silently. The foreign-class
+        // loader will surface a clear "library not found" if any
+        // class actually tries to use this lib.
     }
 
     // Build a name → source map from Source sections so manifest

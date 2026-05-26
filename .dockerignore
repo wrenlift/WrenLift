@@ -1,0 +1,14 @@
+# Keep the Docker build context (and any `--build-context` user
+# of this directory) lean. Cargo artifacts dwarf the actual
+# source tree (~5 GB vs ~50 MB), and shipping them into a builder
+# image would defeat the whole point of `cargo build` running
+# inside the image.
+target/
+**/target/
+.git/
+**/*.dylib
+**/*.so
+**/*.dll
+node_modules/
+hatch/
+specs/snapshots/
