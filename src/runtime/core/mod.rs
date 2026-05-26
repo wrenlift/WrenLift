@@ -310,7 +310,10 @@ pub fn validate_index(
     let raw = validate_int(ctx, value, arg_name)?;
     let index = if raw < 0 { raw + count as i64 } else { raw };
     if index < 0 || index as usize >= count {
-        ctx.runtime_error(format!("{} out of bounds.", arg_name));
+        ctx.runtime_error(format!(
+            "{} {} out of bounds (count {}).",
+            arg_name, raw, count
+        ));
         return None;
     }
     Some(index as usize)

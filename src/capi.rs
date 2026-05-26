@@ -199,6 +199,26 @@ pub extern "C" fn wrenNewVM(config: *const WrenConfiguration) -> *mut WrenVM {
     Box::into_raw(vm)
 }
 
+/// AOT bootstrap VM constructor. The Cranelift-generated
+/// `wlift_aot_main` calls this in place of `wrenNewVM(NULL)` so
+/// the AOT-built binary doesn't inherit the embedding-API
+/// default (1B step limit + suppressed stack traces) — those
+/// fail-closed defaults are right for short-lived `wlift run`
+/// embeds but wrong for long-running AOT-compiled servers,
+/// where the step counter would abort a legitimate listen loop
+/// and missing stack traces hide handler bugs in logs. Matches
+/// `hatch run`'s config (step_limit=0, fiber_stack_traces=true).
+#[cfg(feature = "aot")]
+#[no_mangle]
+pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
+    let config = VMConfig {
+        step_limit: 0,
+        fiber_stack_traces: true,
+        ..VMConfig::default()
+    };
+    Box::into_raw(Box::new(VM::new(config)))
+}
+
 #[no_mangle]
 pub extern "C" fn wrenFreeVM(vm: *mut WrenVM) {
     if !vm.is_null() {
@@ -300,7 +320,15 @@ pub unsafe extern "C" fn wlift_run_aot_program(
     };
 
     use crate::runtime::engine::InterpretResult;
-    let config = VMConfig::default();
+    // Match `hatch run`'s long-running-server config: unlimited
+    // step budget (default 1B fails-closed on legitimate server
+    // loops) and real fiber stack traces (default "<not enabled>"
+    // hides caller context in production error logs).
+    let config = VMConfig {
+        step_limit: 0,
+        fiber_stack_traces: true,
+        ..VMConfig::default()
+    };
     let mut vm = VM::new(config);
 
     // Install every bundled dependency before running the entry.
@@ -724,19 +752,40 @@ pub unsafe extern "C" fn wlift_aot_register_closure(
     vm: *mut WrenVM,
     arity: u8,
     fn_ptr: *const u8,
+    name_ptr: *const c_char,
+    name_len: usize,
 ) -> u64 {
     if vm.is_null() || fn_ptr.is_null() {
         return u64::MAX;
     }
     let vm_ref = unsafe { &mut *vm };
-    // Closure bodies don't need a meaningful name in the engine —
-    // they're never looked up by name, only by FuncId. Reuse the
-    // interner's "<aot-closure>" sentinel.
-    let name_sym = vm_ref.interner.intern("<aot-closure>");
+    let name_sym = aot_intern_name(vm_ref, name_ptr, name_len, "<aot-closure>");
     let func_id = vm_ref
         .engine
         .register_aot_function(name_sym, arity, fn_ptr, None);
     func_id.0 as u64
+}
+
+/// Resolve a (name_ptr, name_len) pair into an interned symbol,
+/// falling back to `default_name` when the pair is empty or
+/// invalid UTF-8. Used by AOT registration helpers so stack
+/// traces show real Wren function names instead of the
+/// `<aot-closure>` / `<aot-sm-closure>` placeholders.
+#[cfg(feature = "aot")]
+unsafe fn aot_intern_name(
+    vm: &mut VM,
+    name_ptr: *const c_char,
+    name_len: usize,
+    default_name: &str,
+) -> crate::intern::SymbolId {
+    if name_ptr.is_null() || name_len == 0 {
+        return vm.interner.intern(default_name);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len) };
+    match std::str::from_utf8(bytes) {
+        Ok(s) => vm.interner.intern(s),
+        Err(_) => vm.interner.intern(default_name),
+    }
 }
 
 /// State-machine variant of [`wlift_aot_register_closure`]. The
@@ -754,12 +803,14 @@ pub unsafe extern "C" fn wlift_aot_register_closure(
 pub unsafe extern "C" fn wlift_aot_register_state_machine_closure(
     vm: *mut WrenVM,
     fn_ptr: *const u8,
+    name_ptr: *const c_char,
+    name_len: usize,
 ) -> u64 {
     if vm.is_null() || fn_ptr.is_null() {
         return u64::MAX;
     }
     let vm_ref = unsafe { &mut *vm };
-    let name_sym = vm_ref.interner.intern("<aot-sm-closure>");
+    let name_sym = aot_intern_name(vm_ref, name_ptr, name_len, "<aot-sm-closure>");
     let func_id = vm_ref
         .engine
         .register_aot_state_machine_function(name_sym, fn_ptr, None);

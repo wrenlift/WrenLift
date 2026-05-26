@@ -1454,6 +1454,11 @@ pub struct AotClosureManifest {
     /// these with the matching 2-param shape; runtime dispatch
     /// invokes them via the poll-fn path rather than `wren_call_*`.
     pub is_state_machine: bool,
+    /// Resolved Wren function name for stack-trace display. Passed
+    /// to the runtime registration helper so a fiber abort shows
+    /// the real source function (e.g. `Api.fetchJson_`) instead of
+    /// the `<aot-sm-closure>` placeholder.
+    pub debug_name: String,
 }
 #[allow(clippy::too_many_arguments)]
 fn emit_aot_module(
@@ -1654,10 +1659,12 @@ fn emit_aot_module(
             tainted_names,
         )?;
         fn_metas.push((sym.clone(), meta));
+        let debug_name = aot_mod.interner.resolve(closure_mir.name).to_string();
         closure_manifest.push(AotClosureManifest {
             fn_symbol: sym,
             arity: closure_mir.arity,
             is_state_machine,
+            debug_name,
         });
     }
 
@@ -2565,7 +2572,11 @@ fn emit_aot_bootstrap_main(
             .map_err(|e| AotError::Module(e.to_string()))
     };
 
-    let wren_new_vm = declare_import(module, "wrenNewVM", &[ptr_ty], Some(ptr_ty))?;
+    // AOT bootstrap calls `wlift_aot_new_vm` (not `wrenNewVM`) so
+    // the binary gets server-style config (no step limit, real
+    // fiber stack traces) instead of the embedding-API defaults.
+    // See [src/capi.rs `wlift_aot_new_vm`].
+    let wren_new_vm = declare_import(module, "wlift_aot_new_vm", &[], Some(ptr_ty))?;
     let wren_free_vm = declare_import(module, "wrenFreeVM", &[ptr_ty], None)?;
     let init_prelude = declare_import(
         module,
@@ -2585,16 +2596,19 @@ fn emit_aot_bootstrap_main(
         &[ptr_ty, ptr_ty, ptr_ty],
         Some(types::I64),
     )?;
+    // Both register_* helpers take a (name_ptr, name_len) pair so
+    // stack traces can show real Wren function names instead of
+    // the `<aot-closure>` / `<aot-sm-closure>` placeholders.
     let register_closure = declare_import(
         module,
         "wlift_aot_register_closure",
-        &[ptr_ty, types::I8, ptr_ty],
+        &[ptr_ty, types::I8, ptr_ty, ptr_ty, ptr_ty],
         Some(types::I64),
     )?;
     let register_sm_closure = declare_import(
         module,
         "wlift_aot_register_state_machine_closure",
-        &[ptr_ty, ptr_ty],
+        &[ptr_ty, ptr_ty, ptr_ty, ptr_ty],
         Some(types::I64),
     )?;
     let register_code_range = declare_import(
@@ -2785,7 +2799,18 @@ fn emit_aot_bootstrap_main(
         // `wlift_aot_register_closure`, writing the returned
         // engine FuncId into `closures_data[i]`.
         closures_data_id: cranelift_module::DataId,
-        closures: Vec<(cranelift_module::FuncId, u8, bool)>,
+        /// Per-closure: (body FuncId, arity, is_state_machine,
+        /// debug-name DataId, debug-name byte length). The name
+        /// bytes are passed to `wlift_aot_register_closure` /
+        /// `wlift_aot_register_state_machine_closure` so stack
+        /// traces show the real Wren function name.
+        closures: Vec<(
+            cranelift_module::FuncId,
+            u8,
+            bool,
+            cranelift_module::DataId,
+            usize,
+        )>,
         /// Per-AOT-function frame metadata: (fn_id import,
         /// code_size, safepoints desc DataId, safepoint count,
         /// roots DataId). Bootstrap calls
@@ -2975,7 +3000,7 @@ fn emit_aot_bootstrap_main(
             .declare_data(&m.closures_symbol, Linkage::Export, true, false)
             .map_err(|e| AotError::Module(e.to_string()))?;
         let mut closures = Vec::with_capacity(m.closures.len());
-        for closure in &m.closures {
+        for (closure_idx, closure) in m.closures.iter().enumerate() {
             let mut sig = Signature::new(cc);
             // State-machine bodies have a fixed 2-arg signature
             // (fiber, resume_v) regardless of the original Wren
@@ -2995,7 +3020,19 @@ fn emit_aot_bootstrap_main(
             let body_id = module
                 .declare_function(&closure.fn_symbol, Linkage::Import, &sig)
                 .map_err(|e| AotError::Module(e.to_string()))?;
-            closures.push((body_id, closure.arity, closure.is_state_machine));
+            let name_bytes = closure.debug_name.as_bytes();
+            let name_id = define_bytes(
+                module,
+                &format!("wlift_closure_name_{}_{}", i, closure_idx),
+                name_bytes,
+            )?;
+            closures.push((
+                body_id,
+                closure.arity,
+                closure.is_state_machine,
+                name_id,
+                name_bytes.len(),
+            ));
         }
 
         // Per-function safepoint metadata. Each AOT function gets
@@ -3219,10 +3256,9 @@ fn emit_aot_bootstrap_main(
         let exit_ref = module.declare_func_in_func(exit_ctx, builder.func);
         let invoke_module_body_ref = module.declare_func_in_func(invoke_module_body, builder.func);
 
-        // entry: vm = wrenNewVM(NULL); brif vm == 0 → err else body.
+        // entry: vm = wlift_aot_new_vm(); brif vm == 0 → err else body.
         builder.switch_to_block(entry_block);
-        let null_cfg = builder.ins().iconst(ptr_ty, 0);
-        let vm_call = builder.ins().call(new_vm_ref, &[null_cfg]);
+        let vm_call = builder.ins().call(new_vm_ref, &[]);
         let vm = builder.inst_results(vm_call)[0];
         let zero = builder.ins().iconst(ptr_ty, 0);
         let is_null = builder.ins().icmp(IntCC::Equal, vm, zero);
@@ -3322,19 +3358,24 @@ fn emit_aot_bootstrap_main(
             // from this slot table at run time.
             let closures_gv = module.declare_data_in_func(m.closures_data_id, builder.func);
             let closures_addr = builder.ins().global_value(ptr_ty, closures_gv);
-            for (k, (body_id, arity, is_sm)) in m.closures.iter().enumerate() {
+            for (k, (body_id, arity, is_sm, name_id, name_len)) in m.closures.iter().enumerate() {
                 let body_ref = module.declare_func_in_func(*body_id, builder.func);
                 let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
+                let name_gv = module.declare_data_in_func(*name_id, builder.func);
+                let name_addr = builder.ins().global_value(ptr_ty, name_gv);
+                let name_len_v = builder.ins().iconst(ptr_ty, *name_len as i64);
                 let func_id_val = if *is_sm {
-                    let reg_call = builder
-                        .ins()
-                        .call(register_sm_closure_ref, &[vm, body_addr]);
+                    let reg_call = builder.ins().call(
+                        register_sm_closure_ref,
+                        &[vm, body_addr, name_addr, name_len_v],
+                    );
                     builder.inst_results(reg_call)[0]
                 } else {
                     let arity_val = builder.ins().iconst(types::I8, *arity as i64);
-                    let reg_call = builder
-                        .ins()
-                        .call(register_closure_ref, &[vm, arity_val, body_addr]);
+                    let reg_call = builder.ins().call(
+                        register_closure_ref,
+                        &[vm, arity_val, body_addr, name_addr, name_len_v],
+                    );
                     builder.inst_results(reg_call)[0]
                 };
                 builder.ins().store(
