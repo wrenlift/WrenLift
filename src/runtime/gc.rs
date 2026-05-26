@@ -128,7 +128,13 @@ unsafe fn pre_drop_check_string(header: *mut ObjHeader, where_: &'static str) {
         }
         ObjType::Fiber => {
             let f = &*(header as *mut ObjFiber);
-            check_vec_buf(header, f.stack.as_ptr() as _, f.stack.capacity(), "ObjFiber.stack", where_);
+            check_vec_buf(
+                header,
+                f.stack.as_ptr() as _,
+                f.stack.capacity(),
+                "ObjFiber.stack",
+                where_,
+            );
             check_vec_buf(
                 header,
                 f.frames.as_ptr() as _,
@@ -1133,7 +1139,14 @@ impl Gc {
         let start = crate::portable_time::Instant::now();
         crate::runtime::gc_ringbuf::record(
             crate::runtime::gc_ringbuf::Ev::GcBegin,
-            [roots.len() as u64, self.nursery_objects.len() as u64, self.old_count as u64, 0, 0, 0],
+            [
+                roots.len() as u64,
+                self.nursery_objects.len() as u64,
+                self.old_count as u64,
+                0,
+                0,
+                0,
+            ],
         );
         // Off-heap pressure forces a major. Minor GCs only sweep
         // the nursery; promoted ObjFibers (which carry the krio
@@ -2026,7 +2039,14 @@ fn update_value_inline(val: &mut Value, nursery: &Nursery) {
                         if (next_raw & 0xFFFC_0000_0000_0000) == 0xFFFC_0000_0000_0000 {
                             crate::runtime::gc_ringbuf::record(
                                 crate::runtime::gc_ringbuf::Ev::PromoteEnd,
-                                [header as u64, next_raw, (*header).obj_type as u64, 0xDEAD, 0, 0],
+                                [
+                                    header as u64,
+                                    next_raw,
+                                    (*header).obj_type as u64,
+                                    0xDEAD,
+                                    0,
+                                    0,
+                                ],
                             );
                         }
                         *val = Value::object((*header).next as *mut u8);
@@ -2085,14 +2105,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
                 update_value_inline(&mut v, nursery);
                 crate::runtime::gc_ringbuf::record(
                     crate::runtime::gc_ringbuf::Ev::MapKeyForward,
-                    [
-                        header as u64,
-                        k_before,
-                        k.to_bits(),
-                        v.to_bits(),
-                        0,
-                        0,
-                    ],
+                    [header as u64, k_before, k.to_bits(), v.to_bits(), 0, 0],
                 );
                 map.entries.insert(MapKey::new(k), v);
                 crate::runtime::gc_ringbuf::record(

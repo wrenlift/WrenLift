@@ -2160,9 +2160,9 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     // freed nursery memory — same bug class as the SM branch in
     // call_closure_jit_or_sync (lines ~1971-1974 there).
     let fiber_root_idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
-    crate::codegen::runtime_fns::push_jit_root(
-        crate::runtime::value::Value::object(fiber as *mut u8),
-    );
+    crate::codegen::runtime_fns::push_jit_root(crate::runtime::value::Value::object(
+        fiber as *mut u8,
+    ));
     let result = poll(fiber, resume_v);
     let kind_after_poll = AOT_SM_POLL_KIND.with(|c| c.get() as u32);
     // Refresh `fiber` from JIT_ROOTS_STORE before any further
