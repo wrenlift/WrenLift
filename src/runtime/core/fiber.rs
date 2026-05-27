@@ -516,10 +516,17 @@ fn try_krio_yield(value: Value) -> Option<Value> {
     // drains after resume_with returns.
     KRIO_YIELD_ROOTS_HANDOFF.with(|cell| cell.replace(fiber_roots));
 
-    // Pump the yield value to the host via krio's untyped slot, then
-    // suspend. On resume the host calls `resume_with::<u64>(bits)`
-    // with the value the next `Fiber.call(v)` passed in.
-    let received: Option<u64> = krio_fiber::yield_value(value.to_bits());
+    // Pump the yield value to the host via krio's `u64` fast path,
+    // then suspend. On resume the host calls `resume_with_u64(bits)`
+    // with the value the next `Fiber.call(v)` passed in. The generic
+    // `yield_value::<u64, u64>` path allocates one `Box<dyn Any>`
+    // per yield-and-resume round-trip; under a tight
+    // `while true { Fiber.yield() }` loop that's 2 Box::new + 2 drop
+    // per tick, which dominates the allocator and OOMs the process
+    // (see `project_krio_box_per_yield_leak` memory note). The u64
+    // fast path stores the bits in a fixed Cell<Option<u64>> — zero
+    // allocation per round-trip.
+    let received: Option<u64> = krio_fiber::yield_u64(value.to_bits());
 
     // Back on the fiber stack — host has reinstalled this fiber's
     // saved roots into JIT_ROOTS_STORE before resuming us.
@@ -680,7 +687,10 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     // call boundary because the body's first statement is a
     // context switch onto the fiber's stack.
     let krio_ptr: *mut krio_fiber::Fiber = unsafe { (*target).krio_fiber.as_deref_mut().unwrap() };
-    let step = unsafe { (*krio_ptr).resume_with::<u64>(input.to_bits()) };
+    // `resume_with_u64` is the alloc-free counterpart of the
+    // generic `resume_with::<u64>` — see the matching comment on
+    // `krio_fiber::yield_u64` in `try_krio_yield`.
+    let step = unsafe { (*krio_ptr).resume_with_u64(input.to_bits()) };
 
     // Restore host's vm.fiber. Even if the body's own restore line
     // already ran (natural-completion path), re-asserting it here
@@ -712,10 +722,14 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
     let result = match step {
         krio_fiber::FiberStep::Yielded => {
             let krio = unsafe { &mut *krio_ptr };
+            // `take_yield_u64` reads the alloc-free fast-path slot
+            // populated by `krio_fiber::yield_u64`. `take_yield_any`
+            // would force the fiber side to box the u64 into a
+            // `Box<dyn Any>` per yield — the leak this whole path
+            // is unwinding.
             let v = krio
-                .take_yield_any()
-                .and_then(|b| b.downcast::<u64>().ok())
-                .map(|b| Value::from_bits(*b))
+                .take_yield_u64()
+                .map(Value::from_bits)
                 .unwrap_or_else(Value::null);
             unsafe {
                 (*target).state = FiberState::Suspended;

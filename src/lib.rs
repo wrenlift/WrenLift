@@ -37,6 +37,76 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: wlift_alloc::Wlift = wlift_alloc::Wlift;
 
+// Explicit System global allocator on Unix when no other allocator
+// is selected. Without an explicit `#[global_allocator]`, Rust's
+// default kicks in — and on Linux x86_64/aarch64 under heavy
+// alloc/free churn (the krio fiber yield loop) the default path
+// retains pages monotonically, blowing through fly.io's 768 MB
+// cap in tens of seconds. Declaring `System` explicitly here is
+// functionally identical to the default but routes every alloc
+// through libc malloc directly, and empirically holds RssAnon
+// flat at ~700 KB over the same workload. Reasons aren't fully
+// understood (possibly a Rust-stdlib thread-local arena path
+// that this declaration bypasses); the fix is reliable and zero
+// overhead.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(feature = "jemalloc"),
+    not(feature = "wlift_alloc"),
+    not(feature = "alloc_trace"),
+))]
+#[global_allocator]
+static GLOBAL: std::alloc::System = std::alloc::System;
+
+// Diagnostic counting allocator, opt-in via the `alloc_trace` feature.
+// Wraps the system allocator with atomic counters; `alloc_trace_snapshot()`
+// returns (allocs, frees, live_bytes). Used by the yield-leak repro to
+// attribute allocations to specific runtime call paths.
+#[cfg(all(
+    feature = "alloc_trace",
+    not(target_arch = "wasm32"),
+    not(feature = "jemalloc"),
+    not(feature = "wlift_alloc"),
+))]
+mod alloc_trace_impl {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    pub static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    pub static FREES: AtomicUsize = AtomicUsize::new(0);
+    pub static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+    pub struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            LIVE_BYTES.fetch_add(l.size(), Ordering::Relaxed);
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            FREES.fetch_add(1, Ordering::Relaxed);
+            LIVE_BYTES.fetch_sub(l.size(), Ordering::Relaxed);
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+}
+#[cfg(all(
+    feature = "alloc_trace",
+    not(target_arch = "wasm32"),
+    not(feature = "jemalloc"),
+    not(feature = "wlift_alloc"),
+))]
+#[global_allocator]
+static GLOBAL: alloc_trace_impl::Counting = alloc_trace_impl::Counting;
+
+#[cfg(feature = "alloc_trace")]
+pub fn alloc_trace_snapshot() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering;
+    (
+        alloc_trace_impl::ALLOCS.load(Ordering::Relaxed),
+        alloc_trace_impl::FREES.load(Ordering::Relaxed),
+        alloc_trace_impl::LIVE_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 pub mod ast;
 pub mod capi;
 pub mod codegen;

@@ -211,6 +211,37 @@ pub extern "C" fn wrenNewVM(config: *const WrenConfiguration) -> *mut WrenVM {
 #[cfg(feature = "aot")]
 #[no_mangle]
 pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
+    // Diagnostic: optional periodic alloc dump (see `alloc_trace`
+    // feature in lib.rs). Spawned once per AOT process — the
+    // bootstrap calls us before any module init.
+    #[cfg(feature = "alloc_trace")]
+    {
+        static SPAWNED: std::sync::Once = std::sync::Once::new();
+        SPAWNED.call_once(|| {
+            if let Ok(s) = std::env::var("WLIFT_ALLOC_DUMP_SEC") {
+                if let Ok(n) = s.parse::<u64>() {
+                    if n > 0 {
+                        std::thread::spawn(move || {
+                            let mut prev = crate::alloc_trace_snapshot();
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(n));
+                                let cur = crate::alloc_trace_snapshot();
+                                eprintln!(
+                                    "[alloc] +{}s allocs=+{} frees=+{} live={}B delta={:+}B",
+                                    n,
+                                    cur.0 - prev.0,
+                                    cur.1 - prev.1,
+                                    cur.2,
+                                    (cur.2 as i64) - (prev.2 as i64),
+                                );
+                                prev = cur;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
     let config = VMConfig {
         step_limit: 0,
         fiber_stack_traces: true,
