@@ -4596,6 +4596,134 @@ pub extern "C" fn wren_is_type(val: u64, class_sym: u64) -> u64 {
     Value::bool(false).to_bits()
 }
 
+#[cfg(all(unix, any(target_arch = "aarch64", target_arch = "x86_64")))]
+unsafe fn dladdr_symbol_runtime(addr: *const ()) -> Option<String> {
+    let mut info: libc::Dl_info = std::mem::zeroed();
+    if libc::dladdr(addr as *const libc::c_void, &mut info) == 0 || info.dli_sname.is_null() {
+        return None;
+    }
+    let cstr = std::ffi::CStr::from_ptr(info.dli_sname);
+    cstr.to_str().ok().map(|s| s.to_string())
+}
+#[cfg(not(all(unix, any(target_arch = "aarch64", target_arch = "x86_64"))))]
+unsafe fn dladdr_symbol_runtime(_addr: *const ()) -> Option<String> {
+    None
+}
+
+/// Diagnostic: receiver is a FORWARDED nursery object. Walk the
+/// native frame chain, resolve each AOT return address via dladdr,
+/// and print "<symbol>+<offset>" for every AOT frame on the stack.
+/// This pinpoints which AOT call site is holding the stale pointer
+/// so a codegen fix (adding declare_value_needs_stack_map) can be
+/// applied at the right spot. The site has to be one whose stack
+/// map didn't cover the list/string receiver across the call that
+/// triggered the minor GC and forwarded it.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn dump_stale_subscript_frames(obj_ptr: *const u8, recv: Value, idx: Value) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    // Cap reporting so a hot loop doesn't bury the terminal.
+    if SEEN.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    eprintln!(
+        "[stale-subscript] recv={:#018x} obj_ptr={:p} idx={:#018x} — \
+         FORWARDED receiver detected; AOT frame chain below:",
+        recv.to_bits(),
+        obj_ptr,
+        idx.to_bits()
+    );
+    let mut fp: usize;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack));
+    }
+    let mut walked = 0;
+    let max_frames = 64;
+    while fp != 0 && walked < max_frames {
+        walked += 1;
+        if fp & 7 != 0 {
+            break;
+        }
+        let saved_fp = unsafe { *(fp as *const usize) };
+        let saved_ret = unsafe { *((fp + 8) as *const usize) };
+        if saved_ret == 0 {
+            break;
+        }
+        // Find the smallest registered code range that contains saved_ret.
+        let vm = unsafe { vm_ref() };
+        let range = vm.and_then(|vm| {
+            vm.engine
+                .code_ranges
+                .iter()
+                .find(|r| saved_ret >= r.start && saved_ret < r.end)
+                .map(|r| (r.start, r.end, r.func_id.0))
+        });
+        if let Some((cr_start, _cr_end, func_id)) = range {
+            let offset = saved_ret.wrapping_sub(cr_start);
+            let sym = unsafe { dladdr_symbol_runtime(cr_start as *const ()) };
+            eprintln!(
+                "  #{walked:02} ret={saved_ret:#x} +{offset} func_id={func_id} sym={}",
+                sym.unwrap_or_else(|| "<unknown>".to_string())
+            );
+            // For the FIRST (topmost) AOT frame — the immediate caller of
+            // wren_subscript_get — also dump that frame's safepoint
+            // live_roots and the actual slot values, so we can see whether
+            // the receiver slot was tracked by the stack map.
+            if walked == 1 {
+                let vm = unsafe { vm_ref() };
+                if let Some(vm) = vm {
+                    if let Some(meta) = vm
+                        .engine
+                        .jit_metadata
+                        .get(func_id as usize)
+                        .and_then(|m| m.as_ref())
+                    {
+                        let sp = meta
+                            .safepoints
+                            .iter()
+                            .find(|sp| sp.code_offset == offset as u32);
+                        if let Some(sp) = sp {
+                            eprintln!(
+                                "    safepoint at +{offset} has {} live root(s):",
+                                sp.live_roots.len()
+                            );
+                            for (i, root) in sp.live_roots.iter().enumerate() {
+                                use crate::codegen::native_meta::RootLocation;
+                                let slot_str = match root.location {
+                                    RootLocation::Spill(off) => {
+                                        let addr =
+                                            (saved_fp as isize + off as isize) as *const u64;
+                                        let bits = unsafe { *addr };
+                                        format!(
+                                            "fp+{} = {:#018x}{}",
+                                            off,
+                                            bits,
+                                            if bits == recv.to_bits() { " *** matches recv ***" } else { "" }
+                                        )
+                                    }
+                                    _ => format!("{:?}", root.location),
+                                };
+                                eprintln!("      [{i}] {slot_str}");
+                            }
+                        } else {
+                            eprintln!("    no safepoint at +{offset} (GAP)");
+                        }
+                    }
+                }
+            }
+        }
+        fp = saved_fp;
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn dump_stale_subscript_frames(_obj_ptr: *const u8, _recv: Value, _idx: Value) {}
+
 /// Subscript get (list[idx] or map[key]).
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
@@ -4605,6 +4733,16 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
     if recv.is_object() {
         let ptr = recv.as_object().unwrap();
         let header = ptr as *const ObjHeader;
+        // Diagnostic: if the receiver is a FORWARDED nursery object, the caller
+        // is holding a stale pointer past a minor GC. Dump the AOT frame chain
+        // (resolved via dladdr) so the responsible call site is identifiable
+        // from a single failing request. Gated on WLIFT_TRACE_STALE_SUBSCRIPT=1.
+        if std::env::var_os("WLIFT_TRACE_STALE_SUBSCRIPT").is_some() {
+            const FORWARDED: u8 = 3;
+            if unsafe { (*header).gc_mark } == FORWARDED {
+                dump_stale_subscript_frames(ptr, recv, idx);
+            }
+        }
         let obj_type = unsafe { (*header).obj_type };
 
         match obj_type {

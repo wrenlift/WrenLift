@@ -3865,25 +3865,23 @@ impl VM {
         // Write back stack map roots directly to native stack spill slots.
         // This ensures GC-forwarded pointers are visible when JIT code resumes.
         //
-        // Validate each slot address against the same user-VA
-        // limit `scan_native_stack_roots` uses — if the walker
-        // produced a slot at an address outside that range, the
-        // safepoint metadata was wrong and writing back would
-        // segfault the GC mid-collection (and we'd lose the rest of
-        // the write-backs that ARE valid).
+        // The only invariants we can rely on:
+        //  - addr != 0 (NULL slot would mean the safepoint metadata was bogus)
+        //  - addr is 8-byte aligned (we're writing a u64)
         //
-        // 47-bit limit on 64-bit hosts matches the canonical x86_64
-        // / aarch64 user-VA split; on 32-bit (wasm32) the upper
-        // bound is just `usize::MAX` since the entire address space
-        // is user-accessible.
-        #[cfg(target_pointer_width = "64")]
-        const USER_VA_LIMIT: usize = 1usize << 47;
-        #[cfg(not(target_pointer_width = "64"))]
-        const USER_VA_LIMIT: usize = usize::MAX;
+        // We can't bound the high half of the address. Linux aarch64
+        // userspace mapped through Docker on Apple Silicon hands out
+        // stacks in the 0xffff_xxxx_xxxx range — bytes that look like
+        // a kernel pointer under the standard 48-bit canonical split,
+        // but are perfectly valid userspace memory in the container's
+        // VA layout. A previous `addr < 1<<47` guard silently dropped
+        // every writeback into those slots, leaving the GC walker's
+        // visit useless and the next AOT load reading the pre-promote
+        // (FORWARDED) pointer.
         for i in 0..native_stack_count {
             let updated = roots[native_stack_start + i];
             let addr = stack_slot_addrs[i] as usize;
-            if addr == 0 || addr & 7 != 0 || addr >= USER_VA_LIMIT {
+            if addr == 0 || addr & 7 != 0 {
                 continue;
             }
             if std::env::var_os("WLIFT_GC_TRACE_WRITEBACK").is_some() {
