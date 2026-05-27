@@ -55,6 +55,58 @@ case-start / pass / fail / summary so editors can render
 live results, and the VS Code spec-runner sidebar's per-row
 ▶ Run button drops the "runs the whole file" caveat.
 
+### Plugin ABI stability
+
+Today's plugin loader statically links the full `wren_lift`
+crate into every `cdylib` (`@hatch:sqlite`, `@hatch:gpu`,
+`@hatch:image`, ...), so each plugin ships its own compiled
+copy of `VM`, `GcImpl`, `Gc`, `ArenaGc`, `NativeContext`,
+plus the field offsets and enum discriminants baked into
+machine code. Any change to `VM`'s layout in a wren_lift
+release (added field, reordered variant, host-gated dep
+bump) causes a silent `EXC_BAD_ACCESS` on the first
+foreign-method call — the plugin reads VM bytes at the wrong
+offsets, `gc_dispatch!` picks the wrong enum arm, and the
+mis-typed payload panics inside the wrong allocator. The
+existing `WLIFT_PLUGIN_ABI_VERSION = 1` constant only fires
+when a maintainer remembers to bump it; private VM fields
+slip past unnoticed. Two-step fix:
+
+1. **Build-time VM-layout fingerprint** (half a day). A
+   `build.rs` emits a `const` derived from
+   `size_of::<VM>() + size_of::<GcImpl>() + size_of::<Gc>()`
+   (and the other plugin-reachable structs); plugins compare
+   their compiled-in fingerprint against the host's at
+   dlopen and abort cleanly with a "rebuild against
+   wren_lift &lt;rev&gt;" message instead of SIGSEGV. Turns the
+   undefined-behaviour failure mode into a refusal we can
+   diagnose. No behaviour change for matching builds.
+2. **Opaque-VM C ABI** (1–2 weeks). Plugins stop
+   `use wren_lift::runtime::vm::VM` entirely and call only
+   `#[no_mangle] extern "C"` functions the host exports
+   from `capi.rs` — `wlift_vm_alloc_string`,
+   `wlift_vm_alloc_list`, `wlift_vm_set_slot`, etc. The
+   plugin's `wren_lift` Cargo dep shrinks to a header-only
+   `wlift_abi` crate that holds `Value` bits + `ObjHeader`
+   layout for plugin-owned objects + the function-pointer
+   table type. No moving VM internals cross the boundary,
+   so VM changes can't reach plugin code at all. The wasm
+   static-link path that currently shares the same
+   `lib.rs` files needs a split crate
+   (`wlift_<name>_core` with Rust + `wlift_<name>_ffi` with
+   the C entry points), same model `@hatch:gpu_web` /
+   `@hatch:window_web` already follow.
+
+#1 lands first as a forcing function — once any unrebuilt
+plugin trips the fingerprint check, #2 stops being optional.
+The Lua / Python / V8 / Node-native model is exactly #2:
+extension authors only see a stable C header, never the
+runtime's Rust (or C++) internals. We've ducked it so far
+because hatch and wren_lift share a monorepo and we always
+rebuild together — but the moment a third party ships a
+plugin, the static-link contract becomes load-bearing for
+everyone, not just hatch's own dylibs.
+
 ## Smaller open items
 
 These don't carry a dedicated treatment but track real gaps.
