@@ -26,7 +26,7 @@ extern "C" fn reload_signal_handler(_sig: libc::c_int) {
     RELOAD_PENDING.store(true, Ordering::Release);
 }
 
-/// Install the SIGUSR1 handler that flips [`RELOAD_PENDING`].
+/// Install the SIGUSR1 handler that flips the module reload-pending flag.
 ///
 /// Idempotent — calling twice rebinds the same handler harmlessly.
 /// Intended to be invoked by the `wlift` binary when a `--watch`
@@ -2244,7 +2244,7 @@ impl VM {
             .collect()
     }
 
-    /// Capture the current fiber's call stack as a Vec<StackFrame> snapshot.
+    /// Capture the current fiber's call stack as a `Vec<StackFrame>` snapshot.
     fn capture_current_trace(&self) -> Vec<StackFrame> {
         if self.fiber.is_null() {
             return Vec::new();
@@ -4135,9 +4135,10 @@ impl VM {
                                         // is the byte offset *after* the
                                         // BL inside the AOT caller; the
                                         // BL itself is at -4.
-                                        let cr = self.engine.code_ranges.iter().find(|r| {
-                                            saved_ret >= r.start && saved_ret < r.end
-                                        });
+                                        let cr =
+                                            self.engine.code_ranges.iter().find(|r| {
+                                                saved_ret >= r.start && saved_ret < r.end
+                                            });
                                         let (fname, base) = match cr {
                                             Some(cr) => {
                                                 let func_id = cr.func_id.0 as usize;
@@ -4150,24 +4151,18 @@ impl VM {
                                                             .resolve(fb.mir().name)
                                                             .to_string()
                                                     })
-                                                    .unwrap_or_else(|| {
-                                                        format!("<func#{func_id}>")
-                                                    });
+                                                    .unwrap_or_else(|| format!("<func#{func_id}>"));
                                                 let dl = unsafe {
                                                     let mut info: libc::Dl_info =
                                                         std::mem::zeroed();
-                                                    if libc::dladdr(
-                                                        cr.start as *const _,
-                                                        &mut info,
-                                                    ) != 0
+                                                    if libc::dladdr(cr.start as *const _, &mut info)
+                                                        != 0
                                                         && !info.dli_sname.is_null()
                                                     {
-                                                        std::ffi::CStr::from_ptr(
-                                                            info.dli_sname,
-                                                        )
-                                                        .to_str()
-                                                        .ok()
-                                                        .map(|s| s.to_string())
+                                                        std::ffi::CStr::from_ptr(info.dli_sname)
+                                                            .to_str()
+                                                            .ok()
+                                                            .map(|s| s.to_string())
                                                     } else {
                                                         None
                                                     }

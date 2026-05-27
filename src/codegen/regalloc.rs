@@ -178,8 +178,8 @@ pub struct TargetRegs {
     /// x86_64: 0 (push rbp is handled outside frame_size).
     pub frame_reserved: u32,
     /// Offset of the first spill slot from the frame pointer.
-    /// AArch64: 16 (spills above saved FP/LR pair at [x29]).
-    /// x86_64: -8 (spills below saved RBP at [rbp]).
+    /// AArch64: 16 (spills above saved FP/LR pair at `x29`).
+    /// x86_64: -8 (spills below saved RBP at `rbp`).
     pub spill_first_offset: i32,
     /// Offset increment per additional spill slot.
     /// AArch64: 8 (positive, growing upward from FP).

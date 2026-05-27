@@ -250,25 +250,24 @@ object = { version = "0.36", default-features = false, features = ["read"] }
 [profile.release]
 strip = "none"
 
-# EXPERIMENTAL: point Cranelift at the darmie/wasmtime fork
-# (branch `fix/cranelift-object-darwin-platform`) so the build
-# picks up:
+# Pin Cranelift to upstream wasmtime `main` so the build picks up:
 #
-#   * upstream `decb45f` ("cranelift: include every SSA value
-#     bound to a variable in stack maps") — fixes earlier-def
-#     drops in re-defined Variables, closes a class of AOT
-#     stack-map gaps; and
-#   * fork commit `cranelift-object: emit PLATFORM_MACOS for
-#     Darwin triples on macOS hosts` — fixes ld64 rejecting
+#   * `decb45f` ("cranelift: include every SSA value bound to a
+#     variable in stack maps") — fixes earlier-def drops in
+#     re-defined Variables, closes a class of AOT stack-map gaps;
+#   * the `cranelift-object: emit PLATFORM_MACOS for Darwin
+#     triples on macOS hosts` patch — fixes ld64 rejecting
 #     PLATFORM_UNKNOWN object files when emitting on macOS.
 #
-# Fork is Cranelift 0.133 vs the pinned 0.130, so AOT codegen
-# absorbs API drift (`MemFlags` → `MemFlagsData` rename). Revert
-# this block + restore the 0.130 pins to fall back to crates.io.
+# Both have been merged upstream; the git pin holds until the next
+# crates.io release ships them. Upstream main is Cranelift 0.133
+# vs the 0.130 we'd otherwise resolve to, so AOT codegen also
+# absorbs the API drift (`MemFlags` → `MemFlagsData` rename).
+# Remove this block to fall back to crates.io once the release lands.
 [patch.crates-io]
-cranelift-codegen = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
-cranelift-frontend = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
-cranelift-module = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
-cranelift-jit = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
-cranelift-native = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
-cranelift-object = { git = "https://github.com/darmie/wasmtime.git", branch = "fix/cranelift-object-darwin-platform" }
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }

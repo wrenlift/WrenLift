@@ -349,7 +349,7 @@ pub enum Instruction {
         /// Valid only for trivial getters of the form `{ _field }`.
         inline_getter_field: Option<u16>,
         /// If true, the callee has no internal method calls — Cranelift
-        /// can emit a pure `call_indirect` to jit_code[func_id] without
+        /// can emit a pure `call_indirect` to `jit_code[func_id]` without
         /// any context setup or FFI round-trip.
         pure_leaf: bool,
         receiver: ValueId,
@@ -395,12 +395,12 @@ pub enum Instruction {
     IsType(ValueId, SymbolId),
 
     // -- Subscript ----------------------------------------------------------
-    /// Subscript get: receiver[args].
+    /// Subscript get: `receiver[args]`.
     SubscriptGet {
         receiver: ValueId,
         args: Vec<ValueId>,
     },
-    /// Subscript set: receiver[args] = value.
+    /// Subscript set: `receiver[args] = value`.
     SubscriptSet {
         receiver: ValueId,
         args: Vec<ValueId>,
@@ -696,7 +696,7 @@ pub struct ClassMir {
 /// MIR for a single method within a class.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MethodMir {
-    /// Wren method signature (e.g. "foo(_)", "bar", "[_]").
+    /// Wren method signature (e.g. `"foo(_)"`, `"bar"`, `"[_]"`).
     pub signature: String,
     pub is_static: bool,
     pub is_constructor: bool,
@@ -757,7 +757,7 @@ pub struct MirFunction {
     pub name: SymbolId,
     /// Number of parameters.
     pub arity: u8,
-    /// Basic blocks (entry block is always blocks[0]).
+    /// Basic blocks (entry block is always `blocks[0]`).
     pub blocks: Vec<BasicBlock>,
     /// String constant table.
     pub strings: Vec<String>,

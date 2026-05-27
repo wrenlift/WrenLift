@@ -72,7 +72,7 @@ unsafe fn string_of(v: Value) -> Option<String> {
     Some(unsafe { (*s).as_str().to_string() })
 }
 
-/// Read a List<Num> or ByteArray into a Vec<u8>.
+/// Read a `List<Num>` or `ByteArray` into a `Vec<u8>`.
 unsafe fn read_byte_buffer(vm: &mut VM, v: Value, label: &str) -> Option<Vec<u8>> {
     if !v.is_object() {
         vm.runtime_error(format!("{}: expected a List<Num> or ByteArray.", label));

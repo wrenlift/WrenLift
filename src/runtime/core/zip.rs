@@ -2,8 +2,8 @@
 //! memory. Paired with @hatch:zip on the Wren side.
 //!
 //! Byte conventions match the rest of the stdlib: inputs are
-//! String (UTF-8) or List<Num in 0..=255>, outputs are always
-//! List<Num>. Archives themselves are handled as byte lists so
+//! String (UTF-8) or `List<Num>` in 0..=255, outputs are always
+//! `List<Num>`. Archives themselves are handled as byte lists so
 //! callers can pair this with `FS.readBytes` / `FS.writeBytes`
 //! (or with an in-memory pipeline) without touching the FS.
 //!

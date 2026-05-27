@@ -158,7 +158,7 @@ impl TierManager {
     /// tier-up is actually valid.
     ///
     /// `threshold` is passed at call-time rather than stored on the
-    /// manager so [`Engine::jit_threshold`] / `opt_threshold` stay
+    /// manager so `Engine::jit_threshold` / `opt_threshold` stay
     /// the single source of truth.
     pub fn should_promote_on_tick(&self, id: FuncId, threshold: u32) -> bool {
         let Some(bead) = self.beads.get(id.0 as usize).and_then(|b| b.as_ref()) else {

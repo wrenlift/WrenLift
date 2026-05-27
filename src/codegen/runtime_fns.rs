@@ -30,7 +30,7 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 /// Flat shadow root storage. All shadow frames share a single contiguous
-/// Vec<Value>. Push/pop is offset arithmetic — zero heap allocation after
+/// `Vec<Value>`. Push/pop is offset arithmetic — zero heap allocation after
 /// the Vec capacity stabilizes (typically after the first few calls).
 #[derive(Default)]
 struct FlatShadowStack {
@@ -951,7 +951,7 @@ fn try_dispatch_callsite_ic(
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct JitContext {
-    /// Pointer to module variable storage (Vec<Value> data pointer).
+    /// Pointer to module variable storage (`Vec<Value>` data pointer).
     pub module_vars: *mut u64,
     /// Number of module variables.
     pub module_var_count: u32,
@@ -1002,7 +1002,7 @@ impl Default for JitContext {
 
 thread_local! {
     /// JIT context — UnsafeCell for zero-copy direct field access.
-    /// Cell<JitContext> copies 48 bytes on every get/set. UnsafeCell gives
+    /// `Cell<JitContext>` copies 48 bytes on every get/set. UnsafeCell gives
     /// direct pointer access with no copying — critical for the hot dispatch path.
     static JIT_CTX: std::cell::UnsafeCell<JitContext> = const { std::cell::UnsafeCell::new(JitContext {
         module_vars: std::ptr::null_mut(),
@@ -2884,8 +2884,8 @@ fn dispatch_method(
     }
 }
 
-/// Call a method with 0 extra args. Codegen: [receiver, method_sym]
-/// On aarch64, wren_call_N uses #[naked] wrappers to capture the caller's
+/// Call a method with 0 extra args. Codegen: `[receiver, method_sym]`
+/// On aarch64, wren_call_N uses `#[naked]` wrappers to capture the caller's
 /// frame pointer (x29) at zero cost to JIT code. The FP is passed as the
 /// LAST argument to the inner function, which pushes it to JIT_FRAME_STACK
 /// for GC stack walking.
@@ -4164,27 +4164,27 @@ fn dispatch_super_call_rooted(
     }
 }
 
-/// Super call with 0 args. Codegen: [method_sym] (no receiver — shouldn't happen in practice)
+/// Super call with 0 args. Codegen: `[method_sym]` (no receiver — shouldn't happen in practice)
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_super_call_0(method: u64) -> u64 {
     let _ = method;
     Value::null().to_bits()
 }
-/// Super call with 1 arg. Codegen: [method_sym, this]
+/// Super call with 1 arg. Codegen: `[method_sym, this]`
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_super_call_1(method: u64, this: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_super_call(recv, sym, &[recv])
 }
-/// Super call with 2 args. Codegen: [method_sym, this, a0]
+/// Super call with 2 args. Codegen: `[method_sym, this, a0]`
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_super_call_2(method: u64, this: u64, a0: u64) -> u64 {
     let recv = Value::from_bits(this);
     let sym = crate::intern::SymbolId::from_raw(method as u32);
     dispatch_super_call(recv, sym, &[recv, Value::from_bits(a0)])
 }
-/// Super call with 3 args. Codegen: [method_sym, this, a0, a1]
+/// Super call with 3 args. Codegen: `[method_sym, this, a0, a1]`
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) -> u64 {
     let recv = Value::from_bits(this);
@@ -4195,7 +4195,7 @@ pub extern "C" fn wren_super_call_3(method: u64, this: u64, a0: u64, a1: u64) ->
         &[recv, Value::from_bits(a0), Value::from_bits(a1)],
     )
 }
-/// Super call with 4 args. Codegen: [method_sym, this, a0, a1, a2]
+/// Super call with 4 args. Codegen: `[method_sym, this, a0, a1, a2]`
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_super_call_4(method: u64, this: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let recv = Value::from_bits(this);
@@ -4696,14 +4696,17 @@ fn dump_stale_subscript_frames(obj_ptr: *const u8, recv: Value, idx: Value) {
                                 use crate::codegen::native_meta::RootLocation;
                                 let slot_str = match root.location {
                                     RootLocation::Spill(off) => {
-                                        let addr =
-                                            (saved_fp as isize + off as isize) as *const u64;
+                                        let addr = (saved_fp as isize + off as isize) as *const u64;
                                         let bits = unsafe { *addr };
                                         format!(
                                             "fp+{} = {:#018x}{}",
                                             off,
                                             bits,
-                                            if bits == recv.to_bits() { " *** matches recv ***" } else { "" }
+                                            if bits == recv.to_bits() {
+                                                " *** matches recv ***"
+                                            } else {
+                                                ""
+                                            }
                                         )
                                     }
                                     _ => format!("{:?}", root.location),
@@ -4724,7 +4727,7 @@ fn dump_stale_subscript_frames(obj_ptr: *const u8, recv: Value, idx: Value) {
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn dump_stale_subscript_frames(_obj_ptr: *const u8, _recv: Value, _idx: Value) {}
 
-/// Subscript get (list[idx] or map[key]).
+/// Subscript get (`list[idx]` or `map[key]`).
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
     let recv = Value::from_bits(receiver);
@@ -4890,7 +4893,7 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
     Value::null().to_bits()
 }
 
-/// Subscript set (list[idx] = val or map[key] = val).
+/// Subscript set (`list[idx] = val` or `map[key] = val`).
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_subscript_set(receiver: u64, index: u64, value: u64) -> u64 {
     let recv = Value::from_bits(receiver);

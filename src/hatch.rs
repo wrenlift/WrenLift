@@ -482,7 +482,7 @@ impl NativeLibEntry {
 
     /// Resolve against an explicit *bundle target* triple rather than
     /// the host. `None` means "host" (current process), and behaves
-    /// like [`resolve`]. `Some("wasm32")` / `Some("wasm32-*")` selects
+    /// like [`Self::resolve`]. `Some("wasm32")` / `Some("wasm32-*")` selects
     /// the wasm-targeted variant — the `wasm` / `wasm32` map keys
     /// are tried first, falling back to `any` / `path` so a single
     /// declared blob can serve native + wasm.

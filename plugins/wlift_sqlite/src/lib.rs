@@ -6,11 +6,11 @@
 //!
 //! Two backends sit behind a thin module-level switch:
 //!
-//!   * Native: [`backend_native`] uses `rusqlite` with bundled
+//!   * Native: `backend_native` uses `rusqlite` with bundled
 //!     libsqlite3. `Connection::open_with_flags`, prepared
 //!     statements, the `Statement::raw_*` family.
 //!
-//!   * Wasm: [`backend_wasm`] uses `sqlite-wasm-rs` — the official
+//!   * Wasm: `backend_wasm` uses `sqlite-wasm-rs` — the official
 //!     SQLite-Wasm C build wrapped as `wasm32-unknown-unknown`
 //!     bindings. Drives `sqlite3_prepare_v2` / `sqlite3_step` /
 //!     `sqlite3_finalize` directly. Memory VFS only (the playground
@@ -427,11 +427,9 @@ pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
         set_return(vm, result);
 
         for row_vals in rows {
-            // Refresh the list pointer from api_stack[0] in case
-            // an earlier iteration's allocator moved it.
-            let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
             let map = context.alloc_map();
-            // alloc_map may have moved `result` — refresh again.
+            // alloc_map may have moved `result` — refresh the list
+            // pointer from api_stack[0] before appending.
             let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
             (*result_ptr).add(map);
             let last_idx = (*result_ptr).len() - 1;

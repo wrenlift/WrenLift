@@ -13,7 +13,7 @@
 //!   Int32Array.new(count)      — zero-init n-element i32 buffer
 //!   Float32Array.new(count)    — zero-init n-element f32 buffer
 //!   Float64Array.new(count)    — zero-init n-element f64 buffer
-//!   Class.fromList(list)       — copy from a List<Num>
+//!   Class.fromList(list)       — copy from a `List<Num>`
 //!   Class.fromString(s)        — (ByteArray only) UTF-8 bytes
 //!
 //!   instance.count             — element count
@@ -22,7 +22,7 @@
 //!   instance[i] = v            — store
 //!   instance.iterate(iter)     — Sequence iteration
 //!   instance.iteratorValue(i)  — Sequence iteration
-//!   instance.toList            — convert to List<Num>
+//!   instance.toList            — convert to `List<Num>`
 //!   instance.toString          — debug repr
 
 use crate::runtime::object::{

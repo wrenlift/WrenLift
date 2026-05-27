@@ -46,8 +46,7 @@ pub mod cl {
     use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     use cranelift_codegen::ir::types;
     use cranelift_codegen::ir::{
-        AbiParam, BlockArg, Function, InstBuilder, MemFlagsData as MemFlags, Signature, Type,
-        Value,
+        AbiParam, BlockArg, Function, InstBuilder, MemFlagsData as MemFlags, Signature, Type, Value,
     };
     use cranelift_codegen::settings::{self, Configurable};
     use cranelift_codegen::Context;
@@ -898,7 +897,7 @@ pub mod cl {
         /// Per-safepoint live-root metadata derived from Cranelift's
         /// user stack maps. Populated for the main function body
         /// (OSR entries are not yet covered). The runtime GC scanner
-        /// in [`crate::runtime::vm::VM::scan_native_stack_roots`]
+        /// in `crate::runtime::vm::VM::scan_native_stack_roots`
         /// keys off the safepoint `code_offset` (return address
         /// minus function start) to find the live boxed slots in the
         /// JIT frame.
@@ -2633,9 +2632,11 @@ pub mod cl {
                 builder.switch_to_block(propagate_block);
                 let return_ty = builder.func.signature.returns[0].value_type;
                 let ret_propagate = if builder.func.dfg.value_type(ret) != return_ty {
-                    builder
-                        .ins()
-                        .bitcast(return_ty, cranelift_codegen::ir::MemFlagsData::new(), ret)
+                    builder.ins().bitcast(
+                        return_ty,
+                        cranelift_codegen::ir::MemFlagsData::new(),
+                        ret,
+                    )
                 } else {
                     ret
                 };

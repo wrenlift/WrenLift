@@ -2157,8 +2157,7 @@ pub unsafe extern "C" fn wlift_aot_invoke_sm_method(
     // either SEGVs or returns garbage — same bug class as the
     // call_closure_jit_or_sync save/restore pair.
     let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
-    let saved_ctx_root_len =
-        crate::codegen::runtime_fns::root_saved_jit_context(saved_ctx);
+    let saved_ctx_root_len = crate::codegen::runtime_fns::root_saved_jit_context(saved_ctx);
     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
         if ctx.vm.is_null() {
             ctx.vm = vm as *mut u8;

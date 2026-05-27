@@ -28,7 +28,7 @@ fn io_bytes_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 }
 
 /// `IoCore.stringToBytes(s)` — return the UTF-8 byte form of a
-/// Wren string as a List<Num>. Wren strings are already UTF-8
+/// Wren string as a `List<Num>`. Wren strings are already UTF-8
 /// internally, so this is a pure copy.
 fn io_string_to_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     if !args[1].is_object() {

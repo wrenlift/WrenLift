@@ -3,7 +3,7 @@
 //! Lives in the `wlift_wasm` crate so it can call into the
 //! `_wbindgen_*` exports the wasm-bindgen runtime ships. Each
 //! foreign method follows the same pattern: mint a handle via
-//! [`runtime::foreign::create_pending_future`-equivalent], kick
+//! `runtime::foreign::create_pending_future`-equivalent, kick
 //! off the JS-side async work, and return the handle wrapped in
 //! a Wren `Future`. JS calls back into the module via the
 //! exports in `lib.rs` (`resolve_future` / `reject_future`) when

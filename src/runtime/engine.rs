@@ -801,7 +801,7 @@ impl ExecutionEngine {
 
     /// Register a MIR function and return its FuncId. The function is
     /// recorded as module-less — only suitable for isolated tests.
-    /// Production paths should use [`register_function_in`] so call
+    /// Production paths should use [`Self::register_function_in`] so call
     /// dispatch can bind frames to the function's defining module.
     pub fn register_function(&mut self, mir: MirFunction) -> FuncId {
         self.register_function_in(mir, None)
@@ -876,7 +876,7 @@ impl ExecutionEngine {
         id
     }
 
-    /// Variant of [`register_aot_function`] that flags `id` as
+    /// Variant of [`Self::register_aot_function`] that flags `id` as
     /// AOT state-machine-backed. Dispatch reads `aot_state_machine[
     /// id]` to route through the poll-fn invocation path
     /// (`(fiber, resume_v) -> result`) instead of
@@ -946,7 +946,7 @@ impl ExecutionEngine {
     /// Install per-function `NativeFrameMetadata` into the slot
     /// the GC stack walker reads. Used by the AOT install path:
     /// AOT functions are registered via `register_aot_function`
-    /// (which pushes a `None` at jit_metadata[func_id]); the
+    /// (which pushes a `None` at `jit_metadata[func_id]`); the
     /// follow-up `register_code_range` call needs the metadata
     /// slot populated for `scan_native_stack_roots` to find the
     /// safepoint live-roots when it walks the fp chain.

@@ -110,7 +110,7 @@ impl Analysis {
     }
 
     /// Inferred type recorded at a `var <name>` declaration's
-    /// span_start. Look up via [`find_var_decl_span`].
+    /// span_start. Look up via `find_var_decl_span`.
     pub fn var_type_at_span(&self, decl_span_start: usize) -> Option<InferredType> {
         let ty = self.type_env.get_var_type(decl_span_start).clone();
         ty.is_known().then_some(ty)
@@ -209,7 +209,7 @@ impl Analysis {
         self.local_var_decl_span(byte, sym)
     }
 
-    /// Same as [`local_var_type`](Self::local_var_type) but takes
+    /// Same as `local_var_type` but takes
     /// the variable name as a string. Looks the symbol up in
     /// this analysis's interner and routes through the AST walk
     /// — used by `identifier_kind_hint` so a `var quad = _quad`

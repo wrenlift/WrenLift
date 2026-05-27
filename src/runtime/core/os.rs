@@ -79,7 +79,7 @@ fn os_env_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
 
 // --- Args -----------------------------------------------------
 
-/// OS.args → List<String> of process argv.
+/// OS.args → `List<String>` of process argv.
 fn os_args(ctx: &mut dyn NativeContext, _args: &[Value]) -> Value {
     let elements: Vec<Value> = std::env::args().map(|a| ctx.alloc_string(a)).collect();
     ctx.alloc_list(elements)

@@ -51,7 +51,7 @@ unsafe fn write_handle(vm: &mut VM, handle: u32) {
     }
 }
 
-/// `Storage.get(scope, key)` — reads `scope`Storage[key]; returns
+/// `Storage.get(scope, key)` — reads `<scope>Storage[key]`; returns
 /// `""` when missing.
 ///
 /// # Safety
@@ -80,7 +80,7 @@ pub unsafe extern "C" fn storage_get(vm: *mut VM) {
     }
 }
 
-/// `Storage.set(scope, key, value)` — writes `scope`Storage[key]
+/// `Storage.set(scope, key, value)` — writes `<scope>Storage[key]`
 /// = value.
 ///
 /// # Safety

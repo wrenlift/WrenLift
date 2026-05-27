@@ -198,7 +198,7 @@ fn validate_header(name: &str, value: &str) -> Result<(), String> {
 }
 
 /// Read the caller's headers map into a flat list of (name,
-/// value) pairs. A single value → one pair. A List<String> →
+/// value) pairs. A single value → one pair. A `List<String>` →
 /// comma-joined into one pair, which is the RFC-7230 §3.2.2
 /// equivalent for everything except `Set-Cookie` (a server
 /// concern, not relevant on request).

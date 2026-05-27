@@ -20,7 +20,7 @@ pub struct MirBuilder<'a> {
     interner: &'a mut Interner,
     resolutions: &'a HashMap<usize, ResolvedName>,
     module_vars: &'a [SymbolId],
-    /// Sema upvalue info: scope_id → Vec<UpvalueInfo> for closures that capture variables.
+    /// Sema upvalue info: scope_id → `Vec<UpvalueInfo>` for closures that capture variables.
     upvalue_map: &'a HashMap<usize, Vec<crate::sema::resolve::UpvalueInfo>>,
     /// Locals that are captured by nested closures, keyed by the
     /// scope_id they belong to. A boxed local lives inside a

@@ -2083,7 +2083,7 @@ pub struct DevirtHint {
     /// a field load.
     pub getter_field: Option<u16>,
     /// If true, the callee has no internal method calls — Cranelift can
-    /// emit a pure `call_indirect` to jit_code[func_id] with no context
+    /// emit a pure `call_indirect` to `jit_code[func_id]` with no context
     /// setup (no current_func_id swap, no depth tracking).
     pub pure_leaf: bool,
 }

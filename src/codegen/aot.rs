@@ -2048,7 +2048,7 @@ pub struct AotImportBinding {
 /// no on-disk source — so the bootstrap calls
 /// `wlift_aot_resolve_runtime_import` once per binding at startup
 /// to look up the value through the runtime VM and write it
-/// into modvars[target_slot].
+/// into `modvars[target_slot]`.
 #[derive(Debug, Clone)]
 pub struct AotRuntimeImport {
     pub target_slot: u32,

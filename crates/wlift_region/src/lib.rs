@@ -153,7 +153,7 @@ impl Region {
     /// caller should fall back to the GC heap.
     ///
     /// # Safety
-    /// Same lifetime contract as [`try_alloc_bytes`]: the returned
+    /// Same lifetime contract as [`Self::try_alloc_bytes`]: the returned
     /// pointer must not outlive the region.
     pub fn try_alloc<T>(&mut self, val: T) -> Option<*mut T> {
         let size = std::mem::size_of::<T>();
@@ -193,7 +193,7 @@ impl Region {
     /// the region; once the region drops, the pointer is invalid.
     ///
     /// Untyped — no destructor runs when the region drops. Use
-    /// [`try_alloc`] for any type whose `Drop` matters (anything
+    /// [`Self::try_alloc`] for any type whose `Drop` matters (anything
     /// owning a `String`, `Vec`, `Box`, etc.).
     ///
     /// # Safety
