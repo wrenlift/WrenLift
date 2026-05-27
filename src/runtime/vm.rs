@@ -4244,6 +4244,15 @@ impl NativeContext for VM {
         Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
     }
 
+    fn intern_string(&mut self, s: String) -> Value {
+        let obj = self.gc.intern_string(s);
+        unsafe {
+            (*obj).header.class = self.string_class;
+        }
+        let v = Value::object(obj as *mut u8);
+        Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })
+    }
+
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value {
         let v = self.new_list(elements);
         Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc(self, v) })

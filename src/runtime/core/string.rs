@@ -404,6 +404,16 @@ fn trim(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     ctx.alloc_string(receiver_str(args).trim().to_string())
 }
 
+// Dedupe through the GC's intern table. Returns either the receiver
+// (if it was already the canonical ObjString for its bytes) or the
+// existing interned copy. Used by JSON / config parsers where map
+// keys repeat heavily — collapses N copies of "name" into one
+// ObjString and one map-key hash entry.
+fn intern(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let s = receiver_str(args).to_string();
+    ctx.intern_string(s)
+}
+
 fn trim_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     ctx.alloc_string(receiver_str(args).trim_start().to_string())
 }
@@ -584,6 +594,7 @@ pub fn bind(vm: &mut VM) {
     vm.primitive(class, "toString", to_string);
     vm.primitive(class, "bytes", bytes);
     vm.primitive(class, "codePoints", code_points);
+    vm.primitive(class, "intern", intern);
     vm.primitive(class, "trim()", trim);
     vm.primitive(class, "trim(_)", trim_chars);
     vm.primitive(class, "trimStart()", trim_start);

@@ -1383,6 +1383,12 @@ pub trait NativeContext {
 
     // -- Allocation --
     fn alloc_string(&mut self, s: String) -> Value;
+    /// Allocate a string through the intern table: if an ObjString with
+    /// the same bytes already exists, returns the existing pointer
+    /// instead of allocating a fresh one. Used by parsers (JSON, etc.)
+    /// where keys repeat heavily; saves both nursery pressure and
+    /// later hashmap-key churn on the consumer side.
+    fn intern_string(&mut self, s: String) -> Value;
     fn alloc_list(&mut self, elements: Vec<Value>) -> Value;
     fn alloc_range(&mut self, from: f64, to: f64, inclusive: bool) -> Value;
     fn alloc_map(&mut self) -> Value;
