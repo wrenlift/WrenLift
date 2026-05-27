@@ -32,7 +32,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use cranelift_codegen::ir::{types, AbiParam, Function, Signature, UserFuncName};
-use cranelift_codegen::isa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, Linkage, Module};
@@ -972,8 +971,6 @@ fn walk_module(
 /// settings (PIC + speed). Shared by both single-source and
 /// path-walking entry points.
 fn make_object_module() -> Result<ObjectModule, AotError> {
-    let triple = target_lexicon::Triple::host();
-
     // ISA settings.
     //
     // `is_pic = true` so the produced object can be linked into a
@@ -1019,9 +1016,24 @@ fn make_object_module() -> Result<ObjectModule, AotError> {
         .map_err(|e| AotError::Isa(e.to_string()))?;
     let flags = settings::Flags::new(flag_builder);
 
-    let isa_builder =
-        isa::lookup(triple.clone()).map_err(|_| AotError::UnsupportedTarget(triple.to_string()))?;
-    let isa = isa_builder
+    // `cranelift_native::builder()` probes the build host's CPU
+    // and enables every feature flag the host supports (AVX2 +
+    // BMI1/2 + SSE4.2 on Skylake-class x86_64, NEON + LSE +
+    // CRC32 on ARMv8.2+ aarch64, etc.). The plain
+    // `isa::lookup(triple)` path used previously gave us only
+    // the base ISA — Cranelift would emit scalar SSE2 code for
+    // x86_64 even when the host had AVX2 sitting unused. Same
+    // codegen would run on a stone-age Sandy Bridge.
+    //
+    // Safe because the AOT artifact only ever runs on the
+    // machine that built it (we ship binaries from build →
+    // identical-arch deploy, not cross-arch). If we ever need
+    // cross-target AOT (e.g. build on aarch64-mac, deploy to
+    // x86_64-linux fly), this needs to flip back to
+    // `isa::lookup` + explicit `set` calls for the deploy
+    // target's feature set.
+    let isa = cranelift_native::builder()
+        .map_err(|e| AotError::Isa(format!("cranelift_native::builder failed: {}", e)))?
         .finish(flags)
         .map_err(|e| AotError::Isa(e.to_string()))?;
 
