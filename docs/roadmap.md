@@ -55,6 +55,67 @@ case-start / pass / fail / summary so editors can render
 live results, and the VS Code spec-runner sidebar's per-row
 ▶ Run button drops the "runs the whole file" caveat.
 
+### Idle-fiber yield should park, not spin
+
+`Fiber.yield()` on a nested fiber (one that has a `caller`, i.e.
+anything driven by `sched.tick` / `f.try()` / `f.call()`) takes
+the stackless `pending_fiber_action::Yield` path: it sets the
+action, returns through the dispatch chain, and the interpreter
+processes the Yield arm via `handle_jit_fiber_action` —
+[runtime_fns.rs:2710](src/codegen/runtime_fns.rs#L2710), which
+just returns the yielded value's bits without actually
+suspending the fiber. AOT-emitted bodies that wrap a yield in a
+`while` loop therefore run the loop at full CPU speed: the
+yield call returns and the next iteration fires immediately,
+millions of times per second, until the wall-clock condition
+breaks the loop.
+
+This was the load-bearing OOM driver on hatch.wrenlift.com.
+`Catalog.refreshLoop` slept between refresh cycles with `while
+(Clock.mono < deadline) Fiber.yield()`. The intended cooperative
+sleep was actually a hot spin at ~1000 Hz × the spin's
+per-iteration dispatch allocation; on Linux glibc the resulting
+allocator churn climbed the process from a clean 36 MB local
+boot RSS to fly.io's 768 MB OOM ceiling in ~40–180 seconds of
+boot work, every restart. The site's mitigation (replace the
+pure-yield with chunked `Clock.sleepMs` + one yield per chunk —
+see [hatch site Catalog.sleepYielding_](https://github.com/wrenlift/hatch/blob/main/site/lib/catalog.wren))
+blocks the thread during each chunk, which papers over the
+runtime gap but pauses every other fiber for the chunk window.
+
+Two ways to fix this in the runtime:
+
+1. **Park nested-fiber yields properly.** Today's `try_krio_yield`
+   short-circuits when the current fiber has a caller —
+   [core/fiber.rs:494–504](src/runtime/core/fiber.rs#L494). The
+   fallback (`set_fiber_action_yield`) propagates a yield
+   *value* but doesn't actually suspend the fiber's execution.
+   The fix is to make the stackless yield path return control
+   to the scheduler at the yield point: switch `vm.fiber` to
+   `(*fiber).caller`, mark the yielding fiber `Suspended`, and
+   resume the caller's frame. The next `f.try()` reinstates
+   the suspended state and continues past the yield. That's
+   what `handle_jit_fiber_action::Call` already does on entry;
+   the symmetric path on Yield is missing.
+
+2. **Scheduler-level idle parking.** When the scheduler's
+   `tick` finds no runnable fiber (all in cooperative-wait
+   states), block on a condvar / kqueue / epoll until the next
+   timer expiry or socket event. The `@hatch:web` scheduler's
+   `Clock.sleepMs(1)` backoff (web.wren:613) is the right
+   shape but only fires when the accept queue is empty —
+   doesn't help when a long-lived background fiber is in a
+   cooperative-sleep loop. Wiring a proper "sleep until X"
+   primitive (e.g. `Fiber.sleepUntil(deadline)`) that
+   registers with the scheduler's idle-block list would let
+   the runtime collapse multiple idle background fibers onto
+   a single OS-level wait.
+
+Either fix alone closes the cold-yield-allocation class; (1)
+is the smaller change but (2) is the more general primitive.
+The site's chunked-sleep workaround can stay until one of
+these lands.
+
 ### Plugin ABI stability
 
 Today's plugin loader statically links the full `wren_lift`
