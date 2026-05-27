@@ -2157,7 +2157,7 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
                 crate::runtime::gc_ringbuf::Ev::MapDrainBegin,
                 [header as u64, map.entries.len() as u64, 0, 0, 0, 0],
             );
-            let entries: Vec<(MapKey, Value)> = map.entries.drain().collect();
+            let entries: Vec<(MapKey, Value)> = map.entries.drain(..).collect();
             for (key, val) in entries {
                 let mut k = key.value();
                 let mut v = val;

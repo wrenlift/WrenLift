@@ -118,6 +118,13 @@ ariadne = "0.5"
 logos = "0.15"
 wasm-encoder = "0.245"
 smallvec = "1"
+# Insertion-ordered hashmap. Used for `ObjMap` so Wren's map
+# iteration matches source / insertion order — same behavior
+# Python 3.7+, JS Map, and Ruby Hash have. Wren's spec doesn't
+# pin iteration order; this is a wlift quality-of-life
+# improvement that costs ~16 bytes per entry (doubly-linked
+# list bookkeeping).
+indexmap = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }

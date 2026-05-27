@@ -66,7 +66,9 @@ fn map_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 fn map_remove(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let map = receiver_map_mut(args);
     let key = MapKey::new(args[1]);
-    match map.entries.remove(&key) {
+    // shift_remove preserves the insertion-ordered iteration of the
+    // remaining keys. See `ObjMap::remove` for rationale.
+    match map.entries.shift_remove(&key) {
         Some(val) => val,
         None => Value::null(),
     }

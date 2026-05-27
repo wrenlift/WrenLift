@@ -741,11 +741,15 @@ impl fmt::Debug for MapKey {
     }
 }
 
-/// A hash map from Value → Value.
+/// A hash map from Value → Value. Iteration order matches
+/// insertion order (via `indexmap`), so `for (k in map.keys)` is
+/// deterministic and matches the source order of map literals —
+/// same behavior Python 3.7+, JS Map, and Ruby Hash have. Wren's
+/// spec doesn't pin iteration order; this is the choice we make.
 #[repr(C)]
 pub struct ObjMap {
     pub header: ObjHeader,
-    pub entries: HashMap<MapKey, Value>,
+    pub entries: indexmap::IndexMap<MapKey, Value>,
 }
 
 impl Default for ObjMap {
@@ -758,7 +762,7 @@ impl ObjMap {
     pub fn new() -> Self {
         Self {
             header: ObjHeader::new(ObjType::Map),
-            entries: HashMap::new(),
+            entries: indexmap::IndexMap::new(),
         }
     }
 
@@ -779,7 +783,11 @@ impl ObjMap {
     }
 
     pub fn remove(&mut self, key: Value) -> Option<Value> {
-        self.entries.remove(&MapKey::new(key))
+        // `shift_remove` preserves insertion order of the remaining
+        // entries. Cost is O(n); fine for typical Wren maps. Use
+        // `swap_remove` if a future hot path needs O(1) removal and
+        // can tolerate order disruption.
+        self.entries.shift_remove(&MapKey::new(key))
     }
 
     pub fn contains(&self, key: Value) -> bool {
