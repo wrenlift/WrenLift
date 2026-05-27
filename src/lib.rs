@@ -97,7 +97,12 @@ mod alloc_trace_impl {
 #[global_allocator]
 static GLOBAL: alloc_trace_impl::Counting = alloc_trace_impl::Counting;
 
-#[cfg(feature = "alloc_trace")]
+#[cfg(all(
+    feature = "alloc_trace",
+    not(target_arch = "wasm32"),
+    not(feature = "jemalloc"),
+    not(feature = "wlift_alloc"),
+))]
 pub fn alloc_trace_snapshot() -> (usize, usize, usize) {
     use std::sync::atomic::Ordering;
     (
