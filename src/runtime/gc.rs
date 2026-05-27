@@ -1255,6 +1255,31 @@ impl Gc {
             self.reset_old_marks();
         }
 
+        // 6. Linux glibc trim. The promote/drop phases just freed
+        //    a batch of nursery objects via libc `free`; without an
+        //    explicit `malloc_trim`, glibc retains the pages in its
+        //    sbrk arena, and RSS grows to the high-water mark.
+        //    Major GC already calls trim at the end of its sweep —
+        //    but the major-GC cadence (~every 8 minors or 30s,
+        //    whichever first) is too slow under bursty allocation
+        //    workloads (the hatch site's `Api.warmAll` warmer hit
+        //    OOM at 30s well before any major fired). Calling
+        //    `malloc_trim` here keeps RSS tracking the working set.
+        //    O(top-of-heap pages); cheap enough to run per minor.
+        //    Guarded on `host` + `not wlift_alloc` + `linux`
+        //    because (a) the symbol only exists in glibc and
+        //    (b) `wlift_alloc`'s `pressure_release` handles its
+        //    own slab walk via `madvise(MADV_FREE)`.
+        #[cfg(all(feature = "host", not(feature = "wlift_alloc"), target_os = "linux"))]
+        {
+            unsafe extern "C" {
+                fn malloc_trim(pad: usize) -> std::ffi::c_int;
+            }
+            unsafe {
+                let _ = malloc_trim(0);
+            }
+        }
+
         self.stats.minor_collections += 1;
         self.minor_since_major += 1;
         self.adjust_threshold();
