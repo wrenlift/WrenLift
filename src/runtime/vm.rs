@@ -2395,6 +2395,34 @@ impl VM {
     /// bytes are freed before the region's pages are unmapped.
     #[cfg(feature = "host")]
     pub fn new_string(&mut self, s: String) -> Value {
+        // Short-string auto-intern. Below the threshold, route the
+        // alloc through the GC's intern table so byte-identical
+        // requests share one `ObjString`. The motivating workload:
+        // JSON parsers, config readers, and templating engines mint
+        // thousands of copies of the same short bytes per request
+        // (object keys, enum-shaped values like "method" / "class",
+        // brace + comma delimiters from a `split` pass, etc.) — each
+        // distinct content shows up once in the intern table and
+        // every later request hits an existing pointer. The hash +
+        // probe cost is well under the saved `String` + `ObjString`
+        // alloc pair, and the intern table's GC sweep keeps unused
+        // entries from accumulating forever.
+        //
+        // Threshold is conservative on purpose: 32 bytes covers the
+        // vast majority of map keys + small enum strings while
+        // staying short enough that the hash pays for itself.
+        // Strings produced by the fiber-arena fast path bypass
+        // interning — those are tied to a specific fiber's region
+        // and must not be deduped across fiber boundaries.
+        //
+        // Layout-stable: this change only touches `new_string`'s
+        // body, never the `VM` struct. Statically-linked plugins
+        // (`@hatch:sqlite` and friends) keep working without a
+        // rebuild — their own copies of `new_string` continue
+        // using `alloc_string` directly until they're recompiled.
+        // See `docs/roadmap.md` "Plugin ABI stability" for the
+        // path to lift that constraint.
+        const INTERN_THRESHOLD: usize = 32;
         if self.fiber_arena_active && !self.fiber.is_null() {
             // Safety: `self.fiber` is the VM-owned currently active
             // fiber pointer. While we hold `&mut self`, no other
@@ -2413,7 +2441,11 @@ impl VM {
                 // `s` was cloned above so it's still usable.
             }
         }
-        let obj = self.gc.alloc_string(s);
+        let obj = if s.len() <= INTERN_THRESHOLD {
+            self.gc.intern_string(s)
+        } else {
+            self.gc.alloc_string(s)
+        };
         unsafe {
             (*obj).header.class = self.string_class;
         }
@@ -2426,7 +2458,13 @@ impl VM {
     /// dead `wlift_region` import entirely.
     #[cfg(not(feature = "host"))]
     pub fn new_string(&mut self, s: String) -> Value {
-        let obj = self.gc.alloc_string(s);
+        // Mirror the host arm — see comment above for the auto-intern rationale.
+        const INTERN_THRESHOLD: usize = 32;
+        let obj = if s.len() <= INTERN_THRESHOLD {
+            self.gc.intern_string(s)
+        } else {
+            self.gc.alloc_string(s)
+        };
         unsafe {
             (*obj).header.class = self.string_class;
         }
