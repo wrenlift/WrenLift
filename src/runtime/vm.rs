@@ -2499,6 +2499,12 @@ impl VM {
 
     /// No-op on wasm: no fiber arenas, no Value ever has
     /// `FLAG_ARENA_ALLOCATED` set, so the barrier is unreachable.
+    ///
+    /// # Safety
+    /// Signature mirrors the `host` variant so call sites compile
+    /// across both feature configurations. This body never reads
+    /// through `val` and so imposes no additional invariants — it
+    /// returns `val` unchanged.
     #[cfg(not(feature = "host"))]
     pub unsafe fn escape_to_gc_if_arena(&mut self, val: Value) -> Value {
         val

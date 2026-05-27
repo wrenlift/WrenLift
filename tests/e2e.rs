@@ -2692,13 +2692,26 @@ fn e2e_jit_mandelbrot() {
 
 #[test]
 fn e2e_stack_overflow() {
-    let config = VMConfig {
-        max_call_depth: 64,
-        ..Default::default()
-    };
-    let mut vm = VM::new(config);
-    vm.output_buffer = Some(String::new());
-    let source = r#"
+    // Run on a dedicated thread with an explicit 8 MiB stack. The
+    // cargo-test runner's default thread stack varies by platform
+    // (macOS 8 MiB, Linux 2 MiB) — a runaway recursion that the
+    // VM's `max_call_depth` should catch can otherwise blow the
+    // native stack first on Linux before the depth check fires,
+    // turning a clean RuntimeError into a SIGSEGV that kills the
+    // whole test binary. The test is asserting that the VM detects
+    // unbounded recursion; the host thread's stack budget is
+    // incidental, so pin it.
+    let handle = std::thread::Builder::new()
+        .name("e2e_stack_overflow".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let config = VMConfig {
+                max_call_depth: 64,
+                ..Default::default()
+            };
+            let mut vm = VM::new(config);
+            vm.output_buffer = Some(String::new());
+            let source = r#"
 class Boom {
     static go(n) {
         Boom.go(n + 1)
@@ -2706,17 +2719,21 @@ class Boom {
 }
 Boom.go(0)
 "#;
-    let result = vm.interpret("main", source);
-    // Should fail with a runtime error, not panic
-    assert!(
-        result != InterpretResult::Success,
-        "infinite recursion should not succeed"
-    );
-    let output = vm.take_output();
-    eprintln!(
-        "  [stack overflow detected: result={:?}, output={:?}]",
-        result, output
-    );
+            let result = vm.interpret("main", source);
+            assert!(
+                result != InterpretResult::Success,
+                "infinite recursion should not succeed"
+            );
+            let output = vm.take_output();
+            eprintln!(
+                "  [stack overflow detected: result={:?}, output={:?}]",
+                result, output
+            );
+        })
+        .expect("spawn e2e_stack_overflow worker");
+    handle
+        .join()
+        .expect("e2e_stack_overflow worker panicked or aborted");
 }
 
 // ---------------------------------------------------------------------------
