@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Docs · Wrenlift</title>
+<meta name="description" content="Install Wrenlift, ship binaries to Linux / macOS / Windows / WebAssembly, and reference every built-in class the runtime adds on top of stock Wren." />
+<link rel="canonical" href="https://wrenlift.com/docs/" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Docs · Wrenlift" />
+<meta property="og:description" content="Install Wrenlift, ship binaries to Linux / macOS / Windows / WebAssembly, and reference every built-in class the runtime adds." />
+<meta property="og:url" content="https://wrenlift.com/docs/" />
+<meta property="og:image" content="https://wrenlift.com/assets/og-image.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Docs · Wrenlift" />
+<meta name="twitter:description" content="Install · platforms · built-in classes." />
+
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC;
+    --cream-2: #F5E8C3;
+    --cream-3: #EFDDA8;
+    --ink: #3A2A18;
+    --ink-2: #5A4225;
+    --ink-3: #7B5E36;
+    --butter: #F4C24A;
+    --butter-deep: #E8A92A;
+    --toast: #D97A2B;
+    --toast-deep: #B45F1A;
+    --ember: #E04E1F;
+    --sage: #8FAE6A;
+    --sage-deep: #6B8C48;
+    --sky: #B8D4E3;
+    --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body);
+    color: var(--ink);
+    background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<!-- DOCS TOPBAR (shared across every doc page) -->
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/">
+      <img src="/assets/wrenlift-icon.svg" alt="" />
+      Wrenlift
+    </a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <!-- SHARED SIDEBAR (copy verbatim into every doc page, then flip
+       the one `class="active"` to whichever entry the page is) -->
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <span class="crumb-current">Docs</span>
+    </nav>
+
+    <h1 class="pkg-title">Wrenlift documentation</h1>
+    <p class="pkg-lede">
+      Install the runtime, ship binaries to every supported platform,
+      and look up the built-in classes Wrenlift adds on top of stock
+      Wren. Standard-library packages live on
+      <a href="https://hatch.wrenlift.com/packages">hatch.wrenlift.com</a>.
+    </p>
+
+    <div class="pkg-readme">
+      <h2>Where to start</h2>
+      <div class="docs-card-grid">
+        <a class="docs-card" href="/docs/install.html">
+          <h3>Install →</h3>
+          <p>Grab a prebuilt binary, or build from source with cargo. Two-minute setup.</p>
+        </a>
+        <a class="docs-card" href="/docs/quickstart.html">
+          <h3>Quick start →</h3>
+          <p>Hello world, common CLI flags, the AOT story in one page.</p>
+        </a>
+      </div>
+
+      <h2>Ship to a platform</h2>
+      <div class="docs-card-grid">
+        <a class="docs-card" href="/docs/platform/linux.html">
+          <h3>Linux</h3>
+          <p>Static binary, distro packaging notes, AOT cross-compile.</p>
+        </a>
+        <a class="docs-card" href="/docs/platform/macos.html">
+          <h3>macOS</h3>
+          <p>Install path, Apple Silicon vs Intel, code-signing AOT binaries.</p>
+        </a>
+        <a class="docs-card" href="/docs/platform/windows.html">
+          <h3>Windows</h3>
+          <p>x86_64 build, MSVC runtime, <code>wlift --aot</code> to <code>.exe</code>.</p>
+        </a>
+        <a class="docs-card" href="/docs/platform/wasm.html">
+          <h3>WebAssembly</h3>
+          <p>Embed the runtime in a webpage. The <code>wlift.js</code> harness API.</p>
+        </a>
+        <a class="docs-card" href="/docs/platform/embedding.html">
+          <h3>Embed in Rust</h3>
+          <p>Use <code>wren_lift</code> as a Rust crate, drive the VM from native code.</p>
+        </a>
+      </div>
+
+      <h2>Built-in reference</h2>
+      <p>
+        Wrenlift extends stock Wren with a small set of classes for
+        async, typed buffers, SIMD, and foreign-function calls. The
+        rest of the standard library lives in
+        <a href="https://hatch.wrenlift.com/packages">Hatch packages</a>
+        — fetched on first use, versioned, and documented separately.
+      </p>
+      <div class="docs-card-grid">
+        <a class="docs-card" href="/docs/ref/system.html">
+          <h3><code>System</code></h3>
+          <p>Wrenlift extras: <code>System.gc()</code>, clocks, profiler hooks.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/fiber.html">
+          <h3><code>Fiber</code></h3>
+          <p>Suspension, <code>.try</code>, async-bridge handoff.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/future.html">
+          <h3><code>Future</code></h3>
+          <p>Browser-async wrapper that bridges Promises and fibers.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/typed-arrays.html">
+          <h3>Typed arrays</h3>
+          <p><code>Float32Array</code>, <code>Int32Array</code>, <code>Uint8Array</code>, and friends.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/simd.html">
+          <h3>SIMD</h3>
+          <p><code>Simd4f</code> / <code>Simd4i</code> — 4-lane arithmetic, comparisons, bitmask.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/foreign.html">
+          <h3>Foreign classes</h3>
+          <p><code>foreign class</code> declarations, <code>#!native</code> attributes, plugin shape.</p>
+        </a>
+        <a class="docs-card" href="/docs/ref/string.html">
+          <h3><code>String</code></h3>
+          <p>Bytes, code points, anything beyond the stock Wren surface.</p>
+        </a>
+      </div>
+    </div>
+  </main>
+
+  <!-- TOC RAIL — empty stub on the landing -->
+  <aside class="docs-toc"></aside>
+
+</div>
+
+</body>
+</html>
