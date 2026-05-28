@@ -4,15 +4,67 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <meta name="theme-color" content="#FBF3DC" />
-<title>SIMD · Wrenlift docs</title>
-<meta name="description" content="Simd4f / Simd4i — 4-lane SIMD vectors. Lane-wise arithmetic, comparisons, bitmask, store/load through typed arrays." />
+<title>SIMD — Simd4f and Simd4i 4-lane vectors in Wrenlift</title>
 <link rel="canonical" href="https://wrenlift.com/docs/ref/simd.html" />
 <link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
 <link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
-<meta property="og:type" content="article" />
-<meta property="og:title" content="SIMD · Wrenlift docs" />
-<meta property="og:description" content="Simd4f / Simd4i — 4-lane SIMD vectors. Lane-wise arithmetic, comparisons, bitmask, store/load through typed arrays." />
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<!-- wrenlift-seo:start -->
+<meta name="description" content="Wrenlift's Simd4f and Simd4i — 4-lane SIMD vectors. Arithmetic, comparisons, lane access, mask/bitmask/select, load/store via typed arrays, wasm SIMD when available." />
+<meta name="keywords" content="Wrenlift SIMD, Simd4f, Simd4i, wasm SIMD128, bitmask, allTrue, select, lane operations, Wren SIMD" />
+<meta name="robots" content="index, follow" />
+<meta name="author" content="Wrenlift" />
+
+<!-- Open Graph -->
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="Wrenlift" />
+<meta property="og:title" content="SIMD — Simd4f and Simd4i 4-lane vectors in Wrenlift" />
+<meta property="og:description" content="Wrenlift's Simd4f and Simd4i — 4-lane SIMD vectors. Arithmetic, comparisons, lane access, mask/bitmask/select, load/store via typed arrays, wasm SIMD when available." />
+<meta property="og:url" content="https://wrenlift.com/docs/ref/simd.html" />
+<meta property="og:image" content="https://wrenlift.com/assets/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="723" />
+<meta property="og:image:alt" content="Wrenlift — a fast standalone runtime for the Wren programming language" />
+
+<!-- Twitter card -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="SIMD — Simd4f and Simd4i 4-lane vectors in Wrenlift" />
+<meta name="twitter:description" content="Wrenlift's Simd4f and Simd4i — 4-lane SIMD vectors. Arithmetic, comparisons, lane access, mask/bitmask/select, load/store via typed arrays, wasm SIMD when available." />
+<meta name="twitter:image" content="https://wrenlift.com/assets/og-image.png" />
+
+<!-- Structured data — TechArticle for docs pages, WebSite for landing -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "SIMD",
+  "name": "SIMD",
+  "url": "https://wrenlift.com/docs/ref/simd.html",
+  "mainEntityOfPage": "https://wrenlift.com/docs/ref/simd.html",
+  "image": "https://wrenlift.com/assets/og-image.png",
+  "datePublished": "2026-05-29",
+  "dateModified": "2026-05-29",
+  "articleSection": "Reference",
+  "keywords": "Wrenlift SIMD, Simd4f, Simd4i, wasm SIMD128, bitmask, allTrue, select, lane operations, Wren SIMD",
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "@id": "https://wrenlift.com/#website",
+    "name": "Wrenlift",
+    "url": "https://wrenlift.com/"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "Wrenlift",
+    "url": "https://wrenlift.com/",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://wrenlift.com/assets/wrenlift-icon.svg"
+    }
+  }
+}
+</script>
+<!-- wrenlift-seo:end -->
 <link rel="stylesheet" href="../_assets/docs.css" />
 <style>
   :root {

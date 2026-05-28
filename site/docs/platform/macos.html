@@ -4,15 +4,67 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <meta name="theme-color" content="#FBF3DC" />
-<title>macOS · Wrenlift docs</title>
-<meta name="description" content="Install Wrenlift on macOS, ship to both Apple Silicon and Intel, sign AOT binaries for distribution." />
+<title>Wrenlift on macOS — Apple Silicon, AOT, Gatekeeper signing</title>
 <link rel="canonical" href="https://wrenlift.com/docs/platform/macos.html" />
 <link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
 <link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
-<meta property="og:type" content="article" />
-<meta property="og:title" content="macOS · Wrenlift docs" />
-<meta property="og:description" content="Install Wrenlift on macOS, ship to both Apple Silicon and Intel, sign AOT binaries for distribution." />
 <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<!-- wrenlift-seo:start -->
+<meta name="description" content="Install Wrenlift on macOS arm64 and Intel, build AOT Mach-O binaries, code-sign and notarize for Gatekeeper, and ship universal binaries through lipo." />
+<meta name="keywords" content="Wrenlift macOS, Apple Silicon, arm64, AOT Mach-O, codesign, notarize, Gatekeeper, lipo universal binary" />
+<meta name="robots" content="index, follow" />
+<meta name="author" content="Wrenlift" />
+
+<!-- Open Graph -->
+<meta property="og:type" content="article" />
+<meta property="og:site_name" content="Wrenlift" />
+<meta property="og:title" content="Wrenlift on macOS — Apple Silicon, AOT, Gatekeeper signing" />
+<meta property="og:description" content="Install Wrenlift on macOS arm64 and Intel, build AOT Mach-O binaries, code-sign and notarize for Gatekeeper, and ship universal binaries through lipo." />
+<meta property="og:url" content="https://wrenlift.com/docs/platform/macos.html" />
+<meta property="og:image" content="https://wrenlift.com/assets/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="723" />
+<meta property="og:image:alt" content="Wrenlift — a fast standalone runtime for the Wren programming language" />
+
+<!-- Twitter card -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Wrenlift on macOS — Apple Silicon, AOT, Gatekeeper signing" />
+<meta name="twitter:description" content="Install Wrenlift on macOS arm64 and Intel, build AOT Mach-O binaries, code-sign and notarize for Gatekeeper, and ship universal binaries through lipo." />
+<meta name="twitter:image" content="https://wrenlift.com/assets/og-image.png" />
+
+<!-- Structured data — TechArticle for docs pages, WebSite for landing -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "Wrenlift on macOS",
+  "name": "Wrenlift on macOS",
+  "url": "https://wrenlift.com/docs/platform/macos.html",
+  "mainEntityOfPage": "https://wrenlift.com/docs/platform/macos.html",
+  "image": "https://wrenlift.com/assets/og-image.png",
+  "datePublished": "2026-05-29",
+  "dateModified": "2026-05-29",
+  "articleSection": "Platform guides",
+  "keywords": "Wrenlift macOS, Apple Silicon, arm64, AOT Mach-O, codesign, notarize, Gatekeeper, lipo universal binary",
+  "inLanguage": "en",
+  "isPartOf": {
+    "@type": "WebSite",
+    "@id": "https://wrenlift.com/#website",
+    "name": "Wrenlift",
+    "url": "https://wrenlift.com/"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "Wrenlift",
+    "url": "https://wrenlift.com/",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://wrenlift.com/assets/wrenlift-icon.svg"
+    }
+  }
+}
+</script>
+<!-- wrenlift-seo:end -->
 <link rel="stylesheet" href="../_assets/docs.css" />
 <style>
   :root {
