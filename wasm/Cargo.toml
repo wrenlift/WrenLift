@@ -33,9 +33,13 @@ toml = "0.8"
 # on `wasm32-*` targets. Adding a plugin here is the wasm
 # equivalent of dropping `lib<crate>.so` into a host package's
 # `libs/` directory.
-wlift_image   = { path = "../plugins/wlift_image",   default-features = false }
-wlift_physics = { path = "../plugins/wlift_physics", default-features = false }
-wlift_sqlite  = { path = "../plugins/wlift_sqlite",  default-features = false }
+#
+# Plugins now depend on the `wlift_abi` header-only crate, so they
+# have no default features to opt out of — the `host` feature flag
+# that used to gate the `wren_lift` Rust internals is gone.
+wlift_image   = { path = "../plugins/wlift_image" }
+wlift_physics = { path = "../plugins/wlift_physics" }
+wlift_sqlite  = { path = "../plugins/wlift_sqlite" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Browser-side panic visibility: any unhandled panic surfaces as a
