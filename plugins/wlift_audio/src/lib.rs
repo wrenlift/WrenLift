@@ -416,7 +416,7 @@ pub unsafe extern "C" fn wlift_audio_play(vm: *mut WrenVm) {
     };
     let options = slot(vm, 2);
     let volume = map_get(options, "volume")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as f32)
         .unwrap_or(1.0);
     let looping = map_get(options, "loop")

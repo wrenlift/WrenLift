@@ -23,6 +23,7 @@
 //! older plugin bundles with a clear error.
 
 #![no_std]
+#![allow(clippy::missing_safety_doc)]
 
 // -- ABI version ------------------------------------------------------------
 

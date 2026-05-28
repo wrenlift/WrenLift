@@ -214,7 +214,11 @@ pub extern "C" fn wlift_aot_new_vm() -> *mut WrenVM {
     // Diagnostic: optional periodic alloc dump (see `alloc_trace`
     // feature in lib.rs). Spawned once per AOT process — the
     // bootstrap calls us before any module init.
-    #[cfg(feature = "alloc_trace")]
+    #[cfg(all(
+        feature = "alloc_trace",
+        not(feature = "jemalloc"),
+        not(feature = "wlift_alloc"),
+    ))]
     {
         static SPAWNED: std::sync::Once = std::sync::Once::new();
         SPAWNED.call_once(|| {

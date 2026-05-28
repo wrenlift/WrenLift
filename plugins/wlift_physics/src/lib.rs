@@ -178,39 +178,39 @@ mod d2 {
     }
 
     pub unsafe fn collider_from_desc(desc: Value) -> Option<Collider> {
-        let kind = map_get(desc, "kind").and_then(|v| string_of(v))?;
+        let kind = map_get(desc, "kind").and_then(string_of)?;
         let mut builder = match kind.as_str() {
             "ball" => {
                 let r = map_get(desc, "radius")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 ColliderBuilder::ball(r)
             }
             "box" => {
                 let hw = map_get(desc, "halfWidth")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 let hh = map_get(desc, "halfHeight")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 ColliderBuilder::cuboid(hw, hh)
             }
             "capsule" => {
                 let hh = map_get(desc, "halfHeight")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 let r = map_get(desc, "radius")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.25) as f32;
                 ColliderBuilder::capsule_y(hh, r)
             }
             _ => return None,
         };
         let restitution = map_get(desc, "restitution")
-            .and_then(|v| v.as_num())
+            .and_then(Value::as_num)
             .unwrap_or(0.0) as f32;
         let friction = map_get(desc, "friction")
-            .and_then(|v| v.as_num())
+            .and_then(Value::as_num)
             .unwrap_or(0.5) as f32;
         builder = builder.restitution(restitution).friction(friction);
         Some(builder.build())
@@ -285,42 +285,42 @@ mod d3 {
     }
 
     pub unsafe fn collider_from_desc(desc: Value) -> Option<Collider> {
-        let kind = map_get(desc, "kind").and_then(|v| string_of(v))?;
+        let kind = map_get(desc, "kind").and_then(string_of)?;
         let mut builder = match kind.as_str() {
             "ball" => {
                 let r = map_get(desc, "radius")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 ColliderBuilder::ball(r)
             }
             "box" => {
                 let hx = map_get(desc, "halfX")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 let hy = map_get(desc, "halfY")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 let hz = map_get(desc, "halfZ")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 ColliderBuilder::cuboid(hx, hy, hz)
             }
             "capsule" => {
                 let hh = map_get(desc, "halfHeight")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.5) as f32;
                 let r = map_get(desc, "radius")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.25) as f32;
                 ColliderBuilder::capsule_y(hh, r)
             }
             _ => return None,
         };
         let restitution = map_get(desc, "restitution")
-            .and_then(|v| v.as_num())
+            .and_then(Value::as_num)
             .unwrap_or(0.0) as f32;
         let friction = map_get(desc, "friction")
-            .and_then(|v| v.as_num())
+            .and_then(Value::as_num)
             .unwrap_or(0.5) as f32;
         builder = builder.restitution(restitution).friction(friction);
         Some(builder.build())
@@ -335,7 +335,7 @@ mod d3 {
 pub unsafe extern "C" fn wlift_physics_world2d_create(vm: *mut WrenVm) {
     let desc = slot(vm, 1);
     let (gx, gy) = map_get(desc, "gravity")
-        .and_then(|v| read_2d(v))
+        .and_then(read_2d)
         .unwrap_or((0.0, -9.81));
     let world = d2::World::new(gx, gy);
     let id = next_id();
@@ -388,12 +388,12 @@ unsafe fn spawn_2d(vm: *mut WrenVm, body_kind: &str) {
     };
     let desc = slot(vm, 2);
     let (px, py) = map_get(desc, "position")
-        .and_then(|v| read_2d(v))
+        .and_then(read_2d)
         .unwrap_or((0.0, 0.0));
     let (vx, vy) = map_get(desc, "linearVelocity")
-        .and_then(|v| read_2d(v))
+        .and_then(read_2d)
         .unwrap_or((0.0, 0.0));
-    let mass = map_get(desc, "mass").and_then(|v| v.as_num());
+    let mass = map_get(desc, "mass").and_then(Value::as_num);
 
     let mut body_builder = match body_kind {
         "static" => RigidBodyBuilder::fixed(),
@@ -613,7 +613,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_apply_force(vm: *mut WrenVm) {
 pub unsafe extern "C" fn wlift_physics_world3d_create(vm: *mut WrenVm) {
     let desc = slot(vm, 1);
     let (gx, gy, gz) = map_get(desc, "gravity")
-        .and_then(|v| read_3d(v))
+        .and_then(read_3d)
         .unwrap_or((0.0, -9.81, 0.0));
     let world = d3::World::new(gx, gy, gz);
     let id = next_id();
@@ -653,12 +653,12 @@ unsafe fn spawn_3d(vm: *mut WrenVm, body_kind: &str) {
     };
     let desc = slot(vm, 2);
     let (px, py, pz) = map_get(desc, "position")
-        .and_then(|v| read_3d(v))
+        .and_then(read_3d)
         .unwrap_or((0.0, 0.0, 0.0));
     let (vx, vy, vz) = map_get(desc, "linearVelocity")
-        .and_then(|v| read_3d(v))
+        .and_then(read_3d)
         .unwrap_or((0.0, 0.0, 0.0));
-    let mass = map_get(desc, "mass").and_then(|v| v.as_num());
+    let mass = map_get(desc, "mass").and_then(Value::as_num);
 
     let mut body_builder = match body_kind {
         "static" => RigidBodyBuilder::fixed(),

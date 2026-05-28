@@ -567,7 +567,7 @@ unsafe fn buffer_usage_from_list(vm: *mut WrenVm, v: Value) -> Option<wgpu::Buff
 // ---------------------------------------------------------------------------
 
 fn backends_from_descriptor(desc: Value) -> wgpu::Backends {
-    let s = match map_get(desc, "backends").and_then(|v| string_of(v)) {
+    let s = match map_get(desc, "backends").and_then(string_of) {
         Some(s) => s,
         None => return wgpu::Backends::PRIMARY,
     };
@@ -606,12 +606,12 @@ pub unsafe extern "C" fn wlift_gpu_request_device(vm: *mut WrenVm) {
     let desc = slot(vm, 1);
     let backends = backends_from_descriptor(desc);
 
-    let power_pref = match map_get(desc, "powerPreference").and_then(|v| string_of(v)) {
+    let power_pref = match map_get(desc, "powerPreference").and_then(string_of) {
         Some(s) if s == "low-power" => wgpu::PowerPreference::LowPower,
         Some(s) if s == "high-performance" => wgpu::PowerPreference::HighPerformance,
         _ => wgpu::PowerPreference::default(),
     };
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
@@ -757,7 +757,7 @@ pub unsafe extern "C" fn wlift_gpu_buffer_create(vm: *mut WrenVm) {
     };
     let desc = slot(vm, 2);
 
-    let size = match map_get(desc, "size").and_then(|v| v.as_num()) {
+    let size = match map_get(desc, "size").and_then(Value::as_num) {
         Some(n) if n.is_finite() && n > 0.0 && n.fract() == 0.0 => n as u64,
         _ => {
             runtime_error(
@@ -792,7 +792,7 @@ pub unsafe extern "C" fn wlift_gpu_buffer_create(vm: *mut WrenVm) {
         }
     };
 
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
 
     let buffer = {
         let reg = devices().lock().unwrap();
@@ -1233,7 +1233,7 @@ pub unsafe extern "C" fn wlift_gpu_shader_create(vm: *mut WrenVm) {
         None => return,
     };
     let desc = slot(vm, 2);
-    let code = match map_get(desc, "code").and_then(|v| string_of(v)) {
+    let code = match map_get(desc, "code").and_then(string_of) {
         Some(c) => c,
         None => {
             runtime_error(
@@ -1243,7 +1243,7 @@ pub unsafe extern "C" fn wlift_gpu_shader_create(vm: *mut WrenVm) {
             return;
         }
     };
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
 
     let module = {
         let reg = devices().lock().unwrap();
@@ -1294,14 +1294,14 @@ pub unsafe extern "C" fn wlift_gpu_texture_create(vm: *mut WrenVm) {
     };
     let desc = slot(vm, 2);
 
-    let width = match map_get(desc, "width").and_then(|v| v.as_num()) {
+    let width = match map_get(desc, "width").and_then(Value::as_num) {
         Some(n) if n.is_finite() && n > 0.0 && n.fract() == 0.0 => n as u32,
         _ => {
             runtime_error(vm, "Texture.create: `width` must be a positive integer.");
             return;
         }
     };
-    let height = match map_get(desc, "height").and_then(|v| v.as_num()) {
+    let height = match map_get(desc, "height").and_then(Value::as_num) {
         Some(n) if n.is_finite() && n > 0.0 && n.fract() == 0.0 => n as u32,
         _ => {
             runtime_error(vm, "Texture.create: `height` must be a positive integer.");
@@ -1309,10 +1309,10 @@ pub unsafe extern "C" fn wlift_gpu_texture_create(vm: *mut WrenVm) {
         }
     };
     let depth = map_get(desc, "depth")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(1);
-    let format = match map_get(desc, "format").and_then(|v| string_of(v)) {
+    let format = match map_get(desc, "format").and_then(string_of) {
         Some(s) => match texture_format_from_str(&s) {
             Some(f) => f,
             None => {
@@ -1341,9 +1341,9 @@ pub unsafe extern "C" fn wlift_gpu_texture_create(vm: *mut WrenVm) {
             return;
         }
     };
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
     let sample_count = map_get(desc, "sampleCount")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(1);
 
@@ -1442,30 +1442,30 @@ pub unsafe extern "C" fn wlift_gpu_sampler_create(vm: *mut WrenVm) {
     let desc = slot(vm, 2);
 
     let mag = map_get(desc, "magFilter")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .map(|s| filter_from_str(&s))
         .unwrap_or(wgpu::FilterMode::Linear);
     let min = map_get(desc, "minFilter")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .map(|s| filter_from_str(&s))
         .unwrap_or(wgpu::FilterMode::Linear);
     let mip = map_get(desc, "mipmapFilter")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .map(|s| filter_from_str(&s))
         .unwrap_or(wgpu::FilterMode::Nearest);
     let au = map_get(desc, "addressModeU")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .map(|s| address_mode_from_str(&s))
         .unwrap_or(wgpu::AddressMode::ClampToEdge);
     let av = map_get(desc, "addressModeV")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .map(|s| address_mode_from_str(&s))
         .unwrap_or(wgpu::AddressMode::ClampToEdge);
     let aw = map_get(desc, "addressModeW")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .map(|s| address_mode_from_str(&s))
         .unwrap_or(wgpu::AddressMode::ClampToEdge);
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
 
     let sampler = {
         let reg = devices().lock().unwrap();
@@ -1553,7 +1553,7 @@ unsafe fn shader_stages_from_list(vm: *mut WrenVm, v: Value) -> Option<wgpu::Sha
 }
 
 unsafe fn binding_type_from_entry(vm: *mut WrenVm, entry: Value) -> Option<wgpu::BindingType> {
-    let kind = match map_get(entry, "kind").and_then(|v| string_of(v)) {
+    let kind = match map_get(entry, "kind").and_then(string_of) {
         Some(s) => s,
         None => {
             runtime_error(vm, "BindGroupLayout entry: missing `kind` string.");
@@ -1578,7 +1578,7 @@ unsafe fn binding_type_from_entry(vm: *mut WrenVm, entry: Value) -> Option<wgpu:
         },
         "sampler" => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         "texture" => {
-            let sample_type = match map_get(entry, "sampleType").and_then(|v| string_of(v)) {
+            let sample_type = match map_get(entry, "sampleType").and_then(string_of) {
                 Some(s) if s == "depth" => wgpu::TextureSampleType::Depth,
                 Some(s) if s == "uint" => wgpu::TextureSampleType::Uint,
                 Some(s) if s == "sint" => wgpu::TextureSampleType::Sint,
@@ -1604,7 +1604,7 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut WrenVm) {
         None => return,
     };
     let desc = slot(vm, 2);
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
 
     let entries_v = match map_get(desc, "entries") {
         Some(v) => v,
@@ -1628,7 +1628,7 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut WrenVm) {
         Vec::with_capacity(entries_list.count as usize);
     for i in 0..entries_list.count as usize {
         let entry = list_get(entries_list, i);
-        let binding = match map_get(entry, "binding").and_then(|v| v.as_num()) {
+        let binding = match map_get(entry, "binding").and_then(Value::as_num) {
             Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u32,
             _ => {
                 runtime_error(
@@ -1718,7 +1718,7 @@ pub unsafe extern "C" fn wlift_gpu_pipeline_layout_create(vm: *mut WrenVm) {
     };
     let desc = slot(vm, 2);
 
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
     let bgl_ids_v = match map_get(desc, "bindGroupLayouts") {
         Some(v) => v,
         None => {
@@ -1835,7 +1835,7 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut WrenVm) {
     };
     let desc = slot(vm, 2);
 
-    let layout_id = match map_get(desc, "layout").and_then(|v| v.as_num()) {
+    let layout_id = match map_get(desc, "layout").and_then(Value::as_num) {
         Some(n) if n.is_finite() && n >= 0.0 => n as u64,
         _ => {
             runtime_error(
@@ -1846,7 +1846,7 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut WrenVm) {
         }
     };
 
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
     let entries_v = match map_get(desc, "entries") {
         Some(v) => v,
         None => {
@@ -1882,7 +1882,7 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut WrenVm) {
     let mut decoded: Vec<(u32, EntryKind)> = Vec::with_capacity(entries_list.count as usize);
     for i in 0..entries_list.count as usize {
         let entry = list_get(entries_list, i);
-        let binding = match map_get(entry, "binding").and_then(|v| v.as_num()) {
+        let binding = match map_get(entry, "binding").and_then(Value::as_num) {
             Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as u32,
             _ => {
                 runtime_error(
@@ -1895,14 +1895,14 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut WrenVm) {
                 return;
             }
         };
-        if let Some(b) = map_get(entry, "buffer").and_then(|v| v.as_num()) {
+        if let Some(b) = map_get(entry, "buffer").and_then(Value::as_num) {
             let bid = b as u64;
             let offset = map_get(entry, "offset")
-                .and_then(|v| v.as_num())
+                .and_then(Value::as_num)
                 .map(|n| n as u64)
                 .unwrap_or(0);
             let size = map_get(entry, "size")
-                .and_then(|v| v.as_num())
+                .and_then(Value::as_num)
                 .map(|n| n as u64);
             decoded.push((
                 binding,
@@ -1912,9 +1912,9 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_create(vm: *mut WrenVm) {
                     size,
                 },
             ));
-        } else if let Some(sid) = map_get(entry, "sampler").and_then(|v| v.as_num()) {
+        } else if let Some(sid) = map_get(entry, "sampler").and_then(Value::as_num) {
             decoded.push((binding, EntryKind::Sampler { id: sid as u64 }));
-        } else if let Some(vid) = map_get(entry, "view").and_then(|v| v.as_num()) {
+        } else if let Some(vid) = map_get(entry, "view").and_then(Value::as_num) {
             decoded.push((binding, EntryKind::View { id: vid as u64 }));
         } else {
             runtime_error(
@@ -2123,7 +2123,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
         None => return,
     };
     let desc = slot(vm, 2);
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
 
     // -- Layout: "auto" | id ----------------------------------
     enum LayoutChoice {
@@ -2166,14 +2166,14 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
             return;
         }
     };
-    let v_module_id = match map_get(vertex_v, "module").and_then(|v| v.as_num()) {
+    let v_module_id = match map_get(vertex_v, "module").and_then(Value::as_num) {
         Some(n) => n as u64,
         None => {
             runtime_error(vm, "RenderPipeline.create: vertex.module missing.");
             return;
         }
     };
-    let v_entry = match map_get(vertex_v, "entryPoint").and_then(|v| string_of(v)) {
+    let v_entry = match map_get(vertex_v, "entryPoint").and_then(string_of) {
         Some(s) => s,
         None => {
             runtime_error(vm, "RenderPipeline.create: vertex.entryPoint missing.");
@@ -2199,7 +2199,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
         };
         for i in 0..buffers_list.count as usize {
             let layout = list_get(buffers_list, i);
-            let stride = match map_get(layout, "arrayStride").and_then(|v| v.as_num()) {
+            let stride = match map_get(layout, "arrayStride").and_then(Value::as_num) {
                 Some(n) => n as u64,
                 None => {
                     runtime_error(
@@ -2209,7 +2209,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
                     return;
                 }
             };
-            let step_mode = match map_get(layout, "stepMode").and_then(|v| string_of(v)) {
+            let step_mode = match map_get(layout, "stepMode").and_then(string_of) {
                 Some(s) if s == "instance" => wgpu::VertexStepMode::Instance,
                 _ => wgpu::VertexStepMode::Vertex,
             };
@@ -2233,7 +2233,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
             let mut attrs: Vec<wgpu::VertexAttribute> = Vec::new();
             for j in 0..attrs_list.count as usize {
                 let attr = list_get(attrs_list, j);
-                let location = match map_get(attr, "shaderLocation").and_then(|v| v.as_num()) {
+                let location = match map_get(attr, "shaderLocation").and_then(Value::as_num) {
                     Some(n) => n as u32,
                     None => {
                         runtime_error(
@@ -2247,10 +2247,10 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
                     }
                 };
                 let offset = map_get(attr, "offset")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .map(|n| n as u64)
                     .unwrap_or(0);
-                let format = match map_get(attr, "format").and_then(|v| string_of(v)) {
+                let format = match map_get(attr, "format").and_then(string_of) {
                     Some(s) => match vertex_format_from_str(&s) {
                         Some(f) => f,
                         None => {
@@ -2295,14 +2295,14 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
         targets: Vec<Option<wgpu::ColorTargetState>>,
     }
     let frag_info = if let Some(fv) = fragment_v {
-        let module_id = match map_get(fv, "module").and_then(|v| v.as_num()) {
+        let module_id = match map_get(fv, "module").and_then(Value::as_num) {
             Some(n) => n as u64,
             None => {
                 runtime_error(vm, "RenderPipeline.create: fragment.module missing.");
                 return;
             }
         };
-        let entry = match map_get(fv, "entryPoint").and_then(|v| string_of(v)) {
+        let entry = match map_get(fv, "entryPoint").and_then(string_of) {
             Some(s) => s,
             None => {
                 runtime_error(vm, "RenderPipeline.create: fragment.entryPoint missing.");
@@ -2329,7 +2329,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
         let mut targets: Vec<Option<wgpu::ColorTargetState>> = Vec::new();
         for i in 0..targets_list.count as usize {
             let t = list_get(targets_list, i);
-            let format = match map_get(t, "format").and_then(|v| string_of(v)) {
+            let format = match map_get(t, "format").and_then(string_of) {
                 Some(s) => match texture_format_from_str(&s) {
                     Some(f) => f,
                     None => {
@@ -2363,15 +2363,15 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
     // -- Primitive --------------------------------------------
     let primitive = if let Some(pv) = map_get(desc, "primitive") {
         let topology = map_get(pv, "topology")
-            .and_then(|v| string_of(v))
+            .and_then(string_of)
             .map(|s| topology_from_str(&s))
             .unwrap_or(wgpu::PrimitiveTopology::TriangleList);
-        let cull_mode = match map_get(pv, "cullMode").and_then(|v| string_of(v)) {
+        let cull_mode = match map_get(pv, "cullMode").and_then(string_of) {
             Some(s) if s == "front" => Some(wgpu::Face::Front),
             Some(s) if s == "back" => Some(wgpu::Face::Back),
             _ => None,
         };
-        let front_face = match map_get(pv, "frontFace").and_then(|v| string_of(v)) {
+        let front_face = match map_get(pv, "frontFace").and_then(string_of) {
             Some(s) if s == "cw" => wgpu::FrontFace::Cw,
             _ => wgpu::FrontFace::Ccw,
         };
@@ -2387,7 +2387,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
 
     // -- DepthStencil ----------------------------------------
     let depth_stencil = if let Some(dv) = map_get(desc, "depthStencil") {
-        let format = match map_get(dv, "format").and_then(|v| string_of(v)) {
+        let format = match map_get(dv, "format").and_then(string_of) {
             Some(s) => match texture_format_from_str(&s) {
                 Some(f) => f,
                 None => {
@@ -2409,7 +2409,7 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
             })
             .unwrap_or(true);
         let depth_compare = map_get(dv, "depthCompare")
-            .and_then(|v| string_of(v))
+            .and_then(string_of)
             .map(|s| compare_from_str(&s))
             .unwrap_or(wgpu::CompareFunction::Less);
         Some(wgpu::DepthStencilState {
@@ -2538,7 +2538,7 @@ pub unsafe extern "C" fn wlift_gpu_encoder_create(vm: *mut WrenVm) {
         None => return,
     };
     let desc = slot(vm, 2);
-    let label = map_get(desc, "label").and_then(|v| string_of(v));
+    let label = map_get(desc, "label").and_then(string_of);
     let encoder = {
         let reg = devices().lock().unwrap();
         let dev = match reg.devices.get(&device_id) {
@@ -2576,7 +2576,7 @@ pub unsafe extern "C" fn wlift_gpu_encoder_destroy(vm: *mut WrenVm) {
 /// `clearValue` Map / List<Num> on the descriptor supplies the clear
 /// color when load == "clear".
 unsafe fn load_op_color(attachment: Value) -> wgpu::LoadOp<wgpu::Color> {
-    let op = map_get(attachment, "loadOp").and_then(|v| string_of(v));
+    let op = map_get(attachment, "loadOp").and_then(string_of);
     match op.as_deref() {
         Some("load") => wgpu::LoadOp::Load,
         _ => {
@@ -2611,7 +2611,7 @@ unsafe fn load_op_color(attachment: Value) -> wgpu::LoadOp<wgpu::Color> {
 }
 
 unsafe fn store_op(attachment: Value) -> wgpu::StoreOp {
-    let op = map_get(attachment, "storeOp").and_then(|v| string_of(v));
+    let op = map_get(attachment, "storeOp").and_then(string_of);
     match op.as_deref() {
         Some("discard") => wgpu::StoreOp::Discard,
         _ => wgpu::StoreOp::Store,
@@ -2665,7 +2665,7 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
     let mut colors: Vec<Color> = Vec::with_capacity(color_list.count as usize);
     for i in 0..color_list.count as usize {
         let att = list_get(color_list, i);
-        let view_id = match map_get(att, "view").and_then(|v| v.as_num()) {
+        let view_id = match map_get(att, "view").and_then(Value::as_num) {
             Some(n) => n as u64,
             None => {
                 runtime_error(
@@ -2689,29 +2689,23 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
         depth_store: wgpu::StoreOp,
     }
     let depth = if let Some(d) = map_get(desc, "depthStencilAttachment") {
-        let view_id = match map_get(d, "view").and_then(|v| v.as_num()) {
+        let view_id = match map_get(d, "view").and_then(Value::as_num) {
             Some(n) => n as u64,
             None => {
                 runtime_error(vm, "RenderPass: depthStencilAttachment.view missing.");
                 return;
             }
         };
-        let depth_load = match map_get(d, "depthLoadOp")
-            .and_then(|v| string_of(v))
-            .as_deref()
-        {
+        let depth_load = match map_get(d, "depthLoadOp").and_then(string_of).as_deref() {
             Some("load") => wgpu::LoadOp::Load,
             _ => wgpu::LoadOp::Clear(
                 map_get(d, "depthClearValue")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .map(|n| n as f32)
                     .unwrap_or(1.0),
             ),
         };
-        let depth_store = match map_get(d, "depthStoreOp")
-            .and_then(|v| string_of(v))
-            .as_deref()
-        {
+        let depth_store = match map_get(d, "depthStoreOp").and_then(string_of).as_deref() {
             Some("discard") => wgpu::StoreOp::Discard,
             _ => wgpu::StoreOp::Store,
         };
@@ -2766,7 +2760,7 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
     let mut decoded: Vec<Cmd> = Vec::with_capacity(commands_list.count as usize);
     for i in 0..commands_list.count as usize {
         let cmd = list_get(commands_list, i);
-        let op = match map_get(cmd, "op").and_then(|v| string_of(v)) {
+        let op = match map_get(cmd, "op").and_then(string_of) {
             Some(s) => s,
             None => {
                 runtime_error(
@@ -2779,22 +2773,22 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
         match op.as_str() {
             "setPipeline" => {
                 let pid = map_get(cmd, "pipeline")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.0) as u64;
                 decoded.push(Cmd::SetPipeline(pid));
             }
             "setVertexBuffer" => {
-                let s = map_get(cmd, "slot").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
+                let s = map_get(cmd, "slot").and_then(Value::as_num).unwrap_or(0.0) as u32;
                 let b = map_get(cmd, "buffer")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.0) as u64;
                 decoded.push(Cmd::SetVertexBuffer { slot: s, buffer: b });
             }
             "setIndexBuffer" => {
                 let b = map_get(cmd, "buffer")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.0) as u64;
-                let f = match map_get(cmd, "format").and_then(|v| string_of(v)).as_deref() {
+                let f = match map_get(cmd, "format").and_then(string_of).as_deref() {
                     Some("uint32") => wgpu::IndexFormat::Uint32,
                     _ => wgpu::IndexFormat::Uint16,
                 };
@@ -2804,12 +2798,8 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
                 });
             }
             "setBindGroup" => {
-                let idx = map_get(cmd, "index")
-                    .and_then(|v| v.as_num())
-                    .unwrap_or(0.0) as u32;
-                let g = map_get(cmd, "group")
-                    .and_then(|v| v.as_num())
-                    .unwrap_or(0.0) as u64;
+                let idx = map_get(cmd, "index").and_then(Value::as_num).unwrap_or(0.0) as u32;
+                let g = map_get(cmd, "group").and_then(Value::as_num).unwrap_or(0.0) as u64;
                 decoded.push(Cmd::SetBindGroup {
                     index: idx,
                     group: g,
@@ -2817,10 +2807,10 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
             }
             "draw" => {
                 let vc = map_get(cmd, "vertexCount")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.0) as u32;
                 let ic = map_get(cmd, "instanceCount")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(1.0) as u32;
                 decoded.push(Cmd::Draw {
                     vertex_count: vc,
@@ -2829,10 +2819,10 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
             }
             "drawIndexed" => {
                 let ic = map_get(cmd, "indexCount")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(0.0) as u32;
                 let inst = map_get(cmd, "instanceCount")
-                    .and_then(|v| v.as_num())
+                    .and_then(Value::as_num)
                     .unwrap_or(1.0) as u32;
                 decoded.push(Cmd::DrawIndexed {
                     index_count: ic,
@@ -3008,10 +2998,10 @@ pub unsafe extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut WrenV
     };
     let desc = slot(vm, 4);
     let width = map_get(desc, "width")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .unwrap_or(0.0) as u32;
     let height = map_get(desc, "height")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .unwrap_or(0.0) as u32;
 
     let mut enc_reg = encoders().lock().unwrap();
@@ -3050,11 +3040,11 @@ pub unsafe extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut WrenV
 
     let bpp = format_bytes_per_pixel(tex.format);
     let bytes_per_row = map_get(desc, "bytesPerRow")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(width * bpp);
     let rows_per_image = map_get(desc, "rowsPerImage")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(height);
 
@@ -3315,7 +3305,7 @@ unsafe fn decode_window_handle(
 )> {
     use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-    let platform = match map_get(desc, "platform").and_then(|v| string_of(v)) {
+    let platform = match map_get(desc, "platform").and_then(string_of) {
         Some(s) => s,
         None => {
             runtime_error(
@@ -3362,7 +3352,7 @@ unsafe fn decode_window_handle(
             ))
         }
         "win32" => {
-            let hwnd_n = match map_get(desc, "hwnd").and_then(|v| v.as_num()) {
+            let hwnd_n = match map_get(desc, "hwnd").and_then(Value::as_num) {
                 Some(n) if n.is_finite() => n as i64,
                 _ => {
                     runtime_error(vm, "Device.createSurface: win32 requires `hwnd` integer.");
@@ -3370,7 +3360,7 @@ unsafe fn decode_window_handle(
                 }
             };
             let hinstance_n = map_get(desc, "hinstance")
-                .and_then(|v| v.as_num())
+                .and_then(Value::as_num)
                 .unwrap_or(0.0);
             let hwnd = match std::num::NonZeroIsize::new(hwnd_n as isize) {
                 Some(h) => h,
@@ -3393,7 +3383,7 @@ unsafe fn decode_window_handle(
             // every target. X11 isn't used on Windows in practice;
             // the truncating cast there is harmless because the
             // arm is unreachable.
-            let window_id = match map_get(desc, "window").and_then(|v| v.as_num()) {
+            let window_id = match map_get(desc, "window").and_then(Value::as_num) {
                 Some(n) if n.is_finite() => n as std::os::raw::c_ulong,
                 _ => {
                     runtime_error(
@@ -3405,7 +3395,7 @@ unsafe fn decode_window_handle(
             };
             let display = map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v));
             let visual_id = map_get(desc, "visual_id")
-                .and_then(|v| v.as_num())
+                .and_then(Value::as_num)
                 .unwrap_or(0.0) as std::os::raw::c_ulong;
             let mut wh = raw_window_handle::XlibWindowHandle::new(window_id);
             wh.visual_id = visual_id;
@@ -3415,7 +3405,7 @@ unsafe fn decode_window_handle(
             ))
         }
         "xcb" => {
-            let window_n = match map_get(desc, "window").and_then(|v| v.as_num()) {
+            let window_n = match map_get(desc, "window").and_then(Value::as_num) {
                 Some(n) if n.is_finite() && n > 0.0 => n as u32,
                 _ => {
                     runtime_error(
@@ -3428,7 +3418,7 @@ unsafe fn decode_window_handle(
             let window = std::num::NonZeroU32::new(window_n)?;
             let connection = map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v));
             let visual_n = map_get(desc, "visual_id")
-                .and_then(|v| v.as_num())
+                .and_then(Value::as_num)
                 .unwrap_or(0.0) as u32;
             let mut wh = raw_window_handle::XcbWindowHandle::new(window);
             wh.visual_id = std::num::NonZeroU32::new(visual_n);
@@ -3567,14 +3557,14 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut WrenVm) {
     };
     let desc = slot(vm, 2);
 
-    let width = match map_get(desc, "width").and_then(|v| v.as_num()) {
+    let width = match map_get(desc, "width").and_then(Value::as_num) {
         Some(n) if n.is_finite() && n > 0.0 => n as u32,
         _ => {
             runtime_error(vm, "Surface.configure: `width` must be a positive integer.");
             return;
         }
     };
-    let height = match map_get(desc, "height").and_then(|v| v.as_num()) {
+    let height = match map_get(desc, "height").and_then(Value::as_num) {
         Some(n) if n.is_finite() && n > 0.0 => n as u32,
         _ => {
             runtime_error(
@@ -3585,21 +3575,15 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut WrenVm) {
         }
     };
     let override_format = map_get(desc, "format")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .and_then(|s| texture_format_from_str(&s));
 
-    let present_mode = match map_get(desc, "presentMode")
-        .and_then(|v| string_of(v))
-        .as_deref()
-    {
+    let present_mode = match map_get(desc, "presentMode").and_then(string_of).as_deref() {
         Some("immediate") => wgpu::PresentMode::Immediate,
         Some("mailbox") => wgpu::PresentMode::Mailbox,
         _ => wgpu::PresentMode::Fifo,
     };
-    let alpha_mode = match map_get(desc, "alphaMode")
-        .and_then(|v| string_of(v))
-        .as_deref()
-    {
+    let alpha_mode = match map_get(desc, "alphaMode").and_then(string_of).as_deref() {
         Some("opaque") => wgpu::CompositeAlphaMode::Opaque,
         Some("premultiplied") => wgpu::CompositeAlphaMode::PreMultiplied,
         _ => wgpu::CompositeAlphaMode::Auto,
@@ -3807,14 +3791,14 @@ pub unsafe extern "C" fn wlift_gpu_queue_write_texture(vm: *mut WrenVm) {
     };
     let desc = slot(vm, 3);
     let width = map_get(desc, "width")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .unwrap_or(0.0) as u32;
     let height = map_get(desc, "height")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .unwrap_or(0.0) as u32;
-    let x = map_get(desc, "x").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
-    let y = map_get(desc, "y").and_then(|v| v.as_num()).unwrap_or(0.0) as u32;
-    let bytes_per_row = match map_get(desc, "bytesPerRow").and_then(|v| v.as_num()) {
+    let x = map_get(desc, "x").and_then(Value::as_num).unwrap_or(0.0) as u32;
+    let y = map_get(desc, "y").and_then(Value::as_num).unwrap_or(0.0) as u32;
+    let bytes_per_row = match map_get(desc, "bytesPerRow").and_then(Value::as_num) {
         Some(n) if n > 0.0 => n as u32,
         _ => {
             runtime_error(
@@ -3825,7 +3809,7 @@ pub unsafe extern "C" fn wlift_gpu_queue_write_texture(vm: *mut WrenVm) {
         }
     };
     let rows_per_image = map_get(desc, "rowsPerImage")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(height);
 

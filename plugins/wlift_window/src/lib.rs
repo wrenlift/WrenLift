@@ -352,14 +352,14 @@ fn pump_once() {
 pub unsafe extern "C" fn wlift_window_create(vm: *mut WrenVm) {
     let desc = slot(vm, 1);
     let title = map_get(desc, "title")
-        .and_then(|v| string_of(v))
+        .and_then(string_of)
         .unwrap_or_else(|| "wlift".to_string());
     let width = map_get(desc, "width")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(1280);
     let height = map_get(desc, "height")
-        .and_then(|v| v.as_num())
+        .and_then(Value::as_num)
         .map(|n| n as u32)
         .unwrap_or(720);
     let resizable = map_get(desc, "resizable")

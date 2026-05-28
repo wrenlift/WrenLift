@@ -5843,7 +5843,7 @@ pub mod cl {
                         let recv = receiver_val.ok_or_else(|| {
                             "CallStaticSelf in SM body without receiver_val".to_string()
                         })?;
-                        let slot = aot_intern_symbol(cfg, mir.name.index(), interner);
+                        let slot = aot_intern_symbol(cfg, _mir.name.index(), interner);
                         let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
                         let base = builder.ins().global_value(types::I64, gv);
                         let method_val = builder.ins().load(
