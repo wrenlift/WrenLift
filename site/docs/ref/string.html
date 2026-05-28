@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -124,14 +125,14 @@
         Construct a one-character string from a Unicode code-point
         integer:
       </p>
-<pre><code>System.print(String.fromCodePoint(65))       // "A"
+<pre><code class="language-wren">System.print(String.fromCodePoint(65))       // "A"
 System.print(String.fromCodePoint(0x1F44B))  // "👋"</code></pre>
       <p>
         Combine with <code>0..n</code> ranges to build small
         UTF-8 buffers without
         <a href="/docs/ref/typed-arrays.html"><code>ByteArray</code></a>:
       </p>
-<pre><code>// Build a 4-byte UTF-8 payload of 0x41 0x42 0x43 0x44 (ABCD):
+<pre><code class="language-wren">// Build a 4-byte UTF-8 payload of 0x41 0x42 0x43 0x44 (ABCD):
 var s = ""
 for (cp in [0x41, 0x42, 0x43, 0x44]) {
   s = s + String.fromCodePoint(cp)
@@ -148,7 +149,7 @@ for (cp in [0x41, 0x42, 0x43, 0x44]) {
         keeps that, and adds a byte-level view through the
         <code>.bytes</code> accessor:
       </p>
-<pre><code>var s = "héllo"
+<pre><code class="language-wren">var s = "héllo"
 System.print(s.count)        // 5  — code points
 System.print(s.bytes.count)  // 6  — bytes (é is 2 bytes in UTF-8)
 
@@ -174,7 +175,7 @@ for (b in s.bytes) {
           <tr><td>Bytes → String</td><td><code>String.fromBytes(byteArray)</code> (decode UTF-8 — aborts on invalid sequences)</td></tr>
         </tbody>
       </table>
-<pre><code>var b = ByteArray.fromString("hi 👋")
+<pre><code class="language-wren">var b = ByteArray.fromString("hi 👋")
 System.print(b.count)              // 6
 
 var s = String.fromBytes(b)

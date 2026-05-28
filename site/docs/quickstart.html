@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -106,7 +107,7 @@
 
       <h2 id="hello-world">Hello world</h2>
       <p>Save the following as <code>hello.wren</code>:</p>
-<pre><code>System.print("hello, world")</code></pre>
+<pre><code class="language-wren">System.print("hello, world")</code></pre>
       <p>Run it:</p>
 <pre><code>wlift hello.wren
 <span style="color:#8FAE6A;">// hello, world</span></code></pre>
@@ -118,7 +119,7 @@
       </p>
 
       <h2 id="first-class">A first class</h2>
-<pre><code>class Counter {
+<pre><code class="language-wren">class Counter {
   construct new(start) {
     _n = start
   }

@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -110,7 +111,7 @@
           <tr><td><code>System.writeAll(seq)</code></td><td><code>write</code> over a sequence.</td></tr>
         </tbody>
       </table>
-<pre><code>System.print("hello, world")
+<pre><code class="language-wren">System.print("hello, world")
 System.write("loading…")
 System.print(1 + 2)            // 3</code></pre>
 
@@ -121,7 +122,7 @@ System.print(1 + 2)            // 3</code></pre>
           <tr><td><code>System.clock</code></td><td>Wall-clock seconds since the runtime started. Monotonic; for benchmarking, not for time-of-day.</td></tr>
         </tbody>
       </table>
-<pre><code>var t = System.clock
+<pre><code class="language-wren">var t = System.clock
 expensive()
 System.print((System.clock - t) * 1000)  // ms</code></pre>
       <aside class="tip">

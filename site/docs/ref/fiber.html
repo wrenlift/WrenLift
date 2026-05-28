@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -108,7 +109,7 @@
           <tr><td><code>.isDone</code></td><td><code>true</code> when the fiber has returned (or aborted).</td></tr>
         </tbody>
       </table>
-<pre><code>var f = Fiber.new {
+<pre><code class="language-wren">var f = Fiber.new {
   System.print("inside")
 }
 f.call()        // inside
@@ -124,7 +125,7 @@ f.isDone        // true</code></pre>
           <tr><td><code>Fiber.abort(error)</code></td><td>Abort the fiber. Up the stack, <code>.try { ... }</code> catches it as the fiber's <code>.error</code> slot.</td></tr>
         </tbody>
       </table>
-<pre><code>var counter = Fiber.new {
+<pre><code class="language-wren">var counter = Fiber.new {
   var i = 0
   while (true) {
     Fiber.yield(i)
@@ -142,7 +143,7 @@ System.print(counter.call())    // 2</code></pre>
         <code>error</code> value instead, so the parent can decide
         how to react.
       </p>
-<pre><code>var fragile = Fiber.new { Fiber.abort("nope") }
+<pre><code class="language-wren">var fragile = Fiber.new { Fiber.abort("nope") }
 
 var r = fragile.try()
 System.print(fragile.error)     // "nope"
@@ -158,7 +159,7 @@ System.print(r)                 // null</code></pre>
           <tr><td><code>Fiber.setDeadlineMs(ms)</code></td><td>Set the deadline. Runtime checkpoints inside loops poll this; expiring deadlines surface as aborts.</td></tr>
         </tbody>
       </table>
-<pre><code>var work = Fiber.new {
+<pre><code class="language-wren">var work = Fiber.new {
   while (!Fiber.isCancelled) {
     step()
   }
@@ -175,7 +176,7 @@ work.call()</code></pre>
         scheduler resumes it via <code>.call(value)</code> when
         the future settles.
       </p>
-<pre><code>var page = Fiber.new {
+<pre><code class="language-wren">var page = Fiber.new {
   var html = Browser.fetch("https://example.com").await
   System.print(html.count)
 }

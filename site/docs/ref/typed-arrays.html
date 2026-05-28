@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -109,7 +110,7 @@
           <tr><td><code>ByteArray.fromString(text)</code></td><td><em>(ByteArray only)</em> UTF-8 byte snapshot of <code>text</code>.</td></tr>
         </tbody>
       </table>
-<pre><code>var f32 = Float32Array.new(16)             // 16 × f32, all 0.0
+<pre><code class="language-wren">var f32 = Float32Array.new(16)             // 16 × f32, all 0.0
 var i32 = Int32Array.fromList([1, 2, 3])
 var hello = ByteArray.fromString("hello")  // 5-byte UTF-8 view</code></pre>
 
@@ -120,7 +121,7 @@ var hello = ByteArray.fromString("hello")  // 5-byte UTF-8 view</code></pre>
         through the element width (truncating for integer arrays,
         precision-clipping for f32).
       </p>
-<pre><code>var v = Float32Array.new(4)
+<pre><code class="language-wren">var v = Float32Array.new(4)
 v[0] = 0.25
 v[1] = 0.50
 System.print(v[0] + v[1])      // 0.75
@@ -141,7 +142,7 @@ System.print(bytes[1])         // 0</code></pre>
         Every typed array supports the for-in protocol via
         <code>iterate</code> + <code>iteratorValue</code>:
       </p>
-<pre><code>var v = Int32Array.fromList([10, 20, 30])
+<pre><code class="language-wren">var v = Int32Array.fromList([10, 20, 30])
 var sum = 0
 for (n in v) sum = sum + n
 System.print(sum)                // 60</code></pre>

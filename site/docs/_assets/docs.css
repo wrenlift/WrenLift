@@ -1,3 +1,31 @@
+/* Syntax-color tokens. The CodeMirror upgrade in
+ * `codemirror-wren.js` reads these to colour Wren code blocks;
+ * the same palette also lights up the dark fallback `<pre>`
+ * blocks via the lower `.pkg-readme pre` rule, so unstyled
+ * code (bash, toml, output samples) still reads as the same
+ * family. Match hatch's docs theme so the two sites feel like
+ * siblings.
+ */
+:root {
+  --syn-panel:   #1d1812;
+  --syn-text:    #e8dcc8;
+  --syn-comment: #6d6354;
+  --syn-keyword: #f4c24a;
+  --syn-string:  #9cb88b;
+  --syn-number:  #d4a76a;
+  --syn-type:    #e8dcc8;
+  --syn-fn:      #e8c878;
+}
+
+/* `.doc-code` wraps the CodeMirror mount. The script also nukes
+ * the original `<pre>`, so this rule controls margin against the
+ * surrounding article. */
+.doc-code {
+  margin: 0 0 20px;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
 /* docs.css — Wrenlift documentation stylesheet.
  *
  * Sits *next to* the landing page's inline styles in site/index.html.
@@ -12,6 +40,22 @@
  * Mobile (≤ 900px): the sidebar collapses behind a hamburger; the TOC
  * rail goes inline above the article.
  */
+
+/* ---- Body-level defaults -------------------------------------- */
+
+/* Mirror the landing page so anchors anywhere in the doc tree
+ * (lede, callouts, tables, paragraphs that aren't inside
+ * `.pkg-readme`) inherit the toast palette instead of falling
+ * back to the browser's default blue. Specific scopes
+ * (.docs-topbar nav, .docs-sidebar, .docs-toc, .docs-card,
+ * .crumbs) override below. */
+a { color: var(--toast-deep); text-decoration: none; }
+a:hover {
+  color: var(--toast);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
 
 /* ---- Shell ---------------------------------------------------- */
 

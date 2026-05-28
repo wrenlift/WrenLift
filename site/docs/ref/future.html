@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -114,7 +115,7 @@
         Wrap host work in a fiber, then chain
         <code>.await</code> on the futures the host gives you:
       </p>
-<pre><code>var fiber = Fiber.new {
+<pre><code class="language-wren">var fiber = Fiber.new {
   var t = Browser.setTimeout(150).await
   var html = Dom.text("#title").await
   System.print(html)
@@ -131,7 +132,7 @@ fiber.try()</code></pre>
       <p>
         Skip awaiting if you want to peek before yielding:
       </p>
-<pre><code>var f = Browser.fetch("…")
+<pre><code class="language-wren">var f = Browser.fetch("…")
 if (f.state == 1) {
   System.print("already cached:", f.await)
 } else {
@@ -148,7 +149,7 @@ if (f.state == 1) {
         images, audio, <code>.hatch</code> bundles, anything you'd
         treat as binary.
       </p>
-<pre><code>var bytes = Browser.fetchBytes("./icon.png").await
+<pre><code class="language-wren">var bytes = Browser.fetchBytes("./icon.png").await
 System.print(bytes.count)
 // Hand to a texture loader, audio decoder, etc.</code></pre>
 

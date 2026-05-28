@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -144,7 +145,7 @@ println!("script output: {}", vm.take_output());</code></pre>
         Rust code. Declare the Wren side with the
         <code>#!native</code> attribute:
       </p>
-<pre><code>#!native = "myapp"
+<pre><code class="language-wren">#!native = "myapp"
 foreign class Counter {
   #!symbol = "myapp_counter_new"
   foreign static create(start)

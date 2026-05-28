@@ -37,6 +37,7 @@
     line-height: 1.6; -webkit-font-smoothing: antialiased;
   }
 </style>
+<script type="module" src="../_assets/codemirror-wren.js"></script>
 </head>
 <body>
 
@@ -106,7 +107,7 @@
         every call routes to a Rust function in the named
         cdylib.
       </p>
-<pre><code>#!native = "sqlite"
+<pre><code class="language-wren">#!native = "sqlite"
 foreign class Database {
   #!symbol = "wlift_sqlite_database_open"
   foreign static open(path)
@@ -117,7 +118,7 @@ foreign class Database {
       <p>
         Wren scripts use it like any other class:
       </p>
-<pre><code>import "@hatch:sqlite" for Database
+<pre><code class="language-wren">import "@hatch:sqlite" for Database
 var db = Database.open(":memory:")
 var rows = db.query("SELECT * FROM users WHERE id = ?", [42])</code></pre>
 
@@ -169,7 +170,7 @@ web_crate = "wlift_sqlite_web"   # wasm32 companion</code></pre>
       </aside>
 
       <h2 id="example">A complete example</h2>
-<pre><code><span style="color:#8FAE6A;">// counter.wren</span>
+<pre><code class="language-wren"><span style="color:#8FAE6A;">// counter.wren</span>
 #!native = "counter"
 foreign class Counter {
   #!symbol = "counter_new"
