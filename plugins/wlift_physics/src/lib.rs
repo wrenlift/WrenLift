@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use wlift_abi::{
-    alloc_list, list_add, list_count, list_get, map_iter, obj_type, runtime_error, set_return,
-    slot, string_str, ObjType, Value, WrenVm,
+    alloc_list, alloc_map, alloc_string, list_add, list_count, list_get, map_iter, map_set,
+    obj_type, runtime_error, set_return, slot, string_str, ObjType, Value, WrenVm,
 };
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
@@ -132,6 +132,9 @@ mod d2 {
         pub ccd_solver: CCDSolver,
         pub bodies_by_id: HashMap<u64, RigidBodyHandle>,
         pub ids_by_handle: HashMap<RigidBodyHandle, u64>,
+        /// Same shape as 3D's `contact_events` — see that struct's
+        /// docstring for the lifecycle.
+        pub contact_events: Vec<(u64, u64, bool)>,
     }
 
     impl World {
@@ -150,10 +153,30 @@ mod d2 {
                 ccd_solver: CCDSolver::new(),
                 bodies_by_id: HashMap::new(),
                 ids_by_handle: HashMap::new(),
+                contact_events: Vec::new(),
             }
         }
 
         pub fn step(&mut self, dt: f32) {
+            // Channel type has to be spelled explicitly: the
+            // compiler can't infer `CollisionEvent` from
+            // `ChannelEventCollector::new` alone, and inside the
+            // 2D scope `CollisionEvent` resolves through `use
+            // rapier2d::prelude::*` to the 2D variant.
+            // rapier's `ChannelEventCollector` takes
+            // `std::sync::mpsc::Sender`s — explicitly typed so
+            // the compiler resolves to the right `CollisionEvent`
+            // (the 2D and 3D rapier crates each export a distinct
+            // one, brought in via the enclosing `use … prelude::*`).
+            let (collision_tx, collision_rx) =
+                std::sync::mpsc::channel::<CollisionEvent>();
+            let (contact_force_tx, _contact_force_rx) =
+                std::sync::mpsc::channel::<ContactForceEvent>();
+            let event_handler = ChannelEventCollector::new(
+                collision_tx,
+                contact_force_tx,
+            );
+
             self.integration_parameters.dt = dt;
             self.physics_pipeline.step(
                 self.gravity,
@@ -167,8 +190,28 @@ mod d2 {
                 &mut self.multibody_joints,
                 &mut self.ccd_solver,
                 &(),
-                &(),
+                &event_handler,
             );
+
+            // Mirror the 3D drain — see d3::World::step for the
+            // full rationale. Identical body-ID resolution path.
+            self.contact_events.clear();
+            while let Ok(ev) = collision_rx.try_recv() {
+                let (ch_a, ch_b, started) = match ev {
+                    CollisionEvent::Started(a, b, _) => (a, b, true),
+                    CollisionEvent::Stopped(a, b, _) => (a, b, false),
+                };
+                let body_a = self.colliders.get(ch_a).and_then(|c| c.parent());
+                let body_b = self.colliders.get(ch_b).and_then(|c| c.parent());
+                if let (Some(ba), Some(bb)) = (body_a, body_b) {
+                    if let (Some(&ida), Some(&idb)) = (
+                        self.ids_by_handle.get(&ba),
+                        self.ids_by_handle.get(&bb),
+                    ) {
+                        self.contact_events.push((ida, idb, started));
+                    }
+                }
+            }
         }
     }
 
@@ -212,7 +255,18 @@ mod d2 {
         let friction = map_get(desc, "friction")
             .and_then(Value::as_num)
             .unwrap_or(0.5) as f32;
-        builder = builder.restitution(restitution).friction(friction);
+        builder = builder
+            .restitution(restitution)
+            .friction(friction)
+            // Opt every collider into rapier's collision-event
+            // channel by default. The cost is negligible (rapier
+            // only emits events for pairs whose narrow-phase
+            // touched / untouched state actually changed), and
+            // the alternative is requiring every user to call
+            // an opt-in setter on every collider before contact
+            // events do anything — a footgun the game-layer
+            // `World3D.drainContactEvents` shouldn't carry.
+            .active_events(ActiveEvents::COLLISION_EVENTS);
         Some(builder.build())
     }
 }
@@ -239,6 +293,13 @@ mod d3 {
         pub ccd_solver: CCDSolver,
         pub bodies_by_id: HashMap<u64, RigidBodyHandle>,
         pub ids_by_handle: HashMap<RigidBodyHandle, u64>,
+        /// Contact events queued during the most recent `step` —
+        /// drained by `wlift_physics_world3d_drain_contact_events`.
+        /// Each entry is `(body_id_a, body_id_b, started)`; we
+        /// translate rapier's `CollisionEvent` into rigid-body IDs
+        /// up-front so the drain export doesn't need to walk
+        /// handle maps under the runtime's lock.
+        pub contact_events: Vec<(u64, u64, bool)>,
     }
 
     impl World {
@@ -257,10 +318,31 @@ mod d3 {
                 ccd_solver: CCDSolver::new(),
                 bodies_by_id: HashMap::new(),
                 ids_by_handle: HashMap::new(),
+                contact_events: Vec::new(),
             }
         }
 
         pub fn step(&mut self, dt: f32) {
+            // Per-step channels for collision + contact-force
+            // events. Constructed fresh each step so a stale
+            // receiver from a previous step can't leak.
+            // `ChannelEventCollector` is rapier's `EventHandler`
+            // impl that just forwards events into the senders;
+            // we drain the collision channel into `contact_events`
+            // before this scope ends.
+            // rapier's `ChannelEventCollector` takes
+            // `std::sync::mpsc::Sender`s — explicitly typed so
+            // the compiler resolves to the 3D `CollisionEvent`
+            // brought in via the enclosing `use rapier3d::prelude::*`.
+            let (collision_tx, collision_rx) =
+                std::sync::mpsc::channel::<CollisionEvent>();
+            let (contact_force_tx, _contact_force_rx) =
+                std::sync::mpsc::channel::<ContactForceEvent>();
+            let event_handler = ChannelEventCollector::new(
+                collision_tx,
+                contact_force_tx,
+            );
+
             self.integration_parameters.dt = dt;
             self.physics_pipeline.step(
                 self.gravity,
@@ -274,8 +356,32 @@ mod d3 {
                 &mut self.multibody_joints,
                 &mut self.ccd_solver,
                 &(),
-                &(),
+                &event_handler,
             );
+
+            // Drain rapier's contact-event channel into our own
+            // buffer, mapped from `ColliderHandle` → user-facing
+            // body IDs. Skip pairs whose collider has no rigid-body
+            // parent (sensor-only colliders fall through here;
+            // once we expose user-spawnable sensors that pattern
+            // grows a parallel resolver).
+            self.contact_events.clear();
+            while let Ok(ev) = collision_rx.try_recv() {
+                let (ch_a, ch_b, started) = match ev {
+                    CollisionEvent::Started(a, b, _) => (a, b, true),
+                    CollisionEvent::Stopped(a, b, _) => (a, b, false),
+                };
+                let body_a = self.colliders.get(ch_a).and_then(|c| c.parent());
+                let body_b = self.colliders.get(ch_b).and_then(|c| c.parent());
+                if let (Some(ba), Some(bb)) = (body_a, body_b) {
+                    if let (Some(&ida), Some(&idb)) = (
+                        self.ids_by_handle.get(&ba),
+                        self.ids_by_handle.get(&bb),
+                    ) {
+                        self.contact_events.push((ida, idb, started));
+                    }
+                }
+            }
         }
     }
 
@@ -322,7 +428,18 @@ mod d3 {
         let friction = map_get(desc, "friction")
             .and_then(Value::as_num)
             .unwrap_or(0.5) as f32;
-        builder = builder.restitution(restitution).friction(friction);
+        builder = builder
+            .restitution(restitution)
+            .friction(friction)
+            // Opt every collider into rapier's collision-event
+            // channel by default. The cost is negligible (rapier
+            // only emits events for pairs whose narrow-phase
+            // touched / untouched state actually changed), and
+            // the alternative is requiring every user to call
+            // an opt-in setter on every collider before contact
+            // events do anything — a footgun the game-layer
+            // `World3D.drainContactEvents` shouldn't carry.
+            .active_events(ActiveEvents::COLLISION_EVENTS);
         Some(builder.build())
     }
 }
@@ -991,6 +1108,247 @@ pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut WrenVm) {
 }
 
 // ---------------------------------------------------------------------------
+// Raycasts + contact events (Phase 4)
+//
+// Raycasts return a 6-key result Map ({ bodyId, point[x,y,z],
+// normal[x,y,z], toi }) or null when nothing was hit. The
+// Wren-side `World3D.castRay` / `World2D.castRay` wraps this
+// shape with a small `RaycastHit3D` / `RaycastHit2D` class.
+//
+// `drain_contact_events` returns the buffer of `(a, b, started)`
+// triplets captured during the most recent `step` as a List of
+// 3-key Maps. The buffer is cleared on each `step`, so calling
+// drain twice produces an empty result the second time.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_cast_ray(vm: *mut WrenVm) {
+    use rapier3d::prelude::*;
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let ox = slot(vm, 2).as_num().unwrap_or(0.0) as f32;
+    let oy = slot(vm, 3).as_num().unwrap_or(0.0) as f32;
+    let oz = slot(vm, 4).as_num().unwrap_or(0.0) as f32;
+    let dx = slot(vm, 5).as_num().unwrap_or(0.0) as f32;
+    let dy = slot(vm, 6).as_num().unwrap_or(0.0) as f32;
+    let dz = slot(vm, 7).as_num().unwrap_or(0.0) as f32;
+    let max_toi = slot(vm, 8).as_num().unwrap_or(f64::MAX) as f32;
+    // `solid` defaults to true — most game uses (projectiles,
+    // line-of-sight) want to hit the inside of a shape if the
+    // ray starts there. Pass `false` for sensor-style sweeps.
+    let solid = slot(vm, 9).as_bool().unwrap_or(true);
+
+    let reg = d3::worlds().lock().unwrap();
+    let world = match reg.get(&world_id) {
+        Some(w) => w,
+        None => {
+            drop(reg);
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let qp = world.broad_phase.as_query_pipeline(
+        world.narrow_phase.query_dispatcher(),
+        &world.bodies,
+        &world.colliders,
+        QueryFilter::default(),
+    );
+    // rapier 0.32 / parry 0.26: `Ray::origin` is a `Vector`, not
+    // a `Point` (the change came when parry switched its 3D math
+    // crate). Origin + dir are both Vectors; `point_at(toi)`
+    // returns `origin + dir * toi` as a `Vector`.
+    let ray = Ray::new(
+        Vector::new(ox, oy, oz),
+        Vector::new(dx, dy, dz),
+    );
+    let hit = match qp.cast_ray_and_get_normal(&ray, max_toi, solid) {
+        Some((collider_handle, intersection)) => {
+            let body_id = world
+                .colliders
+                .get(collider_handle)
+                .and_then(|c| c.parent())
+                .and_then(|bh| world.ids_by_handle.get(&bh).copied());
+            body_id.map(|id| (id, ray, intersection))
+        }
+        None => None,
+    };
+    drop(reg);
+    let (body_id, ray, intersection) = match hit {
+        Some(h) => h,
+        None => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let toi = intersection.time_of_impact;
+    let hit_point = ray.origin + ray.dir * toi;
+    let nx = intersection.normal.x;
+    let ny = intersection.normal.y;
+    let nz = intersection.normal.z;
+    emit_raycast_hit_map(vm, body_id, hit_point.x, hit_point.y, hit_point.z, nx, ny, nz, toi as f64);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world2d_cast_ray(vm: *mut WrenVm) {
+    use rapier2d::prelude::*;
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let ox = slot(vm, 2).as_num().unwrap_or(0.0) as f32;
+    let oy = slot(vm, 3).as_num().unwrap_or(0.0) as f32;
+    let dx = slot(vm, 4).as_num().unwrap_or(0.0) as f32;
+    let dy = slot(vm, 5).as_num().unwrap_or(0.0) as f32;
+    let max_toi = slot(vm, 6).as_num().unwrap_or(f64::MAX) as f32;
+    let solid = slot(vm, 7).as_bool().unwrap_or(true);
+
+    let reg = d2::worlds().lock().unwrap();
+    let world = match reg.get(&world_id) {
+        Some(w) => w,
+        None => {
+            drop(reg);
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let qp = world.broad_phase.as_query_pipeline(
+        world.narrow_phase.query_dispatcher(),
+        &world.bodies,
+        &world.colliders,
+        QueryFilter::default(),
+    );
+    // Same shape as the 3D path — `Ray::origin` is a `Vector`.
+    let ray = Ray::new(
+        Vector::new(ox, oy),
+        Vector::new(dx, dy),
+    );
+    let hit = match qp.cast_ray_and_get_normal(&ray, max_toi, solid) {
+        Some((collider_handle, intersection)) => {
+            let body_id = world
+                .colliders
+                .get(collider_handle)
+                .and_then(|c| c.parent())
+                .and_then(|bh| world.ids_by_handle.get(&bh).copied());
+            body_id.map(|id| (id, ray, intersection))
+        }
+        None => None,
+    };
+    drop(reg);
+    let (body_id, ray, intersection) = match hit {
+        Some(h) => h,
+        None => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let toi = intersection.time_of_impact;
+    let hit_point = ray.origin + ray.dir * toi;
+    // 2D ray always reports `z = 0`; matches what `World2D` users
+    // expect for the `point` field.
+    emit_raycast_hit_map(vm, body_id, hit_point.x, hit_point.y, 0.0,
+                         intersection.normal.x, intersection.normal.y, 0.0, toi as f64);
+}
+
+// Build a Map { bodyId, point: [x,y,z], normal: [x,y,z], toi }
+// and return it as slot 0. Factored to share the GC-rooted Map
+// build between the 2D and 3D paths.
+unsafe fn emit_raycast_hit_map(
+    vm: *mut WrenVm,
+    body_id: u64,
+    px: f32, py: f32, pz: f32,
+    nx: f32, ny: f32, nz: f32,
+    toi: f64,
+) {
+    let m = alloc_map(vm);
+    set_return(vm, m);
+    let k = alloc_string(vm, "bodyId");
+    map_set(vm, m, k, Value::num(body_id as f64));
+
+    let kp = alloc_string(vm, "point");
+    let lp = alloc_list(vm, 3);
+    list_add(vm, lp, Value::num(px as f64));
+    list_add(vm, lp, Value::num(py as f64));
+    list_add(vm, lp, Value::num(pz as f64));
+    map_set(vm, m, kp, lp);
+
+    let kn = alloc_string(vm, "normal");
+    let ln = alloc_list(vm, 3);
+    list_add(vm, ln, Value::num(nx as f64));
+    list_add(vm, ln, Value::num(ny as f64));
+    list_add(vm, ln, Value::num(nz as f64));
+    map_set(vm, m, kn, ln);
+
+    let kt = alloc_string(vm, "toi");
+    map_set(vm, m, kt, Value::num(toi));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_drain_contact_events(vm: *mut WrenVm) {
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            let list = alloc_list(vm, 0);
+            set_return(vm, list);
+            return;
+        }
+    };
+    let mut reg = d3::worlds().lock().unwrap();
+    let events = match reg.get_mut(&world_id) {
+        Some(w) => std::mem::take(&mut w.contact_events),
+        None => Vec::new(),
+    };
+    drop(reg);
+    emit_contact_events_list(vm, &events);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world2d_drain_contact_events(vm: *mut WrenVm) {
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            let list = alloc_list(vm, 0);
+            set_return(vm, list);
+            return;
+        }
+    };
+    let mut reg = d2::worlds().lock().unwrap();
+    let events = match reg.get_mut(&world_id) {
+        Some(w) => std::mem::take(&mut w.contact_events),
+        None => Vec::new(),
+    };
+    drop(reg);
+    emit_contact_events_list(vm, &events);
+}
+
+// Returns a List< Map { a, b, started } > as slot 0. Same GC-
+// rooting pattern as `emit_raycast_hit_map`: list goes into slot
+// 0 first so subsequent allocs can't tear the not-yet-rooted
+// Maps; each Map's keys are interned strings the alloc-string
+// path retains.
+unsafe fn emit_contact_events_list(vm: *mut WrenVm, events: &[(u64, u64, bool)]) {
+    let list = alloc_list(vm, events.len() as u32);
+    set_return(vm, list);
+    for &(a, b, started) in events {
+        let m = alloc_map(vm);
+        list_add(vm, list, m);
+        let ka = alloc_string(vm, "a");
+        map_set(vm, m, ka, Value::num(a as f64));
+        let kb = alloc_string(vm, "b");
+        map_set(vm, m, kb, Value::num(b as f64));
+        let ks = alloc_string(vm, "started");
+        map_set(vm, m, ks, if started { Value::TRUE } else { Value::FALSE });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Static-link symbol registry (wasm only)
 //
 // On `wasm32-*`, plugins ship as Rust crates statically linked into
@@ -1206,6 +1564,37 @@ pub fn register_static_symbols() {
             "wlift_physics",
             "wlift_physics_world3d_apply_force",
             wlift_physics_world3d_apply_force as *const (),
+        )
+    };
+
+    // Phase 4: raycasts + contact events. Same wasm-side
+    // registration pattern as every export above.
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_cast_ray",
+            wlift_physics_world3d_cast_ray as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world2d_cast_ray",
+            wlift_physics_world2d_cast_ray as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_drain_contact_events",
+            wlift_physics_world3d_drain_contact_events as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world2d_drain_contact_events",
+            wlift_physics_world2d_drain_contact_events as *const (),
         )
     };
 }
