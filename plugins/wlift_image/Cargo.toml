@@ -3,6 +3,7 @@ name = "wlift_image"
 version = "0.1.5"
 edition = "2021"
 description = "Image encode / decode / resize / convert for WrenLift. Backed by the `image` crate; bundled into @hatch:image as a cdylib so games + tools share the same RGBA8 pipeline."
+build = "build.rs"
 
 [lib]
 # `cdylib` for the host plugin loader (libloading dlopens the
@@ -12,20 +13,13 @@ description = "Image encode / decode / resize / convert for WrenLift. Backed by 
 # runtime crate links in directly.
 crate-type = ["cdylib", "rlib"]
 
-# Plugins must compile against the SAME `wren_lift` feature set the
-# host binary uses, otherwise host-gated fields in `VM` /
-# `NativeContext` shift offsets and the cdylib's `&mut VM` decode
-# is wrong → silent SIGSEGV on the first foreign-method call. The
-# `host` feature here flips `wren_lift/host` so the plugin's view
-# of those structs matches the binary's. The cdylib build keeps
-# `host` on by default; the wasm static-link path in `wlift_wasm`
-# explicitly disables it via `default-features = false`.
-[features]
-default = ["host"]
-host = ["wren_lift/host"]
-
 [dependencies]
-wren_lift = { path = "../..", default-features = false }
+# Only the header-only `wlift_abi` crate on the plugin side. No
+# `wren_lift` dep — VM/Gc/Obj* layout changes can't reach plugin
+# code anymore; the host process exports the `wlift_plugin_*`
+# symbols via `#[no_mangle]` and the dynamic linker resolves the
+# plugin's externs against them at dlopen.
+wlift_abi = { path = "../../crates/wlift_abi" }
 # Game-asset codecs only — TIFF/EXR/HDR aren't worth the binary
 # bloat for the default package. Callers that need them can fork.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }

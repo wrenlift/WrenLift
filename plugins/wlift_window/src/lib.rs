@@ -35,71 +35,33 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::pump_events::EventLoopExtPumpEvents;
 use winit::window::{Window, WindowId};
 
-use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
-use wren_lift::runtime::value::Value;
-use wren_lift::runtime::vm::VM;
+use wlift_abi::{
+    alloc_list, alloc_map, alloc_string, list_add, map_iter, map_set, obj_type, runtime_error,
+    set_return, slot, string_str, ObjType, Value, WrenVm,
+};
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
 #[no_mangle]
 pub extern "C" fn wlift_plugin_abi_version() -> u32 {
-    wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+    wlift_abi::ABI_VERSION
 }
 
 // ---------------------------------------------------------------------------
-// Slot helpers (mirror wlift_gpu / wlift_sqlite)
+// Helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn slot(vm: *mut VM, index: usize) -> Value {
-    unsafe {
-        let stack = &(*vm).api_stack;
-        stack.get(index).copied().unwrap_or(Value::null())
-    }
+fn string_of(v: Value) -> Option<String> {
+    string_str(v).map(|s| s.to_string())
 }
 
-unsafe fn set_return(vm: *mut VM, v: Value) {
-    unsafe {
-        let stack = &mut (*vm).api_stack;
-        if stack.is_empty() {
-            stack.push(v);
-        } else {
-            stack[0] = v;
-        }
-    }
-}
-
-unsafe fn ctx<'a>(vm: *mut VM) -> &'a mut VM {
-    unsafe { &mut *vm }
-}
-
-unsafe fn string_of(v: Value) -> Option<String> {
-    if !v.is_object() {
+fn map_get(v: Value, key: &str) -> Option<Value> {
+    if obj_type(v) != Some(ObjType::Map) {
         return None;
     }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::String {
-        return None;
-    }
-    let s = ptr as *const ObjString;
-    Some(unsafe { (*s).as_str().to_string() })
-}
-
-unsafe fn map_get(v: Value, key: &str) -> Option<Value> {
-    if !v.is_object() {
-        return None;
-    }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::Map {
-        return None;
-    }
-    let map = ptr as *const ObjMap;
-    unsafe {
-        for (k, val) in (*map).entries.iter() {
-            if let Some(s) = string_of(k.0) {
-                if s == key {
-                    return Some(*val);
-                }
+    for (k, val) in map_iter(v) {
+        if let Some(s) = string_str(k) {
+            if s == key {
+                return Some(val);
             }
         }
     }
@@ -387,7 +349,7 @@ fn pump_once() {
 ///
 /// Returns the window id (Num).
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_create(vm: *mut WrenVm) {
     unsafe {
         let desc = slot(vm, 1);
         let title = map_get(desc, "title")
@@ -402,7 +364,7 @@ pub unsafe extern "C" fn wlift_window_create(vm: *mut VM) {
             .map(|n| n as u32)
             .unwrap_or(720);
         let resizable = map_get(desc, "resizable")
-            .map(|v| !v.is_falsy())
+            .map(|v| !(v.is_null() || v == Value::FALSE))
             .unwrap_or(true);
 
         let id = next_id();
@@ -425,32 +387,31 @@ pub unsafe extern "C" fn wlift_window_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_destroy(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm)
-                    .runtime_error("Window.destroy: id must be a non-negative number.".to_string());
+                runtime_error(vm, "Window.destroy: id must be a non-negative number.");
                 return;
             }
         };
         APP.with(|cell| cell.borrow_mut().pending_close.push(id));
         pump_once();
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_pump(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_pump(vm: *mut WrenVm) {
     unsafe {
         pump_once();
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_close_requested(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_close_requested(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
@@ -471,12 +432,12 @@ pub unsafe extern "C" fn wlift_window_close_requested(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_size(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_size(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm).runtime_error("Window.size: id must be a non-negative number.".to_string());
+                runtime_error(vm, "Window.size: id must be a non-negative number.");
                 return;
             }
         };
@@ -492,14 +453,13 @@ pub unsafe extern "C" fn wlift_window_size(vm: *mut VM) {
         // alloc, write keys via direct `(*map_ptr).set` so each
         // key string is committed to the map's hash table the
         // moment after it's allocated.
-        let context = ctx(vm);
-        let map = context.alloc_map();
+        
+        let map = alloc_map(vm);
         set_return(vm, map);
-        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
-        let kw = context.alloc_string("width".to_string());
-        (*map_ptr).set(kw, Value::num(w as f64));
-        let kh = context.alloc_string("height".to_string());
-        (*map_ptr).set(kh, Value::num(h as f64));
+        let kw = alloc_string(vm, "width");
+        map_set(vm, map, kw, Value::num(w as f64));
+        let kh = alloc_string(vm, "height");
+        map_set(vm, map, kh, Value::num(h as f64));
     }
 }
 
@@ -511,14 +471,12 @@ pub unsafe extern "C" fn wlift_window_size(vm: *mut VM) {
 ///   {"type": "mouseMoved", "x": Num, "y": Num}
 ///   {"type": "mouseDown" | "mouseUp", "button": String}
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm).runtime_error(
-                    "Window.pollEvents: id must be a non-negative number.".to_string(),
-                );
+                runtime_error(vm, "Window.pollEvents: id must be a non-negative number.");
                 return;
             }
         };
@@ -545,74 +503,72 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut VM) {
         // `(*map_ptr).set` so key + value commit happens
         // immediately after the key alloc, with no intervening
         // method-dispatch path that could allocate.
-        let context = ctx(vm);
-        let result = context.alloc_list(Vec::new());
+        
+        let result = alloc_list(vm, 0);
         set_return(vm, result);
-        let result_ptr = result.as_object().unwrap() as *mut ObjList;
 
         for ev in events {
-            let m = context.alloc_map();
-            let map_ptr = m.as_object().unwrap() as *mut ObjMap;
-            (*result_ptr).add(m);
-            let key_type = context.alloc_string("type".to_string());
+            let map = alloc_map(vm);
+            list_add(vm, result, map);
+            let key_type = alloc_string(vm, "type");
             match ev {
                 EventRecord::CloseRequested => {
-                    let v = context.alloc_string("close".to_string());
-                    (*map_ptr).set(key_type, v);
+                    let v = alloc_string(vm, "close");
+                    map_set(vm, map, key_type, v);
                 }
                 EventRecord::Resized { width, height } => {
-                    let v = context.alloc_string("resize".to_string());
-                    (*map_ptr).set(key_type, v);
-                    let kw = context.alloc_string("width".to_string());
-                    (*map_ptr).set(kw, Value::num(width as f64));
-                    let kh = context.alloc_string("height".to_string());
-                    (*map_ptr).set(kh, Value::num(height as f64));
+                    let v = alloc_string(vm, "resize");
+                    map_set(vm, map, key_type, v);
+                    let kw = alloc_string(vm, "width");
+                    map_set(vm, map, kw, Value::num(width as f64));
+                    let kh = alloc_string(vm, "height");
+                    map_set(vm, map, kh, Value::num(height as f64));
                 }
                 EventRecord::KeyDown { code } => {
-                    let v = context.alloc_string("keyDown".to_string());
-                    (*map_ptr).set(key_type, v);
+                    let v = alloc_string(vm, "keyDown");
+                    map_set(vm, map, key_type, v);
                     // Two-step: commit the key with a null value so
                     // the map's hash table holds the key string
                     // across the next `alloc_string`. Without this
                     // intermediate set, allocating `cv` would
                     // potentially GC `kc` (the key) since `kc` is
                     // only a Rust local, not a GC root.
-                    let kc = context.alloc_string("code".to_string());
-                    (*map_ptr).set(kc, Value::null());
-                    let cv = context.alloc_string(code);
-                    (*map_ptr).set(kc, cv);
+                    let kc = alloc_string(vm, "code");
+                    map_set(vm, map, kc, Value::NULL);
+                    let cv = alloc_string(vm, &code);
+                    map_set(vm, map, kc, cv);
                 }
                 EventRecord::KeyUp { code } => {
-                    let v = context.alloc_string("keyUp".to_string());
-                    (*map_ptr).set(key_type, v);
-                    let kc = context.alloc_string("code".to_string());
-                    (*map_ptr).set(kc, Value::null());
-                    let cv = context.alloc_string(code);
-                    (*map_ptr).set(kc, cv);
+                    let v = alloc_string(vm, "keyUp");
+                    map_set(vm, map, key_type, v);
+                    let kc = alloc_string(vm, "code");
+                    map_set(vm, map, kc, Value::NULL);
+                    let cv = alloc_string(vm, &code);
+                    map_set(vm, map, kc, cv);
                 }
                 EventRecord::MouseMoved { x, y } => {
-                    let v = context.alloc_string("mouseMoved".to_string());
-                    (*map_ptr).set(key_type, v);
-                    let kx = context.alloc_string("x".to_string());
-                    (*map_ptr).set(kx, Value::num(x));
-                    let ky = context.alloc_string("y".to_string());
-                    (*map_ptr).set(ky, Value::num(y));
+                    let v = alloc_string(vm, "mouseMoved");
+                    map_set(vm, map, key_type, v);
+                    let kx = alloc_string(vm, "x");
+                    map_set(vm, map, kx, Value::num(x));
+                    let ky = alloc_string(vm, "y");
+                    map_set(vm, map, ky, Value::num(y));
                 }
                 EventRecord::MouseDown { button } => {
-                    let v = context.alloc_string("mouseDown".to_string());
-                    (*map_ptr).set(key_type, v);
-                    let kb = context.alloc_string("button".to_string());
-                    (*map_ptr).set(kb, Value::null());
-                    let bv = context.alloc_string(button);
-                    (*map_ptr).set(kb, bv);
+                    let v = alloc_string(vm, "mouseDown");
+                    map_set(vm, map, key_type, v);
+                    let kb = alloc_string(vm, "button");
+                    map_set(vm, map, kb, Value::NULL);
+                    let bv = alloc_string(vm, &button);
+                    map_set(vm, map, kb, bv);
                 }
                 EventRecord::MouseUp { button } => {
-                    let v = context.alloc_string("mouseUp".to_string());
-                    (*map_ptr).set(key_type, v);
-                    let kb = context.alloc_string("button".to_string());
-                    (*map_ptr).set(kb, Value::null());
-                    let bv = context.alloc_string(button);
-                    (*map_ptr).set(kb, bv);
+                    let v = alloc_string(vm, "mouseUp");
+                    map_set(vm, map, key_type, v);
+                    let kb = alloc_string(vm, "button");
+                    map_set(vm, map, kb, Value::NULL);
+                    let bv = alloc_string(vm, &button);
+                    map_set(vm, map, kb, bv);
                 }
             }
         }
@@ -622,13 +578,12 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut VM) {
 /// Build the platform-tagged raw-window-handle Map @hatch:gpu's
 /// `Device.createSurface` accepts.
 #[no_mangle]
-pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => {
-                ctx(vm)
-                    .runtime_error("Window.handle: id must be a non-negative number.".to_string());
+                runtime_error(vm, "Window.handle: id must be a non-negative number.");
                 return;
             }
         };
@@ -646,9 +601,7 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
             }
         });
         let Some((win, _disp)) = handles else {
-            ctx(vm).runtime_error(
-                "Window.handle: unknown window id or handle unavailable.".to_string(),
-            );
+            runtime_error(vm, "Window.handle: unknown window id or handle unavailable.");
             return;
         };
 
@@ -664,55 +617,54 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
         // reason: shorter window between key alloc and value
         // commit.
         use raw_window_handle::RawWindowHandle;
-        let context = ctx(vm);
-        let map = context.alloc_map();
+        
+        let map = alloc_map(vm);
         set_return(vm, map);
-        let map_ptr = map.as_object().unwrap() as *mut ObjMap;
-        let key_platform = context.alloc_string("platform".to_string());
-        (*map_ptr).set(key_platform, Value::null());
+        let key_platform = alloc_string(vm, "platform");
+        map_set(vm, map, key_platform, Value::NULL);
 
         match win {
             RawWindowHandle::AppKit(h) => {
-                let v = context.alloc_string("appkit".to_string());
-                (*map_ptr).set(key_platform, v);
-                let kv = context.alloc_string("ns_view".to_string());
-                (*map_ptr).set(kv, Value::num(h.ns_view.as_ptr() as usize as f64));
+                let v = alloc_string(vm, "appkit");
+                map_set(vm, map, key_platform, v);
+                let kv = alloc_string(vm, "ns_view");
+                map_set(vm, map, kv, Value::num(h.ns_view.as_ptr() as usize as f64));
             }
             RawWindowHandle::UiKit(h) => {
-                let v = context.alloc_string("uikit".to_string());
-                (*map_ptr).set(key_platform, v);
-                let kv = context.alloc_string("ui_view".to_string());
-                (*map_ptr).set(kv, Value::num(h.ui_view.as_ptr() as usize as f64));
+                let v = alloc_string(vm, "uikit");
+                map_set(vm, map, key_platform, v);
+                let kv = alloc_string(vm, "ui_view");
+                map_set(vm, map, kv, Value::num(h.ui_view.as_ptr() as usize as f64));
             }
             RawWindowHandle::Win32(h) => {
-                let v = context.alloc_string("win32".to_string());
-                (*map_ptr).set(key_platform, v);
-                let kh = context.alloc_string("hwnd".to_string());
-                (*map_ptr).set(kh, Value::num(h.hwnd.get() as f64));
+                let v = alloc_string(vm, "win32");
+                map_set(vm, map, key_platform, v);
+                let kh = alloc_string(vm, "hwnd");
+                map_set(vm, map, kh, Value::num(h.hwnd.get() as f64));
                 if let Some(hi) = h.hinstance {
-                    let key_hinstance = context.alloc_string("hinstance".to_string());
-                    (*map_ptr).set(key_hinstance, Value::num(hi.get() as f64));
+                    let key_hinstance = alloc_string(vm, "hinstance");
+                    map_set(vm, map, key_hinstance, Value::num(hi.get() as f64));
                 }
             }
             RawWindowHandle::Xlib(h) => {
-                let v = context.alloc_string("xlib".to_string());
-                (*map_ptr).set(key_platform, v);
-                let kw = context.alloc_string("window".to_string());
-                (*map_ptr).set(kw, Value::num(h.window as f64));
+                let v = alloc_string(vm, "xlib");
+                map_set(vm, map, key_platform, v);
+                let kw = alloc_string(vm, "window");
+                map_set(vm, map, kw, Value::num(h.window as f64));
                 if h.visual_id != 0 {
-                    let kvi = context.alloc_string("visual_id".to_string());
-                    (*map_ptr).set(kvi, Value::num(h.visual_id as f64));
+                    let kvi = alloc_string(vm, "visual_id");
+                    map_set(vm, map, kvi, Value::num(h.visual_id as f64));
                 }
             }
             RawWindowHandle::Wayland(h) => {
-                let v = context.alloc_string("wayland".to_string());
-                (*map_ptr).set(key_platform, v);
-                let ks = context.alloc_string("surface".to_string());
-                (*map_ptr).set(ks, Value::num(h.surface.as_ptr() as usize as f64));
+                let v = alloc_string(vm, "wayland");
+                map_set(vm, map, key_platform, v);
+                let ks = alloc_string(vm, "surface");
+                map_set(vm, map, ks, Value::num(h.surface.as_ptr() as usize as f64));
             }
             other => {
-                let v = context.alloc_string(format!("{:?}", other).to_lowercase());
-                (*map_ptr).set(key_platform, v);
+                let v = alloc_string(vm, &format!("{:?}", other).to_lowercase());
+                map_set(vm, map, key_platform, v);
             }
         }
 
@@ -727,19 +679,19 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut VM) {
                     match disp.as_raw() {
                         RawDisplayHandle::Xlib(d) => {
                             if let Some(p) = d.display {
-                                let key = context.alloc_string("display".to_string());
-                                (*map_ptr).set(key, Value::num(p.as_ptr() as usize as f64));
+                                let key = alloc_string(vm, "display");
+                                map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
                             }
                         }
                         RawDisplayHandle::Xcb(d) => {
                             if let Some(p) = d.connection {
-                                let key = context.alloc_string("connection".to_string());
-                                (*map_ptr).set(key, Value::num(p.as_ptr() as usize as f64));
+                                let key = alloc_string(vm, "connection");
+                                map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
                             }
                         }
                         RawDisplayHandle::Wayland(d) => {
-                            let key = context.alloc_string("display".to_string());
-                            (*map_ptr).set(key, Value::num(d.display.as_ptr() as usize as f64));
+                            let key = alloc_string(vm, "display");
+                            map_set(vm, map, key, Value::num(d.display.as_ptr() as usize as f64));
                         }
                         _ => {}
                     }

@@ -6562,7 +6562,7 @@ version = "0.1.3"
 dependencies = [
  "cpal",
  "hound",
- "wren_lift",
+ "wlift_abi",
 ]
 
 [[package]]
@@ -6574,7 +6574,7 @@ dependencies = [
  "pollster",
  "raw-window-handle",
  "wgpu",
- "wren_lift",
+ "wlift_abi",
 ]
 
 [[package]]
@@ -6590,7 +6590,7 @@ name = "wlift_image"
 version = "0.1.5"
 dependencies = [
  "image",
- "wren_lift",
+ "wlift_abi",
 ]
 
 [[package]]
@@ -6611,7 +6611,7 @@ version = "0.1.4"
 dependencies = [
  "rapier2d",
  "rapier3d",
- "wren_lift",
+ "wlift_abi",
 ]
 
 [[package]]
@@ -6654,7 +6654,7 @@ version = "0.2.9"
 dependencies = [
  "raw-window-handle",
  "winit",
- "wren_lift",
+ "wlift_abi",
 ]
 
 [[package]]

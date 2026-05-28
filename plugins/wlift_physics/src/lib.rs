@@ -22,9 +22,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use wren_lift::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType};
-use wren_lift::runtime::value::Value;
-use wren_lift::runtime::vm::VM;
+use wlift_abi::{
+    alloc_list, list_add, list_count, list_get, map_iter, obj_type, runtime_error, set_return,
+    slot, string_str, ObjType, Value, WrenVm,
+};
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
 ///
@@ -37,110 +38,71 @@ use wren_lift::runtime::vm::VM;
 #[cfg(not(target_arch = "wasm32"))]
 #[no_mangle]
 pub extern "C" fn wlift_plugin_abi_version() -> u32 {
-    wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+    wlift_abi::ABI_VERSION
 }
 
 // ---------------------------------------------------------------------------
-// Slot helpers (mirror sibling plugins)
+// Helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn slot(vm: *mut VM, index: usize) -> Value {
-    unsafe {
-        let stack = &(*vm).api_stack;
-        stack.get(index).copied().unwrap_or(Value::null())
-    }
+fn string_of(v: Value) -> Option<String> {
+    string_str(v).map(|s| s.to_string())
 }
 
-unsafe fn set_return(vm: *mut VM, v: Value) {
-    unsafe {
-        let stack = &mut (*vm).api_stack;
-        if stack.is_empty() {
-            stack.push(v);
-        } else {
-            stack[0] = v;
-        }
-    }
-}
-
-unsafe fn ctx<'a>(vm: *mut VM) -> &'a mut VM {
-    unsafe { &mut *vm }
-}
-
-unsafe fn string_of(v: Value) -> Option<String> {
-    if !v.is_object() {
+fn map_get(v: Value, key: &str) -> Option<Value> {
+    if obj_type(v) != Some(ObjType::Map) {
         return None;
     }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::String {
-        return None;
-    }
-    let s = ptr as *const ObjString;
-    Some(unsafe { (*s).as_str().to_string() })
-}
-
-unsafe fn map_get(v: Value, key: &str) -> Option<Value> {
-    if !v.is_object() {
-        return None;
-    }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::Map {
-        return None;
-    }
-    let map = ptr as *const ObjMap;
-    unsafe {
-        for (k, val) in (*map).entries.iter() {
-            if let Some(s) = string_of(k.0) {
-                if s == key {
-                    return Some(*val);
-                }
+    for (k, val) in map_iter(v) {
+        if let Some(s) = string_str(k) {
+            if s == key {
+                return Some(val);
             }
         }
     }
     None
 }
 
-unsafe fn list_view<'a>(v: Value) -> Option<&'a ObjList> {
-    if !v.is_object() {
-        return None;
-    }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::List {
-        return None;
-    }
-    Some(unsafe { &*(ptr as *const ObjList) })
-}
-
-unsafe fn read_num_at(list: &ObjList, i: usize, default: f64) -> f64 {
-    if i >= list.count as usize {
+fn read_num_at(list_v: Value, i: u32, default: f64) -> f64 {
+    if i >= list_count(list_v) {
         return default;
     }
-    unsafe { *list.elements.add(i) }.as_num().unwrap_or(default)
+    list_get(list_v, i).as_num().unwrap_or(default)
 }
 
-unsafe fn read_2d(list_v: Value) -> Option<(f32, f32)> {
-    let list = unsafe { list_view(list_v)? };
-    if list.count < 2 {
+fn read_2d(list_v: Value) -> Option<(f32, f32)> {
+    if obj_type(list_v) != Some(ObjType::List) || list_count(list_v) < 2 {
         return None;
     }
     Some((
-        unsafe { read_num_at(list, 0, 0.0) } as f32,
-        unsafe { read_num_at(list, 1, 0.0) } as f32,
+        read_num_at(list_v, 0, 0.0) as f32,
+        read_num_at(list_v, 1, 0.0) as f32,
     ))
 }
 
-unsafe fn read_3d(list_v: Value) -> Option<(f32, f32, f32)> {
-    let list = unsafe { list_view(list_v)? };
-    if list.count < 3 {
+fn read_3d(list_v: Value) -> Option<(f32, f32, f32)> {
+    if obj_type(list_v) != Some(ObjType::List) || list_count(list_v) < 3 {
         return None;
     }
     Some((
-        unsafe { read_num_at(list, 0, 0.0) } as f32,
-        unsafe { read_num_at(list, 1, 0.0) } as f32,
-        unsafe { read_num_at(list, 2, 0.0) } as f32,
+        read_num_at(list_v, 0, 0.0) as f32,
+        read_num_at(list_v, 1, 0.0) as f32,
+        read_num_at(list_v, 2, 0.0) as f32,
     ))
+}
+
+/// Allocate a list, push it as the return value (rooting it via
+/// `api_stack[0]`), then append each Value via `list_add` — the
+/// host helper re-reads the list pointer from the GC-tracked
+/// root before each append, so a forwarded list under a moving
+/// nursery stays consistent.
+fn return_list(vm: *mut WrenVm, values: &[Value]) {
+    let list = alloc_list(vm, values.len() as u32);
+    set_return(vm, list);
+    for v in values {
+        let cur = slot(vm, 0);
+        list_add(vm, cur, *v);
+    }
 }
 
 fn next_id() -> u64 {
@@ -370,7 +332,7 @@ mod d3 {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_create(vm: *mut WrenVm) {
     unsafe {
         let desc = slot(vm, 1);
         let (gx, gy) = map_get(desc, "gravity")
@@ -384,19 +346,19 @@ pub unsafe extern "C" fn wlift_physics_world2d_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_destroy(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => return,
         };
         d2::worlds().lock().unwrap().remove(&id);
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_step(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_step(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
@@ -406,16 +368,16 @@ pub unsafe extern "C" fn wlift_physics_world2d_step(vm: *mut VM) {
         if let Some(w) = d2::worlds().lock().unwrap().get_mut(&id) {
             w.step(dt);
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
-unsafe fn read_world2d_id(vm: *mut VM, slot_index: usize, label: &str) -> Option<u64> {
+unsafe fn read_world2d_id(vm: *mut WrenVm, slot_index: u32, label: &str) -> Option<u64> {
     unsafe {
         match slot(vm, slot_index).as_num() {
             Some(n) if n >= 0.0 => Some(n as u64),
             _ => {
-                ctx(vm).runtime_error(format!(
+                runtime_error(vm, &format!(
                     "{}: world id must be a non-negative integer.",
                     label
                 ));
@@ -425,7 +387,7 @@ unsafe fn read_world2d_id(vm: *mut VM, slot_index: usize, label: &str) -> Option
     }
 }
 
-unsafe fn spawn_2d(vm: *mut VM, body_kind: &str) {
+unsafe fn spawn_2d(vm: *mut WrenVm, body_kind: &str) {
     use rapier2d::prelude::*;
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.spawn") {
@@ -454,17 +416,15 @@ unsafe fn spawn_2d(vm: *mut VM, body_kind: &str) {
             Some(s) => match d2::collider_from_desc(s) {
                 Some(c) => c,
                 None => {
-                    ctx(vm).runtime_error(
-                        "World2D.spawn: descriptor `shape` is missing or has unknown `kind`."
-                            .to_string(),
+                    runtime_error(
+                        vm,
+                        "World2D.spawn: descriptor `shape` is missing or has unknown `kind`.",
                     );
                     return;
                 }
             },
             None => {
-                ctx(vm).runtime_error(
-                    "World2D.spawn: descriptor must include a `shape` Map.".to_string(),
-                );
+                runtime_error(vm, "World2D.spawn: descriptor must include a `shape` Map.");
                 return;
             }
         };
@@ -474,7 +434,7 @@ unsafe fn spawn_2d(vm: *mut VM, body_kind: &str) {
             Some(w) => w,
             None => {
                 drop(reg);
-                ctx(vm).runtime_error("World2D.spawn: unknown world id.".to_string());
+                runtime_error(vm, "World2D.spawn: unknown world id.");
                 return;
             }
         };
@@ -496,20 +456,20 @@ unsafe fn spawn_2d(vm: *mut VM, body_kind: &str) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_spawn_dynamic(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_spawn_dynamic(vm: *mut WrenVm) {
     unsafe { spawn_2d(vm, "dynamic") }
 }
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_spawn_static(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_spawn_static(vm: *mut WrenVm) {
     unsafe { spawn_2d(vm, "static") }
 }
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_spawn_kinematic(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_spawn_kinematic(vm: *mut WrenVm) {
     unsafe { spawn_2d(vm, "kinematic") }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_despawn(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_despawn(vm: *mut WrenVm) {
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.despawn") {
             Some(i) => i,
@@ -533,20 +493,16 @@ pub unsafe extern "C" fn wlift_physics_world2d_despawn(vm: *mut VM) {
                 );
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
-unsafe fn return_2d_pair(vm: *mut VM, x: f32, y: f32) {
-    unsafe {
-        let context = ctx(vm);
-        let list = context.alloc_list(vec![Value::num(x as f64), Value::num(y as f64)]);
-        set_return(vm, list);
-    }
+unsafe fn return_2d_pair(vm: *mut WrenVm, x: f32, y: f32) {
+    return_list(vm, &[Value::num(x as f64), Value::num(y as f64)])
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_position(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_position(vm: *mut WrenVm) {
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.position") {
             Some(i) => i,
@@ -558,7 +514,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_position(vm: *mut VM) {
             Some(w) => w,
             None => {
                 drop(reg);
-                ctx(vm).runtime_error("World2D.position: unknown world id.".to_string());
+                runtime_error(vm, "World2D.position: unknown world id.");
                 return;
             }
         };
@@ -566,7 +522,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_position(vm: *mut VM) {
             Some(h) => *h,
             None => {
                 drop(reg);
-                ctx(vm).runtime_error("World2D.position: unknown body id.".to_string());
+                runtime_error(vm, "World2D.position: unknown body id.");
                 return;
             }
         };
@@ -579,7 +535,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_position(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_linear_velocity(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_linear_velocity(vm: *mut WrenVm) {
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.linearVelocity") {
             Some(i) => i,
@@ -602,7 +558,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_linear_velocity(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_set_linear_velocity(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_set_linear_velocity(vm: *mut WrenVm) {
     use rapier2d::prelude::*;
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.setLinearVelocity") {
@@ -618,12 +574,12 @@ pub unsafe extern "C" fn wlift_physics_world2d_set_linear_velocity(vm: *mut VM) 
                 world.bodies[handle].set_linvel(Vector::new(x, y), true);
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_apply_impulse(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_apply_impulse(vm: *mut WrenVm) {
     use rapier2d::prelude::*;
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.applyImpulse") {
@@ -639,12 +595,12 @@ pub unsafe extern "C" fn wlift_physics_world2d_apply_impulse(vm: *mut VM) {
                 world.bodies[handle].apply_impulse(Vector::new(x, y), true);
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world2d_apply_force(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world2d_apply_force(vm: *mut WrenVm) {
     use rapier2d::prelude::*;
     unsafe {
         let world_id = match read_world2d_id(vm, 1, "World2D.applyForce") {
@@ -660,7 +616,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_apply_force(vm: *mut VM) {
                 world.bodies[handle].add_force(Vector::new(x, y), true);
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
@@ -669,7 +625,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_apply_force(vm: *mut VM) {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_create(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_create(vm: *mut WrenVm) {
     unsafe {
         let desc = slot(vm, 1);
         let (gx, gy, gz) = map_get(desc, "gravity")
@@ -683,19 +639,19 @@ pub unsafe extern "C" fn wlift_physics_world3d_create(vm: *mut VM) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_destroy(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_destroy(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
             _ => return,
         };
         d3::worlds().lock().unwrap().remove(&id);
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_step(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_step(vm: *mut WrenVm) {
     unsafe {
         let id = match slot(vm, 1).as_num() {
             Some(n) if n >= 0.0 => n as u64,
@@ -705,11 +661,11 @@ pub unsafe extern "C" fn wlift_physics_world3d_step(vm: *mut VM) {
         if let Some(w) = d3::worlds().lock().unwrap().get_mut(&id) {
             w.step(dt);
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
-unsafe fn spawn_3d(vm: *mut VM, body_kind: &str) {
+unsafe fn spawn_3d(vm: *mut WrenVm, body_kind: &str) {
     use rapier3d::prelude::*;
     unsafe {
         let world_id = match slot(vm, 1).as_num() {
@@ -738,17 +694,15 @@ unsafe fn spawn_3d(vm: *mut VM, body_kind: &str) {
             Some(s) => match d3::collider_from_desc(s) {
                 Some(c) => c,
                 None => {
-                    ctx(vm).runtime_error(
-                        "World3D.spawn: descriptor `shape` is missing or has unknown `kind`."
-                            .to_string(),
+                    runtime_error(
+                        vm,
+                        "World3D.spawn: descriptor `shape` is missing or has unknown `kind`.",
                     );
                     return;
                 }
             },
             None => {
-                ctx(vm).runtime_error(
-                    "World3D.spawn: descriptor must include a `shape` Map.".to_string(),
-                );
+                runtime_error(vm, "World3D.spawn: descriptor must include a `shape` Map.");
                 return;
             }
         };
@@ -758,7 +712,7 @@ unsafe fn spawn_3d(vm: *mut VM, body_kind: &str) {
             Some(w) => w,
             None => {
                 drop(reg);
-                ctx(vm).runtime_error("World3D.spawn: unknown world id.".to_string());
+                runtime_error(vm, "World3D.spawn: unknown world id.");
                 return;
             }
         };
@@ -779,20 +733,20 @@ unsafe fn spawn_3d(vm: *mut VM, body_kind: &str) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_spawn_dynamic(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_spawn_dynamic(vm: *mut WrenVm) {
     unsafe { spawn_3d(vm, "dynamic") }
 }
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_spawn_static(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_spawn_static(vm: *mut WrenVm) {
     unsafe { spawn_3d(vm, "static") }
 }
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_spawn_kinematic(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_spawn_kinematic(vm: *mut WrenVm) {
     unsafe { spawn_3d(vm, "kinematic") }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_position(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_position(vm: *mut WrenVm) {
     unsafe {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
         let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
@@ -807,18 +761,19 @@ pub unsafe extern "C" fn wlift_physics_world3d_position(vm: *mut VM) {
             })
             .unwrap_or((0.0, 0.0, 0.0));
         drop(reg);
-        let context = ctx(vm);
-        let list = context.alloc_list(vec![
-            Value::num(x as f64),
-            Value::num(y as f64),
-            Value::num(z as f64),
-        ]);
-        set_return(vm, list);
+        return_list(
+            vm,
+            &[
+                Value::num(x as f64),
+                Value::num(y as f64),
+                Value::num(z as f64),
+            ],
+        );
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_linear_velocity(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_linear_velocity(vm: *mut WrenVm) {
     unsafe {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
         let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
@@ -833,18 +788,19 @@ pub unsafe extern "C" fn wlift_physics_world3d_linear_velocity(vm: *mut VM) {
             })
             .unwrap_or((0.0, 0.0, 0.0));
         drop(reg);
-        let context = ctx(vm);
-        let list = context.alloc_list(vec![
-            Value::num(vx as f64),
-            Value::num(vy as f64),
-            Value::num(vz as f64),
-        ]);
-        set_return(vm, list);
+        return_list(
+            vm,
+            &[
+                Value::num(vx as f64),
+                Value::num(vy as f64),
+                Value::num(vz as f64),
+            ],
+        );
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_set_linear_velocity(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_set_linear_velocity(vm: *mut WrenVm) {
     use rapier3d::prelude::*;
     unsafe {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
@@ -858,12 +814,12 @@ pub unsafe extern "C" fn wlift_physics_world3d_set_linear_velocity(vm: *mut VM) 
                 world.bodies[handle].set_linvel(Vector::new(x, y, z), true);
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_apply_impulse(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_apply_impulse(vm: *mut WrenVm) {
     use rapier3d::prelude::*;
     unsafe {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
@@ -877,12 +833,12 @@ pub unsafe extern "C" fn wlift_physics_world3d_apply_impulse(vm: *mut VM) {
                 world.bodies[handle].apply_impulse(Vector::new(x, y, z), true);
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_apply_force(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_apply_force(vm: *mut WrenVm) {
     use rapier3d::prelude::*;
     unsafe {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
@@ -896,12 +852,12 @@ pub unsafe extern "C" fn wlift_physics_world3d_apply_force(vm: *mut VM) {
                 world.bodies[handle].add_force(Vector::new(x, y, z), true);
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut VM) {
+pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut WrenVm) {
     unsafe {
         let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
         let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
@@ -919,7 +875,7 @@ pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut VM) {
                 );
             }
         }
-        set_return(vm, Value::null());
+        set_return(vm, Value::NULL);
     }
 }
 
@@ -942,127 +898,31 @@ pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut VM) {
 /// compiled there at all.
 #[cfg(target_arch = "wasm32")]
 pub fn register_static_symbols() {
-    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
-    // SAFETY: each export is `unsafe extern "C" fn(*mut VM)` with
+    // register_plugin_symbol_unsafe is now wlift_abi::register_symbol below.
+    // SAFETY: each export is `unsafe extern "C" fn(*mut WrenVm)` with
     // the same ABI the host build dispatches via `dlsym`.
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_create",
-        wlift_physics_world2d_create,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_destroy",
-        wlift_physics_world2d_destroy,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_step",
-        wlift_physics_world2d_step,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_spawn_dynamic",
-        wlift_physics_world2d_spawn_dynamic,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_spawn_static",
-        wlift_physics_world2d_spawn_static,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_spawn_kinematic",
-        wlift_physics_world2d_spawn_kinematic,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_despawn",
-        wlift_physics_world2d_despawn,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_position",
-        wlift_physics_world2d_position,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_linear_velocity",
-        wlift_physics_world2d_linear_velocity,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_set_linear_velocity",
-        wlift_physics_world2d_set_linear_velocity,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_apply_impulse",
-        wlift_physics_world2d_apply_impulse,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world2d_apply_force",
-        wlift_physics_world2d_apply_force,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_create",
-        wlift_physics_world3d_create,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_destroy",
-        wlift_physics_world3d_destroy,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_step",
-        wlift_physics_world3d_step,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_spawn_dynamic",
-        wlift_physics_world3d_spawn_dynamic,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_spawn_static",
-        wlift_physics_world3d_spawn_static,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_spawn_kinematic",
-        wlift_physics_world3d_spawn_kinematic,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_despawn",
-        wlift_physics_world3d_despawn,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_position",
-        wlift_physics_world3d_position,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_linear_velocity",
-        wlift_physics_world3d_linear_velocity,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_set_linear_velocity",
-        wlift_physics_world3d_set_linear_velocity,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_apply_impulse",
-        wlift_physics_world3d_apply_impulse,
-    );
-    register_plugin_symbol_unsafe(
-        "wlift_physics",
-        "wlift_physics_world3d_apply_force",
-        wlift_physics_world3d_apply_force,
-    );
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_create", wlift_physics_world2d_create as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_destroy", wlift_physics_world2d_destroy as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_step", wlift_physics_world2d_step as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_spawn_dynamic", wlift_physics_world2d_spawn_dynamic as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_spawn_static", wlift_physics_world2d_spawn_static as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_spawn_kinematic", wlift_physics_world2d_spawn_kinematic as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_despawn", wlift_physics_world2d_despawn as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_position", wlift_physics_world2d_position as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_linear_velocity", wlift_physics_world2d_linear_velocity as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_set_linear_velocity", wlift_physics_world2d_set_linear_velocity as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_apply_impulse", wlift_physics_world2d_apply_impulse as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world2d_apply_force", wlift_physics_world2d_apply_force as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_create", wlift_physics_world3d_create as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_destroy", wlift_physics_world3d_destroy as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_step", wlift_physics_world3d_step as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_spawn_dynamic", wlift_physics_world3d_spawn_dynamic as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_spawn_static", wlift_physics_world3d_spawn_static as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_spawn_kinematic", wlift_physics_world3d_spawn_kinematic as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_despawn", wlift_physics_world3d_despawn as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_position", wlift_physics_world3d_position as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_linear_velocity", wlift_physics_world3d_linear_velocity as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_set_linear_velocity", wlift_physics_world3d_set_linear_velocity as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_apply_impulse", wlift_physics_world3d_apply_impulse as *const ()) };
+    unsafe { wlift_abi::register_symbol("wlift_physics", "wlift_physics_world3d_apply_force", wlift_physics_world3d_apply_force as *const ()) };
 }

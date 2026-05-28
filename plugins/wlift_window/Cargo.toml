@@ -3,17 +3,16 @@ name = "wlift_window"
 version = "0.2.9"
 edition = "2021"
 description = "Default window provider for the WrenLift apps — a winit-backed cdylib bundled into @hatch:window. Exposes a polled event loop and a raw-window-handle Map that @hatch:gpu's Device.createSurface accepts."
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-# `features = ["host"]` matches the binary's view of `wren_lift`,
-# so host-gated fields in `VM` / `NativeContext` line up. Without
-# it the plugin's `&mut VM` decode is offset → silent SIGSEGV on
-# the first foreign-method dispatch. `default-features = false`
-# still keeps `cranelift` out — the JIT bloat doesn't belong here.
-wren_lift = { path = "../..", default-features = false, features = ["host"] }
+# Only the header-only `wlift_abi` crate on the plugin side. No
+# `wren_lift` dep — VM/Gc/Obj* layout changes can't reach plugin
+# code anymore.
+wlift_abi = { path = "../../crates/wlift_abi" }
 
 # winit 0.30: pump_events drives a polled loop that fits Wren's
 # cooperative-fiber game loop. Earlier versions (≤ 0.29) require

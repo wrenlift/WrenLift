@@ -3,16 +3,16 @@ name = "wlift_audio"
 version = "0.1.3"
 edition = "2021"
 description = "Audio playback for the WrenLift apps. cpal-backed output stream + a tiny mixer; WAV decoding via hound. Bundled into @hatch:audio."
+build = "build.rs"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-# `features = ["host"]` matches the binary's view of `wren_lift`,
-# so host-gated fields in `VM` / `NativeContext` line up. Without
-# it the plugin's `&mut VM` decode is offset → silent SIGSEGV on
-# the first foreign-method dispatch. `default-features = false`
-# still keeps `cranelift` out — the JIT bloat doesn't belong here.
-wren_lift = { path = "../..", default-features = false, features = ["host"] }
+# Only the header-only `wlift_abi` crate on the plugin side. No
+# `wren_lift` dep — the host process exports the `wlift_plugin_*`
+# symbols and the dynamic linker resolves the plugin's externs
+# against them at dlopen.
+wlift_abi = { path = "../../crates/wlift_abi" }
 cpal  = "0.17"
 hound = "3.5"

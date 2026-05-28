@@ -1,6 +1,10 @@
 //! Audio plugin for WrenLift. Built as a cdylib, bundled into
 //! @hatch:audio. Output via cpal; WAV decode via hound.
 //!
+//! Host interaction goes through `wlift_abi`'s C-ABI shim — no
+//! `wren_lift` Rust dep, so VM/Gc layout changes can't reach
+//! plugin code.
+//!
 //! # Architecture
 //!
 //! One global `AudioContext` per process — opens cpal's default
@@ -8,11 +12,6 @@
 //! reads from a `Mutex<Vec<Voice>>`. Voices reference cached PCM
 //! samples by id; play() pushes a Voice into the mix list, the
 //! audio thread advances each voice every callback.
-//!
-//! Wren-side, `Sound` is a handle to decoded PCM samples kept in
-//! a per-process registry. `audio.play(sound)` creates one Voice
-//! at a time — same sound can be played concurrently any number
-//! of times; no automatic deduplication.
 //!
 //! Format: f32 stereo at the device's preferred sample rate. WAV
 //! sources are resampled with a naive nearest-neighbour pass
@@ -28,115 +27,71 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use wren_lift::runtime::object::{
-    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
+use wlift_abi::{
+    list_count, list_get, map_iter, obj_type, runtime_error, set_return, slot, string_str,
+    typed_array_bytes, typed_array_kind, ObjType, TypedArrayKind, Value, WrenVm,
 };
-use wren_lift::runtime::value::Value;
-use wren_lift::runtime::vm::VM;
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
 #[no_mangle]
 pub extern "C" fn wlift_plugin_abi_version() -> u32 {
-    wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+    wlift_abi::ABI_VERSION
 }
 
 // ---------------------------------------------------------------------------
-// Slot helpers (mirror sibling plugins)
+// Helpers
 // ---------------------------------------------------------------------------
 
-unsafe fn slot(vm: *mut VM, index: usize) -> Value {
-    unsafe {
-        let stack = &(*vm).api_stack;
-        stack.get(index).copied().unwrap_or(Value::null())
-    }
+fn string_of(v: Value) -> Option<String> {
+    string_str(v).map(|s| s.to_string())
 }
 
-unsafe fn set_return(vm: *mut VM, v: Value) {
-    unsafe {
-        let stack = &mut (*vm).api_stack;
-        if stack.is_empty() {
-            stack.push(v);
-        } else {
-            stack[0] = v;
-        }
-    }
-}
-
-unsafe fn ctx<'a>(vm: *mut VM) -> &'a mut VM {
-    unsafe { &mut *vm }
-}
-
-unsafe fn string_of(v: Value) -> Option<String> {
-    if !v.is_object() {
+fn map_get(map: Value, key: &str) -> Option<Value> {
+    if obj_type(map) != Some(ObjType::Map) {
         return None;
     }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::String {
-        return None;
-    }
-    let s = ptr as *const ObjString;
-    Some(unsafe { (*s).as_str().to_string() })
-}
-
-unsafe fn map_get(v: Value, key: &str) -> Option<Value> {
-    if !v.is_object() {
-        return None;
-    }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::Map {
-        return None;
-    }
-    let map = ptr as *const ObjMap;
-    unsafe {
-        for (k, val) in (*map).entries.iter() {
-            if let Some(s) = string_of(k.0) {
-                if s == key {
-                    return Some(*val);
-                }
+    for (k, val) in map_iter(map) {
+        if let Some(s) = string_str(k) {
+            if s == key {
+                return Some(val);
             }
         }
     }
     None
 }
 
-unsafe fn read_byte_buffer(vm: &mut VM, v: Value, label: &str) -> Option<Vec<u8>> {
+fn read_byte_buffer(vm: *mut WrenVm, v: Value, label: &str) -> Option<Vec<u8>> {
     if !v.is_object() {
-        vm.runtime_error(format!("{}: expected a List<Num> or ByteArray.", label));
+        runtime_error(vm, &format!("{}: expected a List<Num> or ByteArray.", label));
         return None;
     }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    match unsafe { (*header).obj_type } {
-        ObjType::List => {
-            let list = ptr as *const ObjList;
-            let n = unsafe { (*list).count } as usize;
-            let mut out = Vec::with_capacity(n);
+    match obj_type(v) {
+        Some(ObjType::List) => {
+            let n = list_count(v);
+            let mut out = Vec::with_capacity(n as usize);
             for i in 0..n {
-                let entry = unsafe { *(*list).elements.add(i) };
-                let v = match entry.as_num() {
+                let entry = list_get(v, i);
+                let byte = match entry.as_num() {
                     Some(v) if (0.0..=255.0).contains(&v) && v.fract() == 0.0 => v as u8,
                     _ => {
-                        vm.runtime_error(format!("{}: byte {} not in 0..=255.", label, i));
+                        runtime_error(vm, &format!("{}: byte {} not in 0..=255.", label, i));
                         return None;
                     }
                 };
-                out.push(v);
+                out.push(byte);
             }
             Some(out)
         }
-        ObjType::TypedArray => {
-            let arr = ptr as *const ObjTypedArray;
-            if unsafe { (*arr).kind_tag() } == TypedArrayKind::U8 {
-                Some(unsafe { (*arr).as_bytes() }.to_vec())
+        Some(ObjType::TypedArray) => {
+            if typed_array_kind(v) == Some(TypedArrayKind::U8) {
+                Some(typed_array_bytes(v).map(|b| b.to_vec()).unwrap_or_default())
             } else {
-                vm.runtime_error(format!("{}: typed array must be ByteArray (u8).", label));
+                runtime_error(vm, &format!("{}: typed array must be ByteArray (u8).", label));
                 None
             }
         }
         _ => {
-            vm.runtime_error(format!("{}: expected a List<Num> or ByteArray.", label));
+            runtime_error(vm, &format!("{}: expected a List<Num> or ByteArray.", label));
             None
         }
     }
@@ -165,10 +120,6 @@ struct Voice {
     /// queries. The mixer doesn't read it on the hot path.
     #[allow(dead_code)]
     sound_id: u64,
-    /// Cached strong reference to the sample buffer so the audio
-    /// thread can iterate without locking the sounds map. `Arc`
-    /// keeps the bytes alive even if `unload` runs while the
-    /// voice still has frames left.
     samples: Arc<Vec<f32>>,
     cursor: usize, // index into samples (already in stereo frames * 2)
     volume: f32,
@@ -185,8 +136,7 @@ fn mixer() -> &'static Mutex<MixerState> {
 /// We don't expose the `cpal::Stream` to safe Rust — it isn't
 /// `Send` on macOS. Wrap it inside a Mutex on a thread-local
 /// stash; we only ever touch it from the thread that called
-/// `Audio.context()`, which is the Wren main thread. When the
-/// holder drops, the stream is paused + dropped automatically.
+/// `Audio.context()`, which is the Wren main thread.
 struct StreamHolder {
     stream: Option<cpal::Stream>,
     sample_rate: u32,
@@ -210,109 +160,99 @@ fn stream_holder() -> &'static Mutex<StreamHolder> {
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_audio_context_init(vm: *mut VM) {
-    unsafe {
-        let mut holder = stream_holder().lock().unwrap();
-        if holder.stream.is_some() {
-            // Already initialised — return idempotently. The caller
-            // can pump `Audio.context()` repeatedly and only the
-            // first one builds the stream.
-            set_return(vm, Value::bool(true));
-            return;
-        }
-
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                ctx(vm).runtime_error("Audio.context: no default output device.".to_string());
-                return;
-            }
-        };
-        let config = match device.default_output_config() {
-            Ok(c) => c,
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Audio.context: default config: {}", e));
-                return;
-            }
-        };
-        let sample_rate = config.sample_rate();
-        let channels = config.channels();
-        let format = config.sample_format();
-        let stream_config: cpal::StreamConfig = config.into();
-
-        // Build the stream callback. Each tick mixes every active
-        // voice into the output buffer at the device's sample rate.
-        // The stream lives until StreamHolder is dropped; cpal pauses
-        // it on drop.
-        let err_fn = |err| eprintln!("wlift_audio: stream error: {}", err);
-        let stream_result = match format {
-            cpal::SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| {
-                    fill_buffer_f32(data, channels);
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::I16 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [i16], _| {
-                    let mut tmp = vec![0.0f32; data.len()];
-                    fill_buffer_f32(&mut tmp, channels);
-                    for (out, src) in data.iter_mut().zip(tmp.iter()) {
-                        let clamped = src.clamp(-1.0, 1.0);
-                        *out = (clamped * i16::MAX as f32) as i16;
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            cpal::SampleFormat::U16 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [u16], _| {
-                    let mut tmp = vec![0.0f32; data.len()];
-                    fill_buffer_f32(&mut tmp, channels);
-                    for (out, src) in data.iter_mut().zip(tmp.iter()) {
-                        let clamped = src.clamp(-1.0, 1.0);
-                        let signed = (clamped * i16::MAX as f32) as i32;
-                        *out = (signed + 32768) as u16;
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            other => {
-                ctx(vm).runtime_error(format!(
-                    "Audio.context: unsupported sample format {:?}.",
-                    other
-                ));
-                return;
-            }
-        };
-        let stream = match stream_result {
-            Ok(s) => s,
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Audio.context: build_output_stream: {}", e));
-                return;
-            }
-        };
-        if let Err(e) = stream.play() {
-            ctx(vm).runtime_error(format!("Audio.context: stream.play: {}", e));
-            return;
-        }
-        holder.stream = Some(stream);
-        holder.sample_rate = sample_rate;
-        holder.channels = channels;
+pub unsafe extern "C" fn wlift_audio_context_init(vm: *mut WrenVm) {
+    let mut holder = stream_holder().lock().unwrap();
+    if holder.stream.is_some() {
+        // Already initialised — return idempotently. The caller can
+        // pump `Audio.context()` repeatedly and only the first one
+        // builds the stream.
         set_return(vm, Value::bool(true));
+        return;
     }
+
+    let host = cpal::default_host();
+    let device = match host.default_output_device() {
+        Some(d) => d,
+        None => {
+            runtime_error(vm, "Audio.context: no default output device.");
+            return;
+        }
+    };
+    let config = match device.default_output_config() {
+        Ok(c) => c,
+        Err(e) => {
+            runtime_error(vm, &format!("Audio.context: default config: {}", e));
+            return;
+        }
+    };
+    let sample_rate = config.sample_rate();
+    let channels = config.channels();
+    let format = config.sample_format();
+    let stream_config: cpal::StreamConfig = config.into();
+
+    let err_fn = |err| eprintln!("wlift_audio: stream error: {}", err);
+    let stream_result = match format {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _| {
+                fill_buffer_f32(data, channels);
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_output_stream(
+            &stream_config,
+            move |data: &mut [i16], _| {
+                let mut tmp = vec![0.0f32; data.len()];
+                fill_buffer_f32(&mut tmp, channels);
+                for (out, src) in data.iter_mut().zip(tmp.iter()) {
+                    let clamped = src.clamp(-1.0, 1.0);
+                    *out = (clamped * i16::MAX as f32) as i16;
+                }
+            },
+            err_fn,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_output_stream(
+            &stream_config,
+            move |data: &mut [u16], _| {
+                let mut tmp = vec![0.0f32; data.len()];
+                fill_buffer_f32(&mut tmp, channels);
+                for (out, src) in data.iter_mut().zip(tmp.iter()) {
+                    let clamped = src.clamp(-1.0, 1.0);
+                    let signed = (clamped * i16::MAX as f32) as i32;
+                    *out = (signed + 32768) as u16;
+                }
+            },
+            err_fn,
+            None,
+        ),
+        other => {
+            runtime_error(
+                vm,
+                &format!("Audio.context: unsupported sample format {:?}.", other),
+            );
+            return;
+        }
+    };
+    let stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => {
+            runtime_error(vm, &format!("Audio.context: build_output_stream: {}", e));
+            return;
+        }
+    };
+    if let Err(e) = stream.play() {
+        runtime_error(vm, &format!("Audio.context: stream.play: {}", e));
+        return;
+    }
+    holder.stream = Some(stream);
+    holder.sample_rate = sample_rate;
+    holder.channels = channels;
+    set_return(vm, Value::bool(true));
 }
 
 /// Mix every active voice into `data` and advance their cursors.
-/// Voices that finish are removed from the list. Channel-count
-/// mismatches between source (always 2) and device output are
-/// handled by replicating mono → stereo or down-mixing stereo →
-/// mono with a halved sum.
 fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
     for s in data.iter_mut() {
         *s = 0.0;
@@ -322,9 +262,6 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
         return;
     }
     let dc = device_channels as usize;
-    // We assume sources are stereo (2 channels). Re-channel as
-    // we go. `frame_count` is the number of multi-channel frames
-    // in `data`.
     let frame_count = data.len() / dc.max(1);
     let mut i = 0;
     while i < mix.voices.len() {
@@ -350,8 +287,6 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
                     data[base + 1] += r * v.volume;
                 }
                 _ => {
-                    // Replicate stereo into the first two slots,
-                    // leave the rest silent (rare surround case).
                     data[base] += l * v.volume;
                     if dc > 1 {
                         data[base + 1] += r * v.volume;
@@ -369,7 +304,6 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
                 i += 1;
             } else {
                 mix.voices.swap_remove(i);
-                // do NOT advance i; swap_remove brought a new entry into this slot.
             }
         } else {
             i += 1;
@@ -381,154 +315,141 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
 // Sound — load + play
 // ---------------------------------------------------------------------------
 
-/// `wlift_audio_sound_load(bytes)` — decode a WAV byte buffer
-/// into f32 stereo PCM. Returns the sound's id.
-///
-/// Naive sample-rate handling: WAV samples are expanded to
-/// stereo if mono, but no resampling is done — sources at a
-/// different rate from the device will be pitch-shifted. A
-/// higher-quality resampler is on the v0+ list.
 #[no_mangle]
-pub unsafe extern "C" fn wlift_audio_sound_load(vm: *mut VM) {
-    unsafe {
-        let bytes = match read_byte_buffer(ctx(vm), slot(vm, 1), "Sound.load") {
-            Some(b) => b,
-            None => return,
-        };
-        let mut reader = match hound::WavReader::new(Cursor::new(&bytes)) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Sound.load: WAV parse: {}", e));
-                return;
-            }
-        };
-        let spec = reader.spec();
-        let channels = spec.channels as usize;
-        let bits = spec.bits_per_sample;
-        let format = spec.sample_format;
+pub unsafe extern "C" fn wlift_audio_sound_load(vm: *mut WrenVm) {
+    let bytes = match read_byte_buffer(vm, slot(vm, 1), "Sound.load") {
+        Some(b) => b,
+        None => return,
+    };
+    let mut reader = match hound::WavReader::new(Cursor::new(&bytes)) {
+        Ok(r) => r,
+        Err(e) => {
+            runtime_error(vm, &format!("Sound.load: WAV parse: {}", e));
+            return;
+        }
+    };
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    let bits = spec.bits_per_sample;
+    let format = spec.sample_format;
 
-        let mut samples: Vec<f32> = Vec::new();
-        match format {
-            hound::SampleFormat::Int => {
-                let max = match bits {
-                    8 => 127.0,
-                    16 => 32767.0,
-                    24 => 8_388_607.0,
-                    32 => 2_147_483_647.0,
-                    _ => 32767.0,
-                };
-                for s in reader.samples::<i32>() {
-                    match s {
-                        Ok(v) => samples.push(v as f32 / max),
-                        Err(e) => {
-                            ctx(vm).runtime_error(format!("Sound.load: sample read: {}", e));
-                            return;
-                        }
-                    }
-                }
-            }
-            hound::SampleFormat::Float => {
-                for s in reader.samples::<f32>() {
-                    match s {
-                        Ok(v) => samples.push(v),
-                        Err(e) => {
-                            ctx(vm).runtime_error(format!("Sound.load: sample read: {}", e));
-                            return;
-                        }
+    let mut samples: Vec<f32> = Vec::new();
+    match format {
+        hound::SampleFormat::Int => {
+            let max = match bits {
+                8 => 127.0,
+                16 => 32767.0,
+                24 => 8_388_607.0,
+                32 => 2_147_483_647.0,
+                _ => 32767.0,
+            };
+            for s in reader.samples::<i32>() {
+                match s {
+                    Ok(v) => samples.push(v as f32 / max),
+                    Err(e) => {
+                        runtime_error(vm, &format!("Sound.load: sample read: {}", e));
+                        return;
                     }
                 }
             }
         }
-        // Mono → stereo expansion (duplicate). >2 channels gets
-        // down-mixed by averaging the first two for now.
-        let stereo: Vec<f32> = if channels == 1 {
-            samples.iter().flat_map(|&s| [s, s]).collect()
-        } else if channels == 2 {
-            samples
-        } else {
-            let frame_count = samples.len() / channels;
-            let mut out = Vec::with_capacity(frame_count * 2);
-            for i in 0..frame_count {
-                let base = i * channels;
-                out.push(samples[base]);
-                out.push(samples[base + 1]);
+        hound::SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                match s {
+                    Ok(v) => samples.push(v),
+                    Err(e) => {
+                        runtime_error(vm, &format!("Sound.load: sample read: {}", e));
+                        return;
+                    }
+                }
             }
-            out
-        };
-
-        let id = next_id();
-        mixer().lock().unwrap().sounds.insert(id, Arc::new(stereo));
-        set_return(vm, Value::num(id as f64));
+        }
     }
+    // Mono → stereo expansion (duplicate). >2 channels gets
+    // down-mixed by averaging the first two for now.
+    let stereo: Vec<f32> = if channels == 1 {
+        samples.iter().flat_map(|&s| [s, s]).collect()
+    } else if channels == 2 {
+        samples
+    } else {
+        let frame_count = samples.len() / channels;
+        let mut out = Vec::with_capacity(frame_count * 2);
+        for i in 0..frame_count {
+            let base = i * channels;
+            out.push(samples[base]);
+            out.push(samples[base + 1]);
+        }
+        out
+    };
+
+    let id = next_id();
+    mixer().lock().unwrap().sounds.insert(id, Arc::new(stereo));
+    set_return(vm, Value::num(id as f64));
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_audio_sound_unload(vm: *mut VM) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                ctx(vm)
-                    .runtime_error("Sound.unload: id must be a non-negative number.".to_string());
-                return;
-            }
-        };
-        mixer().lock().unwrap().sounds.remove(&id);
-        set_return(vm, Value::null());
-    }
+pub unsafe extern "C" fn wlift_audio_sound_unload(vm: *mut WrenVm) {
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Sound.unload: id must be a non-negative number.");
+            return;
+        }
+    };
+    mixer().lock().unwrap().sounds.remove(&id);
+    set_return(vm, Value::NULL);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_audio_play(vm: *mut VM) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                ctx(vm).runtime_error("Audio.play: id must be a non-negative number.".to_string());
-                return;
-            }
-        };
-        let options = slot(vm, 2);
-        let volume = map_get(options, "volume")
-            .and_then(|v| v.as_num())
-            .map(|n| n as f32)
-            .unwrap_or(1.0);
-        let looping = map_get(options, "loop")
-            .map(|v| !v.is_falsy())
-            .unwrap_or(false);
+pub unsafe extern "C" fn wlift_audio_play(vm: *mut WrenVm) {
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Audio.play: id must be a non-negative number.");
+            return;
+        }
+    };
+    let options = slot(vm, 2);
+    let volume = map_get(options, "volume")
+        .and_then(|v| v.as_num())
+        .map(|n| n as f32)
+        .unwrap_or(1.0);
+    let looping = map_get(options, "loop")
+        .map(|v| !is_falsy(v))
+        .unwrap_or(false);
 
-        let mut mix = mixer().lock().unwrap();
-        let samples = match mix.sounds.get(&id) {
-            Some(s) => Arc::clone(s),
-            None => {
-                drop(mix);
-                ctx(vm).runtime_error("Audio.play: unknown sound id.".to_string());
-                return;
-            }
-        };
-        mix.voices.push(Voice {
-            sound_id: id,
-            samples,
-            cursor: 0,
-            volume,
-            looping,
-        });
-        set_return(vm, Value::null());
-    }
+    let mut mix = mixer().lock().unwrap();
+    let samples = match mix.sounds.get(&id) {
+        Some(s) => Arc::clone(s),
+        None => {
+            drop(mix);
+            runtime_error(vm, "Audio.play: unknown sound id.");
+            return;
+        }
+    };
+    mix.voices.push(Voice {
+        sound_id: id,
+        samples,
+        cursor: 0,
+        volume,
+        looping,
+    });
+    set_return(vm, Value::NULL);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_audio_stop_all(vm: *mut VM) {
-    unsafe {
-        mixer().lock().unwrap().voices.clear();
-        set_return(vm, Value::null());
-    }
+pub unsafe extern "C" fn wlift_audio_stop_all(vm: *mut WrenVm) {
+    mixer().lock().unwrap().voices.clear();
+    set_return(vm, Value::NULL);
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_audio_active_voices(vm: *mut VM) {
-    unsafe {
-        let n = mixer().lock().unwrap().voices.len();
-        set_return(vm, Value::num(n as f64));
-    }
+pub unsafe extern "C" fn wlift_audio_active_voices(vm: *mut WrenVm) {
+    let n = mixer().lock().unwrap().voices.len();
+    set_return(vm, Value::num(n as f64));
+}
+
+/// Wren truthiness — anything other than `null` / `false` is truthy.
+fn is_falsy(v: Value) -> bool {
+    v.is_null() || v == Value::FALSE
 }
