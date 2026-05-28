@@ -1065,6 +1065,24 @@ System.print(s.count)
     );
 }
 
+// Regression: multi-`%()` string interpolation inside a closure went
+// through the threaded interpreter, which only emitted op_string_concat
+// for arity-2 chains and noop'd everything else — so any 3+ part
+// interpolation in a closure returned `null` instead of the formatted
+// string.
+#[test]
+fn e2e_threaded_multi_interp_in_closure() {
+    assert_output(
+        r#"
+var f = Fn.new {|x, y, z|
+  System.print("a %(x) b %(y) c %(z)")
+}
+f.call(1, 2, 3)
+"#,
+        "a 1 b 2 c 3",
+    );
+}
+
 // ===========================================================================
 // 13. Imports
 // ===========================================================================
