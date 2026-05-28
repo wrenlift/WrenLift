@@ -568,9 +568,21 @@ async function defaultFetcher(url, name) {
 
 /// Cache key used by `makeCachedFetcher` when `cacheName` isn't
 /// passed explicitly. Registry URLs are content-addressed by
-/// version (`hatch-gpu-0.3.0.hatch`), so a version bump produces
-/// a new URL — the cache never needs invalidation.
-export const DEFAULT_HATCH_CACHE_NAME = "wlift-hatch-bundles-v1";
+/// version (`hatch-gpu-0.3.0.hatch`), so the cache normally never
+/// needs invalidation — a version bump produces a new URL.
+///
+/// Bump the suffix manually when a published asset is *overwritten*
+/// at the same URL (e.g. a CI re-trigger that re-built the same
+/// version with a different wlift). Every browser that previously
+/// resolved against the old bytes will skip the orphaned cache and
+/// re-fetch the corrected payload.
+///
+/// History:
+///   * v1 — initial cache.
+///   * v2 — 2026-05-28: `@hatch:gpu@0.3.0` and `@hatch:game@0.3.0`
+///     were re-bundled after the WrenLift topo-sort fix landed.
+///     The asset URLs didn't change but the bytes did.
+export const DEFAULT_HATCH_CACHE_NAME = "wlift-hatch-bundles-v2";
 
 /// Wrap any `(url, name) -> Uint8Array` fetcher with a Cache-API
 /// memoisation layer that survives page reload, tab close, and
