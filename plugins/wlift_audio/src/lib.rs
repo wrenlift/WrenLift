@@ -56,7 +56,7 @@ fn map_get(map: Value, key: &str) -> Option<Value> {
     None
 }
 
-fn read_byte_buffer(vm: *mut WrenVm, v: Value, label: &str) -> Option<Vec<u8>> {
+unsafe fn read_byte_buffer(vm: *mut WrenVm, v: Value, label: &str) -> Option<Vec<u8>> {
     if !v.is_object() {
         runtime_error(
             vm,

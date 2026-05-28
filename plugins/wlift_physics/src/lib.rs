@@ -96,7 +96,7 @@ fn read_3d(list_v: Value) -> Option<(f32, f32, f32)> {
 /// host helper re-reads the list pointer from the GC-tracked
 /// root before each append, so a forwarded list under a moving
 /// nursery stays consistent.
-fn return_list(vm: *mut WrenVm, values: &[Value]) {
+unsafe fn return_list(vm: *mut WrenVm, values: &[Value]) {
     let list = alloc_list(vm, values.len() as u32);
     set_return(vm, list);
     for v in values {

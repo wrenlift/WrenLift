@@ -298,21 +298,26 @@ extern "C" {
 // invariants documented inline.
 
 /// Read an argument slot. Returns [`Value::NULL`] for out-of-bounds.
+///
+/// # Safety
+/// `vm` must be the live `*mut WrenVm` the host handed to the
+/// current foreign-method entry point. Same contract for every
+/// wrapper below — the function's docs don't repeat it.
 #[inline]
-pub fn slot(vm: *mut WrenVm, idx: u32) -> Value {
+pub unsafe fn slot(vm: *mut WrenVm, idx: u32) -> Value {
     Value(unsafe { wlift_plugin_slot(vm, idx) })
 }
 
 /// Write the return-value slot (api_stack[0]).
 #[inline]
-pub fn set_return(vm: *mut WrenVm, value: Value) {
+pub unsafe fn set_return(vm: *mut WrenVm, value: Value) {
     unsafe { wlift_plugin_set_return(vm, value.0) }
 }
 
 /// Raise a runtime error. The fiber aborts when the foreign call
 /// returns.
 #[inline]
-pub fn runtime_error(vm: *mut WrenVm, msg: &str) {
+pub unsafe fn runtime_error(vm: *mut WrenVm, msg: &str) {
     unsafe {
         wlift_plugin_runtime_error(vm, msg.as_ptr(), msg.len() as u32);
     }
@@ -320,25 +325,25 @@ pub fn runtime_error(vm: *mut WrenVm, msg: &str) {
 
 /// Allocate an [`ObjString`] from a Rust string slice.
 #[inline]
-pub fn alloc_string(vm: *mut WrenVm, s: &str) -> Value {
+pub unsafe fn alloc_string(vm: *mut WrenVm, s: &str) -> Value {
     Value(unsafe { wlift_plugin_alloc_string(vm, s.as_ptr(), s.len() as u32) })
 }
 
 /// Allocate an empty list with the given reserved capacity.
 #[inline]
-pub fn alloc_list(vm: *mut WrenVm, capacity: u32) -> Value {
+pub unsafe fn alloc_list(vm: *mut WrenVm, capacity: u32) -> Value {
     Value(unsafe { wlift_plugin_alloc_list(vm, capacity) })
 }
 
 /// Allocate an empty map.
 #[inline]
-pub fn alloc_map(vm: *mut WrenVm) -> Value {
+pub unsafe fn alloc_map(vm: *mut WrenVm) -> Value {
     Value(unsafe { wlift_plugin_alloc_map(vm) })
 }
 
 /// Allocate a typed array with `count` elements of the given kind.
 #[inline]
-pub fn alloc_typed_array(vm: *mut WrenVm, count: u32, kind: TypedArrayKind) -> Value {
+pub unsafe fn alloc_typed_array(vm: *mut WrenVm, count: u32, kind: TypedArrayKind) -> Value {
     Value(unsafe { wlift_plugin_alloc_typed_array(vm, count, kind as u8) })
 }
 
@@ -390,7 +395,7 @@ pub fn list_get(value: Value, idx: u32) -> Value {
 /// the element if a minor GC fires between the write and the next
 /// allocator call.
 #[inline]
-pub fn list_add(vm: *mut WrenVm, list: Value, value: Value) {
+pub unsafe fn list_add(vm: *mut WrenVm, list: Value, value: Value) {
     unsafe { wlift_plugin_list_add(vm, list.0, value.0) }
 }
 
@@ -426,7 +431,7 @@ pub fn map_iter(map: Value) -> MapIter {
 }
 
 #[inline]
-pub fn map_set(vm: *mut WrenVm, map: Value, key: Value, value: Value) {
+pub unsafe fn map_set(vm: *mut WrenVm, map: Value, key: Value, value: Value) {
     unsafe { wlift_plugin_map_set(vm, map.0, key.0, value.0) }
 }
 

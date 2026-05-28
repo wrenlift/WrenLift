@@ -87,7 +87,7 @@ fn string_of(v: Value) -> Option<String> {
     string_str(v).map(|s| s.to_string())
 }
 
-fn id_of(vm: *mut WrenVm, v: Value, label: &str) -> Option<u64> {
+unsafe fn id_of(vm: *mut WrenVm, v: Value, label: &str) -> Option<u64> {
     match v.as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
         _ => {
@@ -163,7 +163,7 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
     }
 }
 
-fn sql_to_wren(vm: *mut WrenVm, v: SqlValue) -> Value {
+unsafe fn sql_to_wren(vm: *mut WrenVm, v: SqlValue) -> Value {
     match v {
         SqlValue::Null => Value::NULL,
         SqlValue::Integer(i) => Value::num(i as f64),

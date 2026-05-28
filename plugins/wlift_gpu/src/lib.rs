@@ -454,7 +454,7 @@ fn map_get(v: Value, key: &str) -> Option<Value> {
     None
 }
 
-fn id_of(vm: *mut WrenVm, v: Value, label: &str) -> Option<u64> {
+unsafe fn id_of(vm: *mut WrenVm, v: Value, label: &str) -> Option<u64> {
     match v.as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
         _ => {
@@ -3740,7 +3740,7 @@ pub unsafe extern "C" fn wlift_gpu_surface_acquire(vm: *mut WrenVm) {
 // pixel bytes and a layout descriptor and routes them through
 // `queue.write_texture`.
 
-fn read_byte_buffer(vm: *mut WrenVm, v: Value) -> Option<Vec<u8>> {
+unsafe fn read_byte_buffer(vm: *mut WrenVm, v: Value) -> Option<Vec<u8>> {
     if !v.is_object() {
         runtime_error(
             vm,
