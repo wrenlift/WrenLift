@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Linux · Wrenlift docs</title>
+<meta name="description" content="Install Wrenlift on Linux, ship a static binary, AOT cross-compile." />
+<link rel="canonical" href="https://wrenlift.com/docs/platform/linux.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Linux · Wrenlift docs" />
+<meta property="og:description" content="Install Wrenlift on Linux, ship a static binary, AOT cross-compile." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html" class="active">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Platforms</a> <span class="crumb-sep">/</span> <span class="crumb-current">Linux</span>
+    </nav>
+
+    <h1 class="pkg-title">Linux</h1>
+    <p class="pkg-lede">Wrenlift ships as a static binary on Linux — no runtime install, no glibc version dance. AOT compiled programs are real ELF executables you can drop into any container, .deb, or .rpm.</p>
+
+    <div class="pkg-readme">
+      <h2 id="install">Install</h2>
+      <p>The one-liner works on every distro:</p>
+<pre><code>curl -fsSL https://wrenlift.com/install.sh | bash</code></pre>
+      <p>
+        Drops <code>wlift</code>, <code>hatch</code>, and
+        <code>wlift-lsp</code> into <code>~/.local/bin</code>. See
+        the <a href="/docs/install.html">install page</a> for the
+        full set of env-var knobs.
+      </p>
+
+      <h3 id="distro-packages">Distro packages</h3>
+      <p>
+        Per-distro packages aren't published yet. For now grab the
+        binaries from the
+        <a href="https://github.com/wrenlift/WrenLift/releases">release page</a>
+        and bake them into your own <code>.deb</code> / <code>.rpm</code> /
+        <code>PKGBUILD</code> &mdash; the binaries are statically
+        linked and have no runtime deps.
+      </p>
+
+      <h2 id="dependencies">Runtime dependencies</h2>
+      <p>
+        The <code>wlift</code> and <code>hatch</code> binaries are
+        statically compiled &mdash; no glibc version pin, no dynamic
+        libraries to track. Programs built with <code>wlift --aot</code>
+        link the same way.
+      </p>
+      <aside class="note">
+        <b>Exception:</b> plugins (cdylibs that Wren scripts
+        <code>import</code> via <code>@hatch:&lt;name&gt;</code>) may
+        link against additional libraries depending on what the
+        plugin wraps. <code>@hatch:audio</code> needs ALSA on Linux,
+        for instance. The plugin's hatchfile lists what's required.
+      </aside>
+
+      <h2 id="aot">Build an AOT binary</h2>
+<pre><code>wlift my_app.wren --aot ./my_app
+./my_app</code></pre>
+      <p>
+        The output is a regular ELF executable. Inspect it with
+        <code>file</code>:
+      </p>
+<pre><code>$ file ./my_app
+my_app: ELF 64-bit LSB executable, x86-64, ...</code></pre>
+      <p>
+        AOT binaries embed the full WrenLift runtime, so the file
+        is in the 2&ndash;5 MiB range for a hello-world. Strip
+        symbols with <code>strip ./my_app</code> to drop a megabyte
+        or so on release builds.
+      </p>
+
+      <h2 id="cross-compile">Cross-compile from a Linux host</h2>
+      <p>
+        <code>wlift --aot</code> respects the standard Rust
+        <code>--target</code> triples once the matching
+        <code>libwren_lift.a</code> staticlib is on disk. The
+        simplest path is to install Wrenlift on the target machine
+        directly; cross-compiling from a build host requires the
+        matching Rust toolchain to be installed:
+      </p>
+<pre><code>rustup target add aarch64-unknown-linux-gnu
+WLIFT_TARGET=aarch64-unknown-linux-gnu \
+  wlift my_app.wren --aot ./my_app-arm64</code></pre>
+
+      <h2 id="packaging">Packaging</h2>
+      <p>For container builds, the static binary needs no base:</p>
+<pre><code>FROM scratch
+COPY ./my_app /my_app
+ENTRYPOINT ["/my_app"]</code></pre>
+      <p>
+        For Debian / RPM, drop the binary in <code>/usr/local/bin</code>
+        with no <code>Depends:</code> line. The runtime is fully
+        self-contained.
+      </p>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#install">Install</a></li>
+      <li><a href="#dependencies">Runtime dependencies</a></li>
+      <li><a href="#aot">Build an AOT binary</a></li>
+      <li><a href="#cross-compile">Cross-compile from a Linux host</a></li>
+      <li><a href="#packaging">Packaging</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

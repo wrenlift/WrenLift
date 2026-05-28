@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>macOS · Wrenlift docs</title>
+<meta name="description" content="Install Wrenlift on macOS, ship to both Apple Silicon and Intel, sign AOT binaries for distribution." />
+<link rel="canonical" href="https://wrenlift.com/docs/platform/macos.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="macOS · Wrenlift docs" />
+<meta property="og:description" content="Install Wrenlift on macOS, ship to both Apple Silicon and Intel, sign AOT binaries for distribution." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html" class="active">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Platforms</a> <span class="crumb-sep">/</span> <span class="crumb-current">macOS</span>
+    </nav>
+
+    <h1 class="pkg-title">macOS</h1>
+    <p class="pkg-lede">Native arm64 and x86_64 binaries, with notes on shipping AOT-compiled programs through Gatekeeper. The installer picks the right architecture for your machine; for distribution you ship both and let users pick.</p>
+
+    <div class="pkg-readme">
+      <h2 id="install">Install</h2>
+<pre><code>curl -fsSL https://wrenlift.com/install.sh | bash</code></pre>
+      <p>
+        The installer detects your architecture and pulls the
+        matching binary. <code>~/.local/bin</code> ships on the
+        default <code>PATH</code> on recent macOS shells; older
+        bash users may need to add it manually.
+      </p>
+
+      <h2 id="arch">Apple Silicon vs Intel</h2>
+      <p>
+        Both architectures are first-class. The release page ships
+        separate binaries:
+      </p>
+      <table>
+        <thead><tr><th>Asset</th><th>Use on</th></tr></thead>
+        <tbody>
+          <tr><td><code>wlift-aarch64-apple-darwin.tar.gz</code></td><td>M1, M2, M3, M4 (all Apple Silicon).</td></tr>
+          <tr><td><code>wlift-x86_64-apple-darwin.tar.gz</code></td><td>Pre-2020 Intel Macs.</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Verify which one you're running:
+      </p>
+<pre><code>$ file $(which wlift)
+wlift: Mach-O 64-bit executable arm64</code></pre>
+
+      <h2 id="aot">Build an AOT binary</h2>
+<pre><code>wlift my_app.wren --aot ./my_app
+./my_app</code></pre>
+      <p>
+        Output is a regular Mach-O. Inspect with <code>file</code>
+        / <code>otool -L</code>. AOT binaries link the WrenLift
+        runtime statically; they don't depend on
+        <code>libwren_lift</code> being installed on the target
+        machine.
+      </p>
+
+      <h2 id="sign">Code-sign &amp; notarize</h2>
+      <p>
+        Distributing an AOT binary outside the App Store?
+        Gatekeeper will quarantine it unless it's signed and
+        notarized.
+      </p>
+      <ol>
+        <li><b>Sign with hardened runtime:</b>
+<pre><code>codesign --force --options runtime \
+         --sign "Developer ID Application: Your Name (TEAMID)" \
+         ./my_app</code></pre>
+        </li>
+        <li><b>Zip + submit for notarization:</b>
+<pre><code>ditto -ckV --rsrc --keepParent ./my_app ./my_app.zip
+xcrun notarytool submit ./my_app.zip \
+      --apple-id you@example.com \
+      --team-id TEAMID \
+      --password "@keychain:notary-pw" \
+      --wait</code></pre>
+        </li>
+        <li><b>Staple the ticket back onto the binary:</b>
+<pre><code>xcrun stapler staple ./my_app</code></pre>
+        </li>
+      </ol>
+      <aside class="tip">
+        Wrenlift doesn't ship any private entitlements &mdash; the
+        default hardened-runtime profile is enough. If your script
+        loads plugins (cdylibs from
+        <code>@hatch:&lt;name&gt;</code>) you may need the
+        <code>com.apple.security.cs.disable-library-validation</code>
+        entitlement so those load past Gatekeeper.
+      </aside>
+
+      <h2 id="universal">Build a universal binary</h2>
+      <p>
+        Ship one fat binary that runs on both architectures by
+        building each variant separately and gluing them together
+        with <code>lipo</code>:
+      </p>
+<pre><code>wlift my_app.wren --aot ./my_app-arm64    # on Apple Silicon
+wlift my_app.wren --aot ./my_app-x86_64   # on Intel (or cross-compile)
+lipo -create -output ./my_app ./my_app-arm64 ./my_app-x86_64
+lipo -info ./my_app
+<span style="color:#8FAE6A;">// Architectures in the fat file: ./my_app are: arm64 x86_64</span></code></pre>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#install">Install</a></li>
+      <li><a href="#arch">Apple Silicon vs Intel</a></li>
+      <li><a href="#aot">Build an AOT binary</a></li>
+      <li><a href="#sign">Code-sign &amp; notarize</a></li>
+      <li><a href="#universal">Build a universal binary</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

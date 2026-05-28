@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Windows · Wrenlift docs</title>
+<meta name="description" content="Install Wrenlift on Windows x86_64 and ship a self-contained .exe with wlift --aot." />
+<link rel="canonical" href="https://wrenlift.com/docs/platform/windows.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Windows · Wrenlift docs" />
+<meta property="og:description" content="Install Wrenlift on Windows x86_64 and ship a self-contained .exe with wlift --aot." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html" class="active">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Platforms</a> <span class="crumb-sep">/</span> <span class="crumb-current">Windows</span>
+    </nav>
+
+    <h1 class="pkg-title">Windows</h1>
+    <p class="pkg-lede">Native MSVC build. The runtime statically links its own dependencies, and <code>wlift --aot</code> produces a regular Windows PE executable.</p>
+
+    <div class="pkg-readme">
+      <h2 id="install">Install</h2>
+      <p>
+        Download
+        <code>wlift-x86_64-pc-windows-msvc.zip</code> from the
+        <a href="https://github.com/wrenlift/WrenLift/releases">release page</a>,
+        unzip, and drop the three binaries
+        (<code>wlift.exe</code>, <code>hatch.exe</code>,
+        <code>wlift-lsp.exe</code>) into a directory that's on your
+        <code>PATH</code>. <code>%LOCALAPPDATA%\Programs\wlift\bin</code>
+        is a reasonable choice; add it via <em>System Properties &rarr;
+        Environment Variables</em>.
+      </p>
+      <p>
+        The <code>install.sh</code> shell installer doesn't work on
+        native Windows. WSL users can use the Linux installer and
+        get a Linux <code>wlift</code> binary inside WSL.
+      </p>
+
+      <h2 id="runtime-reqs">Runtime requirements</h2>
+      <p>
+        Built against MSVC. <code>wlift.exe</code> needs the
+        Microsoft Visual C++ Redistributable (2015+) at runtime
+        &mdash; almost every Windows install already has it via
+        Windows Update. If a user reports a missing
+        <code>VCRUNTIME140.dll</code>, point them at Microsoft's
+        <a href="https://aka.ms/vs/17/release/vc_redist.x64.exe"><code>vc_redist.x64.exe</code></a>
+        installer.
+      </p>
+
+      <h2 id="aot">Build an AOT binary</h2>
+<pre><code>wlift my_app.wren --aot .\my_app.exe
+.\my_app.exe</code></pre>
+      <p>
+        Output is a regular Windows PE executable, statically
+        linked against the WrenLift runtime. The only external
+        dependency is the same MSVC runtime <code>wlift.exe</code>
+        itself needs.
+      </p>
+
+      <h2 id="sign">Authenticode signing</h2>
+      <p>
+        Distributing outside a corporate intranet? Sign the
+        binary so SmartScreen and antivirus heuristics don't
+        block it.
+      </p>
+<pre><code>signtool sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 my_app.exe
+signtool verify /pa my_app.exe</code></pre>
+      <p>
+        An EV (Extended Validation) cert builds SmartScreen
+        reputation faster, but the signing flow is identical
+        &mdash; the difference is the cert source, not the
+        <code>signtool</code> arguments.
+      </p>
+
+      <h2 id="packaging">Packaging</h2>
+      <p>
+        For an installer, MSI via WiX or an MSIX bundle are the
+        standard paths. Wrenlift binaries have no Windows registry
+        dependencies, no COM registration, no service install
+        steps &mdash; you're laying down a <code>.exe</code> on
+        disk.
+      </p>
+      <aside class="note">
+        Plugins (cdylibs in <code>@hatch:</code> packages) are
+        <code>.dll</code> files staged alongside the executable.
+        If your AOT program loads plugins, package those
+        <code>.dll</code>s next to the <code>.exe</code> in your
+        installer.
+      </aside>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#install">Install</a></li>
+      <li><a href="#runtime-reqs">Runtime requirements</a></li>
+      <li><a href="#aot">Build an AOT binary</a></li>
+      <li><a href="#sign">Authenticode signing</a></li>
+      <li><a href="#packaging">Packaging</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>WebAssembly · Wrenlift docs</title>
+<meta name="description" content="Embed the Wrenlift runtime in a webpage. The wlift.js harness API: createWlift, runProject, prefetchHatchDeps, makeCachedFetcher." />
+<link rel="canonical" href="https://wrenlift.com/docs/platform/wasm.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="WebAssembly · Wrenlift docs" />
+<meta property="og:description" content="Embed the Wrenlift runtime in a webpage. The wlift.js harness API: createWlift, runProject, prefetchHatchDeps, makeCachedFetcher." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html" class="active">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Platforms</a> <span class="crumb-sep">/</span> <span class="crumb-current">WebAssembly</span>
+    </nav>
+
+    <h1 class="pkg-title">WebAssembly</h1>
+    <p class="pkg-lede">The same runtime that compiles native ELF and Mach-O binaries also compiles to a self-contained <code>.wasm</code> module. <code>wlift.js</code> is the JavaScript harness you import to run Wren code in a browser — used by the playground and ready for any embedder.</p>
+
+    <div class="pkg-readme">
+      <h2 id="install">Add <code>wlift.js</code> to your page</h2>
+      <p>
+        Wrenlift hosts the harness at <code>wrenlift.com/dist/</code>:
+      </p>
+<pre><code>&lt;script type="module"&gt;
+  import { createWlift } from "https://wrenlift.com/dist/wlift.js";
+  const wlift = await createWlift();
+&lt;/script&gt;</code></pre>
+      <p>
+        The harness lazily loads the matching
+        <code>wlift_wasm_bg.wasm</code> module from the same origin.
+        It auto-detects support for the WebAssembly SIMD proposal
+        and loads the faster <code>simd128</code> variant when
+        available; older browsers get the scalar fallback.
+      </p>
+      <p>
+        Hosting it yourself? Copy the four files into your
+        <code>/dist/</code>:
+      </p>
+      <ul>
+        <li><code>wlift.js</code></li>
+        <li><code>wlift_wasm.js</code></li>
+        <li><code>wlift_wasm_bg.wasm</code></li>
+        <li><code>wlift_wasm_bg.simd128.wasm</code></li>
+      </ul>
+
+      <h2 id="hello">Hello world</h2>
+<pre><code>&lt;script type="module"&gt;
+  import { createWlift } from "/dist/wlift.js";
+
+  const wlift = await createWlift();
+  const result = await wlift.run('System.print("hello, web")');
+  console.log(result.output);  // "hello, web\n"
+&lt;/script&gt;</code></pre>
+      <p>
+        <code>result</code> is a
+        <code>{ ok, output, errorKind, elapsedMs }</code> shape.
+        <code>output</code> captures everything the script wrote to
+        <code>System.print</code>; <code>errorKind</code> is non-null
+        when the program threw.
+      </p>
+
+      <h2 id="run-project">runProject — source + hatchfile</h2>
+      <p>
+        For anything beyond a one-liner, you pass the program
+        source <em>and</em> its hatchfile so dependencies install
+        through the registry:
+      </p>
+<pre><code>import { createWlift, runProject } from "/dist/wlift.js";
+
+const wlift = await createWlift();
+const source = `
+  import "@hatch:json" for JSON
+  System.print(JSON.encode({"hello": "world"}))
+`;
+const hatchfile = `
+  name = "demo"
+  version = "0.1.0"
+  entry = "main"
+
+  [dependencies]
+  "@hatch:json" = "0.1.4"
+`;
+const result = await runProject(wlift, source, hatchfile);
+console.log(result.output);</code></pre>
+      <p>
+        <code>runProject</code> parses the manifest, fetches every
+        declared dep from the Hatch registry, installs them, then
+        runs the user source. It returns the same result shape as
+        <code>wlift.run</code>.
+      </p>
+
+      <h2 id="cache">Bundle caching</h2>
+      <p>
+        Fetched <code>.hatch</code> bundles are cached via the
+        browser's Cache API by default. The next page load resolves
+        cached deps instantly, no network round-trip. Override the
+        cache name or opt out for tests:
+      </p>
+<pre><code>// Default cache name:
+await runProject(wlift, source, hatchfile);
+
+// Per-tenant cache:
+await runProject(wlift, source, hatchfile, { cache: "tenant-abc" });
+
+// Disable persistence:
+await runProject(wlift, source, hatchfile, { cache: false });</code></pre>
+      <p>
+        Wipe the stored bundles when a release goes wrong:
+      </p>
+<pre><code>import { clearHatchCache } from "/dist/wlift.js";
+await clearHatchCache();</code></pre>
+
+      <h2 id="prefetch">Prefetching deps</h2>
+      <p>
+        Warm the cache while the user is still typing &mdash;
+        running the code itself stays snappy because the bundle
+        bytes are already on disk by the time
+        <code>runProject</code> needs them:
+      </p>
+<pre><code>import { prefetchHatchDeps } from "/dist/wlift.js";
+
+editor.on("change", debounce(() =&gt; {
+  prefetchHatchDeps(getHatchfileText())
+    .catch(err =&gt; console.warn("prefetch", err));
+}, 600));</code></pre>
+
+      <h2 id="threading">Worker vs main thread</h2>
+      <p>
+        Wrenlift runs on whatever thread <code>createWlift</code>
+        is called from. The runtime is cooperative &mdash; a
+        long-running script blocks the thread until it suspends
+        on a fiber yield or finishes. For UI-heavy pages, run the
+        VM in a Web Worker and post messages from the main thread:
+      </p>
+<pre><code>// worker.js
+import { createWlift, runProject } from "/dist/wlift.js";
+const wlift = await createWlift();
+self.onmessage = async (e) =&gt; {
+  const result = await runProject(wlift, e.data.source, e.data.hatchfile);
+  postMessage(result);
+};</code></pre>
+      <p>
+        WebGPU canvas rendering needs an
+        <code>OffscreenCanvas</code> transferred to the worker
+        via <code>postMessage</code>. The playground does this
+        through the <code>canvas</code> key on the worker bridge;
+        see
+        <a href="https://github.com/wrenlift/WrenLift/blob/main/wasm/web/worker.js"><code>wasm/web/worker.js</code></a>
+        for a complete example.
+      </p>
+
+      <h2 id="simd">SIMD detection</h2>
+      <p>
+        Skip the SIMD-fallback variant entirely on browsers that
+        support the proposal:
+      </p>
+<pre><code>import { simd128Supported, createWlift } from "/dist/wlift.js";
+
+if (simd128Supported()) {
+  console.log("loading SIMD wasm");
+}
+const wlift = await createWlift();   // picks the right binary</code></pre>
+      <p>
+        <code>createWlift</code> already does the right thing;
+        <code>simd128Supported()</code> is exposed for embedders
+        who want to surface the choice (analytics, opt-in flags,
+        etc.).
+      </p>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#install">Add wlift.js</a></li>
+      <li><a href="#hello">Hello world</a></li>
+      <li><a href="#run-project">runProject</a></li>
+      <li><a href="#cache">Bundle caching</a></li>
+      <li><a href="#prefetch">Prefetching deps</a></li>
+      <li><a href="#threading">Worker vs main</a></li>
+      <li><a href="#simd">SIMD detection</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

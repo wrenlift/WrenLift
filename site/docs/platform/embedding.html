@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Embed in Rust · Wrenlift docs</title>
+<meta name="description" content="Use wren_lift as a Rust crate. Drive the VM from native code, expose foreign functions, load plugins." />
+<link rel="canonical" href="https://wrenlift.com/docs/platform/embedding.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Embed in Rust · Wrenlift docs" />
+<meta property="og:description" content="Use wren_lift as a Rust crate. Drive the VM from native code, expose foreign functions, load plugins." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html" class="active">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Platforms</a> <span class="crumb-sep">/</span> <span class="crumb-current">Embed in Rust</span>
+    </nav>
+
+    <h1 class="pkg-title">Embed in Rust</h1>
+    <p class="pkg-lede">Add the runtime as a crate, instantiate a <code>VM</code>, hand it source. Foreign classes give Wren scripts a typed door into your Rust code.</p>
+
+    <div class="pkg-readme">
+      <h2 id="add-dep">Add the dependency</h2>
+<pre><code>[dependencies]
+wren_lift = { git = "https://github.com/wrenlift/WrenLift.git", features = ["host"] }</code></pre>
+      <p>
+        Pin a tag with <code>tag = "v0.1.19"</code> or a commit
+        with <code>rev = "..."</code> for reproducible builds.
+      </p>
+
+      <h2 id="features">Cargo features</h2>
+      <table>
+        <thead><tr><th>Feature</th><th>What it pulls in</th></tr></thead>
+        <tbody>
+          <tr><td><code>host</code> (default)</td><td>Filesystem reads, plugin loading via libloading, the hatch installer. Drop for pure-embedded uses.</td></tr>
+          <tr><td><code>aot</code></td><td>The Cranelift <code>ObjectModule</code> pipeline used by <code>wlift --aot</code>. Needed only if you call AOT from your own binary.</td></tr>
+          <tr><td><code>cranelift</code></td><td>The JIT backend. On by default; opt out for an interpreter-only build.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="run-source">Run a script</h2>
+<pre><code>use wren_lift::runtime::vm::{VM, VMConfig, ExecutionMode, InterpretResult};
+
+let mut vm = VM::new(VMConfig {
+    execution_mode: ExecutionMode::Tiered,
+    ..VMConfig::default()
+});
+vm.output_buffer = Some(String::new());
+
+let result = vm.interpret("main", r#"
+    System.print("hello from rust")
+"#);
+
+assert!(matches!(result, InterpretResult::Success));
+println!("script output: {}", vm.take_output());</code></pre>
+      <p>
+        The first argument to <code>interpret</code> is the module
+        name &mdash; it shows up in error backtraces and is the
+        <code>import "modname"</code> key from other modules.
+      </p>
+
+      <h2 id="foreign">Expose a foreign class</h2>
+      <p>
+        Foreign classes give Wren scripts a typed door into your
+        Rust code. Declare the Wren side with the
+        <code>#!native</code> attribute:
+      </p>
+<pre><code>#!native = "myapp"
+foreign class Counter {
+  #!symbol = "myapp_counter_new"
+  foreign static create(start)
+  #!symbol = "myapp_counter_next"
+  foreign static next(handle)
+}</code></pre>
+      <p>And the matching Rust exports:</p>
+<pre><code>use wren_lift::ffi::{Value, WrenVm};
+
+#[no_mangle]
+pub unsafe extern "C" fn myapp_counter_new(vm: *mut WrenVm) {
+    let start = wren_lift::ffi::slot(vm, 1).as_num().unwrap_or(0.0) as i64;
+    let handle = MY_COUNTERS.insert(start);
+    wren_lift::ffi::set_return(vm, Value::num(handle as f64));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn myapp_counter_next(vm: *mut WrenVm) {
+    let handle = wren_lift::ffi::slot(vm, 1).as_num().unwrap_or(0.0) as usize;
+    let n = MY_COUNTERS.bump(handle);
+    wren_lift::ffi::set_return(vm, Value::num(n as f64));
+}</code></pre>
+      <p>
+        The <code>wlift_abi</code> crate (re-exported through
+        <code>wren_lift::ffi</code>) provides the C-shaped surface
+        you import: <code>slot</code> reads an argument,
+        <code>set_return</code> writes the result,
+        <code>alloc_string</code> / <code>alloc_list</code> /
+        <code>alloc_map</code> create Wren-side objects.
+      </p>
+
+      <h2 id="plugins">Plugins (cdylib)</h2>
+      <p>
+        For dynamic loading (the same shape every
+        <code>@hatch:</code> plugin uses), build your crate as a
+        <code>cdylib</code> and ship it next to a hatchfile:
+      </p>
+<pre><code>[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wlift_abi = { git = "https://github.com/wrenlift/WrenLift.git" }</code></pre>
+      <aside class="tip">
+        Plugins depend only on the small <code>wlift_abi</code>
+        crate, not on the full <code>wren_lift</code>. The host
+        process exports the runtime symbols; plugin
+        <code>cdylib</code>s resolve them at load time. This means
+        host-side <code>VM</code> layout changes don't break
+        already-built plugins.
+      </aside>
+
+      <h2 id="further">Further reading</h2>
+      <ul>
+        <li><a href="/docs/ref/foreign.html">Foreign-class reference</a> &mdash; the Wren-side syntax in detail.</li>
+        <li><a href="https://github.com/wrenlift/WrenLift/tree/main/plugins/wlift_sqlite">wlift_sqlite source</a> &mdash; a complete plugin example.</li>
+        <li><a href="https://github.com/wrenlift/WrenLift/blob/main/crates/wlift_abi/src/lib.rs">wlift_abi/src/lib.rs</a> &mdash; the full ABI surface plugins consume.</li>
+      </ul>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#add-dep">Add the dependency</a></li>
+      <li><a href="#features">Cargo features</a></li>
+      <li><a href="#run-source">Run a script</a></li>
+      <li><a href="#foreign">Expose a foreign class</a></li>
+      <li><a href="#plugins">Plugins (cdylib)</a></li>
+      <li><a href="#further">Further reading</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>
