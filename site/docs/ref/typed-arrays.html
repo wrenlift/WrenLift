@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Typed arrays · Wrenlift docs</title>
+<meta name="description" content="Packed numeric buffers — Float32Array, Int32Array, Uint8Array, and friends. O(1) indexed access; flat memory layout; suited to GPU upload and host roundtrips." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/typed-arrays.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Typed arrays · Wrenlift docs" />
+<meta property="og:description" content="Packed numeric buffers — Float32Array, Int32Array, Uint8Array, and friends. O(1) indexed access; flat memory layout; suited to GPU upload and host roundtrips." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html" class="active">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">Typed arrays</span>
+    </nav>
+
+    <h1 class="pkg-title">Typed arrays</h1>
+    <p class="pkg-lede">Packed numeric buffers — <code>Float32Array</code>, <code>Int32Array</code>, <code>Uint8Array</code>, <code>Float64Array</code>, <code>Int16Array</code>, <code>Uint16Array</code>. O(1) indexed access, flat memory layout. The natural shape for GPU buffer uploads, audio buffers, and wasm host roundtrips.</p>
+
+    <div class="pkg-readme">
+      <h2 id="new">Construct</h2>
+      <p>Every typed array class shares the same three constructors:</p>
+      <table>
+        <thead><tr><th>Constructor</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>X.new(count)</code></td><td>Zero-filled buffer with <code>count</code> elements.</td></tr>
+          <tr><td><code>X.fromList(list)</code></td><td>One element per item of <code>list</code>, cast to the array's element type.</td></tr>
+          <tr><td><code>ByteArray.fromString(text)</code></td><td><em>(ByteArray only)</em> UTF-8 byte snapshot of <code>text</code>.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var f32 = Float32Array.new(16)             // 16 × f32, all 0.0
+var i32 = Int32Array.fromList([1, 2, 3])
+var hello = ByteArray.fromString("hello")  // 5-byte UTF-8 view</code></pre>
+
+      <h2 id="index">Indexed access</h2>
+      <p>
+        Subscript syntax works the same on every typed array.
+        Reads return a Wren <code>Num</code>; writes round-trip
+        through the element width (truncating for integer arrays,
+        precision-clipping for f32).
+      </p>
+<pre><code>var v = Float32Array.new(4)
+v[0] = 0.25
+v[1] = 0.50
+System.print(v[0] + v[1])      // 0.75
+
+var bytes = ByteArray.new(4)
+bytes[0] = 0xFF
+bytes[1] = 256                 // wraps to 0 (u8 cast)
+System.print(bytes[0])         // 255
+System.print(bytes[1])         // 0</code></pre>
+      <p>
+        Out-of-range writes <code>Fiber.abort</code> with a clear
+        error rather than silently silently expanding the buffer.
+        Typed arrays are <em>fixed</em> length once constructed.
+      </p>
+
+      <h2 id="iterate">Iteration</h2>
+      <p>
+        Every typed array supports the for-in protocol via
+        <code>iterate</code> + <code>iteratorValue</code>:
+      </p>
+<pre><code>var v = Int32Array.fromList([10, 20, 30])
+var sum = 0
+for (n in v) sum = sum + n
+System.print(sum)                // 60</code></pre>
+
+      <h2 id="widths">Element widths</h2>
+      <table>
+        <thead><tr><th>Class</th><th>Bytes per element</th><th>Range</th></tr></thead>
+        <tbody>
+          <tr><td><code>ByteArray</code> / <code>Uint8Array</code></td><td>1</td><td><code>0..255</code></td></tr>
+          <tr><td><code>Int16Array</code></td><td>2</td><td><code>-32768..32767</code></td></tr>
+          <tr><td><code>Uint16Array</code></td><td>2</td><td><code>0..65535</code></td></tr>
+          <tr><td><code>Int32Array</code></td><td>4</td><td><code>-2³¹..2³¹-1</code></td></tr>
+          <tr><td><code>Float32Array</code></td><td>4</td><td>f32 finite range</td></tr>
+          <tr><td><code>Float64Array</code></td><td>8</td><td>f64 finite range</td></tr>
+        </tbody>
+      </table>
+      <p>
+        <code>.count</code> is the element count; <code>.byteLength</code>
+        is <code>count × byteWidth</code>. Both are read-only.
+      </p>
+
+      <h2 id="interop">Interop</h2>
+      <p>
+        Typed arrays are the natural shape for crossing the
+        Wren/host boundary — they're a flat pointer + length on
+        the Rust side, so no per-element marshalling cost.
+      </p>
+      <ul>
+        <li><b>GPU upload</b> — <code>buffer.writeFloats(0, arr)</code> in
+          <a href="https://hatch.wrenlift.com/packages/@hatch:gpu"><code>@hatch:gpu</code></a> takes a Float32Array directly.</li>
+        <li><b>Audio buffers</b> — <code>@hatch:audio</code> reads PCM samples from a Float32Array.</li>
+        <li><b>Physics</b> —
+          <a href="https://hatch.wrenlift.com/packages/@hatch:physics"><code>@hatch:physics</code></a>
+          has <code>positionInto(out, offset)</code> / <code>rotationInto(out, offset)</code>
+          variants that write straight into a Float32Array, no per-frame allocation.</li>
+        <li><b>SIMD</b> — <a href="/docs/ref/simd.html"><code>Simd4f.load(arr, 0)</code></a>
+          /<code>.store(arr, 0)</code> bridge between SIMD and typed arrays.</li>
+      </ul>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#new">Construct</a></li>
+      <li><a href="#index">Indexed access</a></li>
+      <li><a href="#iterate">Iteration</a></li>
+      <li><a href="#widths">Element widths</a></li>
+      <li><a href="#interop">Interop</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

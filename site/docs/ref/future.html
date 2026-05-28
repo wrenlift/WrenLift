@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Future · Wrenlift docs</title>
+<meta name="description" content="Async-result handle bridged from JavaScript Promises. .await parks the fiber until the host settles the future." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/future.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Future · Wrenlift docs" />
+<meta property="og:description" content="Async-result handle bridged from JavaScript Promises. .await parks the fiber until the host settles the future." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html" class="active">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">Future</span>
+    </nav>
+
+    <h1 class="pkg-title"><code>Future</code></h1>
+    <p class="pkg-lede">Handle to an async result the host will eventually settle. Returned by every browser bridge — <code>Browser.fetch</code>, <code>Browser.setTimeout</code>, every <code>Dom.*</code> method, every <code>WebSocket.*</code> method. <code>.await</code> inside a fiber parks the current fiber until the future resolves.</p>
+
+    <div class="pkg-readme">
+      <h2 id="shape">The shape</h2>
+      <table>
+        <thead><tr><th>Member</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>.handle</code></td><td>Numeric handle the host uses to address this future. Implementation detail; useful only when bridging custom JS shims.</td></tr>
+          <tr><td><code>.state</code></td><td><code>0</code> pending, <code>1</code> resolved, <code>2</code> rejected. Useful for non-blocking polling.</td></tr>
+          <tr><td><code>.await</code></td><td>Park the fiber until settled; return the resolved value or abort with the rejection message.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="await">Awaiting</h2>
+      <p>
+        Wrap host work in a fiber, then chain
+        <code>.await</code> on the futures the host gives you:
+      </p>
+<pre><code>var fiber = Fiber.new {
+  var t = Browser.setTimeout(150).await
+  var html = Dom.text("#title").await
+  System.print(html)
+}
+fiber.try()</code></pre>
+      <p>
+        <code>.await</code> is implemented as a
+        <code>Fiber.suspend()</code> call against a scheduler the
+        runtime owns; calling <code>.await</code> outside a fiber
+        is a runtime error.
+      </p>
+
+      <h3 id="poll">Non-blocking poll</h3>
+      <p>
+        Skip awaiting if you want to peek before yielding:
+      </p>
+<pre><code>var f = Browser.fetch("…")
+if (f.state == 1) {
+  System.print("already cached:", f.await)
+} else {
+  // ...keep working, await later
+}</code></pre>
+
+      <h2 id="bytefuture"><code>ByteFuture</code></h2>
+      <p>
+        Same parking + scheduling shape as <code>Future</code>,
+        but <code>.await</code> resolves to a
+        <a href="/docs/ref/typed-arrays.html"><code>ByteArray</code></a>
+        instead of a <code>String</code>. Returned by
+        <code>Browser.fetchBytes</code> for raw asset loads —
+        images, audio, <code>.hatch</code> bundles, anything you'd
+        treat as binary.
+      </p>
+<pre><code>var bytes = Browser.fetchBytes("./icon.png").await
+System.print(bytes.count)
+// Hand to a texture loader, audio decoder, etc.</code></pre>
+
+      <h2 id="bridges">Browser / DOM / WebSocket bridges</h2>
+      <p>
+        Every async browser bridge returns a Future:
+      </p>
+      <table>
+        <thead><tr><th>Bridge</th><th>Returns</th></tr></thead>
+        <tbody>
+          <tr><td><code>Browser.fetch(url)</code></td><td><code>Future&lt;String&gt;</code></td></tr>
+          <tr><td><code>Browser.fetchBytes(url)</code></td><td><code>ByteFuture</code></td></tr>
+          <tr><td><code>Browser.setTimeout(ms)</code></td><td><code>Future&lt;null&gt;</code></td></tr>
+          <tr><td><code>Browser.nextFrame</code></td><td><code>Future&lt;null&gt;</code> &mdash; resolves at the next <code>requestAnimationFrame</code></td></tr>
+          <tr><td><code>Dom.text(selector)</code> · <code>Dom.setText(s, v)</code> · <code>Dom.setHTML(s, html)</code> · <code>Dom.addClass(s, c)</code></td><td><code>Future&lt;null&gt;</code> or <code>Future&lt;String&gt;</code></td></tr>
+          <tr><td><code>WebSocket.open(url)</code> · <code>.send(msg)</code> · <code>.receive</code></td><td><code>Future&lt;…&gt;</code> per the call</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Worker mode and main-thread mode use the same shape;
+        worker mode round-trips through <code>postMessage</code>
+        under the hood. See
+        <a href="/docs/platform/wasm.html#threading">the WebAssembly
+        platform guide</a> for the threading story.
+      </p>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#shape">The shape</a></li>
+      <li><a href="#await">Awaiting</a></li>
+      <li><a href="#bytefuture">ByteFuture</a></li>
+      <li><a href="#bridges">Browser / DOM / WebSocket bridges</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

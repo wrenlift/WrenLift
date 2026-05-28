@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Fiber · Wrenlift docs</title>
+<meta name="description" content="Cooperative coroutines. Wren's Fiber, plus Wrenlift's deadline/cancellation hooks and async-bridge behavior." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/fiber.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Fiber · Wrenlift docs" />
+<meta property="og:description" content="Cooperative coroutines. Wren's Fiber, plus Wrenlift's deadline/cancellation hooks and async-bridge behavior." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html" class="active">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">Fiber</span>
+    </nav>
+
+    <h1 class="pkg-title"><code>Fiber</code></h1>
+    <p class="pkg-lede">Cooperative coroutines. <code>Fiber.new {}</code> creates a suspended one; <code>.call</code> runs it until it yields, returns, or aborts. <code>.try</code> is the same as <code>.call</code> but returns rejections instead of propagating them.</p>
+
+    <div class="pkg-readme">
+      <h2 id="construct">Construct &amp; identity</h2>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>Fiber.new(body)</code></td><td>Wrap a closure as a new suspended fiber.</td></tr>
+          <tr><td><code>Fiber.current</code></td><td>The fiber that's currently running.</td></tr>
+          <tr><td><code>.isDone</code></td><td><code>true</code> when the fiber has returned (or aborted).</td></tr>
+        </tbody>
+      </table>
+<pre><code>var f = Fiber.new {
+  System.print("inside")
+}
+f.call()        // inside
+f.isDone        // true</code></pre>
+
+      <h2 id="yield">Yield &amp; resume</h2>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>.call()</code> · <code>.call(value)</code></td><td>Resume the fiber. Returns the value the fiber yielded or returned.</td></tr>
+          <tr><td><code>Fiber.yield()</code> · <code>Fiber.yield(v)</code></td><td>Yield to the caller. Stays alive; the caller's <code>.call</code> returns <code>v</code> (or <code>null</code>).</td></tr>
+          <tr><td><code>Fiber.suspend()</code></td><td>Suspend the running fiber's enclosing transfer (rarely needed directly; used by async bridges).</td></tr>
+          <tr><td><code>Fiber.abort(error)</code></td><td>Abort the fiber. Up the stack, <code>.try { ... }</code> catches it as the fiber's <code>.error</code> slot.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var counter = Fiber.new {
+  var i = 0
+  while (true) {
+    Fiber.yield(i)
+    i = i + 1
+  }
+}
+System.print(counter.call())    // 0
+System.print(counter.call())    // 1
+System.print(counter.call())    // 2</code></pre>
+
+      <h2 id="try"><code>.call</code> vs <code>.try</code></h2>
+      <p>
+        <code>.call</code> propagates aborts up the parent stack.
+        <code>.try</code> swallows them and returns the
+        <code>error</code> value instead, so the parent can decide
+        how to react.
+      </p>
+<pre><code>var fragile = Fiber.new { Fiber.abort("nope") }
+
+var r = fragile.try()
+System.print(fragile.error)     // "nope"
+System.print(r)                 // null</code></pre>
+
+      <h2 id="cancel">Cancellation &amp; deadlines</h2>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>Fiber.isCancelled</code></td><td><code>true</code> when an external caller has requested cancellation.</td></tr>
+          <tr><td><code>Fiber.cancel()</code></td><td>Mark this fiber for cancellation. Compute loops can poll <code>Fiber.isCancelled</code> and bail.</td></tr>
+          <tr><td><code>Fiber.deadlineMs</code></td><td>Deadline in milliseconds (host-monotonic), or <code>null</code> if none set.</td></tr>
+          <tr><td><code>Fiber.setDeadlineMs(ms)</code></td><td>Set the deadline. Runtime checkpoints inside loops poll this; expiring deadlines surface as aborts.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var work = Fiber.new {
+  while (!Fiber.isCancelled) {
+    step()
+  }
+}
+work.call()</code></pre>
+
+      <h2 id="async">Async-bridge integration</h2>
+      <p>
+        Browser bridges &mdash; <code>Browser.fetch</code>,
+        <code>Browser.setTimeout</code>, <code>Dom.*</code>,
+        <code>WebSocket.*</code> &mdash; return a <a href="/docs/ref/future.html"><code>Future</code></a>.
+        Calling <code>.await</code> on a future inside a fiber
+        suspends it through <code>Fiber.suspend</code>; the host
+        scheduler resumes it via <code>.call(value)</code> when
+        the future settles.
+      </p>
+<pre><code>var page = Fiber.new {
+  var html = Browser.fetch("https://example.com").await
+  System.print(html.count)
+}
+page.try()</code></pre>
+      <p>
+        See <a href="/docs/ref/future.html">Future</a> for the
+        settled-value shape and the difference between
+        <code>Future</code> and <code>ByteFuture</code>.
+      </p>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#construct">Construct &amp; identity</a></li>
+      <li><a href="#yield">Yield &amp; resume</a></li>
+      <li><a href="#try">.call vs .try</a></li>
+      <li><a href="#cancel">Cancellation &amp; deadlines</a></li>
+      <li><a href="#async">Async-bridge integration</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

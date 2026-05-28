@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>System · Wrenlift docs</title>
+<meta name="description" content="Wrenlift's System class — print, write, clock, gc, and the runtime extras built on top of the stock Wren surface." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/system.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="System · Wrenlift docs" />
+<meta property="og:description" content="Wrenlift's System class — print, write, clock, gc, and the runtime extras built on top of the stock Wren surface." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html" class="active">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">System</span>
+    </nav>
+
+    <h1 class="pkg-title"><code>System</code></h1>
+    <p class="pkg-lede">Process-level I/O and runtime introspection. Always in scope — no <code>import</code> needed. This page covers the surface specific to Wrenlift; for the stock Wren <code>System</code> methods see <a href="https://wren.io/modules/core/system.html">wren.io</a>.</p>
+
+    <div class="pkg-readme">
+      <h2 id="print">Print &amp; write</h2>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>System.print(value)</code></td><td>Print <code>value.toString</code> followed by a newline. Returns <code>value</code> for chaining.</td></tr>
+          <tr><td><code>System.print</code></td><td>Print a blank line.</td></tr>
+          <tr><td><code>System.printAll(seq)</code></td><td>Print every element of <code>seq</code>, joined into one line, then a newline.</td></tr>
+          <tr><td><code>System.write(value)</code></td><td>Print without a trailing newline.</td></tr>
+          <tr><td><code>System.writeAll(seq)</code></td><td><code>write</code> over a sequence.</td></tr>
+        </tbody>
+      </table>
+<pre><code>System.print("hello, world")
+System.write("loading…")
+System.print(1 + 2)            // 3</code></pre>
+
+      <h2 id="time">Clocks</h2>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>System.clock</code></td><td>Wall-clock seconds since the runtime started. Monotonic; for benchmarking, not for time-of-day.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var t = System.clock
+expensive()
+System.print((System.clock - t) * 1000)  // ms</code></pre>
+      <aside class="tip">
+        For time-of-day, calendar work, or formatted timestamps,
+        use <a href="https://hatch.wrenlift.com/packages/@hatch:time"><code>@hatch:time</code></a>.
+        Keeps the core <code>System</code> surface small.
+      </aside>
+
+      <h2 id="gc">Garbage collection</h2>
+      <table>
+        <thead><tr><th>Method</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>System.gc()</code></td><td>Trigger a GC cycle. Useful between batches in long-running scripts so short-lived allocations don't get promoted to the old gen.</td></tr>
+        </tbody>
+      </table>
+<pre><code>// In a game loop:
+_frame = _frame + 1
+if (_frame % 30 == 0) System.gc()</code></pre>
+      <aside class="note">
+        Wrenlift's default GC is generational; you almost never
+        need to call <code>System.gc()</code> manually. The hook
+        is there for games and other steady-state loops where
+        you want to enforce a known GC cadence.
+      </aside>
+
+      <h2 id="process">Process</h2>
+      <p>
+        Process-level extras &mdash; environment variables, arguments,
+        exit &mdash; live in
+        <a href="https://hatch.wrenlift.com/packages/@hatch:os"><code>@hatch:os</code></a>,
+        not on <code>System</code>. The split keeps embed-friendly
+        scripts portable (the wasm runtime has no
+        <code>std::env</code>; <code>@hatch:os</code> is host-only).
+      </p>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#print">Print &amp; write</a></li>
+      <li><a href="#time">Clocks</a></li>
+      <li><a href="#gc">Garbage collection</a></li>
+      <li><a href="#process">Process</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

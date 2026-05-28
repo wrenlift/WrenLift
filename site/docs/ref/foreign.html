@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Foreign classes · Wrenlift docs</title>
+<meta name="description" content="Declare native-backed Wren classes with #!native and #!symbol attributes. The bridge between Wren scripts and Rust plugins." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/foreign.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Foreign classes · Wrenlift docs" />
+<meta property="og:description" content="Declare native-backed Wren classes with #!native and #!symbol attributes. The bridge between Wren scripts and Rust plugins." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html" class="active">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">Foreign classes</span>
+    </nav>
+
+    <h1 class="pkg-title">Foreign classes</h1>
+    <p class="pkg-lede"><code>foreign class</code> + the <code>#!native</code> and <code>#!symbol</code> attributes wire a Wren class to a native shared library. Used by every <code>@hatch:</code> plugin; also the way you'd build your own bridge into a Rust crate.</p>
+
+    <div class="pkg-readme">
+      <h2 id="shape">The shape</h2>
+      <p>
+        A foreign class declares the Wren-side surface and points
+        at a native shared library. Method bodies are empty —
+        every call routes to a Rust function in the named
+        cdylib.
+      </p>
+<pre><code>#!native = "sqlite"
+foreign class Database {
+  #!symbol = "wlift_sqlite_database_open"
+  foreign static open(path)
+
+  #!symbol = "wlift_sqlite_database_query"
+  foreign query(sql, params)
+}</code></pre>
+      <p>
+        Wren scripts use it like any other class:
+      </p>
+<pre><code>import "@hatch:sqlite" for Database
+var db = Database.open(":memory:")
+var rows = db.query("SELECT * FROM users WHERE id = ?", [42])</code></pre>
+
+      <h2 id="attrs">Attributes</h2>
+      <table>
+        <thead><tr><th>Attribute</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>#!native = "name"</code></td><td>On a <code>foreign class</code>: name of the cdylib (without the <code>lib</code> prefix or extension). The runtime looks for <code>libname.so</code> / <code>libname.dylib</code> / <code>name.dll</code> alongside the bundle.</td></tr>
+          <tr><td><code>#!symbol = "fn_name"</code></td><td>On a <code>foreign</code> method: name of the C-ABI function the cdylib exports. Defaults to the method's mangled name when omitted, but explicit symbols travel better across renames.</td></tr>
+          <tr><td><code>#!wasm = "..."</code></td><td>Same as <code>#!native</code> but only consulted when the runtime is the wasm build. Lets a single bundle target both native and browser by declaring two backing libraries.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="wasm">Wasm path</h2>
+      <p>
+        On the wasm runtime, plugins are statically linked into
+        the host wasm module (browsers can't <code>dlopen</code>).
+        Build a parallel cdylib targeting <code>wasm32-unknown-unknown</code>
+        and stage it at <code>libs/&lt;name&gt;_web.wasm</code>; the
+        hatchfile's <code>web_crate</code> entry tells CI what to
+        build.
+      </p>
+<pre><code>[plugin_source]
+repo      = "https://github.com/wrenlift/WrenLift.git"
+rev       = "..."
+crate     = "wlift_sqlite"       # native cdylib
+web_crate = "wlift_sqlite_web"   # wasm32 companion</code></pre>
+
+      <h2 id="abi">ABI handshake</h2>
+      <p>
+        Foreign methods run against the
+        <code>wlift_abi</code> opaque-VM C shim — a stable C
+        surface the host process exports. Plugin cdylibs depend
+        only on <code>wlift_abi</code> (not <code>wren_lift</code>);
+        host VM layout changes don't break already-built plugins.
+      </p>
+      <p>
+        Each plugin reports a numeric ABI version through the
+        runtime's <code>register_plugin</code> registration call;
+        the host refuses to dlopen mismatches.
+      </p>
+      <aside class="tip">
+        For the Rust side of writing a plugin — the
+        <code>slot</code> / <code>set_return</code> /
+        <code>alloc_string</code> calls you'll reach for — see
+        <a href="/docs/platform/embedding.html#foreign">the embedding
+        guide</a> and
+        <a href="https://github.com/wrenlift/WrenLift/blob/main/crates/wlift_abi/src/lib.rs">wlift_abi/src/lib.rs</a>.
+      </aside>
+
+      <h2 id="example">A complete example</h2>
+<pre><code><span style="color:#8FAE6A;">// counter.wren</span>
+#!native = "counter"
+foreign class Counter {
+  #!symbol = "counter_new"
+  foreign static create(start)
+
+  #!symbol = "counter_next"
+  foreign next
+}
+
+var c = Counter.create(10)
+System.print(c.next)              // 11
+System.print(c.next)              // 12</code></pre>
+
+<pre><code><span style="color:#8FAE6A;">// src/lib.rs of the counter cdylib</span>
+use wlift_abi::{slot, set_return, Value, WrenVm};
+
+#[no_mangle]
+pub unsafe extern "C" fn counter_new(vm: *mut WrenVm) {
+    let start = slot(vm, 1).as_num().unwrap_or(0.0) as i64;
+    // ... stash `start` in a registry, get a handle back ...
+    set_return(vm, Value::num(handle as f64));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn counter_next(vm: *mut WrenVm) {
+    let handle = slot(vm, 0).as_num().unwrap_or(0.0) as u64;
+    let next = bump(handle);
+    set_return(vm, Value::num(next as f64));
+}</code></pre>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#shape">The shape</a></li>
+      <li><a href="#attrs">Attributes</a></li>
+      <li><a href="#wasm">Wasm path</a></li>
+      <li><a href="#abi">ABI handshake</a></li>
+      <li><a href="#example">A complete example</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

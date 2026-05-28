@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>SIMD · Wrenlift docs</title>
+<meta name="description" content="Simd4f / Simd4i — 4-lane SIMD vectors. Lane-wise arithmetic, comparisons, bitmask, store/load through typed arrays." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/simd.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="SIMD · Wrenlift docs" />
+<meta property="og:description" content="Simd4f / Simd4i — 4-lane SIMD vectors. Lane-wise arithmetic, comparisons, bitmask, store/load through typed arrays." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html" class="active">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">SIMD</span>
+    </nav>
+
+    <h1 class="pkg-title">SIMD</h1>
+    <p class="pkg-lede">Two 16-byte vector classes — <code>Simd4f</code> (four <code>f32</code> lanes) and <code>Simd4i</code> (four <code>i32</code> lanes). Modern x86_64 and aarch64 lower these to single instructions; browsers route them through the wasm <code>simd128</code> proposal when supported, scalar fallback otherwise.</p>
+
+    <div class="pkg-readme">
+      <h2 id="construct">Construct</h2>
+      <table>
+        <thead><tr><th>Method</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>Simd4f.new(a, b, c, d)</code></td><td>Four explicit f32 lanes.</td></tr>
+          <tr><td><code>Simd4f.splat(x)</code></td><td>All four lanes set to <code>x</code>.</td></tr>
+          <tr><td><code>Simd4i.new(a, b, c, d)</code></td><td>Four explicit i32 lanes.</td></tr>
+          <tr><td><code>Simd4i.splat(x)</code></td><td>All four lanes set to <code>x</code>.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var v = Simd4f.new(1.0, 2.0, 3.0, 4.0)
+var ones = Simd4f.splat(1.0)
+var w = v + ones                    // (2, 3, 4, 5)
+System.print(w)                     // Simd4f(2, 3, 4, 5)</code></pre>
+
+      <h2 id="arithmetic">Arithmetic &amp; comparison</h2>
+      <p>
+        Real Wren operators land on both classes: <code>+</code>,
+        <code>-</code>, <code>*</code>, <code>/</code> for arithmetic;
+        <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>,
+        <code>&gt;=</code>, <code>==</code>, <code>!=</code> for
+        comparison. <code>min</code> and <code>max</code> are
+        method-style.
+      </p>
+<pre><code>var a = Simd4f.new(1, 2, 3, 4)
+var b = Simd4f.new(2, 2, 2, 2)
+System.print(a + b)                 // Simd4f(3, 4, 5, 6)
+System.print(a * b)                 // Simd4f(2, 4, 6, 8)
+System.print(a.min(b))              // Simd4f(1, 2, 2, 2)
+System.print(a.max(b))              // Simd4f(2, 2, 3, 4)</code></pre>
+
+      <h2 id="lanes">Per-lane access</h2>
+      <table>
+        <thead><tr><th>Method</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>v[i]</code></td><td>Read lane <code>i</code> (<code>0..3</code>) as a Num.</td></tr>
+          <tr><td><code>v.replaceLane(i, x)</code></td><td>New vector with lane <code>i</code> set to <code>x</code>.</td></tr>
+        </tbody>
+      </table>
+      <p>
+        Lane indices are <code>0</code> (lowest) through
+        <code>3</code> (highest). The class is immutable; mutations
+        return a new vector.
+      </p>
+
+      <h2 id="mask">Mask, bitmask, select</h2>
+      <p>
+        Comparisons return a <code>Simd4i</code> mask
+        (<code>-1</code> on true, <code>0</code> on false per lane).
+      </p>
+      <table>
+        <thead><tr><th>Method</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>mask.bitmask</code></td><td>Pack the MSB of each lane into bit <code>i</code> (lane 0 → bit 0).</td></tr>
+          <tr><td><code>mask.allTrue</code></td><td><code>true</code> when every lane is non-zero.</td></tr>
+          <tr><td><code>mask.anyTrue</code></td><td><code>true</code> when at least one lane is non-zero.</td></tr>
+          <tr><td><code>X.select(mask, onTrue, onFalse)</code></td><td>Per-lane: <code>mask[i] ? onTrue[i] : onFalse[i]</code>. Available on both Simd4f and Simd4i.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var ints = Simd4i.new(1, 5, 3, 7)
+var mask = ints &gt; Simd4i.splat(4)
+System.print(mask.bitmask)          // 10   (binary 1010 — lanes 1 + 3)
+System.print(mask.anyTrue)          // true</code></pre>
+
+      <h2 id="io">Load / store via typed arrays</h2>
+      <p>
+        Bridge between SIMD and packed memory through a
+        <a href="/docs/ref/typed-arrays.html">typed array</a>:
+      </p>
+      <table>
+        <thead><tr><th>Method</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>Simd4f.load(arr, offset)</code></td><td>Read 4 floats starting at <code>offset</code> from a <code>Float32Array</code>.</td></tr>
+          <tr><td><code>v.store(arr, offset)</code></td><td>Write 4 floats into a <code>Float32Array</code> starting at <code>offset</code>.</td></tr>
+          <tr><td><code>Simd4i.load</code> · <code>.store</code></td><td>Same, against <code>Int32Array</code>.</td></tr>
+        </tbody>
+      </table>
+<pre><code>var buf = Float32Array.fromList([1, 2, 3, 4, 5, 6, 7, 8])
+var lo  = Simd4f.load(buf, 0)        // (1, 2, 3, 4)
+var hi  = Simd4f.load(buf, 4)        // (5, 6, 7, 8)
+(lo + hi).store(buf, 0)              // buf is now (6, 8, 10, 12, 5, 6, 7, 8)</code></pre>
+      <aside class="note">
+        On browsers without the wasm <code>simd128</code>
+        proposal these operations fall back to scalar code &mdash;
+        you get the same results, just without the speedup.
+        <a href="/docs/platform/wasm.html#simd"><code>simd128Supported()</code></a>
+        on the harness side tells you which path the runtime
+        loaded.
+      </aside>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#construct">Construct</a></li>
+      <li><a href="#arithmetic">Arithmetic &amp; comparison</a></li>
+      <li><a href="#lanes">Per-lane ops</a></li>
+      <li><a href="#mask">Mask, bitmask, select</a></li>
+      <li><a href="#io">Load / store via typed arrays</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

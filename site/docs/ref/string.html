@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>String · Wrenlift docs</title>
+<meta name="description" content="Wrenlift's additions to Wren's String — fromCodePoint, byte-level indexing, the surface above stock Wren." />
+<link rel="canonical" href="https://wrenlift.com/docs/ref/string.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="String · Wrenlift docs" />
+<meta property="og:description" content="Wrenlift's additions to Wren's String — fromCodePoint, byte-level indexing, the surface above stock Wren." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="../_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html" class="active">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a> <span class="crumb-sep">/</span> <a href="/docs/">Reference</a> <span class="crumb-sep">/</span> <span class="crumb-current">String</span>
+    </nav>
+
+    <h1 class="pkg-title"><code>String</code></h1>
+    <p class="pkg-lede">Stock Wren strings plus a few Wrenlift extras for code-point construction, byte-level inspection, and interop with typed arrays.</p>
+
+    <div class="pkg-readme">
+      <h2 id="core">Stock surface</h2>
+      <p>
+        Wrenlift implements the
+        <a href="https://wren.io/modules/core/string.html">full
+        stock Wren <code>String</code> API</a> — concatenation,
+        <code>count</code>, <code>indexOf</code>,
+        <code>contains</code>, <code>startsWith</code>,
+        <code>endsWith</code>, slice (<code>s[a..b]</code>),
+        <code>codePointAt</code>, <code>byteAt</code>,
+        <code>split</code>, <code>trim</code>,
+        <code>replace</code>, and the iteration protocol.
+        Strings are immutable; every "mutator" returns a new
+        string.
+      </p>
+      <p>
+        This page covers what Wrenlift <em>adds</em> on top of
+        that surface. Everything else is exactly as Wren spec
+        documents it.
+      </p>
+
+      <h2 id="fromcodepoint">fromCodePoint</h2>
+      <p>
+        Construct a one-character string from a Unicode code-point
+        integer:
+      </p>
+<pre><code>System.print(String.fromCodePoint(65))       // "A"
+System.print(String.fromCodePoint(0x1F44B))  // "👋"</code></pre>
+      <p>
+        Combine with <code>0..n</code> ranges to build small
+        UTF-8 buffers without
+        <a href="/docs/ref/typed-arrays.html"><code>ByteArray</code></a>:
+      </p>
+<pre><code>// Build a 4-byte UTF-8 payload of 0x41 0x42 0x43 0x44 (ABCD):
+var s = ""
+for (cp in [0x41, 0x42, 0x43, 0x44]) {
+  s = s + String.fromCodePoint(cp)
+}</code></pre>
+      <p>
+        Throws <code>Fiber.abort</code> on invalid code points
+        (negative, &gt; <code>0x10FFFF</code>, or in the surrogate
+        gap <code>0xD800..=0xDFFF</code>).
+      </p>
+
+      <h2 id="bytes">Byte iteration</h2>
+      <p>
+        Stock Wren iterates a string by code-point. Wrenlift
+        keeps that, and adds a byte-level view through the
+        <code>.bytes</code> accessor:
+      </p>
+<pre><code>var s = "héllo"
+System.print(s.count)        // 5  — code points
+System.print(s.bytes.count)  // 6  — bytes (é is 2 bytes in UTF-8)
+
+for (b in s.bytes) {
+  System.print(b)            // 104, 195, 169, 108, 108, 111
+}</code></pre>
+      <p>
+        <code>s.bytes</code> is a lightweight view, not a copy —
+        constructing it doesn't allocate a backing buffer. For
+        a real, mutable buffer, copy through
+        <code>ByteArray.fromString(s)</code>.
+      </p>
+
+      <h2 id="interop">Typed-array interop</h2>
+      <p>
+        Strings and typed arrays bridge cleanly in both
+        directions:
+      </p>
+      <table>
+        <thead><tr><th>Direction</th><th>Call</th></tr></thead>
+        <tbody>
+          <tr><td>String → bytes</td><td><code>ByteArray.fromString(s)</code> (UTF-8 snapshot)</td></tr>
+          <tr><td>Bytes → String</td><td><code>String.fromBytes(byteArray)</code> (decode UTF-8 — aborts on invalid sequences)</td></tr>
+        </tbody>
+      </table>
+<pre><code>var b = ByteArray.fromString("hi 👋")
+System.print(b.count)              // 6
+
+var s = String.fromBytes(b)
+System.print(s)                    // "hi 👋"</code></pre>
+      <aside class="note">
+        Use byte-level routes for binary protocols, hashing,
+        cryptography, and anything that talks to a host buffer.
+        For text manipulation, stick with the stock
+        <code>String</code> API — it tracks code points correctly,
+        and Wrenlift's UTF-8 indexer makes
+        <code>count</code> / slice cost <code>O(byte length)</code>
+        either way.
+      </aside>
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#core">Stock surface</a></li>
+      <li><a href="#fromcodepoint">fromCodePoint</a></li>
+      <li><a href="#bytes">Byte iteration</a></li>
+      <li><a href="#interop">Typed-array interop</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>
