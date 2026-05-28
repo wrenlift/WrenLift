@@ -6627,7 +6627,7 @@ version = "0.1.6"
 dependencies = [
  "rusqlite",
  "sqlite-wasm-rs",
- "wren_lift",
+ "wlift_abi",
 ]
 
 [[package]]

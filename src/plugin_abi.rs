@@ -27,7 +27,12 @@ use crate::runtime::vm::VM;
 
 /// Host-side ABI version. Mirror of `wlift_abi::ABI_VERSION`; bump
 /// in lockstep when changing either side.
-pub const PLUGIN_ABI_VERSION: u32 = 2;
+///
+/// Stays at 1 alongside `wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION`
+/// during the migration window — the new `wlift_plugin_*` exports
+/// are additive, so unmigrated plugins built against the old
+/// VM-direct surface still load.
+pub const PLUGIN_ABI_VERSION: u32 = 1;
 
 // --- Helpers ---------------------------------------------------------------
 

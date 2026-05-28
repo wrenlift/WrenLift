@@ -12,29 +12,30 @@
 //!
 //!   * Wasm: `backend_wasm` uses `sqlite-wasm-rs` — the official
 //!     SQLite-Wasm C build wrapped as `wasm32-unknown-unknown`
-//!     bindings. Drives `sqlite3_prepare_v2` / `sqlite3_step` /
-//!     `sqlite3_finalize` directly. Memory VFS only (the playground
-//!     doesn't need OPFS persistence yet).
+//!     bindings.
 //!
-//! Both backends register the same `(connection_id, sql, params)`
-//! shape against the foreign-method registry, so the Wren-side
-//! `SqliteCore` class is target-independent.
+//! All host interaction goes through `wlift_abi`: a header-only
+//! Rust crate that declares the `wlift_plugin_*` C surface the
+//! host binary exports. No `wren_lift` Rust internals reach this
+//! cdylib, so a `VM` / `GcImpl` / `ObjList` layout change in the
+//! host can't silently SIGSEGV plugin code anymore.
 //!
 //! # Safety
 //!
 //! Every `wlift_sqlite_*` entry point is called by the runtime
-//! with a valid `*mut VM` that stays live for the duration of
+//! with a valid `*mut WrenVm` that stays live for the duration of
 //! the call. The runtime is also responsible for providing
 //! well-formed slot arguments — we validate them defensively
-//! but trust that the pointer itself dereferences.
+//! but trust that the pointer itself dereferences inside the
+//! host's `wlift_plugin_*` helpers.
 
 #![allow(clippy::missing_safety_doc)]
 
-use wren_lift::runtime::object::{
-    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
+use wlift_abi::{
+    alloc_list, alloc_map, alloc_string, alloc_typed_array, list_add, list_count, list_get,
+    map_iter, map_set, obj_type, runtime_error, set_return, slot, string_str, typed_array_bytes,
+    typed_array_bytes_mut, typed_array_kind, ObjType, TypedArrayKind, Value, WrenVm,
 };
-use wren_lift::runtime::value::Value;
-use wren_lift::runtime::vm::VM;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod backend_native;
@@ -46,18 +47,18 @@ mod backend_wasm;
 #[cfg(target_arch = "wasm32")]
 use backend_wasm as backend;
 
-/// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
+/// Plugin ABI handshake. The host's plugin loader calls this
+/// at `dlopen` and compares against its own `PLUGIN_ABI_VERSION`;
+/// mismatch aborts cleanly with a "rebuild against wren_lift ≥ X"
+/// message instead of the silent SIGSEGV that struct-layout drift
+/// used to produce.
 ///
-/// Native-only. The host's `libloading::dlsym` path uses it to
-/// reject a dylib built against a different `wren_lift` than the
-/// host. Statically-linked wasm plugins can't drift versions
-/// (everything's compiled from the same tree), and re-exporting
-/// the symbol from every linked rlib produces wasm-linker
-/// duplicate-symbol errors.
+/// Native-only — statically-linked wasm plugins can't drift versions
+/// (everything's compiled from the same tree).
 #[cfg(not(target_arch = "wasm32"))]
 #[no_mangle]
 pub extern "C" fn wlift_plugin_abi_version() -> u32 {
-    wren_lift::runtime::foreign::WLIFT_PLUGIN_ABI_VERSION
+    wlift_abi::ABI_VERSION
 }
 
 // --- Backend-independent value model ---------------------------
@@ -80,56 +81,17 @@ pub(crate) enum Params {
     Named(Vec<(String, SqlValue)>),
 }
 
-// --- Slot helpers ----------------------------------------------
-//
-// Foreign C functions receive only `*mut VM`. Arguments arrive on
-// the VM's `api_stack` (slot 0 = receiver / return value; slots
-// 1..N = positional args). `VM` implements `NativeContext` so we
-// can reach into its allocator for alloc_string / alloc_list /
-// alloc_map, and surface errors via `runtime_error`.
-
-unsafe fn slot(vm: *mut VM, index: usize) -> Value {
-    unsafe {
-        let stack = &(*vm).api_stack;
-        stack.get(index).copied().unwrap_or(Value::null())
-    }
-}
-
-unsafe fn set_return(vm: *mut VM, v: Value) {
-    unsafe {
-        let stack = &mut (*vm).api_stack;
-        if stack.is_empty() {
-            stack.push(v);
-        } else {
-            stack[0] = v;
-        }
-    }
-}
-
-unsafe fn ctx(vm: *mut VM) -> &'static mut VM {
-    unsafe { &mut *vm }
-}
-
 // --- Type coercion ---------------------------------------------
 
-unsafe fn string_of(v: Value) -> Option<String> {
-    if !v.is_object() {
-        return None;
-    }
-    let ptr = v.as_object()?;
-    let header = ptr as *const ObjHeader;
-    if unsafe { (*header).obj_type } != ObjType::String {
-        return None;
-    }
-    let s = ptr as *const ObjString;
-    Some(unsafe { (*s).as_str().to_string() })
+fn string_of(v: Value) -> Option<String> {
+    string_str(v).map(|s| s.to_string())
 }
 
-fn id_of(vm: &mut VM, v: Value, label: &str) -> Option<u64> {
+fn id_of(vm: *mut WrenVm, v: Value, label: &str) -> Option<u64> {
     match v.as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
         _ => {
-            vm.runtime_error(format!("{}: id must be a non-negative integer.", label));
+            runtime_error(vm, &format!("{}: id must be a non-negative integer.", label));
             None
         }
     }
@@ -154,27 +116,23 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
     if !v.is_object() {
         return Err(format!("{}: unsupported parameter type.", label));
     }
-    let ptr = v.as_object().unwrap();
-    let header = ptr as *const ObjHeader;
-    match unsafe { (*header).obj_type } {
-        ObjType::String => {
-            let s = ptr as *const ObjString;
-            Ok(SqlValue::Text(unsafe { (*s).as_str().to_string() }))
+    match obj_type(v) {
+        Some(ObjType::String) => {
+            Ok(SqlValue::Text(string_of(v).unwrap_or_default()))
         }
         // ByteArray is the canonical blob carrier — `sql_to_wren`
         // returns one for every BLOB column read, so a round-trip
         // (`db.query(...)["b"]` → bind back) doesn't need a manual
         // List<Num> conversion in Wren.
-        ObjType::TypedArray => {
-            let arr = ptr as *const ObjTypedArray;
-            if unsafe { (*arr).kind_tag() } != TypedArrayKind::U8 {
+        Some(ObjType::TypedArray) => {
+            if typed_array_kind(v) != Some(TypedArrayKind::U8) {
                 return Err(format!(
                     "{}: BLOB parameter must be a ByteArray (got {:?}).",
                     label,
-                    unsafe { (*arr).kind_tag() }
+                    typed_array_kind(v),
                 ));
             }
-            let bytes = unsafe { (*arr).as_bytes() }.to_vec();
+            let bytes = typed_array_bytes(v).map(|b| b.to_vec()).unwrap_or_default();
             Ok(SqlValue::Blob(bytes))
         }
         // Backwards-compatible List<Num> path. Pre-ByteArray
@@ -182,12 +140,11 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
         // List of integers in 0..=255; existing call sites
         // (`db.execute("INSERT … blob = ?", [[0xde, 0xad]])`) keep
         // working unchanged. New code should prefer ByteArray.
-        ObjType::List => {
-            let lst = ptr as *const ObjList;
-            let (count, data) = unsafe { ((*lst).count as usize, (*lst).elements) };
-            let mut bytes = Vec::with_capacity(count);
+        Some(ObjType::List) => {
+            let count = list_count(v);
+            let mut bytes = Vec::with_capacity(count as usize);
             for i in 0..count {
-                let elem = unsafe { *data.add(i) };
+                let elem = list_get(v, i);
                 let n = elem
                     .as_num()
                     .ok_or_else(|| format!("{}: BLOB entries must be numbers.", label))?;
@@ -205,26 +162,24 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
     }
 }
 
-fn sql_to_wren(ctx: &mut dyn NativeContext, v: SqlValue) -> Value {
+fn sql_to_wren(vm: *mut WrenVm, v: SqlValue) -> Value {
     match v {
-        SqlValue::Null => Value::null(),
+        SqlValue::Null => Value::NULL,
         SqlValue::Integer(i) => Value::num(i as f64),
         SqlValue::Real(f) => Value::num(f),
-        SqlValue::Text(s) => ctx.alloc_string(s),
+        SqlValue::Text(s) => alloc_string(vm, &s),
         // BLOB → ByteArray. Half the memory of a List<Num> per
         // element (1 byte vs 8-byte boxed Value), zero per-element
         // GC overhead, and a `Response.bytes(...)`-friendly shape
         // for callers that want to forward the column verbatim.
-        // `wren_to_sql` accepts both ByteArray and the legacy
-        // List<Num> on the bind side so existing code that builds
-        // blobs as Wren lists keeps working.
         SqlValue::Blob(b) => {
-            let value = ctx.alloc_typed_array(b.len() as u32, TypedArrayKind::U8);
-            let arr_ptr = value.as_object().unwrap() as *mut ObjTypedArray;
+            let arr = alloc_typed_array(vm, b.len() as u32, TypedArrayKind::U8);
             if !b.is_empty() {
-                unsafe { (*arr_ptr).as_bytes_mut().copy_from_slice(&b) };
+                if let Some(buf) = typed_array_bytes_mut(arr) {
+                    buf.copy_from_slice(&b);
+                }
             }
-            value
+            arr
         }
     }
 }
@@ -236,26 +191,22 @@ fn collect_params(v: Value, label: &str) -> Result<Params, String> {
     if !v.is_object() {
         return Err(format!("{}: params must be a List, Map, or null.", label));
     }
-    let ptr = v.as_object().unwrap();
-    let header = ptr as *const ObjHeader;
-    match unsafe { (*header).obj_type } {
-        ObjType::List => {
-            let lst = ptr as *const ObjList;
-            let (count, data) = unsafe { ((*lst).count as usize, (*lst).elements) };
-            let mut out = Vec::with_capacity(count);
+    match obj_type(v) {
+        Some(ObjType::List) => {
+            let count = list_count(v);
+            let mut out = Vec::with_capacity(count as usize);
             for i in 0..count {
-                let elem = unsafe { *data.add(i) };
-                out.push(wren_to_sql(elem, label)?);
+                out.push(wren_to_sql(list_get(v, i), label)?);
             }
             Ok(Params::Positional(out))
         }
-        ObjType::Map => {
-            let m = ptr as *const ObjMap;
-            let entries: Vec<(Value, Value)> =
-                unsafe { (*m).entries.iter().map(|(k, v)| (k.0, *v)).collect() };
+        Some(ObjType::Map) => {
+            // Snapshot entries before any allocation so iteration
+            // can't be invalidated by GC moves later in the loop.
+            let entries: Vec<(Value, Value)> = map_iter(v).collect();
             let mut out = Vec::with_capacity(entries.len());
-            for (k, v) in entries {
-                let key = match unsafe { string_of(k) } {
+            for (k, val) in entries {
+                let key = match string_of(k) {
                     Some(s) => s,
                     None => {
                         return Err(format!("{}: named parameter keys must be strings.", label));
@@ -266,7 +217,7 @@ fn collect_params(v: Value, label: &str) -> Result<Params, String> {
                 } else {
                     format!(":{}", key)
                 };
-                out.push((key, wren_to_sql(v, label)?));
+                out.push((key, wren_to_sql(val, label)?));
             }
             Ok(Params::Named(out))
         }
@@ -280,231 +231,195 @@ fn collect_params(v: Value, label: &str) -> Result<Params, String> {
 // `backend` alias above, so the same Wren-side `SqliteCore` class
 // works on host and wasm.
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_open(vm: *mut VM) {
-    unsafe {
-        let path_val = slot(vm, 1);
-        let path = match string_of(path_val) {
-            Some(s) => s,
-            None => {
-                ctx(vm).runtime_error("Sqlite.open: path must be a string.".to_string());
-                set_return(vm, Value::null());
-                return;
-            }
-        };
-        match backend::open(&path) {
-            Ok(id) => set_return(vm, Value::num(id as f64)),
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Sqlite.open: {}", e));
-                set_return(vm, Value::null());
-            }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_open(vm: *mut WrenVm) {
+    let path_val = slot(vm, 1);
+    let path = match string_of(path_val) {
+        Some(s) => s,
+        None => {
+            runtime_error(vm, "Sqlite.open: path must be a string.");
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    match backend::open(&path) {
+        Ok(id) => set_return(vm, Value::num(id as f64)),
+        Err(e) => {
+            runtime_error(vm, &format!("Sqlite.open: {}", e));
+            set_return(vm, Value::NULL);
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_close(vm: *mut VM) {
-    unsafe {
-        let id_val = slot(vm, 1);
-        let Some(id) = id_of(ctx(vm), id_val, "Sqlite.close") else {
-            set_return(vm, Value::null());
-            return;
-        };
-        backend::close(id);
-        set_return(vm, Value::null());
-    }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_close(vm: *mut WrenVm) {
+    let id_val = slot(vm, 1);
+    let Some(id) = id_of(vm, id_val, "Sqlite.close") else {
+        set_return(vm, Value::NULL);
+        return;
+    };
+    backend::close(id);
+    set_return(vm, Value::NULL);
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_execute(vm: *mut VM) {
-    unsafe {
-        let id_val = slot(vm, 1);
-        let sql_val = slot(vm, 2);
-        let params_val = slot(vm, 3);
-        let Some(id) = id_of(ctx(vm), id_val, "Sqlite.execute") else {
-            set_return(vm, Value::null());
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_execute(vm: *mut WrenVm) {
+    let id_val = slot(vm, 1);
+    let sql_val = slot(vm, 2);
+    let params_val = slot(vm, 3);
+    let Some(id) = id_of(vm, id_val, "Sqlite.execute") else {
+        set_return(vm, Value::NULL);
+        return;
+    };
+    let sql = match string_of(sql_val) {
+        Some(s) => s,
+        None => {
+            runtime_error(vm, "Sqlite.execute: sql must be a string.");
+            set_return(vm, Value::NULL);
             return;
-        };
-        let sql = match string_of(sql_val) {
-            Some(s) => s,
-            None => {
-                ctx(vm).runtime_error("Sqlite.execute: sql must be a string.".to_string());
-                set_return(vm, Value::null());
-                return;
-            }
-        };
-        let params = match collect_params(params_val, "Sqlite.execute") {
-            Ok(p) => p,
-            Err(e) => {
-                ctx(vm).runtime_error(e);
-                set_return(vm, Value::null());
-                return;
-            }
-        };
-        match backend::execute(id, &sql, &params) {
-            Ok(rows) => set_return(vm, Value::num(rows as f64)),
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Sqlite.execute: {}", e));
-                set_return(vm, Value::null());
-            }
+        }
+    };
+    let params = match collect_params(params_val, "Sqlite.execute") {
+        Ok(p) => p,
+        Err(e) => {
+            runtime_error(vm, &e);
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    match backend::execute(id, &sql, &params) {
+        Ok(rows) => set_return(vm, Value::num(rows as f64)),
+        Err(e) => {
+            runtime_error(vm, &format!("Sqlite.execute: {}", e));
+            set_return(vm, Value::NULL);
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut VM) {
-    unsafe {
-        let id_val = slot(vm, 1);
-        let sql_val = slot(vm, 2);
-        let params_val = slot(vm, 3);
-        let Some(id) = id_of(ctx(vm), id_val, "Sqlite.query") else {
-            set_return(vm, Value::null());
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_query(vm: *mut WrenVm) {
+    let id_val = slot(vm, 1);
+    let sql_val = slot(vm, 2);
+    let params_val = slot(vm, 3);
+    let Some(id) = id_of(vm, id_val, "Sqlite.query") else {
+        set_return(vm, Value::NULL);
+        return;
+    };
+    let sql = match string_of(sql_val) {
+        Some(s) => s,
+        None => {
+            runtime_error(vm, "Sqlite.query: sql must be a string.");
+            set_return(vm, Value::NULL);
             return;
-        };
-        let sql = match string_of(sql_val) {
-            Some(s) => s,
-            None => {
-                ctx(vm).runtime_error("Sqlite.query: sql must be a string.".to_string());
-                set_return(vm, Value::null());
-                return;
-            }
-        };
-        let params = match collect_params(params_val, "Sqlite.query") {
-            Ok(p) => p,
-            Err(e) => {
-                ctx(vm).runtime_error(e);
-                set_return(vm, Value::null());
-                return;
-            }
-        };
+        }
+    };
+    let params = match collect_params(params_val, "Sqlite.query") {
+        Ok(p) => p,
+        Err(e) => {
+            runtime_error(vm, &e);
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
 
-        // Materialize rows BEFORE alloc_string / alloc_map so a
-        // GC inside the allocator can't reach into a borrowed
-        // backend statement.
-        let (col_names, rows) = match backend::query(id, &sql, &params) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx(vm).runtime_error(format!("Sqlite.query: {}", e));
-                set_return(vm, Value::null());
-                return;
-            }
-        };
+    // Materialize rows BEFORE alloc_string / alloc_map so a GC
+    // inside the allocator can't reach into a borrowed backend
+    // statement.
+    let (col_names, rows) = match backend::query(id, &sql, &params) {
+        Ok(r) => r,
+        Err(e) => {
+            runtime_error(vm, &format!("Sqlite.query: {}", e));
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
 
-        // GC rooting: the previous implementation accumulated
-        // `Value`s in a plain `Vec<Value>` on the host stack —
-        // that Vec isn't a GC root, and any allocator call inside
-        // the loop (`alloc_map`, `alloc_string`, `sql_to_wren`)
-        // could trigger a collection that freed the partially-
-        // built maps before they were handed back to Wren. Symptom
-        // in production: catalog refresh allocates ~hundreds of
-        // Maps in a tight loop; the GC threshold trips mid-rebuild;
-        // a subsequent `byName` query lands on freed pointers and
-        // SIGSEGVs (`hatch run … [catalog] refreshed (39 packages)
-        // … zsh: segmentation fault`).
-        //
-        // Strategy: build the result list FIRST as the receiver/
-        // return slot (api_stack[0], scanned by the GC's root set
-        // — see `vm.rs` `roots.extend_from_slice(&self.api_stack)`)
-        // and append each freshly-allocated map to it BEFORE
-        // populating its fields. Once the map is reachable through
-        // the result list's element array, subsequent
-        // `alloc_string` / `sql_to_wren` calls can collect freely
-        // without freeing the in-progress map — the list's element
-        // array is itself reachable through the root, so the map
-        // is transitively rooted.
-        //
-        // Critical: each allocation may move the result list and
-        // the in-progress map under a moving nursery. Re-derive the
-        // raw `*mut ObjList` / `*mut ObjMap` pointers from the
-        // GC-tracked `api_stack[0]` slot (for the list) and the
-        // most-recent list element (for the map) AFTER every
-        // allocator call. Holding the raw pointer across a `alloc_*`
-        // is a use-after-promotion bug — the list/map gets a
-        // forwarded address while the local pointer still points
-        // at the now-freed nursery slot.
-        let context = ctx(vm);
-        let result = context.alloc_list(Vec::new());
-        set_return(vm, result);
+    // GC rooting: build the result list FIRST as the receiver/
+    // return slot (api_stack[0], scanned by the GC's root set) and
+    // append each freshly-allocated map to it via `list_add` BEFORE
+    // populating the map's fields. Once a map is reachable through
+    // the result list, subsequent `alloc_string` / `sql_to_wren`
+    // calls can collect freely — the list's element array is
+    // itself reachable through the root, so the map is
+    // transitively rooted.
+    //
+    // The `wlift_plugin_list_add` host helper handles the GC-safe
+    // append (the old `(*list).add(v)` direct field write had the
+    // same semantics, just via private Rust internals). We re-read
+    // the list from api_stack[0] each iteration in case a previous
+    // allocation promoted it across the nursery/old-gen boundary.
+    let result = alloc_list(vm, 0);
+    set_return(vm, result);
 
-        for row_vals in rows {
-            let map = context.alloc_map();
-            // alloc_map may have moved `result` — refresh the list
-            // pointer from api_stack[0] before appending.
-            let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
-            (*result_ptr).add(map);
-            let last_idx = (*result_ptr).len() - 1;
-            for (i, val) in row_vals.into_iter().enumerate() {
-                let key = context.alloc_string(col_names[i].clone());
-                let wv = sql_to_wren(context, val);
-                // Both alloc_string and sql_to_wren may have moved
-                // the list and the in-progress map. Re-derive the
-                // map pointer from the list's last element each
-                // iteration.
-                let result_ptr = slot(vm, 0).as_object().unwrap() as *mut ObjList;
-                let map_ptr =
-                    (*result_ptr).as_slice()[last_idx].as_object().unwrap() as *mut ObjMap;
-                (*map_ptr).set(key, wv);
-            }
+    for row_vals in rows {
+        let map = alloc_map(vm);
+        // alloc_map may have moved `result` — refresh from slot 0.
+        let result_list = slot(vm, 0);
+        list_add(vm, result_list, map);
+        let last_idx = list_count(result_list) - 1;
+        for (i, val) in row_vals.into_iter().enumerate() {
+            let key = alloc_string(vm, &col_names[i]);
+            let wv = sql_to_wren(vm, val);
+            // Both alloc_string and sql_to_wren may have moved the
+            // list and the in-progress map. Re-derive the map from
+            // the list's last element each iteration.
+            let result_list = slot(vm, 0);
+            let map_v = list_get(result_list, last_idx);
+            map_set(vm, map_v, key, wv);
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_last_insert_rowid(vm: *mut VM) {
-    unsafe {
-        let id_val = slot(vm, 1);
-        let Some(id) = id_of(ctx(vm), id_val, "Sqlite.lastInsertRowid") else {
-            set_return(vm, Value::null());
-            return;
-        };
-        match backend::last_insert_rowid(id) {
-            Some(n) => set_return(vm, Value::num(n as f64)),
-            None => {
-                ctx(vm).runtime_error(format!(
-                    "Sqlite.lastInsertRowid: unknown connection id {}.",
-                    id
-                ));
-                set_return(vm, Value::null());
-            }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_last_insert_rowid(vm: *mut WrenVm) {
+    let id_val = slot(vm, 1);
+    let Some(id) = id_of(vm, id_val, "Sqlite.lastInsertRowid") else {
+        set_return(vm, Value::NULL);
+        return;
+    };
+    match backend::last_insert_rowid(id) {
+        Some(n) => set_return(vm, Value::num(n as f64)),
+        None => {
+            runtime_error(
+                vm,
+                &format!("Sqlite.lastInsertRowid: unknown connection id {}.", id),
+            );
+            set_return(vm, Value::NULL);
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_changes(vm: *mut VM) {
-    unsafe {
-        let id_val = slot(vm, 1);
-        let Some(id) = id_of(ctx(vm), id_val, "Sqlite.changes") else {
-            set_return(vm, Value::null());
-            return;
-        };
-        match backend::changes(id) {
-            Some(n) => set_return(vm, Value::num(n as f64)),
-            None => {
-                ctx(vm).runtime_error(format!("Sqlite.changes: unknown connection id {}.", id));
-                set_return(vm, Value::null());
-            }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_changes(vm: *mut WrenVm) {
+    let id_val = slot(vm, 1);
+    let Some(id) = id_of(vm, id_val, "Sqlite.changes") else {
+        set_return(vm, Value::NULL);
+        return;
+    };
+    match backend::changes(id) {
+        Some(n) => set_return(vm, Value::num(n as f64)),
+        None => {
+            runtime_error(vm, &format!("Sqlite.changes: unknown connection id {}.", id));
+            set_return(vm, Value::NULL);
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn wlift_sqlite_in_transaction(vm: *mut VM) {
-    unsafe {
-        let id_val = slot(vm, 1);
-        let Some(id) = id_of(ctx(vm), id_val, "Sqlite.inTransaction") else {
-            set_return(vm, Value::null());
-            return;
-        };
-        match backend::in_transaction(id) {
-            Some(b) => set_return(vm, Value::bool(b)),
-            None => {
-                ctx(vm).runtime_error(format!(
-                    "Sqlite.inTransaction: unknown connection id {}.",
-                    id
-                ));
-                set_return(vm, Value::null());
-            }
+#[no_mangle]
+pub unsafe extern "C" fn wlift_sqlite_in_transaction(vm: *mut WrenVm) {
+    let id_val = slot(vm, 1);
+    let Some(id) = id_of(vm, id_val, "Sqlite.inTransaction") else {
+        set_return(vm, Value::NULL);
+        return;
+    };
+    match backend::in_transaction(id) {
+        Some(b) => set_return(vm, Value::bool(b)),
+        None => {
+            runtime_error(
+                vm,
+                &format!("Sqlite.inTransaction: unknown connection id {}.", id),
+            );
+            set_return(vm, Value::NULL);
         }
     }
 }
@@ -520,20 +435,41 @@ pub unsafe extern "C" fn wlift_sqlite_in_transaction(vm: *mut VM) {
 
 #[cfg(target_arch = "wasm32")]
 pub fn register_static_symbols() {
-    use wren_lift::runtime::foreign::register_plugin_symbol_unsafe;
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_open", wlift_sqlite_open);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_close", wlift_sqlite_close);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_execute", wlift_sqlite_execute);
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_query", wlift_sqlite_query);
-    register_plugin_symbol_unsafe(
-        "wlift_sqlite",
-        "wlift_sqlite_last_insert_rowid",
-        wlift_sqlite_last_insert_rowid,
-    );
-    register_plugin_symbol_unsafe("wlift_sqlite", "wlift_sqlite_changes", wlift_sqlite_changes);
-    register_plugin_symbol_unsafe(
-        "wlift_sqlite",
-        "wlift_sqlite_in_transaction",
-        wlift_sqlite_in_transaction,
-    );
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_open",
+            wlift_sqlite_open as *const (),
+        );
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_close",
+            wlift_sqlite_close as *const (),
+        );
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_execute",
+            wlift_sqlite_execute as *const (),
+        );
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_query",
+            wlift_sqlite_query as *const (),
+        );
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_last_insert_rowid",
+            wlift_sqlite_last_insert_rowid as *const (),
+        );
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_changes",
+            wlift_sqlite_changes as *const (),
+        );
+        wlift_abi::register_symbol(
+            "wlift_sqlite",
+            "wlift_sqlite_in_transaction",
+            wlift_sqlite_in_transaction as *const (),
+        );
+    }
 }

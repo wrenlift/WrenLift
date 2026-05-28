@@ -3,6 +3,7 @@ name = "wlift_sqlite"
 version = "0.1.6"
 edition = "2021"
 description = "SQLite plugin for the WrenLift runtime — distributed as a dylib bundled into @hatch:sqlite."
+build = "build.rs"
 
 [lib]
 # `cdylib` for the host plugin loader (libloading dlopens the
@@ -12,20 +13,14 @@ description = "SQLite plugin for the WrenLift runtime — distributed as a dylib
 # runtime crate links in directly.
 crate-type = ["cdylib", "rlib"]
 
-# Plugins must compile against the SAME `wren_lift` feature set
-# the host binary uses, otherwise host-gated fields in `VM` /
-# `NativeContext` shift offsets and the cdylib's `&mut VM` decode
-# is wrong → silent SIGSEGV on the first foreign-method call. The
-# `host` feature here flips `wren_lift/host` so the plugin's view
-# of those structs matches the binary's. Native builds keep `host`
-# on by default; the wasm static-link path in `wlift_wasm`
-# explicitly disables it via `default-features = false`.
-[features]
-default = ["host"]
-host = ["wren_lift/host"]
-
 [dependencies]
-wren_lift = { path = "../..", default-features = false }
+# Only the header-only `wlift_abi` crate is on the plugin side.
+# No `wren_lift` dep — VM / Gc / ObjList layout changes can't reach
+# plugin code anymore. The host process exports the `wlift_plugin_*`
+# symbols via `#[no_mangle]`; the dynamic linker resolves the
+# plugin's externs against them at dlopen. Same surface satisfies
+# the wasm static-link path.
+wlift_abi = { path = "../../crates/wlift_abi" }
 
 # Native backend — `rusqlite` bundles libsqlite3 via `cc`. Doesn't
 # build for `wasm32-unknown-unknown` because cc-rs can't drive

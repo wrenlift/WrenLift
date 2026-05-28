@@ -36,7 +36,13 @@
 /// - ObjType / TypedArrayKind discriminant renumbering
 /// - Function signature change
 /// - Function removal
-pub const ABI_VERSION: u32 = 2;
+///
+/// Stays at 1 during the migration window — the new
+/// `wlift_plugin_*` exports are additive, so plugins built against
+/// `wlift_abi` are still load-compatible with the host's existing
+/// v1 handshake. Bump to 2 in Phase E once the unmigrated
+/// VM-direct surface is retired.
+pub const ABI_VERSION: u32 = 1;
 
 // -- Value ------------------------------------------------------------------
 
