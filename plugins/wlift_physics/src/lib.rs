@@ -773,6 +773,148 @@ pub unsafe extern "C" fn wlift_physics_world3d_linear_velocity(vm: *mut WrenVm) 
     );
 }
 
+/// Non-allocating position read: write the body's (x, y, z) into
+/// a caller-provided `Float32Array` starting at `offset`. Returns
+/// `null`. The bridge's hot path uses this instead of `position`
+/// to dodge the per-body `List<Num>` allocation that pins
+/// short-lived garbage faster than the GC can reclaim it.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_position_into(vm: *mut WrenVm) {
+    use wlift_abi::{typed_array_bytes_mut, typed_array_kind, TypedArrayKind};
+
+    let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
+    let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
+    let out_val = slot(vm, 3);
+    let offset = slot(vm, 4).as_num().unwrap_or(0.0) as usize;
+
+    if typed_array_kind(out_val) != Some(TypedArrayKind::F32) {
+        runtime_error(vm, "World3D.positionInto: out must be a Float32Array.");
+        return;
+    }
+
+    let reg = d3::worlds().lock().unwrap();
+    let (x, y, z) = reg
+        .get(&world_id)
+        .and_then(|w| {
+            w.bodies_by_id.get(&body_id).map(|h| {
+                let t = w.bodies[*h].translation();
+                (t.x, t.y, t.z)
+            })
+        })
+        .unwrap_or((0.0, 0.0, 0.0));
+    drop(reg);
+
+    let Some(bytes) = typed_array_bytes_mut(out_val) else {
+        runtime_error(vm, "World3D.positionInto: out has no backing buffer.");
+        return;
+    };
+    let base = offset * 4;
+    if base + 12 > bytes.len() {
+        runtime_error(vm, "World3D.positionInto: offset overruns the array.");
+        return;
+    }
+    bytes[base..base + 4].copy_from_slice(&x.to_le_bytes());
+    bytes[base + 4..base + 8].copy_from_slice(&y.to_le_bytes());
+    bytes[base + 8..base + 12].copy_from_slice(&z.to_le_bytes());
+    set_return(vm, Value::NULL);
+}
+
+/// Non-allocating rotation read — same shape as `position_into`,
+/// writes 4 f32s in scalar-first (w, x, y, z) order to match
+/// `@hatch:math.Quat.new(w, x, y, z)`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_rotation_into(vm: *mut WrenVm) {
+    use wlift_abi::{typed_array_bytes_mut, typed_array_kind, TypedArrayKind};
+
+    let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
+    let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
+    let out_val = slot(vm, 3);
+    let offset = slot(vm, 4).as_num().unwrap_or(0.0) as usize;
+
+    if typed_array_kind(out_val) != Some(TypedArrayKind::F32) {
+        runtime_error(vm, "World3D.rotationInto: out must be a Float32Array.");
+        return;
+    }
+
+    let reg = d3::worlds().lock().unwrap();
+    let (w, x, y, z) = reg
+        .get(&world_id)
+        .and_then(|w_| {
+            w_.bodies_by_id.get(&body_id).map(|h| {
+                let q = w_.bodies[*h].rotation();
+                (q.w, q.x, q.y, q.z)
+            })
+        })
+        .unwrap_or((1.0, 0.0, 0.0, 0.0));
+    drop(reg);
+
+    let Some(bytes) = typed_array_bytes_mut(out_val) else {
+        runtime_error(vm, "World3D.rotationInto: out has no backing buffer.");
+        return;
+    };
+    let base = offset * 4;
+    if base + 16 > bytes.len() {
+        runtime_error(vm, "World3D.rotationInto: offset overruns the array.");
+        return;
+    }
+    bytes[base..base + 4].copy_from_slice(&w.to_le_bytes());
+    bytes[base + 4..base + 8].copy_from_slice(&x.to_le_bytes());
+    bytes[base + 8..base + 12].copy_from_slice(&y.to_le_bytes());
+    bytes[base + 12..base + 16].copy_from_slice(&z.to_le_bytes());
+    set_return(vm, Value::NULL);
+}
+
+/// Return the body's orientation as a Wren `List<Num>` in
+/// scalar-first layout: `[w, x, y, z]`. Matches `@hatch:math`'s
+/// `Quat.new(w, x, y, z)` constructor so the bridge can build a
+/// Quat from the list directly.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_rotation(vm: *mut WrenVm) {
+    let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
+    let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
+    let reg = d3::worlds().lock().unwrap();
+    let (w, x, y, z) = reg
+        .get(&world_id)
+        .and_then(|w_| {
+            w_.bodies_by_id.get(&body_id).map(|h| {
+                let q = w_.bodies[*h].rotation();
+                // glam-style Quat: direct (x, y, z, w) field
+                // access. Repack into scalar-first (w, x, y, z)
+                // to match @hatch:math's `Quat.new(w, x, y, z)`.
+                (q.w, q.x, q.y, q.z)
+            })
+        })
+        .unwrap_or((1.0, 0.0, 0.0, 0.0));
+    drop(reg);
+    return_list(
+        vm,
+        &[
+            Value::num(w as f64),
+            Value::num(x as f64),
+            Value::num(y as f64),
+            Value::num(z as f64),
+        ],
+    );
+}
+
+/// 2D equivalent — 2D rotations are scalars (angle in radians).
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world2d_rotation(vm: *mut WrenVm) {
+    let world_id = slot(vm, 1).as_num().map(|n| n as u64).unwrap_or(0);
+    let body_id = slot(vm, 2).as_num().map(|n| n as u64).unwrap_or(0);
+    let reg = d2::worlds().lock().unwrap();
+    let angle = reg
+        .get(&world_id)
+        .and_then(|w_| {
+            w_.bodies_by_id
+                .get(&body_id)
+                .map(|h| w_.bodies[*h].rotation().angle())
+        })
+        .unwrap_or(0.0);
+    drop(reg);
+    set_return(vm, Value::num(angle as f64));
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn wlift_physics_world3d_set_linear_velocity(vm: *mut WrenVm) {
     use rapier3d::prelude::*;
@@ -929,6 +1071,13 @@ pub fn register_static_symbols() {
     unsafe {
         wlift_abi::register_symbol(
             "wlift_physics",
+            "wlift_physics_world2d_rotation",
+            wlift_physics_world2d_rotation as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
             "wlift_physics_world2d_linear_velocity",
             wlift_physics_world2d_linear_velocity as *const (),
         )
@@ -1008,6 +1157,27 @@ pub fn register_static_symbols() {
             "wlift_physics",
             "wlift_physics_world3d_position",
             wlift_physics_world3d_position as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_position_into",
+            wlift_physics_world3d_position_into as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_rotation",
+            wlift_physics_world3d_rotation as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_rotation_into",
+            wlift_physics_world3d_rotation_into as *const (),
         )
     };
     unsafe {
