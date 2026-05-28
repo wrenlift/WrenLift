@@ -1108,7 +1108,7 @@ pub unsafe extern "C" fn wlift_physics_world3d_despawn(vm: *mut WrenVm) {
 }
 
 // ---------------------------------------------------------------------------
-// Raycasts + contact events (Phase 4)
+// Raycasts + contact events
 //
 // Raycasts return a 6-key result Map ({ bodyId, point[x,y,z],
 // normal[x,y,z], toi }) or null when nothing was hit. The
@@ -1567,8 +1567,8 @@ pub fn register_static_symbols() {
         )
     };
 
-    // Phase 4: raycasts + contact events. Same wasm-side
-    // registration pattern as every export above.
+    // Raycasts + contact events. Same wasm-side registration
+    // pattern as every export above.
     unsafe {
         wlift_abi::register_symbol(
             "wlift_physics",
