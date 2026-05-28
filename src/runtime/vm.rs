@@ -856,8 +856,25 @@ impl VM {
             }
         }
         for (name, entry) in &manifest.native_libs {
+            // Skip the explicit name-override if the resolved path
+            // doesn't exist on disk — common in local dev where the
+            // CI build matrix's per-arch slot (`libs/macos-arm64/...`)
+            // is empty but the bare `libs/libwlift_<name>.dylib`
+            // fallback is populated. `load_library` then walks
+            // `native_search_paths` and finds the bare file via the
+            // platform-aware `library_candidates` set.
+            //
+            // Without the existence check, the override path wins
+            // unconditionally and `load_library` returns
+            // `LibraryNotFound` — `hatch test` against a workspace
+            // package would dlopen-miss the plugin even when a fresh
+            // dylib is sitting in the search-path location next to
+            // it.
             if let Some(raw) = entry.resolve() {
-                self.native_lib_paths.insert(name.clone(), resolve(raw));
+                let path = resolve(raw);
+                if path.exists() {
+                    self.native_lib_paths.insert(name.clone(), path);
+                }
             }
         }
     }
