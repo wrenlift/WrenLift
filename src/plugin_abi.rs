@@ -21,6 +21,14 @@
 //! versions at dlopen and aborts cleanly on mismatch, replacing the
 //! previous silent SIGSEGV when struct layouts drifted.
 
+// Every export is `unsafe extern "C"` because the host receives raw
+// `*mut WrenVm` from a dlopen'd plugin and trusts it to point at a
+// live VM for the call's duration. The safety contract is the same
+// for every function — documented once at the module level rather
+// than restated per function. Same pattern the existing wren* C API
+// in `capi.rs` uses.
+#![allow(clippy::missing_safety_doc)]
+
 use crate::runtime::object::{
     NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
 };
