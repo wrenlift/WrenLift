@@ -91,7 +91,10 @@ fn id_of(vm: *mut WrenVm, v: Value, label: &str) -> Option<u64> {
     match v.as_num() {
         Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => Some(n as u64),
         _ => {
-            runtime_error(vm, &format!("{}: id must be a non-negative integer.", label));
+            runtime_error(
+                vm,
+                &format!("{}: id must be a non-negative integer.", label),
+            );
             None
         }
     }
@@ -117,9 +120,7 @@ fn wren_to_sql(v: Value, label: &str) -> Result<SqlValue, String> {
         return Err(format!("{}: unsupported parameter type.", label));
     }
     match obj_type(v) {
-        Some(ObjType::String) => {
-            Ok(SqlValue::Text(string_of(v).unwrap_or_default()))
-        }
+        Some(ObjType::String) => Ok(SqlValue::Text(string_of(v).unwrap_or_default())),
         // ByteArray is the canonical blob carrier — `sql_to_wren`
         // returns one for every BLOB column read, so a round-trip
         // (`db.query(...)["b"]` → bind back) doesn't need a manual
@@ -399,7 +400,10 @@ pub unsafe extern "C" fn wlift_sqlite_changes(vm: *mut WrenVm) {
     match backend::changes(id) {
         Some(n) => set_return(vm, Value::num(n as f64)),
         None => {
-            runtime_error(vm, &format!("Sqlite.changes: unknown connection id {}.", id));
+            runtime_error(
+                vm,
+                &format!("Sqlite.changes: unknown connection id {}.", id),
+            );
             set_return(vm, Value::NULL);
         }
     }

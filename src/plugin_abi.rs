@@ -21,7 +21,9 @@
 //! versions at dlopen and aborts cleanly on mismatch, replacing the
 //! previous silent SIGSEGV when struct layouts drifted.
 
-use crate::runtime::object::{NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind};
+use crate::runtime::object::{
+    NativeContext, ObjHeader, ObjList, ObjMap, ObjString, ObjType, ObjTypedArray, TypedArrayKind,
+};
 use crate::runtime::value::Value;
 use crate::runtime::vm::VM;
 
@@ -91,18 +93,16 @@ pub unsafe extern "C" fn wlift_plugin_set_return(vm: *mut (), value: u64) {
 pub unsafe extern "C" fn wlift_plugin_runtime_error(vm: *mut (), msg: *const u8, len: u32) {
     let vm = unsafe { vm_ref(vm) };
     let bytes = unsafe { std::slice::from_raw_parts(msg, len as usize) };
-    let s = std::str::from_utf8(bytes).unwrap_or("<invalid utf-8>").to_string();
+    let s = std::str::from_utf8(bytes)
+        .unwrap_or("<invalid utf-8>")
+        .to_string();
     vm.runtime_error(s);
 }
 
 // --- Allocators ------------------------------------------------------------
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_plugin_alloc_string(
-    vm: *mut (),
-    bytes: *const u8,
-    len: u32,
-) -> u64 {
+pub unsafe extern "C" fn wlift_plugin_alloc_string(vm: *mut (), bytes: *const u8, len: u32) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     let slice = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
     // String content can be non-UTF-8 if the plugin is bridging raw
@@ -137,11 +137,7 @@ pub unsafe extern "C" fn wlift_plugin_alloc_map(vm: *mut ()) -> u64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wlift_plugin_alloc_typed_array(
-    vm: *mut (),
-    count: u32,
-    kind: u8,
-) -> u64 {
+pub unsafe extern "C" fn wlift_plugin_alloc_typed_array(vm: *mut (), count: u32, kind: u8) -> u64 {
     let vm = unsafe { vm_ref(vm) };
     let Some(kind) = TypedArrayKind::from_u8(kind) else {
         vm.runtime_error(format!(
@@ -241,7 +237,7 @@ pub unsafe extern "C" fn wlift_plugin_map_iter_next(
         *out_key = k.0.to_bits();
         *out_value = v.to_bits();
     }
-    (cursor + 1)
+    cursor + 1
 }
 
 #[no_mangle]

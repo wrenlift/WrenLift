@@ -989,7 +989,6 @@ pub unsafe extern "C" fn wlift_gpu_buffer_write_floats(vm: *mut WrenVm) {
         |n| (n as f32).to_le_bytes().to_vec(),
         4,
     );
-
 }
 
 /// Write only the first `count` floats of `data` (a
@@ -1093,7 +1092,6 @@ pub unsafe extern "C" fn wlift_gpu_buffer_write_uints(vm: *mut WrenVm) {
         },
         4,
     );
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1386,7 +1384,6 @@ pub unsafe extern "C" fn wlift_gpu_texture_create(vm: *mut WrenVm) {
         },
     );
     set_return(vm, Value::num(id as f64));
-
 }
 
 #[no_mangle]
@@ -1397,7 +1394,6 @@ pub unsafe extern "C" fn wlift_gpu_texture_destroy(vm: *mut WrenVm) {
     };
     textures().lock().unwrap().textures.remove(&id);
     set_return(vm, Value::NULL);
-
 }
 
 #[no_mangle]
@@ -1421,7 +1417,6 @@ pub unsafe extern "C" fn wlift_gpu_texture_create_view(vm: *mut WrenVm) {
     let id = next_id();
     views().lock().unwrap().views.insert(id, view);
     set_return(vm, Value::num(id as f64));
-
 }
 
 #[no_mangle]
@@ -1432,7 +1427,6 @@ pub unsafe extern "C" fn wlift_gpu_view_destroy(vm: *mut WrenVm) {
     };
     views().lock().unwrap().views.remove(&id);
     set_return(vm, Value::NULL);
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1506,7 +1500,6 @@ pub unsafe extern "C" fn wlift_gpu_sampler_destroy(vm: *mut WrenVm) {
     };
     samplers().lock().unwrap().samplers.remove(&id);
     set_return(vm, Value::NULL);
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1695,7 +1688,6 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_layout_create(vm: *mut WrenVm) {
         .layouts
         .insert(id, layout);
     set_return(vm, Value::num(id as f64));
-
 }
 
 #[no_mangle]
@@ -2992,7 +2984,6 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
     drop(view_reg);
     drop(enc_reg);
     set_return(vm, Value::NULL);
-
 }
 
 /// `encoder.copyTextureToBuffer(srcTextureId, dstBufferId, descriptor)`
@@ -3092,7 +3083,6 @@ pub unsafe extern "C" fn wlift_gpu_encoder_copy_texture_to_buffer(vm: *mut WrenV
     drop(tex_reg);
     drop(enc_reg);
     set_return(vm, Value::NULL);
-
 }
 
 /// Finish recording, transition to `Finished` state. Subsequent
@@ -3126,7 +3116,6 @@ pub unsafe extern "C" fn wlift_gpu_encoder_finish(vm: *mut WrenVm) {
     reg.encoders.insert(encoder_id, new_state);
     drop(reg);
     set_return(vm, Value::NULL);
-
 }
 
 /// Submit a list of finished encoder ids to their device's queue.
@@ -3197,7 +3186,6 @@ pub unsafe extern "C" fn wlift_gpu_queue_submit(vm: *mut WrenVm) {
     dev.queue.submit(buffers_to_submit);
     drop(dev_reg);
     set_return(vm, Value::NULL);
-
 }
 
 /// Synchronously read bytes back from a buffer. Maps the buffer
@@ -3278,7 +3266,6 @@ pub unsafe extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut WrenVm) {
         let cur = slot(vm, 0);
         list_add(vm, cur, Value::num(b as f64));
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -3341,17 +3328,16 @@ unsafe fn decode_window_handle(
 
     match platform.as_str() {
         "appkit" => {
-            let view =
-                match map_get(desc, "ns_view").and_then(|v| nonnull_ptr_from_num(v)) {
-                    Some(p) => p,
-                    None => {
-                        runtime_error(
-                            vm,
-                            "Device.createSurface: appkit requires `ns_view` (NSView*) integer.",
-                        );
-                        return None;
-                    }
-                };
+            let view = match map_get(desc, "ns_view").and_then(|v| nonnull_ptr_from_num(v)) {
+                Some(p) => p,
+                None => {
+                    runtime_error(
+                        vm,
+                        "Device.createSurface: appkit requires `ns_view` (NSView*) integer.",
+                    );
+                    return None;
+                }
+            };
             let mut h = raw_window_handle::AppKitWindowHandle::new(view);
             let _ = &mut h; // suppress potential unused-mut on platforms that don't compile this branch
             Some((
@@ -3360,17 +3346,16 @@ unsafe fn decode_window_handle(
             ))
         }
         "uikit" => {
-            let view =
-                match map_get(desc, "ui_view").and_then(|v| nonnull_ptr_from_num(v)) {
-                    Some(p) => p,
-                    None => {
-                        runtime_error(
-                            vm,
-                            "Device.createSurface: uikit requires `ui_view` (UIView*) integer.",
-                        );
-                        return None;
-                    }
-                };
+            let view = match map_get(desc, "ui_view").and_then(|v| nonnull_ptr_from_num(v)) {
+                Some(p) => p,
+                None => {
+                    runtime_error(
+                        vm,
+                        "Device.createSurface: uikit requires `ui_view` (UIView*) integer.",
+                    );
+                    return None;
+                }
+            };
             Some((
                 RawWindowHandle::UiKit(raw_window_handle::UiKitWindowHandle::new(view)),
                 RawDisplayHandle::UiKit(raw_window_handle::UiKitDisplayHandle::new()),
@@ -3384,9 +3369,9 @@ unsafe fn decode_window_handle(
                     return None;
                 }
             };
-            let hinstance_n =                 map_get(desc, "hinstance")
-                    .and_then(|v| v.as_num())
-                    .unwrap_or(0.0);
+            let hinstance_n = map_get(desc, "hinstance")
+                .and_then(|v| v.as_num())
+                .unwrap_or(0.0);
             let hwnd = match std::num::NonZeroIsize::new(hwnd_n as isize) {
                 Some(h) => h,
                 None => {
@@ -3419,9 +3404,9 @@ unsafe fn decode_window_handle(
                 }
             };
             let display = map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v));
-            let visual_id =                 map_get(desc, "visual_id")
-                    .and_then(|v| v.as_num())
-                    .unwrap_or(0.0) as std::os::raw::c_ulong;
+            let visual_id = map_get(desc, "visual_id")
+                .and_then(|v| v.as_num())
+                .unwrap_or(0.0) as std::os::raw::c_ulong;
             let mut wh = raw_window_handle::XlibWindowHandle::new(window_id);
             wh.visual_id = visual_id;
             Some((
@@ -3441,11 +3426,10 @@ unsafe fn decode_window_handle(
                 }
             };
             let window = std::num::NonZeroU32::new(window_n)?;
-            let connection =
-                map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v));
-            let visual_n =                 map_get(desc, "visual_id")
-                    .and_then(|v| v.as_num())
-                    .unwrap_or(0.0) as u32;
+            let connection = map_get(desc, "connection").and_then(|v| nonnull_ptr_from_num(v));
+            let visual_n = map_get(desc, "visual_id")
+                .and_then(|v| v.as_num())
+                .unwrap_or(0.0) as u32;
             let mut wh = raw_window_handle::XcbWindowHandle::new(window);
             wh.visual_id = std::num::NonZeroU32::new(visual_n);
             Some((
@@ -3454,28 +3438,26 @@ unsafe fn decode_window_handle(
             ))
         }
         "wayland" => {
-            let surface =
-                match map_get(desc, "surface").and_then(|v| nonnull_ptr_from_num(v)) {
-                    Some(p) => p,
-                    None => {
-                        runtime_error(
+            let surface = match map_get(desc, "surface").and_then(|v| nonnull_ptr_from_num(v)) {
+                Some(p) => p,
+                None => {
+                    runtime_error(
                         vm,
                         "Device.createSurface: wayland requires `surface` (wl_surface*) integer.",
                     );
-                        return None;
-                    }
-                };
-            let display =
-                match map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v)) {
-                    Some(p) => p,
-                    None => {
-                        runtime_error(
+                    return None;
+                }
+            };
+            let display = match map_get(desc, "display").and_then(|v| nonnull_ptr_from_num(v)) {
+                Some(p) => p,
+                None => {
+                    runtime_error(
                         vm,
                         "Device.createSurface: wayland requires `display` (wl_display*) integer.",
                     );
-                        return None;
-                    }
-                };
+                    return None;
+                }
+            };
             Some((
                 RawWindowHandle::Wayland(raw_window_handle::WaylandWindowHandle::new(surface)),
                 RawDisplayHandle::Wayland(raw_window_handle::WaylandDisplayHandle::new(display)),
@@ -3556,7 +3538,6 @@ pub unsafe extern "C" fn wlift_gpu_surface_create_from_handle(vm: *mut WrenVm) {
         },
     );
     set_return(vm, Value::num(id as f64));
-
 }
 
 #[no_mangle]
@@ -3567,7 +3548,6 @@ pub unsafe extern "C" fn wlift_gpu_surface_destroy(vm: *mut WrenVm) {
     };
     surfaces().lock().unwrap().surfaces.remove(&id);
     set_return(vm, Value::NULL);
-
 }
 
 /// Configure / re-configure the surface. Required before the
@@ -3688,7 +3668,6 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut WrenVm) {
     map_set(vm, map, kw, Value::num(cw as f64));
     let kh = alloc_string(vm, "height");
     map_set(vm, map, kh, Value::num(ch as f64));
-
 }
 
 /// Acquire the next swap-chain frame. Returns a `Map` with two
@@ -3750,7 +3729,6 @@ pub unsafe extern "C" fn wlift_gpu_surface_acquire(vm: *mut WrenVm) {
     map_set(vm, map, key_frame, Value::num(frame_id as f64));
     let key_view = alloc_string(vm, "view");
     map_set(vm, map, key_view, Value::num(view_id as f64));
-
 }
 
 // ---------------------------------------------------------------------------
@@ -3892,7 +3870,6 @@ pub unsafe extern "C" fn wlift_gpu_queue_write_texture(vm: *mut WrenVm) {
     drop(dev_reg);
     drop(tex_reg);
     set_return(vm, Value::NULL);
-
 }
 
 /// Present the in-flight frame. Consumes the `SurfaceTexture`
@@ -3918,5 +3895,4 @@ pub unsafe extern "C" fn wlift_gpu_surface_present_frame(vm: *mut WrenVm) {
     views().lock().unwrap().views.remove(&entry.view_id);
     entry.surface_texture.present();
     set_return(vm, Value::NULL);
-
 }

@@ -3332,7 +3332,7 @@ pub mod cl {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // Instruction lowering threads builder/module/val-map/IC/JIT-code-base — wide by design.
     fn lower_instruction(
         inst: &Instruction,
-        mir: &MirFunction,
+        _mir: &MirFunction,
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,

@@ -58,7 +58,10 @@ fn map_get(map: Value, key: &str) -> Option<Value> {
 
 fn read_byte_buffer(vm: *mut WrenVm, v: Value, label: &str) -> Option<Vec<u8>> {
     if !v.is_object() {
-        runtime_error(vm, &format!("{}: expected a List<Num> or ByteArray.", label));
+        runtime_error(
+            vm,
+            &format!("{}: expected a List<Num> or ByteArray.", label),
+        );
         return None;
     }
     match obj_type(v) {
@@ -82,12 +85,18 @@ fn read_byte_buffer(vm: *mut WrenVm, v: Value, label: &str) -> Option<Vec<u8>> {
             if typed_array_kind(v) == Some(TypedArrayKind::U8) {
                 Some(typed_array_bytes(v).map(|b| b.to_vec()).unwrap_or_default())
             } else {
-                runtime_error(vm, &format!("{}: typed array must be ByteArray (u8).", label));
+                runtime_error(
+                    vm,
+                    &format!("{}: typed array must be ByteArray (u8).", label),
+                );
                 None
             }
         }
         _ => {
-            runtime_error(vm, &format!("{}: expected a List<Num> or ByteArray.", label));
+            runtime_error(
+                vm,
+                &format!("{}: expected a List<Num> or ByteArray.", label),
+            );
             None
         }
     }

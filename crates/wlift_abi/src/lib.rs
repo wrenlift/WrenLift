@@ -75,14 +75,22 @@ impl Value {
 
     #[inline(always)]
     pub fn bool(b: bool) -> Self {
-        if b { Value::TRUE } else { Value::FALSE }
+        if b {
+            Value::TRUE
+        } else {
+            Value::FALSE
+        }
     }
 
     #[inline(always)]
-    pub fn is_null(self) -> bool { self.0 == TAG_NULL }
+    pub fn is_null(self) -> bool {
+        self.0 == TAG_NULL
+    }
 
     #[inline(always)]
-    pub fn is_bool(self) -> bool { self.0 == TAG_TRUE || self.0 == TAG_FALSE }
+    pub fn is_bool(self) -> bool {
+        self.0 == TAG_TRUE || self.0 == TAG_FALSE
+    }
 
     #[inline(always)]
     pub fn is_num(self) -> bool {
@@ -96,7 +104,11 @@ impl Value {
 
     #[inline(always)]
     pub fn as_num(self) -> Option<f64> {
-        if self.is_num() { Some(f64::from_bits(self.0)) } else { None }
+        if self.is_num() {
+            Some(f64::from_bits(self.0))
+        } else {
+            None
+        }
     }
 
     #[inline(always)]

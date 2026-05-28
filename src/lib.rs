@@ -115,12 +115,12 @@ pub fn alloc_trace_snapshot() -> (usize, usize, usize) {
 pub mod ast;
 pub mod capi;
 pub mod codegen;
-pub mod plugin_abi;
 pub mod diagnostics;
 pub mod docs;
 pub mod intern;
 pub mod mir;
 pub mod parse;
+pub mod plugin_abi;
 pub mod portable_time;
 pub mod runtime;
 pub mod sema;
