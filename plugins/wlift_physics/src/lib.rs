@@ -132,6 +132,7 @@ mod d2 {
         pub ccd_solver: CCDSolver,
         pub bodies_by_id: HashMap<u64, RigidBodyHandle>,
         pub ids_by_handle: HashMap<RigidBodyHandle, u64>,
+        pub joints_by_id: HashMap<u64, ImpulseJointHandle>,
         /// Same shape as 3D's `contact_events` — see that struct's
         /// docstring for the lifecycle.
         pub contact_events: Vec<(u64, u64, bool)>,
@@ -153,6 +154,7 @@ mod d2 {
                 ccd_solver: CCDSolver::new(),
                 bodies_by_id: HashMap::new(),
                 ids_by_handle: HashMap::new(),
+                joints_by_id: HashMap::new(),
                 contact_events: Vec::new(),
             }
         }
@@ -255,9 +257,19 @@ mod d2 {
         let friction = map_get(desc, "friction")
             .and_then(Value::as_num)
             .unwrap_or(0.5) as f32;
+        // `sensor: true` flips the collider into trigger mode —
+        // it still surfaces start / stop events through the
+        // collision-event channel but the narrow phase skips
+        // contact resolution. The game layer reads sensor pairs
+        // back through `drainContactEvents` exactly like real
+        // collisions.
+        let is_sensor = map_get(desc, "sensor")
+            .map(|v| v == Value::TRUE)
+            .unwrap_or(false);
         builder = builder
             .restitution(restitution)
             .friction(friction)
+            .sensor(is_sensor)
             // Opt every collider into rapier's collision-event
             // channel by default. The cost is negligible (rapier
             // only emits events for pairs whose narrow-phase
@@ -293,6 +305,7 @@ mod d3 {
         pub ccd_solver: CCDSolver,
         pub bodies_by_id: HashMap<u64, RigidBodyHandle>,
         pub ids_by_handle: HashMap<RigidBodyHandle, u64>,
+        pub joints_by_id: HashMap<u64, ImpulseJointHandle>,
         /// Contact events queued during the most recent `step` —
         /// drained by `wlift_physics_world3d_drain_contact_events`.
         /// Each entry is `(body_id_a, body_id_b, started)`; we
@@ -318,6 +331,7 @@ mod d3 {
                 ccd_solver: CCDSolver::new(),
                 bodies_by_id: HashMap::new(),
                 ids_by_handle: HashMap::new(),
+                joints_by_id: HashMap::new(),
                 contact_events: Vec::new(),
             }
         }
@@ -428,9 +442,19 @@ mod d3 {
         let friction = map_get(desc, "friction")
             .and_then(Value::as_num)
             .unwrap_or(0.5) as f32;
+        // `sensor: true` flips the collider into trigger mode —
+        // it still surfaces start / stop events through the
+        // collision-event channel but the narrow phase skips
+        // contact resolution. The game layer reads sensor pairs
+        // back through `drainContactEvents` exactly like real
+        // collisions.
+        let is_sensor = map_get(desc, "sensor")
+            .map(|v| v == Value::TRUE)
+            .unwrap_or(false);
         builder = builder
             .restitution(restitution)
             .friction(friction)
+            .sensor(is_sensor)
             // Opt every collider into rapier's collision-event
             // channel by default. The cost is negligible (rapier
             // only emits events for pairs whose narrow-phase
@@ -1349,6 +1373,467 @@ unsafe fn emit_contact_events_list(vm: *mut WrenVm, events: &[(u64, u64, bool)])
 }
 
 // ---------------------------------------------------------------------------
+// Shape casts
+//
+// Sweep a shape (ball / box / capsule) through space along a
+// direction vector. Returns the first hit as a Map with the same
+// `bodyId / point / normal / toi` shape `cast_ray` uses, so
+// callers don't have to learn two result shapes. Shape descriptor
+// is the same Map `spawnDynamic({"shape": ...})` already uses.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_cast_shape(vm: *mut WrenVm) {
+    use rapier3d::prelude::*;
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let shape_desc = slot(vm, 2);
+    let ox = slot(vm, 3).as_num().unwrap_or(0.0) as f32;
+    let oy = slot(vm, 4).as_num().unwrap_or(0.0) as f32;
+    let oz = slot(vm, 5).as_num().unwrap_or(0.0) as f32;
+    let dx = slot(vm, 6).as_num().unwrap_or(0.0) as f32;
+    let dy = slot(vm, 7).as_num().unwrap_or(0.0) as f32;
+    let dz = slot(vm, 8).as_num().unwrap_or(0.0) as f32;
+    let max_toi = slot(vm, 9).as_num().unwrap_or(f64::MAX) as f32;
+
+    // Build a one-shot Collider just to reach the shape — the
+    // user-facing descriptor format is identical to
+    // `spawnDynamic({"shape": ...})`, and `Collider::shared_shape`
+    // hands us a clone of the actual `dyn Shape` we hand to
+    // `cast_shape`.
+    let collider = match d3::collider_from_desc(shape_desc) {
+        Some(c) => c,
+        None => {
+            runtime_error(
+                vm,
+                "World3D.castShape: shape descriptor missing or has unknown `kind`.",
+            );
+            return;
+        }
+    };
+    let shape = collider.shared_shape().clone();
+
+    let reg = d3::worlds().lock().unwrap();
+    let world = match reg.get(&world_id) {
+        Some(w) => w,
+        None => {
+            drop(reg);
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let qp = world.broad_phase.as_query_pipeline(
+        world.narrow_phase.query_dispatcher(),
+        &world.bodies,
+        &world.colliders,
+        QueryFilter::default(),
+    );
+    // rapier 0.32 / parry 0.26 swapped nalgebra for glamx —
+    // `Pose` is the new translation+rotation type (constructed
+    // via `Pose::translation(x, y, z)`); `Vector` is `Vec3`
+    // (glamx, not nalgebra), so `ShapeCastHit::normal1` is a
+    // bare `Vector` rather than nalgebra's `Unit<Vector>`.
+    let pose = Pose::translation(ox, oy, oz);
+    let vel = Vector::new(dx, dy, dz);
+    let options = rapier3d::parry::query::ShapeCastOptions {
+        max_time_of_impact: max_toi,
+        stop_at_penetration: true,
+        ..rapier3d::parry::query::ShapeCastOptions::default()
+    };
+    let hit = qp.cast_shape(&pose, vel, &*shape, options);
+    drop(reg);
+
+    let (collider_handle, sc_hit) = match hit {
+        Some(h) => h,
+        None => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let reg = d3::worlds().lock().unwrap();
+    let world = reg.get(&world_id).unwrap();
+    let body_id = world
+        .colliders
+        .get(collider_handle)
+        .and_then(|c| c.parent())
+        .and_then(|bh| world.ids_by_handle.get(&bh).copied());
+    drop(reg);
+    let body_id = match body_id {
+        Some(id) => id,
+        None => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let toi = sc_hit.time_of_impact;
+    let p = sc_hit.witness1;
+    let n = sc_hit.normal1;
+    emit_raycast_hit_map(vm, body_id, p.x, p.y, p.z, n.x, n.y, n.z, toi as f64);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world2d_cast_shape(vm: *mut WrenVm) {
+    use rapier2d::prelude::*;
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let shape_desc = slot(vm, 2);
+    let ox = slot(vm, 3).as_num().unwrap_or(0.0) as f32;
+    let oy = slot(vm, 4).as_num().unwrap_or(0.0) as f32;
+    let dx = slot(vm, 5).as_num().unwrap_or(0.0) as f32;
+    let dy = slot(vm, 6).as_num().unwrap_or(0.0) as f32;
+    let max_toi = slot(vm, 7).as_num().unwrap_or(f64::MAX) as f32;
+
+    let collider = match d2::collider_from_desc(shape_desc) {
+        Some(c) => c,
+        None => {
+            runtime_error(
+                vm,
+                "World2D.castShape: shape descriptor missing or has unknown `kind`.",
+            );
+            return;
+        }
+    };
+    let shape = collider.shared_shape().clone();
+
+    let reg = d2::worlds().lock().unwrap();
+    let world = match reg.get(&world_id) {
+        Some(w) => w,
+        None => {
+            drop(reg);
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let qp = world.broad_phase.as_query_pipeline(
+        world.narrow_phase.query_dispatcher(),
+        &world.bodies,
+        &world.colliders,
+        QueryFilter::default(),
+    );
+    // Mirror the 3D shape: `Pose::translation` in glamx land,
+    // `Vector` is `Vec2`, normal is bare.
+    let pose = Pose::translation(ox, oy);
+    let vel = Vector::new(dx, dy);
+    let options = rapier2d::parry::query::ShapeCastOptions {
+        max_time_of_impact: max_toi,
+        stop_at_penetration: true,
+        ..rapier2d::parry::query::ShapeCastOptions::default()
+    };
+    let hit = qp.cast_shape(&pose, vel, &*shape, options);
+    drop(reg);
+
+    let (collider_handle, sc_hit) = match hit {
+        Some(h) => h,
+        None => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let reg = d2::worlds().lock().unwrap();
+    let world = reg.get(&world_id).unwrap();
+    let body_id = world
+        .colliders
+        .get(collider_handle)
+        .and_then(|c| c.parent())
+        .and_then(|bh| world.ids_by_handle.get(&bh).copied());
+    drop(reg);
+    let body_id = match body_id {
+        Some(id) => id,
+        None => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let toi = sc_hit.time_of_impact;
+    let p = sc_hit.witness1;
+    let n = sc_hit.normal1;
+    emit_raycast_hit_map(vm, body_id, p.x, p.y, 0.0, n.x, n.y, 0.0, toi as f64);
+}
+
+// ---------------------------------------------------------------------------
+// Joints
+//
+// One foreign-method entry point per axis. Descriptor shape:
+//
+//   { "kind": "fixed" | "revolute" | "prismatic" | "spherical",
+//     "anchor1": [x, y, z]?,    // local anchor on body A
+//     "anchor2": [x, y, z]?,    // local anchor on body B
+//     "axis":    [x, y, z]?     // revolute / prismatic only
+//   }
+//
+// Returns a u64 joint id the caller hands to
+// `wlift_physics_world3d_destroy_joint`.
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_create_joint(vm: *mut WrenVm) {
+    use rapier3d::prelude::*;
+
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let body_id_a = match slot(vm, 2).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let body_id_b = match slot(vm, 3).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let desc = slot(vm, 4);
+    let kind = match map_get(desc, "kind").and_then(string_of) {
+        Some(s) => s,
+        None => {
+            runtime_error(vm, "World3D.createJoint: descriptor missing `kind`.");
+            return;
+        }
+    };
+    // rapier 0.32 represents local anchors as `Vec3` (glamx, a
+    // body-local *offset*), not the older nalgebra `Point3`.
+    // `Vector::ZERO` / `Vector::Y` are glamx constants — not
+    // nalgebra associated functions — so plain const access.
+    let anchor1 = map_get(desc, "anchor1")
+        .and_then(read_3d)
+        .map(|(x, y, z)| Vector::new(x, y, z))
+        .unwrap_or(Vector::ZERO);
+    let anchor2 = map_get(desc, "anchor2")
+        .and_then(read_3d)
+        .map(|(x, y, z)| Vector::new(x, y, z))
+        .unwrap_or(Vector::ZERO);
+    let axis = map_get(desc, "axis")
+        .and_then(read_3d)
+        .map(|(x, y, z)| Vector::new(x, y, z))
+        .unwrap_or(Vector::Y);
+
+    let joint_data: GenericJoint = match kind.as_str() {
+        "fixed" => FixedJointBuilder::new()
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        "revolute" => RevoluteJointBuilder::new(axis)
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        "prismatic" => PrismaticJointBuilder::new(axis)
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        "spherical" => SphericalJointBuilder::new()
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        other => {
+            runtime_error(
+                vm,
+                &format!("World3D.createJoint: unknown kind '{}'.", other),
+            );
+            return;
+        }
+    };
+
+    let mut reg = d3::worlds().lock().unwrap();
+    let world = match reg.get_mut(&world_id) {
+        Some(w) => w,
+        None => {
+            drop(reg);
+            runtime_error(vm, "World3D.createJoint: unknown world id.");
+            return;
+        }
+    };
+    let ha = match world.bodies_by_id.get(&body_id_a).copied() {
+        Some(h) => h,
+        None => {
+            drop(reg);
+            runtime_error(vm, "World3D.createJoint: unknown body A id.");
+            return;
+        }
+    };
+    let hb = match world.bodies_by_id.get(&body_id_b).copied() {
+        Some(h) => h,
+        None => {
+            drop(reg);
+            runtime_error(vm, "World3D.createJoint: unknown body B id.");
+            return;
+        }
+    };
+    let handle = world
+        .impulse_joints
+        .insert(ha, hb, joint_data, /* wake_up = */ true);
+    let id = next_id();
+    world.joints_by_id.insert(id, handle);
+    drop(reg);
+    set_return(vm, Value::num(id as f64));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world3d_destroy_joint(vm: *mut WrenVm) {
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => return,
+    };
+    let joint_id = match slot(vm, 2).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => return,
+    };
+    let mut reg = d3::worlds().lock().unwrap();
+    if let Some(world) = reg.get_mut(&world_id) {
+        if let Some(handle) = world.joints_by_id.remove(&joint_id) {
+            world.impulse_joints.remove(handle, /* wake_up = */ true);
+        }
+    }
+    set_return(vm, Value::NULL);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world2d_create_joint(vm: *mut WrenVm) {
+    use rapier2d::prelude::*;
+
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let body_id_a = match slot(vm, 2).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let body_id_b = match slot(vm, 3).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::NULL);
+            return;
+        }
+    };
+    let desc = slot(vm, 4);
+    let kind = match map_get(desc, "kind").and_then(string_of) {
+        Some(s) => s,
+        None => {
+            runtime_error(vm, "World2D.createJoint: descriptor missing `kind`.");
+            return;
+        }
+    };
+    // rapier 0.32: anchors are `Vec2` offsets, not `Point2`s.
+    let anchor1 = map_get(desc, "anchor1")
+        .and_then(read_2d)
+        .map(|(x, y)| Vector::new(x, y))
+        .unwrap_or(Vector::ZERO);
+    let anchor2 = map_get(desc, "anchor2")
+        .and_then(read_2d)
+        .map(|(x, y)| Vector::new(x, y))
+        .unwrap_or(Vector::ZERO);
+    let axis = map_get(desc, "axis")
+        .and_then(read_2d)
+        .map(|(x, y)| Vector::new(x, y))
+        .unwrap_or(Vector::X);
+
+    let joint_data: GenericJoint = match kind.as_str() {
+        "fixed" => FixedJointBuilder::new()
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        "revolute" => RevoluteJointBuilder::new()
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        "prismatic" => PrismaticJointBuilder::new(axis)
+            .local_anchor1(anchor1)
+            .local_anchor2(anchor2)
+            .build()
+            .into(),
+        other => {
+            runtime_error(
+                vm,
+                &format!("World2D.createJoint: unknown kind '{}'.", other),
+            );
+            return;
+        }
+    };
+
+    let mut reg = d2::worlds().lock().unwrap();
+    let world = match reg.get_mut(&world_id) {
+        Some(w) => w,
+        None => {
+            drop(reg);
+            runtime_error(vm, "World2D.createJoint: unknown world id.");
+            return;
+        }
+    };
+    let ha = match world.bodies_by_id.get(&body_id_a).copied() {
+        Some(h) => h,
+        None => {
+            drop(reg);
+            runtime_error(vm, "World2D.createJoint: unknown body A id.");
+            return;
+        }
+    };
+    let hb = match world.bodies_by_id.get(&body_id_b).copied() {
+        Some(h) => h,
+        None => {
+            drop(reg);
+            runtime_error(vm, "World2D.createJoint: unknown body B id.");
+            return;
+        }
+    };
+    let handle = world
+        .impulse_joints
+        .insert(ha, hb, joint_data, /* wake_up = */ true);
+    let id = next_id();
+    world.joints_by_id.insert(id, handle);
+    drop(reg);
+    set_return(vm, Value::num(id as f64));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_physics_world2d_destroy_joint(vm: *mut WrenVm) {
+    let world_id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => return,
+    };
+    let joint_id = match slot(vm, 2).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => return,
+    };
+    let mut reg = d2::worlds().lock().unwrap();
+    if let Some(world) = reg.get_mut(&world_id) {
+        if let Some(handle) = world.joints_by_id.remove(&joint_id) {
+            world.impulse_joints.remove(handle, /* wake_up = */ true);
+        }
+    }
+    set_return(vm, Value::NULL);
+}
+
+// ---------------------------------------------------------------------------
 // Static-link symbol registry (wasm only)
 //
 // On `wasm32-*`, plugins ship as Rust crates statically linked into
@@ -1595,6 +2080,51 @@ pub fn register_static_symbols() {
             "wlift_physics",
             "wlift_physics_world2d_drain_contact_events",
             wlift_physics_world2d_drain_contact_events as *const (),
+        )
+    };
+
+    // Shape casts + joints. Same registration pattern as every
+    // export above.
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_cast_shape",
+            wlift_physics_world3d_cast_shape as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world2d_cast_shape",
+            wlift_physics_world2d_cast_shape as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_create_joint",
+            wlift_physics_world3d_create_joint as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world3d_destroy_joint",
+            wlift_physics_world3d_destroy_joint as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world2d_create_joint",
+            wlift_physics_world2d_create_joint as *const (),
+        )
+    };
+    unsafe {
+        wlift_abi::register_symbol(
+            "wlift_physics",
+            "wlift_physics_world2d_destroy_joint",
+            wlift_physics_world2d_destroy_joint as *const (),
         )
     };
 }
