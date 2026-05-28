@@ -1064,7 +1064,14 @@ fn build_recursive(
 
     let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     collect_wren_files(root, root, &mut wren_files)?;
-    wren_files.sort_by(|a, b| a.0.cmp(&b.0));
+    // Order by intra-package import graph so a module's deps are
+    // installed before it. Falls back to alphabetical on cycle
+    // detection (or any source-read error). The runtime installs
+    // `manifest.modules` in declaration order and resolves
+    // `import "./X" for Y` at install time — `Y` is `null` if
+    // X hasn't been installed yet, so out-of-order = silent null
+    // import slots.
+    topo_sort_wren_files_by_imports(&mut wren_files);
 
     // Compile each to a .wlbc section.
     let mut sections: Vec<Section> = Vec::with_capacity(wren_files.len());
@@ -1879,6 +1886,135 @@ fn collect_wren_files(
         }
     }
     Ok(())
+}
+
+/// Reorder `files` so each module appears after every in-package
+/// module it imports from. Kahn's algorithm over the import graph
+/// with alphabetical tie-breaking on each level for deterministic
+/// output. External imports (`@hatch:foo`, prelude classes) don't
+/// constrain order — only `import "./sibling"` / `import "sibling"`
+/// of an entry in `files` adds an edge.
+///
+/// On a parse failure (unreadable source) or a cycle, falls back
+/// to plain alphabetical sort so the build still proceeds; the
+/// per-module compile pass surfaces the underlying issue with a
+/// cleaner diagnostic.
+#[cfg(feature = "host")]
+fn topo_sort_wren_files_by_imports(files: &mut Vec<(String, std::path::PathBuf)>) {
+    use std::collections::{HashMap, VecDeque};
+
+    let n = files.len();
+    if n <= 1 {
+        return;
+    }
+
+    // Snapshot of original alphabetical order — used as both the
+    // tie-breaker and the fallback if the graph build fails.
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // module name → index in `files`.
+    let name_to_idx: HashMap<String, usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.clone(), i))
+        .collect();
+
+    // adj[j] = list of modules that import j (so j must come first).
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_degree: Vec<usize> = vec![0; n];
+
+    for (i, (_, path)) in files.iter().enumerate() {
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return; // unreadable file — leave alphabetical
+        };
+        for raw_imp in scan_wren_imports(&source) {
+            let normalized = raw_imp
+                .trim_start_matches("./")
+                .trim_start_matches("../")
+                .trim_end_matches(".wren")
+                .replace('/', ".");
+            if normalized.is_empty() {
+                continue;
+            }
+            if let Some(&j) = name_to_idx.get(&normalized) {
+                if j != i {
+                    adj[j].push(i);
+                    in_degree[i] += 1;
+                }
+            }
+        }
+    }
+
+    // Frontier: every module with no remaining in-package deps.
+    // VecDeque + a sort each round gives deterministic-alphabetical
+    // tie-breaking without re-sorting the whole vec each step.
+    let mut frontier: VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+
+    while !frontier.is_empty() {
+        // Sort the current frontier by module name so picking
+        // `pop_front` always takes the alphabetically-smallest
+        // ready module.
+        let mut by_name: Vec<usize> = frontier.drain(..).collect();
+        by_name.sort_by(|&a, &b| files[a].0.cmp(&files[b].0));
+        let i = by_name.remove(0);
+        // Surviving frontier slots stay in the queue for the next
+        // round; this keeps the sort cost O(frontier_size · log)
+        // amortised even when modules unblock in batches.
+        frontier.extend(by_name);
+
+        order.push(i);
+        for &j in &adj[i] {
+            in_degree[j] -= 1;
+            if in_degree[j] == 0 {
+                frontier.push_back(j);
+            }
+        }
+    }
+
+    if order.len() != n {
+        // Cycle detected — keep alphabetical order, the runtime's
+        // null-import-then-fixup path will surface the cycle at
+        // install time with a clearer diagnostic.
+        return;
+    }
+
+    // Materialise the new order. The temporary moves through an
+    // option array so we can drain `files` without cloning the
+    // PathBuf.
+    let mut taken: Vec<Option<(String, std::path::PathBuf)>> =
+        files.drain(..).map(Some).collect();
+    files.reserve(n);
+    for i in order {
+        files.push(taken[i].take().expect("topo_sort: index visited twice"));
+    }
+}
+
+/// Pull the literal-string argument out of every `import "..."`
+/// in `src`. Mirror of `extract_archive_imports` in `runtime/vm.rs`,
+/// duplicated here so the bundler doesn't pull in the VM.
+#[cfg(feature = "host")]
+fn scan_wren_imports(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("import") else {
+            continue;
+        };
+        if !rest
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(open) = rest.find('"') else { continue };
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { continue };
+        out.push(after[..close].to_string());
+    }
+    out
 }
 
 #[cfg(feature = "host")]
