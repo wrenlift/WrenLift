@@ -43,6 +43,17 @@
 
 /* ---- Body-level defaults -------------------------------------- */
 
+/* Squircle the world. The landing page applies CSS
+ * `corner-shape: squircle` universally so every rounded
+ * surface — buttons, pills, cards, code panels — picks up the
+ * iOS-style superellipse curvature instead of a plain quarter-
+ * circle. The directive is a no-op on browsers that don't yet
+ * implement the corner-shape proposal (Safari / Chromium tech
+ * preview as of 2026-05), so the fallback is the original
+ * `border-radius`. Match the home-page recipe verbatim so the
+ * two surfaces feel like the same site. */
+*, *::before, *::after { corner-shape: squircle; }
+
 /* Mirror the landing page so anchors anywhere in the doc tree
  * (lede, callouts, tables, paragraphs that aren't inside
  * `.pkg-readme`) inherit the toast palette instead of falling
