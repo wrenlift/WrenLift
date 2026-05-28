@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Quick start · Wrenlift docs</title>
+<meta name="description" content="Write your first Wren program, learn the common wlift CLI flags, and meet AOT in one page." />
+<link rel="canonical" href="https://wrenlift.com/docs/quickstart.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Quick start · Wrenlift docs" />
+<meta property="og:description" content="Hello world, CLI flags, AOT, the REPL — in one page." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html">Install</a></li>
+        <li><a href="/docs/quickstart.html" class="active">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <span class="crumb-current">Quick start</span>
+    </nav>
+
+    <h1 class="pkg-title">Quick start</h1>
+    <p class="pkg-lede">
+      Hello world, the flags you'll reach for daily, and the
+      ahead-of-time path that turns a script into a self-contained
+      binary — in one page.
+    </p>
+
+    <div class="pkg-readme">
+
+      <h2 id="hello-world">Hello world</h2>
+      <p>Save the following as <code>hello.wren</code>:</p>
+<pre><code>System.print("hello, world")</code></pre>
+      <p>Run it:</p>
+<pre><code>wlift hello.wren
+<span style="color:#8FAE6A;">// hello, world</span></code></pre>
+      <p>
+        That's the whole loop. <code>wlift</code> parses the source,
+        builds MIR, runs the bytecode interpreter, and tiers up to
+        the Cranelift JIT for any hot function. No build step, no
+        config file.
+      </p>
+
+      <h2 id="first-class">A first class</h2>
+<pre><code>class Counter {
+  construct new(start) {
+    _n = start
+  }
+
+  next {
+    _n = _n + 1
+    return _n
+  }
+
+  toString { "Counter(%(_n))" }
+}
+
+var c = Counter.new(0)
+System.print(c.next)         // 1
+System.print(c.next)         // 2
+System.print(c)              // Counter(2)</code></pre>
+      <p>
+        Wrenlift accepts the
+        <a href="https://wren.io/syntax.html">stock Wren syntax</a>
+        verbatim, plus a few small additions documented in
+        <a href="/docs/ref/system.html">the reference</a>.
+      </p>
+
+      <h2 id="repl">REPL</h2>
+      <p>Omit the file argument to drop into the REPL:</p>
+<pre><code>$ wlift
+&gt; var greet = Fn.new {|name| "hello, %(name)" }
+&gt; greet.call("wren")
+"hello, wren"
+&gt; .exit</code></pre>
+
+      <h2 id="cli-flags">CLI flags you'll reach for</h2>
+      <table>
+        <thead><tr><th>Flag</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>--mode interpreter</code></td><td>Skip the JIT entirely. Useful for debugging.</td></tr>
+          <tr><td><code>--mode tiered</code> (default)</td><td>Interpret cold code, JIT-compile hot functions on the fly.</td></tr>
+          <tr><td><code>--mode jit</code></td><td>Compile everything up front before executing.</td></tr>
+          <tr><td><code>--aot &lt;out&gt;</code></td><td>Build a self-contained native binary. See below.</td></tr>
+          <tr><td><code>--bundle &lt;out&gt;</code></td><td>Pack a source tree into a <code>.hatch</code> distribution package.</td></tr>
+          <tr><td><code>--inspect</code></td><td>Print the manifest + section list of a <code>.hatch</code> file.</td></tr>
+          <tr><td><code>--dump-mir</code> · <code>--dump-opt</code> · <code>--dump-asm</code></td><td>Dump MIR / optimised MIR / generated machine code. Compiler debug.</td></tr>
+          <tr><td><code>--gc-stats</code></td><td>Print GC counters after the program finishes.</td></tr>
+          <tr><td><code>--gc &lt;strategy&gt;</code></td><td><code>generational</code> (default), <code>arena</code>, or <code>mark-sweep</code>.</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="aot">AOT — ship a single binary</h2>
+      <p>
+        <code>wlift --aot</code> compiles a source tree into a
+        self-contained executable that runs without the
+        <code>wlift</code> runtime installed.
+      </p>
+<pre><code>wlift hello.wren --aot ./hello
+./hello
+<span style="color:#8FAE6A;">// hello, world</span></code></pre>
+      <p>
+        The output is a real ELF / Mach-O / PE binary &mdash; ship it
+        the same way you'd ship any other native program.
+        Cross-compile by passing a target triple to
+        <code>wlift --aot</code> (see the
+        <a href="/docs/platform/linux.html">platform guides</a> for
+        per-OS notes on packaging and code signing).
+      </p>
+      <aside class="note">
+        <b>Heads up:</b> AOT requires the <code>aot</code> Cargo
+        feature on the WrenLift build. The prebuilt binaries from
+        <a href="/docs/install.html">the installer</a> ship with it
+        enabled.
+      </aside>
+
+      <h2 id="running-bundles">Running a published package</h2>
+      <p>
+        Packages from the
+        <a href="https://hatch.wrenlift.com/packages">Hatch registry</a>
+        ship as <code>.hatch</code> bundles. Pass one directly to
+        <code>wlift</code>:
+      </p>
+<pre><code>wlift my-app.hatch</code></pre>
+      <p>
+        For a project with dependencies, use the
+        <code>hatch</code> CLI:
+      </p>
+<pre><code>$ hatch run path/to/my-app
+  loading @hatch:http@0.3.4
+  loading @hatch:json@0.1.4
+  &gt; standalone · serving :8080</code></pre>
+
+      <h2 id="next-steps">Next steps</h2>
+      <ul>
+        <li><a href="/docs/platform/wasm.html">Run Wrenlift in the browser</a> — the <code>wlift.js</code> harness API.</li>
+        <li><a href="/docs/platform/embedding.html">Embed in a Rust app</a> — add <code>wren_lift</code> as a crate.</li>
+        <li><a href="/docs/ref/system.html">Built-in reference</a> — what's available beyond stock Wren.</li>
+      </ul>
+
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#hello-world">Hello world</a></li>
+      <li><a href="#first-class">A first class</a></li>
+      <li><a href="#repl">REPL</a></li>
+      <li><a href="#cli-flags">CLI flags</a></li>
+      <li><a href="#aot">AOT</a></li>
+      <li><a href="#running-bundles">Running a package</a></li>
+      <li><a href="#next-steps">Next steps</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>

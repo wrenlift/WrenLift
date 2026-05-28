@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#FBF3DC" />
+<title>Install · Wrenlift docs</title>
+<meta name="description" content="Install Wrenlift on macOS, Linux, or Windows. One-liner, prebuilt binary, or cargo install from source." />
+<link rel="canonical" href="https://wrenlift.com/docs/install.html" />
+<link rel="icon" href="/assets/wrenlift-icon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="/assets/wrenlift-mascot.png" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Install · Wrenlift docs" />
+<meta property="og:description" content="One-liner install, prebuilt binaries, or cargo install from source." />
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="_assets/docs.css" />
+<style>
+  :root {
+    --cream: #FBF3DC; --cream-2: #F5E8C3; --cream-3: #EFDDA8;
+    --ink: #3A2A18; --ink-2: #5A4225; --ink-3: #7B5E36;
+    --butter: #F4C24A; --butter-deep: #E8A92A;
+    --toast: #D97A2B; --toast-deep: #B45F1A;
+    --ember: #E04E1F; --sage: #8FAE6A; --sage-deep: #6B8C48;
+    --sky: #B8D4E3; --shell: #F8ECCB;
+    --rule: rgba(58,42,24,0.18);
+    --display: "Nunito", system-ui, sans-serif;
+    --body: "Nunito", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--body); color: var(--ink); background: var(--cream);
+    background-image:
+      radial-gradient(circle at 86% 8%,  rgba(224, 78, 31, 0.10) 0, transparent 28%),
+      radial-gradient(circle at 10% 32%, rgba(244, 194, 74, 0.16) 0, transparent 26%);
+    line-height: 1.6; -webkit-font-smoothing: antialiased;
+  }
+</style>
+</head>
+<body>
+
+<header class="docs-topbar">
+  <div class="docs-topbar-inner">
+    <a class="docs-topbar-brand" href="/"><img src="/assets/wrenlift-icon.svg" alt="" /> Wrenlift</a>
+    <nav>
+      <a href="/docs/" class="active">Docs</a>
+      <a href="https://hatch.wrenlift.com/packages">Packages</a>
+      <a href="/playground/web/">Playground</a>
+      <a href="https://github.com/wrenlift/WrenLift">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="docs-shell">
+
+  <aside class="docs-sidebar">
+    <div class="nav-section">
+      <h4>Getting started</h4>
+      <ul>
+        <li><a href="/docs/install.html" class="active">Install</a></li>
+        <li><a href="/docs/quickstart.html">Quick start</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Platform guides</h4>
+      <ul>
+        <li><a href="/docs/platform/linux.html">Linux</a></li>
+        <li><a href="/docs/platform/macos.html">macOS</a></li>
+        <li><a href="/docs/platform/windows.html">Windows</a></li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a></li>
+        <li><a href="/docs/platform/embedding.html">Embed in Rust</a></li>
+      </ul>
+    </div>
+    <div class="nav-section">
+      <h4>Reference</h4>
+      <ul>
+        <li><a href="/docs/ref/system.html">System</a></li>
+        <li><a href="/docs/ref/fiber.html">Fiber</a></li>
+        <li><a href="/docs/ref/future.html">Future</a></li>
+        <li><a href="/docs/ref/typed-arrays.html">Typed arrays</a></li>
+        <li><a href="/docs/ref/simd.html">SIMD</a></li>
+        <li><a href="/docs/ref/foreign.html">Foreign classes</a></li>
+        <li><a href="/docs/ref/string.html">String</a></li>
+      </ul>
+    </div>
+  </aside>
+
+  <main class="docs-main">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="/">Home</a>
+      <span class="crumb-sep">/</span>
+      <a href="/docs/">Docs</a>
+      <span class="crumb-sep">/</span>
+      <span class="crumb-current">Install</span>
+    </nav>
+
+    <h1 class="pkg-title">Install Wrenlift</h1>
+    <p class="pkg-lede">
+      Three paths: a one-line installer, a prebuilt binary download,
+      or <code>cargo install</code> from source. The one-liner is the
+      quickest and ships with the matching <code>hatch</code> CLI and
+      <code>wlift-lsp</code> language server.
+    </p>
+
+    <div class="pkg-readme">
+
+      <h2 id="one-liner">One-liner</h2>
+      <p>
+        Drops <code>wlift</code>, <code>hatch</code>, and
+        <code>wlift-lsp</code> into <code>~/.local/bin</code>,
+        SHA256-verified against the latest GitHub release.
+      </p>
+<pre><code>curl -fsSL https://wrenlift.com/install.sh | bash</code></pre>
+      <p>
+        Make sure <code>~/.local/bin</code> is on your <code>PATH</code>.
+        Most shell setups already include it; if yours doesn't:
+      </p>
+<pre><code>echo 'export PATH="$HOME/.local/bin:$PATH"' &gt;&gt; ~/.zshrc   # or ~/.bashrc
+exec $SHELL</code></pre>
+
+      <h3 id="installer-knobs">Installer knobs</h3>
+      <p>The installer respects three env vars:</p>
+      <table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>WLIFT_VERSION</code></td><td>latest release</td><td>Pin a tag, e.g. <code>v0.1.19</code>.</td></tr>
+          <tr><td><code>INSTALL_DIR</code></td><td><code>~/.local/bin</code></td><td>Install location. Use <code>/usr/local/bin</code> for system-wide (no <code>sudo</code> elevation).</td></tr>
+          <tr><td><code>WLIFT_REPO</code></td><td><code>wrenlift/WrenLift</code></td><td>Override the GitHub slug. Useful for testing forks.</td></tr>
+        </tbody>
+      </table>
+<pre><code>WLIFT_VERSION=v0.1.19 INSTALL_DIR=/usr/local/bin \
+  curl -fsSL https://wrenlift.com/install.sh | bash</code></pre>
+
+      <h2 id="prebuilt-binary">Prebuilt binary</h2>
+      <p>
+        Every tagged release ships per-platform tarballs on the
+        <a href="https://github.com/wrenlift/WrenLift/releases">GitHub releases</a>
+        page. Pick the asset that matches your machine, untar, and
+        drop the binaries somewhere on <code>PATH</code>.
+      </p>
+      <table>
+        <thead><tr><th>Platform</th><th>Asset suffix</th></tr></thead>
+        <tbody>
+          <tr><td>macOS · Apple Silicon</td><td><code>-aarch64-apple-darwin.tar.gz</code></td></tr>
+          <tr><td>macOS · Intel</td><td><code>-x86_64-apple-darwin.tar.gz</code></td></tr>
+          <tr><td>Linux · x86_64</td><td><code>-x86_64-unknown-linux-gnu.tar.gz</code></td></tr>
+          <tr><td>Linux · ARM64</td><td><code>-aarch64-unknown-linux-gnu.tar.gz</code></td></tr>
+          <tr><td>Windows · x86_64</td><td><code>-x86_64-pc-windows-msvc.zip</code></td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="from-source">From source</h2>
+      <p>
+        Builds the runtime + CLI against the current state of
+        <code>main</code>. Requires Rust 1.79+.
+      </p>
+<pre><code>cargo install --git https://github.com/wrenlift/WrenLift.git \
+              --bins --locked \
+              wren_lift</code></pre>
+      <p>
+        Pin a commit with <code>--rev &lt;sha&gt;</code> for reproducible
+        installs.
+      </p>
+
+      <h2 id="verify">Verify</h2>
+<pre><code>wlift --version
+hatch --version</code></pre>
+      <p>Both should print a version string. If the shell can't find
+      <code>wlift</code>, double-check that <code>INSTALL_DIR</code> is on
+      <code>PATH</code>.</p>
+
+      <h2 id="uninstall">Uninstall</h2>
+      <p>The installer doesn't track files; uninstall is manual:</p>
+<pre><code>rm "$HOME/.local/bin/wlift" "$HOME/.local/bin/hatch" "$HOME/.local/bin/wlift-lsp"
+rm -rf "$HOME/.hatch"     # registry cache + credentials (optional)</code></pre>
+
+      <h2 id="next-steps">Next steps</h2>
+      <ul>
+        <li><a href="/docs/quickstart.html">Quick start</a> — write your first program, learn the common CLI flags.</li>
+        <li><a href="/docs/platform/wasm.html">WebAssembly</a> — embed the runtime in a webpage.</li>
+        <li><a href="https://hatch.wrenlift.com/packages">Browse Hatch packages</a> — the standard library.</li>
+      </ul>
+
+    </div>
+  </main>
+
+  <aside class="docs-toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#one-liner">One-liner</a></li>
+      <li><a href="#installer-knobs" class="h3">Installer knobs</a></li>
+      <li><a href="#prebuilt-binary">Prebuilt binary</a></li>
+      <li><a href="#from-source">From source</a></li>
+      <li><a href="#verify">Verify</a></li>
+      <li><a href="#uninstall">Uninstall</a></li>
+      <li><a href="#next-steps">Next steps</a></li>
+    </ul>
+  </aside>
+
+</div>
+
+</body>
+</html>
