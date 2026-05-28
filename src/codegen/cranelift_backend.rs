@@ -3332,7 +3332,7 @@ pub mod cl {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // Instruction lowering threads builder/module/val-map/IC/JIT-code-base — wide by design.
     fn lower_instruction(
         inst: &Instruction,
-        _mir: &MirFunction,
+        mir: &MirFunction,
         interner: &Interner,
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,
@@ -5829,6 +5829,46 @@ pub mod cl {
 
             // === Static self-calls ===
             Instruction::CallStaticSelf { args } => {
+                // SM-tainted bodies are lowered with a fixed
+                // `(fiber, resume_v) -> i64` poll signature, so a
+                // direct recursive call would feed (receiver, args...)
+                // into the 2-arg slot and trip Cranelift's verifier
+                // with "mismatched argument count". Route through
+                // `wren_call_N` instead, mirroring the SM-skip guard
+                // in the dispatch_call CHA fast block — dispatch_method
+                // sets up a fresh SM poll cycle with the right ABI.
+                #[cfg(feature = "aot")]
+                if let Some(cfg) = aot_config {
+                    if cfg.current_state_machine_layout.borrow().is_some() {
+                        let recv = receiver_val.ok_or_else(|| {
+                            "CallStaticSelf in SM body without receiver_val".to_string()
+                        })?;
+                        let slot = aot_intern_symbol(cfg, mir.name.index(), interner);
+                        let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
+                        let base = builder.ins().global_value(types::I64, gv);
+                        let method_val = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            base,
+                            (slot as i32) * 8,
+                        );
+                        let call_name = match args.len() {
+                            0 => "wren_call_0",
+                            1 => "wren_call_1",
+                            2 => "wren_call_2",
+                            3 => "wren_call_3",
+                            _ => "wren_call_4",
+                        };
+                        let arg_count = 2 + args.len().min(8);
+                        let f = get_runtime_fn(module, builder, call_name, arg_count)?;
+                        let mut call_args: Vec<Value> = vec![recv, method_val];
+                        for a in args.iter().take(8) {
+                            call_args.push(get(a));
+                        }
+                        let result = builder.ins().call(f, &call_args);
+                        return Ok(Some(builder.inst_results(result)[0]));
+                    }
+                }
                 // In f64 mode: call inner function directly with f64 args
                 // (no box/unbox roundtrip — args are already f64).
                 // In i64 mode: call self with i64 args, prepending receiver.

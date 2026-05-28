@@ -4607,10 +4607,15 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
                 std::mem::transmute(fn_ptr);
             f(b(0), b(1), b(2), b(3), b(4), b(5), b(6))
         }
-        _ => {
+        8 => {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7))
+        }
+        _ => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8))
         }
     }
 }

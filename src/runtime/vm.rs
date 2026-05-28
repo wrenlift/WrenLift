@@ -5435,7 +5435,7 @@ impl VM {
         } else {
             std::ptr::null()
         };
-        if !jit_ptr.is_null() && ctor_args.len() <= 7 {
+        if !jit_ptr.is_null() && ctor_args.len() <= 8 {
             // Push every ctor arg as a JIT root so a GC fired during
             // the constructor body (allocations, foreign calls, etc.)
             // updates each pointer through the shared roots Vec
@@ -5460,9 +5460,9 @@ impl VM {
             // reading via `jit_root_at` keeps every value in
             // lockstep with the GC's view).
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
-            // Sized to fit the widest call_jit_fn arm (instance + 7
-            // user args = 8 slots).
-            let mut jit_args = [Value::null(); 8];
+            // Sized to fit the widest call_jit_fn arm (instance + 8
+            // user args = 9 slots).
+            let mut jit_args = [Value::null(); 9];
             jit_args[0] = live_instance;
             for i in 0..ctor_args.len() {
                 jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1 + i);
@@ -5529,8 +5529,11 @@ impl VM {
 
         let mir = self.engine.get_mir(func_id);
         if mir.is_none() {
+            // Read the instance BEFORE truncating; `restore_len` drops
+            // the slot the caller pushed in `call_constructor_sync`.
+            let instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-            return crate::codegen::runtime_fns::jit_root_at(root_len_before);
+            return instance;
         }
         let mir = mir.unwrap();
 
@@ -5539,6 +5542,17 @@ impl VM {
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
             let mut values = vec![Value::UNDEFINED; mir.next_value as usize];
 
+            if mir.blocks.is_empty() {
+                // AOT-only constructor bodies are registered with the
+                // engine for `get_mir`-keyed metadata but their MIR
+                // blocks were stripped by the AOT lowering — the
+                // native code is already in `.text`, so there's no
+                // interp body to walk. The instance lives at
+                // `root_len_before` from `call_constructor_sync`'s
+                // push; read it, then drop the root.
+                crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
+                return live_instance;
+            }
             let block = &mir.blocks[0];
             for (vid, inst) in &block.instructions {
                 if let Instruction::BlockParam(idx) = inst {
