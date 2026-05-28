@@ -350,117 +350,107 @@ fn pump_once() {
 /// Returns the window id (Num).
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_create(vm: *mut WrenVm) {
-    unsafe {
-        let desc = slot(vm, 1);
-        let title = map_get(desc, "title")
-            .and_then(|v| string_of(v))
-            .unwrap_or_else(|| "wlift".to_string());
-        let width = map_get(desc, "width")
-            .and_then(|v| v.as_num())
-            .map(|n| n as u32)
-            .unwrap_or(1280);
-        let height = map_get(desc, "height")
-            .and_then(|v| v.as_num())
-            .map(|n| n as u32)
-            .unwrap_or(720);
-        let resizable = map_get(desc, "resizable")
-            .map(|v| !(v.is_null() || v == Value::FALSE))
-            .unwrap_or(true);
+    let desc = slot(vm, 1);
+    let title = map_get(desc, "title")
+        .and_then(|v| string_of(v))
+        .unwrap_or_else(|| "wlift".to_string());
+    let width = map_get(desc, "width")
+        .and_then(|v| v.as_num())
+        .map(|n| n as u32)
+        .unwrap_or(1280);
+    let height = map_get(desc, "height")
+        .and_then(|v| v.as_num())
+        .map(|n| n as u32)
+        .unwrap_or(720);
+    let resizable = map_get(desc, "resizable")
+        .map(|v| !(v.is_null() || v == Value::FALSE))
+        .unwrap_or(true);
 
-        let id = next_id();
-        pump_handler().lock().unwrap().new_windows.push((
-            id,
-            NewWindowRequest {
-                title,
-                width,
-                height,
-                resizable,
-            },
-        ));
-        // Run a pump so the window actually materialises before
-        // the caller reads back its handle. winit needs to see at
-        // least one resumed/window_event cycle to allocate the
-        // OS-level window.
-        pump_once();
-        set_return(vm, Value::num(id as f64));
-    }
+    let id = next_id();
+    pump_handler().lock().unwrap().new_windows.push((
+        id,
+        NewWindowRequest {
+            title,
+            width,
+            height,
+            resizable,
+        },
+    ));
+    // Run a pump so the window actually materialises before
+    // the caller reads back its handle. winit needs to see at
+    // least one resumed/window_event cycle to allocate the
+    // OS-level window.
+    pump_once();
+    set_return(vm, Value::num(id as f64));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_destroy(vm: *mut WrenVm) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                runtime_error(vm, "Window.destroy: id must be a non-negative number.");
-                return;
-            }
-        };
-        APP.with(|cell| cell.borrow_mut().pending_close.push(id));
-        pump_once();
-        set_return(vm, Value::NULL);
-    }
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.destroy: id must be a non-negative number.");
+            return;
+        }
+    };
+    APP.with(|cell| cell.borrow_mut().pending_close.push(id));
+    pump_once();
+    set_return(vm, Value::NULL);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_pump(vm: *mut WrenVm) {
-    unsafe {
-        pump_once();
-        set_return(vm, Value::NULL);
-    }
+    pump_once();
+    set_return(vm, Value::NULL);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_close_requested(vm: *mut WrenVm) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                set_return(vm, Value::bool(true));
-                return;
-            }
-        };
-        let flag = APP.with(|cell| {
-            cell.borrow()
-                .windows
-                .get(&id)
-                .map(|w| w.close_requested)
-                .unwrap_or(true)
-        });
-        set_return(vm, Value::bool(flag));
-    }
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            set_return(vm, Value::bool(true));
+            return;
+        }
+    };
+    let flag = APP.with(|cell| {
+        cell.borrow()
+            .windows
+            .get(&id)
+            .map(|w| w.close_requested)
+            .unwrap_or(true)
+    });
+    set_return(vm, Value::bool(flag));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_size(vm: *mut WrenVm) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                runtime_error(vm, "Window.size: id must be a non-negative number.");
-                return;
-            }
-        };
-        let (w, h) = APP.with(|cell| {
-            cell.borrow()
-                .windows
-                .get(&id)
-                .map(|wnd| (wnd.width, wnd.height))
-                .unwrap_or((0, 0))
-        });
-        // GC rooting: see `wlift_image_decode` for the pattern.
-        // Set the map as the return slot before any subsequent
-        // alloc, write keys via direct `(*map_ptr).set` so each
-        // key string is committed to the map's hash table the
-        // moment after it's allocated.
-        
-        let map = alloc_map(vm);
-        set_return(vm, map);
-        let kw = alloc_string(vm, "width");
-        map_set(vm, map, kw, Value::num(w as f64));
-        let kh = alloc_string(vm, "height");
-        map_set(vm, map, kh, Value::num(h as f64));
-    }
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.size: id must be a non-negative number.");
+            return;
+        }
+    };
+    let (w, h) = APP.with(|cell| {
+        cell.borrow()
+            .windows
+            .get(&id)
+            .map(|wnd| (wnd.width, wnd.height))
+            .unwrap_or((0, 0))
+    });
+    // GC rooting: see `wlift_image_decode` for the pattern.
+    // Set the map as the return slot before any subsequent
+    // alloc, write keys via direct `(*map_ptr).set` so each
+    // key string is committed to the map's hash table the
+    // moment after it's allocated.
+
+    let map = alloc_map(vm);
+    set_return(vm, map);
+    let kw = alloc_string(vm, "width");
+    map_set(vm, map, kw, Value::num(w as f64));
+    let kh = alloc_string(vm, "height");
+    map_set(vm, map, kh, Value::num(h as f64));
 }
 
 /// Drain pending events for a window. Returns a `List` of Maps:
@@ -472,104 +462,102 @@ pub unsafe extern "C" fn wlift_window_size(vm: *mut WrenVm) {
 ///   {"type": "mouseDown" | "mouseUp", "button": String}
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut WrenVm) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                runtime_error(vm, "Window.pollEvents: id must be a non-negative number.");
-                return;
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.pollEvents: id must be a non-negative number.");
+            return;
+        }
+    };
+    // Pump first so any newly-arrived OS events are part of
+    // the drain.
+    pump_once();
+    let events = APP.with(|cell| {
+        cell.borrow_mut()
+            .queues
+            .get_mut(&id)
+            .map(std::mem::take)
+            .unwrap_or_default()
+    });
+
+    // GC-rooted result list build. Same shape as
+    // `wlift_sqlite_query`'s rebuild — accumulating maps in a
+    // plain `Vec<Value>` was leaving them unrooted across the
+    // inner `alloc_string` calls, so a collection mid-loop
+    // would free partially-built event maps. Allocate the
+    // result list first, set it as slot 0 (GC-rooted via
+    // `api_stack`), append each fresh map to the list before
+    // populating fields. Switched per-field assignment from
+    // `call_method_on(_, "[_]=(_)", ...)` to direct
+    // `(*map_ptr).set` so key + value commit happens
+    // immediately after the key alloc, with no intervening
+    // method-dispatch path that could allocate.
+
+    let result = alloc_list(vm, 0);
+    set_return(vm, result);
+
+    for ev in events {
+        let map = alloc_map(vm);
+        list_add(vm, result, map);
+        let key_type = alloc_string(vm, "type");
+        match ev {
+            EventRecord::CloseRequested => {
+                let v = alloc_string(vm, "close");
+                map_set(vm, map, key_type, v);
             }
-        };
-        // Pump first so any newly-arrived OS events are part of
-        // the drain.
-        pump_once();
-        let events = APP.with(|cell| {
-            cell.borrow_mut()
-                .queues
-                .get_mut(&id)
-                .map(std::mem::take)
-                .unwrap_or_default()
-        });
-
-        // GC-rooted result list build. Same shape as
-        // `wlift_sqlite_query`'s rebuild — accumulating maps in a
-        // plain `Vec<Value>` was leaving them unrooted across the
-        // inner `alloc_string` calls, so a collection mid-loop
-        // would free partially-built event maps. Allocate the
-        // result list first, set it as slot 0 (GC-rooted via
-        // `api_stack`), append each fresh map to the list before
-        // populating fields. Switched per-field assignment from
-        // `call_method_on(_, "[_]=(_)", ...)` to direct
-        // `(*map_ptr).set` so key + value commit happens
-        // immediately after the key alloc, with no intervening
-        // method-dispatch path that could allocate.
-        
-        let result = alloc_list(vm, 0);
-        set_return(vm, result);
-
-        for ev in events {
-            let map = alloc_map(vm);
-            list_add(vm, result, map);
-            let key_type = alloc_string(vm, "type");
-            match ev {
-                EventRecord::CloseRequested => {
-                    let v = alloc_string(vm, "close");
-                    map_set(vm, map, key_type, v);
-                }
-                EventRecord::Resized { width, height } => {
-                    let v = alloc_string(vm, "resize");
-                    map_set(vm, map, key_type, v);
-                    let kw = alloc_string(vm, "width");
-                    map_set(vm, map, kw, Value::num(width as f64));
-                    let kh = alloc_string(vm, "height");
-                    map_set(vm, map, kh, Value::num(height as f64));
-                }
-                EventRecord::KeyDown { code } => {
-                    let v = alloc_string(vm, "keyDown");
-                    map_set(vm, map, key_type, v);
-                    // Two-step: commit the key with a null value so
-                    // the map's hash table holds the key string
-                    // across the next `alloc_string`. Without this
-                    // intermediate set, allocating `cv` would
-                    // potentially GC `kc` (the key) since `kc` is
-                    // only a Rust local, not a GC root.
-                    let kc = alloc_string(vm, "code");
-                    map_set(vm, map, kc, Value::NULL);
-                    let cv = alloc_string(vm, &code);
-                    map_set(vm, map, kc, cv);
-                }
-                EventRecord::KeyUp { code } => {
-                    let v = alloc_string(vm, "keyUp");
-                    map_set(vm, map, key_type, v);
-                    let kc = alloc_string(vm, "code");
-                    map_set(vm, map, kc, Value::NULL);
-                    let cv = alloc_string(vm, &code);
-                    map_set(vm, map, kc, cv);
-                }
-                EventRecord::MouseMoved { x, y } => {
-                    let v = alloc_string(vm, "mouseMoved");
-                    map_set(vm, map, key_type, v);
-                    let kx = alloc_string(vm, "x");
-                    map_set(vm, map, kx, Value::num(x));
-                    let ky = alloc_string(vm, "y");
-                    map_set(vm, map, ky, Value::num(y));
-                }
-                EventRecord::MouseDown { button } => {
-                    let v = alloc_string(vm, "mouseDown");
-                    map_set(vm, map, key_type, v);
-                    let kb = alloc_string(vm, "button");
-                    map_set(vm, map, kb, Value::NULL);
-                    let bv = alloc_string(vm, &button);
-                    map_set(vm, map, kb, bv);
-                }
-                EventRecord::MouseUp { button } => {
-                    let v = alloc_string(vm, "mouseUp");
-                    map_set(vm, map, key_type, v);
-                    let kb = alloc_string(vm, "button");
-                    map_set(vm, map, kb, Value::NULL);
-                    let bv = alloc_string(vm, &button);
-                    map_set(vm, map, kb, bv);
-                }
+            EventRecord::Resized { width, height } => {
+                let v = alloc_string(vm, "resize");
+                map_set(vm, map, key_type, v);
+                let kw = alloc_string(vm, "width");
+                map_set(vm, map, kw, Value::num(width as f64));
+                let kh = alloc_string(vm, "height");
+                map_set(vm, map, kh, Value::num(height as f64));
+            }
+            EventRecord::KeyDown { code } => {
+                let v = alloc_string(vm, "keyDown");
+                map_set(vm, map, key_type, v);
+                // Two-step: commit the key with a null value so
+                // the map's hash table holds the key string
+                // across the next `alloc_string`. Without this
+                // intermediate set, allocating `cv` would
+                // potentially GC `kc` (the key) since `kc` is
+                // only a Rust local, not a GC root.
+                let kc = alloc_string(vm, "code");
+                map_set(vm, map, kc, Value::NULL);
+                let cv = alloc_string(vm, &code);
+                map_set(vm, map, kc, cv);
+            }
+            EventRecord::KeyUp { code } => {
+                let v = alloc_string(vm, "keyUp");
+                map_set(vm, map, key_type, v);
+                let kc = alloc_string(vm, "code");
+                map_set(vm, map, kc, Value::NULL);
+                let cv = alloc_string(vm, &code);
+                map_set(vm, map, kc, cv);
+            }
+            EventRecord::MouseMoved { x, y } => {
+                let v = alloc_string(vm, "mouseMoved");
+                map_set(vm, map, key_type, v);
+                let kx = alloc_string(vm, "x");
+                map_set(vm, map, kx, Value::num(x));
+                let ky = alloc_string(vm, "y");
+                map_set(vm, map, ky, Value::num(y));
+            }
+            EventRecord::MouseDown { button } => {
+                let v = alloc_string(vm, "mouseDown");
+                map_set(vm, map, key_type, v);
+                let kb = alloc_string(vm, "button");
+                map_set(vm, map, kb, Value::NULL);
+                let bv = alloc_string(vm, &button);
+                map_set(vm, map, kb, bv);
+            }
+            EventRecord::MouseUp { button } => {
+                let v = alloc_string(vm, "mouseUp");
+                map_set(vm, map, key_type, v);
+                let kb = alloc_string(vm, "button");
+                map_set(vm, map, kb, Value::NULL);
+                let bv = alloc_string(vm, &button);
+                map_set(vm, map, kb, bv);
             }
         }
     }
@@ -579,124 +567,125 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut WrenVm) {
 /// `Device.createSurface` accepts.
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
-    unsafe {
-        let id = match slot(vm, 1).as_num() {
-            Some(n) if n >= 0.0 => n as u64,
-            _ => {
-                runtime_error(vm, "Window.handle: id must be a non-negative number.");
-                return;
-            }
-        };
-        // Snapshot the raw handles inside the thread-local so we
-        // can release the borrow before the FFI re-entrance into
-        // alloc_map.
-        let handles = APP.with(|cell| {
-            let app = cell.borrow();
-            let entry = app.windows.get(&id)?;
-            let win_handle = entry.window.window_handle().ok().map(|h| h.as_raw());
-            let disp_handle = entry.window.display_handle().ok().map(|h| h.as_raw());
-            match (win_handle, disp_handle) {
-                (Some(w), Some(d)) => Some((w, d)),
-                _ => None,
-            }
-        });
-        let Some((win, _disp)) = handles else {
-            runtime_error(vm, "Window.handle: unknown window id or handle unavailable.");
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.handle: id must be a non-negative number.");
             return;
-        };
+        }
+    };
+    // Snapshot the raw handles inside the thread-local so we
+    // can release the borrow before the FFI re-entrance into
+    // alloc_map.
+    let handles = APP.with(|cell| {
+        let app = cell.borrow();
+        let entry = app.windows.get(&id)?;
+        let win_handle = entry.window.window_handle().ok().map(|h| h.as_raw());
+        let disp_handle = entry.window.display_handle().ok().map(|h| h.as_raw());
+        match (win_handle, disp_handle) {
+            (Some(w), Some(d)) => Some((w, d)),
+            _ => None,
+        }
+    });
+    let Some((win, _disp)) = handles else {
+        runtime_error(
+            vm,
+            "Window.handle: unknown window id or handle unavailable.",
+        );
+        return;
+    };
 
-        // Same GC-rooting pattern as the events list above.
-        // `set_return` lands the map in slot 0 (GC-rooted via
-        // api_stack). `key_platform` gets committed with a null
-        // placeholder right after allocation so the map's hash
-        // table holds the key string across the match arms below
-        // — without that, any `alloc_string` inside a match arm
-        // would race a GC that could free the unrooted key.
-        // Direct `(*map_ptr).set` instead of method-dispatch
-        // `call_method_on(_, "[_]=(_)", ...)` for the same
-        // reason: shorter window between key alloc and value
-        // commit.
-        use raw_window_handle::RawWindowHandle;
-        
-        let map = alloc_map(vm);
-        set_return(vm, map);
-        let key_platform = alloc_string(vm, "platform");
-        map_set(vm, map, key_platform, Value::NULL);
+    // Same GC-rooting pattern as the events list above.
+    // `set_return` lands the map in slot 0 (GC-rooted via
+    // api_stack). `key_platform` gets committed with a null
+    // placeholder right after allocation so the map's hash
+    // table holds the key string across the match arms below
+    // — without that, any `alloc_string` inside a match arm
+    // would race a GC that could free the unrooted key.
+    // Direct `(*map_ptr).set` instead of method-dispatch
+    // `call_method_on(_, "[_]=(_)", ...)` for the same
+    // reason: shorter window between key alloc and value
+    // commit.
+    use raw_window_handle::RawWindowHandle;
 
-        match win {
-            RawWindowHandle::AppKit(h) => {
-                let v = alloc_string(vm, "appkit");
-                map_set(vm, map, key_platform, v);
-                let kv = alloc_string(vm, "ns_view");
-                map_set(vm, map, kv, Value::num(h.ns_view.as_ptr() as usize as f64));
-            }
-            RawWindowHandle::UiKit(h) => {
-                let v = alloc_string(vm, "uikit");
-                map_set(vm, map, key_platform, v);
-                let kv = alloc_string(vm, "ui_view");
-                map_set(vm, map, kv, Value::num(h.ui_view.as_ptr() as usize as f64));
-            }
-            RawWindowHandle::Win32(h) => {
-                let v = alloc_string(vm, "win32");
-                map_set(vm, map, key_platform, v);
-                let kh = alloc_string(vm, "hwnd");
-                map_set(vm, map, kh, Value::num(h.hwnd.get() as f64));
-                if let Some(hi) = h.hinstance {
-                    let key_hinstance = alloc_string(vm, "hinstance");
-                    map_set(vm, map, key_hinstance, Value::num(hi.get() as f64));
-                }
-            }
-            RawWindowHandle::Xlib(h) => {
-                let v = alloc_string(vm, "xlib");
-                map_set(vm, map, key_platform, v);
-                let kw = alloc_string(vm, "window");
-                map_set(vm, map, kw, Value::num(h.window as f64));
-                if h.visual_id != 0 {
-                    let kvi = alloc_string(vm, "visual_id");
-                    map_set(vm, map, kvi, Value::num(h.visual_id as f64));
-                }
-            }
-            RawWindowHandle::Wayland(h) => {
-                let v = alloc_string(vm, "wayland");
-                map_set(vm, map, key_platform, v);
-                let ks = alloc_string(vm, "surface");
-                map_set(vm, map, ks, Value::num(h.surface.as_ptr() as usize as f64));
-            }
-            other => {
-                let v = alloc_string(vm, &format!("{:?}", other).to_lowercase());
-                map_set(vm, map, key_platform, v);
+    let map = alloc_map(vm);
+    set_return(vm, map);
+    let key_platform = alloc_string(vm, "platform");
+    map_set(vm, map, key_platform, Value::NULL);
+
+    match win {
+        RawWindowHandle::AppKit(h) => {
+            let v = alloc_string(vm, "appkit");
+            map_set(vm, map, key_platform, v);
+            let kv = alloc_string(vm, "ns_view");
+            map_set(vm, map, kv, Value::num(h.ns_view.as_ptr() as usize as f64));
+        }
+        RawWindowHandle::UiKit(h) => {
+            let v = alloc_string(vm, "uikit");
+            map_set(vm, map, key_platform, v);
+            let kv = alloc_string(vm, "ui_view");
+            map_set(vm, map, kv, Value::num(h.ui_view.as_ptr() as usize as f64));
+        }
+        RawWindowHandle::Win32(h) => {
+            let v = alloc_string(vm, "win32");
+            map_set(vm, map, key_platform, v);
+            let kh = alloc_string(vm, "hwnd");
+            map_set(vm, map, kh, Value::num(h.hwnd.get() as f64));
+            if let Some(hi) = h.hinstance {
+                let key_hinstance = alloc_string(vm, "hinstance");
+                map_set(vm, map, key_hinstance, Value::num(hi.get() as f64));
             }
         }
+        RawWindowHandle::Xlib(h) => {
+            let v = alloc_string(vm, "xlib");
+            map_set(vm, map, key_platform, v);
+            let kw = alloc_string(vm, "window");
+            map_set(vm, map, kw, Value::num(h.window as f64));
+            if h.visual_id != 0 {
+                let kvi = alloc_string(vm, "visual_id");
+                map_set(vm, map, kvi, Value::num(h.visual_id as f64));
+            }
+        }
+        RawWindowHandle::Wayland(h) => {
+            let v = alloc_string(vm, "wayland");
+            map_set(vm, map, key_platform, v);
+            let ks = alloc_string(vm, "surface");
+            map_set(vm, map, ks, Value::num(h.surface.as_ptr() as usize as f64));
+        }
+        other => {
+            let v = alloc_string(vm, &format!("{:?}", other).to_lowercase());
+            map_set(vm, map, key_platform, v);
+        }
+    }
 
-        // The display half — most embedders only need the platform
-        // tag plus `ns_view` / `hwnd` / etc., but X11 + Wayland
-        // require the display pointer as a separate key.
-        APP.with(|cell| {
-            let app = cell.borrow();
-            if let Some(entry) = app.windows.get(&id) {
-                if let Ok(disp) = entry.window.display_handle() {
-                    use raw_window_handle::RawDisplayHandle;
-                    match disp.as_raw() {
-                        RawDisplayHandle::Xlib(d) => {
-                            if let Some(p) = d.display {
-                                let key = alloc_string(vm, "display");
-                                map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
-                            }
-                        }
-                        RawDisplayHandle::Xcb(d) => {
-                            if let Some(p) = d.connection {
-                                let key = alloc_string(vm, "connection");
-                                map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
-                            }
-                        }
-                        RawDisplayHandle::Wayland(d) => {
+    // The display half — most embedders only need the platform
+    // tag plus `ns_view` / `hwnd` / etc., but X11 + Wayland
+    // require the display pointer as a separate key.
+    APP.with(|cell| {
+        let app = cell.borrow();
+        if let Some(entry) = app.windows.get(&id) {
+            if let Ok(disp) = entry.window.display_handle() {
+                use raw_window_handle::RawDisplayHandle;
+                match disp.as_raw() {
+                    RawDisplayHandle::Xlib(d) => {
+                        if let Some(p) = d.display {
                             let key = alloc_string(vm, "display");
-                            map_set(vm, map, key, Value::num(d.display.as_ptr() as usize as f64));
+                            map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
                         }
-                        _ => {}
                     }
+                    RawDisplayHandle::Xcb(d) => {
+                        if let Some(p) = d.connection {
+                            let key = alloc_string(vm, "connection");
+                            map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
+                        }
+                    }
+                    RawDisplayHandle::Wayland(d) => {
+                        let key = alloc_string(vm, "display");
+                        map_set(vm, map, key, Value::num(d.display.as_ptr() as usize as f64));
+                    }
+                    _ => {}
                 }
             }
-        });
-    }
+        }
+    });
 }

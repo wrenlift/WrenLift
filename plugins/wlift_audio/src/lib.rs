@@ -42,10 +42,6 @@ pub extern "C" fn wlift_plugin_abi_version() -> u32 {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn string_of(v: Value) -> Option<String> {
-    string_str(v).map(|s| s.to_string())
-}
-
 fn map_get(map: Value, key: &str) -> Option<Value> {
     if obj_type(map) != Some(ObjType::Map) {
         return None;
