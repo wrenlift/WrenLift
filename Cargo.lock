@@ -6545,6 +6545,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlift_abi"
+version = "0.1.0"
+
+[[package]]
 name = "wlift_alloc"
 version = "0.1.0"
 dependencies = [

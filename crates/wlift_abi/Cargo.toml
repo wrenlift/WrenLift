@@ -1,0 +1,15 @@
+[package]
+name = "wlift_abi"
+version = "0.1.0"
+edition = "2021"
+description = "Stable C-shaped ABI for WrenLift plugins. Plugin cdylibs depend only on this crate; the host binary exports the `wlift_plugin_*` symbols, and the dynamic linker resolves the plugin's calls against them at dlopen. No `wren_lift` Rust internals cross the plugin boundary."
+license = "MIT"
+
+[lib]
+# Plain library — pure Rust, no_std-friendly, no dynamic-loading concerns.
+# Plugins consume this as an `rlib` dependency; the actual C symbols
+# live in the host process and the linker wires them up at dlopen.
+
+[dependencies]
+# Intentionally empty. Adding anything here risks pulling layout
+# back into plugin space — defeats the whole point of the crate.
