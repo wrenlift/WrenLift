@@ -3651,24 +3651,23 @@ fn run_fiber_with_stop_depth(
                     // especially on loop back-edges where argv-style
                     // phis feed their own slot through mutated
                     // neighbours.
-                    let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
-                    let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
-                    let use_heap = argc > bindings.len();
-                    for i in 0..argc {
-                        let dst_reg = read_u16(code, &mut pc);
-                        let src_reg = read_u16(code, &mut pc);
-                        let val = get_reg(&values, src_reg);
-                        if use_heap {
-                            heap_bindings.push((dst_reg, val));
-                        } else {
-                            bindings[i] = (dst_reg, val);
+                    if argc > 16 {
+                        let mut heap_bindings: Vec<(u16, Value)> = Vec::with_capacity(argc);
+                        for _ in 0..argc {
+                            let dst_reg = read_u16(code, &mut pc);
+                            let src_reg = read_u16(code, &mut pc);
+                            heap_bindings.push((dst_reg, get_reg(&values, src_reg)));
                         }
-                    }
-                    if use_heap {
                         for &(dst_reg, val) in &heap_bindings {
                             set_reg(&mut values, dst_reg, val);
                         }
                     } else {
+                        let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
+                        for item in bindings.iter_mut().take(argc) {
+                            let dst_reg = read_u16(code, &mut pc);
+                            let src_reg = read_u16(code, &mut pc);
+                            *item = (dst_reg, get_reg(&values, src_reg));
+                        }
                         for &(dst_reg, val) in &bindings[..argc] {
                             set_reg(&mut values, dst_reg, val);
                         }
@@ -3779,24 +3778,23 @@ fn run_fiber_with_stop_depth(
                         // Parallel-assign true-branch bindings (read all
                         // sources before any write — see Op::Branch).
                         let mut p = true_params_start;
-                        let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
-                        let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
-                        let use_heap = t_argc > bindings.len();
-                        for i in 0..t_argc {
-                            let dst_reg = read_u16(code, &mut p);
-                            let src_reg = read_u16(code, &mut p);
-                            let val = get_reg(&values, src_reg);
-                            if use_heap {
-                                heap_bindings.push((dst_reg, val));
-                            } else {
-                                bindings[i] = (dst_reg, val);
+                        if t_argc > 16 {
+                            let mut heap_bindings: Vec<(u16, Value)> = Vec::with_capacity(t_argc);
+                            for _ in 0..t_argc {
+                                let dst_reg = read_u16(code, &mut p);
+                                let src_reg = read_u16(code, &mut p);
+                                heap_bindings.push((dst_reg, get_reg(&values, src_reg)));
                             }
-                        }
-                        if use_heap {
                             for &(dst_reg, val) in &heap_bindings {
                                 set_reg(&mut values, dst_reg, val);
                             }
                         } else {
+                            let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
+                            for item in bindings.iter_mut().take(t_argc) {
+                                let dst_reg = read_u16(code, &mut p);
+                                let src_reg = read_u16(code, &mut p);
+                                *item = (dst_reg, get_reg(&values, src_reg));
+                            }
                             for &(dst_reg, val) in &bindings[..t_argc] {
                                 set_reg(&mut values, dst_reg, val);
                             }
@@ -3805,24 +3803,23 @@ fn run_fiber_with_stop_depth(
                     } else {
                         // Same parallel-assign for the false path.
                         let mut p = false_params_start;
-                        let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
-                        let mut heap_bindings: Vec<(u16, Value)> = Vec::new();
-                        let use_heap = f_argc > bindings.len();
-                        for i in 0..f_argc {
-                            let dst_reg = read_u16(code, &mut p);
-                            let src_reg = read_u16(code, &mut p);
-                            let val = get_reg(&values, src_reg);
-                            if use_heap {
-                                heap_bindings.push((dst_reg, val));
-                            } else {
-                                bindings[i] = (dst_reg, val);
+                        if f_argc > 16 {
+                            let mut heap_bindings: Vec<(u16, Value)> = Vec::with_capacity(f_argc);
+                            for _ in 0..f_argc {
+                                let dst_reg = read_u16(code, &mut p);
+                                let src_reg = read_u16(code, &mut p);
+                                heap_bindings.push((dst_reg, get_reg(&values, src_reg)));
                             }
-                        }
-                        if use_heap {
                             for &(dst_reg, val) in &heap_bindings {
                                 set_reg(&mut values, dst_reg, val);
                             }
                         } else {
+                            let mut bindings: [(u16, Value); 16] = [(0, Value::null()); 16];
+                            for item in bindings.iter_mut().take(f_argc) {
+                                let dst_reg = read_u16(code, &mut p);
+                                let src_reg = read_u16(code, &mut p);
+                                *item = (dst_reg, get_reg(&values, src_reg));
+                            }
                             for &(dst_reg, val) in &bindings[..f_argc] {
                                 set_reg(&mut values, dst_reg, val);
                             }
