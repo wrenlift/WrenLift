@@ -4196,6 +4196,13 @@ impl VM {
                                                             .to_string()
                                                     })
                                                     .unwrap_or_else(|| format!("<func#{func_id}>"));
+                                                // `dladdr` is POSIX-only; Windows has
+                                                // `SymFromAddr` via `dbghelp` but the
+                                                // diagnostic value here is the AOT
+                                                // function name we already pulled from
+                                                // the interner, so the resolver is just
+                                                // a "stronger" alternative on Unix.
+                                                #[cfg(unix)]
                                                 let dl = unsafe {
                                                     let mut info: libc::Dl_info =
                                                         std::mem::zeroed();
@@ -4211,6 +4218,8 @@ impl VM {
                                                         None
                                                     }
                                                 };
+                                                #[cfg(not(unix))]
+                                                let dl: Option<String> = None;
                                                 (dl.unwrap_or(n), cr.start)
                                             }
                                             None => ("<unknown>".to_string(), 0),
