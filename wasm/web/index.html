@@ -1639,6 +1639,41 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       }
       return "/proxy";
     }
+    // Persistent dep-bundle cache backed by the browser's Cache API.
+    // URLs into the registry are content-addressed by version
+    // (`hatch-gpu-0.3.0.hatch`), so the cache key never needs
+    // invalidation — a different version is a different URL. The
+    // cache survives reload, tab-close, and worker↔main flip; the
+    // in-memory `depsCache` below still memoises within a single
+    // session, this layer is for sessions across runs.
+    const HATCH_CACHE_NAME = "wlift-hatch-bundles-v1";
+    async function openHatchCache() {
+      // Cache API is unavailable on some legacy / private-mode
+      // builds; degrade to a pass-through so the playground still
+      // works (just without persistence).
+      if (typeof caches === "undefined") return null;
+      try { return await caches.open(HATCH_CACHE_NAME); }
+      catch { return null; }
+    }
+    async function fetchCachedBytes(url, doFetch) {
+      const cache = await openHatchCache();
+      if (cache) {
+        const hit = await cache.match(url);
+        if (hit) return new Uint8Array(await hit.arrayBuffer());
+      }
+      const resp = await doFetch();
+      if (!resp.ok) return resp; // caller surfaces the error
+      // Put a clone before consuming the body — Response bodies
+      // are one-shot, and the caller still needs to read it below.
+      if (cache) {
+        try { await cache.put(url, resp.clone()); }
+        catch (e) {
+          console.warn("[wlift] hatch-cache put failed for", url, e);
+        }
+      }
+      return new Uint8Array(await resp.arrayBuffer());
+    }
+
     async function proxiedFetcher(url, name) {
       // Same-origin / relative URLs (`./foo.hatch`, `/foo.hatch`)
       // need no proxy and would 403 against the registry-only
@@ -1648,20 +1683,21 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       try { isSameOrigin = new URL(url, location.href).origin === location.origin; }
       catch { /* invalid URL — fall through to proxied path */ }
       if (isRelative || isSameOrigin) {
-        const direct = await fetch(url);
-        if (!direct.ok) {
-          throw new Error(`dep '${name}' direct fetch failed: ${direct.status} ${direct.statusText} (${url})`);
-        }
-        return new Uint8Array(await direct.arrayBuffer());
+        const bytes = await fetchCachedBytes(url, () => fetch(url));
+        if (bytes instanceof Uint8Array) return bytes;
+        // `fetchCachedBytes` returned a Response on a !ok — surface
+        // it with a descriptive error.
+        throw new Error(`dep '${name}' direct fetch failed: ${bytes.status} ${bytes.statusText} (${url})`);
       }
       const proxied = `${resolveProxyBase()}?url=${encodeURIComponent(url)}`;
-      const r = await fetch(proxied);
-      if (!r.ok) {
-        throw new Error(
-          `dep '${name}' fetch via proxy failed: ${r.status} ${r.statusText} (upstream: ${url})`,
-        );
-      }
-      return new Uint8Array(await r.arrayBuffer());
+      // Key the cache off the *upstream* URL so a proxy-base change
+      // (e.g. switching from `serve.js` to the prod Edge Function)
+      // still resolves cached bytes from a previous session.
+      const bytes = await fetchCachedBytes(url, () => fetch(proxied));
+      if (bytes instanceof Uint8Array) return bytes;
+      throw new Error(
+        `dep '${name}' fetch via proxy failed: ${bytes.status} ${bytes.statusText} (upstream: ${url})`,
+      );
     }
 
     // Memoise resolved hatch bundles by the exact hatchfile text.
