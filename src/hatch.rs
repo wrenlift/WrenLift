@@ -1982,8 +1982,7 @@ fn topo_sort_wren_files_by_imports(files: &mut Vec<(String, std::path::PathBuf)>
     // Materialise the new order. The temporary moves through an
     // option array so we can drain `files` without cloning the
     // PathBuf.
-    let mut taken: Vec<Option<(String, std::path::PathBuf)>> =
-        files.drain(..).map(Some).collect();
+    let mut taken: Vec<Option<(String, std::path::PathBuf)>> = files.drain(..).map(Some).collect();
     files.reserve(n);
     for i in order {
         files.push(taken[i].take().expect("topo_sort: index visited twice"));
@@ -2011,7 +2010,9 @@ fn scan_wren_imports(src: &str) -> Vec<String> {
         }
         let Some(open) = rest.find('"') else { continue };
         let after = &rest[open + 1..];
-        let Some(close) = after.find('"') else { continue };
+        let Some(close) = after.find('"') else {
+            continue;
+        };
         out.push(after[..close].to_string());
     }
     out
