@@ -433,8 +433,17 @@ export async function resolveDepsFromManifest(
     registryBase = DEFAULT_HATCH_REGISTRY,
     fetcher = defaultFetcher,
     target = "wasm32",
+    // Persist fetched bundle bytes across reloads via the Cache
+    // API. Set `false` to bypass (tests, private mirrors that
+    // never want to hit the storage layer). Pass a string to
+    // override the cache name (`{ cache: "wlift-bundles-v2" }`).
+    cache = true,
   } = {},
 ) {
+  if (cache) {
+    const cacheName = typeof cache === "string" ? cache : DEFAULT_HATCH_CACHE_NAME;
+    fetcher = makeCachedFetcher(fetcher, { cacheName });
+  }
   const order = [];                  // Uint8Array[] in install order
   const seen = new Set();            // package names already queued
   // We deliberately do NOT clear `dep_docs` here. Every fetched
@@ -555,6 +564,85 @@ async function defaultFetcher(url, name) {
     throw new Error(`fetch dep '${name}' from ${url} failed: ${r.status} ${r.statusText}`);
   }
   return new Uint8Array(await r.arrayBuffer());
+}
+
+/// Cache key used by `makeCachedFetcher` when `cacheName` isn't
+/// passed explicitly. Registry URLs are content-addressed by
+/// version (`hatch-gpu-0.3.0.hatch`), so a version bump produces
+/// a new URL — the cache never needs invalidation.
+export const DEFAULT_HATCH_CACHE_NAME = "wlift-hatch-bundles-v1";
+
+/// Wrap any `(url, name) -> Uint8Array` fetcher with a Cache-API
+/// memoisation layer that survives page reload, tab close, and
+/// worker↔main flip. First call to a URL goes to `innerFetcher`
+/// and stashes the bytes; later calls (same session or different)
+/// return cached bytes without touching the network.
+///
+///   const fetcher = makeCachedFetcher(myProxiedFetcher);
+///   await resolveDepsFromManifest(manifest, { fetcher });
+///
+/// Degrades gracefully when the Cache API is unavailable
+/// (private mode, legacy hosts) — every call hits `innerFetcher`,
+/// but the caller's API doesn't change.
+export function makeCachedFetcher(
+  innerFetcher = defaultFetcher,
+  { cacheName = DEFAULT_HATCH_CACHE_NAME } = {},
+) {
+  async function openCache() {
+    if (typeof caches === "undefined") return null;
+    try { return await caches.open(cacheName); }
+    catch { return null; }
+  }
+  return async function cachedFetcher(url, name) {
+    const cache = await openCache();
+    if (cache) {
+      const hit = await cache.match(url);
+      if (hit) return new Uint8Array(await hit.arrayBuffer());
+    }
+    const bytes = await innerFetcher(url, name);
+    if (cache && bytes instanceof Uint8Array) {
+      try {
+        await cache.put(
+          url,
+          new Response(bytes, {
+            headers: { "content-type": "application/octet-stream" },
+          }),
+        );
+      } catch (e) {
+        // Disk-quota / storage-pressure failures are recoverable —
+        // the next call just re-fetches. Don't propagate.
+        console.warn("[wlift] hatch-cache put failed for", url, e);
+      }
+    }
+    return bytes;
+  };
+}
+
+/// Drop every entry the harness has stashed in the Cache API.
+/// Returns `false` when the platform doesn't expose `caches`
+/// (private mode etc.) so callers can decide whether to surface
+/// a "couldn't clear" notice; returns `true` on success.
+export async function clearHatchCache({ cacheName = DEFAULT_HATCH_CACHE_NAME } = {}) {
+  if (typeof caches === "undefined") return false;
+  try { return await caches.delete(cacheName); }
+  catch { return false; }
+}
+
+/// Eagerly warm the harness's bundle cache for a hatchfile so the
+/// next `runProject` / `resolveDepsFromManifest` call resolves
+/// from cache instead of the network. Convenience over calling
+/// `resolveDepsFromManifest` and discarding the result.
+///
+/// Pass the same `{ fetcher, registryBase, target }` you'd pass
+/// to `runProject`; caching is on by default (matching
+/// `resolveDepsFromManifest`).
+///
+///   await prefetchHatchDeps(hatchfileText);
+///   // ...later, after the user clicks Run:
+///   await runProject(wlift, source, hatchfileText);
+export async function prefetchHatchDeps(hatchfileText, opts = {}) {
+  const manifest = await parseHatchfileToml(hatchfileText);
+  return resolveDepsFromManifest(manifest, opts);
 }
 
 /// One-call convenience: given the user's source + their
