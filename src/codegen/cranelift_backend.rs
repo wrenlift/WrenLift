@@ -2531,6 +2531,38 @@ pub mod cl {
             seen
         };
 
+        // Loop headers: any block H with a predecessor P where
+        // `P.id >= H.id`. The MIR builder lowers `while` / `for-in`
+        // / `continue` so the back-edge always jumps to a header
+        // whose id is less-than-or-equal to the body's id; this
+        // single CFG check identifies them without a dominator
+        // pass.
+        //
+        // Used by the back-edge `wren_jit_roots_restore` emit
+        // below: long-running functions (the canonical case is
+        // `App.listen`'s accept loop in @hatch:web — never returns)
+        // would otherwise pin one `JIT_ROOTS_STORE` entry per
+        // allocation forever because `finish_alloc` pushes
+        // unconditionally and the only existing release site is
+        // the exit-time restore. Releasing back to the function-
+        // entry snapshot at every loop header drops accumulated
+        // entries each iteration; Cranelift's stack maps cover
+        // anything still live across the back-edge, so the GC
+        // still sees those values.
+        #[cfg(feature = "aot")]
+        let loop_headers: std::collections::HashSet<BlockId> = {
+            let mut headers = std::collections::HashSet::new();
+            for block in &mir.blocks {
+                for &pred in &block.predecessors {
+                    if pred.0 >= block.id.0 {
+                        headers.insert(block.id);
+                        break;
+                    }
+                }
+            }
+            headers
+        };
+
         #[cfg_attr(not(feature = "aot"), allow(unused_labels))]
         'block_loop: for &block_idx in &rpo {
             let block = &mir.blocks[block_idx];
@@ -2998,6 +3030,28 @@ pub mod cl {
                     let cont = builder.create_block();
                     builder.ins().brif(err, abort_exit, &[], cont, &[]);
                     builder.switch_to_block(cont);
+                }
+            }
+
+            // Back-edge JIT-roots release. Emitted at the top of
+            // every loop header (after block-params + snap_var def
+            // + has_error check) so each iteration starts at the
+            // function-entry snapshot length. Long-running
+            // functions like `App.listen`'s accept loop would
+            // otherwise pin one `JIT_ROOTS_STORE` entry per
+            // allocation forever; releasing back to the entry
+            // snapshot every iteration drops accumulated entries.
+            // Cranelift's stack maps cover anything still live
+            // across the back-edge so the GC still sees those
+            // values.
+            #[cfg(feature = "aot")]
+            if loop_headers.contains(&bid) {
+                if let Some(cfg) = aot_config {
+                    if let Some(snap_var) = *cfg.current_jit_roots_snapshot_var.borrow() {
+                        let snap = builder.use_var(snap_var);
+                        let f = get_runtime_fn(module, builder, "wren_jit_roots_restore", 1)?;
+                        let _ = builder.ins().call(f, &[snap]);
+                    }
                 }
             }
 

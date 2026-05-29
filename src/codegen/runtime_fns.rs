@@ -1407,18 +1407,15 @@ pub fn set_aot_gc_enabled(v: bool) {
 /// every allocated value is unconditionally tracked through the
 /// roots Vec, end of story.
 ///
-/// **Long-running-function caveat:** functions that never return
-/// (e.g. `app.listen`'s accept loop) never hit the exit-time
-/// restore, so `JIT_ROOTS_STORE` accumulates one entry per
-/// allocation forever. Eventual memory ceiling is the working
-/// set + the cumulative sum of every allocation the function ever
-/// made. The fix lives in `aot_finish_alloc_back_edge_release`
-/// (called at every loop back-edge in long-running functions):
-/// it shrinks `JIT_ROOTS_STORE` back to the function-entry
-/// snapshot, on the theory that Cranelift's stack maps cover
-/// anything still live across the iteration. Any false-negative
-/// in the stack maps surfaces as a UAF crash here — preferable to
-/// a silent leak because the gap can be fixed.
+/// **Long-running-function release:** the AOT lowering also
+/// emits `wren_jit_roots_restore(snap)` at the top of every loop
+/// header so functions that never return (canonical case:
+/// `App.listen`'s accept loop in @hatch:web) don't accumulate one
+/// entry per allocation forever. The release runs every iteration;
+/// Cranelift's stack maps cover anything still live across the
+/// back-edge, so the GC still sees those values. Any false-
+/// negative in the stack maps surfaces as a UAF crash here —
+/// preferable to a silent leak because the gap can be fixed.
 ///
 /// JIT / interpreter mode keeps the no-op behaviour — the
 /// bytecode interpreter loop's safepoint already runs GC at safe
