@@ -116,6 +116,157 @@ is the smaller change but (2) is the more general primitive.
 The site's chunked-sleep workaround can stay until one of
 these lands.
 
+### SIMD for physics + game math
+
+Rapier already exploits SIMD inside the plugin — glamx + parry compile
+to f32x4 / SSE / NEON paths on x86_64 and aarch64, so the solver,
+broad-phase BVH traversal, and contact manifold generation are
+vectorized at the crate level. There's no win to chase by rewriting
+`wlift_physics` internals. The latency that *is* visible to a Wren
+game loop sits at three boundaries the runtime can move:
+
+1. **Batched physics queries.** Per-call FFI dominates ray and shape
+   sweeps at high cast counts (e.g. line-of-sight checks across a
+   whole NPC roster, environment probes per particle). Add
+   `World.castRaysBatched(origins, dirs, maxToi, outHits)` and
+   `World.castShapesBatched(shape, origins, dirs, maxToi, outHits)`
+   that take `Float32Array` inputs and write packed result records
+   back into a caller-owned `Float32Array` / `Int32Array` pair — one
+   FFI crossing per batch instead of one per cast. Mirrors the
+   pattern `World.positionInto(out, offset)` already uses for
+   transform readback.
+2. **Rapier `parallel` feature.** Rapier ships a `rayon`-backed
+   parallel island solver behind an optional feature; we don't
+   enable it today. Body-heavy scenes (hundreds of dynamic
+   colliders, ragdolls, debris) get a real multi-core win with a
+   single `Cargo.toml` flip. Behind a `parallel` cfg on
+   `wlift_physics` so single-core / wasm builds stay scalar.
+3. **`@hatch:math` SIMD-typed surface.** `@hatch:math` already uses
+   glamx Rust-side, but the Wren-facing `Vec3` / `Mat4` round-trip
+   scalars through the FFI on every component access. Expose a
+   `Simd4f`-backed `Vec3` / `Vec4` / `Mat4` so transform composition
+   (`mat * mat`, `mat.transformPoint`, batched vertex skinning, the
+   per-frame model-matrix array that feeds `Float32Array` into the
+   GPU buffer) stays in vector registers. The Wren `Simd4f` /
+   `Simd4i` built-ins already exist — this is wiring `@hatch:math`'s
+   public surface to them, not new runtime work.
+
+(1) is the cheapest concrete win and unblocks AI / VFX code that
+currently amortizes FFI by caching results across frames. (2) is a
+one-line Cargo change gated behind benchmarks on a body-heavy scene.
+(3) is the largest mechanical change but the only one that helps
+game code that isn't physics-heavy — UI layout math, particle
+systems, animation blending.
+
+### Particles — 3D path, GPU sim, blend modes
+
+`@hatch:game/particles` ships CPU-driven 2D today: per-particle
+position / velocity / lifetime / colour-over-life, output through
+`Renderer2D.drawSpriteTinted`, slot-reuse pool keeps allocations
+flat. Three deliberate gaps:
+
+1. **3D particles.** The simulation half (`Particle_.step_`,
+   `ParticleSystem.update`, the `Particles` registry) is
+   dimension-agnostic — it integrates `vx/vy` today but extending
+   to `vz` is a field-add, not a redesign. The blocker is on the
+   draw side: `Renderer3D` has no `drawBillboard(tex, origin,
+   width, height, tint)` entry yet. Land that first, then a
+   sibling `ParticleSystem3D` (or a `kind: "3d"` switch on the
+   existing class) feeds it. Shape stays config-driven and
+   identical to 2D from the caller's view.
+2. **GPU simulation + instanced draw.** Past ~5–10k live
+   particles per frame the Wren-side update loop and the per-
+   particle `drawSpriteTinted` calls dominate the frame. The
+   replacement path is (a) store particle state in a storage
+   buffer (`Float32Array` upload at spawn, compute shader steps
+   each frame), (b) emit one `drawIndexed(6, instanceCount =
+   liveCount)` per system with per-instance attributes for
+   position / size / colour. `ParticleSystem.new({...})` config
+   stays unchanged — the simulation backend is an internal swap.
+   Gated behind benchmarks; the CPU path is fine for typical
+   game scale (low thousands) and ships smaller.
+3. **Blend modes on Renderer2D.** The `wlift_gpu` pipeline
+   descriptor now accepts a `"blend"` Map (added for Bloom's
+   upsample), so the GPU layer is unblocked. The remaining work
+   is on Renderer2D's batcher: it ships a single pre-built
+   pipeline today, so switching blend mode mid-frame means
+   flushing the current batch and rebinding a parallel pipeline.
+   Add `blend: "additive" | "alpha" | "premultiplied"` to
+   `ParticleSystem` config (and any `Renderer2D.drawSprite*`
+   variant that needs it), keyed off a small cache of
+   pre-compiled pipelines per blend mode.
+
+### Shadows — cascades, point/spot, depth-convention audit
+
+`@hatch:gpu/Renderer3D` now ships directional-light shadow mapping:
+opt-in `enableShadows({size, extent, near, far, bias, pcfRadius})`,
+a depth-only `SHADOW_WGSL_` vertex pass, a fallback 1×1 depth
+texture bound when shadows are disabled (the PBR shader gates
+sampling on `counts.w == 0`), and 3×3 PCF in
+`shadow_factor()` via the new `wlift_gpu` comparison-sampler
+binding (`samplerType: "comparison"`). Only the *first*
+shadow-casting `DirectionalLight` is honoured per frame
+(`addDirectional(..., castsShadows: true)` inserts at slot 0).
+Three deliberate gaps:
+
+1. **Cascaded shadow maps.** Outdoor scenes covering thousands
+   of metres need 3–4 cascade frusta layered along the view
+   direction so shadow texels stay dense near the camera and
+   sparse at distance. The single-map current path produces
+   visible aliasing past ~50 m. Extension is well-trodden:
+   replace the single depth texture with a texture array,
+   compute per-cascade `light_vp` matrices from a sliced view
+   frustum, pick the cascade in the fragment shader by sampling
+   depth and looking up the slice.
+2. **Point + spot shadows.** Point lights need a cube-map shadow
+   (six face renders per light) or dual-paraboloid; spots use a
+   perspective projection (one render). Both follow the same
+   `texture_depth_*` + `textureSampleCompare` pattern. Per-light
+   shadow toggle goes on `PointLight` / `SpotLight` symmetric
+   with the existing `DirectionalLight.castsShadows`.
+3. **Depth-convention audit.** `Mat4.ortho` / `Mat4.perspective`
+   in `@hatch:math` emit the GL-style `[-1, 1]` z range, but
+   WebGPU's clip-space z is `[0, 1]`. Existing pipelines work in
+   practice because the renderer always renders both passes
+   through the same projection (so the comparison stays
+   self-consistent), but a Reverse-Z / depth-precision audit
+   would close the issue formally. The fix is a `Mat4.orthoWebGPU`
+   / `perspectiveWebGPU` variant that emits the `[0, 1]` mapping
+   directly and a per-pipeline flag picking which one to use.
+
+### Post-processing — DoF, motion-blur
+
+`@hatch:game/chain` ships the orchestration primitive (`PostFX` +
+`PostPass`); concrete effects live in `@hatch:postfx`. Six effects
+shipped: `Tonemap`, `Vignette`, `FXAA`, `ColorGrade`,
+`ChromaticAberration`, `Bloom` (mip-pyramid additive). `PostPass`
+already exposes the hooks for the harder remaining ones —
+`stepCount`, `requestTargets`, `wantsDepth`, `dispatchStep_` — and
+`wlift_gpu` now parses pipeline `blend` descriptors
+(`"alpha" | "additive" | "premultiplied" | { color: {...}, alpha: {...} }`)
+so additive-accumulating chains build cleanly.
+
+Two open gaps:
+
+1. **Depth-of-field.** Needs the chain's `wantsDepth` hook (which
+   exists), a CoC pre-pass, a separable blur (two-step), and a
+   composite. ~3-pipeline effect; the composite step uses the
+   same blend-descriptor wiring Bloom relies on so its soft-focus
+   transition lands cleanly.
+2. **Motion blur.** Needs per-frame previous-frame camera matrix
+   threaded through `Game.run` so the velocity-buffer pass can
+   reconstruct per-pixel motion vectors. Independent of the
+   chain — its own piece of `Game.run` plumbing alongside `g.dt`
+   / `g.elapsed`.
+
+GPU integration tests stay limited to the Wren-side config
+surface (parameter binding, uniform-write byte layout,
+fragment-body sanity); the shader / pipeline / render path is
+exercised end-to-end only by a running game. A headless wgpu test
+fixture that compiles each WGSL shader without dispatching frames
+is the realistic add — bigger than this initiative warrants on
+its own.
+
 ### Plugin ABI stability
 
 Today's plugin loader statically links the full `wren_lift`
