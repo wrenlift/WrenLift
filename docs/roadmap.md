@@ -196,6 +196,46 @@ flat. Three deliberate gaps:
    variant that needs it), keyed off a small cache of
    pre-compiled pipelines per blend mode.
 
+### Asset pipeline + save/load — true async, fan-out, entity-id remap
+
+`@hatch:assets@0.2.3` ships `AssetLoader` — a frame-amortised
+queue draining one entry per `update(dt)` call so loading scenes
+get progress callbacks without the loop stalling. Each entry is a
+`(name, Fn)` pair; the loader stays decoupled from any specific
+decoder (`@hatch:image`, `@hatch:audio`, JSON parse, etc.).
+
+`@hatch:ecs@0.2.4` ships `SaveSystem.snapshot(world, classes)` +
+`SaveSystem.restore(world, data, classes)` — round-trips ECS
+state through a Map ready for `JSON.encode`. Components opt in
+via `static save(inst)` + `static load(data)` so transient
+runtime fields (timers, GPU handles, fiber state) stay out of the
+save automatically.
+
+Three deliberate gaps:
+
+1. **True async loading.** `AssetLoader.update` resolves one
+   entry per call by invoking the closure synchronously. Big
+   assets (multi-MB texture decodes, large audio decompression)
+   still spike a single frame past 16.6 ms. The fix is letting
+   queue entries return a *generator* — a Fn that yields chunks
+   across multiple frames via `Fiber.yield`, with the loader
+   pumping them between resolves. Native code paths could also
+   spawn an OS thread for the decode via a runtime hook.
+2. **Parallel decode fan-out.** Today one entry decodes per
+   frame even when 8 are tiny. A `parallel: 4` knob (or
+   `loader.update(dt, maxItems)`) lets the loop drain several
+   per frame when each is cheap, dropping a 100-asset load from
+   ~1.6 s to ~0.4 s at 60 fps without changing the
+   user-visible API.
+3. **Entity-id remap in `SaveSystem.restore`.** Today restored
+   entities get fresh ids; component data that references *other*
+   entities by id (e.g. a `Target { ownerId }` component, parent
+   links) needs the caller to build the old→new map via the
+   `onEntity` callback and patch references in a post-pass.
+   A built-in `entityRef` field type plus an automatic
+   remap-on-attach hook would close this loop without forcing
+   every game to write the same plumbing.
+
 ### HUD — retained widgets, bitmap-font import, gamepad nav
 
 `@hatch:hud` ships an immediate-mode HUD overlay: `HUD.new(g)` then
