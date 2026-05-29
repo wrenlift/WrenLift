@@ -39,7 +39,7 @@ use std::sync::{Mutex, OnceLock};
 use wlift_abi::{
     alloc_list, alloc_map, alloc_string, list_add, list_count, list_get as abi_list_get, map_iter,
     map_set, obj_type, runtime_error, set_return, slot, string_str, typed_array_bytes,
-    typed_array_kind, ObjType, TypedArrayKind, Value, WrenVm,
+    typed_array_bytes_mut, typed_array_kind, ObjType, TypedArrayKind, Value, WrenVm,
 };
 
 /// Plugin ABI handshake. The host calls this immediately after
@@ -127,6 +127,10 @@ struct BindGroups {
 
 struct RenderPipelines {
     pipelines: HashMap<u64, wgpu::RenderPipeline>,
+}
+
+struct ComputePipelines {
+    pipelines: HashMap<u64, wgpu::ComputePipeline>,
 }
 
 struct Surfaces {
@@ -293,6 +297,15 @@ fn render_pipelines() -> &'static Mutex<RenderPipelines> {
     static REG: OnceLock<Mutex<RenderPipelines>> = OnceLock::new();
     REG.get_or_init(|| {
         Mutex::new(RenderPipelines {
+            pipelines: HashMap::new(),
+        })
+    })
+}
+
+fn compute_pipelines() -> &'static Mutex<ComputePipelines> {
+    static REG: OnceLock<Mutex<ComputePipelines>> = OnceLock::new();
+    REG.get_or_init(|| {
+        Mutex::new(ComputePipelines {
             pipelines: HashMap::new(),
         })
     })
@@ -2643,6 +2656,132 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_destroy(vm: *mut WrenVm) {
 }
 
 // ---------------------------------------------------------------------------
+// ComputePipeline
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_compute_pipeline_create(vm: *mut WrenVm) {
+    let device_id = match id_of(vm, slot(vm, 1), "Device.createComputePipeline") {
+        Some(i) => i,
+        None => return,
+    };
+    let desc = slot(vm, 2);
+    let label = map_get(desc, "label").and_then(string_of);
+
+    enum LayoutChoice {
+        Auto,
+        Id(u64),
+    }
+    let layout_choice = match map_get(desc, "layout") {
+        Some(v) => {
+            if let Some(s) = string_of(v) {
+                if s == "auto" {
+                    LayoutChoice::Auto
+                } else {
+                    runtime_error(vm, &format!(
+                        "ComputePipeline.create: layout '{}' not recognized; use 'auto' or a layout id.",
+                        s
+                    ));
+                    return;
+                }
+            } else if let Some(n) = v.as_num() {
+                LayoutChoice::Id(n as u64)
+            } else {
+                runtime_error(
+                    vm,
+                    "ComputePipeline.create: `layout` must be 'auto' or a layout id.",
+                );
+                return;
+            }
+        }
+        None => LayoutChoice::Auto,
+    };
+
+    let module_id = match map_get(desc, "module").and_then(Value::as_num) {
+        Some(n) => n as u64,
+        None => {
+            runtime_error(vm, "ComputePipeline.create: descriptor `module` missing.");
+            return;
+        }
+    };
+    let entry_point = match map_get(desc, "entryPoint").and_then(string_of) {
+        Some(s) => s,
+        None => {
+            runtime_error(
+                vm,
+                "ComputePipeline.create: descriptor `entryPoint` missing.",
+            );
+            return;
+        }
+    };
+
+    let shader_reg = shaders().lock().unwrap();
+    let module = match shader_reg.shaders.get(&module_id) {
+        Some(m) => m,
+        None => {
+            drop(shader_reg);
+            runtime_error(vm, "ComputePipeline.create: unknown shader module id.");
+            return;
+        }
+    };
+    let pl_reg = pipeline_layouts().lock().unwrap();
+    let layout_ref = match &layout_choice {
+        LayoutChoice::Auto => None,
+        LayoutChoice::Id(id) => match pl_reg.layouts.get(id) {
+            Some(l) => Some(l),
+            None => {
+                drop(pl_reg);
+                drop(shader_reg);
+                runtime_error(vm, "ComputePipeline.create: unknown pipeline layout id.");
+                return;
+            }
+        },
+    };
+
+    let pipeline = {
+        let dev_reg = devices().lock().unwrap();
+        let dev = match dev_reg.devices.get(&device_id) {
+            Some(d) => d,
+            None => {
+                drop(pl_reg);
+                drop(shader_reg);
+                runtime_error(vm, "ComputePipeline.create: unknown device id.");
+                return;
+            }
+        };
+        dev.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: label.as_deref(),
+                layout: layout_ref,
+                module,
+                entry_point: &entry_point,
+                compilation_options: Default::default(),
+                cache: None,
+            })
+    };
+    drop(pl_reg);
+    drop(shader_reg);
+
+    let id = next_id();
+    compute_pipelines()
+        .lock()
+        .unwrap()
+        .pipelines
+        .insert(id, pipeline);
+    set_return(vm, Value::num(id as f64));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_compute_pipeline_destroy(vm: *mut WrenVm) {
+    let id = match id_of(vm, slot(vm, 1), "ComputePipeline.destroy") {
+        Some(i) => i,
+        None => return,
+    };
+    compute_pipelines().lock().unwrap().pipelines.remove(&id);
+    set_return(vm, Value::NULL);
+}
+
+// ---------------------------------------------------------------------------
 // CommandEncoder + RenderPass (record-and-replay)
 // ---------------------------------------------------------------------------
 
@@ -3091,6 +3230,145 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
     set_return(vm, Value::NULL);
 }
 
+/// Record a compute pass into the named encoder.
+///
+/// Wren wrapper drives this via:
+/// ```
+/// pass = encoder.beginComputePass({...descriptor...})
+/// pass.setPipeline(p); pass.setBindGroup(0, g); pass.dispatchWorkgroups(64); pass.end
+/// ```
+/// `pass.end` packages every recorded command into `commands` and
+/// calls this one foreign fn. Same record-and-replay pattern as
+/// `wlift_gpu_encoder_record_pass` — sidesteps the wgpu-side
+/// `ComputePass<'a>` lifetime knot.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_encoder_record_compute_pass(vm: *mut WrenVm) {
+    let encoder_id = match id_of(vm, slot(vm, 1), "ComputePass.end") {
+        Some(i) => i,
+        None => return,
+    };
+    let desc = slot(vm, 2);
+    let _label = map_get(desc, "label").and_then(string_of);
+
+    let commands_v = match map_get(desc, "commands") {
+        Some(v) => v,
+        None => {
+            runtime_error(vm, "ComputePass: missing `commands` list.");
+            return;
+        }
+    };
+    let commands_list = match list_view(commands_v) {
+        Some(l) => l,
+        None => {
+            runtime_error(vm, "ComputePass: `commands` must be a list.");
+            return;
+        }
+    };
+
+    enum Cmd {
+        SetPipeline(u64),
+        SetBindGroup { index: u32, group: u64 },
+        Dispatch { x: u32, y: u32, z: u32 },
+    }
+    let mut decoded: Vec<Cmd> = Vec::with_capacity(commands_list.count as usize);
+    for i in 0..commands_list.count as usize {
+        let cmd = list_get(commands_list, i);
+        let op = match map_get(cmd, "op").and_then(string_of) {
+            Some(s) => s,
+            None => {
+                runtime_error(
+                    vm,
+                    &format!("ComputePass commands[{}]: missing `op` string.", i),
+                );
+                return;
+            }
+        };
+        match op.as_str() {
+            "setPipeline" => {
+                let pid = map_get(cmd, "pipeline")
+                    .and_then(Value::as_num)
+                    .unwrap_or(0.0) as u64;
+                decoded.push(Cmd::SetPipeline(pid));
+            }
+            "setBindGroup" => {
+                let idx = map_get(cmd, "index").and_then(Value::as_num).unwrap_or(0.0) as u32;
+                let g = map_get(cmd, "group").and_then(Value::as_num).unwrap_or(0.0) as u64;
+                decoded.push(Cmd::SetBindGroup {
+                    index: idx,
+                    group: g,
+                });
+            }
+            "dispatch" => {
+                let x = map_get(cmd, "x").and_then(Value::as_num).unwrap_or(1.0) as u32;
+                let y = map_get(cmd, "y").and_then(Value::as_num).unwrap_or(1.0) as u32;
+                let z = map_get(cmd, "z").and_then(Value::as_num).unwrap_or(1.0) as u32;
+                decoded.push(Cmd::Dispatch { x, y, z });
+            }
+            other => {
+                runtime_error(
+                    vm,
+                    &format!("ComputePass commands[{}]: unknown op '{}'.", i, other),
+                );
+                return;
+            }
+        }
+    }
+
+    let mut enc_reg = encoders().lock().unwrap();
+    let enc = match enc_reg.encoders.get_mut(&encoder_id) {
+        Some(e) => e,
+        None => {
+            drop(enc_reg);
+            runtime_error(vm, "ComputePass: unknown encoder id.");
+            return;
+        }
+    };
+    let encoder = match enc {
+        EncoderState::Open { encoder, .. } => encoder,
+        EncoderState::Finished { .. } => {
+            drop(enc_reg);
+            runtime_error(
+                vm,
+                "ComputePass: encoder already finished; create a new one.",
+            );
+            return;
+        }
+    };
+
+    let pipe_reg = compute_pipelines().lock().unwrap();
+    let bg_reg = bind_groups().lock().unwrap();
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        for cmd in &decoded {
+            match cmd {
+                Cmd::SetPipeline(pid) => {
+                    if let Some(p) = pipe_reg.pipelines.get(pid) {
+                        pass.set_pipeline(p);
+                    }
+                }
+                Cmd::SetBindGroup { index, group } => {
+                    if let Some(g) = bg_reg.groups.get(group) {
+                        pass.set_bind_group(*index, g, &[]);
+                    }
+                }
+                Cmd::Dispatch { x, y, z } => {
+                    pass.dispatch_workgroups(*x, *y, *z);
+                }
+            }
+        }
+        // pass dropped here, ending the compute pass
+    }
+
+    drop(bg_reg);
+    drop(pipe_reg);
+    drop(enc_reg);
+    set_return(vm, Value::NULL);
+}
+
 /// `encoder.copyTextureToBuffer(srcTextureId, dstBufferId, descriptor)`
 ///
 /// Descriptor:
@@ -3371,6 +3649,149 @@ pub unsafe extern "C" fn wlift_gpu_buffer_read_bytes(vm: *mut WrenVm) {
         let cur = slot(vm, 0);
         list_add(vm, cur, Value::num(b as f64));
     }
+}
+
+/// Map a MAP_READ buffer and copy its contents into the caller-
+/// supplied typed array. The typed array's byte length must equal
+/// the GPU buffer's byte length; partial reads aren't supported
+/// here so the bounds check is exact.
+///
+/// Used as the fast readback path for compute (1M-element + class
+/// workloads). The List-of-bytes variant above is fine for small
+/// textures but allocates one Wren Num per byte — at 4 MB the
+/// allocator dominates the wall-clock.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_buffer_read_into_typed_array(vm: *mut WrenVm) {
+    let buffer_id = match id_of(vm, slot(vm, 1), "Buffer.readInto") {
+        Some(i) => i,
+        None => return,
+    };
+    let target = slot(vm, 2);
+    let dst = match typed_array_bytes_mut(target) {
+        Some(s) => s,
+        None => {
+            runtime_error(
+                vm,
+                "Buffer.readInto: second argument must be a typed array.",
+            );
+            return;
+        }
+    };
+
+    let buf_reg = buffers().lock().unwrap();
+    let buf = match buf_reg.buffers.get(&buffer_id) {
+        Some(b) => b,
+        None => {
+            drop(buf_reg);
+            runtime_error(vm, "Buffer.readInto: unknown buffer id.");
+            return;
+        }
+    };
+    let dev_reg = devices().lock().unwrap();
+    let dev = match dev_reg.devices.get(&buf.device_id) {
+        Some(d) => d,
+        None => {
+            drop(dev_reg);
+            drop(buf_reg);
+            runtime_error(vm, "Buffer.readInto: device dropped.");
+            return;
+        }
+    };
+
+    let slice = buf.buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<(), wgpu::BufferAsyncError>>();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = sender.send(res);
+    });
+    dev.device.poll(wgpu::Maintain::Wait);
+    match receiver.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            drop(dev_reg);
+            drop(buf_reg);
+            runtime_error(vm, &format!("Buffer.readInto: map failed: {}", e));
+            return;
+        }
+        Err(e) => {
+            drop(dev_reg);
+            drop(buf_reg);
+            runtime_error(vm, &format!("Buffer.readInto: channel: {}", e));
+            return;
+        }
+    }
+    let data = slice.get_mapped_range();
+    if data.len() != dst.len() {
+        drop(data);
+        buf.buffer.unmap();
+        drop(dev_reg);
+        drop(buf_reg);
+        runtime_error(
+            vm,
+            "Buffer.readInto: typed array byte length doesn't match buffer.",
+        );
+        return;
+    }
+    dst.copy_from_slice(&data);
+    drop(data);
+    buf.buffer.unmap();
+    drop(dev_reg);
+    drop(buf_reg);
+    set_return(vm, Value::NULL);
+}
+
+/// `encoder.copyBufferToBuffer(srcId, dstId, srcOffset, dstOffset, size)`.
+/// Standard staging-buffer + compute-readback plumbing.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_gpu_encoder_copy_buffer_to_buffer(vm: *mut WrenVm) {
+    let encoder_id = match id_of(vm, slot(vm, 1), "CommandEncoder.copyBufferToBuffer") {
+        Some(i) => i,
+        None => return,
+    };
+    let src_id = match id_of(vm, slot(vm, 2), "CommandEncoder.copyBufferToBuffer") {
+        Some(i) => i,
+        None => return,
+    };
+    let dst_id = match id_of(vm, slot(vm, 3), "CommandEncoder.copyBufferToBuffer") {
+        Some(i) => i,
+        None => return,
+    };
+    let src_offset = slot(vm, 4).as_num().unwrap_or(0.0) as u64;
+    let dst_offset = slot(vm, 5).as_num().unwrap_or(0.0) as u64;
+    let size = slot(vm, 6).as_num().unwrap_or(0.0) as u64;
+
+    let mut enc_reg = encoders().lock().unwrap();
+    let buf_reg = buffers().lock().unwrap();
+    let enc = match enc_reg.encoders.get_mut(&encoder_id) {
+        Some(EncoderState::Open { encoder, .. }) => encoder,
+        _ => {
+            drop(buf_reg);
+            drop(enc_reg);
+            runtime_error(vm, "copyBufferToBuffer: encoder not in Open state.");
+            return;
+        }
+    };
+    let src = match buf_reg.buffers.get(&src_id) {
+        Some(b) => b,
+        None => {
+            drop(buf_reg);
+            drop(enc_reg);
+            runtime_error(vm, "copyBufferToBuffer: unknown source buffer id.");
+            return;
+        }
+    };
+    let dst = match buf_reg.buffers.get(&dst_id) {
+        Some(b) => b,
+        None => {
+            drop(buf_reg);
+            drop(enc_reg);
+            runtime_error(vm, "copyBufferToBuffer: unknown destination buffer id.");
+            return;
+        }
+    };
+    enc.copy_buffer_to_buffer(&src.buffer, src_offset, &dst.buffer, dst_offset, size);
+    drop(buf_reg);
+    drop(enc_reg);
+    set_return(vm, Value::NULL);
 }
 
 // ---------------------------------------------------------------------------
