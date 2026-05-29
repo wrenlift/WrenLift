@@ -1686,8 +1686,20 @@ System.print("fib(20) = %(result)  (%(whole).%(fracStr) ms)")
       }
       const promise = (async () => {
         const manifest = await parseHatchfileToml(hatchfileText);
+        // Dev loop: on localhost, bypass the persistent Cache
+        // Storage layer so freshly-published bundles (or local
+        // proxy edits) show up on reload without DevTools
+        // gymnastics. Production keeps `cache: true` for perf —
+        // registry URLs are version-pinned so cache hits are
+        // safe there. The in-memory `depsCache` above still
+        // coalesces within a page load.
+        const isLocalhost =
+          location.hostname === "localhost" ||
+          location.hostname === "127.0.0.1" ||
+          location.hostname === "[::1]";
         const deps = await resolveDepsFromManifest(manifest, {
           fetcher: proxiedFetcher,
+          cache: !isLocalhost,
         });
         depsCache = { hatchfileText, deps, inflight: null };
         return deps;

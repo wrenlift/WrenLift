@@ -23,10 +23,19 @@ import { createServer } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { stat, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 // Script lives at `wasm/serve.js`, so ROOT *is* `wasm/`.
 const ROOT = resolve(fileURLToPath(import.meta.url), "..");
 const PORT = Number(process.argv[2] ?? 8080);
+
+// Local hatch cache — proxy short-circuits any registry fetch
+// whose `<dir>-<ver>` matches a file here so dev iteration can
+// build a package locally + reload the browser without going
+// through publish + CDN. Disable by setting
+// `HATCH_LOCAL_CACHE_DISABLE=1`.
+const HATCH_CACHE_DIR = join(homedir(), ".hatch", "cache");
+const HATCH_LOCAL_CACHE = !process.env.HATCH_LOCAL_CACHE_DISABLE;
 
 // Hosts the dev-server proxy will forward to. The page is COEP
 // `require-corp`, which means cross-origin assets it loads must
@@ -90,12 +99,55 @@ function resolveRequest(urlPath) {
   // Otherwise the locally-served playground would fall back to
   // a stale tracked copy in `web/` whenever someone forgets to
   // re-sync after `wasm-pack build`.
-  if (urlPath === "/wlift_wasm.js" || urlPath === "/wlift_wasm_bg.wasm") {
+  if (
+    urlPath === "/wlift_wasm.js" ||
+    urlPath === "/wlift_wasm_bg.wasm" ||
+    urlPath === "/wlift_wasm_bg.simd128.wasm"
+  ) {
     return normalize(join(ROOT, "pkg", urlPath.slice(1)));
   }
   // Default: treat as relative to `web/` so `<script src="worker.js">`
   // and `<link href="style.css">` work without a leading `/web/`.
   return normalize(join(ROOT, "web", urlPath));
+}
+
+// Match registry release URLs like
+//   `…/releases/download/publish/hatch-game%400.3.6/hatch-game-0.3.6.hatch`
+// or the wasm-target variant
+//   `…/releases/download/publish/hatch-game%400.3.6/hatch-game-0.3.6-wasm32.hatch`
+// Returns the full stem (with `-wasm32` preserved) so callers can
+// cache the two targets side-by-side; the web runtime fetches the
+// `-wasm32` flavour because it can't decompress zstd, and that
+// variant has to come from a separate `wlift … --bundle-target
+// wasm32-unknown-unknown` build.
+function localCacheKeyForUrl(url) {
+  const m = url.match(
+    /\/releases\/download\/publish\/[^/]+\/([a-z0-9-]+-\d+\.\d+\.\d+(?:-wasm32)?)\.hatch$/,
+  );
+  return m ? m[1] : null;
+}
+
+async function tryServeFromLocalCache(url, res) {
+  if (!HATCH_LOCAL_CACHE) return false;
+  const key = localCacheKeyForUrl(url);
+  if (!key) return false;
+  const path = join(HATCH_CACHE_DIR, `${key}.hatch`);
+  try {
+    const body = await readFile(path);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Length", body.length);
+    res.setHeader("X-Served-By", `local-cache:${path}`);
+    res.end(body);
+    return true;
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.error(`local cache read failed for ${key}: ${err.message}`);
+    }
+    return false;
+  }
 }
 
 async function handleProxy(req, res) {
@@ -108,6 +160,12 @@ async function handleProxy(req, res) {
     res.statusCode = 400;
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.end("400 Bad Request: missing ?url=\n");
+    return;
+  }
+  // Local cache short-circuit. Lets dev iterate on a package
+  // (`hatch build … && cp … ~/.hatch/cache/…`) without going
+  // through publish + CDN.
+  if (await tryServeFromLocalCache(url, res)) {
     return;
   }
   if (!PROXY_ALLOW.some((prefix) => url.startsWith(prefix))) {
