@@ -211,12 +211,11 @@ Three deliberate gaps:
 
 1. **Retained widget tree.** Immediate mode handles HUDs and
    pause menus comfortably but breaks down for deep menu trees
-   with focus management, layout, and animations. The Godot
-   `Control` / PlayCanvas `Element` shape lands as a separate
-   package (`@hatch:menu`?) — declarative widget hierarchy, a
-   layout solver (likely flexbox-shaped), and lifecycle hooks
-   (`onMount`, `onUnmount`, `onUpdate`). HUD's immediate-mode
-   surface stays unchanged.
+   with focus management, layout, and animations. A separate
+   package (`@hatch:menu`?) lands the declarative shape —
+   widget hierarchy, layout solver (likely flexbox-shaped), and
+   lifecycle hooks (`onMount`, `onUnmount`, `onUpdate`). HUD's
+   immediate-mode surface stays unchanged.
 2. **Bitmap-font import.** `BitmapFont.fromImage(img, {
    glyphWidth, glyphHeight, first, cols })` so games with brand
    typography swap the built-in 5×7 default. Trivial layer on
