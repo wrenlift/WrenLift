@@ -1,0 +1,25 @@
+[package]
+name = "wlift_noise"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural noise primitives (Simplex / Perlin / Value + fractal Brownian motion) for WrenLift. Bundled into @hatch:noise as a cdylib so terrain generators, foliage scatter, weather systems, and texture authoring all sample from the same well-tested deterministic implementations."
+build = "build.rs"
+
+[lib]
+# `cdylib` for the host plugin loader (libloading dlopens the
+# `.dylib`/`.so`/`.dll`). `rlib` for the wasm build path that
+# statically links the plugin into `wlift_wasm` — wasm has no
+# dynamic-library loader, so plugins ship as Rust crates the
+# runtime crate links in directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Header-only ABI shim. No `wren_lift` dep — VM layout changes
+# can't reach plugin code; the host process exports
+# `wlift_plugin_*` via `#[no_mangle]` and the dynamic linker
+# resolves the plugin's externs at dlopen.
+wlift_abi = { path = "../../crates/wlift_abi" }
+# noise-rs gives us tested, deterministic, seeded implementations
+# of every algorithm we expose. `default-features = false` skips
+# the image / ImageBufImpl baggage we never use.
+noise = { version = "0.9", default-features = false }
