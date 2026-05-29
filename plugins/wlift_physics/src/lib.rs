@@ -170,14 +170,10 @@ mod d2 {
             // the compiler resolves to the right `CollisionEvent`
             // (the 2D and 3D rapier crates each export a distinct
             // one, brought in via the enclosing `use … prelude::*`).
-            let (collision_tx, collision_rx) =
-                std::sync::mpsc::channel::<CollisionEvent>();
+            let (collision_tx, collision_rx) = std::sync::mpsc::channel::<CollisionEvent>();
             let (contact_force_tx, _contact_force_rx) =
                 std::sync::mpsc::channel::<ContactForceEvent>();
-            let event_handler = ChannelEventCollector::new(
-                collision_tx,
-                contact_force_tx,
-            );
+            let event_handler = ChannelEventCollector::new(collision_tx, contact_force_tx);
 
             self.integration_parameters.dt = dt;
             self.physics_pipeline.step(
@@ -206,10 +202,9 @@ mod d2 {
                 let body_a = self.colliders.get(ch_a).and_then(|c| c.parent());
                 let body_b = self.colliders.get(ch_b).and_then(|c| c.parent());
                 if let (Some(ba), Some(bb)) = (body_a, body_b) {
-                    if let (Some(&ida), Some(&idb)) = (
-                        self.ids_by_handle.get(&ba),
-                        self.ids_by_handle.get(&bb),
-                    ) {
+                    if let (Some(&ida), Some(&idb)) =
+                        (self.ids_by_handle.get(&ba), self.ids_by_handle.get(&bb))
+                    {
                         self.contact_events.push((ida, idb, started));
                     }
                 }
@@ -348,14 +343,10 @@ mod d3 {
             // `std::sync::mpsc::Sender`s — explicitly typed so
             // the compiler resolves to the 3D `CollisionEvent`
             // brought in via the enclosing `use rapier3d::prelude::*`.
-            let (collision_tx, collision_rx) =
-                std::sync::mpsc::channel::<CollisionEvent>();
+            let (collision_tx, collision_rx) = std::sync::mpsc::channel::<CollisionEvent>();
             let (contact_force_tx, _contact_force_rx) =
                 std::sync::mpsc::channel::<ContactForceEvent>();
-            let event_handler = ChannelEventCollector::new(
-                collision_tx,
-                contact_force_tx,
-            );
+            let event_handler = ChannelEventCollector::new(collision_tx, contact_force_tx);
 
             self.integration_parameters.dt = dt;
             self.physics_pipeline.step(
@@ -388,10 +379,9 @@ mod d3 {
                 let body_a = self.colliders.get(ch_a).and_then(|c| c.parent());
                 let body_b = self.colliders.get(ch_b).and_then(|c| c.parent());
                 if let (Some(ba), Some(bb)) = (body_a, body_b) {
-                    if let (Some(&ida), Some(&idb)) = (
-                        self.ids_by_handle.get(&ba),
-                        self.ids_by_handle.get(&bb),
-                    ) {
+                    if let (Some(&ida), Some(&idb)) =
+                        (self.ids_by_handle.get(&ba), self.ids_by_handle.get(&bb))
+                    {
                         self.contact_events.push((ida, idb, started));
                     }
                 }
@@ -1186,10 +1176,7 @@ pub unsafe extern "C" fn wlift_physics_world3d_cast_ray(vm: *mut WrenVm) {
     // a `Point` (the change came when parry switched its 3D math
     // crate). Origin + dir are both Vectors; `point_at(toi)`
     // returns `origin + dir * toi` as a `Vector`.
-    let ray = Ray::new(
-        Vector::new(ox, oy, oz),
-        Vector::new(dx, dy, dz),
-    );
+    let ray = Ray::new(Vector::new(ox, oy, oz), Vector::new(dx, dy, dz));
     let hit = match qp.cast_ray_and_get_normal(&ray, max_toi, solid) {
         Some((collider_handle, intersection)) => {
             let body_id = world
@@ -1214,7 +1201,17 @@ pub unsafe extern "C" fn wlift_physics_world3d_cast_ray(vm: *mut WrenVm) {
     let nx = intersection.normal.x;
     let ny = intersection.normal.y;
     let nz = intersection.normal.z;
-    emit_raycast_hit_map(vm, body_id, hit_point.x, hit_point.y, hit_point.z, nx, ny, nz, toi as f64);
+    emit_raycast_hit_map(
+        vm,
+        body_id,
+        hit_point.x,
+        hit_point.y,
+        hit_point.z,
+        nx,
+        ny,
+        nz,
+        toi as f64,
+    );
 }
 
 #[no_mangle]
@@ -1250,10 +1247,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_cast_ray(vm: *mut WrenVm) {
         QueryFilter::default(),
     );
     // Same shape as the 3D path — `Ray::origin` is a `Vector`.
-    let ray = Ray::new(
-        Vector::new(ox, oy),
-        Vector::new(dx, dy),
-    );
+    let ray = Ray::new(Vector::new(ox, oy), Vector::new(dx, dy));
     let hit = match qp.cast_ray_and_get_normal(&ray, max_toi, solid) {
         Some((collider_handle, intersection)) => {
             let body_id = world
@@ -1277,8 +1271,17 @@ pub unsafe extern "C" fn wlift_physics_world2d_cast_ray(vm: *mut WrenVm) {
     let hit_point = ray.origin + ray.dir * toi;
     // 2D ray always reports `z = 0`; matches what `World2D` users
     // expect for the `point` field.
-    emit_raycast_hit_map(vm, body_id, hit_point.x, hit_point.y, 0.0,
-                         intersection.normal.x, intersection.normal.y, 0.0, toi as f64);
+    emit_raycast_hit_map(
+        vm,
+        body_id,
+        hit_point.x,
+        hit_point.y,
+        0.0,
+        intersection.normal.x,
+        intersection.normal.y,
+        0.0,
+        toi as f64,
+    );
 }
 
 // Build a Map { bodyId, point: [x,y,z], normal: [x,y,z], toi }
@@ -1288,8 +1291,12 @@ pub unsafe extern "C" fn wlift_physics_world2d_cast_ray(vm: *mut WrenVm) {
 unsafe fn emit_raycast_hit_map(
     vm: *mut WrenVm,
     body_id: u64,
-    px: f32, py: f32, pz: f32,
-    nx: f32, ny: f32, nz: f32,
+    px: f32,
+    py: f32,
+    pz: f32,
+    nx: f32,
+    ny: f32,
+    nz: f32,
     toi: f64,
 ) {
     let m = alloc_map(vm);

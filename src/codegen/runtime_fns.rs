@@ -512,16 +512,28 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
             )
         }
         9 => {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
                 args[8].to_bits(),
             )
         }
@@ -529,72 +541,203 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
             )
         }
         11 => {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
+                args[10].to_bits(),
             )
         }
         12 => {
             let f: extern "C" fn(
-                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
             ) -> u64 = std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
+                args[10].to_bits(),
+                args[11].to_bits(),
             )
         }
         13 => {
             let f: extern "C" fn(
-                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
             ) -> u64 = std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
+                args[10].to_bits(),
+                args[11].to_bits(),
                 args[12].to_bits(),
             )
         }
         14 => {
             let f: extern "C" fn(
-                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
             ) -> u64 = std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
-                args[12].to_bits(), args[13].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
+                args[10].to_bits(),
+                args[11].to_bits(),
+                args[12].to_bits(),
+                args[13].to_bits(),
             )
         }
         15 => {
             let f: extern "C" fn(
-                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
             ) -> u64 = std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
-                args[12].to_bits(), args[13].to_bits(), args[14].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
+                args[10].to_bits(),
+                args[11].to_bits(),
+                args[12].to_bits(),
+                args[13].to_bits(),
+                args[14].to_bits(),
             )
         }
         16 => {
             let f: extern "C" fn(
-                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
+                u64,
             ) -> u64 = std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
-                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
-                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
-                args[12].to_bits(), args[13].to_bits(), args[14].to_bits(), args[15].to_bits(),
+                args[0].to_bits(),
+                args[1].to_bits(),
+                args[2].to_bits(),
+                args[3].to_bits(),
+                args[4].to_bits(),
+                args[5].to_bits(),
+                args[6].to_bits(),
+                args[7].to_bits(),
+                args[8].to_bits(),
+                args[9].to_bits(),
+                args[10].to_bits(),
+                args[11].to_bits(),
+                args[12].to_bits(),
+                args[13].to_bits(),
+                args[14].to_bits(),
+                args[15].to_bits(),
             )
         }
         n => panic!(
