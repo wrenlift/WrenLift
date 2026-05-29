@@ -172,6 +172,82 @@ pub mod cl {
         builder.ins().bitcast(types::I64, MemFlags::new(), num)
     }
 
+    /// Emit a method dispatch through the `wren_call_*` runtime
+    /// helpers. Picks the matching fixed-arity `wren_call_N` for
+    /// 0..=8 user args, or routes through `wren_call_dynamic` with
+    /// a stack-allocated `[u64; n]` buffer for 9+.
+    ///
+    /// A bug-prone shape this consolidates: every call site that
+    /// branched on `args.len()` previously had its own `match`
+    /// plus a `_ => "wren_call_N"` fallback that silently
+    /// truncated higher-arity calls (the highest the table covered
+    /// was 8, the lowest was 4). The JIT'd function's signature
+    /// still expected the original arity, so the truncated args
+    /// arrived as garbage in slots N..real_arity — load-bearing
+    /// example: Renderer2D's
+    /// `drawSprite_(texture, x, y, w, h, u0, v0, u1, v1, r, g, b, a)`
+    /// (13 user args) lost `v1`/`r`/`g`/`b`/`a` on every call,
+    /// surfacing as `Float32Array[head + k] = px` writes hitting
+    /// null receivers.
+    fn emit_wren_call<G>(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut G,
+        receiver: Value,
+        method_val: Value,
+        args: &[Value],
+    ) -> Result<Value, String>
+    where
+        G: FnMut(
+                &mut dyn Module,
+                &mut FunctionBuilder,
+                &str,
+                usize,
+            ) -> Result<cranelift_codegen::ir::FuncRef, String>
+            + ?Sized,
+    {
+        if std::env::var_os("WLIFT_EMIT_WREN_CALL_TRACE").is_some() {
+            eprintln!(
+                "emit_wren_call: args.len()={} routing={}",
+                args.len(),
+                if args.len() > 8 { "wren_call_dynamic" } else { "wren_call_N" }
+            );
+        }
+        if args.len() > 8 {
+            let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
+            let slot = builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    (args.len() as u32) * 8,
+                    3, // 8-byte alignment (2^3)
+                ),
+            );
+            let buf_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+            for (i, &arg) in args.iter().enumerate() {
+                builder.ins().store(MemFlags::trusted(), arg, buf_ptr, (i as i32) * 8);
+            }
+            let count = builder.ins().iconst(types::I64, args.len() as i64);
+            let call = builder.ins().call(f, &[receiver, method_val, count, buf_ptr]);
+            return Ok(builder.inst_results(call)[0]);
+        }
+        let call_name = match args.len() {
+            0 => "wren_call_0",
+            1 => "wren_call_1",
+            2 => "wren_call_2",
+            3 => "wren_call_3",
+            4 => "wren_call_4",
+            5 => "wren_call_5",
+            6 => "wren_call_6",
+            7 => "wren_call_7",
+            _ => "wren_call_8",
+        };
+        let f = get_runtime_fn(module, builder, call_name, 2 + args.len())?;
+        let mut call_args = vec![receiver, method_val];
+        call_args.extend_from_slice(args);
+        let call = builder.ins().call(f, &call_args);
+        Ok(builder.inst_results(call)[0])
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit_method_call_slow<G>(
         interner: &Interner,
@@ -207,22 +283,7 @@ pub mod cl {
             }
             builder.ins().iconst(types::I64, method_bits as i64)
         };
-        let call_name = match args.len() {
-            0 => "wren_call_0",
-            1 => "wren_call_1",
-            2 => "wren_call_2",
-            3 => "wren_call_3",
-            4 => "wren_call_4",
-            5 => "wren_call_5",
-            6 => "wren_call_6",
-            7 => "wren_call_7",
-            _ => "wren_call_8",
-        };
-        let f = get_runtime_fn(module, builder, call_name, 2 + args.len().min(8))?;
-        let mut call_args = vec![receiver, method_val];
-        call_args.extend_from_slice(&args[..args.len().min(8)]);
-        let call = builder.ins().call(f, &call_args);
-        Ok(builder.inst_results(call)[0])
+        emit_wren_call(builder, module, get_runtime_fn, receiver, method_val, args)
     }
 
     fn emit_alloc_simd_vector<G>(
@@ -1664,6 +1725,7 @@ pub mod cl {
             "wren_call_6",
             "wren_call_7",
             "wren_call_8",
+            "wren_call_dynamic",
             "wren_load_jit_ptr",
             "wren_load_jit_closure",
             "wren_jit_roots_snapshot",
@@ -3952,34 +4014,55 @@ pub mod cl {
                                 // Pick the helper whose user-arg
                                 // count matches the call site. The
                                 // `wren_call_N` family ranges
-                                // 0..=8; clamp the higher end to
-                                // wren_call_8 so a future call-site
-                                // arity bump won't silently
-                                // truncate args. Keep arg_count in
-                                // sync with the chosen helper —
-                                // mismatched declarations land as a
-                                // Cranelift "incompatible signature"
-                                // module error.
-                                let user_arity = args.len().min(8);
-                                let call_name = match user_arity {
-                                    0 => "wren_call_0",
-                                    1 => "wren_call_1",
-                                    2 => "wren_call_2",
-                                    3 => "wren_call_3",
-                                    4 => "wren_call_4",
-                                    5 => "wren_call_5",
-                                    6 => "wren_call_6",
-                                    7 => "wren_call_7",
-                                    _ => "wren_call_8",
+                                // 0..=8; arity > 8 routes through
+                                // `wren_call_dynamic` with a
+                                // stack-allocated args buffer so we
+                                // never silently truncate (which
+                                // surfaced as `Float32Array[_]=:
+                                // value must be a number` on the
+                                // sprite-batch path).
+                                let slow_result = if args.len() > 8 {
+                                    let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
+                                    let slot = builder.create_sized_stack_slot(
+                                        cranelift_codegen::ir::StackSlotData::new(
+                                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                            (args.len() as u32) * 8,
+                                            3,
+                                        ),
+                                    );
+                                    let buf_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                                    for (i, a) in args.iter().enumerate() {
+                                        builder.ins().store(
+                                            MemFlags::trusted(),
+                                            get(a),
+                                            buf_ptr,
+                                            (i as i32) * 8,
+                                        );
+                                    }
+                                    let count = builder.ins().iconst(types::I64, args.len() as i64);
+                                    let call =
+                                        builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                                    builder.inst_results(call)[0]
+                                } else {
+                                    let call_name = match args.len() {
+                                        0 => "wren_call_0",
+                                        1 => "wren_call_1",
+                                        2 => "wren_call_2",
+                                        3 => "wren_call_3",
+                                        4 => "wren_call_4",
+                                        5 => "wren_call_5",
+                                        6 => "wren_call_6",
+                                        7 => "wren_call_7",
+                                        _ => "wren_call_8",
+                                    };
+                                    let f = get_runtime_fn(module, builder, call_name, 2 + args.len())?;
+                                    let mut slow_args = vec![r, method_val];
+                                    for a in args.iter() {
+                                        slow_args.push(get(a));
+                                    }
+                                    let slow_call = builder.ins().call(f, &slow_args);
+                                    builder.inst_results(slow_call)[0]
                                 };
-                                let arg_count = 2 + user_arity;
-                                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                                let mut slow_args = vec![r, method_val];
-                                for a in args.iter().take(8) {
-                                    slow_args.push(get(a));
-                                }
-                                let slow_call = builder.ins().call(f, &slow_args);
-                                let slow_result = builder.inst_results(slow_call)[0];
                                 builder
                                     .ins()
                                     .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4119,7 +4202,7 @@ pub mod cl {
                                             2 => "wren_known_call_2_nocheck",
                                             _ => "wren_known_call_3_nocheck",
                                         };
-                                        let fast_arg_count = 2 + args.len().min(3);
+                                        let fast_arg_count = 2 + args.len();
                                         let fast_f = get_runtime_fn(
                                             module,
                                             builder,
@@ -4127,7 +4210,7 @@ pub mod cl {
                                             fast_arg_count,
                                         )?;
                                         let mut fast_args = vec![fid_val, r];
-                                        for a in args.iter().take(3) {
+                                        for a in args.iter() {
                                             fast_args.push(get(a));
                                         }
                                         let fast_call = builder.ins().call(fast_f, &fast_args);
@@ -4153,25 +4236,20 @@ pub mod cl {
 
                             builder.switch_to_block(slow_block);
                             // No class matched — full dispatch
-                            // through wren_call_N.
+                            // through `emit_wren_call`, which picks
+                            // the right `wren_call_N` (0..=8) or
+                            // routes 9+ through `wren_call_dynamic`.
                             let method_bits = method.index() as u64;
                             let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                            let slow_name = match args.len() {
-                                0 => "wren_call_0",
-                                1 => "wren_call_1",
-                                2 => "wren_call_2",
-                                3 => "wren_call_3",
-                                _ => "wren_call_4",
-                            };
-                            let slow_arg_count = 2 + args.len().min(8);
-                            let slow_f =
-                                get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
-                            let mut slow_args = vec![r, method_val];
-                            for a in args.iter().take(8) {
-                                slow_args.push(get(a));
-                            }
-                            let slow_call = builder.ins().call(slow_f, &slow_args);
-                            let slow_result = builder.inst_results(slow_call)[0];
+                            let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                            let slow_result = emit_wren_call(
+                                builder,
+                                module,
+                                get_runtime_fn,
+                                r,
+                                method_val,
+                                &arg_vals,
+                            )?;
                             builder
                                 .ins()
                                 .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4243,21 +4321,15 @@ pub mod cl {
                             method_bits |= ((ic_idx as u64) + 1) << 32;
                         }
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                        let call_name = match args.len() {
-                            0 => "wren_call_0",
-                            1 => "wren_call_1",
-                            2 => "wren_call_2",
-                            3 => "wren_call_3",
-                            _ => "wren_call_4",
-                        };
-                        let arg_count = 2 + args.len().min(8);
-                        let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                        let mut slow_args = vec![r, method_val];
-                        for a in args.iter().take(8) {
-                            slow_args.push(get(a));
-                        }
-                        let slow_call = builder.ins().call(f, &slow_args);
-                        let slow_result = builder.inst_results(slow_call)[0];
+                        let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                        let slow_result = emit_wren_call(
+                            builder,
+                            module,
+                            get_runtime_fn,
+                            r,
+                            method_val,
+                            &arg_vals,
+                        )?;
                         builder
                             .ins()
                             .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4296,25 +4368,52 @@ pub mod cl {
                     }
                     builder.ins().iconst(types::I64, method_bits as i64)
                 };
-                let call_name = match args.len() {
-                    0 => "wren_call_0",
-                    1 => "wren_call_1",
-                    2 => "wren_call_2",
-                    3 => "wren_call_3",
-                    4 => "wren_call_4",
-                    5 => "wren_call_5",
-                    6 => "wren_call_6",
-                    7 => "wren_call_7",
-                    _ => "wren_call_8",
+                // Route arity > 8 through wren_call_dynamic to
+                // avoid the silent .min(8) truncation that
+                // corrupted Renderer2D's drawSprite_(receiver +
+                // 13 args) call frame.
+                let result_val = if args.len() > 8 {
+                    let f = get_runtime_fn(module, builder, "wren_call_dynamic", 4)?;
+                    let slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            (args.len() as u32) * 8,
+                            3,
+                        ),
+                    );
+                    let buf_ptr = builder.ins().stack_addr(types::I64, slot, 0);
+                    for (i, a) in args.iter().enumerate() {
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            get(a),
+                            buf_ptr,
+                            (i as i32) * 8,
+                        );
+                    }
+                    let count = builder.ins().iconst(types::I64, args.len() as i64);
+                    let call = builder.ins().call(f, &[r, method_val, count, buf_ptr]);
+                    builder.inst_results(call)[0]
+                } else {
+                    let call_name = match args.len() {
+                        0 => "wren_call_0",
+                        1 => "wren_call_1",
+                        2 => "wren_call_2",
+                        3 => "wren_call_3",
+                        4 => "wren_call_4",
+                        5 => "wren_call_5",
+                        6 => "wren_call_6",
+                        7 => "wren_call_7",
+                        _ => "wren_call_8",
+                    };
+                    let f = get_runtime_fn(module, builder, call_name, 2 + args.len())?;
+                    let mut call_args = vec![r, method_val];
+                    for a in args.iter() {
+                        call_args.push(get(a));
+                    }
+                    let result = builder.ins().call(f, &call_args);
+                    builder.inst_results(result)[0]
                 };
-                let arg_count = 2 + args.len().min(8);
-                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                let mut call_args = vec![r, method_val];
-                for a in args.iter().take(8) {
-                    call_args.push(get(a));
-                }
-                let result = builder.ins().call(f, &call_args);
-                Ok(Some(builder.inst_results(result)[0]))
+                Ok(Some(result_val))
             }
 
             // === Direct known-function call (devirtualized) ===
@@ -4327,16 +4426,11 @@ pub mod cl {
                 receiver,
                 args,
             } => {
-                // Same wren_call_N arity limit as Instruction::Call —
-                // the slow-path fallback inside this branch also
-                // truncates. Aligned to the wren_call_0..wren_call_8
-                // family.
-                if args.len() > 8 {
-                    return Err(format!(
-                        "CallKnownFunc with arity {} not supported by JIT (max 8)",
-                        args.len()
-                    ));
-                }
+                // High-arity fallbacks (>8 user args) route through
+                // `wren_call_dynamic` via `emit_wren_call`. The
+                // earlier hard-error here was load-bearing only for
+                // truncation safety; with the dynamic helper in
+                // place every call site is arity-correct.
                 let r = get(receiver);
 
                 // AOT mode: short-circuit every JIT-specific fast
@@ -4357,21 +4451,16 @@ pub mod cl {
                         base,
                         (slot as i32) * 8,
                     );
-                    let call_name = match args.len() {
-                        0 => "wren_call_0",
-                        1 => "wren_call_1",
-                        2 => "wren_call_2",
-                        3 => "wren_call_3",
-                        _ => "wren_call_4",
-                    };
-                    let arg_count = 2 + args.len().min(8);
-                    let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                    let mut call_args = vec![r, method_val];
-                    for a in args.iter().take(8) {
-                        call_args.push(get(a));
-                    }
-                    let result = builder.ins().call(f, &call_args);
-                    return Ok(Some(builder.inst_results(result)[0]));
+                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let result = emit_wren_call(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        r,
+                        method_val,
+                        &arg_vals,
+                    )?;
+                    return Ok(Some(result));
                 }
 
                 // === CHA-driven body inlining ===
@@ -4485,26 +4574,19 @@ pub mod cl {
                                 builder.ins().jump(slow_block, &[]);
                             }
 
-                            // Slow path: full dispatch through wren_call_N.
+                            // Slow path: full dispatch via emit_wren_call.
                             builder.switch_to_block(slow_block);
                             let method_bits = method.index() as u64;
                             let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                            let slow_name = match args.len() {
-                                0 => "wren_call_0",
-                                1 => "wren_call_1",
-                                2 => "wren_call_2",
-                                3 => "wren_call_3",
-                                _ => "wren_call_4",
-                            };
-                            let slow_arg_count = 2 + args.len().min(8);
-                            let slow_f =
-                                get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
-                            let mut slow_args = vec![r, method_val];
-                            for a in args.iter().take(8) {
-                                slow_args.push(get(a));
-                            }
-                            let slow_call = builder.ins().call(slow_f, &slow_args);
-                            let slow_result = builder.inst_results(slow_call)[0];
+                            let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                            let slow_result = emit_wren_call(
+                                builder,
+                                module,
+                                get_runtime_fn,
+                                r,
+                                method_val,
+                                &arg_vals,
+                            )?;
                             builder
                                 .ins()
                                 .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4592,25 +4674,19 @@ pub mod cl {
                             .ins()
                             .jump(merge_block, &[BlockArg::Value(fast_result)]);
 
-                        // Slow path: wren_call_N full dispatch.
+                        // Slow path: full dispatch via emit_wren_call.
                         builder.switch_to_block(slow_block);
                         let method_bits = method.index() as u64;
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                        let slow_name = match args.len() {
-                            0 => "wren_call_0",
-                            1 => "wren_call_1",
-                            2 => "wren_call_2",
-                            3 => "wren_call_3",
-                            _ => "wren_call_4",
-                        };
-                        let slow_arg_count = 2 + args.len().min(8);
-                        let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
-                        let mut slow_args = vec![r, method_val];
-                        for a in args.iter().take(8) {
-                            slow_args.push(get(a));
-                        }
-                        let slow_call = builder.ins().call(slow_f, &slow_args);
-                        let slow_result = builder.inst_results(slow_call)[0];
+                        let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                        let slow_result = emit_wren_call(
+                            builder,
+                            module,
+                            get_runtime_fn,
+                            r,
+                            method_val,
+                            &arg_vals,
+                        )?;
                         builder
                             .ins()
                             .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4655,25 +4731,19 @@ pub mod cl {
                         .ins()
                         .jump(merge_block, &[BlockArg::Value(field_val)]);
 
-                    // Slow path: class mismatch → wren_call_N.
+                    // Slow path: class mismatch → emit_wren_call.
                     builder.switch_to_block(slow_block);
                     let method_bits = method.index() as u64;
                     let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                    let slow_name = match args.len() {
-                        0 => "wren_call_0",
-                        1 => "wren_call_1",
-                        2 => "wren_call_2",
-                        3 => "wren_call_3",
-                        _ => "wren_call_4",
-                    };
-                    let slow_arg_count = 2 + args.len().min(8);
-                    let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
-                    let mut slow_args = vec![r, method_val];
-                    for a in args.iter().take(8) {
-                        slow_args.push(get(a));
-                    }
-                    let slow_call = builder.ins().call(slow_f, &slow_args);
-                    let slow_result = builder.inst_results(slow_call)[0];
+                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let slow_result = emit_wren_call(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        r,
+                        method_val,
+                        &arg_vals,
+                    )?;
                     builder
                         .ins()
                         .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4682,9 +4752,16 @@ pub mod cl {
                     return Ok(Some(builder.block_params(merge_block)[0]));
                 }
 
-                // Only inline-dispatch when we have a cached class pointer.
-                // Otherwise fall back to the slow helper.
-                if *expected_class != 0 && args.len() <= 4 {
+                // The cached-class fast path uses the `wren_known_call_N_nocheck`
+                // helpers, which only exist for N ∈ 0..=3. Higher-arity
+                // call sites must skip this branch entirely and fall
+                // through to `emit_wren_call` — otherwise the dispatch
+                // truncates args 4..N to whatever the helper signature
+                // expects, leaving the callee to read garbage. Hot
+                // example: Renderer2D's `pushVertex_(head, px, py, u, v,
+                // r, g, b, a)` (9 user args) had `u, v, r, g, b, a`
+                // silently dropped, surfacing as NaN sprite vertices.
+                if *expected_class != 0 && args.len() <= 3 {
                     let fast_block = builder.create_block();
                     let slow_block = builder.create_block();
                     let merge_block = builder.create_block();
@@ -4723,10 +4800,10 @@ pub mod cl {
                         2 => "wren_known_call_2_nocheck",
                         _ => "wren_known_call_3_nocheck",
                     };
-                    let fast_arg_count = 2 + args.len().min(3);
+                    let fast_arg_count = 2 + args.len();
                     let fast_f = get_runtime_fn(module, builder, fast_name, fast_arg_count)?;
                     let mut fast_args = vec![fid_val, r];
-                    for a in args.iter().take(3) {
+                    for a in args.iter() {
                         fast_args.push(get(a));
                     }
                     let fast_call = builder.ins().call(fast_f, &fast_args);
@@ -4735,25 +4812,19 @@ pub mod cl {
                         .ins()
                         .jump(merge_block, &[BlockArg::Value(fast_result)]);
 
-                    // Slow path: class mismatch → wren_call_N full dispatch.
+                    // Slow path: class mismatch → emit_wren_call.
                     builder.switch_to_block(slow_block);
                     let method_bits = method.index() as u64;
                     let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                    let slow_name = match args.len() {
-                        0 => "wren_call_0",
-                        1 => "wren_call_1",
-                        2 => "wren_call_2",
-                        3 => "wren_call_3",
-                        _ => "wren_call_4",
-                    };
-                    let slow_arg_count = 2 + args.len().min(8);
-                    let slow_f = get_runtime_fn(module, builder, slow_name, slow_arg_count)?;
-                    let mut slow_args = vec![r, method_val];
-                    for a in args.iter().take(8) {
-                        slow_args.push(get(a));
-                    }
-                    let slow_call = builder.ins().call(slow_f, &slow_args);
-                    let slow_result = builder.inst_results(slow_call)[0];
+                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let slow_result = emit_wren_call(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        r,
+                        method_val,
+                        &arg_vals,
+                    )?;
                     builder
                         .ins()
                         .jump(merge_block, &[BlockArg::Value(slow_result)]);
@@ -4762,23 +4833,44 @@ pub mod cl {
                     return Ok(Some(builder.block_params(merge_block)[0]));
                 }
 
-                // No cached class — just call the helper.
-                let packed = (*func_id as u64) | ((method.index() as u64) << 32);
-                let fid_val = builder.ins().iconst(types::I64, packed as i64);
-                let call_name = match args.len() {
-                    0 => "wren_known_call_0",
-                    1 => "wren_known_call_1",
-                    2 => "wren_known_call_2",
-                    _ => "wren_known_call_3",
-                };
-                let arg_count = 2 + args.len().min(3);
-                let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                let mut call_args = vec![fid_val, r];
-                for a in args.iter().take(3) {
-                    call_args.push(get(a));
+                // No cached class (or arity > 3): route through the
+                // generic method-dispatch helpers. `emit_wren_call`
+                // picks `wren_call_N` for 0..=8 and `wren_call_dynamic`
+                // for 9+. The packed func_id hint isn't usable here —
+                // `wren_known_call_N` only covers 0..=3 — and the
+                // generic dispatcher resolves the same target from
+                // the receiver's class anyway.
+                if args.len() <= 3 {
+                    let packed = (*func_id as u64) | ((method.index() as u64) << 32);
+                    let fid_val = builder.ins().iconst(types::I64, packed as i64);
+                    let call_name = match args.len() {
+                        0 => "wren_known_call_0",
+                        1 => "wren_known_call_1",
+                        2 => "wren_known_call_2",
+                        _ => "wren_known_call_3",
+                    };
+                    let arg_count = 2 + args.len();
+                    let f = get_runtime_fn(module, builder, call_name, arg_count)?;
+                    let mut call_args = vec![fid_val, r];
+                    for a in args.iter() {
+                        call_args.push(get(a));
+                    }
+                    let result = builder.ins().call(f, &call_args);
+                    Ok(Some(builder.inst_results(result)[0]))
+                } else {
+                    let method_bits = method.index() as u64;
+                    let method_val = builder.ins().iconst(types::I64, method_bits as i64);
+                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let result = emit_wren_call(
+                        builder,
+                        module,
+                        get_runtime_fn,
+                        r,
+                        method_val,
+                        &arg_vals,
+                    )?;
+                    Ok(Some(result))
                 }
-                let result = builder.ins().call(f, &call_args);
-                Ok(Some(builder.inst_results(result)[0]))
             }
 
             // === Super calls ===
@@ -5852,21 +5944,16 @@ pub mod cl {
                             base,
                             (slot as i32) * 8,
                         );
-                        let call_name = match args.len() {
-                            0 => "wren_call_0",
-                            1 => "wren_call_1",
-                            2 => "wren_call_2",
-                            3 => "wren_call_3",
-                            _ => "wren_call_4",
-                        };
-                        let arg_count = 2 + args.len().min(8);
-                        let f = get_runtime_fn(module, builder, call_name, arg_count)?;
-                        let mut call_args: Vec<Value> = vec![recv, method_val];
-                        for a in args.iter().take(8) {
-                            call_args.push(get(a));
-                        }
-                        let result = builder.ins().call(f, &call_args);
-                        return Ok(Some(builder.inst_results(result)[0]));
+                        let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                        let result = emit_wren_call(
+                            builder,
+                            module,
+                            get_runtime_fn,
+                            recv,
+                            method_val,
+                            &arg_vals,
+                        )?;
+                        return Ok(Some(result));
                     }
                 }
                 // In f64 mode: call inner function directly with f64 args

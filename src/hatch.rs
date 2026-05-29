@@ -1570,7 +1570,17 @@ fn merge_path_dependencies(
                 );
                 match (dep_section, existing) {
                     (Some(d), Some(e)) if d.kind == e.kind && d.data == e.data => {
-                        continue;
+                        // Diamond dedupe — keep one copy. Move
+                        // the outer's existing entry into this
+                        // dep's `new_modules` block so the merge
+                        // places it where the dep wanted it; the
+                        // first-installed position from the
+                        // earlier dep may sit *after* the current
+                        // dep's importing modules, which would
+                        // leave imports reading `null` at install
+                        // time. Falls through to the
+                        // `new_modules.push` below.
+                        manifest.modules.retain(|m| m != mod_name);
                     }
                     (Some(_), Some(_)) if mod_name.starts_with('@') && known_version_conflict => {
                         return Err(HatchError::Encode(format!(
@@ -1587,7 +1597,11 @@ fn merge_path_dependencies(
                             "hatch: dep '{}' bundled '{}'@{} with bytes that differ from another dep's copy — keeping the first-installed; rebuild upstream against a single wlift rev to silence",
                             dep_name, mod_name, dep_label
                         );
-                        continue;
+                        // Same rationale as the diamond branch
+                        // above: re-position so the bundled copy
+                        // (whichever bytes won) sits where the
+                        // current dep's import order needs it.
+                        manifest.modules.retain(|m| m != mod_name);
                     }
                     _ => {
                         return Err(HatchError::Encode(format!(

@@ -496,29 +496,112 @@ unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
                 args[6].to_bits(),
             )
         }
-        // 8 args = receiver + 7 user args. AOT-emitted method
-        // bodies declare their physical arity to match — anything
-        // wider than that is rare enough that no live spec hits it
-        // (the runtime helpers cap at `wren_call_8` regardless).
-        // Truncating to 4 here was what made
-        // `Render_.renderFullWithFrags(_,_,_,_,_,_,_)` silently
-        // dispatch with 4 args and read garbage for the rest — the
-        // template spec's 81/96 fails all fanned out from this one
-        // dropped path.
-        _ => {
+        // 8+ args. AOT-emitted method bodies declare their
+        // physical arity to match the call site. Each explicit
+        // arm below transmutes to an extern "C" fn with the
+        // matching signature so cranelift's calling-convention
+        // register-passing lines up — a `_` arm that drops to a
+        // smaller signature silently truncates higher arg slots
+        // and leaves them reading garbage in the JIT'd frame
+        // (the previous version capped at 8, so Renderer2D's
+        // `drawSprite_(texture, x, y, w, h, u0, v0, u1, v1, r, g,
+        // b, a)` saw garbage for `v1` through `a`, surfacing as
+        // `Float32Array[_]=: value must be a number` across
+        // every sprite-batch flush).
+        8 => {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(
-                args[0].to_bits(),
-                args[1].to_bits(),
-                args[2].to_bits(),
-                args[3].to_bits(),
-                args[4].to_bits(),
-                args[5].to_bits(),
-                args[6].to_bits(),
-                args[7].to_bits(),
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
             )
         }
+        9 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(),
+            )
+        }
+        10 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(),
+            )
+        }
+        11 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(),
+            )
+        }
+        12 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+            )
+        }
+        13 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+                args[12].to_bits(),
+            )
+        }
+        14 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+                args[12].to_bits(), args[13].to_bits(),
+            )
+        }
+        15 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+                args[12].to_bits(), args[13].to_bits(), args[14].to_bits(),
+            )
+        }
+        16 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                args[0].to_bits(), args[1].to_bits(), args[2].to_bits(), args[3].to_bits(),
+                args[4].to_bits(), args[5].to_bits(), args[6].to_bits(), args[7].to_bits(),
+                args[8].to_bits(), args[9].to_bits(), args[10].to_bits(), args[11].to_bits(),
+                args[12].to_bits(), args[13].to_bits(), args[14].to_bits(), args[15].to_bits(),
+            )
+        }
+        n => panic!(
+            "call_jit_cached: arity {} not in explicit table; extend the match arms up to {} \
+             (truncating to a smaller signature silently drops higher args)",
+            n, n
+        ),
     }
 }
 

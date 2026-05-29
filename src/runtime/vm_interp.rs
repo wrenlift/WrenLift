@@ -4609,10 +4609,76 @@ unsafe fn call_jit_fn(fn_ptr: *const u8, args: &[Value]) -> u64 {
                 std::mem::transmute(fn_ptr);
             f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7))
         }
-        _ => {
+        9 => {
             let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
                 std::mem::transmute(fn_ptr);
             f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8))
+        }
+        10 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9))
+        }
+        11 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10))
+        }
+        12 => {
+            let f: extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) -> u64 =
+                std::mem::transmute(fn_ptr);
+            f(b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10), b(11))
+        }
+        13 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10), b(11), b(12),
+            )
+        }
+        14 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10), b(11), b(12),
+                b(13),
+            )
+        }
+        15 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10), b(11), b(12),
+                b(13), b(14),
+            )
+        }
+        16 => {
+            let f: extern "C" fn(
+                u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            ) -> u64 = std::mem::transmute(fn_ptr);
+            f(
+                b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9), b(10), b(11), b(12),
+                b(13), b(14), b(15),
+            )
+        }
+        n => {
+            // Beyond the explicit arity table is a real bug shape:
+            // every prior `_` arm silently truncated to 9 args,
+            // leaving param slots 10..n uninitialised inside the
+            // JIT'd function's frame. The classic symptom was
+            // `Float32Array[_]=: value must be a number` from
+            // Renderer2D's sprite-batch writes where the dropped
+            // u/v/colour args read as garbage. Abort here loudly
+            // so a new high-arity Wren method surfaces this gap at
+            // first JIT call instead of producing NaN downstream.
+            panic!(
+                "call_jit_fn: arity {} not in explicit table; extend the match arms up to {} \
+                 (truncating to the first 9 args was the original bug — silent argument drop)",
+                n, n
+            );
         }
     }
 }
