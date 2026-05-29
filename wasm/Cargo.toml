@@ -38,7 +38,10 @@ toml = "0.8"
 # have no default features to opt out of — the `host` feature flag
 # that used to gate the `wren_lift` Rust internals is gone.
 wlift_image   = { path = "../plugins/wlift_image" }
-wlift_physics = { path = "../plugins/wlift_physics" }
+# `default-features = false` drops rapier's rayon-backed parallel
+# solver — rayon spawns std threads, which doesn't compile to
+# `wasm32-unknown-unknown`. Browser physics stays scalar.
+wlift_physics = { path = "../plugins/wlift_physics", default-features = false }
 wlift_sqlite  = { path = "../plugins/wlift_sqlite" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

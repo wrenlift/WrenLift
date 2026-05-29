@@ -3937,6 +3937,7 @@ dependencies = [
  "ordered-float",
  "parry2d",
  "profiling",
+ "rayon",
  "rustc-hash 2.1.1",
  "simba",
  "static_assertions",
@@ -3964,6 +3965,7 @@ dependencies = [
  "ordered-float",
  "parry3d",
  "profiling",
+ "rayon",
  "rustc-hash 2.1.1",
  "simba",
  "static_assertions",
@@ -6567,7 +6569,7 @@ dependencies = [
 
 [[package]]
 name = "wlift_gpu"
-version = "0.2.12"
+version = "0.2.14"
 dependencies = [
  "bytemuck",
  "log",

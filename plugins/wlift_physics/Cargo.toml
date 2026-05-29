@@ -13,6 +13,14 @@ build = "build.rs"
 # runtime crate links in directly.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# `parallel` flips on rapier's rayon-backed island solver. Default
+# on for host targets; the wasm crate opts out via
+# `default-features = false` (rayon's std-thread spawn doesn't
+# compile to `wasm32-unknown-unknown`).
+default  = ["parallel"]
+parallel = ["rapier2d/parallel", "rapier3d/parallel"]
+
 [dependencies]
 # Only the header-only `wlift_abi` crate on the plugin side. No
 # `wren_lift` dep — VM/Gc/Obj* layout changes can't reach plugin

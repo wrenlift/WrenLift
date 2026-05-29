@@ -1466,6 +1466,12 @@ pub unsafe extern "C" fn wlift_gpu_sampler_create(vm: *mut WrenVm) {
         .map(|s| address_mode_from_str(&s))
         .unwrap_or(wgpu::AddressMode::ClampToEdge);
     let label = map_get(desc, "label").and_then(string_of);
+    // Comparison samplers do PCF in hardware — required for shadow
+    // maps where the fragment shader's `textureSampleCompare` /
+    // `textureSampleCompareLevel` expects a comparison sampler.
+    let compare = map_get(desc, "compare")
+        .and_then(string_of)
+        .and_then(|s| Some(compare_from_str(&s)));
 
     let sampler = {
         let reg = devices().lock().unwrap();
@@ -1484,6 +1490,7 @@ pub unsafe extern "C" fn wlift_gpu_sampler_create(vm: *mut WrenVm) {
             mag_filter: mag,
             min_filter: min,
             mipmap_filter: mip,
+            compare,
             ..Default::default()
         })
     };
@@ -1576,7 +1583,19 @@ unsafe fn binding_type_from_entry(vm: *mut WrenVm, entry: Value) -> Option<wgpu:
             has_dynamic_offset: false,
             min_binding_size: None,
         },
-        "sampler" => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        "sampler" => {
+            // `"samplerType"` distinguishes a filtering sampler (default)
+            // from a comparison sampler (used by `textureSampleCompare`
+            // for hardware-PCF shadow lookups). Two keys keep the
+            // descriptor backwards-compatible — passes that don't set
+            // `samplerType` get the filtering binding as before.
+            let st = match map_get(entry, "samplerType").and_then(string_of) {
+                Some(s) if s == "comparison" => wgpu::SamplerBindingType::Comparison,
+                Some(s) if s == "non-filtering" => wgpu::SamplerBindingType::NonFiltering,
+                _ => wgpu::SamplerBindingType::Filtering,
+            };
+            wgpu::BindingType::Sampler(st)
+        }
         "texture" => {
             let sample_type = match map_get(entry, "sampleType").and_then(string_of) {
                 Some(s) if s == "depth" => wgpu::TextureSampleType::Depth,
@@ -2051,7 +2070,12 @@ pub unsafe extern "C" fn wlift_gpu_bind_group_destroy(vm: *mut WrenVm) {
 //       "module":     shaderId,
 //       "entryPoint": String,
 //       "targets": [
-//         { "format": String, "blend"?: { ... }, "writeMask"?: Num },
+//         { "format": String,
+//           "blend"?: "alpha" | "additive" | "premultiplied" |
+//                     { "color": { "srcFactor": "...", "dstFactor": "...",
+//                                  "operation": "add" | "subtract" | ... },
+//                       "alpha"?: { same as color } },
+//           "writeMask"?: Num },
 //         ...
 //       ]
 //     },
@@ -2114,6 +2138,96 @@ fn compare_from_str(s: &str) -> wgpu::CompareFunction {
         "greater-equal" => C::GreaterEqual,
         _ => C::Always,
     }
+}
+
+fn blend_factor_from_str(s: &str) -> Option<wgpu::BlendFactor> {
+    use wgpu::BlendFactor as F;
+    Some(match s {
+        "zero" => F::Zero,
+        "one" => F::One,
+        "src" | "src-color" => F::Src,
+        "one-minus-src" | "one-minus-src-color" => F::OneMinusSrc,
+        "src-alpha" => F::SrcAlpha,
+        "one-minus-src-alpha" => F::OneMinusSrcAlpha,
+        "dst" | "dst-color" => F::Dst,
+        "one-minus-dst" | "one-minus-dst-color" => F::OneMinusDst,
+        "dst-alpha" => F::DstAlpha,
+        "one-minus-dst-alpha" => F::OneMinusDstAlpha,
+        "src-alpha-saturated" => F::SrcAlphaSaturated,
+        "constant" => F::Constant,
+        "one-minus-constant" => F::OneMinusConstant,
+        _ => return None,
+    })
+}
+
+fn blend_op_from_str(s: &str) -> Option<wgpu::BlendOperation> {
+    use wgpu::BlendOperation as O;
+    Some(match s {
+        "add" => O::Add,
+        "subtract" => O::Subtract,
+        "reverse-subtract" => O::ReverseSubtract,
+        "min" => O::Min,
+        "max" => O::Max,
+        _ => return None,
+    })
+}
+
+// Parse a `{ "srcFactor", "dstFactor", "operation" }` sub-block
+// into `wgpu::BlendComponent`. Missing keys fall back to the
+// alpha-blend default (src=one, dst=zero, op=add) so a half-filled
+// blend Map produces predictable behaviour rather than a panic.
+fn blend_component_from_map(v: Value) -> wgpu::BlendComponent {
+    let src = map_get(v, "srcFactor")
+        .and_then(string_of)
+        .and_then(|s| blend_factor_from_str(&s))
+        .unwrap_or(wgpu::BlendFactor::One);
+    let dst = map_get(v, "dstFactor")
+        .and_then(string_of)
+        .and_then(|s| blend_factor_from_str(&s))
+        .unwrap_or(wgpu::BlendFactor::Zero);
+    let op = map_get(v, "operation")
+        .and_then(string_of)
+        .and_then(|s| blend_op_from_str(&s))
+        .unwrap_or(wgpu::BlendOperation::Add);
+    wgpu::BlendComponent {
+        src_factor: src,
+        dst_factor: dst,
+        operation: op,
+    }
+}
+
+// Parse the optional `"blend"` key on a target descriptor. Two
+// shapes accepted:
+//   - String: `"alpha"` | `"additive"` | `"premultiplied"`
+//     (shorthand for the common presets)
+//   - Map:    `{ "color": { ... }, "alpha": { ... } }` with
+//     explicit `srcFactor` / `dstFactor` / `operation` sub-keys
+fn blend_state_from_value(v: Value) -> Option<wgpu::BlendState> {
+    if let Some(s) = string_of(v) {
+        return Some(match s.as_str() {
+            "alpha" => wgpu::BlendState::ALPHA_BLENDING,
+            "premultiplied" => wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            "additive" => wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::One,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            "replace" | "none" => return None,
+            _ => return None,
+        });
+    }
+    let color = map_get(v, "color").map(blend_component_from_map)?;
+    let alpha = map_get(v, "alpha")
+        .map(blend_component_from_map)
+        .unwrap_or(color);
+    Some(wgpu::BlendState { color, alpha })
 }
 
 #[no_mangle]
@@ -2345,9 +2459,10 @@ pub unsafe extern "C" fn wlift_gpu_render_pipeline_create(vm: *mut WrenVm) {
                     return;
                 }
             };
+            let blend = map_get(t, "blend").and_then(blend_state_from_value);
             targets.push(Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                blend,
                 write_mask: wgpu::ColorWrites::ALL,
             }));
         }
