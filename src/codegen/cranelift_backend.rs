@@ -4241,7 +4241,7 @@ pub mod cl {
                             // routes 9+ through `wren_call_dynamic`.
                             let method_bits = method.index() as u64;
                             let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                            let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                            let arg_vals: Vec<_> = args.iter().map(&get).collect();
                             let slow_result = emit_wren_call(
                                 builder,
                                 module,
@@ -4321,7 +4321,7 @@ pub mod cl {
                             method_bits |= ((ic_idx as u64) + 1) << 32;
                         }
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                        let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                        let arg_vals: Vec<_> = args.iter().map(&get).collect();
                         let slow_result = emit_wren_call(
                             builder,
                             module,
@@ -4451,7 +4451,7 @@ pub mod cl {
                         base,
                         (slot as i32) * 8,
                     );
-                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
                     let result = emit_wren_call(
                         builder,
                         module,
@@ -4578,7 +4578,7 @@ pub mod cl {
                             builder.switch_to_block(slow_block);
                             let method_bits = method.index() as u64;
                             let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                            let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                            let arg_vals: Vec<_> = args.iter().map(&get).collect();
                             let slow_result = emit_wren_call(
                                 builder,
                                 module,
@@ -4678,7 +4678,7 @@ pub mod cl {
                         builder.switch_to_block(slow_block);
                         let method_bits = method.index() as u64;
                         let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                        let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                        let arg_vals: Vec<_> = args.iter().map(&get).collect();
                         let slow_result = emit_wren_call(
                             builder,
                             module,
@@ -4735,7 +4735,7 @@ pub mod cl {
                     builder.switch_to_block(slow_block);
                     let method_bits = method.index() as u64;
                     let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
                     let slow_result = emit_wren_call(
                         builder,
                         module,
@@ -4816,7 +4816,7 @@ pub mod cl {
                     builder.switch_to_block(slow_block);
                     let method_bits = method.index() as u64;
                     let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
                     let slow_result = emit_wren_call(
                         builder,
                         module,
@@ -4860,7 +4860,7 @@ pub mod cl {
                 } else {
                     let method_bits = method.index() as u64;
                     let method_val = builder.ins().iconst(types::I64, method_bits as i64);
-                    let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                    let arg_vals: Vec<_> = args.iter().map(&get).collect();
                     let result = emit_wren_call(
                         builder,
                         module,
@@ -5944,7 +5944,7 @@ pub mod cl {
                             base,
                             (slot as i32) * 8,
                         );
-                        let arg_vals: Vec<_> = args.iter().map(|a| get(a)).collect();
+                        let arg_vals: Vec<_> = args.iter().map(&get).collect();
                         let result = emit_wren_call(
                             builder,
                             module,

@@ -1471,7 +1471,7 @@ pub unsafe extern "C" fn wlift_gpu_sampler_create(vm: *mut WrenVm) {
     // `textureSampleCompareLevel` expects a comparison sampler.
     let compare = map_get(desc, "compare")
         .and_then(string_of)
-        .and_then(|s| Some(compare_from_str(&s)));
+        .map(|s| compare_from_str(&s));
 
     let sampler = {
         let reg = devices().lock().unwrap();

@@ -1284,6 +1284,7 @@ pub unsafe extern "C" fn wlift_physics_world2d_cast_ray(vm: *mut WrenVm) {
 // Build a Map { bodyId, point: [x,y,z], normal: [x,y,z], toi }
 // and return it as slot 0. Factored to share the GC-rooted Map
 // build between the 2D and 3D paths.
+#[allow(clippy::too_many_arguments)]
 unsafe fn emit_raycast_hit_map(
     vm: *mut WrenVm,
     body_id: u64,
