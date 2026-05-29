@@ -196,6 +196,40 @@ flat. Three deliberate gaps:
    variant that needs it), keyed off a small cache of
    pre-compiled pipelines per blend mode.
 
+### HUD — retained widgets, bitmap-font import, gamepad nav
+
+`@hatch:hud` ships an immediate-mode HUD overlay: `HUD.new(g)` then
+`hud.label / hud.rect / hud.border / hud.button`. Renders through
+the existing `Renderer2D` sprite batch (now with alpha blending, so
+font glyphs + transparent UI panels composite correctly). Built-in
+5×7 procedural font covers digits, uppercase, and 11 punctuation
+characters — enough for the canonical HUD label set without
+shipping a font asset. Hover / click state is tracked per widget
+across frames via `id = "%(x):%(y):%(text)"`.
+
+Three deliberate gaps:
+
+1. **Retained widget tree.** Immediate mode handles HUDs and
+   pause menus comfortably but breaks down for deep menu trees
+   with focus management, layout, and animations. The Godot
+   `Control` / PlayCanvas `Element` shape lands as a separate
+   package (`@hatch:menu`?) — declarative widget hierarchy, a
+   layout solver (likely flexbox-shaped), and lifecycle hooks
+   (`onMount`, `onUnmount`, `onUpdate`). HUD's immediate-mode
+   surface stays unchanged.
+2. **Bitmap-font import.** `BitmapFont.fromImage(img, {
+   glyphWidth, glyphHeight, first, cols })` so games with brand
+   typography swap the built-in 5×7 default. Trivial layer on
+   top of Renderer2D's `drawSpriteUV` — each glyph is one UV
+   slice into a font atlas image. Pairs with `@hatch:image` for
+   loading.
+3. **Gamepad navigation.** Plumb a focus pointer through
+   registered widgets so D-pad / left-stick selection drives the
+   same code that mouse clicks do. Needs button registration to
+   record widget order per frame, plus a focus state on `HUD`
+   (separate from the existing hover state). The window plugin
+   already surfaces gamepad events; this is HUD-side wiring.
+
 ### Shadows — cascades, point/spot, depth-convention audit
 
 `@hatch:gpu/Renderer3D` now ships directional-light shadow mapping:
