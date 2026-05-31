@@ -753,31 +753,30 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             }
         }
         krio_fiber::FiberStep::Done => {
-            // The body stashed the closure's last-expression value
-            // into krio_return_value just before exiting; surface
-            // it as the return of this Fiber.call(_).
+            // Wren semantics:
+            //   - Fiber.call() returns the body's last-expression value.
+            //   - Fiber.try()  returns null on clean exit, the abort
+            //                  message on Fiber.abort() / runtime error.
             //
-            // Try-fiber abort path: when the body called
-            // Fiber.abort or hit a runtime error, vm_interp.rs's
-            // try-handling (line ~2418) parked the message on
-            // `(*fiber).error` and returned `Ok(err_val)` from
-            // run_fiber. The krio body forwards that into
-            // `krio_return_value`, so the normal `stored` read
-            // picks it up. The `(*target).error` fallback covers
-            // the case where the body aborted but the err value
-            // didn't propagate through run_fiber's Result (e.g.
-            // an error path that returned `Ok(Value::null())` or
-            // `Err` with the message parked elsewhere) — Wren
-            // callers expect `f.try()` to return the same string
-            // they see in `f.error`.
+            // Both routes funnel through this Done arm. Previously the
+            // arm returned `krio_return_value` unconditionally, so
+            // `Fiber.try { 42 }` returned 42 instead of null and any
+            // user `Fiber.try { instance.method() }` leaked the
+            // method's last expression as if it were an abort message.
+            // The procedural-world demo hit this every frame — the
+            // framework's `Fiber.new { instance.draw(g) }.try()` saw
+            // whatever draw() last computed.
+            //
+            // Fix: gate on `(*target).is_try`. Clean exit + try ⇒ null;
+            // clean exit + call ⇒ the body's value; aborted (error
+            // slot populated) ⇒ the error message either way.
+            let err = unsafe { (*target).error };
             let stored = unsafe { (*target).krio_return_value };
-            let v = if stored.is_null() {
-                let err = unsafe { (*target).error };
-                if !err.is_null() {
-                    err
-                } else {
-                    stored
-                }
+            let is_try = unsafe { (*target).is_try };
+            let v = if !err.is_null() {
+                err
+            } else if is_try {
+                Value::null()
             } else {
                 stored
             };
@@ -794,6 +793,7 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             unsafe {
                 release_fiber_resources(target, FiberState::Done);
                 (*target).krio_return_value = Value::null();
+                (*target).is_try = false;
             }
             v
         }

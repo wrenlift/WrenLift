@@ -609,7 +609,8 @@ fn try_enter_loop_osr(
             unsafe {
                 (*live_fiber).caller = std::ptr::null_mut();
             }
-            resume_caller(vm, caller, result);
+            let resume_val = unsafe { try_clean_return_value(live_fiber, result) };
+            resume_caller(vm, caller, resume_val);
             return Ok(OsrTransfer::ContinueFiberLoop);
         }
         return Ok(OsrTransfer::Return(result));
@@ -1117,7 +1118,8 @@ fn run_fiber_with_stop_depth(
                     unsafe {
                         (*fiber).caller = std::ptr::null_mut();
                     }
-                    resume_caller(vm, caller, return_val);
+                    let resume_val = unsafe { try_clean_return_value(fiber, return_val) };
+                    resume_caller(vm, caller, resume_val);
                     continue 'fiber_loop;
                 }
                 return Ok(return_val);
@@ -1159,7 +1161,8 @@ fn run_fiber_with_stop_depth(
                     unsafe {
                         (*fiber).caller = std::ptr::null_mut();
                     }
-                    resume_caller(vm, caller, return_val);
+                    let resume_val = unsafe { try_clean_return_value(fiber, return_val) };
+                    resume_caller(vm, caller, resume_val);
                     continue 'fiber_loop;
                 }
                 return Ok(return_val);
@@ -3574,7 +3577,8 @@ fn run_fiber_with_stop_depth(
                         let caller = unsafe { (*fiber).caller };
                         if !caller.is_null() {
                             unsafe { (*fiber).caller = std::ptr::null_mut() };
-                            resume_caller(vm, caller, return_val);
+                            let resume_val = unsafe { try_clean_return_value(fiber, return_val) };
+                            resume_caller(vm, caller, resume_val);
                             continue 'fiber_loop;
                         }
                         return Ok(return_val);
@@ -4861,6 +4865,26 @@ pub unsafe fn route_method_error_through_fiber_try(
             resume_caller(vm, caller, err_val);
         }
         Some(err_val)
+    }
+}
+
+/// Wren `Fiber.try()` returns null on clean exit (the body's
+/// return value is intentionally discarded). When a fiber that was
+/// started via `try` reaches its clean-return resume point, we
+/// substitute null for whatever the body produced; aborts already
+/// take a different code path that surfaces the error message.
+/// Caller passes the CHILD fiber so we can read its `is_try`; the
+/// flag is consumed and cleared in the same step so a subsequent
+/// reuse of the fiber object doesn't carry stale state.
+#[inline]
+unsafe fn try_clean_return_value(fiber: *mut ObjFiber, body_return: Value) -> Value {
+    unsafe {
+        if (*fiber).is_try {
+            (*fiber).is_try = false;
+            Value::null()
+        } else {
+            body_return
+        }
     }
 }
 

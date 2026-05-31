@@ -1773,7 +1773,30 @@ pub fn lower_module_with_known_classes(
                             .enumerate()
                             .map(|(i, n)| (interner.intern(n), i as u16))
                             .collect(),
-                        None => HashMap::new(),
+                        None => {
+                            // Silent miscompile guard. Falling back to an
+                            // empty parent map lets the subclass start
+                            // its field indexing at 0, which then aliases
+                            // with the base class's slot 0 — observed in
+                            // @hatch:postfx where Tonemap's `_exposure`
+                            // stomped PostPass's `_pipelines`. Bail loud
+                            // so consumers know they have a compile-order
+                            // problem (parent module must compile before
+                            // subclass module).
+                            panic!(
+                                "class `{}` extends `{}`, but `{}`'s field \
+                                 layout is not yet registered. Compile the \
+                                 module that defines `{}` before the \
+                                 module that contains `{}`. Known classes: \
+                                 {:?}",
+                                interner.resolve(decl.name.0),
+                                sc_name,
+                                sc_name,
+                                sc_name,
+                                interner.resolve(decl.name.0),
+                                known_classes.keys().collect::<Vec<_>>(),
+                            );
+                        }
                     }
                 }
             } else {

@@ -1035,6 +1035,13 @@ pub fn current_runtime_target() -> &'static str {
 struct BuildState {
     active: std::collections::HashSet<std::path::PathBuf>,
     cache: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+    /// Class name → ordered field-name vector, accumulated across
+    /// every package compiled during this build session. The MIR
+    /// builder reads it via `vm.field_layouts` to resolve cross-
+    /// module superclass references — without it, a subclass in
+    /// package B that extends a class declared in package A starts
+    /// its own fields at slot 0 and collides with A's layout.
+    class_field_layouts: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Internal recursive variant. Distinguishes a true cycle (`a → b →
@@ -1073,6 +1080,32 @@ fn build_recursive(
     // import slots.
     topo_sort_wren_files_by_imports(&mut wren_files);
 
+    // Pre-build path dependencies so their class field layouts flow
+    // into our compile VM via `state.class_field_layouts`. Without
+    // this, a class in this package that extends a class declared
+    // in a path-dep package would see an empty known_classes map at
+    // MIR-build time and start its field indexing at slot 0,
+    // colliding with the parent's slots at runtime. We read the
+    // manifest early just enough to pick up dep paths; the full
+    // manifest read + section merge still happens later in
+    // `merge_path_dependencies` (cheap since `state.cache` memoises
+    // the bytes).
+    if let Ok(text) = std::fs::read_to_string(root.join(HATCHFILE)) {
+        if let Ok(early_manifest) = toml::from_str::<Manifest>(&text) {
+            for (_dep_name, dep) in &early_manifest.dependencies {
+                if let Dependency::Path { path, .. } = dep {
+                    let dep_root = root.join(path);
+                    // Ignore failures here — `merge_path_dependencies`
+                    // will surface a clean error when it tries the
+                    // same path again. We only need the layout
+                    // harvest to flow into `state` on the happy
+                    // path so the upcoming compile sees parents.
+                    let _ = build_recursive(&dep_root, state, cache_dir, target);
+                }
+            }
+        }
+    }
+
     // Compile each to a .wlbc section.
     let mut sections: Vec<Section> = Vec::with_capacity(wren_files.len());
     let mut module_names: Vec<String> = Vec::with_capacity(wren_files.len());
@@ -1082,6 +1115,27 @@ fn build_recursive(
     // re-parsing the source at boot.
     let mut module_docs: Vec<crate::docs::ModuleDoc> = Vec::with_capacity(wren_files.len());
 
+    // Shared compile VM. Lives across the topo-sorted loop so each
+    // module's class field layouts (`vm.field_layouts`) accumulate
+    // and become visible to subsequent modules' compiles. We also
+    // seed it from `state.class_field_layouts`, which carries layouts
+    // produced by earlier `build_recursive` calls for dep packages —
+    // so a subclass in this package can resolve a parent class from
+    // an already-built dep without seeing an empty known_classes
+    // map (which used to silently miscompile its field indices
+    // starting at 0 and collide with the parent's slots).
+    //
+    // The per-compile interner is still local: `compile_source_to_blob`
+    // builds its own from the parse result, so SymbolIds don't leak
+    // across module boundaries. Only the field-layout side-table
+    // (class name → field-name vector) is genuinely cross-module.
+    let mut compile_vm = crate::runtime::vm::VM::new_default();
+    for (cls, layout) in &state.class_field_layouts {
+        compile_vm
+            .field_layouts
+            .insert(cls.clone(), layout.clone());
+    }
+
     for (module_name, path) in &wren_files {
         let raw_source = std::fs::read_to_string(path)?;
         // Apply target-conditional attributes (`#!wasm`, `#!native`)
@@ -1089,11 +1143,7 @@ fn build_recursive(
         // gated to a non-matching target get elided; everything
         // else passes through verbatim.
         let source = crate::parse::cfg::apply(&raw_source, target);
-        // Fresh VM per compile so interners don't leak across modules.
-        // Compilation is cheap and stateless here; the VM's runtime
-        // state (modules registered, classes allocated) is never used.
-        let mut vm = crate::runtime::vm::VM::new_default();
-        let blob = vm.compile_source_to_blob(&source).map_err(|_| {
+        let blob = compile_vm.compile_source_to_blob(&source).map_err(|_| {
             HatchError::Encode(format!(
                 "compile of {} failed (see diagnostics on stderr)",
                 path.display()
@@ -1184,6 +1234,14 @@ fn build_recursive(
 
     let hatch = Hatch { manifest, sections };
     let bytes = emit(&hatch)?;
+    // Harvest class field layouts produced by this package's compile
+    // back into the build state so a downstream consumer (e.g. a
+    // workspace demo that imports this dep) sees the parent classes
+    // when its own modules compile. Without this, subclasses across
+    // package boundaries silently mis-lay their fields.
+    for (cls, layout) in compile_vm.field_layouts.drain() {
+        state.class_field_layouts.insert(cls, layout);
+    }
     // Pop from the active recursion stack and cache the encoded
     // bytes so a diamond revisit (`a → b → c` plus `a → c`) returns
     // these same bytes without rebuilding.
