@@ -134,6 +134,7 @@ enum EventRecord {
     MouseMoved { x: f64, y: f64 },
     MouseDown { button: String },
     MouseUp { button: String },
+    MouseWheel { dx: f64, dy: f64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -163,9 +164,22 @@ impl PumpHandler {
     fn drain_pending(&mut self, event_loop: &ActiveEventLoop) {
         let pending = std::mem::take(&mut self.new_windows);
         for (id, req) in pending {
+            // LogicalSize so the request honours the monitor's
+            // scale factor — on a Retina display PhysicalSize(1280,
+            // 720) lands as 1280 PHYSICAL pixels = 640 logical
+            // points = a tiny window. LogicalSize(1280, 720)
+            // multiplies through to 2560 × 1440 physical pixels on
+            // a 2× display, matching the size users actually
+            // expect when they ask for "1280 × 720". The Resized
+            // event still surfaces physical pixels (winit's
+            // convention), which is what wgpu wants for surface
+            // configure.
             let attrs = winit::window::Window::default_attributes()
                 .with_title(req.title)
-                .with_inner_size(winit::dpi::PhysicalSize::new(req.width, req.height))
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    req.width as f64,
+                    req.height as f64,
+                ))
                 .with_resizable(req.resizable);
             match event_loop.create_window(attrs) {
                 Ok(window) => {
@@ -276,6 +290,25 @@ impl ApplicationHandler for PumpHandler {
                             x: position.x,
                             y: position.y,
                         });
+                    }
+                });
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // Normalise both `LineDelta` (discrete notches from a
+                // wheel-mouse) and `PixelDelta` (continuous gestures
+                // from a trackpad) into the same (dx, dy) scalar so
+                // consumers don't branch on the source. Line deltas
+                // come through as small integers, so the consumer
+                // typically multiplies by a step size to compute the
+                // effective scroll. Pixel deltas can be hundreds per
+                // event; divide them down to roughly the same scale.
+                let (dx, dy) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => (x as f64, y as f64),
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.x / 30.0, p.y / 30.0),
+                };
+                APP.with(|cell| {
+                    if let Some(q) = cell.borrow_mut().queues.get_mut(&id) {
+                        q.push(EventRecord::MouseWheel { dx, dy });
                     }
                 });
             }
@@ -558,6 +591,14 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut WrenVm) {
                 map_set(vm, map, kb, Value::NULL);
                 let bv = alloc_string(vm, &button);
                 map_set(vm, map, kb, bv);
+            }
+            EventRecord::MouseWheel { dx, dy } => {
+                let v = alloc_string(vm, "mouseWheel");
+                map_set(vm, map, key_type, v);
+                let kdx = alloc_string(vm, "dx");
+                map_set(vm, map, kdx, Value::num(dx));
+                let kdy = alloc_string(vm, "dy");
+                map_set(vm, map, kdy, Value::num(dy));
             }
         }
     }

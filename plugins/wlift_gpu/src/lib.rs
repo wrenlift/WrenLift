@@ -2941,6 +2941,7 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
         view_id: u64,
         depth_load: wgpu::LoadOp<f32>,
         depth_store: wgpu::StoreOp,
+        read_only: bool,
     }
     let depth = if let Some(d) = map_get(desc, "depthStencilAttachment") {
         let view_id = match map_get(d, "view").and_then(Value::as_num) {
@@ -2963,10 +2964,19 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
             Some("discard") => wgpu::StoreOp::Discard,
             _ => wgpu::StoreOp::Store,
         };
+        // `depthReadOnly: true` makes the depth attachment available
+        // for sampling in a fragment shader of the same pass (wgpu
+        // distinguishes read-only depth from a writable attachment).
+        // When set, wgpu requires `depth_ops: None` so the load/store
+        // ops above are ignored.
+        let read_only = map_get(d, "depthReadOnly")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Some(Depth {
             view_id,
             depth_load,
             depth_store,
+            read_only,
         })
     } else {
         None
@@ -3154,10 +3164,14 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
         match view_reg.views.get(&d.view_id) {
             Some(v) => Some(wgpu::RenderPassDepthStencilAttachment {
                 view: v,
-                depth_ops: Some(wgpu::Operations {
-                    load: d.depth_load,
-                    store: d.depth_store,
-                }),
+                depth_ops: if d.read_only {
+                    None
+                } else {
+                    Some(wgpu::Operations {
+                        load: d.depth_load,
+                        store: d.depth_store,
+                    })
+                },
                 stencil_ops: None,
             }),
             None => {
