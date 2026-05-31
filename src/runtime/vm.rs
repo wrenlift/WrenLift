@@ -5648,6 +5648,16 @@ impl VM {
         let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
         crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
 
+        if mir.blocks.is_empty() {
+            // Mirror the active-fiber guard at the top of this fn:
+            // AOT-registered constructors live in `engine.jit_code`
+            // and only carry a zero-block MIR stub for metadata. The
+            // real body has already run via the JIT-ptr fast path
+            // (or there is no Wren body to walk); return the freshly
+            // allocated instance — the no-fiber jit-root len was
+            // already restored above at 5649.
+            return live_instance;
+        }
         unsafe {
             (*temp_fiber).header.class = self.fiber_class;
 
