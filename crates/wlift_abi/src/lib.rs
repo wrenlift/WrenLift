@@ -277,6 +277,23 @@ extern "C" {
         out_len: *mut u32,
     ) -> bool;
 
+    // --- GC root scratchpad ------------------------------------------------
+    //
+    // Plugins doing multi-allocation foreign methods (parse-event-list,
+    // build-frame-info-map, etc.) need to keep already-allocated
+    // receivers alive across subsequent allocator calls that may
+    // trigger nursery GC. Without rooting, a stale local Value held
+    // in Rust decodes to the from-space pointer post-forwarding; a
+    // later `map_set` / `list_add` mutates the zombie cell and
+    // corrupts the successor object — surfacing as a SIGSEGV in
+    // `trace_object` on the next GC. Use `push_root` for every
+    // receiver carried across an allocator call, `jit_root_at` to
+    // re-read post-GC, and `jit_roots_restore` to pop on exit.
+    pub fn wlift_plugin_jit_roots_snapshot(vm: *mut WrenVm) -> u32;
+    pub fn wlift_plugin_push_root(vm: *mut WrenVm, value: u64) -> u32;
+    pub fn wlift_plugin_jit_root_at(vm: *mut WrenVm, idx: u32) -> u64;
+    pub fn wlift_plugin_jit_roots_restore(vm: *mut WrenVm, depth: u32);
+
     // --- Static plugin registration (wasm path) ----------------------------
 
     /// Register a `(plugin_name, fn_name) -> fn_ptr` mapping the
@@ -434,6 +451,30 @@ pub fn map_iter(map: Value) -> MapIter {
 #[inline]
 pub unsafe fn map_set(vm: *mut WrenVm, map: Value, key: Value, value: Value) {
     unsafe { wlift_plugin_map_set(vm, map.0, key.0, value.0) }
+}
+
+/// GC root scratchpad. Wrap an allocator-chain in
+/// `let snap = roots_snapshot(vm); let r = push_root(vm, v); ...
+/// reload(vm, r) ...; roots_restore(vm, snap)`. See the doc comment
+/// on `wlift_plugin_jit_roots_snapshot` in this file's extern block.
+#[inline]
+pub unsafe fn roots_snapshot(vm: *mut WrenVm) -> u32 {
+    unsafe { wlift_plugin_jit_roots_snapshot(vm) }
+}
+
+#[inline]
+pub unsafe fn push_root(vm: *mut WrenVm, value: Value) -> u32 {
+    unsafe { wlift_plugin_push_root(vm, value.0) }
+}
+
+#[inline]
+pub unsafe fn reload_root(vm: *mut WrenVm, idx: u32) -> Value {
+    unsafe { Value(wlift_plugin_jit_root_at(vm, idx)) }
+}
+
+#[inline]
+pub unsafe fn roots_restore(vm: *mut WrenVm, depth: u32) {
+    unsafe { wlift_plugin_jit_roots_restore(vm, depth) }
 }
 
 /// Read the element-type tag of a typed array.

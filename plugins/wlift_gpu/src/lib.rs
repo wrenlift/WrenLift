@@ -4256,13 +4256,19 @@ pub unsafe extern "C" fn wlift_gpu_surface_acquire(vm: *mut WrenVm) {
     );
 
     // Return a Wren Map { "frame": frame_id, "view": view_id }.
-    // GC-rooted single-Map build.
+    // `map` itself is rooted via `set_return` (api_stack[0] is
+    // GC-walked), so re-read it through `slot(vm, 0)` after each
+    // subsequent allocator call — a stale local would decode to
+    // the pre-forwarding pointer and `map_set` would write through
+    // a zombie cell, smearing NaN-tagged bits into the successor
+    // object's header. Surfaced as a `trace_object` SIGSEGV on the
+    // next GC.
     let map = alloc_map(vm);
     set_return(vm, map);
     let key_frame = alloc_string(vm, "frame");
-    map_set(vm, map, key_frame, Value::num(frame_id as f64));
+    map_set(vm, slot(vm, 0), key_frame, Value::num(frame_id as f64));
     let key_view = alloc_string(vm, "view");
-    map_set(vm, map, key_view, Value::num(view_id as f64));
+    map_set(vm, slot(vm, 0), key_view, Value::num(view_id as f64));
 }
 
 // ---------------------------------------------------------------------------

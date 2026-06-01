@@ -22,7 +22,7 @@
 //! previous silent SIGSEGV when struct layouts drifted.
 
 // Every export is `unsafe extern "C"` because the host receives raw
-// `*mut WrenVm` from a dlopen'd plugin and trusts it to point at a
+// `*mut ()` from a dlopen'd plugin and trusts it to point at a
 // live VM for the call's duration. The safety contract is the same
 // for every function — documented once at the module level rather
 // than restated per function. Same pattern the existing wren* C API
@@ -280,6 +280,59 @@ pub unsafe extern "C" fn wlift_plugin_typed_array_bytes(
         *out_len = bytes.len() as u32;
     }
     true
+}
+
+// --- GC root scratchpad ----------------------------------------------------
+//
+// Plugins doing multi-allocation foreign methods (parse-event-list,
+// build-frame-info-map, etc.) need a way to keep already-allocated
+// receivers alive across subsequent allocator calls that may trigger
+// nursery GC. Without rooting, a stale local `Value` held in Rust
+// after a forwarding GC decodes to the from-space pointer; a later
+// `map_set` / `list_add` then mutates a zombie cell and corrupts the
+// successor object's header (smearing NaN-tagged bits into
+// `ObjHeader.class`, surfacing as a `trace_object` SIGSEGV on the
+// next GC). The pattern's documented in `wlift_gpu`'s `buffer_read_bytes`
+// (re-reads `slot(0)` after each alloc); these primitives extend that
+// discipline to plugins that need MORE than slot(0)'s single root.
+//
+// Lifecycle:
+//   let snap = wlift_plugin_jit_roots_snapshot(vm);
+//   let id_a = wlift_plugin_push_root(vm, val_a);  // returns absolute index
+//   // ... allocator calls; val_a may be forwarded ...
+//   let live_a = wlift_plugin_jit_root_at(vm, id_a); // re-read post-GC
+//   // ... finish work ...
+//   wlift_plugin_jit_roots_restore(vm, snap);      // pop everything
+
+/// Snapshot the current JIT_ROOTS_STORE depth. Pair with
+/// `wlift_plugin_jit_roots_restore` to pop everything pushed in
+/// between.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_plugin_jit_roots_snapshot(_vm: *mut ()) -> u32 {
+    crate::codegen::runtime_fns::jit_roots_snapshot_len() as u32
+}
+
+/// Push a value as a GC root. Returns its absolute slot index in
+/// JIT_ROOTS_STORE for later re-read via `wlift_plugin_jit_root_at`.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_plugin_push_root(_vm: *mut (), value: u64) -> u32 {
+    let idx = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+    crate::codegen::runtime_fns::push_jit_root(Value::from_bits(value));
+    idx as u32
+}
+
+/// Re-read a rooted value at the given absolute slot index. Always
+/// returns the live (post-forwarding) bits — GC updates the slot
+/// in place when nursery objects promote.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_plugin_jit_root_at(_vm: *mut (), idx: u32) -> u64 {
+    crate::codegen::runtime_fns::jit_root_at(idx as usize).to_bits()
+}
+
+/// Pop JIT_ROOTS_STORE back to a snapshot depth.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_plugin_jit_roots_restore(_vm: *mut (), depth: u32) {
+    crate::codegen::runtime_fns::jit_roots_restore_len(depth as usize);
 }
 
 // --- Static plugin registration (wasm path) --------------------------------

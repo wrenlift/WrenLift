@@ -36,8 +36,9 @@ use winit::platform::pump_events::EventLoopExtPumpEvents;
 use winit::window::{Window, WindowId};
 
 use wlift_abi::{
-    alloc_list, alloc_map, alloc_string, list_add, map_iter, map_set, obj_type, runtime_error,
-    set_return, slot, string_str, ObjType, Value, WrenVm,
+    alloc_list, alloc_map, alloc_string, list_add, map_iter, map_set, obj_type, push_root,
+    reload_root, roots_restore, roots_snapshot, runtime_error, set_return, slot, string_str,
+    ObjType, Value, WrenVm,
 };
 
 /// Plugin ABI handshake — see wlift_gpu::wlift_plugin_abi_version.
@@ -526,82 +527,98 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut WrenVm) {
     // immediately after the key alloc, with no intervening
     // method-dispatch path that could allocate.
 
+    // Rooting protocol: every receiver carried across an allocator
+    // call has to be a GC root, or a nursery collection during the
+    // next alloc forwards the object and the Rust-local Value bits
+    // decode to the stale from-space pointer. The next `list_add`
+    // or `map_set` then writes through that zombie cell, smearing
+    // NaN-tagged bits across the successor object's header — which
+    // surfaces as a SIGSEGV in `trace_object` on the next GC.
+    //
+    // `result` is rooted via `set_return` (api_stack[0] is GC-walked);
+    // every per-iteration handle (`map`, `key_type`, "code"/"button"
+    // key strings) goes through `push_root` and is read back via
+    // `reload_root` on the receiving side of each `map_set` /
+    // `list_add`. The whole block pops back to `snap` so successive
+    // calls don't leak roots.
+    let snap = roots_snapshot(vm);
     let result = alloc_list(vm, 0);
     set_return(vm, result);
 
     for ev in events {
         let map = alloc_map(vm);
-        list_add(vm, result, map);
+        let map_r = push_root(vm, map);
+        list_add(vm, slot(vm, 0), reload_root(vm, map_r));
+
         let key_type = alloc_string(vm, "type");
+        let kt_r = push_root(vm, key_type);
         match ev {
             EventRecord::CloseRequested => {
                 let v = alloc_string(vm, "close");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
             }
             EventRecord::Resized { width, height } => {
                 let v = alloc_string(vm, "resize");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kw = alloc_string(vm, "width");
-                map_set(vm, map, kw, Value::num(width as f64));
+                map_set(vm, reload_root(vm, map_r), kw, Value::num(width as f64));
                 let kh = alloc_string(vm, "height");
-                map_set(vm, map, kh, Value::num(height as f64));
+                map_set(vm, reload_root(vm, map_r), kh, Value::num(height as f64));
             }
             EventRecord::KeyDown { code } => {
                 let v = alloc_string(vm, "keyDown");
-                map_set(vm, map, key_type, v);
-                // Two-step: commit the key with a null value so
-                // the map's hash table holds the key string
-                // across the next `alloc_string`. Without this
-                // intermediate set, allocating `cv` would
-                // potentially GC `kc` (the key) since `kc` is
-                // only a Rust local, not a GC root.
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kc = alloc_string(vm, "code");
-                map_set(vm, map, kc, Value::NULL);
+                let kc_r = push_root(vm, kc);
                 let cv = alloc_string(vm, &code);
-                map_set(vm, map, kc, cv);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kc_r), cv);
             }
             EventRecord::KeyUp { code } => {
                 let v = alloc_string(vm, "keyUp");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kc = alloc_string(vm, "code");
-                map_set(vm, map, kc, Value::NULL);
+                let kc_r = push_root(vm, kc);
                 let cv = alloc_string(vm, &code);
-                map_set(vm, map, kc, cv);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kc_r), cv);
             }
             EventRecord::MouseMoved { x, y } => {
                 let v = alloc_string(vm, "mouseMoved");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kx = alloc_string(vm, "x");
-                map_set(vm, map, kx, Value::num(x));
+                map_set(vm, reload_root(vm, map_r), kx, Value::num(x));
                 let ky = alloc_string(vm, "y");
-                map_set(vm, map, ky, Value::num(y));
+                map_set(vm, reload_root(vm, map_r), ky, Value::num(y));
             }
             EventRecord::MouseDown { button } => {
                 let v = alloc_string(vm, "mouseDown");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kb = alloc_string(vm, "button");
-                map_set(vm, map, kb, Value::NULL);
+                let kb_r = push_root(vm, kb);
                 let bv = alloc_string(vm, &button);
-                map_set(vm, map, kb, bv);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kb_r), bv);
             }
             EventRecord::MouseUp { button } => {
                 let v = alloc_string(vm, "mouseUp");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kb = alloc_string(vm, "button");
-                map_set(vm, map, kb, Value::NULL);
+                let kb_r = push_root(vm, kb);
                 let bv = alloc_string(vm, &button);
-                map_set(vm, map, kb, bv);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kb_r), bv);
             }
             EventRecord::MouseWheel { dx, dy } => {
                 let v = alloc_string(vm, "mouseWheel");
-                map_set(vm, map, key_type, v);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
                 let kdx = alloc_string(vm, "dx");
-                map_set(vm, map, kdx, Value::num(dx));
+                map_set(vm, reload_root(vm, map_r), kdx, Value::num(dx));
                 let kdy = alloc_string(vm, "dy");
-                map_set(vm, map, kdy, Value::num(dy));
+                map_set(vm, reload_root(vm, map_r), kdy, Value::num(dy));
             }
         }
+        // Drop the per-iteration roots; the next iteration's `map`
+        // gets a fresh slot, and `result` stays anchored via slot(0).
+        roots_restore(vm, snap);
     }
+    roots_restore(vm, snap);
 }
 
 /// Build the platform-tagged raw-window-handle Map @hatch:gpu's

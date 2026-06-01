@@ -2870,7 +2870,27 @@ pub mod cl {
                             let idx = *idx as usize;
                             if idx < entry_params.len() {
                                 val_map.insert(vid, entry_params[idx]);
-                                if mark_stack_map && is_wren_value(vid, &value_types) {
+                                // Entry-block BlockParam instructions
+                                // bind function args, all of which are
+                                // i64 Wren Value bits by ABI — but
+                                // `infer_osr_value_types` doesn't walk
+                                // BlockParam instructions, leaving their
+                                // entry in `value_types` at the default
+                                // `MirType::Void`. `is_wren_value` then
+                                // returns false and the receiver / arg
+                                // params escape stack-map root marking.
+                                // The symptom: a GC during ANY callee
+                                // (e.g. `Vec4.new(...)` from inside a
+                                // ctor body's `_field = Vec4.new(...)`)
+                                // moves the instance, the caller's
+                                // `this` register isn't visited by the
+                                // GC walker, and every subsequent
+                                // SetField writes to a stale pointer —
+                                // surfacing as the instance's fields
+                                // reading back as `null` later. Mark
+                                // unconditionally (gated only on the
+                                // global `mark_stack_map`).
+                                if mark_stack_map {
                                     builder.declare_value_needs_stack_map(entry_params[idx]);
                                 }
                             }
