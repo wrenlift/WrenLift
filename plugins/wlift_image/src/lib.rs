@@ -14,8 +14,9 @@ use std::io::Cursor;
 
 use wlift_abi::{
     alloc_map, alloc_string, alloc_typed_array, list_count, list_get, map_set, obj_type,
-    runtime_error, set_return, slot, string_str, typed_array_bytes, typed_array_bytes_mut,
-    typed_array_kind, ObjType, TypedArrayKind, Value, WrenVm,
+    push_root, reload_root, roots_restore, roots_snapshot, runtime_error, set_return, slot,
+    string_str, typed_array_bytes, typed_array_bytes_mut, typed_array_kind, ObjType,
+    TypedArrayKind, Value, WrenVm,
 };
 
 /// Plugin ABI handshake. Native-only: statically-linked wasm
@@ -110,35 +111,36 @@ pub unsafe extern "C" fn wlift_image_decode(vm: *mut WrenVm) {
     let (w, h) = img.dimensions();
     let pixels = img.into_raw();
 
-    // GC rooting strategy: every allocation goes through the host's
-    // `finish_alloc`, which pushes the freshly-allocated Value onto
-    // the GC's `JIT_ROOTS_STORE`. Locals here borrow rooted values
-    // until the foreign call returns. Build the map first as the
-    // return-slot root, then fill it — every key/value alloc stays
-    // reachable through finish_alloc plus the map's own field
-    // pointers once installed.
+    // The map and pixel array survive across multiple subsequent
+    // allocator calls; a nursery GC during any of them forwards the
+    // underlying objects, so any plain Rust local holding their
+    // pre-GC NaN-boxed bits becomes a zombie. Use the JIT-roots
+    // stack: snapshot on entry, push every survivor, reload before
+    // use, restore on exit.
 
+    let snap = roots_snapshot(vm);
     let map = alloc_map(vm);
+    let map_r = push_root(vm, map);
+    // Slot 0 is the return slot — keeps `map` rooted past the
+    // foreign-call boundary even after `roots_restore`.
     set_return(vm, map);
 
-    // Pixels ByteArray. Allocated AFTER the map exists so a GC fired
-    // during alloc_typed_array can't free the unrooted map; the
-    // return-slot write above keeps `map` reachable.
     let arr = alloc_typed_array(vm, pixels.len() as u32, TypedArrayKind::U8);
-    if let Some(buf) = typed_array_bytes_mut(arr) {
+    let arr_r = push_root(vm, arr);
+    if let Some(buf) = typed_array_bytes_mut(reload_root(vm, arr_r)) {
         let n = buf.len().min(pixels.len());
         buf[..n].copy_from_slice(&pixels[..n]);
     }
-    // Install pixels first — once it's in the map, the only root
-    // we need to maintain is the map itself.
     let kp = alloc_string(vm, "pixels");
-    map_set(vm, map, kp, arr);
+    map_set(vm, reload_root(vm, map_r), kp, reload_root(vm, arr_r));
 
     let kw = alloc_string(vm, "width");
-    map_set(vm, map, kw, Value::num(w as f64));
+    map_set(vm, reload_root(vm, map_r), kw, Value::num(w as f64));
 
     let kh = alloc_string(vm, "height");
-    map_set(vm, map, kh, Value::num(h as f64));
+    map_set(vm, reload_root(vm, map_r), kh, Value::num(h as f64));
+
+    roots_restore(vm, snap);
 }
 
 // ---------------------------------------------------------------------------
