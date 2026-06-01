@@ -1667,6 +1667,24 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
         }
     }
 
+    // When the target is a workspace directory, chdir into it before
+    // running so `Fs.cwd` at runtime points at the hatchfile's
+    // directory — same convention as `cargo run` / `npm start`. This
+    // lets workspace code reference its own assets via plain relative
+    // paths (`"assets/foo.png"`) regardless of where the user
+    // launched `hatch run` from. Single-file `.hatch` targets keep
+    // the launcher's cwd unchanged.
+    if target.is_dir() {
+        if let Err(e) = std::env::set_current_dir(target) {
+            eprintln!(
+                "error: cannot chdir into '{}': {}",
+                target.display(),
+                e
+            );
+            process::exit(1);
+        }
+    }
+
     match vm.interpret_hatch(main_bytes) {
         InterpretResult::Success => {}
         InterpretResult::CompileError => process::exit(65),
