@@ -473,18 +473,19 @@ pub unsafe extern "C" fn wlift_window_size(vm: *mut WrenVm) {
             .map(|wnd| (wnd.width, wnd.height))
             .unwrap_or((0, 0))
     });
-    // GC rooting: see `wlift_image_decode` for the pattern.
-    // Set the map as the return slot before any subsequent
-    // alloc, write keys via direct `(*map_ptr).set` so each
-    // key string is committed to the map's hash table the
-    // moment after it's allocated.
-
+    // GC rooting: see `wlift_image_decode` for the pattern. The
+    // map survives across each alloc_string, so reload it through
+    // the JIT-roots stack on every map_set instead of relying on
+    // the stale Rust local.
+    let snap = roots_snapshot(vm);
     let map = alloc_map(vm);
+    let map_r = push_root(vm, map);
     set_return(vm, map);
     let kw = alloc_string(vm, "width");
-    map_set(vm, map, kw, Value::num(w as f64));
+    map_set(vm, reload_root(vm, map_r), kw, Value::num(w as f64));
     let kh = alloc_string(vm, "height");
-    map_set(vm, map, kh, Value::num(h as f64));
+    map_set(vm, reload_root(vm, map_r), kh, Value::num(h as f64));
+    roots_restore(vm, snap);
 }
 
 /// Drain pending events for a window. Returns a `List` of Maps:
@@ -653,66 +654,102 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
         return;
     };
 
-    // Same GC-rooting pattern as the events list above.
-    // `set_return` lands the map in slot 0 (GC-rooted via
-    // api_stack). `key_platform` gets committed with a null
-    // placeholder right after allocation so the map's hash
-    // table holds the key string across the match arms below
-    // — without that, any `alloc_string` inside a match arm
-    // would race a GC that could free the unrooted key.
-    // Direct `(*map_ptr).set` instead of method-dispatch
-    // `call_method_on(_, "[_]=(_)", ...)` for the same
-    // reason: shorter window between key alloc and value
-    // commit.
+    // GC rooting: same JIT-roots-stack pattern as events_list /
+    // wlift_image_decode. Both `map` and `key_platform` survive
+    // across every subsequent alloc_string in the match arms and
+    // the display-handle block, so reload them through the
+    // roots-stack rather than holding stale Rust locals.
     use raw_window_handle::RawWindowHandle;
 
+    let snap = roots_snapshot(vm);
     let map = alloc_map(vm);
+    let map_r = push_root(vm, map);
     set_return(vm, map);
-    let key_platform = alloc_string(vm, "platform");
-    map_set(vm, map, key_platform, Value::NULL);
+    let key_platform_r = push_root(vm, alloc_string(vm, "platform"));
+    map_set(
+        vm,
+        reload_root(vm, map_r),
+        reload_root(vm, key_platform_r),
+        Value::NULL,
+    );
 
     match win {
         RawWindowHandle::AppKit(h) => {
             let v = alloc_string(vm, "appkit");
-            map_set(vm, map, key_platform, v);
+            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
             let kv = alloc_string(vm, "ns_view");
-            map_set(vm, map, kv, Value::num(h.ns_view.as_ptr() as usize as f64));
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                kv,
+                Value::num(h.ns_view.as_ptr() as usize as f64),
+            );
         }
         RawWindowHandle::UiKit(h) => {
             let v = alloc_string(vm, "uikit");
-            map_set(vm, map, key_platform, v);
+            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
             let kv = alloc_string(vm, "ui_view");
-            map_set(vm, map, kv, Value::num(h.ui_view.as_ptr() as usize as f64));
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                kv,
+                Value::num(h.ui_view.as_ptr() as usize as f64),
+            );
         }
         RawWindowHandle::Win32(h) => {
             let v = alloc_string(vm, "win32");
-            map_set(vm, map, key_platform, v);
+            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
             let kh = alloc_string(vm, "hwnd");
-            map_set(vm, map, kh, Value::num(h.hwnd.get() as f64));
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                kh,
+                Value::num(h.hwnd.get() as f64),
+            );
             if let Some(hi) = h.hinstance {
                 let key_hinstance = alloc_string(vm, "hinstance");
-                map_set(vm, map, key_hinstance, Value::num(hi.get() as f64));
+                map_set(
+                    vm,
+                    reload_root(vm, map_r),
+                    key_hinstance,
+                    Value::num(hi.get() as f64),
+                );
             }
         }
         RawWindowHandle::Xlib(h) => {
             let v = alloc_string(vm, "xlib");
-            map_set(vm, map, key_platform, v);
+            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
             let kw = alloc_string(vm, "window");
-            map_set(vm, map, kw, Value::num(h.window as f64));
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                kw,
+                Value::num(h.window as f64),
+            );
             if h.visual_id != 0 {
                 let kvi = alloc_string(vm, "visual_id");
-                map_set(vm, map, kvi, Value::num(h.visual_id as f64));
+                map_set(
+                    vm,
+                    reload_root(vm, map_r),
+                    kvi,
+                    Value::num(h.visual_id as f64),
+                );
             }
         }
         RawWindowHandle::Wayland(h) => {
             let v = alloc_string(vm, "wayland");
-            map_set(vm, map, key_platform, v);
+            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
             let ks = alloc_string(vm, "surface");
-            map_set(vm, map, ks, Value::num(h.surface.as_ptr() as usize as f64));
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                ks,
+                Value::num(h.surface.as_ptr() as usize as f64),
+            );
         }
         other => {
             let v = alloc_string(vm, &format!("{:?}", other).to_lowercase());
-            map_set(vm, map, key_platform, v);
+            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
         }
     }
 
@@ -728,22 +765,39 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
                     RawDisplayHandle::Xlib(d) => {
                         if let Some(p) = d.display {
                             let key = alloc_string(vm, "display");
-                            map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
+                            map_set(
+                                vm,
+                                reload_root(vm, map_r),
+                                key,
+                                Value::num(p.as_ptr() as usize as f64),
+                            );
                         }
                     }
                     RawDisplayHandle::Xcb(d) => {
                         if let Some(p) = d.connection {
                             let key = alloc_string(vm, "connection");
-                            map_set(vm, map, key, Value::num(p.as_ptr() as usize as f64));
+                            map_set(
+                                vm,
+                                reload_root(vm, map_r),
+                                key,
+                                Value::num(p.as_ptr() as usize as f64),
+                            );
                         }
                     }
                     RawDisplayHandle::Wayland(d) => {
                         let key = alloc_string(vm, "display");
-                        map_set(vm, map, key, Value::num(d.display.as_ptr() as usize as f64));
+                        map_set(
+                            vm,
+                            reload_root(vm, map_r),
+                            key,
+                            Value::num(d.display.as_ptr() as usize as f64),
+                        );
                     }
                     _ => {}
                 }
             }
         }
     });
+
+    roots_restore(vm, snap);
 }

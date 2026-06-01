@@ -38,8 +38,9 @@ use std::sync::{Mutex, OnceLock};
 
 use wlift_abi::{
     alloc_list, alloc_map, alloc_string, list_add, list_count, list_get as abi_list_get, map_iter,
-    map_set, obj_type, runtime_error, set_return, slot, string_str, typed_array_bytes,
-    typed_array_bytes_mut, typed_array_kind, ObjType, TypedArrayKind, Value, WrenVm,
+    map_set, obj_type, push_root, reload_root, roots_restore, roots_snapshot, runtime_error,
+    set_return, slot, string_str, typed_array_bytes, typed_array_bytes_mut, typed_array_kind,
+    ObjType, TypedArrayKind, Value, WrenVm,
 };
 
 /// Plugin ABI handshake. The host calls this immediately after
@@ -726,29 +727,40 @@ pub unsafe extern "C" fn wlift_gpu_device_info(vm: *mut WrenVm) {
         rec.adapter.get_info()
     };
 
-    // GC rooting: alloc + commit each (key, value) pair
-    // back-to-back so no field stays unrooted across a
-    // subsequent allocator call. Map goes into slot 0 first
-    // (api_stack root). For pairs where both key and value
-    // are `alloc_string`, the key is committed with a null
-    // placeholder before the value is allocated, then
-    // overwritten — that way the key string is reachable
-    // through the map's hash table during the value's alloc
-    // window. See `wlift_sqlite_query` for the same pattern.
+    // The map and every alloc_string return value survive across
+    // subsequent allocator calls; a nursery GC during any of them
+    // forwards the underlying object, so any plain Rust local
+    // holding its pre-GC NaN-boxed bits becomes a zombie. Use the
+    // JIT-roots stack: snapshot on entry, push every survivor,
+    // reload before each use, restore on exit.
+    let snap = roots_snapshot(vm);
     let result = alloc_map(vm);
+    let result_r = push_root(vm, result);
     set_return(vm, result);
 
-    let key_name = alloc_string(vm, "name");
+    let key_name_r = push_root(vm, alloc_string(vm, "name"));
     let name = alloc_string(vm, &info.name);
-    map_set(vm, result, key_name, name);
+    map_set(vm, reload_root(vm, result_r), reload_root(vm, key_name_r), name);
 
-    let key_backend = alloc_string(vm, "backend");
+    let key_backend_r = push_root(vm, alloc_string(vm, "backend"));
     let backend = alloc_string(vm, &format!("{:?}", info.backend).to_lowercase());
-    map_set(vm, result, key_backend, backend);
+    map_set(
+        vm,
+        reload_root(vm, result_r),
+        reload_root(vm, key_backend_r),
+        backend,
+    );
 
-    let key_device_type = alloc_string(vm, "deviceType");
+    let key_device_type_r = push_root(vm, alloc_string(vm, "deviceType"));
     let device_type = alloc_string(vm, &format!("{:?}", info.device_type).to_lowercase());
-    map_set(vm, result, key_device_type, device_type);
+    map_set(
+        vm,
+        reload_root(vm, result_r),
+        reload_root(vm, key_device_type_r),
+        device_type,
+    );
+
+    roots_restore(vm, snap);
 }
 
 // ---------------------------------------------------------------------------
@@ -4196,12 +4208,15 @@ pub unsafe extern "C" fn wlift_gpu_surface_configure(vm: *mut WrenVm) {
     // its camera / depth attachment to match the actual surface
     // (which may have been clamped to `max_texture_dimension_2d`).
     // GC-rooted single-Map build: see `wlift_image_decode`.
+    let snap = roots_snapshot(vm);
     let map = alloc_map(vm);
+    let map_r = push_root(vm, map);
     set_return(vm, map);
     let kw = alloc_string(vm, "width");
-    map_set(vm, map, kw, Value::num(cw as f64));
+    map_set(vm, reload_root(vm, map_r), kw, Value::num(cw as f64));
     let kh = alloc_string(vm, "height");
-    map_set(vm, map, kh, Value::num(ch as f64));
+    map_set(vm, reload_root(vm, map_r), kh, Value::num(ch as f64));
+    roots_restore(vm, snap);
 }
 
 /// Acquire the next swap-chain frame. Returns a `Map` with two
