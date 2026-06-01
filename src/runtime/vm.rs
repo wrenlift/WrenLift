@@ -5121,7 +5121,7 @@ impl VM {
             .get_mir(func_id)
             .map(|m| m.blocks.is_empty())
             .unwrap_or(false);
-        if !aot_fn.is_null() && mir_empty && args.len() <= 8 {
+        if !aot_fn.is_null() && mir_empty && args.len() <= 15 {
             let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
             crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                 ctx.current_func_id = func_id.0 as u64;
@@ -5135,7 +5135,7 @@ impl VM {
                 .get_mir(func_id)
                 .map(|m| m.arity as usize)
                 .unwrap_or(args.len());
-            let mut jit_args = [Value::null(); 8];
+            let mut jit_args = [Value::null(); 16];
             let n;
             if args.len() < body_arity {
                 // Caller didn't supply a receiver but body's arity
@@ -5266,7 +5266,7 @@ impl VM {
             .get_mir(func_id)
             .map(|m| m.blocks.is_empty())
             .unwrap_or(false);
-        if !aot_fn.is_null() && mir_empty && args.len() <= 7 {
+        if !aot_fn.is_null() && mir_empty && args.len() <= 15 {
             let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
             crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                 ctx.current_func_id = func_id.0 as u64;
@@ -5275,7 +5275,7 @@ impl VM {
                     .map(|p| p as *mut u8)
                     .unwrap_or(std::ptr::null_mut());
             });
-            let mut jit_args = [Value::null(); 8];
+            let mut jit_args = [Value::null(); 16];
             let recv = crate::codegen::runtime_fns::jit_root_at(root_len_before);
             jit_args[0] = recv;
             for i in 0..args.len() {
@@ -5461,7 +5461,7 @@ impl VM {
         } else {
             std::ptr::null()
         };
-        if !jit_ptr.is_null() && ctor_args.len() <= 8 {
+        if !jit_ptr.is_null() && ctor_args.len() <= 15 {
             // Push every ctor arg as a JIT root so a GC fired during
             // the constructor body (allocations, foreign calls, etc.)
             // updates each pointer through the shared roots Vec
@@ -5473,10 +5473,14 @@ impl VM {
             // class of "Constructor JIT SIGSEGV under GC pressure"
             // bug logged in CLAUDE.md / project_cranelift_fixes.
             //
-            // Cap at 7 user args (8 total with the implicit
-            // instance receiver) to match the wren_call_0..wren_call_8
-            // helper family + call_jit_fn's arity ladder. Beyond
-            // that the caller still falls through to the MIR walker.
+            // Cap at 15 user args (16 total with the implicit
+            // instance receiver) to match `call_jit_fn`'s arity
+            // ladder, which has explicit arms 0..=16. Beyond that
+            // the caller still falls through to the MIR walker —
+            // but with empty-blocks AOT stubs that path silently
+            // returns the uninitialised instance, so widening this
+            // gate restores correct construction for high-arity
+            // ctors like `GltfMaterial.new_(name, baseColor, ..., 15 args)`.
             for arg in ctor_args.iter() {
                 crate::codegen::runtime_fns::push_jit_root(*arg);
             }
@@ -5486,9 +5490,9 @@ impl VM {
             // reading via `jit_root_at` keeps every value in
             // lockstep with the GC's view).
             let live_instance = crate::codegen::runtime_fns::jit_root_at(root_len_before);
-            // Sized to fit the widest call_jit_fn arm (instance + 8
-            // user args = 9 slots).
-            let mut jit_args = [Value::null(); 9];
+            // Sized to fit the widest call_jit_fn arm (instance + 15
+            // user args = 16 slots).
+            let mut jit_args = [Value::null(); 16];
             jit_args[0] = live_instance;
             for i in 0..ctor_args.len() {
                 jit_args[i + 1] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 1 + i);
