@@ -136,6 +136,162 @@ enum EventRecord {
     MouseDown { button: String },
     MouseUp { button: String },
     MouseWheel { dx: f64, dy: f64 },
+    /// Gamepad button / axis events. `code` is the canonical
+    /// binding name (`"GamepadButtonA"`, `"GamepadAxisLX"`, etc.)
+    /// the action layer maps against. Gamepad events broadcast
+    /// across all windows — gamepads aren't owned by any one
+    /// window — so they land in every active window's queue.
+    GamepadButtonDown { code: String, gamepad: u32 },
+    GamepadButtonUp { code: String, gamepad: u32 },
+    GamepadAxis { code: String, gamepad: u32, value: f64 },
+}
+
+// ---------------------------------------------------------------------------
+// Gamepad polling (gilrs)
+// ---------------------------------------------------------------------------
+//
+// gilrs runs polled too — its `next_event()` returns an event from
+// whichever connected pad has one buffered, or `None`. We poll
+// every `pump_once` call and feed events into every window's queue
+// so any window listening to `pollEvents` sees them. Action-mapping
+// layers ride on top of these names (see actions.wren).
+
+thread_local! {
+    static GILRS: RefCell<Option<gilrs::Gilrs>> = const { RefCell::new(None) };
+}
+
+fn ensure_gilrs() {
+    GILRS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            // Construction can fail on Linux when no input device
+            // is exposed (containerised CI). Log and keep going —
+            // games still want keyboard / mouse.
+            match gilrs::Gilrs::new() {
+                Ok(g) => *slot = Some(g),
+                Err(e) => eprintln!("wlift_window: gilrs init failed: {}; gamepad input disabled", e),
+            }
+        }
+    });
+}
+
+/// Canonical button-binding name. Mirrors the SDL game-controller
+/// labelling convention so Wren-side code reads `"GamepadButtonA"`,
+/// `"GamepadDPadUp"`, etc., regardless of platform.
+fn gilrs_button_name(b: gilrs::Button) -> Option<&'static str> {
+    use gilrs::Button::*;
+    Some(match b {
+        South => "GamepadButtonA",
+        East => "GamepadButtonB",
+        West => "GamepadButtonX",
+        North => "GamepadButtonY",
+        LeftTrigger => "GamepadLeftBumper",
+        RightTrigger => "GamepadRightBumper",
+        LeftTrigger2 => "GamepadLeftTrigger",
+        RightTrigger2 => "GamepadRightTrigger",
+        Select => "GamepadBack",
+        Start => "GamepadStart",
+        Mode => "GamepadGuide",
+        LeftThumb => "GamepadLeftStick",
+        RightThumb => "GamepadRightStick",
+        DPadUp => "GamepadDPadUp",
+        DPadDown => "GamepadDPadDown",
+        DPadLeft => "GamepadDPadLeft",
+        DPadRight => "GamepadDPadRight",
+        _ => return None,
+    })
+}
+
+/// Canonical axis-binding name. Sticks are reported as four signed
+/// axes (-1..1); the action layer is free to threshold them into
+/// digital up/down/left/right or use the magnitude directly.
+fn gilrs_axis_name(a: gilrs::Axis) -> Option<&'static str> {
+    use gilrs::Axis::*;
+    Some(match a {
+        LeftStickX => "GamepadAxisLX",
+        LeftStickY => "GamepadAxisLY",
+        RightStickX => "GamepadAxisRX",
+        RightStickY => "GamepadAxisRY",
+        LeftZ => "GamepadAxisLZ",
+        RightZ => "GamepadAxisRZ",
+        DPadX => "GamepadAxisDX",
+        DPadY => "GamepadAxisDY",
+        _ => return None,
+    })
+}
+
+/// Drain whatever gilrs has buffered into every window's queue.
+fn drain_gilrs() {
+    GILRS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(g) = slot.as_mut() else { return };
+        while let Some(gilrs::Event { id, event, .. }) = g.next_event() {
+            // `id` is a `GamepadId` newtype wrapping a usize. Cast
+            // to u32 so the Wren side gets a plain Num.
+            let gamepad: u32 = Into::<usize>::into(id) as u32;
+            let record = match event {
+                gilrs::EventType::ButtonPressed(b, _) => gilrs_button_name(b)
+                    .map(|c| EventRecord::GamepadButtonDown {
+                        code: c.to_string(),
+                        gamepad,
+                    }),
+                gilrs::EventType::ButtonReleased(b, _) => gilrs_button_name(b)
+                    .map(|c| EventRecord::GamepadButtonUp {
+                        code: c.to_string(),
+                        gamepad,
+                    }),
+                gilrs::EventType::AxisChanged(a, v, _) => gilrs_axis_name(a).map(|c| {
+                    EventRecord::GamepadAxis {
+                        code: c.to_string(),
+                        gamepad,
+                        value: v as f64,
+                    }
+                }),
+                // Connected/Disconnected/etc. are surfaced as
+                // dedicated event types in a follow-up — for now
+                // only button + axis are wired.
+                _ => None,
+            };
+            let Some(record) = record else { continue };
+            APP.with(|cell| {
+                let mut app = cell.borrow_mut();
+                let ids: Vec<u64> = app.queues.keys().copied().collect();
+                for wid in ids {
+                    // Clone per-window. Records are small
+                    // (one short String + Nums); the extra clone
+                    // is negligible against the syscalls gilrs
+                    // already did to read the event.
+                    let clone = match &record {
+                        EventRecord::GamepadButtonDown { code, gamepad } => {
+                            EventRecord::GamepadButtonDown {
+                                code: code.clone(),
+                                gamepad: *gamepad,
+                            }
+                        }
+                        EventRecord::GamepadButtonUp { code, gamepad } => {
+                            EventRecord::GamepadButtonUp {
+                                code: code.clone(),
+                                gamepad: *gamepad,
+                            }
+                        }
+                        EventRecord::GamepadAxis {
+                            code,
+                            gamepad,
+                            value,
+                        } => EventRecord::GamepadAxis {
+                            code: code.clone(),
+                            gamepad: *gamepad,
+                            value: *value,
+                        },
+                        _ => continue,
+                    };
+                    if let Some(q) = app.queues.get_mut(&wid) {
+                        q.push(clone);
+                    }
+                }
+            });
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -363,12 +519,14 @@ fn ensure_event_loop() {
 /// nothing more to do — Wren drives its own pacing.
 fn pump_once() {
     ensure_event_loop();
+    ensure_gilrs();
     EVENT_LOOP.with(|cell| {
         let mut borrow = cell.borrow_mut();
         let el = borrow.as_mut().expect("event loop missing");
         let mut handler = pump_handler().lock().unwrap();
         let _status = el.pump_app_events(Some(Duration::ZERO), &mut *handler);
     });
+    drain_gilrs();
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +593,76 @@ pub unsafe extern "C" fn wlift_window_destroy(vm: *mut WrenVm) {
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_pump(vm: *mut WrenVm) {
     pump_once();
+    set_return(vm, Value::NULL);
+}
+
+/// `Window.lockCursor(id, lock)` — toggle cursor grab. When
+/// locked the cursor stays inside the window; mouse-moved events
+/// keep flowing so an FPS controller can integrate them. Falls
+/// back transparently from Confined (preferred) to Locked
+/// (macOS Cocoa restriction) since both achieve the FPS behaviour
+/// the caller wants.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_window_set_cursor_lock(vm: *mut WrenVm) {
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.lockCursor: id must be a non-negative number.");
+            return;
+        }
+    };
+    let lock = slot(vm, 2).as_bool().unwrap_or(false);
+    let result = APP.with(|cell| {
+        let app = cell.borrow();
+        let Some(entry) = app.windows.get(&id) else {
+            return Err("unknown window id".to_string());
+        };
+        use winit::window::CursorGrabMode;
+        let mode = if lock {
+            CursorGrabMode::Confined
+        } else {
+            CursorGrabMode::None
+        };
+        match entry.window.set_cursor_grab(mode) {
+            Ok(_) => Ok(()),
+            Err(_) if lock => {
+                // Confined isn't supported (macOS Cocoa) — fall
+                // back to Locked, which warps the cursor to the
+                // window centre every frame. Same end result for
+                // mouselook.
+                entry
+                    .window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    if let Err(e) = result {
+        runtime_error(vm, &format!("Window.lockCursor: {}", e));
+        return;
+    }
+    set_return(vm, Value::NULL);
+}
+
+/// `Window.hideCursor(id, hide)` — show or hide the OS cursor
+/// over this window. Independent of `lockCursor`; an FPS title
+/// typically calls both.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_window_set_cursor_visible(vm: *mut WrenVm) {
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.hideCursor: id must be a non-negative number.");
+            return;
+        }
+    };
+    let hide = slot(vm, 2).as_bool().unwrap_or(false);
+    APP.with(|cell| {
+        if let Some(entry) = cell.borrow().windows.get(&id) {
+            entry.window.set_cursor_visible(!hide);
+        }
+    });
     set_return(vm, Value::NULL);
 }
 
@@ -613,6 +841,42 @@ pub unsafe extern "C" fn wlift_window_drain_events(vm: *mut WrenVm) {
                 map_set(vm, reload_root(vm, map_r), kdx, Value::num(dx));
                 let kdy = alloc_string(vm, "dy");
                 map_set(vm, reload_root(vm, map_r), kdy, Value::num(dy));
+            }
+            EventRecord::GamepadButtonDown { code, gamepad } => {
+                let v = alloc_string(vm, "gamepadButtonDown");
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
+                let kc = alloc_string(vm, "code");
+                let kc_r = push_root(vm, kc);
+                let cv = alloc_string(vm, &code);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kc_r), cv);
+                let kg = alloc_string(vm, "gamepad");
+                map_set(vm, reload_root(vm, map_r), kg, Value::num(gamepad as f64));
+            }
+            EventRecord::GamepadButtonUp { code, gamepad } => {
+                let v = alloc_string(vm, "gamepadButtonUp");
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
+                let kc = alloc_string(vm, "code");
+                let kc_r = push_root(vm, kc);
+                let cv = alloc_string(vm, &code);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kc_r), cv);
+                let kg = alloc_string(vm, "gamepad");
+                map_set(vm, reload_root(vm, map_r), kg, Value::num(gamepad as f64));
+            }
+            EventRecord::GamepadAxis {
+                code,
+                gamepad,
+                value,
+            } => {
+                let v = alloc_string(vm, "gamepadAxis");
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kt_r), v);
+                let kc = alloc_string(vm, "code");
+                let kc_r = push_root(vm, kc);
+                let cv = alloc_string(vm, &code);
+                map_set(vm, reload_root(vm, map_r), reload_root(vm, kc_r), cv);
+                let kg = alloc_string(vm, "gamepad");
+                map_set(vm, reload_root(vm, map_r), kg, Value::num(gamepad as f64));
+                let kv = alloc_string(vm, "value");
+                map_set(vm, reload_root(vm, map_r), kv, Value::num(value));
             }
         }
         // Drop the per-iteration roots; the next iteration's `map`

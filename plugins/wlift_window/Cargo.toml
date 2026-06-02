@@ -1,6 +1,6 @@
 [package]
 name = "wlift_window"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 description = "Default window provider for the WrenLift apps — a winit-backed cdylib bundled into @hatch:window. Exposes a polled event loop and a raw-window-handle Map that @hatch:gpu's Device.createSurface accepts."
 build = "build.rs"
@@ -20,3 +20,9 @@ wlift_abi = { path = "../../crates/wlift_abi" }
 # don't compose cleanly with the polling shape we want.
 winit = { version = "0.30", features = ["rwh_06"] }
 raw-window-handle = "0.6"
+# Gamepad / joystick support. `gilrs` polls the OS input devices
+# on every backend we ship (macOS IOKit / Linux evdev / Windows
+# XInput + DirectInput) and feeds them through one cross-platform
+# event API. Polled inside the same `pump_once` pass that drains
+# the winit event loop so callers get one unified event stream.
+gilrs = "0.10"
