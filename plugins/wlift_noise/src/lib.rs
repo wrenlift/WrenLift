@@ -8,7 +8,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use noise::{NoiseFn, OpenSimplex, Perlin, Value};
+use noise::{NoiseFn, OpenSimplex, Perlin, Value, Worley};
+use noise::core::worley::distance_functions::euclidean;
 use wlift_abi::{runtime_error, set_return, slot, Value as WlValue, WrenVm};
 
 /// Plugin ABI handshake. Called by the host immediately after
@@ -386,6 +387,363 @@ pub unsafe extern "C" fn wlift_noise_fill_simplex2(vm: *mut WrenVm) {
             let x = origin_x + (col as f64) * step_x;
             dst[idx] = n.get([x, y]) as f32;
             idx += 1;
+        }
+    }
+    set_return(vm, WlValue::NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Worley (cellular) noise — F1 distance to nearest seed point.
+// ---------------------------------------------------------------------------
+//
+// Worley generates jittered cell-grid seed points; the value at
+// `(x, y)` is the Euclidean distance to the nearest seed. The
+// underlying crate returns roughly [-1, 1]; we forward as-is so
+// callers can compose with the other noise outputs.
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_worley2(vm: *mut WrenVm) {
+    let x = match req_num(vm, 1, "Noise.worley2", "x") {
+        Some(n) => n,
+        None => return,
+    };
+    let y = match req_num(vm, 2, "Noise.worley2", "y") {
+        Some(n) => n,
+        None => return,
+    };
+    let seed = match req_u32_arg(vm, 3, "Noise.worley2", "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let w = Worley::new(seed).set_distance_function(euclidean);
+    set_return(vm, WlValue::num(w.get([x, y])));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_worley3(vm: *mut WrenVm) {
+    let x = match req_num(vm, 1, "Noise.worley3", "x") {
+        Some(n) => n,
+        None => return,
+    };
+    let y = match req_num(vm, 2, "Noise.worley3", "y") {
+        Some(n) => n,
+        None => return,
+    };
+    let z = match req_num(vm, 3, "Noise.worley3", "z") {
+        Some(n) => n,
+        None => return,
+    };
+    let seed = match req_u32_arg(vm, 4, "Noise.worley3", "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let w = Worley::new(seed).set_distance_function(euclidean);
+    set_return(vm, WlValue::num(w.get([x, y, z])));
+}
+
+// ---------------------------------------------------------------------------
+// Ridged-multi fBM — sharp valleys / ridges, the classic
+// mountain-range generator. Per-octave: take 1 - |noise|, square,
+// accumulate. Returns ≈ [0, 1].
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_ridged_fbm2(vm: *mut WrenVm) {
+    let x = match req_num(vm, 1, "Noise.ridgedFbm2", "x") {
+        Some(n) => n,
+        None => return,
+    };
+    let y = match req_num(vm, 2, "Noise.ridgedFbm2", "y") {
+        Some(n) => n,
+        None => return,
+    };
+    let seed = match req_u32_arg(vm, 3, "Noise.ridgedFbm2", "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let octaves = match req_u32_arg(vm, 4, "Noise.ridgedFbm2", "octaves") {
+        Some(n) if n > 0 && n <= 16 => n,
+        Some(_) => {
+            runtime_error(vm, "Noise.ridgedFbm2: octaves must be in 1..=16.");
+            return;
+        }
+        None => return,
+    };
+    let lacunarity = match req_num(vm, 5, "Noise.ridgedFbm2", "lacunarity") {
+        Some(n) => n,
+        None => return,
+    };
+    let persistence = match req_num(vm, 6, "Noise.ridgedFbm2", "persistence") {
+        Some(n) => n,
+        None => return,
+    };
+    let n = OpenSimplex::new(seed);
+    let mut acc = 0.0;
+    let mut amp = 1.0;
+    let mut freq = 1.0;
+    let mut norm = 0.0;
+    for _ in 0..octaves {
+        let s = n.get([x * freq, y * freq]);
+        let r = 1.0 - s.abs();
+        acc += amp * r * r;
+        norm += amp;
+        amp *= persistence;
+        freq *= lacunarity;
+    }
+    set_return(vm, WlValue::num(if norm > 0.0 { acc / norm } else { 0.0 }));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_ridged_fbm3(vm: *mut WrenVm) {
+    let x = match req_num(vm, 1, "Noise.ridgedFbm3", "x") {
+        Some(n) => n,
+        None => return,
+    };
+    let y = match req_num(vm, 2, "Noise.ridgedFbm3", "y") {
+        Some(n) => n,
+        None => return,
+    };
+    let z = match req_num(vm, 3, "Noise.ridgedFbm3", "z") {
+        Some(n) => n,
+        None => return,
+    };
+    let seed = match req_u32_arg(vm, 4, "Noise.ridgedFbm3", "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let octaves = match req_u32_arg(vm, 5, "Noise.ridgedFbm3", "octaves") {
+        Some(n) if n > 0 && n <= 16 => n,
+        Some(_) => {
+            runtime_error(vm, "Noise.ridgedFbm3: octaves must be in 1..=16.");
+            return;
+        }
+        None => return,
+    };
+    let lacunarity = match req_num(vm, 6, "Noise.ridgedFbm3", "lacunarity") {
+        Some(n) => n,
+        None => return,
+    };
+    let persistence = match req_num(vm, 7, "Noise.ridgedFbm3", "persistence") {
+        Some(n) => n,
+        None => return,
+    };
+    let n = OpenSimplex::new(seed);
+    let mut acc = 0.0;
+    let mut amp = 1.0;
+    let mut freq = 1.0;
+    let mut norm = 0.0;
+    for _ in 0..octaves {
+        let s = n.get([x * freq, y * freq, z * freq]);
+        let r = 1.0 - s.abs();
+        acc += amp * r * r;
+        norm += amp;
+        amp *= persistence;
+        freq *= lacunarity;
+    }
+    set_return(vm, WlValue::num(if norm > 0.0 { acc / norm } else { 0.0 }));
+}
+
+// ---------------------------------------------------------------------------
+// 3D + alternate-flavour bulk fills.
+// ---------------------------------------------------------------------------
+//
+// Shape matches `fill_simplex2`: validate `out` typed-array kind +
+// length, decode the grid spec, write `width * height * depth`
+// (or `* height` for the 2D variants) f32 samples in row-major
+// (z outermost, then y, then x for 3D).
+
+unsafe fn require_f32_out(vm: *mut WrenVm, label: &str) -> Option<&'static mut [u8]> {
+    let bytes = wlift_abi::typed_array_bytes_mut(slot(vm, 1))?;
+    if wlift_abi::typed_array_kind(slot(vm, 1)) != Some(wlift_abi::TypedArrayKind::F32) {
+        runtime_error(vm, &format!("{}: `out` must be a Float32Array.", label));
+        return None;
+    }
+    Some(bytes)
+}
+
+unsafe fn fill_2d_inner<F: Fn(f64, f64) -> f64>(
+    vm: *mut WrenVm,
+    label: &str,
+    sample: F,
+) {
+    let bytes = match require_f32_out(vm, label) {
+        Some(b) => b,
+        None => {
+            runtime_error(vm, &format!("{}: `out` must be a Float32Array.", label));
+            return;
+        }
+    };
+    let origin_x = match req_num(vm, 2, label, "originX") {
+        Some(n) => n,
+        None => return,
+    };
+    let origin_y = match req_num(vm, 3, label, "originY") {
+        Some(n) => n,
+        None => return,
+    };
+    let step_x = match req_num(vm, 4, label, "stepX") {
+        Some(n) => n,
+        None => return,
+    };
+    let step_y = match req_num(vm, 5, label, "stepY") {
+        Some(n) => n,
+        None => return,
+    };
+    let width = match req_u32_arg(vm, 6, label, "width") {
+        Some(n) => n,
+        None => return,
+    };
+    let height = match req_u32_arg(vm, 7, label, "height") {
+        Some(n) => n,
+        None => return,
+    };
+    let needed = (width as usize) * (height as usize) * 4;
+    if bytes.len() < needed {
+        runtime_error(
+            vm,
+            &format!(
+                "{}: `out` holds {} floats, need {} for {}×{}.",
+                label,
+                bytes.len() / 4,
+                width as usize * height as usize,
+                width,
+                height
+            ),
+        );
+        return;
+    }
+    let dst = std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, needed / 4);
+    let mut idx = 0;
+    for row in 0..height {
+        let y = origin_y + (row as f64) * step_y;
+        for col in 0..width {
+            let x = origin_x + (col as f64) * step_x;
+            dst[idx] = sample(x, y) as f32;
+            idx += 1;
+        }
+    }
+    set_return(vm, WlValue::NULL);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_fill_perlin2(vm: *mut WrenVm) {
+    let label = "Noise.fillPerlin2";
+    let seed = match req_u32_arg(vm, 8, label, "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let n = Perlin::new(seed);
+    fill_2d_inner(vm, label, |x, y| n.get([x, y]));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_fill_value2(vm: *mut WrenVm) {
+    let label = "Noise.fillValue2";
+    let seed = match req_u32_arg(vm, 8, label, "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let n = Value::new(seed);
+    fill_2d_inner(vm, label, |x, y| n.get([x, y]));
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_fill_worley2(vm: *mut WrenVm) {
+    let label = "Noise.fillWorley2";
+    let seed = match req_u32_arg(vm, 8, label, "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let n = Worley::new(seed).set_distance_function(euclidean);
+    fill_2d_inner(vm, label, |x, y| n.get([x, y]));
+}
+
+/// 3D Simplex bulk fill. Samples `width * height * depth` values
+/// laid out row-major with z outermost, then y, then x. Used by
+/// procedural volumes, voxel terrain, and 3D weather effects that
+/// need a deterministic noise field generated in one foreign call.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_noise_fill_simplex3(vm: *mut WrenVm) {
+    let label = "Noise.fillSimplex3";
+    let bytes = match wlift_abi::typed_array_bytes_mut(slot(vm, 1)) {
+        Some(b) => b,
+        None => {
+            runtime_error(vm, &format!("{}: `out` must be a Float32Array.", label));
+            return;
+        }
+    };
+    if wlift_abi::typed_array_kind(slot(vm, 1)) != Some(wlift_abi::TypedArrayKind::F32) {
+        runtime_error(vm, &format!("{}: `out` must be a Float32Array.", label));
+        return;
+    }
+    let origin_x = match req_num(vm, 2, label, "originX") {
+        Some(n) => n,
+        None => return,
+    };
+    let origin_y = match req_num(vm, 3, label, "originY") {
+        Some(n) => n,
+        None => return,
+    };
+    let origin_z = match req_num(vm, 4, label, "originZ") {
+        Some(n) => n,
+        None => return,
+    };
+    let step_x = match req_num(vm, 5, label, "stepX") {
+        Some(n) => n,
+        None => return,
+    };
+    let step_y = match req_num(vm, 6, label, "stepY") {
+        Some(n) => n,
+        None => return,
+    };
+    let step_z = match req_num(vm, 7, label, "stepZ") {
+        Some(n) => n,
+        None => return,
+    };
+    let width = match req_u32_arg(vm, 8, label, "width") {
+        Some(n) => n,
+        None => return,
+    };
+    let height = match req_u32_arg(vm, 9, label, "height") {
+        Some(n) => n,
+        None => return,
+    };
+    let depth = match req_u32_arg(vm, 10, label, "depth") {
+        Some(n) => n,
+        None => return,
+    };
+    let seed = match req_u32_arg(vm, 11, label, "seed") {
+        Some(n) => n,
+        None => return,
+    };
+    let needed = (width as usize) * (height as usize) * (depth as usize) * 4;
+    if bytes.len() < needed {
+        runtime_error(
+            vm,
+            &format!(
+                "{}: `out` holds {} floats, need {} for {}×{}×{}.",
+                label,
+                bytes.len() / 4,
+                width as usize * height as usize * depth as usize,
+                width,
+                height,
+                depth
+            ),
+        );
+        return;
+    }
+    let n = OpenSimplex::new(seed);
+    let dst = std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, needed / 4);
+    let mut idx = 0;
+    for slice in 0..depth {
+        let z = origin_z + (slice as f64) * step_z;
+        for row in 0..height {
+            let y = origin_y + (row as f64) * step_y;
+            for col in 0..width {
+                let x = origin_x + (col as f64) * step_x;
+                dst[idx] = n.get([x, y, z]) as f32;
+                idx += 1;
+            }
         }
     }
     set_return(vm, WlValue::NULL);
