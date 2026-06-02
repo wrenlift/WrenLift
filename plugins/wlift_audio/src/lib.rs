@@ -111,6 +111,25 @@ fn next_id() -> u64 {
 // Mixer state — shared between the Wren thread and cpal's audio thread
 // ---------------------------------------------------------------------------
 
+/// Four bus indices the mixer multiplies into every voice. Master
+/// applies after everyone else: master = 0.5 halves the whole
+/// scene regardless of per-bus settings.
+const BUS_MASTER: usize = 0;
+const BUS_MUSIC: usize = 1;
+const BUS_SFX: usize = 2;
+const BUS_UI: usize = 3;
+const BUS_COUNT: usize = 4;
+
+fn bus_index_from_name(name: &str) -> Option<usize> {
+    Some(match name {
+        "master" => BUS_MASTER,
+        "music" => BUS_MUSIC,
+        "sfx" => BUS_SFX,
+        "ui" => BUS_UI,
+        _ => return None,
+    })
+}
+
 #[derive(Default)]
 struct MixerState {
     /// Decoded PCM samples per Sound id. Stereo, f32, interleaved.
@@ -118,6 +137,10 @@ struct MixerState {
     sounds: HashMap<u64, Arc<Vec<f32>>>,
     /// Live voices.
     voices: Vec<Voice>,
+    /// Per-bus volume scalars. Initialised to 1.0 so a caller
+    /// who never touches Audio.group(...).volume gets identical
+    /// behaviour to the pre-bus API.
+    bus_volumes: [f32; BUS_COUNT],
 }
 
 struct Voice {
@@ -129,13 +152,25 @@ struct Voice {
     cursor: usize, // index into samples (already in stereo frames * 2)
     volume: f32,
     looping: bool,
+    /// Which bus this voice mixes into. Default `BUS_SFX` so
+    /// `Audio.play(snd)` without an explicit group lands on the
+    /// SFX bus — the convention every game wants for one-shots.
+    bus: usize,
 }
 
 static MIXER: OnceLock<Mutex<MixerState>> = OnceLock::new();
 static STREAM: OnceLock<Mutex<StreamHolder>> = OnceLock::new();
 
 fn mixer() -> &'static Mutex<MixerState> {
-    MIXER.get_or_init(|| Mutex::new(MixerState::default()))
+    MIXER.get_or_init(|| {
+        Mutex::new(MixerState {
+            sounds: HashMap::new(),
+            voices: Vec::new(),
+            // Every bus starts at unity so behaviour is identical
+            // for callers who never reach for setGroupVolume.
+            bus_volumes: [1.0; BUS_COUNT],
+        })
+    })
 }
 
 /// We don't expose the `cpal::Stream` to safe Rust — it isn't
@@ -266,6 +301,10 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
     if mix.voices.is_empty() {
         return;
     }
+    // Snapshot bus scalars before the hot loop so the per-frame
+    // path reads them with no further indirection.
+    let bus_volumes = mix.bus_volumes;
+    let master = bus_volumes[BUS_MASTER];
     let dc = device_channels as usize;
     let frame_count = data.len() / dc.max(1);
     let mut i = 0;
@@ -275,6 +314,9 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
         let total_frames = src.len() / 2;
         let mut local_cursor = v.cursor;
         let mut emitted = 0usize;
+        // Final scalar = voice * bus * master. Master applies to
+        // every voice; per-bus to voices on that bus only.
+        let scale = v.volume * bus_volumes[v.bus] * master;
         while emitted < frame_count && local_cursor < src.len() {
             let l = src[local_cursor];
             let r = if local_cursor + 1 < src.len() {
@@ -285,16 +327,16 @@ fn fill_buffer_f32(data: &mut [f32], device_channels: u16) {
             let base = emitted * dc;
             match dc {
                 1 => {
-                    data[base] += 0.5 * (l + r) * v.volume;
+                    data[base] += 0.5 * (l + r) * scale;
                 }
                 2 => {
-                    data[base] += l * v.volume;
-                    data[base + 1] += r * v.volume;
+                    data[base] += l * scale;
+                    data[base + 1] += r * scale;
                 }
                 _ => {
-                    data[base] += l * v.volume;
+                    data[base] += l * scale;
                     if dc > 1 {
-                        data[base + 1] += r * v.volume;
+                        data[base + 1] += r * scale;
                     }
                 }
             }
@@ -326,52 +368,36 @@ pub unsafe extern "C" fn wlift_audio_sound_load(vm: *mut WrenVm) {
         Some(b) => b,
         None => return,
     };
-    let mut reader = match hound::WavReader::new(Cursor::new(&bytes)) {
-        Ok(r) => r,
-        Err(e) => {
-            runtime_error(vm, &format!("Sound.load: WAV parse: {}", e));
-            return;
+    // Format dispatch by magic number. WAV starts with `RIFF...`
+    // / `RIFX` (rare big-endian variant); OGG starts with `OggS`.
+    // Anything else surfaces as a clean error rather than hounding
+    // wave-parsing into junk frames.
+    let (samples, channels) = if bytes.len() >= 4 && (&bytes[..4] == b"OggS") {
+        match decode_ogg(&bytes) {
+            Ok(pair) => pair,
+            Err(e) => {
+                runtime_error(vm, &format!("Sound.load: OGG decode: {}", e));
+                return;
+            }
         }
+    } else if bytes.len() >= 4 && (&bytes[..4] == b"RIFF" || &bytes[..4] == b"RIFX") {
+        match decode_wav(&bytes) {
+            Ok(pair) => pair,
+            Err(e) => {
+                runtime_error(vm, &format!("Sound.load: WAV decode: {}", e));
+                return;
+            }
+        }
+    } else {
+        runtime_error(
+            vm,
+            "Sound.load: unrecognised container (need WAV / OGG Vorbis).",
+        );
+        return;
     };
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let bits = spec.bits_per_sample;
-    let format = spec.sample_format;
 
-    let mut samples: Vec<f32> = Vec::new();
-    match format {
-        hound::SampleFormat::Int => {
-            let max = match bits {
-                8 => 127.0,
-                16 => 32767.0,
-                24 => 8_388_607.0,
-                32 => 2_147_483_647.0,
-                _ => 32767.0,
-            };
-            for s in reader.samples::<i32>() {
-                match s {
-                    Ok(v) => samples.push(v as f32 / max),
-                    Err(e) => {
-                        runtime_error(vm, &format!("Sound.load: sample read: {}", e));
-                        return;
-                    }
-                }
-            }
-        }
-        hound::SampleFormat::Float => {
-            for s in reader.samples::<f32>() {
-                match s {
-                    Ok(v) => samples.push(v),
-                    Err(e) => {
-                        runtime_error(vm, &format!("Sound.load: sample read: {}", e));
-                        return;
-                    }
-                }
-            }
-        }
-    }
     // Mono → stereo expansion (duplicate). >2 channels gets
-    // down-mixed by averaging the first two for now.
+    // down-mixed by taking the first two channels for now.
     let stereo: Vec<f32> = if channels == 1 {
         samples.iter().flat_map(|&s| [s, s]).collect()
     } else if channels == 2 {
@@ -390,6 +416,73 @@ pub unsafe extern "C" fn wlift_audio_sound_load(vm: *mut WrenVm) {
     let id = next_id();
     mixer().lock().unwrap().sounds.insert(id, Arc::new(stereo));
     set_return(vm, Value::num(id as f64));
+}
+
+fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
+    let mut reader = hound::WavReader::new(Cursor::new(bytes))
+        .map_err(|e| format!("WAV parse: {}", e))?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    let bits = spec.bits_per_sample;
+    let mut samples: Vec<f32> = Vec::new();
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max = match bits {
+                8 => 127.0,
+                16 => 32767.0,
+                24 => 8_388_607.0,
+                32 => 2_147_483_647.0,
+                _ => 32767.0,
+            };
+            for s in reader.samples::<i32>() {
+                match s {
+                    Ok(v) => samples.push(v as f32 / max),
+                    Err(e) => return Err(format!("sample read: {}", e)),
+                }
+            }
+        }
+        hound::SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                match s {
+                    Ok(v) => samples.push(v),
+                    Err(e) => return Err(format!("sample read: {}", e)),
+                }
+            }
+        }
+    }
+    Ok((samples, channels))
+}
+
+fn decode_ogg(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
+    use lewton::inside_ogg::OggStreamReader;
+    let mut reader = OggStreamReader::new(Cursor::new(bytes))
+        .map_err(|e| format!("ogg parse: {}", e))?;
+    let channels = reader.ident_hdr.audio_channels as usize;
+    let mut samples: Vec<f32> = Vec::new();
+    // Each `read_dec_packet` returns a `Vec<Vec<i16>>` with one
+    // inner vec per channel, samples interleaved within. We
+    // re-interleave + convert to f32 here so downstream sees the
+    // standard interleaved float buffer the mixer wants.
+    loop {
+        match reader.read_dec_packet() {
+            Ok(Some(packet)) => {
+                if packet.is_empty() {
+                    continue;
+                }
+                let frames = packet[0].len();
+                samples.reserve(frames * channels);
+                for f in 0..frames {
+                    for ch in 0..channels {
+                        let s = packet[ch][f];
+                        samples.push(s as f32 / 32768.0);
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("ogg decode: {}", e)),
+        }
+    }
+    Ok((samples, channels))
 }
 
 #[no_mangle]
@@ -422,6 +515,12 @@ pub unsafe extern "C" fn wlift_audio_play(vm: *mut WrenVm) {
     let looping = map_get(options, "loop")
         .map(|v| !is_falsy(v))
         .unwrap_or(false);
+    // `group` defaults to "sfx" — one-shots are the dominant
+    // playback shape; music + UI explicitly opt into their bus.
+    let bus = map_get(options, "group")
+        .and_then(|v| wlift_abi::string_str(v).map(|s| s.to_string()))
+        .and_then(|s| bus_index_from_name(&s))
+        .unwrap_or(BUS_SFX);
 
     let mut mix = mixer().lock().unwrap();
     let samples = match mix.sounds.get(&id) {
@@ -438,8 +537,73 @@ pub unsafe extern "C" fn wlift_audio_play(vm: *mut WrenVm) {
         cursor: 0,
         volume,
         looping,
+        bus,
     });
     set_return(vm, Value::NULL);
+}
+
+/// `Audio.setGroupVolume(name, volume)` — set a bus scalar.
+/// `master` multiplies after every per-bus scalar so it acts as
+/// the global volume; the other three buses (`music`, `sfx`,
+/// `ui`) are independent.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_audio_set_group_volume(vm: *mut WrenVm) {
+    let name = match wlift_abi::string_str(slot(vm, 1)) {
+        Some(s) => s.to_string(),
+        None => {
+            runtime_error(vm, "Audio.setGroupVolume: name must be a String.");
+            return;
+        }
+    };
+    let vol = match slot(vm, 2).as_num() {
+        Some(n) => n as f32,
+        None => {
+            runtime_error(vm, "Audio.setGroupVolume: volume must be a Num.");
+            return;
+        }
+    };
+    let bus = match bus_index_from_name(&name) {
+        Some(b) => b,
+        None => {
+            runtime_error(
+                vm,
+                &format!(
+                    "Audio.setGroupVolume: unknown group '{}'; expected master / music / sfx / ui.",
+                    name
+                ),
+            );
+            return;
+        }
+    };
+    mixer().lock().unwrap().bus_volumes[bus] = vol.max(0.0);
+    set_return(vm, Value::NULL);
+}
+
+/// `Audio.groupVolume(name)` — read the current bus scalar.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_audio_group_volume(vm: *mut WrenVm) {
+    let name = match wlift_abi::string_str(slot(vm, 1)) {
+        Some(s) => s.to_string(),
+        None => {
+            runtime_error(vm, "Audio.groupVolume: name must be a String.");
+            return;
+        }
+    };
+    let bus = match bus_index_from_name(&name) {
+        Some(b) => b,
+        None => {
+            runtime_error(
+                vm,
+                &format!(
+                    "Audio.groupVolume: unknown group '{}'; expected master / music / sfx / ui.",
+                    name
+                ),
+            );
+            return;
+        }
+    };
+    let v = mixer().lock().unwrap().bus_volumes[bus];
+    set_return(vm, Value::num(v as f64));
 }
 
 #[no_mangle]

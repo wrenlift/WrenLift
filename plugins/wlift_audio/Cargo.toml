@@ -1,8 +1,8 @@
 [package]
 name = "wlift_audio"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
-description = "Audio playback for the WrenLift apps. cpal-backed output stream + a tiny mixer; WAV decoding via hound. Bundled into @hatch:audio."
+description = "Audio playback for the WrenLift apps. cpal-backed output stream + a tiny mixer; WAV decoding via hound, OGG Vorbis via lewton; named bus groups (master/music/sfx/ui) with independent volume. Bundled into @hatch:audio."
 build = "build.rs"
 
 [lib]
@@ -16,3 +16,7 @@ crate-type = ["cdylib"]
 wlift_abi = { path = "../../crates/wlift_abi" }
 cpal  = "0.17"
 hound = "3.5"
+# Pure-Rust OGG Vorbis decoder. Smaller dep footprint than
+# symphonia for the WAV+OGG-only surface we want. Stereo
+# interleaved f32 output matches the mixer's native format.
+lewton = "0.10"
