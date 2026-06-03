@@ -6734,6 +6734,7 @@ name = "wlift_image"
 version = "0.1.5"
 dependencies = [
  "image",
+ "once_cell",
  "wlift_abi",
 ]
 
