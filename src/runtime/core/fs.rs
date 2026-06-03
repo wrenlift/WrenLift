@@ -49,16 +49,26 @@ fn fs_write_text(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 
 // --- Bytes --------------------------------------------------------------
 
-/// FS.readBytes(path) → List of Num (0–255). Useful for binary
-/// files where UTF-8 decoding would mangle the bytes.
+/// FS.readBytes(path) → ByteArray (native u8 storage, one
+/// contiguous allocation). Useful for binary files where UTF-8
+/// decoding would mangle the bytes. Indexed access (`bytes[i]`)
+/// + iteration work identically to a `List<Num>`; the difference
+/// is one allocation regardless of file size.
 fn fs_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = super::validate_string(ctx, args[1], "Path") else {
         return Value::null();
     };
     match fs::read(&path) {
         Ok(bytes) => {
-            let elements: Vec<Value> = bytes.iter().map(|&b| Value::num(b as f64)).collect();
-            ctx.alloc_list(elements)
+            let len = bytes.len() as u32;
+            let result = ctx.alloc_typed_array(len, crate::runtime::object::TypedArrayKind::U8);
+            let arr_ptr = result.as_object().unwrap()
+                as *mut crate::runtime::object::ObjTypedArray;
+            unsafe {
+                let dst = (*arr_ptr).as_bytes_mut();
+                dst.copy_from_slice(&bytes);
+            }
+            result
         }
         Err(e) => {
             ctx.runtime_error(format!("FS.readBytes: {}: {}", path, e));
@@ -67,20 +77,39 @@ fn fs_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     }
 }
 
-/// FS.writeBytes(path, list). Each list entry must be an integer
-/// in 0..=255; non-integers abort.
+/// FS.writeBytes(path, bytes). `bytes` is either a `ByteArray` (one
+/// contiguous slice of u8, the common path) or a `List<Num>` where
+/// each entry is an integer in 0..=255.
 fn fs_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = super::validate_string(ctx, args[1], "Path") else {
         return Value::null();
     };
-    let list_val = args[2];
-    let list_ptr = match list_val.as_object() {
-        Some(p) => p as *const crate::runtime::object::ObjList,
+    let arg = args[2];
+    let obj_ptr = match arg.as_object() {
+        Some(p) => p,
         None => {
-            ctx.runtime_error("FS.writeBytes: Bytes must be a list.".to_string());
+            ctx.runtime_error(
+                "FS.writeBytes: bytes must be a ByteArray or a List of integers.".to_string(),
+            );
             return Value::null();
         }
     };
+    // Try ByteArray first — single-slice fast path.
+    unsafe {
+        let header = &*(obj_ptr as *const crate::runtime::object::ObjHeader);
+        if header.obj_type == crate::runtime::object::ObjType::TypedArray {
+            let arr = &*(obj_ptr as *const crate::runtime::object::ObjTypedArray);
+            if arr.kind_tag() == crate::runtime::object::TypedArrayKind::U8 {
+                let bytes = arr.as_bytes();
+                if let Err(e) = fs::write(&path, bytes) {
+                    ctx.runtime_error(format!("FS.writeBytes: {}: {}", path, e));
+                }
+                return Value::null();
+            }
+        }
+    }
+    // Fallback: List<Num>.
+    let list_ptr = obj_ptr as *const crate::runtime::object::ObjList;
     let (count, ptr) = unsafe { ((*list_ptr).count as usize, (*list_ptr).elements) };
     let mut bytes = Vec::with_capacity(count);
     for i in 0..count {
