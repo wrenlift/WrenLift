@@ -3032,6 +3032,10 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
             index_count: u32,
             instance_count: u32,
         },
+        DrawIndexedIndirect {
+            buffer: u64,
+            offset: u64,
+        },
     }
     let mut decoded: Vec<Cmd> = Vec::with_capacity(commands_list.count as usize);
     for i in 0..commands_list.count as usize {
@@ -3103,6 +3107,18 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
                 decoded.push(Cmd::DrawIndexed {
                     index_count: ic,
                     instance_count: inst,
+                });
+            }
+            "drawIndexedIndirect" => {
+                let b = map_get(cmd, "buffer")
+                    .and_then(Value::as_num)
+                    .unwrap_or(0.0) as u64;
+                let off = map_get(cmd, "offset")
+                    .and_then(Value::as_num)
+                    .unwrap_or(0.0) as u64;
+                decoded.push(Cmd::DrawIndexedIndirect {
+                    buffer: b,
+                    offset: off,
                 });
             }
             other => {
@@ -3242,6 +3258,22 @@ pub unsafe extern "C" fn wlift_gpu_encoder_record_pass(vm: *mut WrenVm) {
                     instance_count,
                 } => {
                     pass.draw_indexed(0..*index_count, 0, 0..*instance_count);
+                }
+                Cmd::DrawIndexedIndirect { buffer, offset } => {
+                    let buf = match buf_reg.buffers.get(buffer) {
+                        Some(b) => &b.buffer,
+                        None => {
+                            runtime_error(
+                                vm,
+                                &format!(
+                                    "RenderPass.drawIndexedIndirect: buffer id {} not found",
+                                    buffer
+                                ),
+                            );
+                            return;
+                        }
+                    };
+                    pass.draw_indexed_indirect(buf, *offset);
                 }
             }
         }
