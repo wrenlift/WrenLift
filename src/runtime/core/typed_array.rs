@@ -252,6 +252,61 @@ fn byte_array_to_utf8_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Val
     }
 }
 
+/// ByteArray.parseF64(off, len) — parse a decimal number directly
+/// from a byte range, no intermediate String allocation. Parsers that
+/// scan number tokens via byte indices can call this instead of
+/// `utf8Slice` + `Num.fromString` — one FFI hop, no temp String,
+/// uses Rust's `f64::from_str` (the same lexical_core-backed path
+/// Num.fromString uses). Returns `null` on parse failure so callers
+/// can guard.
+fn byte_array_parse_f64(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    // Validate off / len BEFORE borrowing the byte slice. as_num()
+    // could in principle trigger a GC path on something exotic
+    // (it doesn't in practice today, but pinning the borrow's
+    // lifetime to as little code as possible is the safe shape).
+    let off = match args[1].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+        _ => {
+            ctx.runtime_error("ByteArray.parseF64: off must be a non-negative integer.".into());
+            return Value::null();
+        }
+    };
+    let len = match args[2].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+        _ => {
+            ctx.runtime_error("ByteArray.parseF64: len must be a non-negative integer.".into());
+            return Value::null();
+        }
+    };
+
+    // Borrow the byte slice, slice + str-cast + f64-parse in one
+    // tight block, materialise the f64 BEFORE returning so we never
+    // re-touch the borrow after the parse. No GC root juggling
+    // because we don't allocate anything Wren-side on the hot path.
+    let parsed: Option<f64> = {
+        let arr = unsafe {
+            let ptr = args[0].as_object().unwrap();
+            &*(ptr as *const ObjTypedArray)
+        };
+        let bytes = arr.as_bytes();
+        let end = off.saturating_add(len);
+        if end > bytes.len() {
+            None
+        } else {
+            // The byte range came from the parser's scan loop, which
+            // already restricted it to ASCII digits / '-' / '.' /
+            // 'e' / 'E' / '+' — valid UTF-8 by construction. Skip
+            // the validation pass.
+            let s = unsafe { std::str::from_utf8_unchecked(&bytes[off..end]) };
+            s.parse::<f64>().ok()
+        }
+    };
+    match parsed {
+        Some(n) => Value::num(n),
+        None    => Value::null(),
+    }
+}
+
 /// ByteArray.utf8Slice(off, len) — interpret bytes [off, off+len) as
 /// UTF-8 and return a fresh String. The bounded slice variant that
 /// per-token parsers (JSON / TOML / CSV) want — no temp ByteArray
@@ -720,6 +775,11 @@ pub fn bind(vm: &mut VM) {
         // a fresh String per accumulator slot.
         vm.primitive(cls, "toUtf8String", byte_array_to_utf8_string);
         vm.primitive(cls, "utf8Slice(_,_)", byte_array_utf8_slice);
+        // Token-emitting primitives: parsers call these per token
+        // (number / quoted-string) so the slice + parse / slice +
+        // intern fuse into a single FFI hop with no intermediate
+        // Wren-side String allocation.
+        vm.primitive(cls, "parseF64(_,_)", byte_array_parse_f64);
     }
 
     // Int32Array
