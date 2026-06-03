@@ -236,6 +236,69 @@ fn byte_array_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
     result
 }
 
+/// ByteArray.toUtf8String — interpret the whole buffer as UTF-8 and
+/// return a fresh String. One FFI hop, one validation pass, one
+/// allocation; replaces the pure-Wren `chars.add(String.fromCodePoint(b))
+/// + chars.join("")` pattern that was O(n) iterations + an O(n) join
+/// over thousands of one-char Strings.
+fn byte_array_to_utf8_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let bytes = receiver_ta_bytes(args);
+    match std::str::from_utf8(bytes) {
+        Ok(s) => ctx.alloc_string(s.to_string()),
+        Err(_) => {
+            ctx.runtime_error("ByteArray.toUtf8String: bytes are not valid UTF-8.".to_string());
+            Value::null()
+        }
+    }
+}
+
+/// ByteArray.utf8Slice(off, len) — interpret bytes [off, off+len) as
+/// UTF-8 and return a fresh String. The bounded slice variant that
+/// per-token parsers (JSON / TOML / CSV) want — no temp ByteArray
+/// allocation, one FFI hop per emitted token.
+fn byte_array_utf8_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
+    let bytes = receiver_ta_bytes(args);
+    let off = match args[1].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+        _ => {
+            ctx.runtime_error("ByteArray.utf8Slice: off must be a non-negative integer.".into());
+            return Value::null();
+        }
+    };
+    let len = match args[2].as_num() {
+        Some(n) if n.is_finite() && n >= 0.0 && n.fract() == 0.0 => n as usize,
+        _ => {
+            ctx.runtime_error("ByteArray.utf8Slice: len must be a non-negative integer.".into());
+            return Value::null();
+        }
+    };
+    let end = off.saturating_add(len);
+    if end > bytes.len() {
+        ctx.runtime_error(format!(
+            "ByteArray.utf8Slice: off={} + len={} > buffer length {}.",
+            off, len, bytes.len()));
+        return Value::null();
+    }
+    match std::str::from_utf8(&bytes[off..end]) {
+        Ok(s) => ctx.alloc_string(s.to_string()),
+        Err(_) => {
+            ctx.runtime_error("ByteArray.utf8Slice: slice is not valid UTF-8.".to_string());
+            Value::null()
+        }
+    }
+}
+
+// Borrow the bytes of the receiver ByteArray. Helper for the
+// to_utf8_string / utf8_slice primitives. The receiver lives for
+// the duration of the foreign call; the cast extends its lifetime
+// to the borrow, which is sound because the GC doesn't relocate
+// while a primitive is on the stack.
+fn receiver_ta_bytes<'a>(args: &'a [Value]) -> &'a [u8] {
+    let arr = receiver_ta(args);
+    let b = arr.as_bytes();
+    unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
+}
+
 // --- Accessors -------------------------------------------------
 
 fn ta_count(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
@@ -651,6 +714,12 @@ pub fn bind(vm: &mut VM) {
             byte_array_copy_to_int32_array_u16);
         vm.primitive(cls, "copyU8ToInt32Array(_,_,_,_,_)",
             byte_array_copy_to_int32_array_u8);
+        // Bulk UTF-8 decoders — replace the pure-Wren
+        // `chars.add(String.fromCodePoint(b)); chars.join("")` pattern
+        // that O(n²)'s on multi-MB buffers because the join allocates
+        // a fresh String per accumulator slot.
+        vm.primitive(cls, "toUtf8String", byte_array_to_utf8_string);
+        vm.primitive(cls, "utf8Slice(_,_)", byte_array_utf8_slice);
     }
 
     // Int32Array
