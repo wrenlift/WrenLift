@@ -311,6 +311,7 @@ struct NewWindowRequest {
     width: u32,
     height: u32,
     resizable: bool,
+    visible: bool,
 }
 
 impl PumpHandler {
@@ -337,14 +338,35 @@ impl PumpHandler {
                     req.width as f64,
                     req.height as f64,
                 ))
-                .with_resizable(req.resizable);
+                .with_resizable(req.resizable)
+                // Open hidden so Game.run can finish GPU init + paint
+                // a real clear frame BEFORE the user sees anything.
+                // Without this the OS shows the default background
+                // (white on macOS) for the few hundred ms between
+                // Window.create returning and the first present
+                // landing — flashing the window is a worse first
+                // impression than waiting a beat longer.
+                // `Window.show()` flips this once init is done.
+                .with_visible(req.visible);
             match event_loop.create_window(attrs) {
                 Ok(window) => {
                     let winit_id = window.id();
+                    // PHYSICAL pixels — what wgpu's surface needs and
+                    // what the Resized event later reports. The
+                    // request size was LOGICAL (so winit could honour
+                    // the monitor's scale factor when opening); on a
+                    // 2× retina display that means the actual surface
+                    // backing is 2× larger than what we asked for.
+                    // Storing the request value here would size the
+                    // swap chain to a quarter of the visible window,
+                    // surfacing as a small clear-coloured rectangle
+                    // in the bottom-left corner with the rest of the
+                    // window painted by the OS default background.
+                    let inner = window.inner_size();
                     let entry = WindowEntry {
                         window,
-                        width: req.width,
-                        height: req.height,
+                        width:  inner.width,
+                        height: inner.height,
                         close_requested: false,
                     };
                     APP.with(|cell| {
@@ -538,6 +560,10 @@ fn pump_once() {
 ///   "width":     Num     (default 1280)
 ///   "height":    Num     (default 720)
 ///   "resizable": Bool    (default true)
+///   "visible":   Bool    (default true) — pass `false` to open
+///                hidden; the caller then calls `Window.show(id)`
+///                once it has painted the first frame, avoiding
+///                the OS-default-background flash during GPU init.
 ///
 /// Returns the window id (Num).
 #[no_mangle]
@@ -557,6 +583,9 @@ pub unsafe extern "C" fn wlift_window_create(vm: *mut WrenVm) {
     let resizable = map_get(desc, "resizable")
         .map(|v| !(v.is_null() || v == Value::FALSE))
         .unwrap_or(true);
+    let visible = map_get(desc, "visible")
+        .map(|v| !(v.is_null() || v == Value::FALSE))
+        .unwrap_or(true);
 
     let id = next_id();
     pump_handler().lock().unwrap().new_windows.push((
@@ -566,6 +595,7 @@ pub unsafe extern "C" fn wlift_window_create(vm: *mut WrenVm) {
             width,
             height,
             resizable,
+            visible,
         },
     ));
     // Run a pump so the window actually materialises before
@@ -593,6 +623,33 @@ pub unsafe extern "C" fn wlift_window_destroy(vm: *mut WrenVm) {
 #[no_mangle]
 pub unsafe extern "C" fn wlift_window_pump(vm: *mut WrenVm) {
     pump_once();
+    set_return(vm, Value::NULL);
+}
+
+/// `Window.setVisible(id, visible)` — flip the OS-window's
+/// visibility. The typical use is opening hidden (`Window.create`
+/// with `"visible": false`), running GPU device + surface + first
+/// paint, then `Window.setVisible(id, true)`. Doing it that way
+/// instead of paint-while-OS-shows-default-background avoids the
+/// brief white flash macOS otherwise shows for the few hundred
+/// milliseconds between window create and first present.
+#[no_mangle]
+pub unsafe extern "C" fn wlift_window_set_visible(vm: *mut WrenVm) {
+    let id = match slot(vm, 1).as_num() {
+        Some(n) if n >= 0.0 => n as u64,
+        _ => {
+            runtime_error(vm, "Window.setVisible: id must be a non-negative number.");
+            return;
+        }
+    };
+    let v = slot(vm, 2);
+    let visible = !(v.is_null() || v == Value::FALSE);
+    APP.with(|cell| {
+        let app = cell.borrow();
+        if let Some(entry) = app.windows.get(&id) {
+            entry.window.set_visible(visible);
+        }
+    });
     set_return(vm, Value::NULL);
 }
 
