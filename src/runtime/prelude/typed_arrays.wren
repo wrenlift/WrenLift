@@ -33,6 +33,37 @@ class ByteArray {
   toList {}
 
   toString {}
+
+  /// Read one little-endian 32-bit float at `byteOffset`. Native
+  /// — significantly faster than reconstructing the IEEE-754 value
+  /// from `[byte]` indices in Wren. Use this in binary-asset hot
+  /// paths (glTF / .glb / OBJ).
+  readF32LE(byteOffset) {}
+
+  /// Read one little-endian unsigned 16-bit value, widened to Num.
+  readU16LE(byteOffset) {}
+
+  /// Read one little-endian unsigned 32-bit value, widened to Num.
+  readU32LE(byteOffset) {}
+
+  /// Bulk decode: read `count` little-endian f32 values starting
+  /// at byte offset `srcByteOffset`, writing them into `dst` (a
+  /// `Float32Array`) starting at element offset `dstOffset`.
+  /// `stride` is the byte stride between consecutive source f32s
+  /// (≥ 4; 0 / 4 means tight packing).
+  ///
+  /// One FFI call covers the entire accessor — the inner loop is
+  /// a tight Rust copy.
+  copyToFloat32Array(srcByteOffset, count, dst, dstOffset, stride) {}
+
+  /// Bulk decode: read `count` little-endian u16 values, widen to
+  /// i32, write into `dst` (an `Int32Array`). `stride` ≥ 2.
+  /// Typical use: glTF JOINTS_0 with `componentType: 5123`.
+  copyU16LEToInt32Array(srcByteOffset, count, dst, dstOffset, stride) {}
+
+  /// Bulk decode: read `count` u8 values, widen to i32, write into
+  /// `dst` (an `Int32Array`). `stride` ≥ 1.
+  copyU8ToInt32Array(srcByteOffset, count, dst, dstOffset, stride) {}
 }
 
 /// `count`-element i32 buffer. Same shape as `ByteArray`;
