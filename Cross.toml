@@ -1,23 +1,34 @@
 # Cross-rs container customisation for cargo cross-builds.
 #
-# `wlift_audio` depends on `cpal`, which on Linux pulls in
-# `alsa-sys` and needs `libasound2-dev` headers at compile time.
-# The default `cross-rs` image for `aarch64-unknown-linux-gnu`
-# ships without ALSA, so the build script panics with:
+# Native-linker plugins on Linux depend on a small zoo of system
+# libraries at build time. The default `cross-rs` image for
+# `aarch64-unknown-linux-gnu` ships without any of them, so the
+# corresponding build scripts panic at first compile. The set
+# below covers every current native plugin:
 #
-#   The system library `alsa` required by crate `alsa-sys`
-#   was not found. ... HINT: you may need to install a package
-#   such as alsa, alsa-dev or alsa-devel.
+#   libasound2-dev  → wlift_audio  (cpal → alsa-sys)
+#   libudev-dev     → wlift_window (winit input device
+#                      enumeration)
+#   libxkbcommon-dev,
+#   libwayland-dev,
+#   libx11-dev,
+#   libxcb1-dev,
+#   libxrandr-dev,
+#   libxinerama-dev,
+#   libxcursor-dev,
+#   libxi-dev       → wlift_window (winit X11 + wayland
+#                      backends; winit picks one at runtime, so
+#                      both have to be linkable at build time
+#                      even on a headless cross runner)
 #
 # `pre-build` runs inside the container before each cargo build,
-# adding the arm64 architecture and apt-installing the matching
-# `libasound2-dev:arm64` package. The host package brings the
-# `.pc` file pkg-config needs, the `:arm64` variant brings the
-# arm64 sysroot headers + lib stubs the cross compiler links
-# against.
+# adding the arm64 architecture and apt-installing each library
+# in both flavours: the host package brings the `.pc` file
+# pkg-config needs, the `:arm64` variant brings the arm64
+# sysroot headers + lib stubs the cross compiler links against.
 #
-# Cheap to keep around even when wlift_audio isn't being built —
-# `pre-build` only runs for the configured target.
+# Cheap to keep around even when only one plugin is being
+# built — `pre-build` only runs for the configured target.
 
 [target.aarch64-unknown-linux-gnu]
 # Pin to `:main` so the container is jammy (22.04) — the older
@@ -28,5 +39,5 @@
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
 pre-build = [
     "dpkg --add-architecture arm64",
-    "apt-get update && apt-get install --assume-yes pkg-config libasound2-dev libasound2-dev:arm64",
+    "apt-get update && apt-get install --assume-yes pkg-config libasound2-dev libasound2-dev:arm64 libudev-dev libudev-dev:arm64 libxkbcommon-dev libxkbcommon-dev:arm64 libwayland-dev libwayland-dev:arm64 libx11-dev libx11-dev:arm64 libxcb1-dev libxcb1-dev:arm64 libxrandr-dev libxrandr-dev:arm64 libxinerama-dev libxinerama-dev:arm64 libxcursor-dev libxcursor-dev:arm64 libxi-dev libxi-dev:arm64",
 ]
