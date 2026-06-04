@@ -753,33 +753,25 @@ fn try_krio_call(target: *mut ObjFiber, input: Value) -> Option<Value> {
             }
         }
         krio_fiber::FiberStep::Done => {
-            // Wren semantics:
-            //   - Fiber.call() returns the body's last-expression value.
-            //   - Fiber.try()  returns null on clean exit, the abort
-            //                  message on Fiber.abort() / runtime error.
+            // Wren semantics (verified against wren-lang/wren
+            // src/vm/wren_core.c: fiber_try is identical to fiber_call
+            // except it marks the caller's state as FIBER_TRY for
+            // error routing):
+            //   - clean exit: both call() and try() return the body's
+            //     last-expression value
+            //   - abort: call() propagates, try() returns the error
+            //     message string in the caller's result slot
             //
-            // Both routes funnel through this Done arm. Previously the
-            // arm returned `krio_return_value` unconditionally, so
-            // `Fiber.try { 42 }` returned 42 instead of null and any
-            // user `Fiber.try { instance.method() }` leaked the
-            // method's last expression as if it were an abort message.
-            // The procedural-world demo hit this every frame — the
-            // framework's `Fiber.new { instance.draw(g) }.try()` saw
-            // whatever draw() last computed.
-            //
-            // Fix: gate on `(*target).is_try`. Clean exit + try ⇒ null;
-            // clean exit + call ⇒ the body's value; aborted (error
-            // slot populated) ⇒ the error message either way.
+            // The earlier `is_try ⇒ Value::null()` gate was a misread
+            // of the spec — the canonical Wren error-handling docs
+            // only document the abort case for try(), but on clean
+            // exit the body's value flows through the normal call-
+            // return path. Stripping that gate lets `var x = f.try()`
+            // capture the body value the way every Wren consumer
+            // expects.
             let err = unsafe { (*target).error };
             let stored = unsafe { (*target).krio_return_value };
-            let is_try = unsafe { (*target).is_try };
-            let v = if !err.is_null() {
-                err
-            } else if is_try {
-                Value::null()
-            } else {
-                stored
-            };
+            let v = if !err.is_null() { err } else { stored };
             // Escape barrier (the critical case): we're about to
             // drop the child's region in `release_fiber_resources`.
             // If `v` points into that region, the parent would be

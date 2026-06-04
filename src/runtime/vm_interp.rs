@@ -4868,24 +4868,27 @@ pub unsafe fn route_method_error_through_fiber_try(
     }
 }
 
-/// Wren `Fiber.try()` returns null on clean exit (the body's
-/// return value is intentionally discarded). When a fiber that was
-/// started via `try` reaches its clean-return resume point, we
-/// substitute null for whatever the body produced; aborts already
-/// take a different code path that surfaces the error message.
-/// Caller passes the CHILD fiber so we can read its `is_try`; the
-/// flag is consumed and cleared in the same step so a subsequent
-/// reuse of the fiber object doesn't carry stale state.
+/// Wren `Fiber.try()` returns the body's value on clean exit (same
+/// as `Fiber.call()`) and the abort message string on error. The
+/// `is_try` flag only affects abort routing — when set, an abort
+/// from the body is caught and surfaced as a return string in the
+/// caller's slot rather than propagating up the fiber chain.
+///
+/// Verified against wren-lang/wren `src/vm/wren_core.c:fiber_try`,
+/// which is identical to `fiber_call` except for setting the
+/// caller's state to `FIBER_TRY` (used by the error-routing path).
+/// Clean-exit return flows through the normal call-return path
+/// unchanged.
+///
+/// Caller passes the CHILD fiber so we can clear `is_try`; the flag
+/// is consumed here so a subsequent reuse of the fiber object
+/// doesn't carry stale state.
 #[inline]
 unsafe fn try_clean_return_value(fiber: *mut ObjFiber, body_return: Value) -> Value {
     unsafe {
-        if (*fiber).is_try {
-            (*fiber).is_try = false;
-            Value::null()
-        } else {
-            body_return
-        }
+        (*fiber).is_try = false;
     }
+    body_return
 }
 
 fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
