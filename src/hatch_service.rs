@@ -23,7 +23,7 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use sha2::Digest;
@@ -717,14 +717,68 @@ fn curl_get(url: &str, headers: &[&str]) -> Result<String, ServiceError> {
 }
 
 pub fn curl_post(url: &str, headers: &[&str], body: &str) -> Result<String, ServiceError> {
-    let mut cmd = Command::new("curl");
-    cmd.arg("-sS").arg("--fail-with-body").arg("-X").arg("POST");
-    for h in headers {
-        cmd.arg("-H").arg(h);
+    // Stream the body via stdin (`--data-binary @-`) instead of
+    // baking it into argv. The CLI publish path hands ~200 KB
+    // docs JSON to /docs-upload — large enough to trip execve's
+    // ARG_MAX on Linux CI runners and silently fail the upload
+    // (see @hatch:gpu 0.3.15 / @hatch:game 0.3.29 publishes
+    // landing with docs_url NULL). stdin has no such ceiling.
+    //
+    // Also retries transient 5xx / connection failures so an
+    // Edge Function gateway timeout doesn't turn into a permanent
+    // NULL column (@hatch:image 0.1.9 lost docs_url to a single
+    // 504 with no retry).
+    let mk_cmd = || {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-sS").arg("--fail-with-body").arg("-X").arg("POST");
+        for h in headers {
+            cmd.arg("-H").arg(h);
+        }
+        cmd.arg("--data-binary").arg("@-");
+        cmd.arg(url);
+        cmd
+    };
+
+    let mut last_err: Option<ServiceError> = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500 * (1u64 << (attempt - 1))));
+        }
+        match run_curl_with_stdin(mk_cmd(), body) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if !is_transient(&e) {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
     }
-    cmd.arg("--data-binary").arg(body);
-    cmd.arg(url);
-    run_curl(cmd)
+    Err(last_err.expect("retry loop ran at least once"))
+}
+
+/// curl exit codes / response bodies we treat as worth retrying.
+///
+/// 28: timeout, 7: failed to connect, 56: recv failure during
+/// transfer. 5xx response bodies surfaced through `--fail-with-body`
+/// also retry — `Gateway Timeout` from the Supabase Edge Function
+/// is the canonical case.
+fn is_transient(e: &ServiceError) -> bool {
+    match e {
+        ServiceError::CurlFailed { code, stderr } => {
+            if matches!(code, Some(7) | Some(28) | Some(56) | Some(52)) {
+                return true;
+            }
+            let s = stderr.to_ascii_lowercase();
+            s.contains("gateway timeout")
+                || s.contains("bad gateway")
+                || s.contains("service unavailable")
+                || s.contains("timeout")
+                || s.contains("\"status\":5")
+        }
+        ServiceError::Io(_) => true,
+        _ => false,
+    }
 }
 
 fn run_curl(mut cmd: Command) -> Result<String, ServiceError> {
@@ -733,6 +787,24 @@ fn run_curl(mut cmd: Command) -> Result<String, ServiceError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ServiceError::NoCurl),
         Err(e) => return Err(ServiceError::Io(e)),
     };
+    finish_curl(output)
+}
+
+fn run_curl_with_stdin(mut cmd: Command, body: &str) -> Result<String, ServiceError> {
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ServiceError::NoCurl),
+        Err(e) => return Err(ServiceError::Io(e)),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body.as_bytes()).map_err(ServiceError::Io)?;
+    }
+    let output = child.wait_with_output().map_err(ServiceError::Io)?;
+    finish_curl(output)
+}
+
+fn finish_curl(output: std::process::Output) -> Result<String, ServiceError> {
     if !output.status.success() {
         // --fail-with-body writes body to stdout on HTTP errors and
         // non-zero-exits curl; surface both so callers can show the
