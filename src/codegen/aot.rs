@@ -2549,7 +2549,20 @@ pub fn link_executable(obj: &Path, staticlib: &Path, out: &Path) -> Result<(), A
             // Linux honours `RLIMIT_STACK` so a runtime override
             // works there, but match the macOS default for
             // parity.
-            .arg("-Wl,-z,stack-size=134217728");
+            .arg("-Wl,-z,stack-size=134217728")
+            // Export the host's `#[no_mangle]` symbols (the
+            // `wlift_plugin_*` C ABI shim that `crates/wlift_abi`
+            // declares as extern) so `dlopen`'d plugin cdylibs
+            // can resolve them at load time. macOS's dyld
+            // exports executable symbols by default; Linux's
+            // ld.so requires the link-time opt-in. Without this
+            // flag, every plugin dlopen on a Linux AOT build
+            // fails with "undefined symbol: wlift_plugin_*".
+            // The Rust-built wlift / hatch binaries already pick
+            // this up via `.cargo/config.toml`'s rustflags, but
+            // the AOT pipeline invokes `cc` directly and so
+            // needs the flag passed here too.
+            .arg("-Wl,--export-dynamic");
     }
     if let Ok(custom) = std::env::var("WLIFT_AOT_STACK_SIZE") {
         if cfg!(target_os = "macos") {
