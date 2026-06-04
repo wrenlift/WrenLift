@@ -1049,6 +1049,13 @@ struct BuildState {
     /// package B that extends a class declared in package A starts
     /// its own fields at slot 0 and collides with A's layout.
     class_field_layouts: std::collections::HashMap<String, Vec<String>>,
+    /// Deduplicates the layout-harvest pass for version-pinned
+    /// dependencies, which live in the registry cache rather than at
+    /// a canonical filesystem path (so `cache` above can't key them).
+    /// Without this, a diamond dep (`a → b → c` plus `a → c`) re-fetches
+    /// and re-compiles the same artifact's Source sections each time
+    /// it surfaces in a parent's hatchfile.
+    layout_harvested: std::collections::HashSet<(String, String)>,
 }
 
 /// Internal recursive variant. Distinguishes a true cycle (`a → b →
@@ -1057,6 +1064,75 @@ struct BuildState {
 /// already-built and just needs to be re-folded). The former errors
 /// loudly; the latter returns the cached bytes so the second arm of
 /// the diamond doesn't trip the cycle detector.
+/// Pre-populate `state.class_field_layouts` from a version-pinned
+/// dependency so a consumer's subclass can resolve its parent class
+/// at MIR build time. Mirrors what `build_recursive` does on the way
+/// out for path/git deps, except sourced from a cached registry
+/// artifact instead of a workspace tree.
+///
+/// Walks the dep's manifest dependencies transitively first (so
+/// deeper ancestors are present in `state` before this dep's own
+/// Source sections replay), then compiles each `SectionKind::Source`
+/// through a throwaway VM seeded with everything currently harvested.
+/// The resulting bytecode blobs are discarded — `merge_path_dependencies`
+/// pulls the canonical compiled `.hatch` bytes later. Only the side
+/// effect on `field_layouts` matters here.
+///
+/// Failures (fetch error in offline mode, malformed `.hatch`, etc.)
+/// are intentionally swallowed: `merge_path_dependencies` will surface
+/// a clean error on the same dep if it actually matters at compile
+/// time. We only need the layout flow on the happy path.
+#[cfg(feature = "host")]
+fn harvest_version_dep_layouts(
+    dep_name: &str,
+    version: &str,
+    state: &mut BuildState,
+    cache_dir: Option<&Path>,
+    target: Option<&str>,
+) {
+    let key = (dep_name.to_string(), version.to_string());
+    if !state.layout_harvested.insert(key) {
+        // Already harvested in this build session. Diamond deps
+        // hit this on every revisit.
+        return;
+    }
+
+    let Ok(bytes) = resolve_version_cached_or_fetch(dep_name, version, cache_dir, target) else {
+        return;
+    };
+    let Ok(dep_hatch) = load(&bytes) else {
+        return;
+    };
+
+    // Transitively harvest the dep's own version deps first so the
+    // Source replay below sees ancestor classes from any chain of
+    // version-pinned packages (e.g. game → ecs → fp).
+    for (sub_name, sub_dep) in &dep_hatch.manifest.dependencies {
+        if let Dependency::Version(sub_version) = sub_dep {
+            harvest_version_dep_layouts(sub_name, sub_version, state, cache_dir, target);
+        }
+        // Path / git deps inside a published `.hatch` aren't a
+        // sensible shape — the artifact should pin every dep to a
+        // version at publish time. Skip silently; merge will surface
+        // any real problem.
+    }
+
+    let mut harvest_vm = crate::runtime::vm::VM::new_default();
+    for (cls, layout) in &state.class_field_layouts {
+        harvest_vm.field_layouts.insert(cls.clone(), layout.clone());
+    }
+    for s in &dep_hatch.sections {
+        if matches!(s.kind, SectionKind::Source) {
+            if let Ok(src) = std::str::from_utf8(&s.data) {
+                let _ = harvest_vm.compile_source_to_blob(src);
+            }
+        }
+    }
+    for (cls, layout) in harvest_vm.field_layouts.drain() {
+        state.class_field_layouts.insert(cls, layout);
+    }
+}
+
 #[cfg(feature = "host")]
 fn build_recursive(
     root: &Path,
@@ -1087,27 +1163,67 @@ fn build_recursive(
     // import slots.
     topo_sort_wren_files_by_imports(&mut wren_files);
 
-    // Pre-build path dependencies so their class field layouts flow
-    // into our compile VM via `state.class_field_layouts`. Without
-    // this, a class in this package that extends a class declared
-    // in a path-dep package would see an empty known_classes map at
-    // MIR-build time and start its field indexing at slot 0,
-    // colliding with the parent's slots at runtime. We read the
-    // manifest early just enough to pick up dep paths; the full
-    // manifest read + section merge still happens later in
-    // `merge_path_dependencies` (cheap since `state.cache` memoises
-    // the bytes).
+    // Pre-build every dependency so its class field layouts flow into
+    // our compile VM via `state.class_field_layouts`. Without this, a
+    // class in this package that extends a class declared in a dep
+    // package would see an empty known_classes map at MIR-build time
+    // and panic at `builder.rs` (or, in older builds, silently start
+    // its field indexing at slot 0 and collide with the parent's
+    // slots at runtime). We read the manifest early just enough to
+    // pick up dep declarations; the full manifest read + section
+    // merge still happens later in `merge_path_dependencies` (cheap
+    // since `state.cache` memoises path-dep bytes and the registry
+    // cache deduplicates version/git fetches).
+    //
+    // Path + git deps recurse into `build_recursive`, which itself
+    // harvests on the way out via the drain at the bottom of this
+    // function. Version deps don't have a workspace to recurse into,
+    // so `harvest_version_dep_layouts` fetches the cached `.hatch`,
+    // walks its own deps transitively, then compile-replays its
+    // `Source` sections through a throwaway VM whose populated
+    // `field_layouts` get drained back into `state` — same end state
+    // as a path-dep recursion, no `.hatch` wire-format change.
     if let Ok(text) = std::fs::read_to_string(root.join(HATCHFILE)) {
         if let Ok(early_manifest) = toml::from_str::<Manifest>(&text) {
-            for dep in early_manifest.dependencies.values() {
-                if let Dependency::Path { path, .. } = dep {
-                    let dep_root = root.join(path);
-                    // Ignore failures here — `merge_path_dependencies`
-                    // will surface a clean error when it tries the
-                    // same path again. We only need the layout
-                    // harvest to flow into `state` on the happy
-                    // path so the upcoming compile sees parents.
-                    let _ = build_recursive(&dep_root, state, cache_dir, target);
+            for (dep_name, dep) in &early_manifest.dependencies {
+                match dep {
+                    Dependency::Path { path, .. } => {
+                        let dep_root = root.join(path);
+                        // Ignore failures here — `merge_path_dependencies`
+                        // will surface a clean error when it tries the
+                        // same path again. We only need the layout
+                        // harvest to flow into `state` on the happy
+                        // path so the upcoming compile sees parents.
+                        let _ = build_recursive(&dep_root, state, cache_dir, target);
+                    }
+                    Dependency::Git { git, .. } => {
+                        let Some(git_ref) = dep.git_ref() else {
+                            continue;
+                        };
+                        let cache_base = match cache_dir {
+                            Some(p) => p.to_path_buf(),
+                            None => match crate::hatch_registry::cache_root() {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            },
+                        };
+                        let checkout = crate::hatch_registry::cached_git_checkout_path(
+                            &cache_base,
+                            git,
+                            git_ref,
+                        );
+                        if checkout.exists() {
+                            let _ = build_recursive(&checkout, state, cache_dir, target);
+                        }
+                    }
+                    Dependency::Version(version) => {
+                        harvest_version_dep_layouts(dep_name, version, state, cache_dir, target);
+                    }
+                    Dependency::Url { .. } => {
+                        // URL deps are wasm-runtime only;
+                        // `merge_path_dependencies` errors loudly on
+                        // the host build path. No layouts to harvest.
+                    }
                 }
             }
         }
