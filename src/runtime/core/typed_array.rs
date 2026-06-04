@@ -303,7 +303,7 @@ fn byte_array_parse_f64(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     match parsed {
         Some(n) => Value::num(n),
-        None    => Value::null(),
+        None => Value::null(),
     }
 }
 
@@ -331,7 +331,10 @@ fn byte_array_utf8_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     if end > bytes.len() {
         ctx.runtime_error(format!(
             "ByteArray.utf8Slice: off={} + len={} > buffer length {}.",
-            off, len, bytes.len()));
+            off,
+            len,
+            bytes.len()
+        ));
         return Value::null();
     }
     match std::str::from_utf8(&bytes[off..end]) {
@@ -490,12 +493,18 @@ fn byte_array_read_f32_le(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
     let off = match args[1].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.readF32LE: byteOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.readF32LE: byteOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     if off + 4 > bytes.len() {
-        ctx.runtime_error(format!("ByteArray.readF32LE: byteOffset {} + 4 out of range (len {})", off, bytes.len()));
+        ctx.runtime_error(format!(
+            "ByteArray.readF32LE: byteOffset {} + 4 out of range (len {})",
+            off,
+            bytes.len()
+        ));
         return Value::null();
     }
     let v = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
@@ -508,12 +517,18 @@ fn byte_array_read_u16_le(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
     let off = match args[1].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.readU16LE: byteOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.readU16LE: byteOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     if off + 2 > bytes.len() {
-        ctx.runtime_error(format!("ByteArray.readU16LE: byteOffset {} + 2 out of range (len {})", off, bytes.len()));
+        ctx.runtime_error(format!(
+            "ByteArray.readU16LE: byteOffset {} + 2 out of range (len {})",
+            off,
+            bytes.len()
+        ));
         return Value::null();
     }
     let v = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
@@ -526,12 +541,18 @@ fn byte_array_read_u32_le(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
     let off = match args[1].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.readU32LE: byteOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.readU32LE: byteOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     if off + 4 > bytes.len() {
-        ctx.runtime_error(format!("ByteArray.readU32LE: byteOffset {} + 4 out of range (len {})", off, bytes.len()));
+        ctx.runtime_error(format!(
+            "ByteArray.readU32LE: byteOffset {} + 4 out of range (len {})",
+            off,
+            bytes.len()
+        ));
         return Value::null();
     }
     let v = u32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
@@ -550,26 +571,37 @@ fn byte_array_copy_to_float32_array(ctx: &mut dyn NativeContext, args: &[Value])
     let src_off = match args[1].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyToFloat32Array: srcByteOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyToFloat32Array: srcByteOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     let count = match args[2].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyToFloat32Array: count must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyToFloat32Array: count must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     let stride = match args[5].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
             let s = n as usize;
-            if s == 0 { 4 } else { s }
+            if s == 0 {
+                4
+            } else {
+                s
+            }
         }
         _ => 4,
     };
     if stride < 4 {
-        ctx.runtime_error(format!("ByteArray.copyToFloat32Array: stride {} < 4", stride));
+        ctx.runtime_error(format!(
+            "ByteArray.copyToFloat32Array: stride {} < 4",
+            stride
+        ));
         return Value::null();
     }
     let dst_obj = match args[3].as_object() {
@@ -582,7 +614,9 @@ fn byte_array_copy_to_float32_array(ctx: &mut dyn NativeContext, args: &[Value])
     let dst_off = match args[4].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyToFloat32Array: dstOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyToFloat32Array: dstOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
@@ -595,16 +629,29 @@ fn byte_array_copy_to_float32_array(ctx: &mut dyn NativeContext, args: &[Value])
         if count > 0 {
             let last_src = src_off + (count - 1) * stride + 4;
             if last_src > src_bytes.len() {
-                ctx.runtime_error(format!("ByteArray.copyToFloat32Array: source overrun (need {}, have {})", last_src, src_bytes.len()));
+                ctx.runtime_error(format!(
+                    "ByteArray.copyToFloat32Array: source overrun (need {}, have {})",
+                    last_src,
+                    src_bytes.len()
+                ));
                 return Value::null();
             }
             if dst_off + count > dst_arr.count as usize {
-                ctx.runtime_error(format!("ByteArray.copyToFloat32Array: dst overrun (need {}, have {})", dst_off + count, dst_arr.count));
+                ctx.runtime_error(format!(
+                    "ByteArray.copyToFloat32Array: dst overrun (need {}, have {})",
+                    dst_off + count,
+                    dst_arr.count
+                ));
                 return Value::null();
             }
             for i in 0..count {
                 let b = src_off + i * stride;
-                let v = f32::from_le_bytes([src_bytes[b], src_bytes[b + 1], src_bytes[b + 2], src_bytes[b + 3]]);
+                let v = f32::from_le_bytes([
+                    src_bytes[b],
+                    src_bytes[b + 1],
+                    src_bytes[b + 2],
+                    src_bytes[b + 3],
+                ]);
                 dst_arr.set_f32(dst_off + i, v);
             }
         }
@@ -620,26 +667,38 @@ fn byte_array_copy_to_int32_array_u16(ctx: &mut dyn NativeContext, args: &[Value
     let src_off = match args[1].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyU16LEToInt32Array: srcByteOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyU16LEToInt32Array: srcByteOffset must be a non-negative integer"
+                    .into(),
+            );
             return Value::null();
         }
     };
     let count = match args[2].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyU16LEToInt32Array: count must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyU16LEToInt32Array: count must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     let stride = match args[5].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
             let s = n as usize;
-            if s == 0 { 2 } else { s }
+            if s == 0 {
+                2
+            } else {
+                s
+            }
         }
         _ => 2,
     };
     if stride < 2 {
-        ctx.runtime_error(format!("ByteArray.copyU16LEToInt32Array: stride {} < 2", stride));
+        ctx.runtime_error(format!(
+            "ByteArray.copyU16LEToInt32Array: stride {} < 2",
+            stride
+        ));
         return Value::null();
     }
     let dst_obj = match args[3].as_object() {
@@ -652,7 +711,9 @@ fn byte_array_copy_to_int32_array_u16(ctx: &mut dyn NativeContext, args: &[Value
     let dst_off = match args[4].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyU16LEToInt32Array: dstOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyU16LEToInt32Array: dstOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
@@ -665,11 +726,19 @@ fn byte_array_copy_to_int32_array_u16(ctx: &mut dyn NativeContext, args: &[Value
         if count > 0 {
             let last_src = src_off + (count - 1) * stride + 2;
             if last_src > src_bytes.len() {
-                ctx.runtime_error(format!("ByteArray.copyU16LEToInt32Array: source overrun (need {}, have {})", last_src, src_bytes.len()));
+                ctx.runtime_error(format!(
+                    "ByteArray.copyU16LEToInt32Array: source overrun (need {}, have {})",
+                    last_src,
+                    src_bytes.len()
+                ));
                 return Value::null();
             }
             if dst_off + count > dst_arr.count as usize {
-                ctx.runtime_error(format!("ByteArray.copyU16LEToInt32Array: dst overrun (need {}, have {})", dst_off + count, dst_arr.count));
+                ctx.runtime_error(format!(
+                    "ByteArray.copyU16LEToInt32Array: dst overrun (need {}, have {})",
+                    dst_off + count,
+                    dst_arr.count
+                ));
                 return Value::null();
             }
             for i in 0..count {
@@ -689,26 +758,37 @@ fn byte_array_copy_to_int32_array_u8(ctx: &mut dyn NativeContext, args: &[Value]
     let src_off = match args[1].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyU8ToInt32Array: srcByteOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyU8ToInt32Array: srcByteOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     let count = match args[2].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyU8ToInt32Array: count must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyU8ToInt32Array: count must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
     let stride = match args[5].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => {
             let s = n as usize;
-            if s == 0 { 1 } else { s }
+            if s == 0 {
+                1
+            } else {
+                s
+            }
         }
         _ => 1,
     };
     if stride < 1 {
-        ctx.runtime_error(format!("ByteArray.copyU8ToInt32Array: stride {} < 1", stride));
+        ctx.runtime_error(format!(
+            "ByteArray.copyU8ToInt32Array: stride {} < 1",
+            stride
+        ));
         return Value::null();
     }
     let dst_obj = match args[3].as_object() {
@@ -721,7 +801,9 @@ fn byte_array_copy_to_int32_array_u8(ctx: &mut dyn NativeContext, args: &[Value]
     let dst_off = match args[4].as_num() {
         Some(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
         _ => {
-            ctx.runtime_error("ByteArray.copyU8ToInt32Array: dstOffset must be a non-negative integer".into());
+            ctx.runtime_error(
+                "ByteArray.copyU8ToInt32Array: dstOffset must be a non-negative integer".into(),
+            );
             return Value::null();
         }
     };
@@ -734,11 +816,19 @@ fn byte_array_copy_to_int32_array_u8(ctx: &mut dyn NativeContext, args: &[Value]
         if count > 0 {
             let last_src = src_off + (count - 1) * stride + 1;
             if last_src > src_bytes.len() {
-                ctx.runtime_error(format!("ByteArray.copyU8ToInt32Array: source overrun (need {}, have {})", last_src, src_bytes.len()));
+                ctx.runtime_error(format!(
+                    "ByteArray.copyU8ToInt32Array: source overrun (need {}, have {})",
+                    last_src,
+                    src_bytes.len()
+                ));
                 return Value::null();
             }
             if dst_off + count > dst_arr.count as usize {
-                ctx.runtime_error(format!("ByteArray.copyU8ToInt32Array: dst overrun (need {}, have {})", dst_off + count, dst_arr.count));
+                ctx.runtime_error(format!(
+                    "ByteArray.copyU8ToInt32Array: dst overrun (need {}, have {})",
+                    dst_off + count,
+                    dst_arr.count
+                ));
                 return Value::null();
             }
             for i in 0..count {
@@ -763,12 +853,21 @@ pub fn bind(vm: &mut VM) {
         vm.primitive(cls, "readF32LE(_)", byte_array_read_f32_le);
         vm.primitive(cls, "readU16LE(_)", byte_array_read_u16_le);
         vm.primitive(cls, "readU32LE(_)", byte_array_read_u32_le);
-        vm.primitive(cls, "copyToFloat32Array(_,_,_,_,_)",
-            byte_array_copy_to_float32_array);
-        vm.primitive(cls, "copyU16LEToInt32Array(_,_,_,_,_)",
-            byte_array_copy_to_int32_array_u16);
-        vm.primitive(cls, "copyU8ToInt32Array(_,_,_,_,_)",
-            byte_array_copy_to_int32_array_u8);
+        vm.primitive(
+            cls,
+            "copyToFloat32Array(_,_,_,_,_)",
+            byte_array_copy_to_float32_array,
+        );
+        vm.primitive(
+            cls,
+            "copyU16LEToInt32Array(_,_,_,_,_)",
+            byte_array_copy_to_int32_array_u16,
+        );
+        vm.primitive(
+            cls,
+            "copyU8ToInt32Array(_,_,_,_,_)",
+            byte_array_copy_to_int32_array_u8,
+        );
         // Bulk UTF-8 decoders — replace the pure-Wren
         // `chars.add(String.fromCodePoint(b)); chars.join("")` pattern
         // that O(n²)'s on multi-MB buffers because the join allocates

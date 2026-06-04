@@ -13,10 +13,10 @@
 use std::io::Cursor;
 
 use wlift_abi::{
-    alloc_map, alloc_string, alloc_typed_array, list_count, list_get, map_set, obj_type,
-    push_root, reload_root, roots_restore, roots_snapshot, runtime_error, set_return, slot,
-    string_str, typed_array_bytes, typed_array_bytes_mut, typed_array_kind, ObjType,
-    TypedArrayKind, Value, WrenVm,
+    alloc_map, alloc_string, alloc_typed_array, list_count, list_get, map_set, obj_type, push_root,
+    reload_root, roots_restore, roots_snapshot, runtime_error, set_return, slot, string_str,
+    typed_array_bytes, typed_array_bytes_mut, typed_array_kind, ObjType, TypedArrayKind, Value,
+    WrenVm,
 };
 
 /// Plugin ABI handshake. Native-only: statically-linked wasm
@@ -267,9 +267,9 @@ pub unsafe extern "C" fn wlift_image_poll(vm: *mut WrenVm) {
     };
     let jobs = JOBS.lock().unwrap();
     let code: f64 = match jobs.get(&id) {
-        Some(JobState::Pending)  => 0.0,
+        Some(JobState::Pending) => 0.0,
         Some(JobState::Ready { .. }) => 1.0,
-        Some(JobState::Failed(_))    => 2.0,
+        Some(JobState::Failed(_)) => 2.0,
         // Unknown id reads as "Failed" so the caller routes through
         // take_error; this catches double-drains + use-after-cancel
         // with one error path.
@@ -337,7 +337,10 @@ pub unsafe extern "C" fn wlift_image_take_error(vm: *mut WrenVm) {
     let id = match slot(vm, 1).as_num() {
         Some(n) if n.is_finite() && n >= 0.0 => n as u32,
         _ => {
-            runtime_error(vm, "Image.takeDecodeError: id must be a non-negative number.");
+            runtime_error(
+                vm,
+                "Image.takeDecodeError: id must be a non-negative number.",
+            );
             return;
         }
     };
@@ -350,7 +353,8 @@ pub unsafe extern "C" fn wlift_image_take_error(vm: *mut WrenVm) {
     };
     let msg = match drained {
         Some(JobState::Failed(m)) => m,
-        _ => "Image.takeDecodeError: job is not Failed (still pending, ready, or already drained).".to_string(),
+        _ => "Image.takeDecodeError: job is not Failed (still pending, ready, or already drained)."
+            .to_string(),
     };
     let s = alloc_string(vm, &msg);
     set_return(vm, s);

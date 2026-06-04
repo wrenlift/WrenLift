@@ -1676,11 +1676,7 @@ fn cmd_run(target: &Path, withs: &[PathBuf]) {
     // the launcher's cwd unchanged.
     if target.is_dir() {
         if let Err(e) = std::env::set_current_dir(target) {
-            eprintln!(
-                "error: cannot chdir into '{}': {}",
-                target.display(),
-                e
-            );
+            eprintln!("error: cannot chdir into '{}': {}", target.display(), e);
             process::exit(1);
         }
     }

@@ -419,8 +419,8 @@ pub unsafe extern "C" fn wlift_audio_sound_load(vm: *mut WrenVm) {
 }
 
 fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
-    let mut reader = hound::WavReader::new(Cursor::new(bytes))
-        .map_err(|e| format!("WAV parse: {}", e))?;
+    let mut reader =
+        hound::WavReader::new(Cursor::new(bytes)).map_err(|e| format!("WAV parse: {}", e))?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
     let bits = spec.bits_per_sample;
@@ -455,8 +455,8 @@ fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
 
 fn decode_ogg(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
     use lewton::inside_ogg::OggStreamReader;
-    let mut reader = OggStreamReader::new(Cursor::new(bytes))
-        .map_err(|e| format!("ogg parse: {}", e))?;
+    let mut reader =
+        OggStreamReader::new(Cursor::new(bytes)).map_err(|e| format!("ogg parse: {}", e))?;
     let channels = reader.ident_hdr.audio_channels as usize;
     let mut samples: Vec<f32> = Vec::new();
     // Each `read_dec_packet` returns a `Vec<Vec<i16>>` with one

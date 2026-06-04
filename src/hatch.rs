@@ -1131,9 +1131,7 @@ fn build_recursive(
     // (class name → field-name vector) is genuinely cross-module.
     let mut compile_vm = crate::runtime::vm::VM::new_default();
     for (cls, layout) in &state.class_field_layouts {
-        compile_vm
-            .field_layouts
-            .insert(cls.clone(), layout.clone());
+        compile_vm.field_layouts.insert(cls.clone(), layout.clone());
     }
 
     for (module_name, path) in &wren_files {

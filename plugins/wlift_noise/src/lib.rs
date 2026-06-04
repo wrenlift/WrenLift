@@ -8,8 +8,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use noise::{NoiseFn, OpenSimplex, Perlin, Value, Worley};
 use noise::core::worley::distance_functions::euclidean;
+use noise::{NoiseFn, OpenSimplex, Perlin, Value, Worley};
 use wlift_abi::{runtime_error, set_return, slot, Value as WlValue, WrenVm};
 
 /// Plugin ABI handshake. Called by the host immediately after
@@ -561,11 +561,7 @@ unsafe fn require_f32_out(vm: *mut WrenVm, label: &str) -> Option<&'static mut [
     Some(bytes)
 }
 
-unsafe fn fill_2d_inner<F: Fn(f64, f64) -> f64>(
-    vm: *mut WrenVm,
-    label: &str,
-    sample: F,
-) {
+unsafe fn fill_2d_inner<F: Fn(f64, f64) -> f64>(vm: *mut WrenVm, label: &str, sample: F) {
     let bytes = match require_f32_out(vm, label) {
         Some(b) => b,
         None => {

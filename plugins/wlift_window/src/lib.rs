@@ -129,21 +129,48 @@ struct WindowEntry {
 /// Recorded event ready to be exposed to Wren as a Map.
 enum EventRecord {
     CloseRequested,
-    Resized { width: u32, height: u32 },
-    KeyDown { code: String },
-    KeyUp { code: String },
-    MouseMoved { x: f64, y: f64 },
-    MouseDown { button: String },
-    MouseUp { button: String },
-    MouseWheel { dx: f64, dy: f64 },
+    Resized {
+        width: u32,
+        height: u32,
+    },
+    KeyDown {
+        code: String,
+    },
+    KeyUp {
+        code: String,
+    },
+    MouseMoved {
+        x: f64,
+        y: f64,
+    },
+    MouseDown {
+        button: String,
+    },
+    MouseUp {
+        button: String,
+    },
+    MouseWheel {
+        dx: f64,
+        dy: f64,
+    },
     /// Gamepad button / axis events. `code` is the canonical
     /// binding name (`"GamepadButtonA"`, `"GamepadAxisLX"`, etc.)
     /// the action layer maps against. Gamepad events broadcast
     /// across all windows — gamepads aren't owned by any one
     /// window — so they land in every active window's queue.
-    GamepadButtonDown { code: String, gamepad: u32 },
-    GamepadButtonUp { code: String, gamepad: u32 },
-    GamepadAxis { code: String, gamepad: u32, value: f64 },
+    GamepadButtonDown {
+        code: String,
+        gamepad: u32,
+    },
+    GamepadButtonUp {
+        code: String,
+        gamepad: u32,
+    },
+    GamepadAxis {
+        code: String,
+        gamepad: u32,
+        value: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +196,10 @@ fn ensure_gilrs() {
             // games still want keyboard / mouse.
             match gilrs::Gilrs::new() {
                 Ok(g) => *slot = Some(g),
-                Err(e) => eprintln!("wlift_window: gilrs init failed: {}; gamepad input disabled", e),
+                Err(e) => eprintln!(
+                    "wlift_window: gilrs init failed: {}; gamepad input disabled",
+                    e
+                ),
             }
         }
     });
@@ -230,23 +260,25 @@ fn drain_gilrs() {
             // to u32 so the Wren side gets a plain Num.
             let gamepad: u32 = Into::<usize>::into(id) as u32;
             let record = match event {
-                gilrs::EventType::ButtonPressed(b, _) => gilrs_button_name(b)
-                    .map(|c| EventRecord::GamepadButtonDown {
+                gilrs::EventType::ButtonPressed(b, _) => {
+                    gilrs_button_name(b).map(|c| EventRecord::GamepadButtonDown {
                         code: c.to_string(),
                         gamepad,
-                    }),
-                gilrs::EventType::ButtonReleased(b, _) => gilrs_button_name(b)
-                    .map(|c| EventRecord::GamepadButtonUp {
+                    })
+                }
+                gilrs::EventType::ButtonReleased(b, _) => {
+                    gilrs_button_name(b).map(|c| EventRecord::GamepadButtonUp {
                         code: c.to_string(),
                         gamepad,
-                    }),
-                gilrs::EventType::AxisChanged(a, v, _) => gilrs_axis_name(a).map(|c| {
-                    EventRecord::GamepadAxis {
+                    })
+                }
+                gilrs::EventType::AxisChanged(a, v, _) => {
+                    gilrs_axis_name(a).map(|c| EventRecord::GamepadAxis {
                         code: c.to_string(),
                         gamepad,
                         value: v as f64,
-                    }
-                }),
+                    })
+                }
                 // Connected/Disconnected/etc. are surfaced as
                 // dedicated event types in a follow-up — for now
                 // only button + axis are wired.
@@ -365,7 +397,7 @@ impl PumpHandler {
                     let inner = window.inner_size();
                     let entry = WindowEntry {
                         window,
-                        width:  inner.width,
+                        width: inner.width,
                         height: inner.height,
                         close_requested: false,
                     };
@@ -997,7 +1029,12 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
     match win {
         RawWindowHandle::AppKit(h) => {
             let v = alloc_string(vm, "appkit");
-            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                reload_root(vm, key_platform_r),
+                v,
+            );
             let kv = alloc_string(vm, "ns_view");
             map_set(
                 vm,
@@ -1008,7 +1045,12 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
         }
         RawWindowHandle::UiKit(h) => {
             let v = alloc_string(vm, "uikit");
-            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                reload_root(vm, key_platform_r),
+                v,
+            );
             let kv = alloc_string(vm, "ui_view");
             map_set(
                 vm,
@@ -1019,7 +1061,12 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
         }
         RawWindowHandle::Win32(h) => {
             let v = alloc_string(vm, "win32");
-            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                reload_root(vm, key_platform_r),
+                v,
+            );
             let kh = alloc_string(vm, "hwnd");
             map_set(
                 vm,
@@ -1039,14 +1086,14 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
         }
         RawWindowHandle::Xlib(h) => {
             let v = alloc_string(vm, "xlib");
-            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
-            let kw = alloc_string(vm, "window");
             map_set(
                 vm,
                 reload_root(vm, map_r),
-                kw,
-                Value::num(h.window as f64),
+                reload_root(vm, key_platform_r),
+                v,
             );
+            let kw = alloc_string(vm, "window");
+            map_set(vm, reload_root(vm, map_r), kw, Value::num(h.window as f64));
             if h.visual_id != 0 {
                 let kvi = alloc_string(vm, "visual_id");
                 map_set(
@@ -1059,7 +1106,12 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
         }
         RawWindowHandle::Wayland(h) => {
             let v = alloc_string(vm, "wayland");
-            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                reload_root(vm, key_platform_r),
+                v,
+            );
             let ks = alloc_string(vm, "surface");
             map_set(
                 vm,
@@ -1070,7 +1122,12 @@ pub unsafe extern "C" fn wlift_window_handle(vm: *mut WrenVm) {
         }
         other => {
             let v = alloc_string(vm, &format!("{:?}", other).to_lowercase());
-            map_set(vm, reload_root(vm, map_r), reload_root(vm, key_platform_r), v);
+            map_set(
+                vm,
+                reload_root(vm, map_r),
+                reload_root(vm, key_platform_r),
+                v,
+            );
         }
     }
 

@@ -62,8 +62,7 @@ fn fs_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Ok(bytes) => {
             let len = bytes.len() as u32;
             let result = ctx.alloc_typed_array(len, crate::runtime::object::TypedArrayKind::U8);
-            let arr_ptr = result.as_object().unwrap()
-                as *mut crate::runtime::object::ObjTypedArray;
+            let arr_ptr = result.as_object().unwrap() as *mut crate::runtime::object::ObjTypedArray;
             unsafe {
                 let dst = (*arr_ptr).as_bytes_mut();
                 dst.copy_from_slice(&bytes);

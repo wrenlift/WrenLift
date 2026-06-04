@@ -740,7 +740,12 @@ pub unsafe extern "C" fn wlift_gpu_device_info(vm: *mut WrenVm) {
 
     let key_name_r = push_root(vm, alloc_string(vm, "name"));
     let name = alloc_string(vm, &info.name);
-    map_set(vm, reload_root(vm, result_r), reload_root(vm, key_name_r), name);
+    map_set(
+        vm,
+        reload_root(vm, result_r),
+        reload_root(vm, key_name_r),
+        name,
+    );
 
     let key_backend_r = push_root(vm, alloc_string(vm, "backend"));
     let backend = alloc_string(vm, &format!("{:?}", info.backend).to_lowercase());
