@@ -2770,10 +2770,6 @@ fn handle_jit_fiber_action(
                     }
                     set_jit_context(saved_jit_ctx);
                     set_jit_depth(saved_jit_depth);
-                    let body_done = matches!(
-                        kind,
-                        crate::capi::AotSmPollKind::Done | crate::capi::AotSmPollKind::None
-                    );
                     match kind {
                         crate::capi::AotSmPollKind::Yield => unsafe {
                             (*target).state = FiberState::Suspended;
@@ -2815,22 +2811,6 @@ fn handle_jit_fiber_action(
                             vm.has_error = false;
                             vm.last_error = None;
                             return routed.to_bits();
-                        }
-                    }
-                    // Mirror `try_krio_call`'s Done-arm semantics for
-                    // the AOT state-machine path: when a fiber.try()
-                    // body returns cleanly, the result is null — not
-                    // the body's last expression. Without this gate,
-                    // `var x = f.try()` reads back whatever the body
-                    // happened to return (the "stale slot" bug the
-                    // box-pattern workaround threads through every
-                    // production callsite that wraps an Http.get /
-                    // JSON.parse / etc. in a Fiber).
-                    if body_done {
-                        let is_try = unsafe { (*target).is_try };
-                        unsafe { (*target).is_try = false };
-                        if is_try {
-                            return Value::null().to_bits();
                         }
                     }
                     return ret_bits;
