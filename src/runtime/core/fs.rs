@@ -52,8 +52,7 @@ fn fs_write_text(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 /// FS.readBytes(path) → ByteArray (native u8 storage, one
 /// contiguous allocation). Useful for binary files where UTF-8
 /// decoding would mangle the bytes. Indexed access (`bytes[i]`)
-/// + iteration work identically to a `List<Num>`; the difference
-/// is one allocation regardless of file size.
+/// + iteration work identically to a `List<Num>`; the difference is one allocation regardless of file size.
 fn fs_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let Some(path) = super::validate_string(ctx, args[1], "Path") else {
         return Value::null();

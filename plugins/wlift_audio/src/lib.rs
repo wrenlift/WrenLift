@@ -471,9 +471,12 @@ fn decode_ogg(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
                 }
                 let frames = packet[0].len();
                 samples.reserve(frames * channels);
-                for (f, _) in packet.iter().take(frames).enumerate() {
-                    for ch in packet.iter().take(channels).enumerate() {
-                        let s = packet[ch.0][f];
+                // Re-interleave channel-major packets into frame-major output;
+                // the index pattern is the readable form of this transpose.
+                #[allow(clippy::needless_range_loop)]
+                for f in 0..frames {
+                    for ch in 0..channels {
+                        let s = packet[ch][f];
                         samples.push(s as f32 / 32768.0);
                     }
                 }

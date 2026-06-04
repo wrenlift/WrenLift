@@ -239,8 +239,7 @@ fn byte_array_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value 
 /// ByteArray.toUtf8String — interpret the whole buffer as UTF-8 and
 /// return a fresh String. One FFI hop, one validation pass, one
 /// allocation; replaces the pure-Wren `chars.add(String.fromCodePoint(b))
-/// + chars.join("")` pattern that was O(n) iterations + an O(n) join
-/// over thousands of one-char Strings.
+/// + chars.join("")` pattern that was O(n) iterations + an O(n) join over thousands of one-char Strings.
 fn byte_array_to_utf8_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     let bytes = receiver_ta_bytes(args);
     match std::str::from_utf8(bytes) {
@@ -351,7 +350,7 @@ fn byte_array_utf8_slice(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
 // the duration of the foreign call; the cast extends its lifetime
 // to the borrow, which is sound because the GC doesn't relocate
 // while a primitive is on the stack.
-fn receiver_ta_bytes<'a>(args: &'a [Value]) -> &'a [u8] {
+fn receiver_ta_bytes(args: &[Value]) -> &[u8] {
     let arr = receiver_ta(args);
     let b = arr.as_bytes();
     unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }
