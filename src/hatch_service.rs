@@ -105,6 +105,14 @@ pub struct PackageRecord {
     /// READMEs without per-host raw-URL conventions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readme_url: Option<String>,
+    /// Public URL for the package's `CHANGELOG.md`, sibling of
+    /// `readme_url`. `hatch publish` reads `CHANGELOG.md` from
+    /// the workspace, posts it to `hatch-bot/changelog-upload`,
+    /// and the returned URL lands here. The site's changelog
+    /// route reads this URL first; legacy rows fall back to the
+    /// `git`-relative GitHub-raw resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changelog_url: Option<String>,
     /// Present in server responses, omitted on submission (the
     /// server sets it from the auth'd JWT).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -835,6 +843,7 @@ mod tests {
             readme: None,
             docs_url: None,
             readme_url: None,
+            changelog_url: None,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(

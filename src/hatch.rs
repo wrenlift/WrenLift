@@ -144,6 +144,13 @@ pub struct Manifest {
     /// Defaults to `"README.md"` at the repo root when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readme: Option<String>,
+    /// Where this package's CHANGELOG lives. Same shape as `readme`:
+    /// an absolute URL is used verbatim by the docs renderer; a
+    /// relative path is resolved against the `git` URL using the
+    /// host's `raw` URL convention. Defaults to `"CHANGELOG.md"`
+    /// at the repo root when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<String>,
     /// Ordered list of module names in this hatch. The loader installs
     /// them in this order so a module's imports resolve against
     /// already-loaded peers. Producers are expected to write this in
@@ -1092,7 +1099,7 @@ fn build_recursive(
     // the bytes).
     if let Ok(text) = std::fs::read_to_string(root.join(HATCHFILE)) {
         if let Ok(early_manifest) = toml::from_str::<Manifest>(&text) {
-            for (_dep_name, dep) in &early_manifest.dependencies {
+            for dep in early_manifest.dependencies.values() {
                 if let Dependency::Path { path, .. } = dep {
                     let dep_root = root.join(path);
                     // Ignore failures here — `merge_path_dependencies`
@@ -1215,6 +1222,7 @@ fn build_recursive(
             description: None,
             homepage: None,
             readme: None,
+            changelog: None,
             modules: module_names.clone(),
             bundled_versions: BTreeMap::new(),
             dependencies: BTreeMap::new(),
@@ -1918,8 +1926,69 @@ pub fn collect_workspace_docs(root: &Path) -> Result<String, HatchError> {
             ));
         }
     }
-    crate::docs::render_module_docs_json(&module_docs)
+
+    // Pull the narrative markdown (CHANGELOG / README) off disk
+    // so the published docs.json carries both alongside the
+    // module list. The hatchfile is optional in workspaces that
+    // call this without one (`hatch docs <dir>` on a bare
+    // package); default the paths to CHANGELOG.md / README.md
+    // at the root in that case. Absolute-URL overrides skip the
+    // inline embed — the site renders external URLs through the
+    // catalog row's *_url column instead.
+    let manifest_opt: Option<Manifest> = std::fs::read_to_string(root.join(HATCHFILE))
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok());
+    let changelog = read_narrative_file(
+        root,
+        manifest_opt.as_ref().and_then(|m| m.changelog.as_deref()),
+        "CHANGELOG.md",
+    );
+    let readme = read_narrative_file(
+        root,
+        manifest_opt.as_ref().and_then(|m| m.readme.as_deref()),
+        "README.md",
+    );
+
+    let bundle = crate::docs::DocsBundle {
+        schema_version: crate::docs::DOCS_SCHEMA_VERSION,
+        modules: module_docs,
+        changelog,
+        readme,
+    };
+    crate::docs::render_docs_bundle(&bundle)
         .map_err(|e| HatchError::Encode(format!("docs json: {}", e)))
+}
+
+/// Read an optional narrative markdown file (CHANGELOG / README)
+/// from the package root. `manifest_override` is the value of
+/// Manifest.changelog / Manifest.readme (None when absent).
+/// `default_filename` is the conventional name (CHANGELOG.md /
+/// README.md) used when the manifest doesn't specify one.
+///
+/// Returns None when:
+///   - the override is an absolute URL (site renders externally)
+///   - the resolved path doesn't exist or isn't a file
+///   - the file is empty / whitespace-only
+///   - the file can't be read
+#[cfg(feature = "host")]
+fn read_narrative_file(
+    root: &Path,
+    manifest_override: Option<&str>,
+    default_filename: &str,
+) -> Option<String> {
+    let rel = manifest_override.unwrap_or(default_filename);
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return None;
+    }
+    let path = root.join(rel);
+    if !path.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(text)
 }
 
 #[cfg(feature = "host")]
@@ -2122,6 +2191,7 @@ mod tests {
                 target: None,
                 homepage: None,
                 readme: None,
+                changelog: None,
             },
             sections: vec![
                 Section {

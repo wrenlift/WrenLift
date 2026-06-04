@@ -538,6 +538,7 @@ mod tests {
                 target: None,
                 homepage: None,
                 readme: None,
+                changelog: None,
             },
             sections: Vec::new(),
         };

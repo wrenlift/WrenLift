@@ -1148,6 +1148,12 @@ pub fn register_hatch_docs(bundle_bytes: &[u8]) -> JsValue {
     // deserialise it directly. Skips re-parsing every Source
     // section at workspace boot, and means the docs match the
     // exact code that was published.
+    //
+    // `parse_module_docs_json` accepts both the v2 wrapper
+    // `{ schema_version, modules, changelog?, readme? }` and the
+    // legacy v1 top-level array, so old + new bundles both feed
+    // the same path here. We discard the narrative fields — the
+    // playground only needs the per-module hover index.
     let prebaked: Option<Vec<wren_lift::docs::ModuleDoc>> = hatch
         .sections
         .iter()

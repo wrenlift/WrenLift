@@ -24,6 +24,6 @@ pub use collect::collect_module;
 pub use model::{ClassDoc, MemberDoc, MemberKind, ModuleDoc, ParamTypeInfo};
 pub use prelude::prelude_docs;
 pub use render::{
-    parse_module_docs_json, render_manifest, render_module_docs_json, render_module_json,
-    PackageManifest,
+    parse_docs_bundle, parse_module_docs_json, render_docs_bundle, render_manifest,
+    render_module_docs_json, render_module_json, DocsBundle, PackageManifest, DOCS_SCHEMA_VERSION,
 };

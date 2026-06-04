@@ -773,9 +773,13 @@ fn cmd_docs(target: &Path, out: Option<&Path>) {
             },
             None => {
                 // No docs section in this bundle — emit an empty
-                // array so consumers can treat "no docs" and
-                // "valid empty" identically.
-                "[]".to_string()
+                // v2 wrapper so consumers can treat "no docs" and
+                // "valid empty" identically without a shape
+                // branch.
+                format!(
+                    "{{\"schema_version\":{},\"modules\":[]}}",
+                    wren_lift::docs::DOCS_SCHEMA_VERSION
+                )
             }
         }
     };
@@ -1419,6 +1423,21 @@ fn publish_workspace(
         }
     };
 
+    // Same shape for the CHANGELOG — read `<workspace>/CHANGELOG.md`,
+    // post to `hatch-bot/changelog-upload`, stamp the returned
+    // public URL into `changelog_url`. Snapshot semantics match
+    // README: a typo fix on main without a republish doesn't show
+    // on the catalog; the changelog page is locked to the published
+    // version.
+    let changelog_url = match upload_workspace_changelog(dir, &manifest, creds) {
+        Ok(Some(url)) => Some(url),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("warning: changelog upload skipped — {}", e);
+            None
+        }
+    };
+
     let record = wren_lift::hatch_service::PackageRecord {
         name: manifest.name.clone(),
         version: manifest.version.clone(),
@@ -1428,6 +1447,7 @@ fn publish_workspace(
         readme: manifest.readme.clone(),
         docs_url,
         readme_url,
+        changelog_url,
         owner: None, // server sets from JWT
     };
 
@@ -1446,8 +1466,21 @@ fn upload_workspace_docs(
 ) -> Result<Option<String>, String> {
     let docs_json = wren_lift::hatch::collect_workspace_docs(dir)
         .map_err(|e| format!("collect docs: {}", e))?;
-    if docs_json.trim() == "[]" || docs_json.trim().is_empty() {
+    if docs_json.trim().is_empty() {
         return Ok(None);
+    }
+    // The v2 wrapper is `{ schema_version, modules: [...], changelog?, readme? }`.
+    // Skip the upload when there's literally nothing of value:
+    // no modules, no changelog, no readme. Parsing here is cheap
+    // and avoids a brittle string compare against `[]` (the old
+    // legacy sentinel that no longer matches the new shape).
+    if let Ok(bundle) = wren_lift::docs::parse_docs_bundle(docs_json.as_bytes()) {
+        if bundle.modules.is_empty()
+            && bundle.changelog.as_deref().unwrap_or("").trim().is_empty()
+            && bundle.readme.as_deref().unwrap_or("").trim().is_empty()
+        {
+            return Ok(None);
+        }
     }
     // Body: {name, version, docs} where docs is the parsed JSON
     // from `collect_workspace_docs`. Splice in literally rather
@@ -1498,6 +1531,42 @@ fn upload_workspace_readme(
         serde_json::to_string(&markdown).unwrap_or_else(|_| "\"\"".into()),
     );
     post_to_hatch_bot("readme-upload", &body, creds)
+}
+
+/// Read `<dir>/CHANGELOG.md` and POST it to
+/// `<hatch-bot>/changelog-upload`. Sibling of
+/// `upload_workspace_readme` — same auth, same response shape
+/// (returns the public URL). `Ok(None)` if the workspace has
+/// no CHANGELOG, or if `manifest.changelog` points at an
+/// absolute URL (the site renders external URLs verbatim).
+fn upload_workspace_changelog(
+    dir: &Path,
+    manifest: &wren_lift::hatch::Manifest,
+    creds: &wren_lift::hatch_service::Credentials,
+) -> Result<Option<String>, String> {
+    let rel = manifest
+        .changelog
+        .clone()
+        .unwrap_or_else(|| "CHANGELOG.md".to_string());
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return Ok(None);
+    }
+    let path = dir.join(&rel);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let markdown =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    if markdown.trim().is_empty() {
+        return Ok(None);
+    }
+    let body = format!(
+        r#"{{"name":{},"version":{},"changelog":{}}}"#,
+        serde_json::to_string(&manifest.name).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&manifest.version).unwrap_or_else(|_| "\"\"".into()),
+        serde_json::to_string(&markdown).unwrap_or_else(|_| "\"\"".into()),
+    );
+    post_to_hatch_bot("changelog-upload", &body, creds)
 }
 
 /// Resolve `<hatch-bot-base>/<route>` from `HATCH_BOT_URL`,
