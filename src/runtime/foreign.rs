@@ -219,14 +219,34 @@ pub fn load_library(
     // Explicit hatchfile override wins over everything else.
     if let Some(override_path) = name_overrides.get(name) {
         tried.push(override_path.display().to_string());
-        if let Ok(lib) = unsafe { Library::new(override_path) } {
-            verify_plugin_abi(&lib, name)?;
-            return Ok(lib);
+        match unsafe { Library::new(override_path) } {
+            Ok(lib) => {
+                verify_plugin_abi(&lib, name)?;
+                return Ok(lib);
+            }
+            Err(e) => {
+                // Surface the dlopen reason to stderr the same way
+                // the fallback path does (line ~273 below). Without
+                // this, override-path failures arrive as a generic
+                // "could not load native library 'X' (tried: Y)"
+                // with no clue whether Y is missing, wrong arch,
+                // or just has an unresolvable transitive
+                // dependency. ABI mismatches go through the
+                // `verify_plugin_abi(...)?` branch above and
+                // surface a typed error already; this catches
+                // everything else.
+                eprintln!(
+                    "note: native lib '{}' failed to load: {}: {}",
+                    name,
+                    override_path.display(),
+                    e
+                );
+                return Err(ForeignLoadError::LibraryNotFound {
+                    name: name.to_string(),
+                    tried,
+                });
+            }
         }
-        return Err(ForeignLoadError::LibraryNotFound {
-            name: name.to_string(),
-            tried,
-        });
     }
 
     let candidates = library_candidates(name);

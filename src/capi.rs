@@ -1195,16 +1195,36 @@ pub unsafe extern "C" fn wlift_aot_install_native_lib(
     let payload = unsafe { std::slice::from_raw_parts(bytes, bytes_len) };
 
     let filename = crate::runtime::foreign::default_native_lib_filename(&lib_name);
-    let tmp_dir = std::env::temp_dir().join("wlift_aot_native_libs");
-    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+    // Allow operators to redirect the install directory via
+    // `WLIFT_AOT_NATIVE_LIBS_DIR`. Useful in Docker images that
+    // want a stable, pre-cleaned location (e.g. `/app/libs` or
+    // `/usr/local/lib`) instead of `/tmp`, where some platforms
+    // mount tmpfs with strict size caps or aggressive cleanup
+    // policies that can wipe the extracted dylib between
+    // bootstrap-install and first dlopen. Defaults to
+    // `<tempdir>/wlift_aot_native_libs` so out-of-box self-
+    // contained binaries keep working unchanged.
+    let install_dir = std::env::var_os("WLIFT_AOT_NATIVE_LIBS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("wlift_aot_native_libs"));
+    if let Err(e) = std::fs::create_dir_all(&install_dir) {
         let vm_ref = unsafe { &mut *vm };
-        vm_ref.report_error(&format!("creating native-lib temp dir: {}", e));
+        vm_ref.report_error(&format!(
+            "creating native-lib install dir {}: {}",
+            install_dir.display(),
+            e
+        ));
         return 70;
     }
-    let path = tmp_dir.join(&filename);
+    let path = install_dir.join(&filename);
     if let Err(e) = std::fs::write(&path, payload) {
         let vm_ref = unsafe { &mut *vm };
-        vm_ref.report_error(&format!("writing native lib '{}': {}", lib_name, e));
+        vm_ref.report_error(&format!(
+            "writing native lib '{}' to {}: {}",
+            lib_name,
+            path.display(),
+            e
+        ));
         return 70;
     }
 
