@@ -471,9 +471,9 @@ fn decode_ogg(bytes: &[u8]) -> Result<(Vec<f32>, usize), String> {
                 }
                 let frames = packet[0].len();
                 samples.reserve(frames * channels);
-                for f in 0..frames {
-                    for ch in 0..channels {
-                        let s = packet[ch][f];
+                for (f, _) in packet.iter().take(frames).enumerate() {
+                    for ch in packet.iter().take(channels).enumerate() {
+                        let s = packet[ch.0][f];
                         samples.push(s as f32 / 32768.0);
                     }
                 }
