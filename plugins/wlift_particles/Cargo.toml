@@ -1,0 +1,16 @@
+[package]
+name = "wlift_particles"
+version = "0.1.0"
+edition = "2021"
+description = "CPU particle-system math for WrenLift. The hot per-frame integrate + GPU-instance-pack loops for `ParticleSystem3D` run in native Rust against the Wren-side Float32Arrays so 100k-particle gameframes stay under the parity 8 ms budget without touching the wlift JIT codegen."
+build = "build.rs"
+
+[lib]
+# `cdylib` for the host's dlopen path; `rlib` for static linkage
+# into `wlift_wasm` (which has no dynamic-library loader).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Header-only ABI shim. No `wren_lift` dep — VM layout shifts can't
+# reach plugin code.
+wlift_abi = { path = "../../crates/wlift_abi" }

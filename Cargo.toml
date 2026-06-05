@@ -7,6 +7,7 @@ members = [
     "plugins/wlift_image",
     "plugins/wlift_audio",
     "plugins/wlift_physics",
+    "plugins/wlift_particles",
     "plugins/wlift_hello",
     "plugins/wlift_noise",
     "plugins/wlift_window_web",
