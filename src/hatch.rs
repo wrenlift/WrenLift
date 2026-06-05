@@ -307,6 +307,14 @@ pub enum Dependency {
     /// `name = { path = "../sibling" }` — workspace-relative path
     /// resolved at `hatch build`, recursively built, and its sections
     /// merged into the enclosing hatch.
+    ///
+    /// Dual form: `name = { path = "../sibling", version = "1.2.3" }`.
+    /// The resolver tries the path first; if it doesn't exist (typical
+    /// when a consumer clones a publish bundle without the workspace
+    /// checkout) it falls back to the registry `version` pin via the
+    /// release-artifact cache. One hatchfile works in both dev (path
+    /// resolves) and registry-only (path missing → version fetches)
+    /// contexts.
     Path {
         path: String,
         #[serde(default)]
@@ -1187,14 +1195,23 @@ fn build_recursive(
         if let Ok(early_manifest) = toml::from_str::<Manifest>(&text) {
             for (dep_name, dep) in &early_manifest.dependencies {
                 match dep {
-                    Dependency::Path { path, .. } => {
+                    Dependency::Path { path, version } => {
                         let dep_root = root.join(path);
-                        // Ignore failures here — `merge_path_dependencies`
-                        // will surface a clean error when it tries the
-                        // same path again. We only need the layout
-                        // harvest to flow into `state` on the happy
-                        // path so the upcoming compile sees parents.
-                        let _ = build_recursive(&dep_root, state, cache_dir, target);
+                        if dep_root.exists() {
+                            // Ignore failures here — `merge_path_dependencies`
+                            // will surface a clean error when it tries the
+                            // same path again. We only need the layout
+                            // harvest to flow into `state` on the happy
+                            // path so the upcoming compile sees parents.
+                            let _ = build_recursive(&dep_root, state, cache_dir, target);
+                        } else if let Some(v) = version {
+                            // Local-override miss: path doesn't exist
+                            // (typical when a consumer clones a publish
+                            // bundle without the workspace checkout).
+                            // Harvest the version-pinned cached bundle's
+                            // layouts instead.
+                            harvest_version_dep_layouts(dep_name, v, state, cache_dir, target);
+                        }
                     }
                     Dependency::Git { git, .. } => {
                         let Some(git_ref) = dep.git_ref() else {
@@ -1567,11 +1584,32 @@ fn resolve_dep_bytes_inner(
     target: Option<&str>,
 ) -> Result<Vec<u8>, HatchError> {
     match dep {
-        Dependency::Path { path, .. } => {
+        Dependency::Path { path, version } => {
             let dep_root = root.join(path);
-            build_recursive(&dep_root, state, cache_dir, target).map_err(|e| {
-                HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
-            })
+            if dep_root.exists() {
+                build_recursive(&dep_root, state, cache_dir, target).map_err(|e| {
+                    HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
+                })
+            } else if let Some(v) = version {
+                // Local-override miss: declared workspace path
+                // doesn't resolve, fall back to the registry pin.
+                // Lets a single hatchfile work in both dev (path
+                // exists → workspace build) and CI / consumer
+                // clones (path missing → registry fetch).
+                eprintln!(
+                    "hatch: '{}' path {} not found — falling back to version '{}'",
+                    dep_name,
+                    dep_root.display(),
+                    v
+                );
+                resolve_version_cached_or_fetch(dep_name, v, cache_dir, target)
+            } else {
+                Err(HatchError::Encode(format!(
+                    "dependency '{}' path {} doesn't exist (no fallback `version` pin set)",
+                    dep_name,
+                    dep_root.display()
+                )))
+            }
         }
         Dependency::Version(version) => {
             resolve_version_cached_or_fetch(dep_name, version, cache_dir, target)
@@ -1642,11 +1680,30 @@ fn merge_path_dependencies(
 
     for (dep_name, dep) in deps {
         let dep_bytes = match &dep {
-            Dependency::Path { path, .. } => {
+            Dependency::Path { path, version } => {
                 let dep_root = root.join(path);
-                build_recursive(&dep_root, state, cache_dir, target).map_err(|e| {
-                    HatchError::Encode(format!("failed to build dependency '{}': {}", dep_name, e))
-                })?
+                if dep_root.exists() {
+                    build_recursive(&dep_root, state, cache_dir, target).map_err(|e| {
+                        HatchError::Encode(format!(
+                            "failed to build dependency '{}': {}",
+                            dep_name, e
+                        ))
+                    })?
+                } else if let Some(v) = version {
+                    eprintln!(
+                        "hatch: '{}' path {} not found — falling back to version '{}'",
+                        dep_name,
+                        dep_root.display(),
+                        v
+                    );
+                    resolve_version_cached_or_fetch(&dep_name, v, cache_dir, target)?
+                } else {
+                    return Err(HatchError::Encode(format!(
+                        "dependency '{}' path {} doesn't exist (no fallback `version` pin set)",
+                        dep_name,
+                        dep_root.display()
+                    )));
+                }
             }
             Dependency::Version(version) => {
                 // Cache-or-fetch via the registry. `hatch install`
