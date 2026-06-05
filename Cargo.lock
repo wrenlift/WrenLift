@@ -6759,6 +6759,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "wlift_particles"
+version = "0.1.0"
+dependencies = [
+ "wlift_abi",
+]
+
+[[package]]
 name = "wlift_physics"
 version = "0.1.4"
 dependencies = [
