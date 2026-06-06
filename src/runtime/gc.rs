@@ -774,6 +774,49 @@ impl Gc {
         use std::collections::HashSet;
         let remembered: HashSet<usize> = self.remembered_set.iter().map(|&p| p as usize).collect();
 
+        // Build a set of all live old-gen object addresses once
+        // (also used for the stale-source check below) so the
+        // class-validity pass can confirm each `(*hdr).class`
+        // points at one of them.
+        let live_old: HashSet<usize> = {
+            let mut s = HashSet::new();
+            let mut o = self.old_objects;
+            while !o.is_null() {
+                s.insert(o as usize);
+                o = unsafe { (*o).next };
+            }
+            s
+        };
+
+        // Direction 0: every old-gen object's `class` field is either
+        // null or a plausible heap pointer pointing to a Class that's
+        // still in old_objects. A `class` that became a small integer
+        // (3 in the wild) means something overwrote that 8-byte slot
+        // — a use-after-free aliased onto the header from another
+        // allocation. Catches the corruption AT THE SOURCE GC cycle
+        // rather than waiting for the next `trace_object` to fault.
+        let mut current = self.old_objects;
+        while !current.is_null() {
+            unsafe {
+                let class = (*current).class as usize;
+                let plausible = class == 0 || class >= 0x10000;
+                let in_old = class == 0 || live_old.contains(&class);
+                if !plausible || !in_old {
+                    panic!(
+                        "CORRUPT CLASS BUG: old obj {:p} ({:?}) has class={:#x} \
+                         (plausible_addr={}, in_old_objects={}) — \
+                         use-after-free overwrote header.class",
+                        current,
+                        (*current).obj_type,
+                        class,
+                        plausible,
+                        in_old,
+                    );
+                }
+                current = (*current).next;
+            }
+        }
+
         // Direction 1: every old-gen object's young references are in remembered_set.
         let mut current = self.old_objects;
         while !current.is_null() {
@@ -784,16 +827,7 @@ impl Gc {
         }
 
         // Direction 2: every remembered_set entry is still in old_objects.
-        // Build the in-list set once and check membership of every entry.
-        let live_old: HashSet<usize> = {
-            let mut s = HashSet::new();
-            let mut o = self.old_objects;
-            while !o.is_null() {
-                s.insert(o as usize);
-                o = unsafe { (*o).next };
-            }
-            s
-        };
+        // (`live_old` already computed at top.)
         for &entry in &self.remembered_set {
             if !live_old.contains(&(entry as usize)) {
                 let ty = unsafe { (*entry).obj_type };
@@ -819,9 +853,9 @@ impl Gc {
                     && !remembered.contains(&(header as usize))
                 {
                     panic!(
-                            "WRITE BARRIER BUG: old {:?} ({:?}) → young {:?}, not in remembered set. desc: {}",
-                            header, (*header).obj_type, target, desc
-                        );
+                        "WRITE BARRIER BUG: old {:?} ({:?}) → young {:?}, not in remembered set. desc: {}",
+                        header, (*header).obj_type, target, desc
+                    );
                 }
             }
         };
@@ -830,9 +864,9 @@ impl Gc {
                 let target = ptr as *mut ObjHeader;
                 if (*target).generation == GEN_YOUNG && !remembered.contains(&(header as usize)) {
                     panic!(
-                            "WRITE BARRIER BUG: old {:?} ({:?}) → young raw {:?}, not in remembered set. desc: {}",
-                            header, (*header).obj_type, ptr, desc
-                        );
+                        "WRITE BARRIER BUG: old {:?} ({:?}) → young raw {:?}, not in remembered set. desc: {}",
+                        header, (*header).obj_type, ptr, desc
+                    );
                 }
             }
         };
@@ -892,6 +926,16 @@ impl Gc {
                 check_raw(fiber.caller as *const u8, "fiber.caller");
                 check_val(fiber.error, "fiber.error");
                 check_val(fiber.context_map, "fiber.context_map");
+                if let Some(v) = fiber.jit_resume_value {
+                    check_val(v, "fiber.jit_resume_value");
+                }
+                #[cfg(feature = "host")]
+                {
+                    check_val(fiber.krio_return_value, "fiber.krio_return_value");
+                    for (i, &v) in fiber.krio_jit_roots.iter().enumerate() {
+                        check_val(v, &format!("fiber.krio_jit_roots[{}]", i));
+                    }
+                }
             }
             ObjType::Class => {
                 let class = &*(header as *mut ObjClass);
@@ -1232,6 +1276,69 @@ impl Gc {
             }
         }
 
+        // Trace every old-gen container object unconditionally. The
+        // interpreter has many write paths that mutate slots inside
+        // old-gen objects — set_reg into a fiber's frame.values,
+        // SubscriptSet via a JIT direct path that elided the write
+        // barrier (project_jit_list_subscript_set_barrier), arena-
+        // resident instance fields, etc. — and any one of them that
+        // misses `gc.write_barrier(source, value)` produces the same
+        // class of bug: an old(container) → young(value) edge that
+        // `remembered_set` never sees, so the next minor GC drops
+        // the young value while the container still holds the (now-
+        // stale) pointer. `trace_object` then faults at offset 0x4
+        // dereferencing the recycled header.
+        //
+        // The previous form here gated on `ObjType::Fiber` only —
+        // that closed the set_reg leak ([[project-fiber-set-reg-barrier]])
+        // but missed the JIT-list-subscript leak and any other
+        // container class with a future missing-barrier site.
+        // Tracing every container type costs O(#old containers) per
+        // GC; on a busy game scene with ~5–10k old objects this
+        // measures under a millisecond — far cheaper than chasing
+        // a stale pointer to a 0x4 fault.
+        //
+        // Closure / Upvalue carry Value slots too (closed upvalues,
+        // upvalue.closed). Class is included because method-resolver
+        // installs into `methods` can leave young SymbolId entries
+        // pointing at young classes via inheritance. Module holds
+        // module-level globals — equivalent to instance fields.
+        unsafe {
+            let mut current = self.old_objects;
+            // Bound the walk: if the list has been corrupted into a
+            // cycle or its `next` pointers turn to garbage, an
+            // unbounded loop would hang. Sized to old_count * 2 +
+            // slack so a legitimate fresh-promotion can't trip it.
+            let max_walk = self.old_count.saturating_mul(2).max(1024);
+            let mut walked = 0usize;
+            while is_valid_obj_ptr(current) && walked < max_walk {
+                // Validate the obj_type byte fits in the enum range
+                // before dispatching; garbage memory may report a
+                // type discriminant past the highest variant, which
+                // means the header is freed memory recycled by the
+                // allocator.
+                let type_byte = *(current as *const u8);
+                if type_byte > ObjType::Simd as u8 {
+                    break;
+                }
+                if matches!(
+                    (*current).obj_type,
+                    ObjType::Fiber
+                        | ObjType::List
+                        | ObjType::Map
+                        | ObjType::Instance
+                        | ObjType::Closure
+                        | ObjType::Upvalue
+                        | ObjType::Class
+                        | ObjType::Module
+                ) {
+                    trace_object(current, &mut gray_stack);
+                }
+                current = (*current).next;
+                walked += 1;
+            }
+        }
+
         process_gray_stack(&mut gray_stack);
 
         // 2. Promote live nursery objects, drop dead ones.
@@ -1296,6 +1403,47 @@ impl Gc {
         for &obj in &remembered {
             unsafe {
                 trace_object(obj, &mut gray_stack);
+            }
+        }
+        // Mirror of the broadened container sweep in `collect_minor`:
+        // trace every old-gen container type unconditionally so
+        // missing-barrier sites (set_reg, JIT-list-subscript, and
+        // any future ones) don't surface as use-after-free on the
+        // next collection. See the comment in `collect_minor` for
+        // the rationale + the per-type breakdown.
+        unsafe {
+            let mut current = self.old_objects;
+            // Bound the walk: if the list has been corrupted into a
+            // cycle or its `next` pointers turn to garbage, an
+            // unbounded loop would hang. Sized to old_count * 2 +
+            // slack so a legitimate fresh-promotion can't trip it.
+            let max_walk = self.old_count.saturating_mul(2).max(1024);
+            let mut walked = 0usize;
+            while is_valid_obj_ptr(current) && walked < max_walk {
+                // Validate the obj_type byte fits in the enum range
+                // before dispatching; garbage memory may report a
+                // type discriminant past the highest variant, which
+                // means the header is freed memory recycled by the
+                // allocator.
+                let type_byte = *(current as *const u8);
+                if type_byte > ObjType::Simd as u8 {
+                    break;
+                }
+                if matches!(
+                    (*current).obj_type,
+                    ObjType::Fiber
+                        | ObjType::List
+                        | ObjType::Map
+                        | ObjType::Instance
+                        | ObjType::Closure
+                        | ObjType::Upvalue
+                        | ObjType::Class
+                        | ObjType::Module
+                ) {
+                    trace_object(current, &mut gray_stack);
+                }
+                current = (*current).next;
+                walked += 1;
             }
         }
         process_gray_stack(&mut gray_stack);
@@ -1713,6 +1861,16 @@ impl Gc {
                 check_raw(fiber.caller as *const u8, "fiber.caller");
                 check_val(fiber.error, "fiber.error");
                 check_val(fiber.context_map, "fiber.context_map");
+                if let Some(v) = fiber.jit_resume_value {
+                    check_val(v, "fiber.jit_resume_value");
+                }
+                #[cfg(feature = "host")]
+                {
+                    check_val(fiber.krio_return_value, "fiber.krio_return_value");
+                    for (i, &v) in fiber.krio_jit_roots.iter().enumerate() {
+                        check_val(v, &format!("fiber.krio_jit_roots[{}]", i));
+                    }
+                }
             }
             ObjType::Class => {
                 let class = &*(header as *mut ObjClass);
@@ -1834,11 +1992,36 @@ impl Drop for Gc {
 // Mark phase (free functions)
 // ---------------------------------------------------------------------------
 
+// Defensive: bracket the valid user-space heap range so a corrupt
+// header pointer can be skipped instead of crashing the whole VM.
+//
+// - Bottom 64 KB: NULL + small-integer corruption (a SymbolId or
+//   Value-tag leaked into a slot, a freed `ObjHeader.next` over-
+//   written by a recycled allocation). The OS never maps page 0.
+// - Above 0x0000_8000_0000_0000 (128 TB): kernel space + PAC-
+//   signed pointer auth bits + NaN-boxed Value tag bits leaked
+//   into what should be a header pointer. The QNAN tag for objects
+//   sits up here, so a `Value` accidentally tracing as a header
+//   lands well past this ceiling.
+//
+// Skipping bracketed pointers turns the eventual fault into a
+// leaked-tracing-step instead of a SIGSEGV. The real fix is to
+// find the corruption source — see [[project_jit_list_subscript_set_barrier]]
+// and [[project_fiber_set_reg_barrier]] for prior examples — but
+// this guard keeps the demo running while we investigate.
+const MIN_VALID_HEAP_ADDR: usize = 0x10000;
+const MAX_VALID_HEAP_ADDR: usize = 0x0000_8000_0000_0000;
+
+fn is_valid_obj_ptr(header: *mut ObjHeader) -> bool {
+    let addr = header as usize;
+    addr >= MIN_VALID_HEAP_ADDR && addr < MAX_VALID_HEAP_ADDR
+}
+
 fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
     if val.is_object() {
         if let Some(ptr) = val.as_object() {
             let header = ptr as *mut ObjHeader;
-            if !header.is_null() {
+            if is_valid_obj_ptr(header) {
                 mark_gray(header, gray_stack);
             }
         }
@@ -1846,6 +2029,9 @@ fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {
 }
 
 fn mark_gray(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
+    if !is_valid_obj_ptr(header) {
+        return;
+    }
     unsafe {
         if (*header).gc_mark != WHITE {
             return;
@@ -1857,6 +2043,9 @@ fn mark_gray(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
 
 fn process_gray_stack(gray_stack: &mut Vec<*mut ObjHeader>) {
     while let Some(obj) = gray_stack.pop() {
+        if !is_valid_obj_ptr(obj) {
+            continue;
+        }
         unsafe {
             (*obj).gc_mark = BLACK;
             trace_object(obj, gray_stack);
@@ -1866,8 +2055,19 @@ fn process_gray_stack(gray_stack: &mut Vec<*mut ObjHeader>) {
 
 /// Trace all object references from a single object.
 unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHeader>) {
-    if !(*header).class.is_null() {
+    // Reject obviously-corrupt headers before dereferencing. Same
+    // bracket as `is_valid_obj_ptr` — covers both low-int corruption
+    // (collect_minor 0x4 fault) and high-garbage / PAC-signed
+    // pointers (collect_major 0x2ada... fault).
+    if !is_valid_obj_ptr(header) {
+        return;
+    }
+    if !(*header).class.is_null() && is_valid_obj_ptr((*header).class as *mut ObjHeader) {
         mark_gray((*header).class as *mut ObjHeader, gray_stack);
+    } else if !(*header).class.is_null() {
+        // Class pointer set but corrupt — skip the mark but keep
+        // going so the rest of this header's children still get
+        // traced.
     }
 
     match (*header).obj_type {
@@ -1954,6 +2154,16 @@ unsafe fn trace_object(header: *mut ObjHeader, gray_stack: &mut Vec<*mut ObjHead
             }
             mark_value(fiber.error, gray_stack);
             mark_value(fiber.context_map, gray_stack);
+            if let Some(v) = fiber.jit_resume_value {
+                mark_value(v, gray_stack);
+            }
+            #[cfg(feature = "host")]
+            {
+                mark_value(fiber.krio_return_value, gray_stack);
+                for &val in &fiber.krio_jit_roots {
+                    mark_value(val, gray_stack);
+                }
+            }
         }
 
         ObjType::Class => {
@@ -2222,6 +2432,16 @@ unsafe fn update_pointers_in_object_inline(header: *mut ObjHeader, nursery: &Nur
             update_raw_ptr_inline(&mut fiber.caller, nursery);
             update_value_inline(&mut fiber.error, nursery);
             update_value_inline(&mut fiber.context_map, nursery);
+            if let Some(ref mut v) = fiber.jit_resume_value {
+                update_value_inline(v, nursery);
+            }
+            #[cfg(feature = "host")]
+            {
+                update_value_inline(&mut fiber.krio_return_value, nursery);
+                for val in fiber.krio_jit_roots.iter_mut() {
+                    update_value_inline(val, nursery);
+                }
+            }
         }
 
         ObjType::Class => {

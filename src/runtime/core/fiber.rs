@@ -291,6 +291,12 @@ unsafe fn get_or_init_context_map(ctx: &mut dyn NativeContext, fiber: *mut ObjFi
     }
     let map = ctx.alloc_map();
     (*fiber).context_map = map;
+    // Old(fiber)->young(map) edge if the fiber has already been
+    // promoted. Without a barrier, the next minor GC misses the
+    // map and a subsequent access faults at 0x4 (same channel as
+    // the prior fiber set_reg / list subscript-set barrier fixes).
+    let fiber_val = Value::object(fiber as *mut u8);
+    ctx.write_barrier(fiber_val, map);
     map
 }
 

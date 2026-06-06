@@ -211,6 +211,13 @@ fn list_swap(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     };
     let list = receiver_list_mut(args);
     list.swap(index_a, index_b);
+    // Same minor-GC-misses-edge channel as list_sort_by /
+    // random_shuffle: post-swap values are old(list)→? edges and
+    // may be young. Re-arm the barrier defensively.
+    let a = receiver_list(args).get(index_a).unwrap_or(Value::null());
+    let b = receiver_list(args).get(index_b).unwrap_or(Value::null());
+    ctx.write_barrier(args[0], a);
+    ctx.write_barrier(args[0], b);
     Value::null()
 }
 
@@ -258,12 +265,17 @@ fn list_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         // If both are the same type, fall back to bit comparison for stability.
         std::cmp::Ordering::Equal
     });
-    // Write sorted elements back into the list.
+    // Write sorted elements back into the list. Each set() can
+    // create an old(list) -> young(value) edge if the list has
+    // already been promoted; without a write_barrier the next
+    // minor GC won't see those references and will free the value.
     let list = receiver_list_mut(args);
-    for (i, v) in elements.into_iter().enumerate() {
+    for (i, v) in elements.iter().copied().enumerate() {
         list.set(i, v);
     }
-    let _ = ctx; // suppress unused warning
+    for v in elements {
+        ctx.write_barrier(args[0], v);
+    }
     args[0]
 }
 
@@ -298,6 +310,14 @@ fn list_sort_by(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         if min_idx != i {
             let list = receiver_list_mut(args);
             list.swap(i, min_idx);
+            // Swap moves two pre-existing slot values around; both
+            // post-swap values are old(list) -> ? edges and may be
+            // young, so re-arm the barrier defensively. (Cheap: no
+            // work happens unless the value is actually young.)
+            let a = receiver_list(args).get(i).unwrap_or(Value::null());
+            let b = receiver_list(args).get(min_idx).unwrap_or(Value::null());
+            ctx.write_barrier(args[0], a);
+            ctx.write_barrier(args[0], b);
         }
     }
     args[0]

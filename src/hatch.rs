@@ -1160,6 +1160,34 @@ fn build_recursive(
     }
     state.active.insert(canonical.clone());
 
+    // Wrap the rest in a closure so we can guarantee `state.active`
+    // gets cleaned up on every exit path — error or success. The
+    // previous "remove only at the Ok path" left stale entries on
+    // ANY error, and the early-harvest pass below intentionally
+    // swallows errors via `let _ = build_recursive(...)`. Those
+    // leaked entries made the subsequent real-resolution pass see
+    // the same dep "still active" and fire a spurious "dependency
+    // cycle detected" — repro'd by demos that declared a path dep
+    // on `@hatch:postfx` while `@hatch:postfx` itself path-pinned
+    // `@hatch:game`.
+    let result = build_recursive_inner(root, &canonical, state, cache_dir, target);
+    state.active.remove(&canonical);
+    if let Ok(bytes) = &result {
+        state.cache.insert(canonical, bytes.clone());
+    }
+    return result;
+}
+
+#[cfg(feature = "host")]
+fn build_recursive_inner(
+    root: &Path,
+    canonical: &Path,
+    state: &mut BuildState,
+    cache_dir: Option<&Path>,
+    target: Option<&str>,
+) -> Result<Vec<u8>, HatchError> {
+    let _ = canonical; // suppress unused for shared closure shape
+
     let mut wren_files: Vec<(String, std::path::PathBuf)> = Vec::new();
     collect_wren_files(root, root, &mut wren_files)?;
     // Order by intra-package import graph so a module's deps are
@@ -1381,11 +1409,9 @@ fn build_recursive(
     for (cls, layout) in compile_vm.field_layouts.drain() {
         state.class_field_layouts.insert(cls, layout);
     }
-    // Pop from the active recursion stack and cache the encoded
-    // bytes so a diamond revisit (`a → b → c` plus `a → c`) returns
-    // these same bytes without rebuilding.
-    state.active.remove(&canonical);
-    state.cache.insert(canonical, bytes.clone());
+    // `state.active` cleanup + `state.cache.insert` happens in the
+    // outer `build_recursive` wrapper so error paths from this
+    // function also get cleaned up.
     Ok(bytes)
 }
 

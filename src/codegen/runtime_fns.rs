@@ -4620,15 +4620,33 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
     // Root the closure before upvalue allocations.
     push_jit_root(Value::object(closure_ptr as *mut u8));
 
-    // Populate upvalues with captured values (pre-closed)
+    // Populate upvalues with captured values (pre-closed).
+    // CRITICAL: `alloc_upvalue` can trigger a minor GC that
+    // promotes the closure to old-gen. If we then write through
+    // the stale `closure_ptr`, we mutate a freed nursery slot and
+    // the live (forwarded) closure ends up with garbage upvalues.
+    // Refresh the closure pointer from JIT_ROOTS_STORE every
+    // iteration — the GC forwards the slot in place, so reading
+    // it back always yields the current address. Then enroll the
+    // old(closure) -> young(upvalue) edge in remembered_set so a
+    // subsequent minor GC traces through the new upvalue.
+    let closure_root_idx = jit_roots_len() - 1;
     for (i, &uv_bits) in upvalue_vals.iter().enumerate() {
         let captured_val = Value::from_bits(uv_bits);
         let uv_obj = vm.gc.alloc_upvalue(std::ptr::null_mut());
         unsafe {
             (*uv_obj).closed = captured_val;
             (*uv_obj).location = &mut (*uv_obj).closed as *mut Value;
-            if i < (*closure_ptr).upvalues.len() {
-                (&mut (*closure_ptr).upvalues)[i] = uv_obj;
+            let live_closure_val = jit_root_at(closure_root_idx);
+            let live_closure = live_closure_val
+                .as_object()
+                .expect("closure root vanished") as *mut crate::runtime::object::ObjClosure;
+            if i < (*live_closure).upvalues.len() {
+                (&mut (*live_closure).upvalues)[i] = uv_obj;
+                vm.gc.write_barrier(
+                    live_closure as *mut crate::runtime::object::ObjHeader,
+                    Value::object(uv_obj as *mut u8),
+                );
             }
         }
     }

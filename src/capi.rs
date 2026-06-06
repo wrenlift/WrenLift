@@ -2904,6 +2904,11 @@ pub extern "C" fn wrenSetListElement(
             index as usize
         };
         list.set(idx, elem);
+        // Inter-gen edge — old-gen list receiver gets a young
+        // value from a plugin write. Without this barrier the
+        // edge never enters the remembered_set and the next
+        // minor GC drops the young object behind the list.
+        (*vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
     }
 }
 
@@ -2937,6 +2942,8 @@ pub extern "C" fn wrenInsertInList(
         };
         let idx = idx.min(list.len());
         list.insert(idx, elem);
+        // Inter-gen edge — same shape as wrenSetListElement.
+        (*vm).gc.write_barrier(ptr as *mut ObjHeader, elem);
     }
 }
 
@@ -3020,6 +3027,12 @@ pub extern "C" fn wrenSetMapValue(
     unsafe {
         let map = &mut *(ptr as *mut ObjMap);
         map.set(key, val);
+        // Map needs both key AND value barriers — either edge
+        // can drag a young object into an old-gen container.
+        // Mirrors wren_map_set in runtime_fns.rs.
+        let hdr = ptr as *mut ObjHeader;
+        (*vm).gc.write_barrier(hdr, key);
+        (*vm).gc.write_barrier(hdr, val);
     }
 }
 

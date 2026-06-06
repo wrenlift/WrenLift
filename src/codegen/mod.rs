@@ -4693,7 +4693,33 @@ impl<'a> LowerCtx<'a> {
                     src: val_reg,
                     mem: Mem::new(elem_addr, 0),
                 });
-                self.mf.emit(MachInst::Mov { dst, src: val_reg });
+                // Write barrier: the runtime fallback `wren_subscript_set`
+                // calls write_barrier after the store; the direct JIT path
+                // must do the same, or an old-gen List → young-gen value
+                // edge becomes invisible to the next minor GC and the
+                // young value is freed while the list still references it.
+                // trace_object then dereferences the dangling pointer and
+                // faults at offset 0x4 in the recycled header (see
+                // project_jit_list_subscript_set_barrier).
+                //
+                // Only emit when the value's inferred rep could be an
+                // object — primitives don't create inter-gen edges, and
+                // the existing SetField path uses the same gate.
+                if self
+                    .gc_value_reps
+                    .get(value.0 as usize)
+                    .copied()
+                    .unwrap_or(GcValueRep::MaybeObject)
+                    .is_gc_root()
+                {
+                    self.mf.emit(MachInst::CallRuntime {
+                        name: "wren_write_barrier",
+                        args: vec![recv_reg, val_reg],
+                        ret: Some(dst),
+                    });
+                } else {
+                    self.mf.emit(MachInst::Mov { dst, src: val_reg });
+                }
             }
             // Multi-index subscript: fall back to runtime call
             Instruction::SubscriptGet { receiver, args } => {

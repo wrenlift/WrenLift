@@ -347,6 +347,11 @@ fn random_shuffle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         let b = list.get(j).unwrap_or(Value::null());
         list.set(i, b);
         list.set(j, a);
+        // Both written values may be young while the list is old —
+        // missing write barriers leave the dangling-elements bug
+        // (see project_jit_list_subscript_set_barrier).
+        ctx.write_barrier(args[1], a);
+        ctx.write_barrier(args[1], b);
     }
     save_prng(args, &prng);
     Value::null()

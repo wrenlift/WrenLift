@@ -4900,10 +4900,13 @@ fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
                 // JIT barrier path: caller's frames were temporarily removed.
                 // Store the resume value so handle_jit_fiber_action can read it.
                 (*caller).jit_resume_value = Some(value);
+                vm.gc
+                    .write_barrier(caller as *mut ObjHeader, value);
             }
         } else if (*caller).mir_frames.is_empty() {
             // No resume_value_dst and no frames: JIT barrier path.
             (*caller).jit_resume_value = Some(value);
+            vm.gc.write_barrier(caller as *mut ObjHeader, value);
         }
     }
     vm.fiber = caller;
