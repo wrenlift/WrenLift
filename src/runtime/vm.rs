@@ -696,8 +696,12 @@ impl VM {
             &resolve_result,
             &self.field_layouts,
         );
-        for (name, layout) in new_layouts {
-            self.field_layouts.insert(name, layout);
+        // Insert into the VM's compile-time layout table AND keep a
+        // serializable clone so the emitted .wlbc carries the same
+        // information for downstream consumers (the install path
+        // re-registers it into vm.field_layouts on load).
+        for (name, layout) in &new_layouts {
+            self.field_layouts.insert(name.clone(), layout.clone());
         }
 
         // 4. Optimize top-level + method + closure bodies
@@ -729,11 +733,12 @@ impl VM {
         let var_sources = resolve_result.module_var_sources.clone();
 
         // 6. Serialize.
-        crate::serialize::emit(&interner, &module_mir, &var_names, &var_sources).map_err(|e| {
-            crate::diagnostics::Diagnostic::error(format!("failed to emit .wlbc: {}", e))
-                .eprint_no_source();
-            InterpretResult::CompileError
-        })
+        crate::serialize::emit(&interner, &module_mir, &var_names, &var_sources, &new_layouts)
+            .map_err(|e| {
+                crate::diagnostics::Diagnostic::error(format!("failed to emit .wlbc: {}", e))
+                    .eprint_no_source();
+                InterpretResult::CompileError
+            })
     }
 
     /// Load and execute a module from a `.wlbc` bytecode cache.
@@ -768,6 +773,7 @@ impl VM {
             blob.module,
             blob.var_names,
             blob.var_sources,
+            blob.class_field_names,
         )
     }
 
@@ -1095,6 +1101,7 @@ impl VM {
                     blob.module,
                     blob.var_names,
                     blob.var_sources,
+                    blob.class_field_names,
                 ),
                 Err(e) => {
                     // A `decode:` failure here usually means the
@@ -1299,8 +1306,8 @@ impl VM {
             &resolve_result,
             &self.field_layouts,
         );
-        for (name, layout) in new_layouts {
-            self.field_layouts.insert(name, layout);
+        for (name, layout) in &new_layouts {
+            self.field_layouts.insert(name.clone(), layout.clone());
         }
 
         // 5. Optimize top-level function
@@ -1342,6 +1349,7 @@ impl VM {
             module_mir,
             var_names,
             var_sources,
+            new_layouts,
         )
     }
 
@@ -1625,6 +1633,7 @@ impl VM {
             module_mir,
             var_names,
             sources,
+            std::collections::HashMap::new(),
         )
     }
 
@@ -1635,7 +1644,18 @@ impl VM {
         mut module_mir: crate::mir::ModuleMir,
         var_names: Vec<String>,
         var_sources: Vec<Option<String>>,
+        class_field_names: std::collections::HashMap<String, Vec<String>>,
     ) -> InterpretResult {
+        // Register every class declared in this module into the
+        // VM's compile-time field-layout table. A downstream module
+        // compiled later in the same VM — e.g. user source on the
+        // wasm playground that subclasses a class defined in a
+        // pre-built `.hatch` bundle — needs the parent layout to
+        // assign field slots correctly. Without this the MIR
+        // builder panics with "field layout is not yet registered".
+        for (cls, layout) in class_field_names {
+            self.field_layouts.insert(cls, layout);
+        }
         use crate::mir::BlockId;
         // 6. Remap symbols: the source interner and VM interner have different
         // indices for the same strings. Build a mapping and rewrite the MIR.
@@ -1916,22 +1936,6 @@ impl VM {
                 };
                 (*class_ptr).num_fields = class_mir.num_fields + inherited_fields;
                 (*class_ptr).attributes = class_mir.attributes;
-            }
-
-            // Re-register the class's field-name layout into the
-            // compile-time `field_layouts` map so a downstream
-            // module compiled later in the same VM (e.g. the wasm
-            // playground installs `@hatch:game` then compiles
-            // user source that extends `Game`) can look up the
-            // parent's slot layout from
-            // `lower_module_with_known_classes`. Without this the
-            // MIR builder panics with "field layout is not yet
-            // registered" because Wlbc decode skips the source-
-            // compile path that originally populated field_layouts.
-            if !class_mir.field_names.is_empty() {
-                let class_name = self.interner.resolve(class_mir.name).to_string();
-                self.field_layouts
-                    .insert(class_name, class_mir.field_names.clone());
             }
 
             // Register each method's MIR and bind to the class
@@ -4772,8 +4776,8 @@ impl VM {
             &resolve_result,
             &self.field_layouts,
         );
-        for (name, layout) in new_layouts {
-            self.field_layouts.insert(name, layout);
+        for (name, layout) in &new_layouts {
+            self.field_layouts.insert(name.clone(), layout.clone());
         }
         let constfold = ConstFold;
         let dce = Dce;
@@ -4960,8 +4964,8 @@ impl VM {
             &resolve_result,
             &self.field_layouts,
         );
-        for (name, layout) in new_layouts {
-            self.field_layouts.insert(name, layout);
+        for (name, layout) in &new_layouts {
+            self.field_layouts.insert(name.clone(), layout.clone());
         }
         let constfold = ConstFold;
         let dce = Dce;

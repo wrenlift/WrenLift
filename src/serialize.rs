@@ -48,6 +48,13 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 /// produces one in serialized output.
 ///
 /// History:
+/// - v7 (2026-06-14): `class_field_names` field on `ModuleBlob` —
+///   ordered (inherited + own) field-name list per class declared
+///   in the module. Installed at module-install time into
+///   `vm.field_layouts` so downstream source compiles (e.g. the
+///   wasm playground compiling user code that subclasses `Game`
+///   from a pre-built `@hatch:game` bundle) can resolve the parent
+///   layout without re-running the parent's source compile.
 /// - v6 (2026-04-29): `var_sources` field on `ModuleBlob` so the
 ///   install path can honour `import "<module>" for <name>` source
 ///   pins (was lost on the wlbc round-trip, breaking dispatcher
@@ -56,7 +63,7 @@ pub const MAGIC: [u8; 4] = *b"WLBC";
 ///   to seed the effect-summary pass.
 /// - v4: prior; first version this constant gained a written-down
 ///   bump policy.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Combined payload: everything a fresh `VM` needs to materialise the
 /// module without touching the parser, resolver, MIR builder, or the
@@ -76,6 +83,26 @@ pub struct ModuleBlob {
     pub module: ModuleMir,
     pub var_names: Vec<String>,
     pub var_sources: Vec<Option<String>>,
+    /// Ordered (inherited + own) field-name list per class declared
+    /// in this module. Harvested into `vm.field_layouts` at install
+    /// time so a later source compile (e.g. user code subclassing a
+    /// class defined in this module) can resolve the parent layout
+    /// without re-running the parent's source compile.
+    pub class_field_names: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// v6 layout — kept solely for the back-compat read path in
+/// `load()`. v6 artifacts published to the hatch registry before
+/// the v7 bump still install (with empty class_field_names — a
+/// downstream source compile that subclasses a class defined in
+/// a v6 module will still hit the "field layout is not yet
+/// registered" panic until the module is republished).
+#[derive(serde::Deserialize)]
+struct ModuleBlobV6 {
+    interner: Interner,
+    module: ModuleMir,
+    var_names: Vec<String>,
+    var_sources: Vec<Option<String>>,
 }
 
 /// v5 layout — kept solely for the back-compat read path in
@@ -142,12 +169,14 @@ pub fn emit(
     module: &ModuleMir,
     var_names: &[String],
     var_sources: &[Option<String>],
+    class_field_names: &std::collections::HashMap<String, Vec<String>>,
 ) -> Result<Vec<u8>, SerializeError> {
     let blob = ModuleBlob {
         interner: interner.clone(),
         module: module.clone(),
         var_names: var_names.to_vec(),
         var_sources: var_sources.to_vec(),
+        class_field_names: class_field_names.clone(),
     };
 
     let payload = bincode::serde::encode_to_vec(&blob, bincode::config::standard())
@@ -168,14 +197,13 @@ pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
         return Err(SerializeError::BadMagic);
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    // v5 is the previous wlbc layout: same as v6 minus `var_sources`.
-    // Already-published registry artifacts encode v5; loading them
-    // here (with empty source pins) avoids forcing every package to
-    // republish on the v6 bump. v5 artifacts can't honour
-    // `import "<mod>" for <name>` source pins at install time, but
-    // none of the legacy packages use the dispatcher pattern that
-    // needs them.
-    if version != VERSION && version != 5 {
+    // v5 and v6 are the previous wlbc layouts kept for back-compat
+    // so already-published registry artifacts still install. v5/v6
+    // lack `class_field_names`, so downstream source compiles that
+    // subclass a class defined in a legacy bundle will hit the
+    // "field layout is not yet registered" panic — republish the
+    // affected package against the current wren_lift sources.
+    if version != VERSION && version != 5 && version != 6 {
         return Err(SerializeError::VersionMismatch {
             expected: VERSION,
             found: version,
@@ -201,6 +229,21 @@ pub fn load(bytes: &[u8]) -> Result<ModuleBlob, SerializeError> {
             module: v5.module,
             var_names: v5.var_names,
             var_sources,
+            class_field_names: std::collections::HashMap::new(),
+        });
+    }
+    if version == 6 {
+        let (v6, _consumed) = bincode::serde::decode_from_slice::<ModuleBlobV6, _>(
+            payload,
+            bincode::config::standard(),
+        )
+        .map_err(|e| SerializeError::Decode(e.to_string()))?;
+        return Ok(ModuleBlob {
+            interner: v6.interner,
+            module: v6.module,
+            var_names: v6.var_names,
+            var_sources: v6.var_sources,
+            class_field_names: std::collections::HashMap::new(),
         });
     }
     let (blob, _consumed) =
@@ -239,7 +282,14 @@ mod tests {
         let var_names = vec!["System".to_string(), "greeting".to_string()];
 
         let var_sources = vec![None; var_names.len()];
-        let blob_bytes = emit(&interner, &module, &var_names, &var_sources).expect("emit");
+        let blob_bytes = emit(
+            &interner,
+            &module,
+            &var_names,
+            &var_sources,
+            &std::collections::HashMap::new(),
+        )
+        .expect("emit");
         let blob = load(&blob_bytes).expect("load");
 
         assert_eq!(
@@ -309,7 +359,14 @@ mod tests {
     fn load_rejects_truncated_payload() {
         let mut interner = Interner::new();
         let module = empty_module(&mut interner);
-        let blob = emit(&interner, &module, &[], &[]).expect("emit");
+        let blob = emit(
+            &interner,
+            &module,
+            &[],
+            &[],
+            &std::collections::HashMap::new(),
+        )
+        .expect("emit");
         let truncated = &blob[..blob.len() - 1];
         assert!(matches!(
             load(truncated),

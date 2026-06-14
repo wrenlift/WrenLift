@@ -674,17 +674,6 @@ pub struct ClassMir {
     pub superclass: Option<SymbolId>,
     pub methods: Vec<MethodMir>,
     pub num_fields: u16,
-    /// Ordered field names (inherited + own) — same shape as the
-    /// `emitted_layouts` map `lower_module_with_known_classes`
-    /// returns. Serialized into Wlbc so that when a downstream
-    /// module is compiled against a pre-built `.hatch` bundle
-    /// (e.g. the wasm playground installing `@hatch:game` then
-    /// compiling user source that subclasses `Game`), the field
-    /// names can be harvested back into `vm.field_layouts` and
-    /// the MIR builder's superclass-layout lookup succeeds.
-    /// `#[serde(default)]` so old Wlbc artifacts still decode.
-    #[serde(default)]
-    pub field_names: Vec<String>,
     /// Protocols this class conforms to (computed during compilation).
     pub protocols: crate::sema::protocol::ProtocolSet,
     /// Runtime-visible attributes (`#key`, `#!` ones are stripped).
