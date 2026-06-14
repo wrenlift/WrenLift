@@ -2010,7 +2010,18 @@ impl Drop for Gc {
 // and [[project_fiber_set_reg_barrier]] for prior examples — but
 // this guard keeps the demo running while we investigate.
 const MIN_VALID_HEAP_ADDR: usize = 0x10000;
+// 64-bit user-space VA ceiling (2^47) on x86_64/aarch64; tagged
+// NaN-boxed Values lift well past this so a Value mistakenly traced
+// as a header pointer lands above the cap and gets skipped. wasm32
+// is 32-bit (usize = u32 = max 4 GB), so the 48-bit cap doesn't fit
+// the type; on that target every flat-address pointer is by
+// definition valid, so set the cap to usize::MAX (i.e. no upper
+// bound check) and let the lower bound + as_object/is_object guards
+// handle false positives.
+#[cfg(not(target_pointer_width = "32"))]
 const MAX_VALID_HEAP_ADDR: usize = 0x0000_8000_0000_0000;
+#[cfg(target_pointer_width = "32")]
+const MAX_VALID_HEAP_ADDR: usize = usize::MAX;
 
 fn is_valid_obj_ptr(header: *mut ObjHeader) -> bool {
     let addr = header as usize;
