@@ -1926,17 +1926,46 @@ impl VM {
                 }
                 None => self.gc.alloc_class(class_mir.name, superclass),
             };
+            let inherited_fields = if !superclass.is_null() {
+                unsafe { (*superclass).num_fields }
+            } else {
+                0
+            };
             unsafe {
                 (*class_ptr).header.class = self.class_class;
                 // Total fields = own fields + inherited fields from superclass chain
-                let inherited_fields = if !superclass.is_null() {
-                    (*superclass).num_fields
-                } else {
-                    0
-                };
                 (*class_ptr).num_fields = class_mir.num_fields + inherited_fields;
                 (*class_ptr).attributes = class_mir.attributes;
             }
+
+            // Synthesis fallback: if the class's true field-name
+            // layout wasn't provided up-front (legacy v6/v5 .hatch
+            // bundles that predate the class_field_names top-level
+            // map, or modules installed via paths that don't thread
+            // the map through), register a placeholder layout using
+            // `__inherited_slot_<n>` names so downstream source
+            // compiles can still resolve the parent's slot COUNT.
+            // The synthetic names are guaranteed not to collide with
+            // any real Wren field reference (a leading `_` then a
+            // double underscore is impossible in normal source). The
+            // subclass's own field-name references inside its
+            // methods (e.g. `_pipelines.add(...)`) miss this map and
+            // assign fresh slots after `inherited_fields`, which
+            // preserves correct slot offsetting in the common
+            // "subclass overrides hooks, doesn't poke parent's
+            // private state by name" pattern. v7 bundles that ship
+            // the real names already pre-populate vm.field_layouts
+            // earlier in install_module_mir_and_run_with_sources, so
+            // the entry-or-insert idiom leaves them alone.
+            let class_name_str = self.interner.resolve(class_mir.name).to_string();
+            let total_fields = (class_mir.num_fields + inherited_fields) as usize;
+            self.field_layouts
+                .entry(class_name_str)
+                .or_insert_with(|| {
+                    (0..total_fields)
+                        .map(|i| format!("__inherited_slot_{}", i))
+                        .collect()
+                });
 
             // Register each method's MIR and bind to the class
             for method_mir in class_mir.methods {
