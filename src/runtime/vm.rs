@@ -1918,6 +1918,22 @@ impl VM {
                 (*class_ptr).attributes = class_mir.attributes;
             }
 
+            // Re-register the class's field-name layout into the
+            // compile-time `field_layouts` map so a downstream
+            // module compiled later in the same VM (e.g. the wasm
+            // playground installs `@hatch:game` then compiles
+            // user source that extends `Game`) can look up the
+            // parent's slot layout from
+            // `lower_module_with_known_classes`. Without this the
+            // MIR builder panics with "field layout is not yet
+            // registered" because Wlbc decode skips the source-
+            // compile path that originally populated field_layouts.
+            if !class_mir.field_names.is_empty() {
+                let class_name = self.interner.resolve(class_mir.name).to_string();
+                self.field_layouts
+                    .insert(class_name, class_mir.field_names.clone());
+            }
+
             // Register each method's MIR and bind to the class
             for method_mir in class_mir.methods {
                 let method_func_id = self

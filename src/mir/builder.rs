@@ -1803,7 +1803,7 @@ pub fn lower_module_with_known_classes(
                 HashMap::new()
             };
             let inherited_fields = parent_field_map.len() as u16;
-            let (class_mir, method_closures) = compile_class(
+            let (mut class_mir, method_closures) = compile_class(
                 decl,
                 interner,
                 resolve,
@@ -1834,8 +1834,14 @@ pub fn lower_module_with_known_classes(
                 .map(|(sym, idx)| (*idx, interner.resolve(*sym).to_string()))
                 .collect();
             ordered.sort_by_key(|(idx, _)| *idx);
+            let field_names_ordered: Vec<String> =
+                ordered.into_iter().map(|(_, n)| n).collect();
             let class_name = interner.resolve(decl.name.0).to_string();
-            emitted_layouts.insert(class_name, ordered.into_iter().map(|(_, n)| n).collect());
+            emitted_layouts.insert(class_name, field_names_ordered.clone());
+            // Persist field names INTO the ClassMir so a downstream
+            // install (Wlbc decode) can re-register the layout
+            // without re-running source compilation.
+            class_mir.field_names = field_names_ordered;
             class_field_maps.insert(decl.name.0, full_map);
             classes.push(class_mir);
             all_closures.extend(method_closures);
@@ -2017,6 +2023,9 @@ fn compile_class(
                 .iter()
                 .filter(|s| !parent_field_map.contains_key(s))
                 .count() as u16,
+            // Populated by the caller (`lower_module_with_known_classes`)
+            // with the ordered (inherited + own) name list.
+            field_names: Vec::new(),
             protocols: conformance.conforms,
             attributes: lower_runtime_attributes(&decl.attributes, interner),
             native_library: if decl.is_foreign {
