@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":5,"timestamp":1789210692,"nonce":"7inrc59XT/ZEH29ZSjU9HbQtV5E=","added":["debt","area:aot"],"removed":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789213909,"nonce":"DvrYATFcE1YA5LKQmKT/q6iY6rs=","message":"Superseded by the krio-default workstream under the Ash epic; kept open until that lands.","files":null}]}
