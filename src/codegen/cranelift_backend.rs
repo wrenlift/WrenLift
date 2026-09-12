@@ -5847,11 +5847,61 @@ pub mod cl {
             Instruction::MulF64(a, b) => Ok(Some(builder.ins().fmul(get(a), get(b)))),
             Instruction::DivF64(a, b) => Ok(Some(builder.ins().fdiv(get(a), get(b)))),
             Instruction::ModF64(a, b) => {
-                // f64 modulo: a - floor(a/b) * b
-                let div = builder.ins().fdiv(get(a), get(b));
-                let floored = builder.ins().floor(div);
-                let mul = builder.ins().fmul(floored, get(b));
-                Ok(Some(builder.ins().fsub(get(a), mul)))
+                // Wren's `%` is C fmod: truncated remainder with the
+                // dividend's sign. Integral operands below 2^53 take an
+                // exact integer remainder inline; anything else goes to
+                // libm so large quotients and fractions stay exact.
+                let av = get(a);
+                let bv = get(b);
+                let fast = builder.create_block();
+                let slow = builder.create_block();
+                let merge = builder.create_block();
+                builder.append_block_param(merge, types::F64);
+
+                let ai = builder.ins().fcvt_to_sint_sat(types::I64, av);
+                let bi = builder.ins().fcvt_to_sint_sat(types::I64, bv);
+                let a_back = builder.ins().fcvt_from_sint(types::F64, ai);
+                let b_back = builder.ins().fcvt_from_sint(types::F64, bi);
+                let a_int = builder.ins().fcmp(FloatCC::Equal, a_back, av);
+                let b_int = builder.ins().fcmp(FloatCC::Equal, b_back, bv);
+                let limit = builder.ins().f64const(9007199254740992.0);
+                let a_abs = builder.ins().fabs(av);
+                let b_abs = builder.ins().fabs(bv);
+                let a_small = builder.ins().fcmp(FloatCC::LessThan, a_abs, limit);
+                let b_small = builder.ins().fcmp(FloatCC::LessThan, b_abs, limit);
+                let zero = builder.ins().iconst(types::I64, 0);
+                let b_nz = builder.ins().icmp(IntCC::NotEqual, bi, zero);
+                let ok1 = builder.ins().band(a_int, b_int);
+                let ok2 = builder.ins().band(a_small, b_small);
+                let ok3 = builder.ins().band(ok1, ok2);
+                let ok = builder.ins().band(ok3, b_nz);
+                builder.ins().brif(ok, fast, &[], slow, &[]);
+
+                builder.switch_to_block(fast);
+                builder.seal_block(fast);
+                let r = builder.ins().srem(ai, bi);
+                let rf = builder.ins().fcvt_from_sint(types::F64, r);
+                // A zero remainder keeps the dividend's sign, as fmod does.
+                let rf = builder.ins().fcopysign(rf, av);
+                builder.ins().jump(merge, &[BlockArg::Value(rf)]);
+
+                builder.switch_to_block(slow);
+                builder.seal_block(slow);
+                let mut sig = module.make_signature();
+                sig.params.push(AbiParam::new(types::F64));
+                sig.params.push(AbiParam::new(types::F64));
+                sig.returns.push(AbiParam::new(types::F64));
+                let fid = module
+                    .declare_function("fmod", Linkage::Import, &sig)
+                    .map_err(|e| e.to_string())?;
+                let fref = module.declare_func_in_func(fid, builder.func);
+                let call = builder.ins().call(fref, &[av, bv]);
+                let slow_r = builder.inst_results(call)[0];
+                builder.ins().jump(merge, &[BlockArg::Value(slow_r)]);
+
+                builder.switch_to_block(merge);
+                builder.seal_block(merge);
+                Ok(Some(builder.block_params(merge)[0]))
             }
             Instruction::NegF64(a) => Ok(Some(builder.ins().fneg(get(a)))),
 
