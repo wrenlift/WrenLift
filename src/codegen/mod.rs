@@ -1599,7 +1599,18 @@ fn infer_mir_value_types(mir: &MirFunction) -> Vec<crate::mir::MirType> {
                 | Instruction::IsType(..)
                 | Instruction::ClassIs(..)
                 | Instruction::ObjectIs(..)
-                | Instruction::ClosureFnIs(..) => MirType::Bool,
+                | Instruction::ClosureFnIs(..)
+                | Instruction::CmpLtI64(..)
+                | Instruction::CmpGtI64(..)
+                | Instruction::CmpLeI64(..)
+                | Instruction::CmpGeI64(..) => MirType::Bool,
+                Instruction::AddI64(..)
+                | Instruction::SubI64(..)
+                | Instruction::MulI64(..)
+                | Instruction::RemI64(..)
+                | Instruction::BandI64(..)
+                | Instruction::NegI64(_) => MirType::I64,
+                Instruction::I64ToF64(_) => MirType::F64,
                 Instruction::BitAnd(..)
                 | Instruction::BitOr(..)
                 | Instruction::BitXor(..)
@@ -1932,6 +1943,10 @@ pub struct NativeOsrEntry {
     /// replacement split the parameter the interpreter still carries
     /// as an object.
     pub live_in_field: Vec<Option<u16>>,
+    /// Parallel to `live_in_regs`: the compiled body carries this
+    /// live-in as an integer, so the transfer must decline unless the
+    /// value is an integral Num within 2^53.
+    pub live_in_int: Vec<bool>,
 }
 
 unsafe impl Send for NativeOsrEntry {}
@@ -4338,6 +4353,9 @@ impl<'a> LowerCtx<'a> {
             }
             Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
                 panic!("speculation guards are lowered by the Cranelift backend only")
+            }
+            Instruction::AddI64(..) | Instruction::SubI64(..) | Instruction::MulI64(..) | Instruction::RemI64(..) | Instruction::BandI64(..) | Instruction::CmpLtI64(..) | Instruction::CmpGtI64(..) | Instruction::CmpLeI64(..) | Instruction::CmpGeI64(..) | Instruction::NegI64(_) | Instruction::I64ToF64(_) => {
+                panic!("integer arithmetic is lowered by the Cranelift backend only")
             }
             // -- IsType: inline tag checks for primitives, class ptr for objects --
             Instruction::IsType(a, sym) => {

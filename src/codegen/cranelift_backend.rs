@@ -1343,6 +1343,7 @@ pub mod cl {
                 live_in_regs: def.live_in_regs,
                 live_in_num: def.live_in_num,
                 live_in_field: def.live_in_field,
+                live_in_int: def.live_in_int,
             })
             .collect();
 
@@ -1434,6 +1435,7 @@ pub mod cl {
         live_in_regs: Vec<u32>,
         live_in_num: Vec<bool>,
         live_in_field: Vec<Option<u16>>,
+        live_in_int: Vec<bool>,
     }
 
     #[derive(Clone)]
@@ -1470,6 +1472,13 @@ pub mod cl {
         >,
         cha_by_method: crate::runtime::engine::SharedCha,
     ) -> Vec<PendingOsrDefinition> {
+        let i64_params: HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter())
+            .filter(|(_, t)| *t == MirType::I64)
+            .map(|(p, _)| *p)
+            .collect();
         let mut defs = Vec::new();
         for target_block in collect_osr_targets(mir) {
             let Some(layout) = osr_entry_layout(mir, target_block) else {
@@ -1582,6 +1591,13 @@ pub mod cl {
                     .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
                     .map(|v| mir.scalar_param_sources.get(&v).map(|(_, f)| *f))
                     .collect(),
+                live_in_int: layout
+                    .external_args
+                    .iter()
+                    .copied()
+                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .map(|v| i64_params.contains(&v))
+                    .collect(),
             });
         }
         defs
@@ -1616,7 +1632,7 @@ pub mod cl {
         if target_block
             .params
             .iter()
-            .any(|(_, ty)| !matches!(ty, MirType::Value | MirType::F64))
+            .any(|(_, ty)| !matches!(ty, MirType::Value | MirType::F64 | MirType::I64))
         {
             return None;
         }
@@ -1624,7 +1640,7 @@ pub mod cl {
             .blocks
             .iter()
             .flat_map(|b| b.params.iter())
-            .filter(|(_, t)| *t == MirType::F64)
+            .filter(|(_, t)| matches!(t, MirType::F64 | MirType::I64))
             .map(|(p, _)| *p)
             .collect();
 
@@ -1765,7 +1781,18 @@ pub mod cl {
                     | Instruction::IsType(..)
                     | Instruction::ClassIs(..)
                     | Instruction::ObjectIs(..)
-                    | Instruction::ClosureFnIs(..) => MirType::Bool,
+                    | Instruction::ClosureFnIs(..)
+                    | Instruction::CmpLtI64(..)
+                    | Instruction::CmpGtI64(..)
+                    | Instruction::CmpLeI64(..)
+                    | Instruction::CmpGeI64(..) => MirType::Bool,
+                    Instruction::AddI64(..)
+                    | Instruction::SubI64(..)
+                    | Instruction::MulI64(..)
+                    | Instruction::RemI64(..)
+                    | Instruction::BandI64(..)
+                    | Instruction::NegI64(_) => MirType::I64,
+                    Instruction::I64ToF64(_) => MirType::F64,
                     Instruction::GuardNum(src)
                     | Instruction::GuardBool(src)
                     | Instruction::Move(src)
@@ -2300,6 +2327,13 @@ pub mod cl {
             .filter(|(_, t)| *t == MirType::F64)
             .map(|(p, _)| *p)
             .collect();
+        let i64_params: std::collections::HashSet<ValueId> = mir
+            .blocks
+            .iter()
+            .flat_map(|b| b.params.iter())
+            .filter(|(_, t)| *t == MirType::I64)
+            .map(|(p, _)| *p)
+            .collect();
         if let Some(ref layout) = osr_entry {
             let reachable = osr_reachable_blocks(mir, layout.target_block);
             let mut region_defs: std::collections::HashSet<ValueId> =
@@ -2317,6 +2351,7 @@ pub mod cl {
                         types::I64
                     };
                     let var = builder.declare_var(ty);
+                    let _ = &i64_params;
                     if mark_stack_map && is_wren_value(*vid, &value_types) {
                         builder.declare_var_needs_stack_map(var);
                     }
@@ -2337,6 +2372,9 @@ pub mod cl {
                 slot += 1;
                 let v = if f64_params.contains(vid) {
                     builder.ins().bitcast(types::F64, MemFlags::new(), v)
+                } else if i64_params.contains(vid) {
+                    let f = builder.ins().bitcast(types::F64, MemFlags::new(), v);
+                    builder.ins().fcvt_to_sint(types::I64, f)
                 } else {
                     v
                 };
@@ -2357,6 +2395,10 @@ pub mod cl {
                 slot += 1;
                 let v = match ty {
                     MirType::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), v),
+                    MirType::I64 => {
+                        let f = builder.ins().bitcast(types::F64, MemFlags::new(), v);
+                        builder.ins().fcvt_to_sint(types::I64, f)
+                    }
                     _ => v,
                 };
                 args.push(BlockArg::Value(v));
@@ -3242,6 +3284,10 @@ pub mod cl {
                         | Instruction::ClassIs(..)
                         | Instruction::ObjectIs(..)
                         | Instruction::ClosureFnIs(..)
+                        | Instruction::CmpLtI64(..)
+                        | Instruction::CmpGtI64(..)
+                        | Instruction::CmpLeI64(..)
+                        | Instruction::CmpGeI64(..)
                 );
                 let result = lower_instruction(
                     inst,
@@ -6099,6 +6145,30 @@ pub mod cl {
                 builder.switch_to_block(merge_block);
                 Ok(Some(builder.block_params(merge_block)[0]))
             }
+            // === Integer arithmetic on proven-integral values ===
+            Instruction::AddI64(a, b) => Ok(Some(builder.ins().iadd(get(a), get(b)))),
+            Instruction::SubI64(a, b) => Ok(Some(builder.ins().isub(get(a), get(b)))),
+            Instruction::MulI64(a, b) => Ok(Some(builder.ins().imul(get(a), get(b)))),
+            Instruction::RemI64(a, b) => Ok(Some(builder.ins().srem(get(a), get(b)))),
+            Instruction::BandI64(a, b) => Ok(Some(builder.ins().band(get(a), get(b)))),
+            Instruction::NegI64(a) => Ok(Some(builder.ins().ineg(get(a)))),
+            Instruction::CmpLtI64(a, b) => {
+                Ok(Some(builder.ins().icmp(IntCC::SignedLessThan, get(a), get(b))))
+            }
+            Instruction::CmpGtI64(a, b) => {
+                Ok(Some(builder.ins().icmp(IntCC::SignedGreaterThan, get(a), get(b))))
+            }
+            Instruction::CmpLeI64(a, b) => Ok(Some(builder.ins().icmp(
+                IntCC::SignedLessThanOrEqual,
+                get(a),
+                get(b),
+            ))),
+            Instruction::CmpGeI64(a, b) => Ok(Some(builder.ins().icmp(
+                IntCC::SignedGreaterThanOrEqual,
+                get(a),
+                get(b),
+            ))),
+            Instruction::I64ToF64(a) => Ok(Some(builder.ins().fcvt_from_sint(types::F64, get(a)))),
             Instruction::ObjectIs(a, obj_ptr) => {
                 let v = get(a);
                 let expected = builder

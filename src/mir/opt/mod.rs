@@ -9,6 +9,7 @@ pub mod devirt;
 pub mod escape;
 pub mod inline;
 pub mod inline_calls;
+pub mod int_loop;
 pub mod licm;
 pub mod purity;
 pub mod range_loop;
@@ -126,6 +127,14 @@ fn map_inst_operands(inst: &mut Instruction, f: &dyn Fn(ValueId) -> ValueId) {
         | ToString(a)
         | MathUnaryF64(_, a) => {
             *a = f(*a);
+        }
+        NegI64(a) | I64ToF64(a) => {
+            *a = f(*a);
+        }
+        AddI64(a, b) | SubI64(a, b) | MulI64(a, b) | RemI64(a, b) | BandI64(a, b)
+        | CmpLtI64(a, b) | CmpGtI64(a, b) | CmpLeI64(a, b) | CmpGeI64(a, b) => {
+            *a = f(*a);
+            *b = f(*b);
         }
         GuardClass(a, _) | GuardProtocol(a, _) | IsType(a, _) | ClassIs(a, _)
         | ObjectIs(a, _) | ClosureFnIs(a, _) => {

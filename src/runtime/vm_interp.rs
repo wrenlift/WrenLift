@@ -473,8 +473,14 @@ fn try_enter_loop_osr(
             });
         }
         let needs_num = entry.live_in_num.get(i).copied().unwrap_or(false);
+        let needs_int = entry.live_in_int.get(i).copied().unwrap_or(false);
+        let integral = |v: Value| {
+            v.as_num()
+                .map(|n| n == n.trunc() && n.abs() <= 9007199254740992.0)
+                .unwrap_or(false)
+        };
         match value {
-            Some(v) if needs_num && !v.is_num() => {
+            Some(v) if (needs_num && !v.is_num()) || (needs_int && !integral(v)) => {
                 if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
                     eprintln!(
                         "osr-trace: decline FuncId({}) bb{} live-in v{} not a Num",

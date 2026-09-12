@@ -287,6 +287,17 @@ fn inst_discriminant(inst: &Instruction) -> u32 {
         ClassIs(..) => 66,
         ClosureFnIs(..) => 67,
         ObjectIs(..) => 68,
+        AddI64(..) => 69,
+        SubI64(..) => 70,
+        MulI64(..) => 71,
+        RemI64(..) => 72,
+        BandI64(..) => 73,
+        NegI64(..) => 74,
+        CmpLtI64(..) => 75,
+        CmpGtI64(..) => 76,
+        CmpLeI64(..) => 77,
+        CmpGeI64(..) => 78,
+        I64ToF64(..) => 79,
     }
 }
 

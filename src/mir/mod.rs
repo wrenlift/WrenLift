@@ -421,6 +421,22 @@ pub enum Instruction {
     ObjectIs(ValueId, usize),
     /// Raw Bool: the value is a closure of this `ObjFn` pointer. JIT-only.
     ClosureFnIs(ValueId, usize),
+
+    // -- Integer arithmetic on values proven integral (JIT-only) ------------
+    AddI64(ValueId, ValueId),
+    SubI64(ValueId, ValueId),
+    MulI64(ValueId, ValueId),
+    /// Truncated remainder, as fmod on integers; the divisor is a nonzero constant.
+    RemI64(ValueId, ValueId),
+    BandI64(ValueId, ValueId),
+    NegI64(ValueId),
+    /// Raw Bool comparisons.
+    CmpLtI64(ValueId, ValueId),
+    CmpGtI64(ValueId, ValueId),
+    CmpLeI64(ValueId, ValueId),
+    CmpGeI64(ValueId, ValueId),
+    /// Exact conversion of a proven-integral value back to f64.
+    I64ToF64(ValueId),
 }
 
 impl Instruction {
@@ -512,7 +528,18 @@ impl Instruction {
             | Instruction::IsType(a, _)
             | Instruction::ClassIs(a, _)
             | Instruction::ObjectIs(a, _)
-            | Instruction::ClosureFnIs(a, _) => vec![*a],
+            | Instruction::ClosureFnIs(a, _)
+            | Instruction::NegI64(a)
+            | Instruction::I64ToF64(a) => vec![*a],
+            Instruction::AddI64(a, b)
+            | Instruction::SubI64(a, b)
+            | Instruction::MulI64(a, b)
+            | Instruction::RemI64(a, b)
+            | Instruction::BandI64(a, b)
+            | Instruction::CmpLtI64(a, b)
+            | Instruction::CmpGtI64(a, b)
+            | Instruction::CmpLeI64(a, b)
+            | Instruction::CmpGeI64(a, b) => vec![*a, *b],
 
             Instruction::GetField(recv, _) => vec![*recv],
             Instruction::SetField(recv, _, val) => vec![*recv, *val],
@@ -1304,6 +1331,17 @@ fn fmt_instruction(inst: &Instruction, interner: &crate::intern::Interner) -> St
         Instruction::ToString(a) => format!("to_string {}", a),
         Instruction::ClassIs(a, class) => format!("class_is {}, {:#x}", a, class),
         Instruction::ObjectIs(a, obj) => format!("object_is {}, {:#x}", a, obj),
+        Instruction::AddI64(a, b) => format!("iadd {}, {}", a, b),
+        Instruction::SubI64(a, b) => format!("isub {}, {}", a, b),
+        Instruction::MulI64(a, b) => format!("imul {}, {}", a, b),
+        Instruction::RemI64(a, b) => format!("irem {}, {}", a, b),
+        Instruction::BandI64(a, b) => format!("iand {}, {}", a, b),
+        Instruction::NegI64(a) => format!("ineg {}", a),
+        Instruction::CmpLtI64(a, b) => format!("icmp_i64.lt {}, {}", a, b),
+        Instruction::CmpGtI64(a, b) => format!("icmp_i64.gt {}, {}", a, b),
+        Instruction::CmpLeI64(a, b) => format!("icmp_i64.le {}, {}", a, b),
+        Instruction::CmpGeI64(a, b) => format!("icmp_i64.ge {}, {}", a, b),
+        Instruction::I64ToF64(a) => format!("i64_to_f64 {}", a),
         Instruction::ClosureFnIs(a, f) => format!("closure_fn_is {}, {:#x}", a, f),
 
         Instruction::IsType(a, sym) => {

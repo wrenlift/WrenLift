@@ -489,6 +489,9 @@ impl<'a> Encoder<'a> {
             Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
                 unreachable!("speculation guards exist only in JIT compile clones")
             }
+            Instruction::AddI64(..) | Instruction::SubI64(..) | Instruction::MulI64(..) | Instruction::RemI64(..) | Instruction::BandI64(..) | Instruction::CmpLtI64(..) | Instruction::CmpGtI64(..) | Instruction::CmpLeI64(..) | Instruction::CmpGeI64(..) | Instruction::NegI64(_) | Instruction::I64ToF64(_) => {
+                unreachable!("integer arithmetic exists only in JIT compile clones")
+            }
             Instruction::IsType(a, sym) => {
                 self.emit_op(Op::IsType);
                 self.emit_reg(dst);

@@ -4677,3 +4677,111 @@ System.print(g.call(3))
         assert_eq!(output.trim(), "3\n4\nnull\nnull\n6\nnull\n4", "{:?}", mode);
     }
 }
+
+#[test]
+fn e2e_tiered_integer_specialised_loops_match_reference() {
+    // Loop counters and accumulators proven integral run as i64; every
+    // case that could differ from f64 (negative zero from a product,
+    // negation or remainder, growth past 2^53, fractional steps, bounds
+    // that are not constants) stays float. Expected output is wren_cli's.
+    let src = r#"class K {
+  // negative zero from a product with zero
+  static negProd() {
+    var s = 0
+    var i = 0
+    while (i < 3000) {
+      s = i * -1
+      i = i + 1
+      if (i == 3000) s = 0 * -1
+    }
+    return s
+  }
+  // remainder of a negative dividend
+  static negRem() {
+    var s = 0
+    var i = 0
+    while (i < 3000) {
+      s = (0 - i) % 8
+      i = i + 1
+    }
+    return s
+  }
+  // remainder by a non power of two
+  static rem7() {
+    var s = 0
+    var i = 0
+    while (i < 3000) {
+      s = (s * 5 + i) % 7
+      i = i + 1
+    }
+    return s
+  }
+  // grows past 2^53 and must stay float
+  static big() {
+    var x = 1
+    var i = 0
+    while (i < 60) {
+      x = x * 3
+      i = i + 1
+    }
+    return x
+  }
+  // counter bounded by a non-constant stays float but correct
+  static bound(n) {
+    var s = 0
+    var i = 0
+    while (i < n) {
+      s = s + i
+      i = i + 1
+    }
+    return s
+  }
+  // fractional step stays float
+  static frac() {
+    var s = 0
+    var i = 0
+    while (i < 3000) {
+      s = s + 0.5
+      i = i + 1
+    }
+    return s
+  }
+  // subtraction below zero, negation
+  static neg() {
+    var s = 0
+    var i = 0
+    while (i < 3000) {
+      s = (10 - i) - (-i)
+      i = i + 1
+    }
+    return s
+  }
+  // exit value used after the loop with float ops
+  static mixed() {
+    var s = 0
+    var i = 0
+    while (i < 3000) {
+      s = (s * 31 + (i % 8)) % 4294967296
+      i = i + 1
+    }
+    return s / 3 + i.sqrt
+  }
+}
+System.print(K.negProd())
+System.print(K.negRem())
+System.print(K.rem7())
+System.print(K.big())
+System.print(K.bound(3000))
+System.print(K.bound(2.5))
+System.print(K.frac())
+System.print(K.neg())
+System.print(K.mixed())
+System.print(1 / K.negProd())
+"#;
+    let expected = "-0\n-7\n6\n4.2391158275216e+28\n4498500\n3\n1500\n10\n1011574997.4389\n-infinity";
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let (result, output, errors) = run_collecting_errors(src, mode);
+        assert!(matches!(result, InterpretResult::Success), "{:?}: {:?}", mode, errors);
+        assert_eq!(output.trim(), expected, "{:?}", mode);
+    }
+}

@@ -257,6 +257,10 @@ fn run_jit_opt_pipeline(mir: &mut MirFunction, interner: &crate::intern::Interne
     // WLIFT_DISABLE_UNBOX_PARAMS keeps loop-carried Nums boxed; safe to run with.
     if std::env::var_os("WLIFT_DISABLE_UNBOX_PARAMS").is_none() {
         crate::mir::opt::unbox_params::UnboxParams.run(mir);
+        // WLIFT_DISABLE_INT_SPEC keeps proven-integral values as f64; safe to run with.
+        if std::env::var_os("WLIFT_DISABLE_INT_SPEC").is_none() {
+            crate::mir::opt::int_loop::IntSpecialize.run(mir);
+        }
     }
 }
 
@@ -1866,6 +1870,7 @@ impl ExecutionEngine {
                 live_in_regs: entry.live_in_regs.clone(),
                 live_in_num: entry.live_in_num.clone(),
                 live_in_field: entry.live_in_field.clone(),
+                live_in_int: entry.live_in_int.clone(),
             });
         }
         None
