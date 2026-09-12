@@ -1015,17 +1015,31 @@ pub mod cl {
         JIT_TIER_HOOK.with(|c| *c.borrow_mut() = hook);
     }
 
+    thread_local! {
+        /// The function this thread is compiling, for code that names
+        /// itself to the runtime (guard deopts).
+        static JIT_FUNC_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    }
+
+    /// Set the function id for this thread's next JIT compile.
+    pub fn set_jit_func_id(id: u32) {
+        JIT_FUNC_ID.with(|c| c.set(id));
+    }
+
+    pub(crate) fn jit_func_id() -> u32 {
+        JIT_FUNC_ID.with(|c| c.get())
+    }
+
     fn jit_tier_hook() -> Option<TierHook> {
         JIT_TIER_HOOK.with(|c| c.borrow().clone())
     }
 
     /// Byte offsets inside `engine::TierCell`.
-    const TIER_CELL_CALLS: i32 = 0;
+    const TIER_CELL_COUNTDOWN: i32 = 0;
     const TIER_CELL_RETIER: i32 = 4;
-    const TIER_CELL_NEXT_TICK: i32 = 8;
 
-    /// Bump the cell's count and call `wren_tier_tick` when it reaches
-    /// the next tick.
+    /// Count down the cell and call `wren_tier_tick` when it reaches
+    /// zero.
     #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
     fn emit_tier_tick(
         builder: &mut FunctionBuilder,
@@ -1041,23 +1055,20 @@ pub mod cl {
         let cell = builder.ins().iconst(types::I64, hook.cell as i64);
         let c = builder
             .ins()
-            .uload32(MemFlags::trusted(), cell, TIER_CELL_CALLS);
-        let c1 = builder.ins().iadd_imm_u(c, 1);
+            .uload32(MemFlags::trusted(), cell, TIER_CELL_COUNTDOWN);
+        let c1 = builder.ins().iadd_imm_s(c, -1);
         builder
             .ins()
-            .istore32(MemFlags::trusted(), c1, cell, TIER_CELL_CALLS);
-        let next = builder
-            .ins()
-            .uload32(MemFlags::trusted(), cell, TIER_CELL_NEXT_TICK);
-        let tick = builder.ins().icmp(IntCC::Equal, c1, next);
+            .istore32(MemFlags::trusted(), c1, cell, TIER_CELL_COUNTDOWN);
+        let tick = builder.ins().icmp_imm_u(IntCC::Equal, c1, 0);
         let tick_block = builder.create_block();
         let cont_block = builder.create_block();
         builder.set_cold_block(tick_block);
         builder.ins().brif(tick, tick_block, &[], cont_block, &[]);
         builder.switch_to_block(tick_block);
         let fid = builder.ins().iconst(types::I64, hook.func_id as i64);
-        let f = get_runtime_fn(module, builder, "wren_tier_tick", 2)?;
-        builder.ins().call(f, &[fid, c1]);
+        let f = get_runtime_fn(module, builder, "wren_tier_tick", 1)?;
+        builder.ins().call(f, &[fid]);
         builder.ins().jump(cont_block, &[]);
         builder.switch_to_block(cont_block);
         Ok(())
@@ -1065,6 +1076,20 @@ pub mod cl {
 
     pub(crate) fn jit_modvars_cell() -> usize {
         JIT_MODVARS_CELL.with(|c| c.get())
+    }
+
+    /// Whether slot `idx` of the compiling function's module is within
+    /// the module's variable vector. The vector is sized to the module's
+    /// declarations at load and never shrinks, so a slot inside it now
+    /// stays inside it, and the access needs no bounds check.
+    pub(crate) fn jit_modvar_in_range(idx: u16) -> bool {
+        let cell = jit_modvars_cell();
+        if cell == 0 {
+            return false;
+        }
+        // SAFETY: the cell is leaked per module and only ever read here.
+        let cell = unsafe { &*(cell as *const crate::runtime::engine::ModuleVarsCell) };
+        (idx as usize) < cell.len.load(std::sync::atomic::Ordering::Acquire)
     }
 
     #[inline]
@@ -1318,6 +1343,63 @@ pub mod cl {
                         }
                     })
                     .collect();
+                // The inner body assumes its parameters are numbers; the
+                // wrapper checks the guarded ones and hands anything else
+                // to the interpreter.
+                let guarded: Vec<usize> =
+                    mir.blocks[0]
+                        .instructions
+                        .iter()
+                        .filter_map(|(_, inst)| match inst {
+                            Instruction::GuardNum(src) => mir.blocks[0]
+                                .instructions
+                                .iter()
+                                .find_map(|(v, i)| match i {
+                                    Instruction::BlockParam(idx) if v == src => Some(*idx as usize),
+                                    _ => None,
+                                }),
+                            _ => None,
+                        })
+                        .collect();
+                if !guarded.is_empty() {
+                    let mut runtime_cache: HashMap<String, cranelift_codegen::ir::FuncRef> =
+                        HashMap::new();
+                    let mut get_runtime_fn =
+                        |module: &mut dyn Module,
+                         builder: &mut FunctionBuilder,
+                         name: &str,
+                         param_count: usize|
+                         -> Result<cranelift_codegen::ir::FuncRef, String> {
+                            if let Some(&func_ref) = runtime_cache.get(name) {
+                                return Ok(func_ref);
+                            }
+                            let func_ref = declare_runtime_fn(module, builder, name, param_count)?;
+                            runtime_cache.insert(name.to_string(), func_ref);
+                            Ok(func_ref)
+                        };
+                    let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                    let mut fails: Option<Value> = None;
+                    for &idx in &guarded {
+                        let Some(&p) = entry_params.get(idx) else {
+                            continue;
+                        };
+                        let masked = builder.ins().band(p, qnan);
+                        let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                        fails = Some(match fails {
+                            Some(f) => builder.ins().bor(f, is_box),
+                            None => is_box,
+                        });
+                    }
+                    if let Some(fails) = fails {
+                        emit_guard_deopt(
+                            &mut builder,
+                            &mut module,
+                            &mut get_runtime_fn,
+                            fails,
+                            jit_func_id(),
+                        )?;
+                    }
+                }
                 let f64_args: Vec<Value> = used_indices
                     .iter()
                     .map(|&idx| {
@@ -1990,6 +2072,7 @@ pub mod cl {
             "wren_osr_exit",
             "wren_tier_tick",
             "wren_retier",
+            "wren_deopt_n",
         ];
 
         for name in &names {
@@ -3811,6 +3894,54 @@ pub mod cl {
     }
 
     /// Describes what the fast-path of an inline boxed binary operation does.
+    /// Branch on `fails` to a cold block that re-executes the call in
+    /// the interpreter through `wren_deopt_*` with the entry parameters
+    /// and returns its result; lowering continues on the other edge.
+    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
+    fn emit_guard_deopt(
+        builder: &mut FunctionBuilder,
+        module: &mut dyn Module,
+        get_runtime_fn: &mut dyn FnMut(
+            &mut dyn Module,
+            &mut FunctionBuilder,
+            &str,
+            usize,
+        ) -> Result<cranelift_codegen::ir::FuncRef, String>,
+        fails: Value,
+        func_id: u32,
+    ) -> Result<(), String> {
+        let entry = builder
+            .func
+            .layout
+            .entry_block()
+            .ok_or("guard outside a function body")?;
+        let params: Vec<Value> = builder.block_params(entry).to_vec();
+        let deopt_block = builder.create_block();
+        let cont_block = builder.create_block();
+        builder.set_cold_block(deopt_block);
+        builder.ins().brif(fails, deopt_block, &[], cont_block, &[]);
+        builder.switch_to_block(deopt_block);
+        let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            (params.len().max(1) * 8) as u32,
+            3,
+        ));
+        for (i, p) in params.iter().enumerate() {
+            builder
+                .ins()
+                .stack_store(types::I64, *p, slot, (i * 8) as i32);
+        }
+        let buf = builder.ins().stack_addr(types::I64, slot, 0);
+        let fid = builder.ins().iconst(types::I64, func_id as i64);
+        let n = builder.ins().iconst(types::I64, params.len() as i64);
+        let f = get_runtime_fn(module, builder, "wren_deopt_n", 3)?;
+        let call = builder.ins().call(f, &[fid, n, buf]);
+        let result = builder.inst_results(call)[0];
+        builder.ins().return_(&[result]);
+        builder.switch_to_block(cont_block);
+        Ok(())
+    }
+
     /// Store `live` into `buf` as `(register, boxed value)` pairs, the
     /// layout `wren_osr_exit` and `wren_retier` read.
     fn emit_live_snapshot(
@@ -4369,6 +4500,15 @@ pub mod cl {
                         (*idx as i32) * 8,
                     );
                     Ok(Some(result))
+                } else if jit_modvar_in_range(*idx) {
+                    let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
+                    let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                    Ok(Some(builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        base,
+                        (*idx as i32) * 8,
+                    )))
                 } else if jit_modvars_cell() != 0 {
                     // Three loads through the module's stable cell; an
                     // index past the current length reads null, as the
@@ -4416,6 +4556,14 @@ pub mod cl {
                         .store(MemFlags::trusted(), store_val, base, (*idx as i32) * 8);
                     // SetModuleVar's MIR contract: result is the
                     // stored value (mirrors the helper's return).
+                    Ok(Some(store_val))
+                } else if jit_modvar_in_range(*idx) {
+                    let store_val = get(val);
+                    let cell = builder.ins().iconst(types::I64, jit_modvars_cell() as i64);
+                    let base = builder.ins().load(types::I64, MemFlags::trusted(), cell, 0);
+                    builder
+                        .ins()
+                        .store(MemFlags::trusted(), store_val, base, (*idx as i32) * 8);
                     Ok(Some(store_val))
                 } else if jit_modvars_cell() != 0 {
                     // In-range stores go straight to the vector; an
@@ -6596,12 +6744,35 @@ pub mod cl {
             }
 
             // === Guards ===
+            // A speculative guard at the entry: the body was specialised
+            // on the profiled type, so a value of another type hands the
+            // call to the interpreter and the function back to baseline.
             Instruction::GuardNum(src) => {
-                // In f64 mode: no guard needed, values are already f64
-                // In i64 mode: pass through (guards are for optimization hints)
-                Ok(Some(get(src)))
+                let v = get(src);
+                if f64_self_id.is_some() || aot_config.is_some() {
+                    return Ok(Some(v));
+                }
+                let qnan = builder.ins().iconst(types::I64, QNAN as i64);
+                let masked = builder.ins().band(v, qnan);
+                let is_box = builder.ins().icmp(IntCC::Equal, masked, qnan);
+                emit_guard_deopt(builder, module, get_runtime_fn, is_box, jit_func_id())?;
+                Ok(Some(v))
             }
-            Instruction::GuardBool(src) => Ok(Some(get(src))),
+            Instruction::GuardBool(src) => {
+                let v = get(src);
+                if f64_self_id.is_some() || aot_config.is_some() {
+                    return Ok(Some(v));
+                }
+                let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+                let f = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                let is_t = builder.ins().icmp(IntCC::Equal, v, t);
+                let is_f = builder.ins().icmp(IntCC::Equal, v, f);
+                let is_bool = builder.ins().bor(is_t, is_f);
+                let one = builder.ins().iconst(types::I8, 1);
+                let fails = builder.ins().bxor(is_bool, one);
+                emit_guard_deopt(builder, module, get_runtime_fn, fails, jit_func_id())?;
+                Ok(Some(v))
+            }
             Instruction::GuardClass(src, _class_id) => Ok(Some(get(src))),
             Instruction::GuardProtocol(src, _proto) => Ok(Some(get(src))),
 

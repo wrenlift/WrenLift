@@ -4530,6 +4530,9 @@ impl NativeContext for VM {
 
     // Reported once, with a stack trace, by whoever unwinds the flag.
     fn runtime_error(&mut self, msg: String) {
+        if super::vm_interp::env_error_trace() {
+            eprintln!("error-trace: raise {msg} vm.fiber={:p}", self.fiber);
+        }
         self.has_error = true;
         self.last_error = Some(msg);
     }

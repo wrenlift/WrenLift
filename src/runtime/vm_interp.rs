@@ -73,6 +73,13 @@ fn env_osr_trace() -> bool {
     env_flag(&CACHED, "WLIFT_OSR_TRACE")
 }
 
+/// `WLIFT_TRACE_ERRORS=1` prints every raised runtime error and where the
+/// interpreter consumes it; safe to run with.
+pub(crate) fn env_error_trace() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "WLIFT_TRACE_ERRORS")
+}
+
 #[inline]
 fn env_nested_osr_disabled() -> bool {
     use std::sync::OnceLock;
@@ -919,9 +926,23 @@ enum NativeError {
 /// Must run after every native call so the flag never outlives the call
 /// that set it.
 #[inline]
+#[track_caller]
 fn take_native_error(vm: &mut VM, fiber: *mut ObjFiber) -> Option<NativeError> {
     if !vm.has_error {
         return None;
+    }
+    if env_error_trace() {
+        eprintln!(
+            "error-trace: take_native_error fiber={:p} is_try={} caller={:p} vm.fiber={:p} sync_entry={:p} frames={} msg={:?} at {}",
+            fiber,
+            unsafe { (*fiber).is_try },
+            unsafe { (*fiber).caller },
+            vm.fiber,
+            vm.sync_entry_fiber,
+            unsafe { (*fiber).mir_frames.len() },
+            vm.last_error,
+            std::panic::Location::caller()
+        );
     }
     vm.has_error = false;
     let msg = vm
@@ -1162,6 +1183,19 @@ fn run_fiber_with_stop_depth(
     let prev = std::mem::replace(&mut vm.sync_entry_fiber, entry);
     let result = run_fiber_loop(vm, stop_depth);
     vm.sync_entry_fiber = prev;
+    // An unwinding error leaves the frames it was raised in on the
+    // fiber; the bridge that pushed the entry frame reports the error
+    // to its own caller, whose frame must be on top again.
+    if let (Err(_), Some(depth)) = (&result, stop_depth) {
+        if !entry.is_null() {
+            unsafe {
+                let frames = &mut (*entry).mir_frames;
+                if frames.len() > depth {
+                    frames.truncate(depth);
+                }
+            }
+        }
+    }
     result
 }
 
@@ -2973,6 +3007,21 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                         }
                                     };
                                     crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
+                                    // Restore the caller's module context so
+                                    // the next interpreter ops read from the
+                                    // right module_vars.
+                                    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
+                                    vm.engine.note_native_entry(FuncId(fn_idx as u32));
+                                    // An error the callee raised: caught by
+                                    // this fiber's try (the caller fiber is
+                                    // current now), ending the run, or
+                                    // unwinding.
+                                    take_jit_error(vm, fiber)?;
+                                    if vm.fiber != fiber
+                                        || unsafe { (*fiber).mir_frames.is_empty() }
+                                    {
+                                        continue 'fiber_loop;
+                                    }
                                     // Reload the caller's register file —
                                     // GC during the call may have updated
                                     // entries through the frame.values
@@ -2982,11 +3031,6 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                             &mut (*fiber).mir_frames.last_mut().unwrap().values,
                                         );
                                     }
-                                    // Restore the caller's module context so
-                                    // the next interpreter ops read from the
-                                    // right module_vars.
-                                    crate::codegen::runtime_fns::set_jit_context(saved_ctx);
-                                    vm.engine.note_native_entry(FuncId(fn_idx as u32));
                                     set_reg(&mut values, dst, Value::from_bits(result_bits));
                                     steps += 1;
                                     continue;
@@ -3156,6 +3200,13 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     closure_ptr,
                                     &arg_vals[1..],
                                 );
+                                // An error the initialiser raised in compiled
+                                // code: caught by this fiber's try, ending the
+                                // run, or unwinding.
+                                take_jit_error(vm, fiber)?;
+                                if vm.fiber != fiber || unsafe { (*fiber).mir_frames.is_empty() } {
+                                    continue 'fiber_loop;
+                                }
                                 // Re-read interpreter state (may have been modified
                                 // by nested calls or GC during constructor execution).
                                 values = unsafe {
@@ -4621,7 +4672,9 @@ fn dispatch_closure_bc_inner(
                     };
                     let result_val = Value::from_bits(result_bits);
 
-                    set_reg(&mut values, return_dst.0 as u16, result_val);
+                    if !values.is_empty() {
+                        set_reg(&mut values, return_dst.0 as u16, result_val);
+                    }
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
                             frame.pc = pc;
@@ -4648,7 +4701,9 @@ fn dispatch_closure_bc_inner(
                     };
                     let result_val = Value::from_bits(result_bits);
 
-                    set_reg(&mut values, return_dst.0 as u16, result_val);
+                    if !values.is_empty() {
+                        set_reg(&mut values, return_dst.0 as u16, result_val);
+                    }
                     unsafe {
                         if let Some(frame) = (*fiber).mir_frames.last_mut() {
                             frame.pc = pc;
@@ -4819,7 +4874,9 @@ fn dispatch_closure_bc_inner(
                     .unwrap_or_default()
             };
             // Store result in caller's frame and return.
-            set_reg(&mut values, return_dst.0 as u16, result);
+            if !values.is_empty() {
+                set_reg(&mut values, return_dst.0 as u16, result);
+            }
             unsafe {
                 if let Some(frame) = (*fiber).mir_frames.last_mut() {
                     frame.pc = pc;
@@ -5219,6 +5276,14 @@ pub unsafe fn route_method_error_through_fiber_try(
     unsafe {
         if !may_route_try(vm, fiber) {
             return None;
+        }
+        if env_error_trace() {
+            eprintln!(
+                "error-trace: route fiber={:p} caller={:p} msg={:?}",
+                fiber,
+                (*fiber).caller,
+                err_msg
+            );
         }
         let err_val = vm.new_string(err_msg);
         (*fiber).error = err_val;

@@ -1316,11 +1316,11 @@ pub fn take_osr_exit() -> Option<OsrExitRecord> {
     OSR_EXIT.with(|e| e.borrow_mut().take())
 }
 
-/// Baseline code reporting its `count`th entry: proposes the top tier
-/// when the engine's policy says so.
+/// Baseline code whose tier countdown reached zero: proposes the top
+/// tier when the engine's policy says so and reloads the countdown.
 #[cfg(feature = "host")]
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_tier_tick(func_id: u64, count: u64) -> u64 {
+pub extern "C" fn wren_tier_tick(func_id: u64) -> u64 {
     let vm = read_jit_ctx().vm as *mut crate::runtime::vm::VM;
     if vm.is_null() {
         return 0;
@@ -1328,11 +1328,8 @@ pub extern "C" fn wren_tier_tick(func_id: u64, count: u64) -> u64 {
     // SAFETY: the context's vm pointer is the running VM; compiled code
     // only runs while it is alive.
     let vm = unsafe { &mut *vm };
-    vm.engine.native_tick(
-        crate::runtime::engine::FuncId(func_id as u32),
-        count as u32,
-        &vm.interner,
-    );
+    vm.engine
+        .native_tick(crate::runtime::engine::FuncId(func_id as u32), &vm.interner);
     0
 }
 
@@ -1428,6 +1425,7 @@ pub unsafe extern "C" fn wren_retier(func_id: u64, header: u64, buf: *const u64,
 }
 
 static OSR_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static TIER_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[inline(always)]
 fn set_current_native_shadow_roots_ptr(ptr: *mut Value) {
@@ -2804,10 +2802,12 @@ fn dispatch_call_rooted(recv: Value, method_packed: u64, args: &[Value]) -> u64 
                     }
                     dispatch_method(vm, m, args, Some(dc))
                 } else {
-                    Value::null().to_bits()
+                    let name = vm.interner.resolve(method_sym).to_string();
+                    raise_method_not_found(vm, recv, &name)
                 }
             } else {
-                Value::null().to_bits()
+                let name = vm.interner.resolve(method_sym).to_string();
+                raise_method_not_found(vm, recv, &name)
             }
         }
     }
@@ -2853,9 +2853,6 @@ fn handle_jit_fiber_action(
                 if !caller.is_null() {
                     (*caller).state = FiberState::Suspended;
                 }
-                if is_call {
-                    (*target).caller = caller;
-                }
             }
 
             // krio fast path. AOT-compiled `fiber.try() / .call()`
@@ -2880,6 +2877,15 @@ fn handle_jit_fiber_action(
                         set_jit_depth(saved_jit_depth);
                         return v.to_bits();
                     }
+                }
+            }
+            // A krio-backed target returned to the caller through its own
+            // stack above; only the shared-loop paths below hand the
+            // caller to the target. A krio loop that found a caller
+            // would run the caller's frame on the fiber's own stack.
+            unsafe {
+                if is_call {
+                    (*target).caller = caller;
                 }
             }
 
@@ -5566,69 +5572,69 @@ pub extern "C" fn wren_guard_protocol(value: u64, protocol_id: u64) -> u64 {
 // Guard deoptimization — invalidate JIT + re-execute via interpreter
 // ---------------------------------------------------------------------------
 
-/// Common deopt implementation: invalidate JIT code for the current function
-/// and re-execute it via the interpreter with the given args.
-fn deopt_impl(args: &[u64]) -> u64 {
+/// A speculative guard failed at the entry of `func_id`'s compiled
+/// code, before any side effect: the function goes back to the
+/// interpreter until an unspeculated compile lands, and this call is
+/// re-run there with its original arguments.
+#[cfg(feature = "host")]
+fn deopt_impl(func_id: u32, args: &[u64]) -> u64 {
     let vm = unsafe { vm_ref() };
     let vm = match vm {
         Some(v) => v,
         None => return Value::null().to_bits(),
     };
+    let id = crate::runtime::engine::FuncId(func_id);
+    if env_flag(&TIER_TRACE, "WLIFT_TIER_TRACE") {
+        eprintln!(
+            "tier-trace: [{:.2}ms] deopt FuncId({}) argc={}",
+            crate::runtime::engine::trace_clock_ms(),
+            func_id,
+            args.len()
+        );
+    }
+    // The bailout reloads the bead to interpreted first, so the
+    // recompile can go through the broker.
+    let _decision = vm.engine.tier.record_bailout(id, 0, 0);
+    vm.engine.note_speculation_failed(id, &vm.interner);
+    let values: Vec<Value> = args.iter().map(|&a| Value::from_bits(a)).collect();
+
+    // The running closure when the dispatcher recorded one for this
+    // function; a method reached through a direct call has only the
+    // caller's, so it is dispatched again by name instead.
     let ctx = read_jit_ctx();
     let closure_ptr = ctx.closure as *mut ObjClosure;
-    if closure_ptr.is_null() {
-        return Value::null().to_bits();
+    let closure_matches =
+        !closure_ptr.is_null() && unsafe { (*(*closure_ptr).function).fn_id } == func_id;
+    if closure_matches {
+        let defining_class = if ctx.defining_class.is_null() {
+            None
+        } else {
+            Some(ctx.defining_class as *mut crate::runtime::object::ObjClass)
+        };
+        return vm
+            .call_closure_sync(closure_ptr, &values, defining_class)
+            .map(|v| v.to_bits())
+            .unwrap_or(Value::null().to_bits());
     }
-    let func_id = unsafe { (*(*closure_ptr).function).fn_id } as usize;
-
-    // Two sides of the same event: the engine updates its own tier
-    // bookkeeping (tier_states, stats), and the beadie bead records
-    // the bailout so the deopt policy can decide whether to allow
-    // further recompilation or blacklist the function.
-    let id = crate::runtime::engine::FuncId(func_id as u32);
-    vm.engine.note_deopt_to_baseline(id);
-    let _decision = vm.engine.tier.record_bailout(id, 0, 0);
-
-    // Re-execute via interpreter with the original args.
-    let defining_class = if ctx.defining_class.is_null() {
-        None
-    } else {
-        Some(ctx.defining_class as *mut crate::runtime::object::ObjClass)
+    let Some(name) = vm.engine.get_mir(id).map(|m| m.name) else {
+        return Value::null().to_bits();
     };
-    let values: Vec<Value> = args.iter().map(|&a| Value::from_bits(a)).collect();
-    vm.call_closure_sync(closure_ptr, &values, defining_class)
-        .map(|v| v.to_bits())
-        .unwrap_or(Value::null().to_bits())
+    let Some(&recv) = values.first() else {
+        return Value::null().to_bits();
+    };
+    dispatch_call(recv, name.index() as u64, &values)
 }
 
-/// Deopt with 0 args (standalone function, no receiver).
+/// Deopt `func_id` with its `n` entry arguments in `buf`.
+///
+/// # Safety
+/// `buf` must point at `n` readable u64s; compiled code passes its own
+/// stack buffer.
+#[cfg(feature = "host")]
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_deopt_0() -> u64 {
-    deopt_impl(&[])
-}
-
-/// Deopt with 1 arg (e.g. standalone function with 1 param, or method with `this` only).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_deopt_1(a0: u64) -> u64 {
-    deopt_impl(&[a0])
-}
-
-/// Deopt with 2 args (e.g. method with `this` + 1 param).
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_deopt_2(a0: u64, a1: u64) -> u64 {
-    deopt_impl(&[a0, a1])
-}
-
-/// Deopt with 3 args.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_deopt_3(a0: u64, a1: u64, a2: u64) -> u64 {
-    deopt_impl(&[a0, a1, a2])
-}
-
-/// Deopt with 4 args.
-#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
-pub extern "C" fn wren_deopt_4(a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    deopt_impl(&[a0, a1, a2, a3])
+pub unsafe extern "C" fn wren_deopt_n(func_id: u64, n: u64, buf: *const u64) -> u64 {
+    let args: Vec<u64> = (0..n as usize).map(|i| unsafe { *buf.add(i) }).collect();
+    deopt_impl(func_id as u32, &args)
 }
 
 // ---------------------------------------------------------------------------
@@ -5724,6 +5730,7 @@ pub extern "C" fn wren_bit_not(a: u64) -> u64 {
         return box_num((!n) as f64);
     }
     match unsafe { vm_ref() } {
+        Some(vm) if vm.has_error => Value::null().to_bits(),
         Some(vm) => {
             let sym = vm.interner.lookup("~").or_else(|| vm.interner.lookup("!"));
             if let Some(sym) = sym {
@@ -5732,7 +5739,7 @@ pub extern "C" fn wren_bit_not(a: u64) -> u64 {
                     return dispatch_method(vm, method, &[va], None);
                 }
             }
-            Value::null().to_bits()
+            raise_method_not_found(vm, va, "~")
         }
         None => Value::null().to_bits(),
     }
@@ -5753,6 +5760,7 @@ fn wren_bit_binop(
         return box_num(fast(x, y) as f64);
     }
     match unsafe { vm_ref() } {
+        Some(vm) if vm.has_error => Value::null().to_bits(),
         Some(vm) => {
             let sym = vm
                 .interner
@@ -5764,10 +5772,23 @@ fn wren_bit_binop(
                     return dispatch_method(vm, method, &[va, Value::from_bits(b)], None);
                 }
             }
-            Value::null().to_bits()
+            raise_method_not_found(vm, va, method_with_paren)
         }
         None => Value::null().to_bits(),
     }
+}
+
+/// Raise the interpreter's method-not-found error for `recv` and return
+/// the null the caller hands back; the interpreter picks the error up
+/// at the next boundary.
+fn raise_method_not_found(vm: &mut crate::runtime::vm::VM, recv: Value, method: &str) -> u64 {
+    // The first error stands; compiled code keeps running on nulls
+    // until the interpreter unwinds it.
+    if !vm.has_error {
+        let class_name = vm.class_name_of(recv);
+        vm.runtime_error(format!("{} does not implement '{}'", class_name, method));
+    }
+    Value::null().to_bits()
 }
 
 /// Common path for arithmetic-operator slow paths: if the receiver
@@ -5788,6 +5809,7 @@ fn wren_arith_dispatch(
         return box_num(fast(unbox_num(a), unbox_num(b)));
     }
     match unsafe { vm_ref() } {
+        Some(vm) if vm.has_error => Value::null().to_bits(),
         Some(vm) => {
             let sym = vm
                 .interner
@@ -5799,7 +5821,7 @@ fn wren_arith_dispatch(
                     return dispatch_method(vm, method, &[va, Value::from_bits(b)], None);
                 }
             }
-            Value::null().to_bits()
+            raise_method_not_found(vm, va, method_with_paren)
         }
         None => Value::null().to_bits(),
     }
@@ -5814,6 +5836,7 @@ pub extern "C" fn wren_num_neg(a: u64) -> u64 {
     }
     // Non-numeric: dispatch as prefix - method
     match unsafe { vm_ref() } {
+        Some(vm) if vm.has_error => Value::null().to_bits(),
         Some(vm) => {
             let sym = vm
                 .interner
@@ -5825,7 +5848,7 @@ pub extern "C" fn wren_num_neg(a: u64) -> u64 {
                     return dispatch_method(vm, method, &[va], None);
                 }
             }
-            Value::null().to_bits()
+            raise_method_not_found(vm, va, "-()")
         }
         None => Value::null().to_bits(),
     }
@@ -5877,6 +5900,7 @@ fn wren_cmp_dispatch(
         return Value::bool(fast(unbox_num(a), unbox_num(b))).to_bits();
     }
     match unsafe { vm_ref() } {
+        Some(vm) if vm.has_error => Value::bool(false).to_bits(),
         Some(vm) => {
             let sym = vm
                 .interner
@@ -5888,6 +5912,7 @@ fn wren_cmp_dispatch(
                     return dispatch_method(vm, method, &[va, Value::from_bits(b)], None);
                 }
             }
+            raise_method_not_found(vm, va, method_with_paren);
             Value::bool(false).to_bits()
         }
         None => Value::bool(false).to_bits(),
@@ -6136,11 +6161,8 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_guard_class" => Some(wren_guard_class as *const () as usize),
         "wren_guard_protocol" => Some(wren_guard_protocol as *const () as usize),
         // Guard deoptimization (arity-specific)
-        "wren_deopt_0" => Some(wren_deopt_0 as *const () as usize),
-        "wren_deopt_1" => Some(wren_deopt_1 as *const () as usize),
-        "wren_deopt_2" => Some(wren_deopt_2 as *const () as usize),
-        "wren_deopt_3" => Some(wren_deopt_3 as *const () as usize),
-        "wren_deopt_4" => Some(wren_deopt_4 as *const () as usize),
+        #[cfg(feature = "host")]
+        "wren_deopt_n" => Some(wren_deopt_n as *const () as usize),
         // Subscript
         "wren_subscript_get" => Some(wren_subscript_get as *const () as usize),
         "wren_subscript_set" => Some(wren_subscript_set as *const () as usize),

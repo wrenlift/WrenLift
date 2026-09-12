@@ -33,9 +33,9 @@ pub mod llvm {
 
     use crate::codegen::cranelift_backend::cl::{
         collect_osr_targets, const_f64_of, env_jit_callsite_ic, env_pure_leaf_direct,
-        infer_osr_value_types, is_positive_power_of_two, jit_modvars_cell, osr_entry_layout,
-        should_compile_osr_entries, OsrEntryLayout, PTR_MASK, QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ,
-        TAG_TRUE,
+        infer_osr_value_types, is_positive_power_of_two, jit_func_id, jit_modvar_in_range,
+        jit_modvars_cell, osr_entry_layout, should_compile_osr_entries, OsrEntryLayout, PTR_MASK,
+        QNAN, TAG_FALSE, TAG_NULL, TAG_OBJ, TAG_TRUE,
     };
     use crate::codegen::NativeOsrEntry;
     use crate::intern::Interner;
@@ -1238,7 +1238,10 @@ pub mod llvm {
                 }
                 I::GetModuleVar(idx) => {
                     let cell = jit_modvars_cell();
-                    if cell != 0 {
+                    if jit_modvar_in_range(*idx) {
+                        let base = self.load64(self.c64(cell as u64), 0)?;
+                        self.load64(base, (*idx as i64) * 8)?.into()
+                    } else if cell != 0 {
                         let cellv = self.c64(cell as u64);
                         let base = self.load64(cellv, 0)?;
                         let len = self.load64(cellv, 8)?;
@@ -1263,7 +1266,10 @@ pub mod llvm {
                 I::SetModuleVar(idx, val) => {
                     let v = self.boxed(val)?;
                     let cell = jit_modvars_cell();
-                    if cell != 0 {
+                    if jit_modvar_in_range(*idx) {
+                        let base = self.load64(self.c64(cell as u64), 0)?;
+                        self.store64(base, (*idx as i64) * 8, v)?;
+                    } else if cell != 0 {
                         let cellv = self.c64(cell as u64);
                         let base = self.load64(cellv, 0)?;
                         let len = self.load64(cellv, 8)?;
@@ -1629,9 +1635,25 @@ pub mod llvm {
                     .into(),
                 I::Unbox(a) => self.getf(a)?.into(),
                 I::Box(a) => self.boxed(a)?.into(),
-                I::GuardNum(s) | I::GuardBool(s) | I::GuardClass(s, _) | I::GuardProtocol(s, _) => {
-                    self.get(s)?
+                I::GuardNum(s) => {
+                    let v = self.boxed(s)?;
+                    let fails = self.is_nan_boxed(v)?;
+                    self.guard_deopt(fails)?;
+                    v.into()
                 }
+                I::GuardBool(s) => {
+                    let v = self.boxed(s)?;
+                    let t = self.icmp(IntPredicate::EQ, v, self.c64(TAG_TRUE))?;
+                    let f = self.icmp(IntPredicate::EQ, v, self.c64(TAG_FALSE))?;
+                    let is_bool = self.b.build_or(t, f, "isbool").map_err(|e| e.to_string())?;
+                    let fails = self
+                        .b
+                        .build_not(is_bool, "fails")
+                        .map_err(|e| e.to_string())?;
+                    self.guard_deopt(fails)?;
+                    v.into()
+                }
+                I::GuardClass(s, _) | I::GuardProtocol(s, _) => self.get(s)?,
                 I::MathUnaryF64(op, a) => {
                     use crate::mir::MathUnaryOp::*;
                     let x = self.getf(a)?;
@@ -1689,6 +1711,38 @@ pub mod llvm {
                 }
             };
             Ok(Some(v))
+        }
+
+        /// Branch on `fails` to a cold block that re-executes the call in
+        /// the interpreter with the entry parameters and returns its
+        /// result; lowering continues on the other edge.
+        fn guard_deopt(&mut self, fails: IntValue<'ctx>) -> Result<(), String> {
+            if self.inline_depth > 0 {
+                bail!("speculative guard inside an inlined body");
+            }
+            let params: Vec<IntValue<'ctx>> = if self.entries.is_empty() {
+                (0..self.sh.mir.arity as usize)
+                    .map(|i| self.f.get_nth_param(i as u32).unwrap().into_int_value())
+                    .collect()
+            } else {
+                self.param_regs.clone()
+            };
+            let deopt = self.new_block("deopt");
+            let cont = self.new_block("cont");
+            self.cbr(fails, deopt, cont)?;
+            self.b.position_at_end(deopt);
+            let (_, buf) = self.stack_buf(params.len())?;
+            for (i, p) in params.iter().enumerate() {
+                self.store64(buf, (i * 8) as i64, *p)?;
+            }
+            let fid = self.c64(jit_func_id() as u64);
+            let n = self.c64(params.len() as u64);
+            let result = self.call_helper("wren_deopt_n", &[fid, n, buf])?;
+            self.b
+                .build_return(Some(&result))
+                .map_err(|e| e.to_string())?;
+            self.b.position_at_end(cont);
+            Ok(())
         }
 
         fn helper2(

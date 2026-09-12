@@ -4950,3 +4950,69 @@ System.print(fsum)
         assert_eq!(output, expected);
     }
 }
+
+#[test]
+fn e2e_native_operator_and_call_errors_surface_from_compiled_code() {
+    // A missing operator or method reached from compiled code raises
+    // the interpreter's error instead of yielding null and carrying on,
+    // and a speculatively typed parameter given another type is handed
+    // back to the interpreter, which raises the same error.
+    let src = r#"
+class K {
+  static twice(x) {
+    var a = x + x
+    var b = a * 2 - x
+    var c = b / 4 + a
+    return c - b + x * 3
+  }
+  static poke(o) { o.nothing }
+}
+var s = 0
+for (i in 0...3000) s = s + K.twice(i)
+System.print(s)
+var caught = Fiber.new { K.twice("ab") }.try()
+System.print(caught)
+var caught2 = Fiber.new { K.poke(3) }.try()
+System.print(caught2)
+System.print(K.twice(1.5))
+K.twice("zz")
+System.print("not reached")
+"#;
+    let run = |mode: ExecutionMode| {
+        use std::sync::Arc;
+        let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = errors.clone();
+        let config = VMConfig {
+            error_fn: Some(Box::new(move |_, _, _, msg| {
+                sink.lock().unwrap().push(msg.to_string());
+            })),
+            execution_mode: mode,
+            jit_threshold: 20,
+            opt_threshold: 40,
+            ..VMConfig::default()
+        };
+        let (result, output, _) = run_with_config(src, config);
+        let errors = errors.lock().unwrap().clone();
+        (result, output, errors)
+    };
+    let (r0, expected, e0) = run(ExecutionMode::Interpreter);
+    assert!(matches!(r0, InterpretResult::RuntimeError), "{:?}", e0);
+    assert!(
+        expected.contains("String does not implement '-(_)'"),
+        "{expected}"
+    );
+    assert!(
+        expected.contains("Num does not implement 'nothing'"),
+        "{expected}"
+    );
+    assert!(!expected.contains("not reached"));
+    let (r1, output, e1) = run(ExecutionMode::Tiered);
+    assert!(matches!(r1, InterpretResult::RuntimeError), "{:?}", e1);
+    assert_eq!(output, expected);
+    assert_eq!(e1.len(), 1, "{:?}", e1);
+    assert!(
+        e1[0].contains("String does not implement '-(_)'"),
+        "{:?}",
+        e1
+    );
+}

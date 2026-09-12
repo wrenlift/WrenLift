@@ -30,25 +30,42 @@ use crate::mir::MirFunction;
 /// CHA-known sites without a method-cache lookup).
 pub type ChaMap = HashMap<SymbolId, Vec<(usize, u32, usize)>>;
 
-/// Counters baseline code keeps for the tier above it: its own entry
-/// count, and the re-tier word it polls at outermost loop headers,
-/// set once top-tier code with OSR entries is installed. Offsets are
-/// baked into compiled code (`cranelift_backend::TIER_CELL_*`).
+/// Counters baseline code keeps for the tier above it. `countdown` is
+/// decremented on every entry and outermost-loop iteration and calls
+/// `wren_tier_tick` when it reaches zero; the helper reloads it with
+/// the next interval and keeps the running total, so the call happens
+/// only when a decision can change. `retier` is polled at outermost
+/// loop headers and set once top-tier code with OSR entries is
+/// installed. Offsets are baked into compiled code
+/// (`cranelift_backend::TIER_CELL_*`).
 #[repr(C)]
 #[derive(Default)]
 pub struct TierCell {
-    pub calls: std::sync::atomic::AtomicU32,
+    pub countdown: std::sync::atomic::AtomicU32,
     pub retier: std::sync::atomic::AtomicU32,
-    /// The count at which the code next calls `wren_tier_tick`; the
-    /// helper moves it, so the call happens only when a decision can
-    /// change.
-    pub next_tick: std::sync::atomic::AtomicU32,
+    /// Entries counted so far, updated by the helper.
+    pub total: std::sync::atomic::AtomicU32,
+    /// The interval the countdown was last loaded with.
+    pub interval: std::sync::atomic::AtomicU32,
 }
 
 impl TierCell {
-    fn set_next_tick(&self, at: u32) {
-        self.next_tick
-            .store(at, std::sync::atomic::Ordering::Relaxed);
+    /// Call the helper again after `interval` more entries.
+    fn tick_after(&self, interval: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.interval.store(interval, Relaxed);
+        self.countdown.store(interval, Relaxed);
+    }
+
+    /// Credit the interval that just elapsed and return the total.
+    fn tick(&self) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let total = self
+            .total
+            .load(Relaxed)
+            .saturating_add(self.interval.load(Relaxed));
+        self.total.store(total, Relaxed);
+        total
     }
 }
 
@@ -94,7 +111,9 @@ fn promotion_gate_enabled() -> bool {
 /// What the top tier could win on a function, judged from its MIR
 /// before a compile is spent: nothing for a loop-free body that is
 /// mostly a call, little for a loop whose body is mostly calls, and
-/// the rest for a loop with real work between the calls.
+/// the rest for a loop with real work between the calls. Only `High`
+/// is promoted: the baseline tier already serves the others, and a
+/// top-tier compile there costs more than it returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopTierCeiling {
     None,
@@ -747,6 +766,12 @@ pub struct ExecutionEngine {
     /// Functions the top tier will never take: the worth gate refused
     /// them or their compile failed.
     promote_refused: Vec<bool>,
+    /// Functions a speculative guard failed in; their compiles carry
+    /// no speculation from then on.
+    speculation_failed: Vec<bool>,
+    /// Native code replaced by a recompile. Frames may still be running
+    /// it, so it is kept for the engine's lifetime.
+    retired_code: Vec<ExecutableFunction>,
     /// The thread top-tier compiles run on, started on first use.
     #[cfg(feature = "host")]
     promoter: Option<Promoter>,
@@ -1003,6 +1028,8 @@ impl ExecutionEngine {
             tier_cells: Vec::new(),
             promote_retry_at: Vec::new(),
             promote_refused: Vec::new(),
+            speculation_failed: Vec::new(),
+            retired_code: Vec::new(),
             #[cfg(feature = "host")]
             promoter: None,
             bc_cache: Vec::new(),
@@ -1066,6 +1093,7 @@ impl ExecutionEngine {
         self.tier_cells.push(Box::new(TierCell::default()));
         self.promote_retry_at.push(0);
         self.promote_refused.push(false);
+        self.speculation_failed.push(false);
         self.bc_cache.push(std::ptr::null());
         #[cfg(feature = "host")]
         self.threaded_code.push(None); // None = not yet checked
@@ -2140,6 +2168,48 @@ impl ExecutionEngine {
         }
     }
 
+    /// A speculative guard failed in `id`'s compiled code. The function
+    /// runs its baseline until a compile without speculation replaces
+    /// it; the top tier may be proposed again for the unspeculated body.
+    #[cfg(feature = "host")]
+    pub fn note_speculation_failed(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        let idx = id.0 as usize;
+        if idx >= self.functions.len() || self.speculation_failed[idx] {
+            return;
+        }
+        self.speculation_failed[idx] = true;
+        if tier_trace_enabled() {
+            eprintln!(
+                "tier-trace: [{:.2}ms] speculation failed FuncId({}), recompiling",
+                trace_clock_ms(),
+                id.0
+            );
+        }
+        if let Some(FuncBody::Native {
+            optimized_executable,
+            ..
+        }) = self.functions.get_mut(idx)
+        {
+            if let Some(old) = optimized_executable.take() {
+                self.retired_code.push(old);
+            }
+        }
+        self.optimized_code[idx] = std::ptr::null();
+        self.optimized_osr_entries[idx].clear();
+        self.baseline_code[idx] = std::ptr::null();
+        self.baseline_osr_entries[idx].clear();
+        self.tier_states[idx] = TierState::Interpreted;
+        self.sync_active_tier_cache(idx);
+        self.invalidate_ic_entries_for(id);
+        self.tier_cells[idx]
+            .retier
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.promote_retry_at[idx] = 0;
+        if self.compiling_tier[idx].is_none() {
+            self.request_compile(id, CompileTier::Baseline, interner);
+        }
+    }
+
     pub fn note_ic_hit(&mut self, id: FuncId) {
         if !self.collect_tier_stats {
             return;
@@ -2665,32 +2735,21 @@ impl ExecutionEngine {
         }
     }
 
+    /// The MIR a tier compiles: the profile's type guards when
+    /// speculation is allowed, then the JIT pipeline.
     fn build_compile_mir(
         mir: &Arc<MirFunction>,
         tier: CompileTier,
         interner: &crate::intern::Interner,
         profile: Option<&TypeProfile>,
+        speculate: bool,
     ) -> Arc<MirFunction> {
-        match tier {
-            CompileTier::Baseline => {
-                let mut baseline_mir = (**mir).clone();
-                // Insert speculative guards at baseline when profile data is
-                // available (collected during the 100 interpreted calls).
-                // This enables TypeSpecialize to convert boxed arith to
-                // native f64 ops, giving 10-40x speedup on numeric code.
-                if profile.is_some() {
-                    insert_speculative_guards(&mut baseline_mir, profile);
-                }
-                run_jit_opt_pipeline(&mut baseline_mir, interner);
-                Arc::new(baseline_mir)
-            }
-            CompileTier::Optimized => {
-                let mut spec = (**mir).clone();
-                insert_speculative_guards(&mut spec, profile);
-                run_jit_opt_pipeline(&mut spec, interner);
-                Arc::new(spec)
-            }
+        let mut out = (**mir).clone();
+        if speculate && (profile.is_some() || tier == CompileTier::Optimized) {
+            insert_speculative_guards(&mut out, profile);
         }
+        run_jit_opt_pipeline(&mut out, interner);
+        Arc::new(out)
     }
 
     /// WLIFT_TIER_TRACE helper — prints the engine's TierState alongside
@@ -2756,7 +2815,22 @@ impl ExecutionEngine {
                         mir,
                         bytecode,
                     },
-                    native @ FuncBody::Native { .. } => native,
+                    // A recompile: the old code may still be on the
+                    // stack, so it is retired rather than dropped.
+                    FuncBody::Native {
+                        baseline_executable,
+                        optimized_executable,
+                        mir,
+                        bytecode,
+                    } => {
+                        self.retired_code.push(baseline_executable);
+                        FuncBody::Native {
+                            baseline_executable: executable,
+                            optimized_executable,
+                            mir,
+                            bytecode,
+                        }
+                    }
                 };
                 self.functions[idx] = body;
                 self.baseline_code[idx] = native_ptr;
@@ -2972,10 +3046,13 @@ impl ExecutionEngine {
 
     /// Baseline code's own entry count crossing a sampling point.
     #[cfg(feature = "host")]
-    pub fn native_tick(&mut self, id: FuncId, count: u32, interner: &crate::intern::Interner) {
+    pub fn native_tick(&mut self, id: FuncId, interner: &crate::intern::Interner) {
         if self.mode != ExecutionMode::Tiered {
             return;
         }
+        let Some(count) = self.tier_cells.get(id.0 as usize).map(|c| c.tick()) else {
+            return;
+        };
         if tier_trace_enabled() {
             eprintln!(
                 "tier-trace: [{:.2}ms] tick FuncId({}) count={}",
@@ -2998,17 +3075,15 @@ impl ExecutionEngine {
             || self.tier_states[idx] == TierState::OptimizedNative
             || crate::codegen::top_tier() == crate::codegen::TopTier::Off;
         if settled {
-            cell.set_next_tick(u32::MAX);
+            cell.tick_after(u32::MAX);
         } else if self.compiling_tier[idx].is_some() {
             // Compile in flight: come back to install it.
-            cell.set_next_tick(count.saturating_add(4096));
+            cell.tick_after(4096);
         } else {
-            cell.set_next_tick(
-                count
-                    .saturating_add(64)
-                    .max(self.promote_retry_at[idx])
-                    .max(self.top_tier_queue_at()),
-            );
+            let at = self.promote_retry_at[idx]
+                .max(self.top_tier_queue_at())
+                .max(count.saturating_add(64));
+            cell.tick_after(at - count);
         }
     }
 
@@ -3022,11 +3097,19 @@ impl ExecutionEngine {
         if self.tier_states.get(idx).copied() != Some(TierState::OptimizedNative) {
             return None;
         }
-        self.optimized_osr_entries
+        let entry = self
+            .optimized_osr_entries
             .get(idx)?
             .iter()
-            .find(|e| e.target_block == header)
-            .cloned()
+            .find(|e| e.target_block == header)?;
+        // Only the bytecode's own registers mean the same thing in both
+        // bodies; a value the JIT pipeline created is numbered per
+        // compile.
+        let registers = self.functions.get(idx)?.mir().next_value;
+        if entry.live_in_regs.iter().any(|r| *r >= registers) {
+            return None;
+        }
+        Some(entry.clone())
     }
 
     /// Stop baseline code polling for a transfer into the top tier.
@@ -3177,7 +3260,9 @@ impl ExecutionEngine {
             Some(Arc::new(cha))
         };
         let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
-        let compile_mir = Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref());
+        let speculate = !self.speculation_failed[idx];
+        let compile_mir =
+            Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref(), speculate);
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
@@ -3248,18 +3333,32 @@ impl ExecutionEngine {
 
     #[cfg(feature = "host")]
     pub fn request_tier_up(&mut self, id: FuncId, interner: &crate::intern::Interner) {
+        let idx = id.0 as usize;
+        let Some(tier) = self.next_compile_tier(idx) else {
+            return;
+        };
+        self.request_compile(id, tier, interner);
+    }
+
+    /// Compile `id` at `tier` in the background; the install lands
+    /// through `poll_compilations`.
+    #[cfg(feature = "host")]
+    fn request_compile(
+        &mut self,
+        id: FuncId,
+        tier: CompileTier,
+        interner: &crate::intern::Interner,
+    ) {
         if self.mode != ExecutionMode::Tiered {
             return;
         }
+        let prep_started = std::time::Instant::now();
         // Respect the deopt policy: functions blacklisted after too many
         // bailouts stay in the interpreter for the rest of the run.
         if self.tier.is_blacklisted(id) {
             return;
         }
         let idx = id.0 as usize;
-        let Some(tier) = self.next_compile_tier(idx) else {
-            return;
-        };
         // Direct + transitive yield-method check — same shape as the
         // gate in `should_request_compile`; both refuse the JIT for
         // any function whose call graph reaches `Fiber.yield`.
@@ -3302,11 +3401,14 @@ impl ExecutionEngine {
             return;
         };
         let mir = Arc::clone(body.mir());
+        let top_tier_on = crate::codegen::top_tier() != crate::codegen::TopTier::Off;
+        let worth_top_tier = top_tier_on
+            && (!promotion_gate_enabled() || top_tier_ceiling(&mir) == TopTierCeiling::High);
         if tier == CompileTier::Optimized {
-            if crate::codegen::top_tier() == crate::codegen::TopTier::Off {
+            if !top_tier_on {
                 return;
             }
-            if promotion_gate_enabled() && top_tier_ceiling(&mir) == TopTierCeiling::None {
+            if !worth_top_tier {
                 self.promote_refused[idx] = true;
                 if tier_trace_enabled() {
                     eprintln!(
@@ -3318,10 +3420,13 @@ impl ExecutionEngine {
                 return;
             }
         }
-        let tier_hook = if tier == CompileTier::Baseline
-            && crate::codegen::top_tier() != crate::codegen::TopTier::Off
-        {
-            self.tier_cells[idx].set_next_tick(self.top_tier_queue_at());
+        // Only a body the top tier could take carries the counter and
+        // the re-tier polls; the rest is never proposed.
+        if tier == CompileTier::Baseline && !worth_top_tier {
+            self.promote_refused[idx] = true;
+        }
+        let tier_hook = if tier == CompileTier::Baseline && worth_top_tier {
+            self.tier_cells[idx].tick_after(self.top_tier_queue_at());
             Some(crate::codegen::cranelift_backend::cl::TierHook {
                 func_id: id.0,
                 cell: self.tier_cells[idx].as_ref() as *const TierCell as usize,
@@ -3332,6 +3437,7 @@ impl ExecutionEngine {
         };
         let sroa_mir = self.scalar_replaced(id, &mir, interner);
         let profile = self.get_type_profile(id).cloned();
+        let speculate = !self.speculation_failed[idx];
         let trace_name = self
             .functions
             .get(idx)
@@ -3385,12 +3491,13 @@ impl ExecutionEngine {
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
             eprintln!(
-                "tier-trace: [{:.2}ms] queue {:?} FuncId({}) {} ic_ptrs={}",
+                "tier-trace: [{:.2}ms] queue {:?} FuncId({}) {} ic_ptrs={} prep={:?}",
                 trace_clock_ms(),
                 tier,
                 id.0,
                 trace_name,
-                ic_count
+                ic_count,
+                prep_started.elapsed()
             );
         }
 
@@ -3415,8 +3522,13 @@ impl ExecutionEngine {
                 );
             }
             let compile_started = std::time::Instant::now();
-            let mut compile_mir =
-                Self::build_compile_mir(&sroa_mir, tier, &interner_clone, profile.as_ref());
+            let mut compile_mir = Self::build_compile_mir(
+                &sroa_mir,
+                tier,
+                &interner_clone,
+                profile.as_ref(),
+                speculate,
+            );
             if !cold.is_empty() {
                 Arc::make_mut(&mut compile_mir)
                     .osr_excluded
@@ -3439,6 +3551,7 @@ impl ExecutionEngine {
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
             crate::codegen::cranelift_backend::cl::set_jit_cold_headers(cold);
             crate::codegen::cranelift_backend::cl::set_jit_tier_hook(tier_hook);
+            crate::codegen::cranelift_backend::cl::set_jit_func_id(id.0);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -3526,7 +3639,10 @@ impl ExecutionEngine {
         // recompile of compiled code runs on a runtime thread and lands
         // through the same channel, where the install swaps the bead's
         // code and OSR table.
-        if tier == CompileTier::Optimized {
+        // The broker takes interpreted beads only; the top tier and
+        // recompiles of a compiled bead go through the promoter.
+        let bead_interpreted = self.tier.state(id) == Some(beadie::BeadState::Interpreted);
+        if tier == CompileTier::Optimized || !bead_interpreted {
             let promoter = self.promoter.get_or_insert_with(Promoter::start);
             if !promoter.submit(Box::new(move || {
                 let _ = compile_fn();
@@ -3534,13 +3650,13 @@ impl ExecutionEngine {
                 // Nothing is in flight; propose again at double the count.
                 self.compiling_tier[idx] = None;
                 self.pending_count = self.pending_count.saturating_sub(1);
-                let count = self.tier.invocations(id).max(
-                    self.tier_cells[idx]
-                        .calls
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                );
+                let cell = &self.tier_cells[idx];
+                let count = self
+                    .tier
+                    .invocations(id)
+                    .max(cell.total.load(std::sync::atomic::Ordering::Relaxed));
                 self.promote_retry_at[idx] = count.saturating_mul(2).max(count + 1);
-                self.tier_cells[idx].set_next_tick(self.promote_retry_at[idx]);
+                cell.tick_after(self.promote_retry_at[idx] - count);
             }
             return;
         }
