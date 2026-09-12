@@ -10,14 +10,19 @@ class Stepper2 is Stepper {
   construct new() {}
   step(acc, i) { (acc * 31 + (i % 8) + 0) % 4294967296 }
 }
-var start = System.clock
-var s = System.clock < 0 ? Stepper2.new() : Stepper.new()
-var sum = 0
-var i = 0
-while (i < 100000000) {
-  sum = s.step(sum, i)
-  i = i + 1
+class Bench {
+  static run() {
+    var s = System.clock < 0 ? Stepper2.new() : Stepper.new()
+    var sum = 0
+    var i = 0
+    while (i < 100000000) {
+      sum = s.step(sum, i)
+      i = i + 1
+    }
+    if (sum >= 2147483648) sum = sum - 4294967296
+    return sum
+  }
 }
-if (sum >= 2147483648) sum = sum - 4294967296
-System.print("BenchMethodCall %(sum)")
+var start = System.clock
+System.print("BenchMethodCall %(Bench.run())")
 System.print("elapsed: %(System.clock - start)")
