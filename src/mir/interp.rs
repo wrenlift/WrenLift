@@ -265,10 +265,10 @@ pub fn eval_pure_instruction(
         Instruction::BitAnd(a, b) => bitwise_binop(&get, *a, *b, |x, y| x & y),
         Instruction::BitOr(a, b) => bitwise_binop(&get, *a, *b, |x, y| x | y),
         Instruction::BitXor(a, b) => bitwise_binop(&get, *a, *b, |x, y| x ^ y),
-        Instruction::Shl(a, b) => bitwise_binop(&get, *a, *b, |x, y| x << (y & 31)),
-        Instruction::Shr(a, b) => bitwise_binop(&get, *a, *b, |x, y| x >> (y & 31)),
+        Instruction::Shl(a, b) => bitwise_binop(&get, *a, *b, |x, y| x.wrapping_shl(y & 31)),
+        Instruction::Shr(a, b) => bitwise_binop(&get, *a, *b, |x, y| x.wrapping_shr(y & 31)),
         Instruction::BitNot(a) => {
-            let n = get_boxed_num(&get, *a)? as i32;
+            let n = Value::num_to_u32_wrapping(get_boxed_num(&get, *a)?);
             Ok(InterpValue::Boxed(Value::num((!n) as f64)))
         }
 
@@ -392,10 +392,10 @@ fn bitwise_binop(
     get: &impl Fn(ValueId) -> Result<InterpValue, InterpError>,
     a: ValueId,
     b: ValueId,
-    op: impl Fn(i32, i32) -> i32,
+    op: impl Fn(u32, u32) -> u32,
 ) -> Result<InterpValue, InterpError> {
-    let lhs = get_boxed_num(get, a)? as i32;
-    let rhs = get_boxed_num(get, b)? as i32;
+    let lhs = Value::num_to_u32_wrapping(get_boxed_num(get, a)?);
+    let rhs = Value::num_to_u32_wrapping(get_boxed_num(get, b)?);
     Ok(InterpValue::Boxed(Value::num(op(lhs, rhs) as f64)))
 }
 
@@ -1016,7 +1016,7 @@ mod tests {
         f.block_mut(bb).terminator = Terminator::Return(v1);
 
         let result = eval(&f).unwrap();
-        assert_eq!(result, InterpValue::Boxed(Value::num(-1.0)));
+        assert_eq!(result, InterpValue::Boxed(Value::num(4294967295.0)));
     }
 
     #[test]

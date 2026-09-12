@@ -192,11 +192,13 @@ fn try_fold(inst: &Instruction, constants: &HashMap<ValueId, ConstVal>) -> Optio
         Instruction::BitOr(a, b) => int_binop(constants, *a, *b, |x, y| x | y),
         Instruction::BitXor(a, b) => int_binop(constants, *a, *b, |x, y| x ^ y),
         Instruction::BitNot(a) => match constants.get(a) {
-            Some(ConstVal::Num(n)) => Some(ConstVal::Num((!(*n as i32)) as f64)),
+            Some(ConstVal::Num(n)) => Some(ConstVal::Num(
+                (!crate::runtime::value::Value::num_to_u32_wrapping(*n)) as f64,
+            )),
             _ => None,
         },
-        Instruction::Shl(a, b) => int_binop(constants, *a, *b, |x, y| x << (y & 31)),
-        Instruction::Shr(a, b) => int_binop(constants, *a, *b, |x, y| x >> (y & 31)),
+        Instruction::Shl(a, b) => int_binop(constants, *a, *b, |x, y| x.wrapping_shl(y & 31)),
+        Instruction::Shr(a, b) => int_binop(constants, *a, *b, |x, y| x.wrapping_shr(y & 31)),
 
         // Math intrinsics
         Instruction::MathUnaryF64(op, a) => match constants.get(a) {
@@ -331,12 +333,15 @@ fn int_binop(
     constants: &HashMap<ValueId, ConstVal>,
     a: ValueId,
     b: ValueId,
-    op: impl Fn(i32, i32) -> i32,
+    op: impl Fn(u32, u32) -> u32,
 ) -> Option<ConstVal> {
     match (constants.get(&a), constants.get(&b)) {
-        (Some(ConstVal::Num(x)), Some(ConstVal::Num(y))) => {
-            Some(ConstVal::Num(op(*x as i32, *y as i32) as f64))
-        }
+        (Some(ConstVal::Num(x)), Some(ConstVal::Num(y))) => Some(ConstVal::Num(
+            op(
+                crate::runtime::value::Value::num_to_u32_wrapping(*x),
+                crate::runtime::value::Value::num_to_u32_wrapping(*y),
+            ) as f64,
+        )),
         _ => None,
     }
 }

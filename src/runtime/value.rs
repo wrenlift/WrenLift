@@ -86,6 +86,14 @@ impl Value {
 
     // -- Type checks --------------------------------------------------------
 
+    /// Wren's bitwise operands are unsigned 32-bit: the conversion
+    /// saturates like the C cast on the reference implementation, so
+    /// negative operands read as 0 and results lie in `[0, 2^32)`.
+    #[inline(always)]
+    pub fn num_to_u32_wrapping(n: f64) -> u32 {
+        n as u32
+    }
+
     /// Is this value a number (any f64, including NaN)?
     #[inline(always)]
     pub fn is_num(self) -> bool {

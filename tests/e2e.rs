@@ -138,7 +138,7 @@ System.print(~0)
 System.print(1 << 4)
 System.print(256 >> 4)
 "#,
-        "15\n255\n240\n-1\n16\n16",
+        "15\n255\n240\n4294967295\n16\n16",
     );
 }
 

@@ -1298,20 +1298,22 @@ impl<'a> MirWasmEmitter<'a> {
                 self.emit_runtime_call(func, dst, "wren_not", &[*a])?;
             }
 
-            // -- Bitwise (truncate to i32, operate, convert back) --
-            Instruction::BitAnd(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I64And),
-            Instruction::BitOr(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I64Or),
-            Instruction::BitXor(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I64Xor),
-            Instruction::Shl(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I64Shl),
-            Instruction::Shr(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I64ShrS),
+            // -- Bitwise: operands saturate to u32 like the reference
+            //    implementation's C cast, results are u32 (wasm i32
+            //    shifts already mask the count to 5 bits) --
+            Instruction::BitAnd(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I32And),
+            Instruction::BitOr(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I32Or),
+            Instruction::BitXor(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I32Xor),
+            Instruction::Shl(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I32Shl),
+            Instruction::Shr(a, b) => self.emit_bitwise(func, dst, *a, *b, WasmInst::I32ShrU),
             Instruction::BitNot(a) => {
                 // Unbox → NOT → rebox.
                 func.instruction(&WasmInst::LocalGet(self.local(*a)));
                 func.instruction(&WasmInst::F64ReinterpretI64);
-                func.instruction(&WasmInst::I64TruncF64S);
-                func.instruction(&WasmInst::I64Const(-1));
-                func.instruction(&WasmInst::I64Xor);
-                func.instruction(&WasmInst::F64ConvertI64S);
+                func.instruction(&WasmInst::I32TruncSatF64U);
+                func.instruction(&WasmInst::I32Const(-1));
+                func.instruction(&WasmInst::I32Xor);
+                func.instruction(&WasmInst::F64ConvertI32U);
                 func.instruction(&WasmInst::I64ReinterpretF64);
                 func.instruction(&WasmInst::LocalSet(self.local(dst)));
             }
@@ -2292,18 +2294,18 @@ impl<'a> MirWasmEmitter<'a> {
         b: ValueId,
         op: WasmInst<'static>,
     ) {
-        // Unbox a: i64 → f64 → i64 (truncated)
+        // Unbox a: i64 → f64 → u32 (saturating)
         func.instruction(&WasmInst::LocalGet(self.local(a)));
         func.instruction(&WasmInst::F64ReinterpretI64);
-        func.instruction(&WasmInst::I64TruncF64S);
+        func.instruction(&WasmInst::I32TruncSatF64U);
         // Unbox b
         func.instruction(&WasmInst::LocalGet(self.local(b)));
         func.instruction(&WasmInst::F64ReinterpretI64);
-        func.instruction(&WasmInst::I64TruncF64S);
+        func.instruction(&WasmInst::I32TruncSatF64U);
         // Op
         func.instruction(&op);
-        // Rebox: i64 → f64 → i64
-        func.instruction(&WasmInst::F64ConvertI64S);
+        // Rebox: u32 → f64 → i64
+        func.instruction(&WasmInst::F64ConvertI32U);
         func.instruction(&WasmInst::I64ReinterpretF64);
         func.instruction(&WasmInst::LocalSet(self.local(dst)));
     }

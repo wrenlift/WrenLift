@@ -5521,7 +5521,7 @@ pub extern "C" fn wren_num_mod(a: u64, b: u64) -> u64 {
 
 // ---------------------------------------------------------------------------
 // Bitwise — declared by the Cranelift lowering for `Instruction::BitAnd /
-// BitOr / BitXor / BitNot / Shl / Shr`. Wren truncates Num operands to i32
+// BitOr / BitXor / BitNot / Shl / Shr`. Wren truncates Num operands to u32
 // before the op (per the bytecode interpreter's `Op::BitAnd` / etc.). Hatch
 // packages use these for hash mixing; without the symbols the staticlib
 // failed to link any AOT object that touched those ops.
@@ -5548,17 +5548,13 @@ pub extern "C" fn wren_bit_xor(a: u64, b: u64) -> u64 {
 #[cfg(feature = "host")]
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_bit_shl(a: u64, b: u64) -> u64 {
-    wren_bit_binop(a, b, "<<(_)", "<<", |x, y| {
-        ((x as u32).wrapping_shl((y & 31) as u32)) as i32
-    })
+    wren_bit_binop(a, b, "<<(_)", "<<", |x, y| x.wrapping_shl(y & 31))
 }
 
 #[cfg(feature = "host")]
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_bit_shr(a: u64, b: u64) -> u64 {
-    wren_bit_binop(a, b, ">>(_)", ">>", |x, y| {
-        ((x as u32).wrapping_shr((y & 31) as u32)) as i32
-    })
+    wren_bit_binop(a, b, ">>(_)", ">>", |x, y| x.wrapping_shr(y & 31))
 }
 
 #[cfg(feature = "host")]
@@ -5566,7 +5562,7 @@ pub extern "C" fn wren_bit_shr(a: u64, b: u64) -> u64 {
 pub extern "C" fn wren_bit_not(a: u64) -> u64 {
     let va = Value::from_bits(a);
     if va.is_num() {
-        let n = unbox_num(a) as i32;
+        let n = Value::num_to_u32_wrapping(unbox_num(a));
         return box_num((!n) as f64);
     }
     match unsafe { vm_ref() } {
@@ -5590,12 +5586,12 @@ fn wren_bit_binop(
     b: u64,
     method_with_paren: &str,
     method_bare: &str,
-    fast: impl FnOnce(i32, i32) -> i32,
+    fast: impl FnOnce(u32, u32) -> u32,
 ) -> u64 {
     let va = Value::from_bits(a);
     if va.is_num() {
-        let x = unbox_num(a) as i32;
-        let y = unbox_num(b) as i32;
+        let x = Value::num_to_u32_wrapping(unbox_num(a));
+        let y = Value::num_to_u32_wrapping(unbox_num(b));
         return box_num(fast(x, y) as f64);
     }
     match unsafe { vm_ref() } {

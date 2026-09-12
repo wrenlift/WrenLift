@@ -227,8 +227,8 @@ fn num_bitwise_and(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(v) => v,
         None => return Value::null(),
     };
-    let left = args[0].as_num().unwrap() as u32;
-    let right = right as u32;
+    let left = Value::num_to_u32_wrapping(args[0].as_num().unwrap());
+    let right = Value::num_to_u32_wrapping(right);
     Value::num((left & right) as f64)
 }
 
@@ -237,8 +237,8 @@ fn num_bitwise_or(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(v) => v,
         None => return Value::null(),
     };
-    let left = args[0].as_num().unwrap() as u32;
-    let right = right as u32;
+    let left = Value::num_to_u32_wrapping(args[0].as_num().unwrap());
+    let right = Value::num_to_u32_wrapping(right);
     Value::num((left | right) as f64)
 }
 
@@ -247,8 +247,8 @@ fn num_bitwise_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(v) => v,
         None => return Value::null(),
     };
-    let left = args[0].as_num().unwrap() as u32;
-    let right = right as u32;
+    let left = Value::num_to_u32_wrapping(args[0].as_num().unwrap());
+    let right = Value::num_to_u32_wrapping(right);
     Value::num((left ^ right) as f64)
 }
 
@@ -257,8 +257,8 @@ fn num_left_shift(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(v) => v,
         None => return Value::null(),
     };
-    let left = args[0].as_num().unwrap() as u32;
-    let right = right as u32;
+    let left = Value::num_to_u32_wrapping(args[0].as_num().unwrap());
+    let right = Value::num_to_u32_wrapping(right);
     Value::num((left << right) as f64)
 }
 
@@ -267,13 +267,13 @@ fn num_right_shift(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
         Some(v) => v,
         None => return Value::null(),
     };
-    let left = args[0].as_num().unwrap() as u32;
-    let right = right as u32;
+    let left = Value::num_to_u32_wrapping(args[0].as_num().unwrap());
+    let right = Value::num_to_u32_wrapping(right);
     Value::num((left >> right) as f64)
 }
 
 fn num_bitwise_not(_ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
-    let n = args[0].as_num().unwrap() as u32;
+    let n = Value::num_to_u32_wrapping(args[0].as_num().unwrap());
     Value::num((!n) as f64)
 }
 

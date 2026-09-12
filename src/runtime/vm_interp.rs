@@ -861,8 +861,12 @@ macro_rules! bc_bitwise_binop {
         if a.is_num() && b.is_num() {
             let x = unsafe { a.as_num_unchecked() };
             let y = unsafe { b.as_num_unchecked() };
-            let f: fn(i32, i32) -> i32 = $op;
-            set_reg($values, dst, Value::num(f(x as i32, y as i32) as f64));
+            let f: fn(u32, u32) -> u32 = $op;
+            set_reg(
+                $values,
+                dst,
+                Value::num(f(Value::num_to_u32_wrapping(x), Value::num_to_u32_wrapping(y)) as f64),
+            );
             false
         } else {
             let recv = a;
@@ -1617,7 +1621,7 @@ fn run_fiber_with_stop_depth(
                     let a = get_reg(&values, src);
                     match a.as_num() {
                         Some(n) => {
-                            let i = n as i32;
+                            let i = Value::num_to_u32_wrapping(n);
                             set_reg(&mut values, dst, Value::num((!i) as f64));
                         }
                         None => {
@@ -2020,7 +2024,7 @@ fn run_fiber_with_stop_depth(
                         &mut values,
                         &module_name,
                         bc_ptr,
-                        |x: i32, y: i32| x & y,
+                        |x: u32, y: u32| x & y,
                         "&(_)"
                     ) {
                         continue 'fiber_loop;
@@ -2034,7 +2038,7 @@ fn run_fiber_with_stop_depth(
                         &mut values,
                         &module_name,
                         bc_ptr,
-                        |x: i32, y: i32| x | y,
+                        |x: u32, y: u32| x | y,
                         "|(_)"
                     ) {
                         continue 'fiber_loop;
@@ -2051,7 +2055,10 @@ fn run_fiber_with_stop_depth(
                             set_reg(
                                 &mut values,
                                 dst,
-                                Value::num(((x as i32) ^ (y as i32)) as f64),
+                                Value::num(
+                                    (Value::num_to_u32_wrapping(x) ^ Value::num_to_u32_wrapping(y))
+                                        as f64,
+                                ),
                             );
                         }
                         _ => {
@@ -2067,7 +2074,7 @@ fn run_fiber_with_stop_depth(
                         &mut values,
                         &module_name,
                         bc_ptr,
-                        |x: i32, y: i32| x << (y & 31),
+                        |x: u32, y: u32| x.wrapping_shl(y & 31),
                         "<<(_)"
                     ) {
                         continue 'fiber_loop;
@@ -2081,7 +2088,7 @@ fn run_fiber_with_stop_depth(
                         &mut values,
                         &module_name,
                         bc_ptr,
-                        |x: i32, y: i32| x >> (y & 31),
+                        |x: u32, y: u32| x.wrapping_shr(y & 31),
                         ">>(_)"
                     ) {
                         continue 'fiber_loop;
