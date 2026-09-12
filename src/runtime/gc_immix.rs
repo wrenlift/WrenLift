@@ -200,6 +200,9 @@ pub struct ImmixGc {
     /// Blocks that hold at least one line-owning allocation; gates the
     /// interior-pointer walk-back.
     has_span: Vec<bool>,
+    /// Free blocks whose pages were handed back to the OS and must be
+    /// reclaimed before reuse (macOS keeps a reusable/reuse ledger).
+    handed_back: Vec<bool>,
     /// (chunk base, first block number) sorted by base, for address
     /// lookups.
     chunk_index: Vec<(usize, u32)>,
@@ -245,6 +248,7 @@ impl ImmixGc {
             block_bases: Vec::new(),
             in_use: Vec::new(),
             has_span: Vec::new(),
+            handed_back: Vec::new(),
             chunk_index: Vec::new(),
             free_blocks: Vec::new(),
             objects: Vec::new(),
@@ -295,6 +299,7 @@ impl ImmixGc {
             self.block_bases.push(chunk.base + i * BLOCK_SIZE);
             self.in_use.push(false);
             self.has_span.push(false);
+            self.handed_back.push(false);
         }
         self.chunk_index.push((chunk.base, first));
         self.chunk_index.sort_unstable();
@@ -316,6 +321,10 @@ impl ImmixGc {
         }
         let b = self.free_blocks.pop()?;
         self.in_use[b as usize] = true;
+        if self.handed_back[b as usize] {
+            self.handed_back[b as usize] = false;
+            reclaim_pages(self.block_bases[b as usize], BLOCK_SIZE);
+        }
         self.clear_metadata(b, 0, LINES_PER_BLOCK);
         Some(b)
     }
@@ -637,7 +646,11 @@ impl ImmixGc {
         self.small = Region::default();
         self.medium = Region::default();
 
+        let quiet = self.last_collect.elapsed() >= HEARTBEAT;
         let live = self.sweep();
+        if quiet {
+            self.hand_back_free_blocks();
+        }
         self.live_bytes = live;
         let floor = trigger_floor_bytes();
         let ceiling = TRIGGER_CEILING.max(live).max(floor);
@@ -748,6 +761,76 @@ impl ImmixGc {
         live_bytes
     }
 }
+
+/// Free blocks kept resident so a burst after an idle period does not
+/// pay page faults immediately.
+const RESIDENT_FLOAT: usize = 16;
+
+impl ImmixGc {
+    /// Return the pages of free blocks beyond the resident float to the
+    /// OS. Only called after a quiet collection: a churning workload
+    /// would otherwise pay a madvise pair per block per cycle.
+    fn hand_back_free_blocks(&mut self) {
+        if self.free_blocks.len() <= RESIDENT_FLOAT {
+            return;
+        }
+        self.free_blocks.sort_unstable_by(|a, b| b.cmp(a));
+        // The float stays at the end of the list (lowest addresses),
+        // which is what pops next.
+        let n = self.free_blocks.len() - RESIDENT_FLOAT;
+        let mut run_start: Option<(usize, usize)> = None;
+        for &b in self.free_blocks[..n].iter().rev() {
+            let b = b as usize;
+            if self.handed_back[b] {
+                continue;
+            }
+            self.handed_back[b] = true;
+            let base = self.block_bases[b];
+            match run_start {
+                Some((lo, len)) if lo + len == base => run_start = Some((lo, len + BLOCK_SIZE)),
+                Some((lo, len)) => {
+                    hand_back_pages(lo, len);
+                    run_start = Some((base, BLOCK_SIZE));
+                }
+                None => run_start = Some((base, BLOCK_SIZE)),
+            }
+        }
+        if let Some((lo, len)) = run_start {
+            hand_back_pages(lo, len);
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn hand_back_pages(addr: usize, len: usize) {
+    unsafe {
+        libc::madvise(addr as *mut libc::c_void, len, libc::MADV_FREE_REUSABLE);
+    }
+}
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn reclaim_pages(addr: usize, len: usize) {
+    unsafe {
+        libc::madvise(addr as *mut libc::c_void, len, libc::MADV_FREE_REUSE);
+    }
+}
+#[cfg(all(target_os = "linux", feature = "host"))]
+fn hand_back_pages(addr: usize, len: usize) {
+    unsafe {
+        libc::madvise(addr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+    }
+}
+#[cfg(all(target_os = "linux", feature = "host"))]
+fn reclaim_pages(_addr: usize, _len: usize) {}
+#[cfg(not(any(
+    all(target_os = "macos", feature = "host"),
+    all(target_os = "linux", feature = "host")
+)))]
+fn hand_back_pages(_addr: usize, _len: usize) {}
+#[cfg(not(any(
+    all(target_os = "macos", feature = "host"),
+    all(target_os = "linux", feature = "host")
+)))]
+fn reclaim_pages(_addr: usize, _len: usize) {}
 
 impl Drop for ImmixGc {
     fn drop(&mut self) {
@@ -1033,6 +1116,33 @@ mod tests {
         assert!(live.contains(&raw));
         assert!(live.contains(&interior));
         assert!(!live.contains(&dead));
+    }
+
+    #[test]
+    fn handed_back_blocks_are_reclaimed_before_reuse() {
+        let mut gc = ImmixGc::new();
+        for _ in 0..200_000 {
+            gc.alloc_string("g".to_string());
+        }
+        let mut roots = Vec::new();
+        gc.collect(&mut roots);
+        assert!(gc.free_blocks.len() > RESIDENT_FLOAT);
+        gc.hand_back_free_blocks();
+        let handed: usize = gc.handed_back.iter().filter(|&&h| h).count();
+        assert_eq!(handed, gc.free_blocks.len() - RESIDENT_FLOAT);
+        // Allocate through every handed-back block and verify the
+        // memory is usable and the ledger clears.
+        for _ in 0..200_000 {
+            let p = gc.alloc_string("again".to_string());
+            assert_eq!(unsafe { &(*p).value }, "again");
+        }
+        let still: usize = gc
+            .handed_back
+            .iter()
+            .zip(gc.in_use.iter())
+            .filter(|(&h, &u)| h && u)
+            .count();
+        assert_eq!(still, 0, "an in-use block is still marked handed back");
     }
 
     #[test]

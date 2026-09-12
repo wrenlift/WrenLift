@@ -3762,9 +3762,12 @@ pub mod cl {
                 builder
                     .ins()
                     .store(MemFlags::trusted(), store_val, fields_ptr, offset);
-                // Write barrier
-                let wb = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
-                let _result = builder.ins().call(wb, &[recv_val, store_val]);
+                // Write barrier; AOT cannot know the binary's collector,
+                // JIT code skips it when no barrier collector is live.
+                if aot_config.is_some() || crate::runtime::gc_trait::jit_needs_write_barriers() {
+                    let wb = get_runtime_fn(module, builder, "wren_write_barrier", 2)?;
+                    let _result = builder.ins().call(wb, &[recv_val, store_val]);
+                }
                 // SetField result is the stored value
                 Ok(Some(store_val))
             }

@@ -123,9 +123,23 @@ macro_rules! gc_dispatch {
     };
 }
 
+/// VMs created with a collector that needs write barriers. Compiled
+/// code emits barriers while this is non-zero; a process that only
+/// ever runs Immix VMs leaves it at zero and skips them. Read on the
+/// compile broker thread, so it is process-wide.
+static BARRIER_VMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when JIT code compiled now must carry write barriers.
+pub fn jit_needs_write_barriers() -> bool {
+    BARRIER_VMS.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 impl GcImpl {
     /// Create a new GC instance for the given strategy.
     pub fn new(strategy: GcStrategy) -> Self {
+        if strategy != GcStrategy::Immix {
+            BARRIER_VMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         match strategy {
             GcStrategy::Generational => GcImpl::Generational(super::gc::Gc::new()),
             GcStrategy::Arena => GcImpl::Arena(ArenaGc::new()),
