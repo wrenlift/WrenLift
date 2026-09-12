@@ -428,27 +428,37 @@ fn try_enter_loop_osr(
     else {
         return Ok(OsrTransfer::NotEntered);
     };
-    if point.param_regs.len() > 4 {
-        return Ok(OsrTransfer::NotEntered);
-    }
-
-    let mut osr_args = SmallVec::<[Value; 4]>::new();
-    for &reg in &point.param_regs {
-        let Some(value) = values.get(reg as usize).copied() else {
-            return Ok(OsrTransfer::NotEntered);
-        };
-        if value.is_undefined() {
-            return Ok(OsrTransfer::NotEntered);
+    let Some(entry) = vm.engine.active_osr_entry(func_id, point.target_block) else {
+        if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+            eprintln!(
+                "osr-trace: no entry FuncId({}) bb{}",
+                func_id.0, point.target_block.0
+            );
         }
-        osr_args.push(value);
-    }
-
-    let Some(entry) = vm
-        .engine
-        .active_osr_entry(func_id, point.target_block, osr_args.len())
-    else {
         return Ok(OsrTransfer::NotEntered);
     };
+    // The entry names its live-ins by register; a register the
+    // interpreter never defined means the compiled body's value set
+    // drifted from the bytecode's, so decline rather than guess.
+    let mut osr_args = SmallVec::<[Value; 8]>::new();
+    for &reg in &entry.live_in_regs {
+        let value = values.get(reg as usize).copied();
+        match value {
+            Some(v) if !v.is_undefined() => osr_args.push(v),
+            _ => {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "osr-trace: decline FuncId({}) bb{} live-in v{} {}",
+                        func_id.0,
+                        point.target_block.0,
+                        reg,
+                        if value.is_none() { "out of range" } else { "undefined" }
+                    );
+                }
+                return Ok(OsrTransfer::NotEntered);
+            }
+        }
+    }
 
     let jit_depth = crate::codegen::runtime_fns::jit_depth();
     if jit_depth >= crate::codegen::runtime_fns::MAX_JIT_DEPTH {
@@ -540,7 +550,7 @@ fn try_enter_loop_osr(
     vm.engine.note_native_entry(func_id);
     vm.engine.note_osr_entry(func_id);
     crate::codegen::runtime_fns::set_jit_depth(jit_depth + 1);
-    let result_bits = unsafe { call_jit_fn(entry.ptr, &osr_args) };
+    let result_bits = unsafe { call_osr_entry(entry.ptr, &osr_args) };
     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
 
     let live_fiber = if crate::codegen::runtime_fns::jit_roots_snapshot_len() > fiber_root_idx {
@@ -4579,6 +4589,15 @@ fn ensure_ctx_reg() {}
 /// execute from the current thread context.
 pub unsafe fn call_jit_fn_pub(fn_ptr: *const u8, args: &[Value]) -> u64 {
     call_jit_fn(fn_ptr, args)
+}
+
+/// Enter an OSR entry: live-ins travel through one pointer to a Value
+/// array, so a loop with any number of them can be entered.
+#[inline(always)]
+unsafe fn call_osr_entry(fn_ptr: *const u8, args: &[Value]) -> u64 {
+    ensure_ctx_reg();
+    let f: extern "C" fn(*const u64) -> u64 = std::mem::transmute(fn_ptr);
+    f(args.as_ptr() as *const u64)
 }
 
 /// Sets x20 = JitContext pointer before the call (preserved by callee-saved ABI).

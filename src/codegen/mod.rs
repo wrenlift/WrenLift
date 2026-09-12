@@ -1911,11 +1911,16 @@ pub struct CompiledArtifact {
 }
 
 /// Native entry point for a compiled loop/header OSR target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeOsrEntry {
     pub target_block: BlockId,
     pub param_count: u16,
     pub ptr: *const u8,
+    /// Register (value id) of every live-in the entry loads, in the
+    /// order the entry expects: externals first, then the target
+    /// block's params. Read from the interpreter's register file at
+    /// transfer time.
+    pub live_in_regs: Vec<u32>,
 }
 
 unsafe impl Send for NativeOsrEntry {}

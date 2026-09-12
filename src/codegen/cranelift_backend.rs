@@ -1294,6 +1294,7 @@ pub mod cl {
                 target_block: def.target_block,
                 param_count: def.param_count,
                 ptr: module.get_finalized_function(def.func_id),
+                live_in_regs: def.live_in_regs,
             })
             .collect();
 
@@ -1382,6 +1383,7 @@ pub mod cl {
         target_block: BlockId,
         param_count: u16,
         func_id: cranelift_module::FuncId,
+        live_in_regs: Vec<u32>,
     }
 
     #[derive(Clone)]
@@ -1430,12 +1432,18 @@ pub mod cl {
                 continue;
             };
 
+            // One parameter: pointer to the live-in Values in block order
+            // (externals first, then the target block's params).
             let mut sig = module.make_signature();
-            for _ in 0..layout.param_count {
-                sig.params.push(AbiParam::new(types::I64));
-            }
+            sig.params.push(AbiParam::new(types::I64));
             sig.returns.push(AbiParam::new(types::I64));
 
+            if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                eprintln!(
+                    "osr-trace: layout {} bb{} externals={:?}",
+                    safe_name, target_block.0, layout.external_args
+                );
+            }
             let osr_name = format!("{}_osr_bb{}", safe_name, target_block.0);
             let Ok(func_id) = module.declare_function(&osr_name, Linkage::Local, &sig) else {
                 continue;
@@ -1501,6 +1509,12 @@ pub mod cl {
                 target_block,
                 param_count: layout.param_count,
                 func_id,
+                live_in_regs: layout
+                    .external_args
+                    .iter()
+                    .map(|v| v.0)
+                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| p.0))
+                    .collect(),
             });
         }
         defs
@@ -1549,8 +1563,10 @@ pub mod cl {
             return None;
         }
 
+        // Live-ins arrive through one pointer to an array of Values, so
+        // any count is fine as long as it fits the descriptor.
         let param_count = external_args.len() + target_block.params.len();
-        if param_count > 4 {
+        if param_count > u16::MAX as usize {
             return None;
         }
 
@@ -2191,32 +2207,64 @@ pub mod cl {
                 .unwrap_or(false)
         };
 
+        // Live-ins that the region itself redefines on a later trip
+        // (a value built by an enclosing loop body and consumed by the
+        // inner header) become Cranelift variables: the entry defines
+        // them, the region's own definition redefines them, and the
+        // frontend merges the two at the header.
+        let mut osr_vars: HashMap<ValueId, cranelift_frontend::Variable> = HashMap::new();
+        if let Some(ref layout) = osr_entry {
+            let reachable = osr_reachable_blocks(mir, layout.target_block);
+            let mut region_defs: std::collections::HashSet<ValueId> =
+                std::collections::HashSet::new();
+            for &idx in &reachable {
+                let block = &mir.blocks[idx];
+                region_defs.extend(block.params.iter().map(|(p, _)| *p));
+                region_defs.extend(block.instructions.iter().map(|(d, _)| *d));
+            }
+            for vid in &layout.external_args {
+                if region_defs.contains(vid) {
+                    let var = builder.declare_var(types::I64);
+                    if mark_stack_map && is_wren_value(*vid, &value_types) {
+                        builder.declare_var_needs_stack_map(var);
+                    }
+                    osr_vars.insert(*vid, var);
+                }
+            }
+        }
+
         if let Some(ref layout) = osr_entry {
             let osr_entry = builder.create_block();
             builder.switch_to_block(osr_entry);
+            let args_ptr = builder.append_block_param(osr_entry, types::I64);
+            let mut slot = 0i32;
             for vid in &layout.external_args {
-                let param = builder.append_block_param(osr_entry, types::I64);
-                val_map.insert(*vid, param);
+                let v = builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), args_ptr, slot * VALUE_SIZE);
+                slot += 1;
+                val_map.insert(*vid, v);
+                if let Some(var) = osr_vars.get(vid) {
+                    builder.def_var(*var, v);
+                }
                 if mark_stack_map && is_wren_value(*vid, &value_types) {
-                    builder.declare_value_needs_stack_map(param);
+                    builder.declare_value_needs_stack_map(v);
                 }
             }
             let target_block = &mir.blocks[layout.target_block.0 as usize];
+            let mut args: Vec<BlockArg> = Vec::with_capacity(target_block.params.len());
             for (_, ty) in &target_block.params {
-                let cl_type = match ty {
-                    MirType::F64 => types::F64,
-                    _ => types::I64,
+                let v = builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), args_ptr, slot * VALUE_SIZE);
+                slot += 1;
+                let v = match ty {
+                    MirType::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), v),
+                    _ => v,
                 };
-                builder.append_block_param(osr_entry, cl_type);
+                args.push(BlockArg::Value(v));
             }
             emit_osr_external_constants(mir, layout.target_block, builder, &mut val_map)?;
-            let args: Vec<BlockArg> = builder
-                .block_params(osr_entry)
-                .iter()
-                .skip(layout.external_args.len())
-                .copied()
-                .map(BlockArg::Value)
-                .collect();
             builder.ins().jump(block_map[&layout.target_block], &args);
         }
 
@@ -2795,9 +2843,19 @@ pub mod cl {
                 };
                 let param = builder.append_block_param(cl_block, cl_type);
                 val_map.insert(*vid, param);
+                if let Some(var) = osr_vars.get(vid) {
+                    builder.def_var(*var, param);
+                }
                 if mark_stack_map && matches!(ty, MirType::Value) {
                     builder.declare_value_needs_stack_map(param);
                 }
+            }
+            // Materialise the current value of every OSR variable at
+            // block entry so plain lookups in this block see the value
+            // flowing in along the edge that was taken.
+            for (vid, var) in &osr_vars {
+                let v = builder.use_var(*var);
+                val_map.insert(*vid, v);
             }
 
             // For the entry block (first in RPO = bb0), map BlockParam
@@ -3105,6 +3163,9 @@ pub mod cl {
                 )?;
                 if let Some(val) = result {
                     val_map.insert(vid, val);
+                    if let Some(var) = osr_vars.get(&vid) {
+                        builder.def_var(*var, val);
+                    }
                     if is_raw_bool {
                         raw_bools.insert(vid);
                     }

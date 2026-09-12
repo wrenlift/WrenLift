@@ -1754,26 +1754,51 @@ impl ExecutionEngine {
         }
     }
 
+    /// The installed OSR entry for `target_block`, if any. Candidates
+    /// come from the compiled tiers' descriptors (which carry the
+    /// live-in register list); beadie's table decides which one is
+    /// active by pointer.
     pub fn active_osr_entry(
         &self,
         id: FuncId,
         target_block: crate::mir::BlockId,
-        param_count: usize,
     ) -> Option<NativeOsrEntry> {
-        // Beadie's bead owns the active OSR table now. `osr_entry` does
-        // an O(log N) binary search on a sorted slice; the site key
-        // encodes (block_id, param_count) so this matches the exact
-        // `(target_block, param_count)` lookup the legacy Vec did.
-        let site = super::tier::encode_osr_site(target_block.0, param_count as u16);
-        let ptr = self.tier.osr_entry(id, site)?;
-        if ptr.is_null() {
-            return None;
+        let idx = id.0 as usize;
+        let candidates = self
+            .optimized_osr_entries
+            .get(idx)
+            .into_iter()
+            .chain(self.baseline_osr_entries.get(idx))
+            .flat_map(|v| v.iter())
+            .filter(|e| e.target_block == target_block);
+        for entry in candidates {
+            let site = super::tier::encode_osr_site(target_block.0, entry.param_count);
+            let Some(ptr) = self.tier.osr_entry(id, site) else {
+                if tier_trace_enabled() {
+                    eprintln!(
+                        "tier-trace: osr site bb{} params={} not in bead table for FuncId({})",
+                        target_block.0, entry.param_count, id.0
+                    );
+                }
+                continue;
+            };
+            if ptr.is_null() || ptr as *const u8 != entry.ptr {
+                if tier_trace_enabled() {
+                    eprintln!(
+                        "tier-trace: osr site bb{} pointer mismatch for FuncId({})",
+                        target_block.0, id.0
+                    );
+                }
+                continue;
+            }
+            return Some(NativeOsrEntry {
+                target_block,
+                param_count: entry.param_count,
+                ptr: entry.ptr,
+                live_in_regs: entry.live_in_regs.clone(),
+            });
         }
-        Some(NativeOsrEntry {
-            target_block,
-            param_count: param_count as u16,
-            ptr: ptr as *const u8,
-        })
+        None
     }
 
     pub fn tier_state(&self, id: FuncId) -> TierState {
@@ -2817,7 +2842,7 @@ mod tests {
         assert!(engine.baseline_osr_entries[id.0 as usize].is_empty());
         assert!(engine.optimized_osr_entries[id.0 as usize].is_empty());
         assert!(engine
-            .active_osr_entry(id, crate::mir::BlockId(0), 0)
+            .active_osr_entry(id, crate::mir::BlockId(0))
             .is_none());
     }
 

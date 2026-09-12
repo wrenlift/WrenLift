@@ -1033,42 +1033,71 @@ pub fn osr_rematerializable_defs(
 /// constants that can be rematerialized. The order is deterministic and is
 /// part of the bytecode-to-native OSR ABI.
 pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<ValueId> {
-    let reachable = osr_reachable_blocks(func, target);
-    let rematerializable = osr_rematerializable_defs(func, target);
-    let mut internal_defs = HashSet::new();
-    for &idx in &reachable {
-        let block = &func.blocks[idx];
+    // Classic backward liveness over the whole function: a value is
+    // live-in at the target if some path from the target uses it
+    // before redefining it. That includes values defined inside the
+    // loop region on an earlier trip around an enclosing loop (a range
+    // built in the outer body and consumed by the inner header), which
+    // a reachability-only rule misclassifies as internal.
+    let n = func.blocks.len();
+    let mut gens: Vec<HashSet<ValueId>> = Vec::with_capacity(n);
+    let mut defs: Vec<HashSet<ValueId>> = Vec::with_capacity(n);
+    for block in &func.blocks {
+        let mut d = HashSet::new();
+        let mut g = HashSet::new();
         for &(param, _) in &block.params {
-            internal_defs.insert(param);
+            d.insert(param);
         }
-        for &(dst, _) in &block.instructions {
-            internal_defs.insert(dst);
-        }
-    }
-
-    let mut seen = HashSet::new();
-    let mut live = Vec::new();
-    for idx in osr_rpo_from(func, target) {
-        let block = &func.blocks[idx];
-        for (_, inst) in &block.instructions {
+        for &(dst, ref inst) in &block.instructions {
             for op in inst.operands() {
-                if !internal_defs.contains(&op)
-                    && !rematerializable.contains_key(&op)
-                    && seen.insert(op)
-                {
-                    live.push(op);
+                if !d.contains(&op) {
+                    g.insert(op);
                 }
             }
+            d.insert(dst);
         }
         for op in block.terminator.operands() {
-            if !internal_defs.contains(&op)
-                && !rematerializable.contains_key(&op)
-                && seen.insert(op)
-            {
-                live.push(op);
+            if !d.contains(&op) {
+                g.insert(op);
+            }
+        }
+        gens.push(g);
+        defs.push(d);
+    }
+    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            let mut out: HashSet<ValueId> = HashSet::new();
+            for succ in func.blocks[b].terminator.successors() {
+                if let Some(li) = live_in.get(succ.0 as usize) {
+                    out.extend(li.iter().copied());
+                }
+            }
+            let mut inn = gens[b].clone();
+            for v in out {
+                if !defs[b].contains(&v) {
+                    inn.insert(v);
+                }
+            }
+            if inn != live_in[b] {
+                live_in[b] = inn;
+                changed = true;
             }
         }
     }
+    let Some(target_block) = func.blocks.get(target.0 as usize) else {
+        return Vec::new();
+    };
+    let rematerializable = osr_rematerializable_defs(func, target);
+    let params: HashSet<ValueId> = target_block.params.iter().map(|&(p, _)| p).collect();
+    let mut live: Vec<ValueId> = live_in[target.0 as usize]
+        .iter()
+        .copied()
+        .filter(|v| !params.contains(v) && !rematerializable.contains_key(v))
+        .collect();
+    live.sort_by_key(|v| v.0);
     live
 }
 
