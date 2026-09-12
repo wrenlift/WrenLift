@@ -345,8 +345,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "beadie"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59cbfae69078e8925d0fd0284d8eba5568dcda855afec52c0c9e2d08a313823f"
+source = "git+https://github.com/darmie/beadie.git?rev=868d1069eeda1ea162460273869597a9b0866ebf#868d1069eeda1ea162460273869597a9b0866ebf"
 dependencies = [
  "beadie-backend",
  "beadie-core",
@@ -355,8 +354,7 @@ dependencies = [
 [[package]]
 name = "beadie-backend"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a3ae0a2221c427de4c6667d6c755187eebb5e3f83f1bb70da0cb482e88b5053"
+source = "git+https://github.com/darmie/beadie.git?rev=868d1069eeda1ea162460273869597a9b0866ebf#868d1069eeda1ea162460273869597a9b0866ebf"
 dependencies = [
  "beadie-core",
  "crossbeam-channel",
@@ -366,8 +364,7 @@ dependencies = [
 [[package]]
 name = "beadie-core"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05efceacab7f89e1c421d659dfd1a0160faf0625b19774f8b23db2976af286b4"
+source = "git+https://github.com/darmie/beadie.git?rev=868d1069eeda1ea162460273869597a9b0866ebf#868d1069eeda1ea162460273869597a9b0866ebf"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
@@ -2674,12 +2671,12 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "krio-core"
 version = "0.1.0"
-source = "git+https://github.com/darmie/krio.git?rev=1051689b0066ac9d4d0cd1f3d78cfd3fdacd4871#1051689b0066ac9d4d0cd1f3d78cfd3fdacd4871"
+source = "git+https://github.com/darmie/krio.git?rev=286f5e0710e20772179fc2ca96f6fda8d13e3a70#286f5e0710e20772179fc2ca96f6fda8d13e3a70"
 
 [[package]]
 name = "krio-fiber"
 version = "0.1.0"
-source = "git+https://github.com/darmie/krio.git?rev=1051689b0066ac9d4d0cd1f3d78cfd3fdacd4871#1051689b0066ac9d4d0cd1f3d78cfd3fdacd4871"
+source = "git+https://github.com/darmie/krio.git?rev=286f5e0710e20772179fc2ca96f6fda8d13e3a70#286f5e0710e20772179fc2ca96f6fda8d13e3a70"
 dependencies = [
  "krio-core",
  "libc",
