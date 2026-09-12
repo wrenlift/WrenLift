@@ -1295,6 +1295,7 @@ pub mod cl {
                 param_count: def.param_count,
                 ptr: module.get_finalized_function(def.func_id),
                 live_in_regs: def.live_in_regs,
+                live_in_num: def.live_in_num,
             })
             .collect();
 
@@ -1384,6 +1385,7 @@ pub mod cl {
         param_count: u16,
         func_id: cranelift_module::FuncId,
         live_in_regs: Vec<u32>,
+        live_in_num: Vec<bool>,
     }
 
     #[derive(Clone)]
@@ -1514,6 +1516,13 @@ pub mod cl {
                     .iter()
                     .map(|v| v.0)
                     .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| p.0))
+                    .collect(),
+                live_in_num: layout
+                    .external_args
+                    .iter()
+                    .copied()
+                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .map(|v| mir.speculated_num_params.contains(&v))
                     .collect(),
             });
         }

@@ -1796,6 +1796,7 @@ impl ExecutionEngine {
                 param_count: entry.param_count,
                 ptr: entry.ptr,
                 live_in_regs: entry.live_in_regs.clone(),
+                live_in_num: entry.live_in_num.clone(),
             });
         }
         None

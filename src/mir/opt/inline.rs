@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::MirPass;
 use crate::intern::{Interner, SymbolId};
-use crate::mir::{Instruction, MathBinaryOp, MathUnaryOp, MirFunction, ValueId};
+use crate::mir::{BlockId, Instruction, MathBinaryOp, MathUnaryOp, MirFunction, Terminator, ValueId};
 
 pub struct TypeSpecialize {
     /// Maps method SymbolId → unary math intrinsic for known-Num receivers.
@@ -92,7 +92,16 @@ impl MirPass for TypeSpecialize {
     }
 
     fn run(&self, func: &mut MirFunction) -> bool {
-        let mut known_nums: HashSet<ValueId> = HashSet::new();
+        let mut known_nums: HashSet<ValueId> = infer_loop_carried_nums(func);
+        {
+            let mut assumed: Vec<ValueId> = known_nums.iter().copied().collect();
+            assumed.sort_by_key(|v| v.0);
+            for v in assumed {
+                if !func.speculated_num_params.contains(&v) {
+                    func.speculated_num_params.push(v);
+                }
+            }
+        }
         let mut changed = false;
 
         // Pre-pass: if this function has GuardNum on any parameter,
@@ -265,6 +274,93 @@ enum CmpOp {
     Gt,
     Le,
     Ge,
+}
+
+/// Block parameters that are provably Num on every incoming edge.
+///
+/// A loop accumulator is a block parameter whose incoming values are a
+/// constant on the entry edge and the loop's own arithmetic on the back
+/// edge; a single forward walk never learns its type because the back
+/// edge refers to values defined later. This runs an optimistic fixed
+/// point instead: every non-entry block parameter is assumed Num,
+/// arithmetic over known values is Num, and any parameter fed by a
+/// value that is not known on some edge is dropped until nothing
+/// changes. Entry-block parameters count only when guarded.
+fn infer_loop_carried_nums(func: &MirFunction) -> HashSet<ValueId> {
+    let mut candidates: HashSet<ValueId> = HashSet::new();
+    for block in func.blocks.iter().skip(1) {
+        for &(param, _) in &block.params {
+            candidates.insert(param);
+        }
+    }
+    loop {
+        // Forward propagation with the current candidate set as the
+        // assumed-Num block parameters.
+        let mut known: HashSet<ValueId> = candidates.clone();
+        let mut grew = true;
+        while grew {
+            grew = false;
+            for block in &func.blocks {
+                for (vid, inst) in &block.instructions {
+                    if known.contains(vid) {
+                        continue;
+                    }
+                    let is_num = match inst {
+                        Instruction::ConstNum(_) | Instruction::Box(_) => true,
+                        Instruction::GuardNum(_) => true,
+                        Instruction::Move(a) | Instruction::Neg(a) => known.contains(a),
+                        Instruction::Add(a, b)
+                        | Instruction::Sub(a, b)
+                        | Instruction::Mul(a, b)
+                        | Instruction::Div(a, b)
+                        | Instruction::Mod(a, b) => known.contains(a) && known.contains(b),
+                        _ => false,
+                    };
+                    if is_num {
+                        known.insert(*vid);
+                        grew = true;
+                    }
+                    if let Instruction::GuardNum(src) = inst {
+                        if known.insert(*src) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+        }
+        // Drop every candidate that some edge feeds with a non-Num.
+        let mut dropped = false;
+        for block in &func.blocks {
+            let mut check = |target: BlockId, args: &[ValueId]| {
+                let params = &func.blocks[target.0 as usize].params;
+                for (i, arg) in args.iter().enumerate() {
+                    if let Some(&(param, _)) = params.get(i) {
+                        if candidates.contains(&param) && !known.contains(arg) {
+                            candidates.remove(&param);
+                            dropped = true;
+                        }
+                    }
+                }
+            };
+            match &block.terminator {
+                Terminator::Branch { target, args } => check(*target, args),
+                Terminator::CondBranch {
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                    ..
+                } => {
+                    check(*true_target, true_args);
+                    check(*false_target, false_args);
+                }
+                _ => {}
+            }
+        }
+        if !dropped {
+            return candidates;
+        }
+    }
 }
 
 fn expand_binop(

@@ -1921,6 +1921,9 @@ pub struct NativeOsrEntry {
     /// block's params. Read from the interpreter's register file at
     /// transfer time.
     pub live_in_regs: Vec<u32>,
+    /// Parallel to `live_in_regs`: the compiled body assumed this
+    /// live-in is a Num, so the transfer must decline otherwise.
+    pub live_in_num: Vec<bool>,
 }
 
 unsafe impl Send for NativeOsrEntry {}
@@ -2136,7 +2139,11 @@ fn devirt_calls_with_ic(
             {
                 if ic_idx < ic_snapshot.len() {
                     let ic = &ic_snapshot[ic_idx];
-                    if ic.kind == 1 && ic.class != 0 && ic.func_id != 0 {
+                    // Kinds 1, 2 and 6 name a closure method with its
+                    // class and function id; whether the callee is
+                    // compiled yet only decides which path the guarded
+                    // known call takes at run time.
+                    if matches!(ic.kind, 1 | 2 | 6) && ic.class != 0 && ic.func_id != 0 {
                         let fid = ic.func_id as u32;
                         let hint = devirt_hints.and_then(|h| h.get(ic_idx)).copied();
                         let getter_field = hint.and_then(|h| h.getter_field);

@@ -441,9 +441,19 @@ fn try_enter_loop_osr(
     // interpreter never defined means the compiled body's value set
     // drifted from the bytecode's, so decline rather than guess.
     let mut osr_args = SmallVec::<[Value; 8]>::new();
-    for &reg in &entry.live_in_regs {
+    for (i, &reg) in entry.live_in_regs.iter().enumerate() {
         let value = values.get(reg as usize).copied();
+        let needs_num = entry.live_in_num.get(i).copied().unwrap_or(false);
         match value {
+            Some(v) if needs_num && !v.is_num() => {
+                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                    eprintln!(
+                        "osr-trace: decline FuncId({}) bb{} live-in v{} not a Num",
+                        func_id.0, point.target_block.0, reg
+                    );
+                }
+                return Ok(OsrTransfer::NotEntered);
+            }
             Some(v) if !v.is_undefined() => osr_args.push(v),
             _ => {
                 if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
@@ -2479,6 +2489,29 @@ fn run_fiber_with_stop_depth(
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
+                            // Record the monomorphic target even while it
+                            // is interpreted (kind 2): the caller's compile
+                            // consumes this snapshot, and a callee that is
+                            // still warming up would otherwise leave the
+                            // site with nothing to devirtualise.
+                            if vm.engine.mode != ExecutionMode::Interpreter {
+                                let ic_table = unsafe { &mut *bc.ic_table.get() };
+                                if let Some(ic) = ic_table.get_mut(ic_idx) {
+                                    if ic.kind == 0
+                                        || (ic.kind == 2 && ic.class != cache_key_class as usize)
+                                    {
+                                        let fn_idx =
+                                            unsafe { (*(*closure_ptr).function).fn_id } as usize;
+                                        *ic = crate::mir::bytecode::CallSiteIC {
+                                            class: cache_key_class as usize,
+                                            jit_ptr: std::ptr::null(),
+                                            closure: closure_ptr as *const u8,
+                                            func_id: fn_idx as u64,
+                                            kind: 2,
+                                        };
+                                    }
+                                }
+                            }
                             // Try to populate IC for JIT leaf methods.
                             if vm.engine.mode != ExecutionMode::Interpreter && argc <= 3 {
                                 let fn_ptr = unsafe { (*closure_ptr).function };

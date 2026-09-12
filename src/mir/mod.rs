@@ -767,6 +767,10 @@ pub struct MirFunction {
     pub next_block: u32,
     /// Source span map: ValueId → source byte range (for runtime error reporting).
     pub span_map: std::collections::HashMap<ValueId, crate::ast::Span>,
+    /// Block parameters the type specialiser assumed to be Num on the
+    /// strength of their in-function edges. An OSR entry feeding one
+    /// of these from the interpreter must check the value first.
+    pub speculated_num_params: Vec<ValueId>,
 }
 
 impl MirFunction {
@@ -779,6 +783,7 @@ impl MirFunction {
             next_value: 0,
             next_block: 0,
             span_map: std::collections::HashMap::new(),
+            speculated_num_params: Vec::new(),
         }
     }
 
@@ -1121,22 +1126,6 @@ pub fn osr_reachable_blocks(func: &MirFunction, start: BlockId) -> HashSet<usize
     reachable
 }
 
-fn osr_rpo_from(func: &MirFunction, start: BlockId) -> Vec<usize> {
-    let mut seen = HashSet::new();
-    let mut order = Vec::new();
-    fn dfs(idx: usize, func: &MirFunction, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
-        if idx >= func.blocks.len() || !seen.insert(idx) {
-            return;
-        }
-        for succ in func.blocks[idx].terminator.successors() {
-            dfs(succ.0 as usize, func, seen, order);
-        }
-        order.push(idx);
-    }
-    dfs(start.0 as usize, func, &mut seen, &mut order);
-    order.reverse();
-    order
-}
 
 // ---------------------------------------------------------------------------
 // CLIF-style formatting helpers
