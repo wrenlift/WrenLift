@@ -4453,3 +4453,75 @@ System.print(Bench.escapes(20000))
     };
     assert_eq!(output.trim(), expected.trim());
 }
+
+// ===========================================================================
+// Runtime errors raised by natives
+// ===========================================================================
+
+/// Run `source` with an error callback and return (result, output, errors).
+fn run_collecting_errors(source: &str, mode: ExecutionMode) -> (InterpretResult, String, Vec<String>) {
+    use std::sync::Arc;
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = errors.clone();
+    let mut config = VMConfig::default();
+    config.error_fn = Some(Box::new(move |_, _, _, msg| {
+        sink.lock().unwrap().push(msg.to_string());
+    }));
+    config.execution_mode = mode;
+    let (result, output, _) = run_with_config(source, config);
+    let errors = errors.lock().unwrap().clone();
+    (result, output, errors)
+}
+
+#[test]
+fn e2e_native_error_in_method_reports_once() {
+    let src = r#"
+class B {
+  static run(seed) {
+    var acc = seed
+    for (i in 0...3) {
+      acc = acc + i
+    }
+    return acc * 2
+  }
+}
+System.print("before")
+B.run("s")
+System.print("after")
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let (result, output, errors) = run_collecting_errors(src, mode);
+        assert!(matches!(result, InterpretResult::RuntimeError), "{:?}", mode);
+        assert_eq!(output.trim(), "before", "{:?}", mode);
+        assert_eq!(errors.len(), 1, "{:?}: {:?}", mode, errors);
+        assert!(errors[0].contains("Right operand must be a string."), "{:?}: {}", mode, errors[0]);
+        assert!(errors[0].contains("stack trace"), "{:?}: {}", mode, errors[0]);
+    }
+}
+
+#[test]
+fn e2e_native_error_caught_by_fiber_try() {
+    let src = r#"
+var f = Fiber.new { "a" + 1 }
+f.try()
+System.print("caught: %(f.error)")
+var g = Fiber.new { null + 1 }
+g.try()
+System.print("caught: %(g.error)")
+var h = Fiber.new { [1, 2][5] }
+h.try()
+System.print("caught: %(h.error)")
+System.print("done")
+"#;
+    for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
+        let (result, output, errors) = run_collecting_errors(src, mode);
+        assert!(matches!(result, InterpretResult::Success), "{:?}: {:?}", mode, errors);
+        assert_eq!(errors, Vec::<String>::new(), "{:?}", mode);
+        assert_eq!(
+            output.trim(),
+            "caught: Right operand must be a string.\ncaught: Null does not implement '+(_)'\ncaught: Subscript 5 out of bounds (count 2).\ndone",
+            "{:?}",
+            mode
+        );
+    }
+}

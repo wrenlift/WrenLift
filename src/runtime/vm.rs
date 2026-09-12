@@ -2191,6 +2191,17 @@ impl VM {
         // The local `fiber` from before run_fiber is potentially stale.
         let fiber = self.fiber;
 
+        let result = match result {
+            Ok(_) if self.has_error => {
+                self.has_error = false;
+                let msg = self
+                    .last_error
+                    .take()
+                    .unwrap_or_else(|| "runtime error".to_string());
+                Err(super::vm_interp::RuntimeError::Error(msg))
+            }
+            r => r,
+        };
         let interpret_result = match result {
             Ok(_) => {
                 self.fiber = prev_fiber;
@@ -4423,10 +4434,10 @@ impl NativeContext for VM {
         Value::from_bits(unsafe { crate::codegen::runtime_fns::finish_alloc_native(self, v) })
     }
 
+    // Reported once, with a stack trace, by whoever unwinds the flag.
     fn runtime_error(&mut self, msg: String) {
         self.has_error = true;
-        self.last_error = Some(msg.clone());
-        self.report_error(&msg);
+        self.last_error = Some(msg);
     }
 
     fn has_error(&self) -> bool {

@@ -770,6 +770,63 @@ fn build_arg_vals(
 // Macros for repetitive opcode patterns (must precede run_fiber)
 // ---------------------------------------------------------------------------
 
+/// Where a native's raised error went.
+enum NativeError {
+    /// Caught by the enclosing `Fiber.try`; the caller fiber has been resumed.
+    Caught,
+    /// Caught by a `Fiber.try` with no caller: the run ends with the error string.
+    Finished(Value),
+    Unwind(RuntimeError),
+}
+
+/// Consume the error a native raised through `NativeContext::runtime_error`.
+/// Must run after every native call so the flag never outlives the call
+/// that set it.
+#[inline]
+fn take_native_error(vm: &mut VM, fiber: *mut ObjFiber) -> Option<NativeError> {
+    if !vm.has_error {
+        return None;
+    }
+    vm.has_error = false;
+    let msg = vm
+        .last_error
+        .take()
+        .unwrap_or_else(|| "runtime error in native method".to_string());
+    if !unsafe { (*fiber).is_try } {
+        return Some(NativeError::Unwind(RuntimeError::Error(msg)));
+    }
+    let had_caller = unsafe { !(*fiber).caller.is_null() };
+    let err_val = unsafe { route_method_error_through_fiber_try(vm, fiber, msg) }
+        .expect("fiber is in try mode");
+    Some(if had_caller {
+        NativeError::Caught
+    } else {
+        NativeError::Finished(err_val)
+    })
+}
+
+/// Post-native-call check inside the dispatch loop.
+macro_rules! native_error_check {
+    ($vm:expr, $fiber:expr, $label:lifetime) => {
+        match take_native_error($vm, $fiber) {
+            None => {}
+            Some(NativeError::Caught) => continue $label,
+            Some(NativeError::Finished(v)) => return Ok(v),
+            Some(NativeError::Unwind(e)) => return Err(e),
+        }
+    };
+}
+
+/// Outcome of an operator dispatch from a boxed opcode.
+enum Dispatch {
+    /// The result is in the destination register.
+    Value,
+    /// A closure frame was pushed, or the caller fiber was resumed.
+    Continue,
+    /// The fiber run ends with this value.
+    Finished(Value),
+}
+
 /// Boxed binary arithmetic: try numeric, fall back to operator dispatch.
 /// Returns true if a closure frame was pushed (caller should continue 'fiber_loop).
 macro_rules! bc_boxed_binop {
@@ -792,7 +849,7 @@ macro_rules! bc_boxed_binop {
         } else {
             let recv = a;
             let arg = b;
-            try_operator_dispatch(
+            match try_operator_dispatch(
                 $vm,
                 $fiber,
                 recv,
@@ -803,7 +860,11 @@ macro_rules! bc_boxed_binop {
                 dst,
                 $module_name,
                 $bc_ptr,
-            )?
+            )? {
+                Dispatch::Value => false,
+                Dispatch::Continue => true,
+                Dispatch::Finished(v) => return Ok(v),
+            }
         }
     }};
 }
@@ -846,7 +907,7 @@ macro_rules! bc_boxed_cmp {
         } else {
             let recv = a;
             let arg = b;
-            try_operator_dispatch(
+            match try_operator_dispatch(
                 $vm,
                 $fiber,
                 recv,
@@ -857,7 +918,11 @@ macro_rules! bc_boxed_cmp {
                 dst,
                 $module_name,
                 $bc_ptr,
-            )?
+            )? {
+                Dispatch::Value => false,
+                Dispatch::Continue => true,
+                Dispatch::Finished(v) => return Ok(v),
+            }
         }
     }};
 }
@@ -904,7 +969,7 @@ macro_rules! bc_bitwise_binop {
         } else {
             let recv = a;
             let arg = b;
-            try_operator_dispatch(
+            match try_operator_dispatch(
                 $vm,
                 $fiber,
                 recv,
@@ -915,7 +980,11 @@ macro_rules! bc_bitwise_binop {
                 dst,
                 $module_name,
                 $bc_ptr,
-            )?
+            )? {
+                Dispatch::Value => false,
+                Dispatch::Continue => true,
+                Dispatch::Finished(v) => return Ok(v),
+            }
         }
     }};
 }
@@ -1624,7 +1693,7 @@ fn run_fiber_with_stop_depth(
                         Some(n) => set_reg(&mut values, dst, Value::num(-n)),
                         None => {
                             let recv = a;
-                            let result = try_operator_dispatch(
+                            match try_operator_dispatch(
                                 vm,
                                 fiber,
                                 recv,
@@ -1635,9 +1704,10 @@ fn run_fiber_with_stop_depth(
                                 dst,
                                 &module_name,
                                 bc_ptr,
-                            )?;
-                            if result {
-                                continue 'fiber_loop;
+                            )? {
+                                Dispatch::Value => {}
+                                Dispatch::Continue => continue 'fiber_loop,
+                                Dispatch::Finished(v) => return Ok(v),
                             }
                         }
                     }
@@ -1667,7 +1737,7 @@ fn run_fiber_with_stop_depth(
                         }
                         None => {
                             let recv = a;
-                            let result = try_operator_dispatch(
+                            match try_operator_dispatch(
                                 vm,
                                 fiber,
                                 recv,
@@ -1678,9 +1748,10 @@ fn run_fiber_with_stop_depth(
                                 dst,
                                 &module_name,
                                 bc_ptr,
-                            )?;
-                            if result {
-                                continue 'fiber_loop;
+                            )? {
+                                Dispatch::Value => {}
+                                Dispatch::Continue => continue 'fiber_loop,
+                                Dispatch::Finished(v) => return Ok(v),
                             }
                         }
                     }
@@ -1990,7 +2061,7 @@ fn run_fiber_with_stop_depth(
                         && !rhs.is_bool()
                         && !rhs.is_num()
                     {
-                        let result = try_operator_dispatch(
+                        match try_operator_dispatch(
                             vm,
                             fiber,
                             lhs,
@@ -2001,9 +2072,10 @@ fn run_fiber_with_stop_depth(
                             dst,
                             &module_name,
                             bc_ptr,
-                        )?;
-                        if result {
-                            continue 'fiber_loop;
+                        )? {
+                            Dispatch::Value => {}
+                            Dispatch::Continue => continue 'fiber_loop,
+                            Dispatch::Finished(v) => return Ok(v),
                         }
                     } else {
                         set_reg(&mut values, dst, Value::bool(lhs == rhs));
@@ -2021,7 +2093,7 @@ fn run_fiber_with_stop_depth(
                         && !rhs.is_bool()
                         && !rhs.is_num()
                     {
-                        let result = try_operator_dispatch(
+                        match try_operator_dispatch(
                             vm,
                             fiber,
                             lhs,
@@ -2032,9 +2104,10 @@ fn run_fiber_with_stop_depth(
                             dst,
                             &module_name,
                             bc_ptr,
-                        )?;
-                        if result {
-                            continue 'fiber_loop;
+                        )? {
+                            Dispatch::Value => {}
+                            Dispatch::Continue => continue 'fiber_loop,
+                            Dispatch::Finished(v) => return Ok(v),
                         }
                     } else {
                         set_reg(&mut values, dst, Value::bool(lhs != rhs));
@@ -2469,33 +2542,7 @@ fn run_fiber_with_stop_depth(
                                 }
                                 _ => unreachable!(),
                             };
-                            if vm.has_error {
-                                vm.has_error = false;
-                                let fiber_is_try = unsafe { (*fiber).is_try };
-                                if fiber_is_try {
-                                    let err_msg = vm.last_error.take().unwrap_or_default();
-                                    let err_val = vm.new_string(err_msg);
-                                    unsafe {
-                                        (*fiber).error = err_val;
-                                        (*fiber).is_try = false;
-                                        (*fiber).state = FiberState::Done;
-                                    }
-                                    // Old-gen fiber, young err string.
-                                    vm.gc.write_barrier(fiber as *mut ObjHeader, err_val);
-                                    let caller = unsafe { (*fiber).caller };
-                                    if !caller.is_null() {
-                                        unsafe {
-                                            (*fiber).caller = std::ptr::null_mut();
-                                        }
-                                        resume_caller(vm, caller, err_val);
-                                        continue 'fiber_loop;
-                                    }
-                                    return Ok(err_val);
-                                }
-                                return Err(RuntimeError::Error(
-                                    "runtime error in native method".into(),
-                                ));
-                            }
+                            native_error_check!(vm, fiber, 'fiber_loop);
                             if let Some(action) = vm.pending_fiber_action.take() {
                                 handle_fiber_action_bc(
                                     vm,
@@ -3255,6 +3302,7 @@ fn run_fiber_with_stop_depth(
                                     }
                                     _ => unreachable!(),
                                 };
+                                native_error_check!(vm, fiber, 'fiber_loop);
                                 set_reg(&mut values, dst, result);
                             }
                             Some(Method::Closure(closure_ptr)) => {
@@ -3375,6 +3423,7 @@ fn run_fiber_with_stop_depth(
                                 }
                                 _ => unreachable!(),
                             };
+                            native_error_check!(vm, fiber, 'fiber_loop);
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
@@ -3450,6 +3499,7 @@ fn run_fiber_with_stop_depth(
                                 }
                                 _ => unreachable!(),
                             };
+                            native_error_check!(vm, fiber, 'fiber_loop);
                             set_reg(&mut values, dst, result);
                         }
                         Some(Method::Closure(closure_ptr)) => {
@@ -5110,7 +5160,7 @@ fn try_operator_dispatch(
     dst: u16,
     module_name: &Rc<String>,
     caller_bc_ptr: *const BytecodeFunction,
-) -> Result<bool, RuntimeError> {
+) -> Result<Dispatch, RuntimeError> {
     let method_sym = vm.interner.intern(method_str);
     let class = vm.class_of(recv);
     // Check method cache first
@@ -5140,8 +5190,14 @@ fn try_operator_dispatch(
                 }
                 _ => unreachable!(),
             };
+            match take_native_error(vm, fiber) {
+                None => {}
+                Some(NativeError::Caught) => return Ok(Dispatch::Continue),
+                Some(NativeError::Finished(v)) => return Ok(Dispatch::Finished(v)),
+                Some(NativeError::Unwind(e)) => return Err(e),
+            }
             set_reg(values, dst, result);
-            Ok(false)
+            Ok(Dispatch::Value)
         }
         Some(Method::Closure(closure_ptr)) => {
             let mut arg_vals: SmallVec<[Value; 4]> = SmallVec::with_capacity(1 + args.len());
@@ -5162,13 +5218,22 @@ fn try_operator_dispatch(
                 caller_bc_ptr,
                 false, // no threaded — bytecode loop handles return
             )?;
-            Ok(true)
+            Ok(Dispatch::Continue)
         }
-        _ => Err(RuntimeError::Error(format!(
-            "{} does not implement '{}'",
-            vm.class_name_of(recv),
-            method_str
-        ))),
+        _ => {
+            let msg = format!("{} does not implement '{}'", vm.class_name_of(recv), method_str);
+            if !unsafe { (*fiber).is_try } {
+                return Err(RuntimeError::Error(msg));
+            }
+            let had_caller = unsafe { !(*fiber).caller.is_null() };
+            let err_val = unsafe { route_method_error_through_fiber_try(vm, fiber, msg) }
+                .expect("fiber is in try mode");
+            Ok(if had_caller {
+                Dispatch::Continue
+            } else {
+                Dispatch::Finished(err_val)
+            })
+        }
     }
 }
 
