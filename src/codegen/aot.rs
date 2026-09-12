@@ -1297,7 +1297,7 @@ fn mir_calls_any_tainted_named_method(
 /// Top-level fn: every Wren value is NaN-boxed as a `u64` —
 /// signature is `(arity × i64) -> i64`. The AOT lowering emits
 /// `GetModuleVar(slot)` / `SetModuleVar(slot, _)` as direct
-/// `global_value` + `load`/`store` against `modvars_symbol`,
+/// `symbol_value` + `load`/`store` against `modvars_symbol`,
 /// killing the runtime helper call entirely. The data symbol is
 /// declared up front so the lowering can resolve its `DataId`
 /// without reaching back into the driver.
@@ -1422,7 +1422,7 @@ fn emit_aot_function(
             return Err(AotError::Module(format!("[{}] {}", symbol, e)));
         }
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(module.target_config());
     }
 
     // Diagnostic: dump the cranelift IR for matching functions, even
@@ -3348,7 +3348,7 @@ fn emit_aot_bootstrap_main(
         // dlopen sees the right candidate dirs.
         for (path_id, path_len) in &search_path_ids {
             let gv = module.declare_data_in_func(*path_id, builder.func);
-            let addr = builder.ins().global_value(ptr_ty, gv);
+            let addr = builder.ins().symbol_value(ptr_ty, gv);
             let len = builder.ins().iconst(ptr_ty, *path_len as i64);
             let _ = builder
                 .ins()
@@ -3357,8 +3357,8 @@ fn emit_aot_bootstrap_main(
         for (name_id, name_len, payload_id, payload_len) in &native_lib_ids {
             let name_gv = module.declare_data_in_func(*name_id, builder.func);
             let payload_gv = module.declare_data_in_func(*payload_id, builder.func);
-            let name_addr = builder.ins().global_value(ptr_ty, name_gv);
-            let payload_addr = builder.ins().global_value(ptr_ty, payload_gv);
+            let name_addr = builder.ins().symbol_value(ptr_ty, name_gv);
+            let payload_addr = builder.ins().symbol_value(ptr_ty, payload_gv);
             let name_len_v = builder.ins().iconst(ptr_ty, *name_len as i64);
             let payload_len_v = builder.ins().iconst(ptr_ty, *payload_len as i64);
             let _ = builder.ins().call(
@@ -3373,10 +3373,10 @@ fn emit_aot_bootstrap_main(
             let symbols_gv = module.declare_data_in_func(m.symbols_id, builder.func);
             let name_gv = module.declare_data_in_func(m.name_id, builder.func);
 
-            let modvars_addr = builder.ins().global_value(ptr_ty, modvars_gv);
-            let consts_addr = builder.ins().global_value(ptr_ty, consts_gv);
-            let symbols_addr = builder.ins().global_value(ptr_ty, symbols_gv);
-            let name_addr = builder.ins().global_value(ptr_ty, name_gv);
+            let modvars_addr = builder.ins().symbol_value(ptr_ty, modvars_gv);
+            let consts_addr = builder.ins().symbol_value(ptr_ty, consts_gv);
+            let symbols_addr = builder.ins().symbol_value(ptr_ty, symbols_gv);
+            let name_addr = builder.ins().symbol_value(ptr_ty, name_gv);
 
             let modvars_count = builder.ins().iconst(ptr_ty, m.modvars_count as i64);
             let _ = builder
@@ -3401,7 +3401,7 @@ fn emit_aot_bootstrap_main(
 
             for (k, text_id) in m.const_text_ids.iter().enumerate() {
                 let text_gv = module.declare_data_in_func(*text_id, builder.func);
-                let text_addr = builder.ins().global_value(ptr_ty, text_gv);
+                let text_addr = builder.ins().symbol_value(ptr_ty, text_gv);
                 let len = builder.ins().iconst(ptr_ty, m.const_lens[k] as i64);
                 let alloc_call = builder.ins().call(alloc_const_ref, &[vm, text_addr, len]);
                 let str_val = builder.inst_results(alloc_call)[0];
@@ -3412,7 +3412,7 @@ fn emit_aot_bootstrap_main(
 
             for (k, name_id) in m.symbol_name_ids.iter().enumerate() {
                 let sym_name_gv = module.declare_data_in_func(*name_id, builder.func);
-                let sym_name_addr = builder.ins().global_value(ptr_ty, sym_name_gv);
+                let sym_name_addr = builder.ins().symbol_value(ptr_ty, sym_name_gv);
                 let len = builder.ins().iconst(ptr_ty, m.symbol_lens[k] as i64);
                 let intern_call = builder
                     .ins()
@@ -3428,12 +3428,12 @@ fn emit_aot_bootstrap_main(
             // index into `MakeClosure`, then loads the FuncId
             // from this slot table at run time.
             let closures_gv = module.declare_data_in_func(m.closures_data_id, builder.func);
-            let closures_addr = builder.ins().global_value(ptr_ty, closures_gv);
+            let closures_addr = builder.ins().symbol_value(ptr_ty, closures_gv);
             for (k, (body_id, arity, is_sm, name_id, name_len)) in m.closures.iter().enumerate() {
                 let body_ref = module.declare_func_in_func(*body_id, builder.func);
                 let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
                 let name_gv = module.declare_data_in_func(*name_id, builder.func);
-                let name_addr = builder.ins().global_value(ptr_ty, name_gv);
+                let name_addr = builder.ins().symbol_value(ptr_ty, name_gv);
                 let name_len_v = builder.ins().iconst(ptr_ty, *name_len as i64);
                 let func_id_val = if *is_sm {
                     let reg_call = builder.ins().call(
@@ -3468,10 +3468,10 @@ fn emit_aot_bootstrap_main(
                 let fn_addr = builder.ins().func_addr(ptr_ty, fn_ref);
                 let code_size_val = builder.ins().iconst(types::I32, *code_size as i64);
                 let sps_gv = module.declare_data_in_func(*sps_id, builder.func);
-                let sps_addr = builder.ins().global_value(ptr_ty, sps_gv);
+                let sps_addr = builder.ins().symbol_value(ptr_ty, sps_gv);
                 let sps_count_val = builder.ins().iconst(types::I32, *sps_count as i64);
                 let roots_gv = module.declare_data_in_func(*roots_id, builder.func);
-                let roots_addr = builder.ins().global_value(ptr_ty, roots_gv);
+                let roots_addr = builder.ins().symbol_value(ptr_ty, roots_gv);
                 let _ = builder.ins().call(
                     register_code_range_ref,
                     &[
@@ -3497,10 +3497,10 @@ fn emit_aot_bootstrap_main(
             // a populated parent slot in modvars.
             for (target_slot, mod_id, mod_len, var_id, var_len) in &m.runtime_imports {
                 let mod_gv = module.declare_data_in_func(*mod_id, builder.func);
-                let mod_addr = builder.ins().global_value(ptr_ty, mod_gv);
+                let mod_addr = builder.ins().symbol_value(ptr_ty, mod_gv);
                 let mod_len_v = builder.ins().iconst(ptr_ty, *mod_len as i64);
                 let var_gv = module.declare_data_in_func(*var_id, builder.func);
-                let var_addr = builder.ins().global_value(ptr_ty, var_gv);
+                let var_addr = builder.ins().symbol_value(ptr_ty, var_gv);
                 let var_len_v = builder.ins().iconst(ptr_ty, *var_len as i64);
                 let slot_v = builder.ins().iconst(ptr_ty, *target_slot as i64);
                 let _ = builder.ins().call(
@@ -3523,7 +3523,7 @@ fn emit_aot_bootstrap_main(
             // just pull each pointer across by slot.
             for (target_slot, src_id, source_slot) in &m.imports {
                 let src_gv = module.declare_data_in_func(*src_id, builder.func);
-                let src_addr = builder.ins().global_value(ptr_ty, src_gv);
+                let src_addr = builder.ins().symbol_value(ptr_ty, src_gv);
                 let val = builder.ins().load(
                     types::I64,
                     MemFlags::trusted(),
@@ -3558,7 +3558,7 @@ fn emit_aot_bootstrap_main(
                     class.methods.iter().enumerate()
                 {
                     let sig_gv = module.declare_data_in_func(*sig_id, builder.func);
-                    let sig_addr = builder.ins().global_value(ptr_ty, sig_gv);
+                    let sig_addr = builder.ins().symbol_value(ptr_ty, sig_gv);
                     let body_ref = module.declare_func_in_func(*body_id, builder.func);
                     let body_addr = builder.ins().func_addr(ptr_ty, body_ref);
 
@@ -3584,7 +3584,7 @@ fn emit_aot_bootstrap_main(
                 }
 
                 let class_name_gv = module.declare_data_in_func(class.name_id, builder.func);
-                let class_name_addr = builder.ins().global_value(ptr_ty, class_name_gv);
+                let class_name_addr = builder.ins().symbol_value(ptr_ty, class_name_gv);
                 let parent_slot_val = builder.ins().iconst(ptr_ty, class.parent_slot as i64);
                 let slot_val = builder.ins().iconst(ptr_ty, class.slot as i64);
                 let class_name_len = builder.ins().iconst(ptr_ty, class.name_len as i64);
@@ -3628,11 +3628,11 @@ fn emit_aot_bootstrap_main(
                         foreign.methods.iter().enumerate()
                     {
                         let sig_gv = module.declare_data_in_func(*sig_id, builder.func);
-                        let sig_addr = builder.ins().global_value(ptr_ty, sig_gv);
+                        let sig_addr = builder.ins().symbol_value(ptr_ty, sig_gv);
                         let sym_addr = match sym_opt {
                             Some(id) => {
                                 let sgv = module.declare_data_in_func(*id, builder.func);
-                                builder.ins().global_value(ptr_ty, sgv)
+                                builder.ins().symbol_value(ptr_ty, sgv)
                             }
                             None => builder.ins().iconst(ptr_ty, 0),
                         };
@@ -3658,7 +3658,7 @@ fn emit_aot_bootstrap_main(
                     }
 
                     let lib_gv = module.declare_data_in_func(foreign.lib_id, builder.func);
-                    let lib_addr = builder.ins().global_value(ptr_ty, lib_gv);
+                    let lib_addr = builder.ins().symbol_value(ptr_ty, lib_gv);
                     let lib_len_v = builder.ins().iconst(ptr_ty, foreign.lib_len as i64);
                     let f_count = builder.ins().iconst(ptr_ty, foreign.methods.len() as i64);
                     let _ = builder.ins().call(
@@ -3712,7 +3712,7 @@ fn emit_aot_bootstrap_main(
         builder.ins().return_(&[err_val]);
 
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(module.target_config());
     }
 
     module

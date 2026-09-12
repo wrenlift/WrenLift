@@ -278,7 +278,7 @@ pub mod cl {
         let method_val = if let Some(cfg) = aot_config {
             let slot = aot_intern_symbol(cfg, method.index(), interner);
             let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-            let base = builder.ins().global_value(types::I64, gv);
+            let base = builder.ins().symbol_value(types::I64, gv);
             builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
@@ -1128,7 +1128,7 @@ pub mod cl {
                     None, // and no method dispatch — nothing for CHA
                 )?;
                 builder.seal_all_blocks();
-                builder.finalize();
+                builder.finalize(module.target_config());
             }
             if std::env::var_os("WLIFT_CL_IR").is_some() {
                 eprintln!("=== Cranelift IR (inner f64) for {} ===", safe_name);
@@ -1194,7 +1194,7 @@ pub mod cl {
                     .bitcast(types::I64, MemFlags::new(), f64_result);
                 builder.ins().return_(&[i64_result]);
                 builder.seal_all_blocks();
-                builder.finalize();
+                builder.finalize(module.target_config());
             }
             if std::env::var_os("WLIFT_CL_IR").is_some() {
                 eprintln!("=== Cranelift IR (wrapper) for {} ===", safe_name);
@@ -1241,7 +1241,7 @@ pub mod cl {
             )?;
 
             builder.seal_all_blocks();
-            builder.finalize();
+            builder.finalize(module.target_config());
         }
 
         // Dump Cranelift IR if requested
@@ -1463,7 +1463,7 @@ pub mod cl {
                 );
                 if result.is_ok() {
                     builder.seal_all_blocks();
-                    builder.finalize();
+                    builder.finalize(module.target_config());
                 }
                 result
             };
@@ -1904,7 +1904,7 @@ pub mod cl {
         /// `cranelift_module::DataId` for this module's per-module
         /// var array (`wlift_modvars_<n>`). The lowering replaces
         /// `wren_get_module_var(slot)` / `wren_set_module_var(slot,
-        /// val)` with a `global_value` + load/store at offset
+        /// val)` with a `symbol_value` + load/store at offset
         /// `slot * 8`, killing both helper calls and the TLS read.
         pub modvars_data: cranelift_module::DataId,
 
@@ -2687,7 +2687,7 @@ pub mod cl {
                     .ins()
                     .call(trace_load_fn, &[fiber, zero, recv_id, recv_v]);
                 let symbols_gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-                let symbols_addr = builder.ins().global_value(types::I64, symbols_gv);
+                let symbols_addr = builder.ins().symbol_value(types::I64, symbols_gv);
                 let sym_slot = aot_intern_symbol(cfg, method_sym.index(), interner);
                 let sym_v = builder.ins().load(
                     types::I64,
@@ -3774,7 +3774,7 @@ pub mod cl {
             // AOT mode: each module owns a `wlift_modvars_<n>`
             // data symbol — a `[u64; var_count]` in `.bss` —
             // declared by the AOT driver and threaded through
-            // here as a `DataId`. Get/Set become a `global_value`
+            // here as a `DataId`. Get/Set become a `symbol_value`
             // load + offset, killing the runtime helper entirely.
             //
             // JIT mode keeps the `wren_get/set_module_var` dispatch
@@ -3783,7 +3783,7 @@ pub mod cl {
             Instruction::GetModuleVar(idx) => {
                 if let Some(cfg) = aot_config {
                     let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     let result = builder.ins().load(
                         types::I64,
                         MemFlags::trusted(),
@@ -3801,7 +3801,7 @@ pub mod cl {
             Instruction::SetModuleVar(idx, val) => {
                 if let Some(cfg) = aot_config {
                     let gv = module.declare_data_in_func(cfg.modvars_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     let store_val = get(val);
                     builder
                         .ins()
@@ -3839,7 +3839,7 @@ pub mod cl {
                     let method_val = if let Some(cfg) = aot_config {
                         let slot = aot_intern_symbol(cfg, method.index(), interner);
                         let sym_gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-                        let sym_base = builder.ins().global_value(types::I64, sym_gv);
+                        let sym_base = builder.ins().symbol_value(types::I64, sym_gv);
                         builder.ins().load(
                             types::I64,
                             MemFlags::trusted(),
@@ -3858,7 +3858,7 @@ pub mod cl {
                         ));
                     for (i, a) in args.iter().enumerate() {
                         let v = get(a);
-                        builder.ins().stack_store(v, stack_slot, (i * 8) as i32);
+                        builder.ins().stack_store(types::I64, v, stack_slot, (i * 8) as i32);
                     }
                     let buf = builder.ins().stack_addr(types::I64, stack_slot, 0);
                     let count = builder.ins().iconst(types::I64, args.len() as i64);
@@ -3981,7 +3981,7 @@ pub mod cl {
                                         .map_err(|e| e.to_string())?;
                                     let gv =
                                         module.declare_data_in_func(class_data_id, builder.func);
-                                    let modvars_addr = builder.ins().global_value(types::I64, gv);
+                                    let modvars_addr = builder.ins().symbol_value(types::I64, gv);
                                     let boxed_cls = builder.ins().load(
                                         types::I64,
                                         MemFlags::trusted(),
@@ -4084,7 +4084,7 @@ pub mod cl {
                                 let slot = aot_intern_symbol(cfg, method.index(), interner);
                                 let sym_gv =
                                     module.declare_data_in_func(cfg.symbols_data, builder.func);
-                                let sym_base = builder.ins().global_value(types::I64, sym_gv);
+                                let sym_base = builder.ins().symbol_value(types::I64, sym_gv);
                                 let method_val = builder.ins().load(
                                     types::I64,
                                     MemFlags::trusted(),
@@ -4439,7 +4439,7 @@ pub mod cl {
                 let method_val = if let Some(cfg) = aot_config {
                     let slot = aot_intern_symbol(cfg, method.index(), interner);
                     let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     builder
                         .ins()
                         .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
@@ -4522,7 +4522,7 @@ pub mod cl {
                 if let Some(cfg) = aot_config {
                     let slot = aot_intern_symbol(cfg, method.index(), interner);
                     let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     let method_val = builder.ins().load(
                         types::I64,
                         MemFlags::trusted(),
@@ -4943,7 +4943,7 @@ pub mod cl {
                 let method_val = if let Some(cfg) = aot_config {
                     let slot = aot_intern_symbol(cfg, method.index(), interner);
                     let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     builder
                         .ins()
                         .load(types::I64, MemFlags::trusted(), base, (slot as i32) * 8)
@@ -5182,7 +5182,7 @@ pub mod cl {
                             .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
                             .map_err(|e| e.to_string())?;
                         let gv = module.declare_data_in_func(class_data_id, builder.func);
-                        let modvars_addr = builder.ins().global_value(types::I64, gv);
+                        let modvars_addr = builder.ins().symbol_value(types::I64, gv);
                         let class_bits = builder.ins().load(
                             types::I64,
                             MemFlags::trusted(),
@@ -5207,7 +5207,7 @@ pub mod cl {
                             .declare_data(&defining.modvars_symbol, Linkage::Export, true, false)
                             .map_err(|e| e.to_string())?;
                         let gv = module.declare_data_in_func(class_data_id, builder.func);
-                        let modvars_addr = builder.ins().global_value(types::I64, gv);
+                        let modvars_addr = builder.ins().symbol_value(types::I64, gv);
                         let class_bits = builder.ins().load(
                             types::I64,
                             MemFlags::trusted(),
@@ -5240,7 +5240,7 @@ pub mod cl {
                 let n = upvalues.len();
                 let fn_id_val = if let Some(cfg) = aot_config {
                     let gv = module.declare_data_in_func(cfg.closures_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     builder
                         .ins()
                         .load(types::I64, MemFlags::trusted(), base, (*fn_id as i32) * 8)
@@ -5283,7 +5283,7 @@ pub mod cl {
                         ));
                     for (i, uv) in upvalues.iter().enumerate() {
                         let v = get(uv);
-                        builder.ins().stack_store(v, slot, (i * 8) as i32);
+                        builder.ins().stack_store(types::I64, v, slot, (i * 8) as i32);
                     }
                     let buf = builder.ins().stack_addr(types::I64, slot, 0);
                     let count = builder.ins().iconst(types::I64, n as i64);
@@ -5334,7 +5334,7 @@ pub mod cl {
                 // 1. Receiver must be an object-kind NaN-boxed
                 //    value. Object values have their top 16 bits
                 //    equal to 0xFFFC (QNAN | sign bit).
-                let shr48 = builder.ins().ushr_imm(r, 48);
+                let shr48 = builder.ins().ushr_imm_u(r, 48);
                 let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
                 let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
                 builder
@@ -5512,7 +5512,7 @@ pub mod cl {
                 );
 
                 builder.switch_to_block(simd_get_f32_block);
-                let simd_data_base = builder.ins().iadd_imm(obj_ptr, SIMD_LANES as i64);
+                let simd_data_base = builder.ins().iadd_imm_u(obj_ptr, SIMD_LANES as i64);
                 let four_simd_f32 = builder.ins().iconst(types::I64, 4);
                 let simd_f32_offset = builder.ins().imul(simd_idx_i, four_simd_f32);
                 let simd_f32_addr = builder.ins().iadd(simd_data_base, simd_f32_offset);
@@ -5530,7 +5530,7 @@ pub mod cl {
                     .jump(merge_block, &[BlockArg::Value(simd_f32_bits)]);
 
                 builder.switch_to_block(simd_get_i32_block);
-                let simd_data_base = builder.ins().iadd_imm(obj_ptr, SIMD_LANES as i64);
+                let simd_data_base = builder.ins().iadd_imm_u(obj_ptr, SIMD_LANES as i64);
                 let four_simd_i32 = builder.ins().iconst(types::I64, 4);
                 let simd_i32_offset = builder.ins().imul(simd_idx_i, four_simd_i32);
                 let simd_i32_addr = builder.ins().iadd(simd_data_base, simd_i32_offset);
@@ -5596,7 +5596,7 @@ pub mod cl {
                 builder.append_block_param(merge_block, types::I64);
 
                 // 1. Receiver must be an object (NaN-boxed pointer).
-                let shr48 = builder.ins().ushr_imm(r, 48);
+                let shr48 = builder.ins().ushr_imm_u(r, 48);
                 let obj_tag = builder.ins().iconst(types::I64, 0xFFFC);
                 let is_obj = builder.ins().icmp(IntCC::Equal, shr48, obj_tag);
                 builder
@@ -5957,7 +5957,7 @@ pub mod cl {
                         }
                     };
                     let gv = module.declare_data_in_func(cfg.consts_data, builder.func);
-                    let base = builder.ins().global_value(types::I64, gv);
+                    let base = builder.ins().symbol_value(types::I64, gv);
                     let result = builder.ins().load(
                         types::I64,
                         MemFlags::trusted(),
@@ -5991,7 +5991,7 @@ pub mod cl {
                         })?;
                         let slot = aot_intern_symbol(cfg, _mir.name.index(), interner);
                         let gv = module.declare_data_in_func(cfg.symbols_data, builder.func);
-                        let base = builder.ins().global_value(types::I64, gv);
+                        let base = builder.ins().symbol_value(types::I64, gv);
                         let method_val = builder.ins().load(
                             types::I64,
                             MemFlags::trusted(),

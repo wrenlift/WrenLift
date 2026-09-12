@@ -161,7 +161,7 @@ zstd = { version = "0.13", optional = true }
 rand = { version = "0.9", optional = true }
 rand_core = { version = "0.6", features = ["std"], optional = true }
 ureq = { version = "2", features = ["tls"], optional = true }
-cranelift-codegen = { version = "0.133", optional = true }
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
 # Host-only allocator override. mimalloc replaces the system
 # malloc as Rust's `#[global_allocator]` (declared in `lib.rs`),
 # yielding a tighter peak-RSS profile than glibc's per-thread
@@ -177,13 +177,13 @@ mimalloc = { version = "0.1", default-features = false, optional = true }
 # see on Fly's debian-trixie x86_64). Gated behind the `jemalloc`
 # feature so wasm / non-host builds don't try to link the C bits.
 tikv-jemallocator = { version = "0.6", default-features = false, optional = true }
-cranelift-frontend = { version = "0.133", optional = true }
-cranelift-module = { version = "0.133", optional = true }
-cranelift-jit = { version = "0.133", optional = true }
-cranelift-native = { version = "0.133", optional = true }
-# AOT object emission — pinned to the same 0.130 series as the
-# rest of cranelift so the `Module` trait impls stay ABI-aligned.
-cranelift-object = { version = "0.133", optional = true }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
+# AOT object emission — same wasmtime rev as the rest of cranelift
+# so the `Module` trait impls stay ABI-aligned.
+cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", rev = "bc2f967927f9f0e839095a752bf554c4a09fdd13", optional = true }
 # `target-lexicon` is a transitive of cranelift-codegen, but the
 # AOT entry point parses target triples at the top of the build
 # pipeline so we depend on it directly behind the `aot` feature.
@@ -261,24 +261,7 @@ object = { version = "0.36", default-features = false, features = ["read"] }
 [profile.release]
 strip = "none"
 
-# Pin Cranelift to upstream wasmtime `main` so the build picks up:
-#
-#   * `decb45f` ("cranelift: include every SSA value bound to a
-#     variable in stack maps") — fixes earlier-def drops in
-#     re-defined Variables, closes a class of AOT stack-map gaps;
-#   * the `cranelift-object: emit PLATFORM_MACOS for Darwin
-#     triples on macOS hosts` patch — fixes ld64 rejecting
-#     PLATFORM_UNKNOWN object files when emitting on macOS.
-#
-# Both have been merged upstream; the git pin holds until the next
-# crates.io release ships them. Upstream main is Cranelift 0.133
-# vs the 0.130 we'd otherwise resolve to, so AOT codegen also
-# absorbs the API drift (`MemFlags` → `MemFlagsData` rename).
-# Remove this block to fall back to crates.io once the release lands.
-[patch.crates-io]
-cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-jit = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-native = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
-cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+# Cranelift is pinned to one wasmtime git rev, the same rev beadie-cranelift
+# and Ash pin, so exactly one cranelift lands in a graph that also carries
+# beadie. Declared as git deps rather than a [patch] because the rev's
+# version is a `-dev` pre-release that no crates.io requirement can match.
