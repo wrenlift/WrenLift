@@ -818,6 +818,13 @@ pub struct MirFunction {
     /// Compile-time only.
     #[serde(skip)]
     pub scalar_param_sources: std::collections::HashMap<ValueId, (ValueId, u16)>,
+    /// Loop headers the interpreter never transfers into: headers of
+    /// generic loop copies the inliner made, and headers whose loop had
+    /// no inline-cache data at compile time (the interpreter keeps
+    /// running those to warm them up). No OSR entry is compiled for them.
+    /// Compile-time only.
+    #[serde(skip)]
+    pub osr_excluded: std::collections::HashSet<BlockId>,
 }
 
 impl MirFunction {
@@ -832,6 +839,7 @@ impl MirFunction {
             span_map: std::collections::HashMap::new(),
             speculated_num_params: Vec::new(),
             scalar_param_sources: std::collections::HashMap::new(),
+            osr_excluded: std::collections::HashSet::new(),
         }
     }
 
@@ -974,6 +982,35 @@ impl MirFunction {
     }
 
     /// Populate predecessor lists from terminator edges.
+    /// Drop empty, unreachable blocks at the end of the block list, such
+    /// as the block the builder opens after an explicit `return`. Only
+    /// trailing blocks go, so no block id changes.
+    pub fn trim_dead_tail(&mut self) {
+        loop {
+            let n = self.blocks.len();
+            if n <= 1 {
+                return;
+            }
+            let last = &self.blocks[n - 1];
+            let dead = last.instructions.is_empty()
+                && last.params.is_empty()
+                && matches!(last.terminator, Terminator::Unreachable);
+            if !dead {
+                return;
+            }
+            let id = last.id;
+            let referenced = self
+                .blocks
+                .iter()
+                .any(|b| b.terminator.successors().contains(&id));
+            if referenced {
+                return;
+            }
+            self.blocks.pop();
+            self.next_block = self.blocks.len() as u32;
+        }
+    }
+
     pub fn compute_predecessors(&mut self) {
         // Clear existing.
         for block in &mut self.blocks {
@@ -1085,57 +1122,111 @@ pub fn osr_rematerializable_defs(
 /// Values used by a loop/header region but defined outside it, excluding
 /// constants that can be rematerialized. The order is deterministic and is
 /// part of the bytecode-to-native OSR ABI.
+/// Live-in value sets per block, one bit per value id.
+pub struct LiveSets {
+    words: usize,
+    bits: Vec<u64>,
+}
+
+impl LiveSets {
+    /// Whether `v` is live on entry to block `b`.
+    pub fn contains(&self, b: usize, v: ValueId) -> bool {
+        let i = v.0 as usize;
+        i / 64 < self.words && self.bits[b * self.words + i / 64] >> (i % 64) & 1 == 1
+    }
+
+    /// The values live on entry to block `b`, ascending.
+    pub fn iter(&self, b: usize) -> impl Iterator<Item = ValueId> + '_ {
+        let row = &self.bits[b * self.words..(b + 1) * self.words];
+        row.iter().enumerate().flat_map(|(w, &word)| {
+            let mut bits = word;
+            std::iter::from_fn(move || {
+                if bits == 0 {
+                    return None;
+                }
+                let tz = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                Some(ValueId((w * 64 + tz) as u32))
+            })
+        })
+    }
+}
+
 /// Classic backward liveness: the values live on entry to each block.
-pub fn live_in_sets(func: &MirFunction) -> Vec<HashSet<ValueId>> {
+pub fn live_in_sets(func: &MirFunction) -> LiveSets {
     let n = func.blocks.len();
-    let mut gens: Vec<HashSet<ValueId>> = Vec::with_capacity(n);
-    let mut defs: Vec<HashSet<ValueId>> = Vec::with_capacity(n);
-    for block in &func.blocks {
-        let mut d = HashSet::new();
-        let mut g = HashSet::new();
+    let max_value = func
+        .blocks
+        .iter()
+        .flat_map(|b| {
+            b.params
+                .iter()
+                .map(|(v, _)| v.0)
+                .chain(b.instructions.iter().map(|(v, _)| v.0))
+                .chain(b.used_values().into_iter().map(|v| v.0))
+        })
+        .max()
+        .map(|m| m as usize + 1)
+        .unwrap_or(0)
+        .max(func.next_value as usize);
+    let words = max_value.div_ceil(64).max(1);
+    let mut gens = vec![0u64; n * words];
+    let mut defs = vec![0u64; n * words];
+    let set = |bits: &mut [u64], v: ValueId| {
+        let i = v.0 as usize;
+        bits[i / 64] |= 1 << (i % 64);
+    };
+    let has = |bits: &[u64], v: ValueId| {
+        let i = v.0 as usize;
+        bits[i / 64] >> (i % 64) & 1 == 1
+    };
+    for (b, block) in func.blocks.iter().enumerate() {
+        let d = &mut defs[b * words..(b + 1) * words];
+        let mut g = vec![0u64; words];
         for &(param, _) in &block.params {
-            d.insert(param);
+            set(d, param);
         }
         for &(dst, ref inst) in &block.instructions {
             for op in inst.operands() {
-                if !d.contains(&op) {
-                    g.insert(op);
+                if !has(d, op) {
+                    set(&mut g, op);
                 }
             }
-            d.insert(dst);
+            set(d, dst);
         }
         for op in block.terminator.operands() {
-            if !d.contains(&op) {
-                g.insert(op);
+            if !has(d, op) {
+                set(&mut g, op);
             }
         }
-        gens.push(g);
-        defs.push(d);
+        gens[b * words..(b + 1) * words].copy_from_slice(&g);
     }
-    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut live = gens.clone();
+    let mut out = vec![0u64; words];
     let mut changed = true;
     while changed {
         changed = false;
         for b in (0..n).rev() {
-            let mut out: HashSet<ValueId> = HashSet::new();
+            out.iter_mut().for_each(|w| *w = 0);
             for succ in func.blocks[b].terminator.successors() {
-                if let Some(li) = live_in.get(succ.0 as usize) {
-                    out.extend(li.iter().copied());
+                let s = succ.0 as usize;
+                if s < n {
+                    for w in 0..words {
+                        out[w] |= live[s * words + w];
+                    }
                 }
             }
-            let mut inn = gens[b].clone();
-            for v in out {
-                if !defs[b].contains(&v) {
-                    inn.insert(v);
+            for w in 0..words {
+                let idx = b * words + w;
+                let next = gens[idx] | (out[w] & !defs[idx]);
+                if next != live[idx] {
+                    live[idx] = next;
+                    changed = true;
                 }
-            }
-            if inn != live_in[b] {
-                live_in[b] = inn;
-                changed = true;
             }
         }
     }
-    live_in
+    LiveSets { words, bits: live }
 }
 
 pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<ValueId> {
@@ -1150,13 +1241,10 @@ pub fn osr_external_live_values(func: &MirFunction, target: BlockId) -> Vec<Valu
     };
     let rematerializable = osr_rematerializable_defs(func, target);
     let params: HashSet<ValueId> = target_block.params.iter().map(|&(p, _)| p).collect();
-    let mut live: Vec<ValueId> = live_in[target.0 as usize]
-        .iter()
-        .copied()
+    live_in
+        .iter(target.0 as usize)
         .filter(|v| !params.contains(v) && !rematerializable.contains_key(v))
-        .collect();
-    live.sort_by_key(|v| v.0);
-    live
+        .collect()
 }
 
 /// Set of block indices reachable via successor edges from `start`.

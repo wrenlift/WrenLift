@@ -970,6 +970,28 @@ pub mod cl {
         JIT_MODVARS_CELL.with(|c| c.set(addr));
     }
 
+    thread_local! {
+        /// Loop headers of the compiling function whose call sites had no
+        /// inline-cache data; OSR-entered code leaves such a loop after a
+        /// few hundred iterations so the interpreter can warm it up.
+        static JIT_COLD_HEADERS: std::cell::RefCell<HashMap<BlockId, Vec<ValueId>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+
+    /// Set the cold loop headers for this thread's next compile, each with
+    /// the registers the interpreter needs to resume at it.
+    pub fn set_jit_cold_headers(headers: HashMap<BlockId, Vec<ValueId>>) {
+        JIT_COLD_HEADERS.with(|c| *c.borrow_mut() = headers);
+    }
+
+    fn jit_cold_headers() -> HashMap<BlockId, Vec<ValueId>> {
+        JIT_COLD_HEADERS.with(|c| c.borrow().clone())
+    }
+
+    /// Iterations of a cold loop before its compiled code hands back to the
+    /// interpreter.
+    const COLD_LOOP_EXIT_AFTER: i64 = 256;
+
     fn jit_modvars_cell() -> usize {
         JIT_MODVARS_CELL.with(|c| c.get())
     }
@@ -1557,6 +1579,14 @@ pub mod cl {
                 }
                 continue;
             }
+            if std::env::var_os("WLIFT_CL_IR").is_some() {
+                eprintln!(
+                    "=== Cranelift IR for {} osr bb{} ===",
+                    safe_name, target_block.0
+                );
+                eprintln!("{}", func.display());
+                eprintln!("=== end ===");
+            }
             let mut ctx = Context::for_function(func);
             if let Err(error) = module.define_function(func_id, &mut ctx) {
                 if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
@@ -1631,12 +1661,39 @@ pub mod cl {
         defs
     }
 
+    /// Loop headers of the function: targets of edges whose source they
+    /// dominate. Block ids are no guide once passes append blocks out of
+    /// order, so this uses dominators.
     fn collect_osr_targets(mir: &MirFunction) -> Vec<BlockId> {
+        use crate::mir::opt::licm::{compute_dominators, compute_rpo};
+        let mut with_preds = mir.clone();
+        with_preds.compute_predecessors();
+        let rpo = compute_rpo(&with_preds);
+        let idom = compute_dominators(&with_preds, &rpo);
+        let dominates = |a: usize, b: usize| {
+            let mut cur = b;
+            loop {
+                if cur == a {
+                    return true;
+                }
+                let next = idom[cur];
+                if next == usize::MAX || next == cur {
+                    return false;
+                }
+                cur = next;
+            }
+        };
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         for block in &mir.blocks {
+            if idom[block.id.0 as usize] == usize::MAX && block.id.0 != 0 {
+                continue;
+            }
             for target in block.terminator.successors() {
-                if target.0 <= block.id.0 && seen.insert(target) {
+                if dominates(target.0 as usize, block.id.0 as usize)
+                    && !mir.osr_excluded.contains(&target)
+                    && seen.insert(target)
+                {
                     targets.push(target);
                 }
             }
@@ -2388,10 +2445,59 @@ pub mod cl {
             }
         }
 
+        // Cold loop headers get an iteration counter and a buffer for
+        // their live-ins; only OSR-entered code can hand a loop back to
+        // the interpreter, because only then does a frame exist to resume.
+        let mut cold_exits: HashMap<
+            BlockId,
+            (
+                cranelift_codegen::ir::StackSlot,
+                cranelift_codegen::ir::StackSlot,
+                Vec<ValueId>,
+            ),
+        > = HashMap::new();
+        if osr_entry.is_some() {
+            for (header, live) in jit_cold_headers() {
+                if header.0 as usize >= mir.blocks.len() {
+                    continue;
+                }
+                // A split parameter lives in the interpreter as an object
+                // field; leave such loops alone.
+                if live
+                    .iter()
+                    .any(|v| mir.scalar_param_sources.contains_key(v))
+                {
+                    continue;
+                }
+                let counter =
+                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ));
+                let buf =
+                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (live.len().max(1) * 16) as u32,
+                        3,
+                    ));
+                cold_exits.insert(header, (counter, buf, live));
+            }
+        }
+        let exit_value_types = if cold_exits.is_empty() {
+            Vec::new()
+        } else {
+            infer_osr_value_types(mir)
+        };
+
         if let Some(ref layout) = osr_entry {
             let osr_entry = builder.create_block();
             builder.switch_to_block(osr_entry);
             let args_ptr = builder.append_block_param(osr_entry, types::I64);
+            for (counter, _, _) in cold_exits.values() {
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.ins().stack_store(types::I64, zero, *counter, 0);
+            }
             let mut slot = 0i32;
             for vid in &layout.external_args {
                 let v = builder.ins().load(
@@ -3029,6 +3135,62 @@ pub mod cl {
             for (vid, var) in &osr_vars {
                 let v = builder.use_var(*var);
                 val_map.insert(*vid, v);
+            }
+
+            // Cold loop: count iterations and hand the loop back to the
+            // interpreter once it proves hot, with the header's live-ins.
+            // Every register the interpreter needs must still exist in the
+            // compiled code; a header that lost one gets no exit.
+            if let Some((counter, buf, live)) = cold_exits
+                .get(&bid)
+                .filter(|(_, _, live)| live.iter().all(|v| val_map.contains_key(v)))
+            {
+                let c = builder
+                    .ins()
+                    .stack_load(types::I64, types::I64, *counter, 0);
+                let one = builder.ins().iconst(types::I64, 1);
+                let c1 = builder.ins().iadd(c, one);
+                builder.ins().stack_store(types::I64, c1, *counter, 0);
+                let limit = builder.ins().iconst(types::I64, COLD_LOOP_EXIT_AFTER);
+                let hot = builder.ins().icmp(IntCC::SignedGreaterThan, c1, limit);
+                let exit_block = builder.create_block();
+                let cont_block = builder.create_block();
+                builder.set_cold_block(exit_block);
+                builder.ins().brif(hot, exit_block, &[], cont_block, &[]);
+                builder.switch_to_block(exit_block);
+                for (i, vid) in live.iter().enumerate() {
+                    let Some(&v) = val_map.get(vid) else {
+                        return Err(format!("cold exit live-in {:?} undefined", vid));
+                    };
+                    let boxed = match exit_value_types.get(vid.0 as usize) {
+                        Some(MirType::F64) => builder.ins().bitcast(types::I64, MemFlags::new(), v),
+                        Some(MirType::I64) => {
+                            let f = builder.ins().fcvt_from_sint(types::F64, v);
+                            builder.ins().bitcast(types::I64, MemFlags::new(), f)
+                        }
+                        Some(MirType::Bool) if raw_bools.contains(vid) => {
+                            let t = builder.ins().iconst(types::I64, TAG_TRUE as i64);
+                            let f = builder.ins().iconst(types::I64, TAG_FALSE as i64);
+                            builder.ins().select(v, t, f)
+                        }
+                        _ => v,
+                    };
+                    let reg = builder.ins().iconst(types::I64, vid.0 as i64);
+                    builder
+                        .ins()
+                        .stack_store(types::I64, reg, *buf, (i * 16) as i32);
+                    builder
+                        .ins()
+                        .stack_store(types::I64, boxed, *buf, (i * 16 + 8) as i32);
+                }
+                let buf_ptr = builder.ins().stack_addr(types::I64, *buf, 0);
+                let header_id = builder.ins().iconst(types::I64, bid.0 as i64);
+                let n = builder.ins().iconst(types::I64, live.len() as i64);
+                let exit_fn = get_runtime_fn(module, builder, "wren_osr_exit", 3)?;
+                let call = builder.ins().call(exit_fn, &[header_id, buf_ptr, n]);
+                let sentinel = builder.inst_results(call)[0];
+                builder.ins().return_(&[sentinel]);
+                builder.switch_to_block(cont_block);
             }
 
             // For the entry block (first in RPO = bb0), map BlockParam

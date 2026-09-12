@@ -403,11 +403,9 @@ pub unsafe fn call_jit_with_shadow_st(
 ) -> u64 {
     let ctx = unsafe { &mut (*j).ctx };
     let callee_module = vm.engine.func_module(func_id);
+    let (mv_ptr, mv_count) = vm.engine.module_vars_for(func_id);
     let same_module = match callee_module {
-        Some(mn) => {
-            let bytes = mn.as_bytes();
-            bytes.as_ptr() == ctx.module_name && bytes.len() as u32 == ctx.module_name_len
-        }
+        Some(_) => mv_ptr.is_null() || mv_ptr == ctx.module_vars,
         None => true,
     };
     if same_module {
@@ -416,14 +414,12 @@ pub unsafe fn call_jit_with_shadow_st(
     // Cross-module call: swap context.
     let mod_name = callee_module.unwrap();
     let saved_ctx = *ctx;
-    if let Some(m) = vm.engine.modules.get(mod_name.as_str()) {
-        let bytes = mod_name.as_bytes();
-        ctx.module_vars = m.vars.as_ptr() as *mut u64;
-        ctx.module_var_count = m.vars.len() as u32;
-        ctx.module_name = bytes.as_ptr();
-        ctx.module_name_len = bytes.len() as u32;
-        ctx.current_func_id = func_id.0 as u64;
-    }
+    let bytes = mod_name.as_bytes();
+    ctx.module_vars = mv_ptr;
+    ctx.module_var_count = mv_count;
+    ctx.module_name = bytes.as_ptr();
+    ctx.module_name_len = bytes.len() as u32;
+    ctx.current_func_id = func_id.0 as u64;
     let result = unsafe { call_jit_cached_st(ctx, fn_ptr, args) };
     *unsafe { &mut (*j).ctx } = saved_ctx;
     result
@@ -1284,6 +1280,34 @@ thread_local! {
 #[inline(always)]
 pub fn jit_state() -> *mut JitThread {
     JIT.with(|j| j.get())
+}
+
+thread_local! {
+    /// The loop header a compiled body left through an OSR exit, with
+    /// (register, value) pairs the interpreter restores before resuming.
+    static OSR_EXIT: std::cell::RefCell<Option<(u32, Vec<(u32, Value)>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Compiled code leaving a cold loop: `buf` holds `n` (register, value)
+/// pairs of the header's live-ins. Returns the internal undefined
+/// sentinel the OSR caller checks for.
+#[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
+pub extern "C" fn wren_osr_exit(header: u64, buf: *const u64, n: u64) -> u64 {
+    let vals: Vec<(u32, Value)> = (0..n as usize)
+        .map(|i| unsafe {
+            (
+                *buf.add(2 * i) as u32,
+                Value::from_bits(*buf.add(2 * i + 1)),
+            )
+        })
+        .collect();
+    OSR_EXIT.with(|e| *e.borrow_mut() = Some((header as u32, vals)));
+    Value::UNDEFINED.to_bits()
+}
+
+/// Take the pending OSR exit record, if a compiled body just left one.
+pub fn take_osr_exit() -> Option<(u32, Vec<(u32, Value)>)> {
+    OSR_EXIT.with(|e| e.borrow_mut().take())
 }
 
 #[inline(always)]
@@ -2222,19 +2246,15 @@ pub fn call_closure_jit_or_sync(
             .unwrap_or(std::ptr::null_mut());
     });
     if let Some(mn) = callee_module.as_ref() {
-        let bytes = mn.as_bytes();
-        let cur = read_jit_ctx();
-        let same = bytes.as_ptr() == cur.module_name && bytes.len() as u32 == cur.module_name_len;
-        if !same {
-            if let Some(m) = vm.engine.modules.get(mn.as_str()) {
-                let bytes = mn.as_bytes();
-                mutate_jit_ctx(|ctx| {
-                    ctx.module_vars = m.vars.as_ptr() as *mut u64;
-                    ctx.module_var_count = m.vars.len() as u32;
-                    ctx.module_name = bytes.as_ptr();
-                    ctx.module_name_len = bytes.len() as u32;
-                });
-            }
+        let (mv_ptr, mv_count) = vm.engine.module_vars_for(callee_func_id);
+        if !mv_ptr.is_null() {
+            let bytes = mn.as_bytes();
+            mutate_jit_ctx(|ctx| {
+                ctx.module_vars = mv_ptr;
+                ctx.module_var_count = mv_count;
+                ctx.module_name = bytes.as_ptr();
+                ctx.module_name_len = bytes.len() as u32;
+            });
         }
     }
 
@@ -5985,6 +6005,7 @@ pub fn resolve(name: &str) -> Option<usize> {
         "wren_make_closure_n" => Some(wren_make_closure_n as *const () as usize),
         // Strings
         "wren_string_concat" => Some(wren_string_concat as *const () as usize),
+        "wren_osr_exit" => Some(wren_osr_exit as *const () as usize),
         "wren_to_string" => Some(wren_to_string as *const () as usize),
         "wren_const_string" => Some(wren_const_string as *const () as usize),
         // Type checks & guards

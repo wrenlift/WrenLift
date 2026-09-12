@@ -443,6 +443,10 @@ enum OsrTransfer {
     NotEntered,
     ContinueFiberLoop,
     Return(Value),
+    /// The compiled body left a cold loop; the frame's registers hold
+    /// that loop header's live-ins and interpretation resumes at this
+    /// bytecode offset.
+    ContinueAt(u32),
 }
 
 #[allow(clippy::too_many_arguments)] // OSR transfer needs every piece of the live frame context.
@@ -477,6 +481,10 @@ fn try_enter_loop_osr(
         return Ok(OsrTransfer::NotEntered);
     };
     let Some(entry) = vm.engine.active_osr_entry(func_id, point.target_block) else {
+        // A loop compiled cold has no entry; once it proves hot here, ask
+        // for the next tier so its caches make it into the code.
+        vm.engine
+            .osr_entry_is_cold(func_id, point.target_block, &vm.interner);
         if env_osr_trace() {
             eprintln!(
                 "osr-trace: no entry FuncId({}) bb{}",
@@ -485,6 +493,20 @@ fn try_enter_loop_osr(
         }
         return Ok(OsrTransfer::NotEntered);
     };
+    // Code compiled before this loop ever ran has generic call sites;
+    // keep interpreting so the caches fill and a recompile can use them.
+    if vm
+        .engine
+        .osr_entry_is_cold(func_id, point.target_block, &vm.interner)
+    {
+        if env_osr_trace() {
+            eprintln!(
+                "osr-trace: cold entry FuncId({}) bb{}, interpreting",
+                func_id.0, point.target_block.0
+            );
+        }
+        return Ok(OsrTransfer::NotEntered);
+    }
     // The entry names its live-ins by register; a register the
     // interpreter never defined means the compiled body's value set
     // drifted from the bytecode's, so decline rather than guess.
@@ -620,7 +642,8 @@ fn try_enter_loop_osr(
             .map(|mir| vm.interner.resolve(mir.name).to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
         eprintln!(
-            "osr-trace: enter FuncId({}) {} bb{} argc={}",
+            "osr-trace: [{:.2}ms] enter FuncId({}) {} bb{} argc={}",
+            crate::runtime::engine::trace_clock_ms(),
             func_id.0,
             name,
             point.target_block.0,
@@ -653,6 +676,48 @@ fn try_enter_loop_osr(
         .unwrap_or(std::ptr::null_mut());
     crate::codegen::runtime_fns::jit_roots_restore_len(saved_ctx_root_idx);
     crate::codegen::runtime_fns::set_jit_context(restored_ctx);
+
+    // A cold-loop exit: the body stopped at a loop header it was compiled
+    // for without inline-cache data. Put the header's live-ins back into
+    // the frame's registers and interpret from that header.
+    if result_bits == Value::UNDEFINED.to_bits() && !vm.has_error {
+        if let Some((header, live)) = crate::codegen::runtime_fns::take_osr_exit() {
+            let header = crate::mir::BlockId(header);
+            let Some(offset) = bc
+                .osr_points
+                .iter()
+                .find(|p| p.target_block == header)
+                .map(|p| p.target_offset)
+            else {
+                return Err(RuntimeError::Error(format!(
+                    "OSR exit at bb{} has no bytecode loop header",
+                    header.0
+                )));
+            };
+            unsafe {
+                if let Some(frame) = (*live_fiber).mir_frames.last_mut() {
+                    *values = std::mem::take(&mut frame.values);
+                }
+            }
+            for (reg, v) in &live {
+                let i = *reg as usize;
+                if i >= values.len() {
+                    values.resize(i + 1, UNDEF);
+                }
+                values[i] = *v;
+            }
+            if env_osr_trace() {
+                eprintln!(
+                    "osr-trace: [{:.2}ms] exit FuncId({}) bb{} live={}",
+                    crate::runtime::engine::trace_clock_ms(),
+                    func_id.0,
+                    header.0,
+                    live.len()
+                );
+            }
+            return Ok(OsrTransfer::ContinueAt(offset));
+        }
+    }
 
     if vm.has_error {
         vm.has_error = false;
@@ -2808,33 +2873,24 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                     // method_call, binary_trees) at zero
                                     // additional overhead after the fix.
                                     let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
-                                    let callee_module =
-                                        vm.engine.func_module(FuncId(fn_idx as u32));
-                                    let same_module = match callee_module {
-                                        Some(mn) => {
-                                            let bytes = mn.as_bytes();
-                                            bytes.as_ptr() == saved_ctx.module_name
-                                                && bytes.len() as u32 == saved_ctx.module_name_len
-                                        }
-                                        None => true,
-                                    };
+                                    // The callee's module table comes from its cached
+                                    // cell; no name comparison or lookup per call.
+                                    let callee_id = FuncId(fn_idx as u32);
+                                    let callee_module = vm.engine.func_module(callee_id);
+                                    let (mv_ptr, mv_count) = vm.engine.module_vars_for(callee_id);
                                     crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
                                         ctx.current_func_id = fn_idx as u64;
                                         ctx.closure = closure_ptr as *mut u8;
                                         ctx.defining_class = defining_class
                                             .map(|p| p as *mut u8)
                                             .unwrap_or(std::ptr::null_mut());
-                                        if !same_module {
-                                            if let Some(mod_name) = callee_module {
-                                                if let Some(m) =
-                                                    vm.engine.modules.get(mod_name.as_str())
-                                                {
-                                                    ctx.module_vars = m.vars.as_ptr() as *mut u64;
-                                                    ctx.module_var_count = m.vars.len() as u32;
-                                                    let bytes = mod_name.as_bytes();
-                                                    ctx.module_name = bytes.as_ptr();
-                                                    ctx.module_name_len = bytes.len() as u32;
-                                                }
+                                        if let Some(mod_name) = callee_module {
+                                            if !mv_ptr.is_null() {
+                                                ctx.module_vars = mv_ptr;
+                                                ctx.module_var_count = mv_count;
+                                                let bytes = mod_name.as_bytes();
+                                                ctx.module_name = bytes.as_ptr();
+                                                ctx.module_name_len = bytes.len() as u32;
                                             }
                                         }
                                     });
@@ -4043,6 +4099,10 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 OsrTransfer::NotEntered => {}
                                 OsrTransfer::ContinueFiberLoop => continue 'fiber_loop,
                                 OsrTransfer::Return(value) => return Ok(value),
+                                OsrTransfer::ContinueAt(offset) => {
+                                    pc = offset;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -4182,6 +4242,10 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 OsrTransfer::NotEntered => {}
                                 OsrTransfer::ContinueFiberLoop => continue 'fiber_loop,
                                 OsrTransfer::Return(value) => return Ok(value),
+                                OsrTransfer::ContinueAt(offset) => {
+                                    pc = offset;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -4513,12 +4577,7 @@ fn dispatch_closure_bc_inner(
                     .cloned()
                     .unwrap_or_else(|| Rc::clone(module_name));
                 let mod_name_bytes = callee_module_name.as_bytes();
-                let (mv_ptr, mv_count) = vm
-                    .engine
-                    .modules
-                    .get(callee_module_name.as_str())
-                    .map(|m| (m.vars.as_ptr() as *mut u64, m.vars.len() as u32))
-                    .unwrap_or((std::ptr::null_mut(), 0));
+                let (mv_ptr, mv_count) = vm.engine.module_vars_for(target_func_id);
                 crate::codegen::runtime_fns::set_jit_context(
                     crate::codegen::runtime_fns::JitContext {
                         module_vars: mv_ptr,

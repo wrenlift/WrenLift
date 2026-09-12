@@ -245,9 +245,8 @@ fn version_loop(
     }
     let live_in = live_in_sets(func);
     for &e in &exits {
-        let mut needed: Vec<ValueId> = live_in[e.0 as usize]
-            .iter()
-            .copied()
+        let mut needed: Vec<ValueId> = live_in
+            .iter(e.0 as usize)
             .filter(|v| loop_defs.contains(v))
             .collect();
         needed.sort_by_key(|v| v.0);
@@ -316,6 +315,7 @@ fn version_loop(
     }
     let slow_to_fast: HashMap<ValueId, ValueId> =
         fast_to_slow.iter().map(|(f, s)| (*s, *f)).collect();
+    func.osr_excluded.extend(block_map.values().copied());
     Some(SlowCopy {
         blocks: block_map.values().copied().collect(),
         fast_to_slow,
@@ -475,9 +475,8 @@ fn slow_continuation(func: &mut MirFunction, copy: &mut SlowCopy, slow_dst: Valu
     for &b in &copy.blocks {
         copy_defs.extend(func.block(b).defined_values());
     }
-    let mut needed: Vec<ValueId> = live_in[post.0 as usize]
-        .iter()
-        .copied()
+    let mut needed: Vec<ValueId> = live_in
+        .iter(post.0 as usize)
         .filter(|v| copy_defs.contains(v))
         .collect();
     needed.sort_by_key(|v| v.0);

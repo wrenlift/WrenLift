@@ -345,6 +345,16 @@ fn tier_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WLIFT_TIER_TRACE").is_some())
 }
 
+/// Milliseconds since the first trace line, for ordering trace output.
+pub fn trace_clock_ms() -> f64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1e3
+}
+
 /// Returns true if `mir` directly invokes a method that drives a
 /// fiber switch — `Fiber.yield` / `Fiber.suspend`, or one of the
 /// instance-side fiber controls (`fiber.try / call / transfer /
@@ -583,6 +593,10 @@ pub struct ExecutionEngine {
     /// when invoked from module B. `None` is only used by isolated
     /// unit-test paths that don't run through the full VM pipeline.
     pub func_modules: Vec<Option<Rc<String>>>,
+    /// Per function, the address of its module's variable cell once
+    /// resolved (0 until then); the cell is leaked per module, so the
+    /// address never goes stale.
+    func_modvars_cell: std::cell::RefCell<Vec<usize>>,
     pub runtime_call_stats: RuntimeCallStats,
     /// Cached field index for trivial getters of the form `{ _field }`.
     pub trivial_getter_fields: Vec<Option<u16>>,
@@ -592,6 +606,15 @@ pub struct ExecutionEngine {
     pub baseline_code: Vec<*const u8>,
     /// Baseline native OSR entry points indexed by FuncId.
     pub baseline_osr_entries: Vec<Vec<NativeOsrEntry>>,
+    /// Loop headers whose body had no inline-cache data when the
+    /// installed code was compiled, so its call sites are generic. The
+    /// interpreter keeps running such a loop and asks for a recompile
+    /// once it is hot, instead of entering code that will never improve.
+    pub cold_osr_blocks: Vec<std::collections::HashSet<crate::mir::BlockId>>,
+    /// Cold sets of compiles in flight, applied at install.
+    pending_cold_osr: HashMap<usize, std::collections::HashSet<crate::mir::BlockId>>,
+    /// Probes of a cold entry per (function, block), for pacing recompile requests.
+    cold_osr_probes: HashMap<(u32, u32), u32>,
     /// Whether baseline-native code can use the direct fast path.
     pub baseline_leaf: Vec<bool>,
     /// Baseline native metadata indexed by FuncId.
@@ -839,11 +862,15 @@ impl ExecutionEngine {
             tier_states: Vec::new(),
             tier_stats: Vec::new(),
             func_modules: Vec::new(),
+            func_modvars_cell: std::cell::RefCell::new(Vec::new()),
             runtime_call_stats: RuntimeCallStats::default(),
             trivial_getter_fields: Vec::new(),
             trivial_setter_fields: Vec::new(),
             baseline_code: Vec::new(),
             baseline_osr_entries: Vec::new(),
+            cold_osr_blocks: Vec::new(),
+            pending_cold_osr: HashMap::new(),
+            cold_osr_probes: HashMap::new(),
             baseline_leaf: Vec::new(),
             baseline_metadata: Vec::new(),
             optimized_code: Vec::new(),
@@ -901,6 +928,7 @@ impl ExecutionEngine {
         self.trivial_setter_fields.push(trivial_setter);
         self.baseline_code.push(std::ptr::null());
         self.baseline_osr_entries.push(Vec::new());
+        self.cold_osr_blocks.push(std::collections::HashSet::new());
         self.baseline_leaf.push(false);
         self.baseline_metadata.push(None);
         self.optimized_code.push(std::ptr::null());
@@ -1225,7 +1253,8 @@ impl ExecutionEngine {
         if tier_trace_enabled() && !snapshot.is_empty() {
             let k5 = snapshot.iter().filter(|ic| ic.kind == 5).count();
             eprintln!(
-                "tier-trace: ic_ptrs FuncId({}) total={} kind5={}",
+                "tier-trace: [{:.2}ms] ic_ptrs FuncId({}) total={} kind5={}",
+                trace_clock_ms(),
                 id.0,
                 snapshot.len(),
                 k5
@@ -1868,7 +1897,7 @@ impl ExecutionEngine {
             let Some(ptr) = self.tier.osr_entry(id, site) else {
                 if tier_trace_enabled() {
                     eprintln!(
-                        "tier-trace: osr site bb{} params={} not in bead table for FuncId({})",
+                        "tier-trace: [{:.2}ms] osr site bb{} params={} not in bead table for FuncId({})", trace_clock_ms(),
                         target_block.0, entry.param_count, id.0
                     );
                 }
@@ -1877,8 +1906,10 @@ impl ExecutionEngine {
             if ptr.is_null() || ptr as *const u8 != entry.ptr {
                 if tier_trace_enabled() {
                     eprintln!(
-                        "tier-trace: osr site bb{} pointer mismatch for FuncId({})",
-                        target_block.0, id.0
+                        "tier-trace: [{:.2}ms] osr site bb{} pointer mismatch for FuncId({})",
+                        trace_clock_ms(),
+                        target_block.0,
+                        id.0
                     );
                 }
                 continue;
@@ -2086,12 +2117,42 @@ impl ExecutionEngine {
     /// Address of the module variable cell for `id`'s defining module,
     /// or 0 when the module is not recorded.
     fn modvars_cell_addr(&self, id: FuncId) -> usize {
-        self.func_modules
-            .get(id.0 as usize)
+        let idx = id.0 as usize;
+        if let Some(&addr) = self.func_modvars_cell.borrow().get(idx) {
+            if addr != 0 {
+                return addr;
+            }
+        }
+        let addr = self
+            .func_modules
+            .get(idx)
             .and_then(|m| m.as_ref())
             .and_then(|name| self.modules.get(name.as_str()))
             .map(|e| e.cell as *const ModuleVarsCell as usize)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if addr != 0 {
+            let mut cache = self.func_modvars_cell.borrow_mut();
+            if cache.len() <= idx {
+                cache.resize(idx + 1, 0);
+            }
+            cache[idx] = addr;
+        }
+        addr
+    }
+
+    /// The module variable table of `id`'s module as (pointer, length),
+    /// read from the module's cell without a name lookup.
+    #[inline]
+    pub fn module_vars_for(&self, id: FuncId) -> (*mut u64, u32) {
+        use std::sync::atomic::Ordering;
+        let addr = self.modvars_cell_addr(id);
+        if addr == 0 {
+            return (std::ptr::null_mut(), 0);
+        }
+        let cell = unsafe { &*(addr as *const ModuleVarsCell) };
+        let len = cell.len.load(Ordering::Acquire);
+        let ptr = cell.ptr.load(Ordering::Acquire);
+        (ptr, len as u32)
     }
 
     /// Shape of the class held by module variable `idx` of `module`
@@ -2343,6 +2404,95 @@ impl ExecutionEngine {
         sites
     }
 
+    /// Loop headers whose body has call sites but no inline-cache data
+    /// yet: the loop has not run, so compiling it now bakes in generic
+    /// dispatch.
+    /// Each cold header maps to the registers the interpreter needs to
+    /// resume there: the header's live-ins in the bytecode's own terms.
+    fn cold_loop_headers(
+        mir: &MirFunction,
+        ics: &[CallSiteIC],
+    ) -> HashMap<crate::mir::BlockId, Vec<crate::mir::ValueId>> {
+        use crate::mir::opt::licm::{
+            compute_dominators, compute_rpo, detect_loops, merge_loops_by_header,
+        };
+        use crate::mir::Instruction;
+        let mut cold = HashMap::new();
+        // WLIFT_COLD_LOOP_RECOMPILE=1 turns on cold-loop exits and the
+        // recompile they request; safe to run with, but the recompile
+        // costs more than it returns on short loops, so it is off.
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("WLIFT_COLD_LOOP_RECOMPILE").is_some()) {
+            return cold;
+        }
+        if mir.blocks.is_empty() {
+            return cold;
+        }
+        // Call-site index per block, in the snapshot's order.
+        let mut ic_idx = 0usize;
+        let mut site_kinds: Vec<Vec<u64>> = vec![Vec::new(); mir.blocks.len()];
+        for (bi, block) in mir.blocks.iter().enumerate() {
+            for (_, inst) in &block.instructions {
+                if matches!(
+                    inst,
+                    Instruction::Call { .. } | Instruction::SuperCall { .. }
+                ) {
+                    site_kinds[bi].push(ics.get(ic_idx).map(|ic| ic.kind).unwrap_or(0));
+                    ic_idx += 1;
+                }
+            }
+        }
+        let rpo = compute_rpo(mir);
+        let idom = compute_dominators(mir, &rpo);
+        for lp in merge_loops_by_header(&detect_loops(mir, &idom)) {
+            let kinds: Vec<u64> = lp
+                .body
+                .iter()
+                .flat_map(|b| site_kinds[b.0 as usize].iter().copied())
+                .collect();
+            if !kinds.is_empty() && kinds.iter().all(|k| *k == 0) {
+                let live: Vec<crate::mir::ValueId> =
+                    crate::mir::osr_external_live_values(mir, lp.header)
+                        .into_iter()
+                        .chain(
+                            mir.blocks[lp.header.0 as usize]
+                                .params
+                                .iter()
+                                .map(|(p, _)| *p),
+                        )
+                        .collect();
+                cold.insert(lp.header, live);
+            }
+        }
+        cold
+    }
+
+    /// Whether the installed OSR entry for `block` was compiled before
+    /// its loop ever ran. Every 256th probe asks for the next tier, so
+    /// a loop that is really hot gets code with its caches filled.
+    pub fn osr_entry_is_cold(
+        &mut self,
+        id: FuncId,
+        block: crate::mir::BlockId,
+        interner: &crate::intern::Interner,
+    ) -> bool {
+        let idx = id.0 as usize;
+        if !self
+            .cold_osr_blocks
+            .get(idx)
+            .map(|s| s.contains(&block))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let probes = self.cold_osr_probes.entry((id.0, block.0)).or_insert(0);
+        *probes += 1;
+        if *probes % 256 == 0 {
+            self.request_tier_up(id, interner);
+        }
+        true
+    }
+
     /// The compile clone with known calls inlined. `WLIFT_DISABLE_MIR_INLINE`
     /// turns it off; safe to run with.
     fn inline_known(
@@ -2429,7 +2579,7 @@ impl ExecutionEngine {
             .unwrap_or_else(|| "Unregistered".to_string());
         let invocations = self.tier.invocations(id);
         eprintln!(
-            "tier-trace: {event} {tier:?} FuncId({}) engine={engine_tier:?} bead={bead_state} invocations={invocations}",
+            "tier-trace: [{:.2}ms] {event} {tier:?} FuncId({}) engine={engine_tier:?} bead={bead_state} invocations={invocations}", trace_clock_ms(),
             idx
         );
     }
@@ -2480,6 +2630,7 @@ impl ExecutionEngine {
                 self.functions[idx] = body;
                 self.baseline_code[idx] = native_ptr;
                 self.baseline_osr_entries[idx] = osr_entries.clone();
+                self.cold_osr_blocks[idx] = self.pending_cold_osr.remove(&idx).unwrap_or_default();
                 self.baseline_leaf[idx] = inline_safe;
                 self.baseline_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::BaselineNative;
@@ -2509,6 +2660,7 @@ impl ExecutionEngine {
                 }
                 self.optimized_code[idx] = native_ptr;
                 self.optimized_osr_entries[idx] = osr_entries.clone();
+                self.cold_osr_blocks[idx] = self.pending_cold_osr.remove(&idx).unwrap_or_default();
                 self.optimized_leaf[idx] = inline_safe;
                 self.optimized_metadata[idx] = native_meta;
                 self.tier_states[idx] = TierState::OptimizedNative;
@@ -2942,6 +3094,12 @@ impl ExecutionEngine {
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
+        let cold = callsite_ic_ptrs
+            .as_deref()
+            .map(|ics| Self::cold_loop_headers(&mir, ics))
+            .unwrap_or_default();
+        self.pending_cold_osr
+            .insert(idx, cold.keys().copied().collect());
         let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let modvars_cell = self.modvars_cell_addr(id);
@@ -2955,8 +3113,12 @@ impl ExecutionEngine {
         if tier_trace_enabled() {
             let ic_count = callsite_ic_ptrs.as_ref().map(|v| v.len()).unwrap_or(0);
             eprintln!(
-                "tier-trace: queue {:?} FuncId({}) {} ic_ptrs={}",
-                tier, id.0, trace_name, ic_count
+                "tier-trace: [{:.2}ms] queue {:?} FuncId({}) {} ic_ptrs={}",
+                trace_clock_ms(),
+                tier,
+                id.0,
+                trace_name,
+                ic_count
             );
         }
 
@@ -2970,15 +3132,25 @@ impl ExecutionEngine {
         // native_meta, tier) still travels back to the interpreter
         // thread through `compilation_tx` so `poll_compilations` can
         // finish the engine-side install at a safepoint.
-        let compile_fn = move |_bead: &std::sync::Arc<beadie::Bead>| -> beadie::OsrCompileResult {
+        let compile_fn = move || -> beadie::OsrCompileResult {
             if tier_trace_enabled() {
                 eprintln!(
-                    "tier-trace: start {:?} FuncId({}) {}",
-                    tier, id.0, trace_name_clone
+                    "tier-trace: [{:.2}ms] start {:?} FuncId({}) {}",
+                    trace_clock_ms(),
+                    tier,
+                    id.0,
+                    trace_name_clone
                 );
             }
-            let compile_mir =
+            let compile_started = std::time::Instant::now();
+            let mut compile_mir =
                 Self::build_compile_mir(&sroa_mir, tier, &interner_clone, profile.as_ref());
+            if !cold.is_empty() {
+                Arc::make_mut(&mut compile_mir)
+                    .osr_excluded
+                    .extend(cold.keys().copied());
+            }
+            let mir_ready = compile_started.elapsed();
             let (callsite_ic_ptrs, callsite_ic_live_ptrs, devirt_hints) =
                 match (callsite_ic_ptrs, callsite_ic_live_ptrs) {
                     (Some(ics), Some(live)) => {
@@ -2993,6 +3165,7 @@ impl ExecutionEngine {
                 eprintln!("{}", compile_mir.pretty_print(&interner_clone));
             }
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(modvars_cell);
+            crate::codegen::cranelift_backend::cl::set_jit_cold_headers(cold);
             let result = crate::codegen::compile_function_artifact_with_interner_and_callsite_ics(
                 &compile_mir,
                 target,
@@ -3006,6 +3179,7 @@ impl ExecutionEngine {
                 inline_bodies.clone(),
                 cha_for_codegen.clone(),
             );
+            crate::codegen::cranelift_backend::cl::set_jit_cold_headers(Default::default());
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
             let result = result
                 .map_err(|e| {
@@ -3039,11 +3213,14 @@ impl ExecutionEngine {
                 });
             if tier_trace_enabled() {
                 eprintln!(
-                    "tier-trace: finish {:?} FuncId({}) {} success={}",
+                    "tier-trace: [{:.2}ms] finish {:?} FuncId({}) {} success={} mir={:?} total={:?}",
+                    trace_clock_ms(),
                     tier,
                     id.0,
                     trace_name_clone,
-                    result.is_some()
+                    result.is_some(),
+                    mir_ready,
+                    compile_started.elapsed()
                 );
             }
             // Extract the native entry + OSR entries for beadie BEFORE
@@ -3071,14 +3248,32 @@ impl ExecutionEngine {
         // → Compiling → Compiled (with OSR table) as the closure
         // progresses. If the bead has already been promoted (race),
         // `AlreadyQueued` is returned and we roll back the pending_count.
-        let submit_result = self.tier.submit_compile_osr(id, compile_fn);
+        // The broker only takes a bead that is still interpreted; a
+        // recompile of compiled code runs on a runtime thread and lands
+        // through the same channel, where the install swaps the bead's
+        // code and OSR table.
+        if tier == CompileTier::Optimized {
+            std::thread::Builder::new()
+                .name(format!("wlift-opt-{}", id.0))
+                .spawn(move || {
+                    let _ = compile_fn();
+                })
+                .ok();
+            return;
+        }
+        let submit_result = self
+            .tier
+            .submit_compile_osr(id, move |_bead: &std::sync::Arc<beadie::Bead>| compile_fn());
         if !submit_result.is_accepted() {
             self.compiling_tier[idx] = None;
             self.pending_count = self.pending_count.saturating_sub(1);
             if tier_trace_enabled() {
                 eprintln!(
-                    "tier-trace: submit-rejected {:?} FuncId({}) {:?}",
-                    tier, id.0, submit_result
+                    "tier-trace: [{:.2}ms] submit-rejected {:?} FuncId({}) {:?}",
+                    trace_clock_ms(),
+                    tier,
+                    id.0,
+                    submit_result
                 );
             }
         }
@@ -3103,10 +3298,19 @@ impl ExecutionEngine {
             if tier_trace_enabled() {
                 match &result {
                     CompilationResult::Compiled { id, tier, .. } => {
-                        eprintln!("tier-trace: install {:?} FuncId({})", tier, id.0);
+                        eprintln!(
+                            "tier-trace: [{:.2}ms] install {:?} FuncId({})",
+                            trace_clock_ms(),
+                            tier,
+                            id.0
+                        );
                     }
                     CompilationResult::Failed { id } => {
-                        eprintln!("tier-trace: install failed FuncId({})", id.0);
+                        eprintln!(
+                            "tier-trace: [{:.2}ms] install failed FuncId({})",
+                            trace_clock_ms(),
+                            id.0
+                        );
                     }
                 }
             }
