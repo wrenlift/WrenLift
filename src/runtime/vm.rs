@@ -366,6 +366,13 @@ pub struct VM {
     /// Last error message from runtime_error (for Fiber.try to retrieve).
     pub last_error: Option<String>,
 
+    /// The fiber a nested, depth-bounded run loop was entered on (a
+    /// native or compiled caller waiting for one frame to unwind).
+    /// An error on that fiber must unwind to that caller rather than
+    /// switch fibers underneath it; the caller's own level routes it
+    /// through `Fiber.try`. Null at the outermost loop.
+    pub sync_entry_fiber: *mut ObjFiber,
+
     /// Modules currently being loaded (for circular import detection).
     loading_modules: HashSet<String>,
 
@@ -569,6 +576,7 @@ impl VM {
             module_sources: HashMap::new(),
             error_fiber: ptr::null_mut(),
             last_error: None,
+            sync_entry_fiber: std::ptr::null_mut(),
             loading_modules: HashSet::new(),
             gc_requested: false,
             // krio (stackful fiber) backings are required by the
@@ -2911,6 +2919,20 @@ impl VM {
     ///
     /// Test mode (`config.error_fn` set) forwards the message
     /// verbatim so the test harness can pattern-match on it.
+    /// A nested run loop unwinds an error to the caller that entered it;
+    /// re-raise it there so the caller's own level reports or catches it,
+    /// and hand back null as the call's value.
+    fn reraise(&mut self, result: Result<Value, super::vm_interp::RuntimeError>) -> Option<Value> {
+        match result {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.has_error = true;
+                self.last_error = Some(e.to_string());
+                Some(Value::null())
+            }
+        }
+    }
+
     pub fn report_error(&self, msg: &str) {
         if let Some(ref f) = self.config.error_fn {
             f(ErrorKind::Runtime, "", 0, msg);
@@ -5336,7 +5358,7 @@ impl VM {
 
             let result = super::vm_interp::run_fiber_until_depth(self, stop_depth);
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-            return result.ok();
+            return self.reraise(result);
         }
 
         // No active fiber: same AOT-stub fast path as the
@@ -5491,7 +5513,7 @@ impl VM {
         crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
         self.release_sync_fiber(live_temp_fiber);
 
-        result.ok()
+        self.reraise(result)
     }
 
     /// Dispatch a constructor call from JIT code safely.
@@ -5732,8 +5754,8 @@ impl VM {
 
             let result = super::vm_interp::run_fiber_until_depth(self, stop_depth);
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
-            return match result {
-                Ok(v) if !v.is_null() => v,
+            return match self.reraise(result) {
+                Some(v) if !v.is_null() => v,
                 _ => live_instance,
             };
         }
@@ -5839,8 +5861,8 @@ impl VM {
 
         // The constructor body returns `this` (the instance). If it returns null
         // or errors, fall back to live_instance.
-        match result {
-            Ok(v) if !v.is_null() => v,
+        match self.reraise(result) {
+            Some(v) if !v.is_null() => v,
             _ => live_instance,
         }
     }

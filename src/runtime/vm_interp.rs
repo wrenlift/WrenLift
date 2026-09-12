@@ -281,12 +281,22 @@ fn call_foreign_c_with_frame_sync(
     result
 }
 
+/// How a root frame ran natively.
+enum RootNative {
+    /// No native body; interpret it.
+    NotRun,
+    Returned(Value),
+    /// The body raised and the enclosing `Fiber.try` caught it; the
+    /// caller fiber is already resumed when there is one.
+    Caught { had_caller: bool, error: Value },
+}
+
 fn try_run_root_frame_native(
     vm: &mut VM,
     fiber: *mut ObjFiber,
     func_id: FuncId,
     module_name: &Rc<String>,
-) -> Result<Option<Value>, RuntimeError> {
+) -> Result<RootNative, RuntimeError> {
     #[inline(always)]
     fn trace_root_native(msg: impl FnOnce() -> String) {
         if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
@@ -295,7 +305,7 @@ fn try_run_root_frame_native(
     }
 
     if vm.engine.mode == ExecutionMode::Interpreter || crate::codegen::runtime_fns::jit_disabled() {
-        return Ok(None);
+        return Ok(RootNative::NotRun);
     }
 
     let fn_idx = func_id.0 as usize;
@@ -306,23 +316,23 @@ fn try_run_root_frame_native(
         .copied()
         .unwrap_or(std::ptr::null());
     if native_fn_ptr.is_null() {
-        return Ok(None);
+        return Ok(RootNative::NotRun);
     }
 
     let is_leaf = vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
     let allow_nonleaf_native = crate::codegen::runtime_fns::allow_root_nonleaf_native(vm, func_id);
     if !is_leaf && !allow_nonleaf_native {
-        return Ok(None);
+        return Ok(RootNative::NotRun);
     }
 
     let saved_ctx = crate::codegen::runtime_fns::read_jit_ctx();
     if !saved_ctx.vm.is_null() {
-        return Ok(None);
+        return Ok(RootNative::NotRun);
     }
 
     let jit_depth = crate::codegen::runtime_fns::jit_depth();
     if jit_depth >= crate::codegen::runtime_fns::MAX_JIT_DEPTH {
-        return Ok(None);
+        return Ok(RootNative::NotRun);
     }
 
     let vm_ptr = vm as *mut VM as *mut u8;
@@ -385,10 +395,16 @@ fn try_run_root_frame_native(
             .last_error
             .take()
             .unwrap_or_else(|| "runtime error in native entry".to_string());
-        return Err(RuntimeError::Error(err));
+        if !may_route_try(vm, live_fiber) {
+            return Err(RuntimeError::Error(err));
+        }
+        let had_caller = unsafe { !(*live_fiber).caller.is_null() };
+        let error = unsafe { route_method_error_through_fiber_try(vm, live_fiber, err) }
+            .expect("fiber is in try mode");
+        return Ok(RootNative::Caught { had_caller, error });
     }
 
-    Ok(Some(Value::from_bits(result_bits)))
+    Ok(RootNative::Returned(Value::from_bits(result_bits)))
 }
 
 enum OsrTransfer {
@@ -602,7 +618,20 @@ fn try_enter_loop_osr(
             .last_error
             .take()
             .unwrap_or_else(|| "runtime error in OSR entry".to_string());
-        return Err(RuntimeError::Error(err));
+        if !may_route_try(vm, live_fiber) {
+            return Err(RuntimeError::Error(err));
+        }
+        let had_caller = unsafe { !(*live_fiber).caller.is_null() };
+        let error = unsafe { route_method_error_through_fiber_try(vm, live_fiber, err) }
+            .expect("fiber is in try mode");
+        unsafe {
+            (*live_fiber).mir_frames.pop();
+        }
+        return Ok(if had_caller {
+            OsrTransfer::ContinueFiberLoop
+        } else {
+            OsrTransfer::Return(error)
+        });
     }
 
     // Deopt: fiber actions (yield / transfer / suspend) triggered inside the
@@ -792,7 +821,7 @@ fn take_native_error(vm: &mut VM, fiber: *mut ObjFiber) -> Option<NativeError> {
         .last_error
         .take()
         .unwrap_or_else(|| "runtime error in native method".to_string());
-    if !unsafe { (*fiber).is_try } {
+    if !may_route_try(vm, fiber) {
         return Some(NativeError::Unwind(RuntimeError::Error(msg)));
     }
     let had_caller = unsafe { !(*fiber).caller.is_null() };
@@ -803,6 +832,24 @@ fn take_native_error(vm: &mut VM, fiber: *mut ObjFiber) -> Option<NativeError> {
     } else {
         NativeError::Finished(err_val)
     })
+}
+
+/// Consume an error raised inside compiled code the interpreter called.
+/// Caught by the enclosing `Fiber.try` it resumes the caller fiber, or
+/// ends the run with the error string when there is none; otherwise it
+/// unwinds.
+fn take_jit_error(vm: &mut VM, fiber: *mut ObjFiber) -> Result<(), RuntimeError> {
+    match take_native_error(vm, fiber) {
+        None | Some(NativeError::Caught) => Ok(()),
+        Some(NativeError::Finished(err_val)) => {
+            unsafe {
+                (*fiber).mir_frames.clear();
+                (*fiber).jit_resume_value = Some(err_val);
+            }
+            Ok(())
+        }
+        Some(NativeError::Unwind(e)) => Err(e),
+    }
 }
 
 /// Post-native-call check inside the dispatch loop.
@@ -1000,6 +1047,26 @@ fn run_fiber_with_stop_depth(
     if vm.fiber.is_null() {
         return Err(RuntimeError::Error("no active fiber".into()));
     }
+    let entry = if stop_depth.is_some() {
+        vm.fiber
+    } else {
+        std::ptr::null_mut()
+    };
+    let prev = std::mem::replace(&mut vm.sync_entry_fiber, entry);
+    let result = run_fiber_loop(vm, stop_depth);
+    vm.sync_entry_fiber = prev;
+    result
+}
+
+/// Whether an error raised on `fiber` may be caught here by its
+/// `Fiber.try`. A fiber a nested loop was entered on belongs to the
+/// caller waiting on it, so its errors unwind instead.
+fn may_route_try(vm: &VM, fiber: *mut ObjFiber) -> bool {
+    let is_try = unsafe { (*fiber).is_try };
+    is_try && !std::ptr::eq(vm.sync_entry_fiber, fiber)
+}
+
+fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, RuntimeError> {
 
     // `stop_depth` is a frame count on the fiber that was active when
     // this run loop was entered — typically a native-to-Wren bridge
@@ -1236,7 +1303,21 @@ fn run_fiber_with_stop_depth(
         }
 
         if pc == 0 && closure.is_none() && return_dst.is_none() {
-            if let Some(return_val) = try_run_root_frame_native(vm, fiber, func_id, &module_name)? {
+            let ran = try_run_root_frame_native(vm, fiber, func_id, &module_name)?;
+            if let RootNative::Caught { had_caller, error } = ran {
+                unsafe {
+                    (*fiber).mir_frames.pop();
+                }
+                values.clear();
+                if vm.register_pool.len() < 128 {
+                    vm.register_pool.push(values);
+                }
+                if had_caller {
+                    continue 'fiber_loop;
+                }
+                return Ok(error);
+            }
+            if let RootNative::Returned(return_val) = ran {
                 fiber = vm.fiber;
                 if std::env::var_os("WLIFT_TRACE_ROOT_NATIVE").is_some() {
                     let frame_count = if fiber.is_null() {
@@ -1407,6 +1488,7 @@ fn run_fiber_with_stop_depth(
                     if vm.register_pool.len() < 128 {
                         vm.register_pool.push(regs_back);
                     }
+                    native_error_check!(vm, fiber, 'fiber_loop);
                     unsafe {
                         (*fiber).mir_frames.pop();
                     }
@@ -4390,6 +4472,7 @@ fn dispatch_closure_bc_inner(
                     let result_bits = unsafe { call_jit_fn(fn_ptr_raw, arg_vals) };
                     crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);
                     crate::codegen::runtime_fns::set_jit_depth(jit_depth);
+                    take_jit_error(vm, fiber)?;
 
                     let mut values = unsafe {
                         (*fiber)
@@ -4416,6 +4499,7 @@ fn dispatch_closure_bc_inner(
                         arg_vals,
                         defining_class,
                     );
+                    take_jit_error(vm, fiber)?;
 
                     let mut values = unsafe {
                         (*fiber)
@@ -4582,6 +4666,20 @@ fn dispatch_closure_bc_inner(
             if vm.register_pool.len() < 128 {
                 vm.register_pool.push(regs_back);
             }
+            unsafe {
+                if let Some(frame) = (*fiber).mir_frames.last_mut() {
+                    frame.pc = pc;
+                    frame.values = values;
+                }
+            }
+            take_jit_error(vm, fiber)?;
+            let mut values = unsafe {
+                (*fiber)
+                    .mir_frames
+                    .last_mut()
+                    .map(|f| std::mem::take(&mut f.values))
+                    .unwrap_or_default()
+            };
             // Store result in caller's frame and return.
             set_reg(&mut values, return_dst.0 as u16, result);
             unsafe {
@@ -4981,7 +5079,7 @@ pub unsafe fn route_method_error_through_fiber_try(
     err_msg: String,
 ) -> Option<Value> {
     unsafe {
-        if !(*fiber).is_try {
+        if !may_route_try(vm, fiber) {
             return None;
         }
         let err_val = vm.new_string(err_msg);
@@ -5222,7 +5320,7 @@ fn try_operator_dispatch(
         }
         _ => {
             let msg = format!("{} does not implement '{}'", vm.class_name_of(recv), method_str);
-            if !unsafe { (*fiber).is_try } {
+            if !may_route_try(vm, fiber) {
                 return Err(RuntimeError::Error(msg));
             }
             let had_caller = unsafe { !(*fiber).caller.is_null() };
