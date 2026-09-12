@@ -3909,7 +3909,10 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
     let arg_count = args.len();
     let load_args = |j: *mut JitThread| -> smallvec::SmallVec<[Value; 5]> {
         let roots = unsafe { &(*j).roots };
-        roots[root_base..root_base + arg_count].iter().copied().collect()
+        roots[root_base..root_base + arg_count]
+            .iter()
+            .copied()
+            .collect()
     };
 
     let result = (|| {
@@ -3925,7 +3928,8 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
                 }
                 unsafe { (*j).depth = depth + 1 };
                 let collected = load_args(j);
-                let result = unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &collected) };
+                let result =
+                    unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &collected) };
                 unsafe {
                     (*j).depth = depth;
                     if !is_leaf {
@@ -4731,9 +4735,8 @@ fn make_closure_inner(fn_id: u64, upvalue_vals: &[u64]) -> u64 {
             (*uv_obj).closed = captured_val;
             (*uv_obj).location = &mut (*uv_obj).closed as *mut Value;
             let live_closure_val = jit_root_at(closure_root_idx);
-            let live_closure = live_closure_val
-                .as_object()
-                .expect("closure root vanished") as *mut crate::runtime::object::ObjClosure;
+            let live_closure = live_closure_val.as_object().expect("closure root vanished")
+                as *mut crate::runtime::object::ObjClosure;
             if i < (*live_closure).upvalues.len() {
                 (&mut (*live_closure).upvalues)[i] = uv_obj;
                 vm.gc.write_barrier(

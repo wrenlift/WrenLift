@@ -317,7 +317,10 @@ enum RootNative {
     Returned(Value),
     /// The body raised and the enclosing `Fiber.try` caught it; the
     /// caller fiber is already resumed when there is one.
-    Caught { had_caller: bool, error: Value },
+    Caught {
+        had_caller: bool,
+        error: Value,
+    },
 }
 
 fn try_run_root_frame_native(
@@ -526,7 +529,11 @@ fn try_enter_loop_osr(
                         func_id.0,
                         point.target_block.0,
                         reg,
-                        if value.is_none() { "out of range" } else { "undefined" }
+                        if value.is_none() {
+                            "out of range"
+                        } else {
+                            "undefined"
+                        }
                     );
                 }
                 return Ok(OsrTransfer::NotEntered);
@@ -1102,7 +1109,6 @@ fn may_route_try(vm: &VM, fiber: *mut ObjFiber) -> bool {
 }
 
 fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, RuntimeError> {
-
     // `stop_depth` is a frame count on the fiber that was active when
     // this run loop was entered — typically a native-to-Wren bridge
     // (`vm.call_fn_native`, constructor sync path) that pushes a frame
@@ -2564,7 +2570,8 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 let function = unsafe { (*closure_ptr).function };
                                 let ic_table = unsafe { &mut *bc.ic_table.get() };
                                 if let Some(ic) = ic_table.get_mut(ic_idx) {
-                                    if ic.kind == 0 || (ic.kind == 7 && ic.class != function as usize)
+                                    if ic.kind == 0
+                                        || (ic.kind == 7 && ic.class != function as usize)
                                     {
                                         *ic = crate::mir::bytecode::CallSiteIC {
                                             class: function as usize,
@@ -3973,9 +3980,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         // pending-compile polling only runs every 64 iterations.
                         backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
-                        if env_osr_trace()
-                            && (backedge_counter == 1 || should_tier_up)
-                        {
+                        if env_osr_trace() && (backedge_counter == 1 || should_tier_up) {
                             let name = vm
                                 .engine
                                 .get_mir(func_id)
@@ -4118,9 +4123,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     if target < branch_offset && vm.engine.mode == ExecutionMode::Tiered {
                         backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
-                        if env_osr_trace()
-                            && (backedge_counter == 1 || should_tier_up)
-                        {
+                        if env_osr_trace() && (backedge_counter == 1 || should_tier_up) {
                             let name = vm
                                 .engine
                                 .get_mir(func_id)
@@ -5205,8 +5208,7 @@ fn resume_caller(vm: &mut VM, caller: *mut ObjFiber, value: Value) {
                 // JIT barrier path: caller's frames were temporarily removed.
                 // Store the resume value so handle_jit_fiber_action can read it.
                 (*caller).jit_resume_value = Some(value);
-                vm.gc
-                    .write_barrier(caller as *mut ObjHeader, value);
+                vm.gc.write_barrier(caller as *mut ObjHeader, value);
             }
         } else if (*caller).mir_frames.is_empty() {
             // No resume_value_dst and no frames: JIT barrier path.
@@ -5395,7 +5397,11 @@ fn try_operator_dispatch(
             Ok(Dispatch::Continue)
         }
         _ => {
-            let msg = format!("{} does not implement '{}'", vm.class_name_of(recv), method_str);
+            let msg = format!(
+                "{} does not implement '{}'",
+                vm.class_name_of(recv),
+                method_str
+            );
             if !may_route_try(vm, fiber) {
                 return Err(RuntimeError::Error(msg));
             }

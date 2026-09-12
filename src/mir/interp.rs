@@ -327,12 +327,22 @@ pub fn eval_pure_instruction(
         Instruction::StringConcat(_) => Err(InterpError::Unsupported("StringConcat".into())),
         Instruction::ToString(_) => Err(InterpError::Unsupported("ToString".into())),
         Instruction::IsType(_, _) => Err(InterpError::Unsupported("IsType".into())),
-        Instruction::ClassIs(_, _) | Instruction::ObjectIs(_, _) | Instruction::ClosureFnIs(_, _) => {
+        Instruction::ClassIs(_, _)
+        | Instruction::ObjectIs(_, _)
+        | Instruction::ClosureFnIs(_, _) => {
             Err(InterpError::Unsupported("speculation guard".into()))
         }
-        Instruction::AddI64(..) | Instruction::SubI64(..) | Instruction::MulI64(..) | Instruction::RemI64(..) | Instruction::BandI64(..) | Instruction::CmpLtI64(..) | Instruction::CmpGtI64(..) | Instruction::CmpLeI64(..) | Instruction::CmpGeI64(..) | Instruction::NegI64(_) | Instruction::I64ToF64(_) => {
-            Err(InterpError::Unsupported("integer arithmetic".into()))
-        }
+        Instruction::AddI64(..)
+        | Instruction::SubI64(..)
+        | Instruction::MulI64(..)
+        | Instruction::RemI64(..)
+        | Instruction::BandI64(..)
+        | Instruction::CmpLtI64(..)
+        | Instruction::CmpGtI64(..)
+        | Instruction::CmpLeI64(..)
+        | Instruction::CmpGeI64(..)
+        | Instruction::NegI64(_)
+        | Instruction::I64ToF64(_) => Err(InterpError::Unsupported("integer arithmetic".into())),
         Instruction::SubscriptGet { .. } => Err(InterpError::Unsupported("SubscriptGet".into())),
         Instruction::SubscriptSet { .. } => Err(InterpError::Unsupported("SubscriptSet".into())),
         Instruction::GetStaticField(_) => Err(InterpError::Unsupported("GetStaticField".into())),

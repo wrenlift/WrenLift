@@ -4354,7 +4354,17 @@ impl<'a> LowerCtx<'a> {
             Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
                 panic!("speculation guards are lowered by the Cranelift backend only")
             }
-            Instruction::AddI64(..) | Instruction::SubI64(..) | Instruction::MulI64(..) | Instruction::RemI64(..) | Instruction::BandI64(..) | Instruction::CmpLtI64(..) | Instruction::CmpGtI64(..) | Instruction::CmpLeI64(..) | Instruction::CmpGeI64(..) | Instruction::NegI64(_) | Instruction::I64ToF64(_) => {
+            Instruction::AddI64(..)
+            | Instruction::SubI64(..)
+            | Instruction::MulI64(..)
+            | Instruction::RemI64(..)
+            | Instruction::BandI64(..)
+            | Instruction::CmpLtI64(..)
+            | Instruction::CmpGtI64(..)
+            | Instruction::CmpLeI64(..)
+            | Instruction::CmpGeI64(..)
+            | Instruction::NegI64(_)
+            | Instruction::I64ToF64(_) => {
                 panic!("integer arithmetic is lowered by the Cranelift backend only")
             }
             // -- IsType: inline tag checks for primitives, class ptr for objects --

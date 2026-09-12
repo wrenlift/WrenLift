@@ -2079,7 +2079,17 @@ impl<'a> MirWasmEmitter<'a> {
             Instruction::ClassIs(..) | Instruction::ObjectIs(..) | Instruction::ClosureFnIs(..) => {
                 return Err("speculation guards are not lowered to wasm".into());
             }
-            Instruction::AddI64(..) | Instruction::SubI64(..) | Instruction::MulI64(..) | Instruction::RemI64(..) | Instruction::BandI64(..) | Instruction::CmpLtI64(..) | Instruction::CmpGtI64(..) | Instruction::CmpLeI64(..) | Instruction::CmpGeI64(..) | Instruction::NegI64(_) | Instruction::I64ToF64(_) => {
+            Instruction::AddI64(..)
+            | Instruction::SubI64(..)
+            | Instruction::MulI64(..)
+            | Instruction::RemI64(..)
+            | Instruction::BandI64(..)
+            | Instruction::CmpLtI64(..)
+            | Instruction::CmpGtI64(..)
+            | Instruction::CmpLeI64(..)
+            | Instruction::CmpGeI64(..)
+            | Instruction::NegI64(_)
+            | Instruction::I64ToF64(_) => {
                 return Err("integer arithmetic is not lowered to wasm".into());
             }
             Instruction::SubscriptGet { receiver, args } => {

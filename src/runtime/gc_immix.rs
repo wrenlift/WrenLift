@@ -87,7 +87,11 @@ fn trigger_floor_bytes() -> usize {
 /// to tune.
 fn growth_factor() -> usize {
     static CACHED: OnceLock<usize> = OnceLock::new();
-    *CACHED.get_or_init(|| env_usize("WLIFT_GC_GROWTH").unwrap_or(DEFAULT_GROWTH).max(1))
+    *CACHED.get_or_init(|| {
+        env_usize("WLIFT_GC_GROWTH")
+            .unwrap_or(DEFAULT_GROWTH)
+            .max(1)
+    })
 }
 
 /// `WLIFT_GC_STRESS`: collect at every poll. Diagnostic only; the bump
@@ -597,12 +601,7 @@ impl ImmixGc {
 
     /// Mark everything a word range might point at: raw addresses and
     /// NaN-boxed object payloads that land inside an allocation.
-    fn scan_range_conservative(
-        &self,
-        lo: usize,
-        hi: usize,
-        gray_stack: &mut Vec<*mut ObjHeader>,
-    ) {
+    fn scan_range_conservative(&self, lo: usize, hi: usize, gray_stack: &mut Vec<*mut ObjHeader>) {
         let word = std::mem::size_of::<usize>();
         let mut p = lo.next_multiple_of(word);
         while p + word <= hi {
@@ -918,7 +917,11 @@ impl GcAllocator for ImmixGc {
             std::ptr::null_mut()
         };
         unsafe {
-            p.write(ObjInstance::new_with_fields(class, num_fields as u32, fields));
+            p.write(ObjInstance::new_with_fields(
+                class,
+                num_fields as u32,
+                fields,
+            ));
         }
         p
     }
@@ -999,7 +1002,11 @@ mod tests {
         for _ in 0..10_000 {
             let p = gc.alloc_range(0.0, 1.0, false) as usize;
             let size = std::mem::size_of::<ObjRange>().next_multiple_of(QUANTUM);
-            assert_eq!(p / LINE_SIZE, (p + size - 1) / LINE_SIZE, "straddles a line");
+            assert_eq!(
+                p / LINE_SIZE,
+                (p + size - 1) / LINE_SIZE,
+                "straddles a line"
+            );
             assert!(p != last);
             last = p;
         }
@@ -1033,7 +1040,10 @@ mod tests {
         assert_eq!(f % LINE_SIZE, 0);
         let s = gc.alloc_string("x".to_string()) as usize;
         let fiber_lines = std::mem::size_of::<ObjFiber>().div_ceil(LINE_SIZE);
-        assert!(s >= f + fiber_lines * LINE_SIZE, "small object packed into a span's tail line");
+        assert!(
+            s >= f + fiber_lines * LINE_SIZE,
+            "small object packed into a span's tail line"
+        );
     }
 
     #[test]
@@ -1080,18 +1090,31 @@ mod tests {
         let fiber = gc.alloc_fiber() as usize;
         let size = std::mem::size_of::<ObjRange>();
         for off in [0, 8, size - 1] {
-            assert_eq!(gc.containing_allocation(small + off).map(|h| h as usize), Some(small));
+            assert_eq!(
+                gc.containing_allocation(small + off).map(|h| h as usize),
+                Some(small)
+            );
         }
         let fsize = std::mem::size_of::<ObjFiber>();
         for off in [0, 200, fsize - 1] {
-            assert_eq!(gc.containing_allocation(fiber + off).map(|h| h as usize), Some(fiber));
+            assert_eq!(
+                gc.containing_allocation(fiber + off).map(|h| h as usize),
+                Some(fiber)
+            );
         }
         // A span owns its reserved lines end to end; addresses outside
         // the heap resolve to nothing.
         let span_end = fiber + fsize.div_ceil(LINE_SIZE) * LINE_SIZE;
-        assert_eq!(gc.containing_allocation(span_end - 1).map(|h| h as usize), Some(fiber));
+        assert_eq!(
+            gc.containing_allocation(span_end - 1).map(|h| h as usize),
+            Some(fiber)
+        );
         assert_eq!(gc.containing_allocation(0x1000), None);
-        assert_eq!(gc.containing_allocation(small.wrapping_sub(1)).map(|h| h as usize), None);
+        assert_eq!(
+            gc.containing_allocation(small.wrapping_sub(1))
+                .map(|h| h as usize),
+            None
+        );
     }
 
     #[test]

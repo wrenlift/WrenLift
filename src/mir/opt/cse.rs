@@ -198,9 +198,9 @@ fn make_key(inst: &Instruction, replacements: &HashMap<ValueId, ValueId>) -> Opt
         Instruction::GuardClass(_, sym) | Instruction::IsType(_, sym) => {
             key.push(sym.index() as u64);
         }
-        Instruction::ClassIs(_, p) | Instruction::ObjectIs(_, p) | Instruction::ClosureFnIs(_, p) => {
-            key.push(*p as u64)
-        }
+        Instruction::ClassIs(_, p)
+        | Instruction::ObjectIs(_, p)
+        | Instruction::ClosureFnIs(_, p) => key.push(*p as u64),
         Instruction::MakeRange(_, _, incl) => key.push(*incl as u64),
         Instruction::MathUnaryF64(op, _) => key.push(*op as u64),
         Instruction::MathBinaryF64(op, _, _) => key.push(*op as u64),

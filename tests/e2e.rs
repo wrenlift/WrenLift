@@ -4459,7 +4459,10 @@ System.print(Bench.escapes(20000))
 // ===========================================================================
 
 /// Run `source` with an error callback and return (result, output, errors).
-fn run_collecting_errors(source: &str, mode: ExecutionMode) -> (InterpretResult, String, Vec<String>) {
+fn run_collecting_errors(
+    source: &str,
+    mode: ExecutionMode,
+) -> (InterpretResult, String, Vec<String>) {
     use std::sync::Arc;
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = errors.clone();
@@ -4493,11 +4496,25 @@ System.print("after")
 "#;
     for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
         let (result, output, errors) = run_collecting_errors(src, mode);
-        assert!(matches!(result, InterpretResult::RuntimeError), "{:?}", mode);
+        assert!(
+            matches!(result, InterpretResult::RuntimeError),
+            "{:?}",
+            mode
+        );
         assert_eq!(output.trim(), "before", "{:?}", mode);
         assert_eq!(errors.len(), 1, "{:?}: {:?}", mode, errors);
-        assert!(errors[0].contains("Right operand must be a string."), "{:?}: {}", mode, errors[0]);
-        assert!(errors[0].contains("stack trace"), "{:?}: {}", mode, errors[0]);
+        assert!(
+            errors[0].contains("Right operand must be a string."),
+            "{:?}: {}",
+            mode,
+            errors[0]
+        );
+        assert!(
+            errors[0].contains("stack trace"),
+            "{:?}: {}",
+            mode,
+            errors[0]
+        );
     }
 }
 
@@ -4517,7 +4534,12 @@ System.print("done")
 "#;
     for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
         let (result, output, errors) = run_collecting_errors(src, mode);
-        assert!(matches!(result, InterpretResult::Success), "{:?}: {:?}", mode, errors);
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}",
+            mode,
+            errors
+        );
         assert_eq!(errors, Vec::<String>::new(), "{:?}", mode);
         assert_eq!(
             output.trim(),
@@ -4780,10 +4802,16 @@ System.print(K.neg())
 System.print(K.mixed())
 System.print(1 / K.negProd())
 "#;
-    let expected = "-0\n-7\n6\n4.2391158275216e+28\n4498500\n3\n1500\n10\n1011574997.4389\n-infinity";
+    let expected =
+        "-0\n-7\n6\n4.2391158275216e+28\n4498500\n3\n1500\n10\n1011574997.4389\n-infinity";
     for mode in [ExecutionMode::Interpreter, ExecutionMode::Tiered] {
         let (result, output, errors) = run_collecting_errors(src, mode);
-        assert!(matches!(result, InterpretResult::Success), "{:?}: {:?}", mode, errors);
+        assert!(
+            matches!(result, InterpretResult::Success),
+            "{:?}: {:?}",
+            mode,
+            errors
+        );
         assert_eq!(output.trim(), expected, "{:?}", mode);
     }
 }

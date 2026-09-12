@@ -741,12 +741,18 @@ impl VM {
         let var_sources = resolve_result.module_var_sources.clone();
 
         // 6. Serialize.
-        crate::serialize::emit(&interner, &module_mir, &var_names, &var_sources, &new_layouts)
-            .map_err(|e| {
-                crate::diagnostics::Diagnostic::error(format!("failed to emit .wlbc: {}", e))
-                    .eprint_no_source();
-                InterpretResult::CompileError
-            })
+        crate::serialize::emit(
+            &interner,
+            &module_mir,
+            &var_names,
+            &var_sources,
+            &new_layouts,
+        )
+        .map_err(|e| {
+            crate::diagnostics::Diagnostic::error(format!("failed to emit .wlbc: {}", e))
+                .eprint_no_source();
+            InterpretResult::CompileError
+        })
     }
 
     /// Load and execute a module from a `.wlbc` bytecode cache.
@@ -1963,13 +1969,11 @@ impl VM {
             // the entry-or-insert idiom leaves them alone.
             let class_name_str = self.interner.resolve(class_mir.name).to_string();
             let total_fields = (class_mir.num_fields + inherited_fields) as usize;
-            self.field_layouts
-                .entry(class_name_str)
-                .or_insert_with(|| {
-                    (0..total_fields)
-                        .map(|i| format!("__inherited_slot_{}", i))
-                        .collect()
-                });
+            self.field_layouts.entry(class_name_str).or_insert_with(|| {
+                (0..total_fields)
+                    .map(|i| format!("__inherited_slot_{}", i))
+                    .collect()
+            });
 
             // Register each method's MIR and bind to the class
             for method_mir in class_mir.methods {
@@ -2975,7 +2979,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "meta".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["Meta".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["Meta".to_string()],
+                    ),
                 );
                 true
             }
@@ -2984,7 +2992,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "random".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["Random".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["Random".to_string()],
+                    ),
                 );
                 true
             }
@@ -2994,7 +3006,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "fs".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["FS".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["FS".to_string()],
+                    ),
                 );
                 true
             }
@@ -3004,7 +3020,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "os".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["OS".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["OS".to_string()],
+                    ),
                 );
                 true
             }
@@ -3013,7 +3033,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "time".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["TimeCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["TimeCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3023,7 +3047,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "hash".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["HashCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["HashCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3033,7 +3061,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "crypto".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["CryptoCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["CryptoCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3043,7 +3075,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "zip".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["ZipCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["ZipCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3053,7 +3089,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "socket".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["SocketCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["SocketCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3062,7 +3102,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "io".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["IoCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["IoCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3072,7 +3116,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "http".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["HttpCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["HttpCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3082,7 +3130,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "proc".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["ProcCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["ProcCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3091,7 +3143,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "regex".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["RegexCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["RegexCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3100,7 +3156,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "uuid".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["UuidCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["UuidCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3109,7 +3169,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "toml".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["TomlCore".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["TomlCore".to_string()],
+                    ),
                 );
                 true
             }
@@ -3118,7 +3182,11 @@ impl VM {
                 let class_value = Value::object(class as *mut u8);
                 self.engine.modules.insert(
                     "hatch".to_string(),
-                    super::engine::ModuleEntry::new(super::engine::FuncId(u32::MAX), vec![class_value], vec!["Hatch".to_string()]),
+                    super::engine::ModuleEntry::new(
+                        super::engine::FuncId(u32::MAX),
+                        vec![class_value],
+                        vec!["Hatch".to_string()],
+                    ),
                 );
                 true
             }
@@ -4096,8 +4164,8 @@ impl VM {
         let mut on_chain = vec![false; fibers.len()];
         // Walk the running chain from the innermost fiber outward.
         let mut start = probe;
-        let mut cur = krio_fiber::current_fiber_id()
-            .and_then(|id| fibers.iter().position(|f| f.0 == id));
+        let mut cur =
+            krio_fiber::current_fiber_id().and_then(|id| fibers.iter().position(|f| f.0 == id));
         while let Some(i) = cur {
             on_chain[i] = true;
             let (_, lo, hi, _, caller_sp) = fibers[i];
@@ -4120,7 +4188,11 @@ impl VM {
             if on_chain[i] || saved_sp == 0 {
                 continue;
             }
-            let s = if saved_sp >= lo && saved_sp < hi { saved_sp } else { lo };
+            let s = if saved_sp >= lo && saved_sp < hi {
+                saved_sp
+            } else {
+                lo
+            };
             ranges.push((s, hi));
         }
         ranges

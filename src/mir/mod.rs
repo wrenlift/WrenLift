@@ -1179,7 +1179,6 @@ pub fn osr_reachable_blocks(func: &MirFunction, start: BlockId) -> HashSet<usize
     reachable
 }
 
-
 // ---------------------------------------------------------------------------
 // CLIF-style formatting helpers
 // ---------------------------------------------------------------------------

@@ -336,12 +336,10 @@ fn int_binop(
     op: impl Fn(u32, u32) -> u32,
 ) -> Option<ConstVal> {
     match (constants.get(&a), constants.get(&b)) {
-        (Some(ConstVal::Num(x)), Some(ConstVal::Num(y))) => Some(ConstVal::Num(
-            op(
-                crate::runtime::value::Value::num_to_u32_wrapping(*x),
-                crate::runtime::value::Value::num_to_u32_wrapping(*y),
-            ) as f64,
-        )),
+        (Some(ConstVal::Num(x)), Some(ConstVal::Num(y))) => Some(ConstVal::Num(op(
+            crate::runtime::value::Value::num_to_u32_wrapping(*x),
+            crate::runtime::value::Value::num_to_u32_wrapping(*y),
+        ) as f64)),
         _ => None,
     }
 }

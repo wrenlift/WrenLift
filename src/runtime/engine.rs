@@ -431,7 +431,10 @@ fn mir_touches_module_vars(mir: &MirFunction) -> bool {
     use crate::mir::Instruction;
     mir.blocks.iter().any(|b| {
         b.instructions.iter().any(|(_, i)| {
-            matches!(i, Instruction::GetModuleVar(_) | Instruction::SetModuleVar(..))
+            matches!(
+                i,
+                Instruction::GetModuleVar(_) | Instruction::SetModuleVar(..)
+            )
         })
     })
 }
@@ -1437,13 +1440,20 @@ impl ExecutionEngine {
         ics: Vec<CallSiteIC>,
         live: Vec<usize>,
         hints: Option<Vec<crate::codegen::DevirtHint>>,
-    ) -> (Vec<CallSiteIC>, Vec<usize>, Option<Vec<crate::codegen::DevirtHint>>) {
+    ) -> (
+        Vec<CallSiteIC>,
+        Vec<usize>,
+        Option<Vec<crate::codegen::DevirtHint>>,
+    ) {
         use crate::mir::Instruction;
         let mut by_dst: HashMap<crate::mir::ValueId, usize> = HashMap::new();
         let mut idx = 0usize;
         for block in &authoritative.blocks {
             for (dst, inst) in &block.instructions {
-                if matches!(inst, Instruction::Call { .. } | Instruction::SuperCall { .. }) {
+                if matches!(
+                    inst,
+                    Instruction::Call { .. } | Instruction::SuperCall { .. }
+                ) {
                     by_dst.insert(*dst, idx);
                     idx += 1;
                 }
@@ -1454,7 +1464,10 @@ impl ExecutionEngine {
         let mut out_hints = hints.as_ref().map(|_| Vec::new());
         for block in &optimised.blocks {
             for (dst, inst) in &block.instructions {
-                if matches!(inst, Instruction::Call { .. } | Instruction::SuperCall { .. }) {
+                if matches!(
+                    inst,
+                    Instruction::Call { .. } | Instruction::SuperCall { .. }
+                ) {
                     match by_dst.get(dst) {
                         Some(&i) if i < ics.len() => {
                             out_ics.push(ics[i]);
@@ -2091,7 +2104,9 @@ impl ExecutionEngine {
         module: &str,
         idx: u32,
     ) -> Option<Arc<crate::mir::opt::sroa_loop::ScalarClass>> {
-        use crate::mir::opt::sroa_loop::{trivial_ctor_field_map, trivial_getter_field, ScalarClass};
+        use crate::mir::opt::sroa_loop::{
+            trivial_ctor_field_map, trivial_getter_field, ScalarClass,
+        };
         use crate::mir::Instruction;
         use crate::runtime::object::{Method, ObjClass, ObjHeader, ObjType};
         // A class slot is written once by the VM at install; any
@@ -2102,7 +2117,9 @@ impl ExecutionEngine {
             if m.as_str() != module {
                 continue;
             }
-            let Some(body) = self.functions.get(fid) else { continue };
+            let Some(body) = self.functions.get(fid) else {
+                continue;
+            };
             for block in &body.mir().blocks {
                 for (_, inst) in &block.instructions {
                     if let Instruction::SetModuleVar(slot, _) = inst {
@@ -2116,7 +2133,12 @@ impl ExecutionEngine {
         let entry = self.modules.get(module)?;
         let value = *entry.vars.get(idx as usize)?;
         if std::env::var_os("WLIFT_SROA_TRACE").is_some() {
-            eprintln!("sroa-trace: module {} slot {} is_object={}", module, idx, value.is_object());
+            eprintln!(
+                "sroa-trace: module {} slot {} is_object={}",
+                module,
+                idx,
+                value.is_object()
+            );
         }
         let ptr = value.as_object()?;
         let header = ptr as *const ObjHeader;
@@ -2136,8 +2158,12 @@ impl ExecutionEngine {
                         continue;
                     }
                     let fn_id = unsafe { (*(**closure).function).fn_id };
-                    let Some(mir) = self.get_mir(FuncId(fn_id)) else { continue };
-                    let Some(map) = trivial_ctor_field_map(&mir) else { continue };
+                    let Some(mir) = self.get_mir(FuncId(fn_id)) else {
+                        continue;
+                    };
+                    let Some(map) = trivial_ctor_field_map(&mir) else {
+                        continue;
+                    };
                     let nargs = mir.arity.saturating_sub(1) as usize;
                     let mut per_arg: Vec<Option<usize>> = vec![None; nargs];
                     let mut ok = true;
@@ -2164,7 +2190,9 @@ impl ExecutionEngine {
                         continue;
                     }
                     let fn_id = unsafe { (*(**closure).function).fn_id };
-                    let Some(mir) = self.get_mir(FuncId(fn_id)) else { continue };
+                    let Some(mir) = self.get_mir(FuncId(fn_id)) else {
+                        continue;
+                    };
                     if let Some(field) = trivial_getter_field(&mir) {
                         if field < num_fields {
                             getters.insert(sym, field);
@@ -2744,8 +2772,7 @@ impl ExecutionEngine {
             }
             Some(Arc::new(cha))
         };
-        let sroa_mir =
-            self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
+        let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
         let compile_mir = Self::build_compile_mir(&sroa_mir, tier, interner, profile.as_ref());
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
@@ -2789,9 +2816,9 @@ impl ExecutionEngine {
             );
         crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
         let compiled = match compiled_result {
-                Ok(compiled) => compiled,
-                Err(_) => return false,
-            };
+            Ok(compiled) => compiled,
+            Err(_) => return false,
+        };
         let native_meta = compiled.native_meta;
         // Use MIR analysis for leaf classification. Shadow frame push/pop
         // is handled by each dispatch path via metadata checks, so even if
@@ -2915,8 +2942,7 @@ impl ExecutionEngine {
         let devirt_hints = callsite_ic_ptrs
             .as_ref()
             .map(|ics| self.compute_devirt_hints(ics));
-        let sroa_mir =
-            self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
+        let sroa_mir = self.inline_known(id, &mir, sroa_mir, callsite_ic_ptrs.as_deref(), interner);
         let jit_code_base_raw = self.jit_code.as_ptr() as usize;
         let modvars_cell = self.modvars_cell_addr(id);
         let callee_purity = self.compute_callee_purity_map();
@@ -2981,35 +3007,36 @@ impl ExecutionEngine {
                 cha_for_codegen.clone(),
             );
             crate::codegen::cranelift_backend::cl::set_jit_modvars_cell(0);
-            let result = result.map_err(|e| {
-                if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
-                    eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
-                }
-                e
-            })
-            .ok()
-            .and_then(|artifact| {
-                let native_meta = artifact.native_meta;
-                let inline_safe =
-                    is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
-                artifact
-                    .code
-                    .into_executable()
-                    .map_err(|e| {
-                        if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
-                            eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
-                        }
-                        e
-                    })
-                    .ok()
-                    .map(|executable| CompilationResult::Compiled {
-                        id,
-                        tier,
-                        executable,
-                        native_meta,
-                        inline_safe,
-                    })
-            });
+            let result = result
+                .map_err(|e| {
+                    if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
+                        eprintln!("COMPILE ERR FuncId({}): {}", id.0, e);
+                    }
+                    e
+                })
+                .ok()
+                .and_then(|artifact| {
+                    let native_meta = artifact.native_meta;
+                    let inline_safe =
+                        is_mir_inline_safe(&compile_mir, tier) || !artifact.needs_shadow_frame;
+                    artifact
+                        .code
+                        .into_executable()
+                        .map_err(|e| {
+                            if std::env::var_os("WLIFT_JIT_DEBUG").is_some() {
+                                eprintln!("EXEC ERR FuncId({}): {}", id.0, e);
+                            }
+                            e
+                        })
+                        .ok()
+                        .map(|executable| CompilationResult::Compiled {
+                            id,
+                            tier,
+                            executable,
+                            native_meta,
+                            inline_safe,
+                        })
+                });
             if tier_trace_enabled() {
                 eprintln!(
                     "tier-trace: finish {:?} FuncId({}) {} success={}",

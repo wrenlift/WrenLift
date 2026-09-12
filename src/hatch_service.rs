@@ -791,7 +791,9 @@ fn run_curl(mut cmd: Command) -> Result<String, ServiceError> {
 }
 
 fn run_curl_with_stdin(mut cmd: Command, body: &str) -> Result<String, ServiceError> {
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(ServiceError::NoCurl),

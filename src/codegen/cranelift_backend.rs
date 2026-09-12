@@ -104,7 +104,10 @@ pub mod cl {
     }
 
     fn is_positive_power_of_two(c: f64) -> bool {
-        c > 0.0 && c.is_finite() && (c.to_bits() & ((1u64 << 52) - 1)) == 0 && c >= f64::MIN_POSITIVE
+        c > 0.0
+            && c.is_finite()
+            && (c.to_bits() & ((1u64 << 52) - 1)) == 0
+            && c >= f64::MIN_POSITIVE
     }
 
     fn emit_class_load_guarded(
@@ -1574,28 +1577,53 @@ pub mod cl {
                     .external_args
                     .iter()
                     .copied()
-                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
-                    .map(|v| mir.scalar_param_sources.get(&v).map(|(o, _)| o.0).unwrap_or(v.0))
+                    .chain(
+                        mir.blocks[target_block.0 as usize]
+                            .params
+                            .iter()
+                            .map(|(p, _)| *p),
+                    )
+                    .map(|v| {
+                        mir.scalar_param_sources
+                            .get(&v)
+                            .map(|(o, _)| o.0)
+                            .unwrap_or(v.0)
+                    })
                     .collect(),
                 live_in_num: layout
                     .external_args
                     .iter()
                     .copied()
-                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .chain(
+                        mir.blocks[target_block.0 as usize]
+                            .params
+                            .iter()
+                            .map(|(p, _)| *p),
+                    )
                     .map(|v| mir.speculated_num_params.contains(&v))
                     .collect(),
                 live_in_field: layout
                     .external_args
                     .iter()
                     .copied()
-                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .chain(
+                        mir.blocks[target_block.0 as usize]
+                            .params
+                            .iter()
+                            .map(|(p, _)| *p),
+                    )
                     .map(|v| mir.scalar_param_sources.get(&v).map(|(_, f)| *f))
                     .collect(),
                 live_in_int: layout
                     .external_args
                     .iter()
                     .copied()
-                    .chain(mir.blocks[target_block.0 as usize].params.iter().map(|(p, _)| *p))
+                    .chain(
+                        mir.blocks[target_block.0 as usize]
+                            .params
+                            .iter()
+                            .map(|(p, _)| *p),
+                    )
                     .map(|v| i64_params.contains(&v))
                     .collect(),
             });
@@ -2366,9 +2394,12 @@ pub mod cl {
             let args_ptr = builder.append_block_param(osr_entry, types::I64);
             let mut slot = 0i32;
             for vid in &layout.external_args {
-                let v = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, slot * VALUE_SIZE);
+                let v = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    slot * VALUE_SIZE,
+                );
                 slot += 1;
                 let v = if f64_params.contains(vid) {
                     builder.ins().bitcast(types::F64, MemFlags::new(), v)
@@ -2389,9 +2420,12 @@ pub mod cl {
             let target_block = &mir.blocks[layout.target_block.0 as usize];
             let mut args: Vec<BlockArg> = Vec::with_capacity(target_block.params.len());
             for (_, ty) in &target_block.params {
-                let v = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, slot * VALUE_SIZE);
+                let v = builder.ins().load(
+                    types::I64,
+                    MemFlags::trusted(),
+                    args_ptr,
+                    slot * VALUE_SIZE,
+                );
                 slot += 1;
                 let v = match ty {
                     MirType::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), v),
@@ -4217,7 +4251,9 @@ pub mod cl {
                         ));
                     for (i, a) in args.iter().enumerate() {
                         let v = get(a);
-                        builder.ins().stack_store(types::I64, v, stack_slot, (i * 8) as i32);
+                        builder
+                            .ins()
+                            .stack_store(types::I64, v, stack_slot, (i * 8) as i32);
                     }
                     let buf = builder.ins().stack_addr(types::I64, stack_slot, 0);
                     let count = builder.ins().iconst(types::I64, args.len() as i64);
@@ -5642,7 +5678,9 @@ pub mod cl {
                         ));
                     for (i, uv) in upvalues.iter().enumerate() {
                         let v = get(uv);
-                        builder.ins().stack_store(types::I64, v, slot, (i * 8) as i32);
+                        builder
+                            .ins()
+                            .stack_store(types::I64, v, slot, (i * 8) as i32);
                     }
                     let buf = builder.ins().stack_addr(types::I64, slot, 0);
                     let count = builder.ins().iconst(types::I64, n as i64);
@@ -6131,15 +6169,20 @@ pub mod cl {
                 let merge_block = builder.create_block();
                 builder.append_block_param(merge_block, types::I8);
                 let no = builder.ins().iconst(types::I8, 0);
-                builder
-                    .ins()
-                    .brif(is_obj, object_block, &[], merge_block, &[BlockArg::Value(no)]);
+                builder.ins().brif(
+                    is_obj,
+                    object_block,
+                    &[],
+                    merge_block,
+                    &[BlockArg::Value(no)],
+                );
                 builder.switch_to_block(object_block);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(v, ptr_mask);
-                let class = builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
+                let class =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj_ptr, HEADER_CLASS);
                 let expected = builder.ins().iconst(types::I64, *class_ptr as i64);
                 let hit = builder.ins().icmp(IntCC::Equal, class, expected);
                 builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);
@@ -6153,12 +6196,16 @@ pub mod cl {
             Instruction::RemI64(a, b) => Ok(Some(builder.ins().srem(get(a), get(b)))),
             Instruction::BandI64(a, b) => Ok(Some(builder.ins().band(get(a), get(b)))),
             Instruction::NegI64(a) => Ok(Some(builder.ins().ineg(get(a)))),
-            Instruction::CmpLtI64(a, b) => {
-                Ok(Some(builder.ins().icmp(IntCC::SignedLessThan, get(a), get(b))))
-            }
-            Instruction::CmpGtI64(a, b) => {
-                Ok(Some(builder.ins().icmp(IntCC::SignedGreaterThan, get(a), get(b))))
-            }
+            Instruction::CmpLtI64(a, b) => Ok(Some(builder.ins().icmp(
+                IntCC::SignedLessThan,
+                get(a),
+                get(b),
+            ))),
+            Instruction::CmpGtI64(a, b) => Ok(Some(builder.ins().icmp(
+                IntCC::SignedGreaterThan,
+                get(a),
+                get(b),
+            ))),
             Instruction::CmpLeI64(a, b) => Ok(Some(builder.ins().icmp(
                 IntCC::SignedLessThanOrEqual,
                 get(a),
@@ -6187,9 +6234,13 @@ pub mod cl {
                 let merge_block = builder.create_block();
                 builder.append_block_param(merge_block, types::I8);
                 let no = builder.ins().iconst(types::I8, 0);
-                builder
-                    .ins()
-                    .brif(is_obj, object_block, &[], merge_block, &[BlockArg::Value(no)]);
+                builder.ins().brif(
+                    is_obj,
+                    object_block,
+                    &[],
+                    merge_block,
+                    &[BlockArg::Value(no)],
+                );
                 builder.switch_to_block(object_block);
                 let ptr_mask = builder.ins().iconst(types::I64, PTR_MASK as i64);
                 let obj_ptr = builder.ins().band(v, ptr_mask);
@@ -6209,12 +6260,10 @@ pub mod cl {
                     &[BlockArg::Value(no)],
                 );
                 builder.switch_to_block(closure_block);
-                let function = builder.ins().load(
-                    types::I64,
-                    MemFlags::trusted(),
-                    obj_ptr,
-                    CLOSURE_FUNCTION,
-                );
+                let function =
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), obj_ptr, CLOSURE_FUNCTION);
                 let expected = builder.ins().iconst(types::I64, *fn_ptr as i64);
                 let hit = builder.ins().icmp(IntCC::Equal, function, expected);
                 builder.ins().jump(merge_block, &[BlockArg::Value(hit)]);

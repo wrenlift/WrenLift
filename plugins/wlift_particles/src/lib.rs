@@ -51,7 +51,9 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use wlift_abi::{runtime_error, set_return, slot, typed_array_bytes_mut, typed_array_kind, Value, WrenVm};
+use wlift_abi::{
+    runtime_error, set_return, slot, typed_array_bytes_mut, typed_array_kind, Value, WrenVm,
+};
 
 /// Plugin ABI handshake — see wlift_gpu / wlift_physics for the
 /// rationale. Native-only; the wasm static-link path can't drift.
@@ -83,9 +85,7 @@ unsafe fn req_f32_slice<'a>(
     // SAFETY: typed_array_bytes_mut returned an F32 array's backing
     // buffer (verified by the kind check just above); the byte ptr is
     // 4-byte aligned and `len` reflects the f32 element count.
-    Some(unsafe {
-        core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, len)
-    })
+    Some(unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut f32, len) })
 }
 
 unsafe fn req_u32(vm: *mut WrenVm, idx: u32, label: &str, what: &str) -> Option<u32> {
@@ -168,25 +168,28 @@ pub unsafe extern "C" fn wlift_particles_integrate(vm: *mut WrenVm) {
     if deaths.len() < 2 {
         runtime_error(
             vm,
-            &format!("{}: `deaths` must have at least 2 floats for the sentinel header.", label),
+            &format!(
+                "{}: `deaths` must have at least 2 floats for the sentinel header.",
+                label
+            ),
         );
         return;
     }
 
-    let dt          = params[0];
-    let gx          = params[1];
-    let gy          = params[2];
-    let gz          = params[3];
-    let drag        = params[4];
-    let kp_on       = params[5] != 0.0;
-    let kp_y        = params[6];
+    let dt = params[0];
+    let gx = params[1];
+    let gy = params[2];
+    let gz = params[3];
+    let drag = params[4];
+    let kp_on = params[5] != 0.0;
+    let kp_y = params[6];
 
     // Pre-multiply gravity and drag by dt once — saves four
     // multiplications per particle vs the textbook
     // `v += g*dt - v*drag*dt` form.
-    let gxdt   = gx * dt;
-    let gydt   = gy * dt;
-    let gzdt   = gz * dt;
+    let gxdt = gx * dt;
+    let gydt = gy * dt;
+    let gzdt = gz * dt;
     let damp_dt = 1.0 - drag * dt;
 
     let mut live: usize = live_count_arg as usize;
@@ -216,7 +219,7 @@ pub unsafe extern "C" fn wlift_particles_integrate(vm: *mut WrenVm) {
         if age * inv_life >= 1.0 {
             if death_count < deaths_cap {
                 let d_off = 2 + death_count * 3;
-                deaths[d_off]     = sim[off];
+                deaths[d_off] = sim[off];
                 deaths[d_off + 1] = sim[off + 1];
                 deaths[d_off + 2] = sim[off + 2];
                 death_count += 1;
@@ -265,7 +268,7 @@ pub unsafe extern "C" fn wlift_particles_integrate(vm: *mut WrenVm) {
             let hz = pz + (nz - pz) * u;
             if death_count < deaths_cap {
                 let d_off = 2 + death_count * 3;
-                deaths[d_off]     = hx;
+                deaths[d_off] = hx;
                 deaths[d_off + 1] = kp_y;
                 deaths[d_off + 2] = hz;
                 death_count += 1;
@@ -284,7 +287,7 @@ pub unsafe extern "C" fn wlift_particles_integrate(vm: *mut WrenVm) {
         sim[off + 3] = nvx;
         sim[off + 4] = nvy;
         sim[off + 5] = nvz;
-        sim[off]     = nx;
+        sim[off] = nx;
         sim[off + 1] = ny;
         sim[off + 2] = nz;
         sim[off + 6] = age;
@@ -379,8 +382,8 @@ pub unsafe extern "C" fn wlift_particles_pack(vm: *mut WrenVm) {
     let cd2 = params[6];
     let cd3 = params[7];
     let sx_base = params[8];
-    let sy      = params[9];
-    let rot     = params[10];
+    let sy = params[9];
+    let rot = params[10];
     let width_scale_on = params[11] != 0.0;
     let ref_dist = params[12];
     let ex = params[13];
@@ -388,7 +391,7 @@ pub unsafe extern "C" fn wlift_particles_pack(vm: *mut WrenVm) {
     let ez = params[15];
 
     let mut sim_off: usize = 0;
-    let mut off:     usize = 0;
+    let mut off: usize = 0;
     let mut i: usize = 0;
     while i < live {
         let age = sim[sim_off + 6];
@@ -399,8 +402,12 @@ pub unsafe extern "C" fn wlift_particles_pack(vm: *mut WrenVm) {
         // spawned slot in the same frame may briefly have t very near
         // 0 with floating noise.
         let mut t = age * inv_life;
-        if t < 0.0 { t = 0.0; }
-        if t > 1.0 { t = 1.0; }
+        if t < 0.0 {
+            t = 0.0;
+        }
+        if t > 1.0 {
+            t = 1.0;
+        }
 
         let r = cs0 + cd0 * t;
         let g = cs1 + cd1 * t;
@@ -421,31 +428,35 @@ pub unsafe extern "C" fn wlift_particles_pack(vm: *mut WrenVm) {
             // for the rationale (matches the legacy Wren behaviour
             // exactly so the visual output doesn't shift).
             let mut lin = dist / ref_dist;
-            if lin > 1.0 { lin = 1.0; }
+            if lin > 1.0 {
+                lin = 1.0;
+            }
             let mut scale = lin.sqrt();
-            if scale < 0.22 { scale = 0.22; }
+            if scale < 0.22 {
+                scale = 0.22;
+            }
             sx = sx_base * scale;
             // Atmospheric alpha fade: closer streaks at 65% of base,
             // reference-distance streaks at full alpha.
             a = a * (0.65 + 0.35 * lin);
         }
 
-        inst[off]      = px;
-        inst[off + 1]  = py;
-        inst[off + 2]  = pz;
-        inst[off + 3]  = sx;
-        inst[off + 4]  = sy;
+        inst[off] = px;
+        inst[off + 1] = py;
+        inst[off + 2] = pz;
+        inst[off + 3] = sx;
+        inst[off + 4] = sy;
         // Slots 5..8 (UV-rect 0,0,1,1), 14 (lodIndex 0), 15 (pad 0)
         // are pre-filled at construct in the Wren wrapper.
-        inst[off + 9]  = r;
+        inst[off + 9] = r;
         inst[off + 10] = g;
         inst[off + 11] = b;
         inst[off + 12] = a;
         inst[off + 13] = rot;
 
         sim_off += 8;
-        off     += 16;
-        i       += 1;
+        off += 16;
+        i += 1;
     }
 
     set_return(vm, Value::num(live as f64));

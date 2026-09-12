@@ -263,7 +263,9 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
             let mut visit = |target: BlockId, args: &[ValueId]| {
                 let params = &func.blocks[target.0 as usize].params;
                 for (i, arg) in args.iter().enumerate() {
-                    let Some(&(p, _)) = params.get(i) else { continue };
+                    let Some(&(p, _)) = params.get(i) else {
+                        continue;
+                    };
                     if !param_candidates.contains(&p) {
                         continue;
                     }
@@ -328,7 +330,9 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
                 let mut visit = |target: BlockId, args: &[ValueId]| {
                     let params = &func.blocks[target.0 as usize].params;
                     for (i, arg) in args.iter().enumerate() {
-                        let Some(&(p, _)) = params.get(i) else { continue };
+                        let Some(&(p, _)) = params.get(i) else {
+                            continue;
+                        };
                         if !param_candidates.contains(&p) || dropped_params.contains(&p) {
                             continue;
                         }
@@ -488,7 +492,10 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
             eprintln!(
                 "sroa-trace: round: allocs={} params={} escaped={:?} dropped={:?}",
                 scalars.len(),
-                round.values().filter(|s| matches!(s, Scalar::Param { .. })).count(),
+                round
+                    .values()
+                    .filter(|s| matches!(s, Scalar::Param { .. }))
+                    .count(),
                 escaped,
                 dropped_params
             );

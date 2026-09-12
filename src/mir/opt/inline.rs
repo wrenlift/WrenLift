@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::MirPass;
 use crate::intern::{Interner, SymbolId};
-use crate::mir::{BlockId, Instruction, MathBinaryOp, MathUnaryOp, MirFunction, Terminator, ValueId};
+use crate::mir::{
+    BlockId, Instruction, MathBinaryOp, MathUnaryOp, MirFunction, Terminator, ValueId,
+};
 
 pub struct TypeSpecialize {
     /// Maps method SymbolId → unary math intrinsic for known-Num receivers.
