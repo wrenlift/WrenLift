@@ -158,6 +158,7 @@ pub enum Token {
 
     // -- Literals -----------------------------------------------------------
     /// Number: integer, float, hex, scientific notation.
+    #[allow(clippy::duplicated_attributes)]
     #[regex(r"0[xX][0-9a-fA-F]+", priority = 3)]
     #[regex(r"[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?", priority = 2)]
     Number,

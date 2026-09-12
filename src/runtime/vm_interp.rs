@@ -50,6 +50,24 @@ fn env_flag(cell: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
 }
 
 #[inline]
+fn env_trace_native_entry() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "WLIFT_TRACE_NATIVE_ENTRY")
+}
+
+#[inline]
+fn env_trace_ic_jit() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "WLIFT_TRACE_IC_JIT")
+}
+
+#[inline]
+fn env_trace_jit_call() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "WLIFT_TRACE_JIT_CALL")
+}
+
+#[inline]
 fn env_osr_trace() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     env_flag(&CACHED, "WLIFT_OSR_TRACE")
@@ -370,7 +388,7 @@ fn try_run_root_frame_native(
     });
 
     vm.engine.note_native_entry(func_id);
-    if { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); env_flag(&ON, "WLIFT_TRACE_NATIVE_ENTRY") } {
+    if env_trace_native_entry() {
         let name = vm
             .engine
             .get_mir(func_id)
@@ -2413,7 +2431,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             // route a not-actually-alloc-free callee
                             // into the IC fast path.
                             if recv_class == ic.class && is_leaf {
-                                if { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); env_flag(&ON, "WLIFT_TRACE_IC_JIT") } {
+                                if env_trace_ic_jit() {
                                     let fn_idx_ic = ic.func_id as usize;
                                     let name = vm
                                         .engine
@@ -2739,7 +2757,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 #[cfg(not(feature = "cranelift"))]
                                 let jit_dispatch_ok = !jit_ptr.is_null()
                                     && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-                                if { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); env_flag(&ON, "WLIFT_TRACE_JIT_CALL") } {
+                                if env_trace_jit_call() {
                                     eprintln!(
                                         "JIT-CHECK: fn_idx={} argc={} jit_null={} ok={}",
                                         fn_idx,

@@ -3646,6 +3646,7 @@ pub mod cl {
         Ok(builder.block_params(merge)[0])
     }
 
+    #[allow(clippy::type_complexity)] // the runtime-fn resolver closure type is shared verbatim
     fn emit_inline_boxed_binop(
         builder: &mut FunctionBuilder,
         module: &mut dyn Module,

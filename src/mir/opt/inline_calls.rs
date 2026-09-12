@@ -385,7 +385,7 @@ fn inline_site(
     func: &mut MirFunction,
     dst: ValueId,
     sites: &HashMap<ValueId, KnownCallee>,
-    mut slow: Option<&mut SlowCopy>,
+    slow: Option<&mut SlowCopy>,
 ) {
     let Some((block, k)) = locate(func, dst) else {
         return;
@@ -434,7 +434,7 @@ fn inline_site(
         false_args: Vec::new(),
     };
 
-    let slow_term = match slow.as_deref_mut() {
+    let slow_term = match slow {
         None => Terminator::Branch {
             target: post,
             args: vec![slow_result],

@@ -77,8 +77,8 @@ impl Well512 {
 
     fn from_bytes(data: &[u8]) -> Self {
         let mut state = [0u32; STATE_SIZE];
-        for (i, chunk) in data[..64].chunks_exact(4).enumerate() {
-            state[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (slot, chunk) in state.iter_mut().zip(data[..64].as_chunks::<4>().0) {
+            *slot = u32::from_le_bytes(*chunk);
         }
         let index = u32::from_le_bytes([data[64], data[65], data[66], data[67]]);
         Self { state, index }

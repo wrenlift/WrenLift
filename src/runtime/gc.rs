@@ -2025,7 +2025,7 @@ const MAX_VALID_HEAP_ADDR: usize = usize::MAX;
 
 fn is_valid_obj_ptr(header: *mut ObjHeader) -> bool {
     let addr = header as usize;
-    addr >= MIN_VALID_HEAP_ADDR && addr < MAX_VALID_HEAP_ADDR
+    (MIN_VALID_HEAP_ADDR..MAX_VALID_HEAP_ADDR).contains(&addr)
 }
 
 pub(super) fn mark_value(val: Value, gray_stack: &mut Vec<*mut ObjHeader>) {

@@ -1175,7 +1175,7 @@ fn build_recursive(
     if let Ok(bytes) = &result {
         state.cache.insert(canonical, bytes.clone());
     }
-    return result;
+    result
 }
 
 #[cfg(feature = "host")]

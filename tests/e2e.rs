@@ -4463,11 +4463,13 @@ fn run_collecting_errors(source: &str, mode: ExecutionMode) -> (InterpretResult,
     use std::sync::Arc;
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = errors.clone();
-    let mut config = VMConfig::default();
-    config.error_fn = Some(Box::new(move |_, _, _, msg| {
-        sink.lock().unwrap().push(msg.to_string());
-    }));
-    config.execution_mode = mode;
+    let config = VMConfig {
+        error_fn: Some(Box::new(move |_, _, _, msg| {
+            sink.lock().unwrap().push(msg.to_string());
+        })),
+        execution_mode: mode,
+        ..VMConfig::default()
+    };
     let (result, output, _) = run_with_config(source, config);
     let errors = errors.lock().unwrap().clone();
     (result, output, errors)

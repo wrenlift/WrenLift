@@ -5250,8 +5250,7 @@ impl VM {
                 .map(|m| m.arity as usize)
                 .unwrap_or(args.len());
             let mut jit_args = [Value::null(); 16];
-            let n;
-            if args.len() < body_arity {
+            let n = if args.len() < body_arity {
                 // Caller didn't supply a receiver but body's arity
                 // expects one. Plug the closure pointer in slot 0
                 // (the historical `Method::Closure` shape).
@@ -5261,14 +5260,14 @@ impl VM {
                     jit_args[i + 1] =
                         crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
                 }
-                n = args.len() + 1;
+                args.len() + 1
             } else {
                 #[allow(clippy::needless_range_loop)]
                 for i in 0..args.len() {
                     jit_args[i] = crate::codegen::runtime_fns::jit_root_at(root_len_before + 2 + i);
                 }
-                n = args.len();
-            }
+                args.len()
+            };
             let result_bits = unsafe { super::vm_interp::call_jit_fn_pub(aot_fn, &jit_args[..n]) };
             crate::codegen::runtime_fns::set_jit_context(saved_ctx);
             crate::codegen::runtime_fns::jit_roots_restore_len(root_len_before);

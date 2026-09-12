@@ -68,9 +68,7 @@ pub fn trivial_ctor_field_map(mir: &MirFunction) -> Option<HashMap<usize, usize>
                     return None;
                 }
                 let val = resolve(*val, &aliases);
-                let Some(&arg) = params.get(&val) else {
-                    return None;
-                };
+                let arg = *params.get(&val)?;
                 if arg == 0 || fields.contains_key(&(*field as usize)) {
                     return None;
                 }
@@ -299,8 +297,8 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
                             // this param cannot be scalar.
                             if !param_candidates.contains(&arg_root) {
                                 dropped_params.insert(p);
-                            } else if !param_class.contains_key(&p) {
-                                param_class.insert(p, None);
+                            } else {
+                                param_class.entry(p).or_insert(None);
                             }
                         }
                     }
@@ -544,6 +542,7 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
 
     // Getters -> field moves; allocations and aliases deleted.
     let nblocks = func.blocks.len();
+    #[allow(clippy::needless_range_loop)] // the body also allocates values on `func`
     for bi in 0..nblocks {
         let mut new_insts = Vec::with_capacity(func.blocks[bi].instructions.len());
         let old = std::mem::take(&mut func.blocks[bi].instructions);
@@ -632,9 +631,9 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
             _ => {}
         }
     }
-    for bi in 0..nblocks {
+    for block in func.blocks.iter_mut() {
         let mut new_params = Vec::new();
-        for (p, ty) in std::mem::take(&mut func.blocks[bi].params) {
+        for (p, ty) in std::mem::take(&mut block.params) {
             match split_params.get(&p) {
                 Some(fresh) => {
                     for nv in fresh {
@@ -644,7 +643,7 @@ pub fn scalar_replace_loop_objects(func: &mut MirFunction, resolve: &ClassResolv
                 None => new_params.push((p, ty)),
             }
         }
-        func.blocks[bi].params = new_params;
+        block.params = new_params;
     }
     for (bi, nv) in null_consts {
         func.blocks[bi]

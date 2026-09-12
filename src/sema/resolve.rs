@@ -367,8 +367,8 @@ impl<'a> Resolver<'a> {
         let mut index = local_idx;
         let mut is_local = true;
 
-        for scope_idx in (source_scope + 1)..=target_scope {
-            if self.scopes[scope_idx].kind == ScopeKind::Block {
+        for scope in &mut self.scopes[(source_scope + 1)..=target_scope] {
+            if scope.kind == ScopeKind::Block {
                 continue;
             }
             let info = UpvalueInfo {
@@ -376,7 +376,7 @@ impl<'a> Resolver<'a> {
                 is_local,
                 name,
             };
-            index = self.scopes[scope_idx].add_upvalue(info);
+            index = scope.add_upvalue(info);
             is_local = false;
         }
 

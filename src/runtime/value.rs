@@ -605,6 +605,7 @@ mod num_fmt_tests {
     use super::num_to_wren_string as f;
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn matches_reference_percent_14g() {
         assert_eq!(f(-0.0), "-0");
         assert_eq!(f(0.0), "0");
