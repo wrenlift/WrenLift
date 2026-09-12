@@ -75,9 +75,15 @@ pub fn jit_frame_entries() -> Vec<(usize, u32, usize)> {
     JIT_FRAME_STACK.with(|stack| stack.borrow().clone())
 }
 
+/// Trace switches read once: these gates sit on every dispatch.
+fn env_flag(cell: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_some())
+}
+
 #[inline(always)]
 fn trace_jit_ic(msg: impl FnOnce() -> String) {
-    if std::env::var_os("WLIFT_TRACE_JIT_IC").is_some() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if env_flag(&ON, "WLIFT_TRACE_JIT_IC") {
         eprintln!("{}", msg());
     }
 }
@@ -379,56 +385,61 @@ pub unsafe fn call_jit_with_shadow(
     func_id: crate::runtime::engine::FuncId,
     args: &[Value],
 ) -> u64 {
-    // Swap in the callee's module context for the duration of the
-    // JIT call. Any GetModuleVar op inside the callee resolves
-    // against the callee's own slots; without this swap, cross-
-    // module calls (e.g. a JIT'd hot loop calling `Expect.that`
-    // defined in a different module) read the CALLER's slot N,
-    // which silently produces Null and shows up later as
-    // "Null does not implement 'foo'".
-    // Fast path for intra-module calls: if the callee lives in the
-    // same module the caller's JIT context is already set up for,
-    // skip the lookup + mutate_jit_ctx + restore entirely. This is
-    // the common case for recursive / same-class method dispatch
-    // (fib, method_call, binary_trees benchmarks) and keeps the per-
-    // call overhead at ~zero. The cross-module swap only costs when
-    // we actually crossed a module boundary.
-    let cur_ctx = read_jit_ctx();
+    unsafe { call_jit_with_shadow_st(jit_state(), vm, fn_ptr, func_id, args) }
+}
+
+/// `call_jit_with_shadow` over an already fetched thread state.
+///
+/// Swaps in the callee's module context for the duration of the call
+/// so its `GetModuleVar` reads its own slots; a callee in the caller's
+/// module needs no swap, which is the common case.
+#[inline(always)]
+pub unsafe fn call_jit_with_shadow_st(
+    j: *mut JitThread,
+    vm: &crate::runtime::vm::VM,
+    fn_ptr: *const u8,
+    func_id: crate::runtime::engine::FuncId,
+    args: &[Value],
+) -> u64 {
+    let ctx = unsafe { &mut (*j).ctx };
     let callee_module = vm.engine.func_module(func_id);
     let same_module = match callee_module {
         Some(mn) => {
             let bytes = mn.as_bytes();
-            bytes.as_ptr() == cur_ctx.module_name && bytes.len() as u32 == cur_ctx.module_name_len
+            bytes.as_ptr() == ctx.module_name && bytes.len() as u32 == ctx.module_name_len
         }
         None => true,
     };
     if same_module {
-        return call_jit_cached(fn_ptr, args);
+        return unsafe { call_jit_cached_st(ctx, fn_ptr, args) };
     }
     // Cross-module call: swap context.
     let mod_name = callee_module.unwrap();
-    let saved_ctx = cur_ctx;
+    let saved_ctx = *ctx;
     if let Some(m) = vm.engine.modules.get(mod_name.as_str()) {
         let bytes = mod_name.as_bytes();
-        mutate_jit_ctx(|ctx| {
-            ctx.module_vars = m.vars.as_ptr() as *mut u64;
-            ctx.module_var_count = m.vars.len() as u32;
-            ctx.module_name = bytes.as_ptr();
-            ctx.module_name_len = bytes.len() as u32;
-            ctx.current_func_id = func_id.0 as u64;
-        });
+        ctx.module_vars = m.vars.as_ptr() as *mut u64;
+        ctx.module_var_count = m.vars.len() as u32;
+        ctx.module_name = bytes.as_ptr();
+        ctx.module_name_len = bytes.len() as u32;
+        ctx.current_func_id = func_id.0 as u64;
     }
-    let result = call_jit_cached(fn_ptr, args);
-    set_jit_context(saved_ctx);
+    let result = unsafe { call_jit_cached_st(ctx, fn_ptr, args) };
+    *unsafe { &mut (*j).ctx } = saved_ctx;
     result
 }
 
 #[inline(always)]
 unsafe fn call_jit_cached(fn_ptr: *const u8, args: &[Value]) -> u64 {
-    // Ensure x19 holds JitContext pointer for the JIT code.
+    unsafe { call_jit_cached_st(&mut (*jit_state()).ctx, fn_ptr, args) }
+}
+
+#[inline(always)]
+unsafe fn call_jit_cached_st(ctx: *mut JitContext, fn_ptr: *const u8, args: &[Value]) -> u64 {
+    // Ensure x20 holds the JitContext pointer for the JIT code.
     #[cfg(target_arch = "aarch64")]
     {
-        let ctx_ptr = jit_ctx_ptr() as u64;
+        let ctx_ptr = ctx as u64;
         core::arch::asm!(
             "mov x20, {ctx}",
             ctx = in(reg) ctx_ptr,
@@ -1149,19 +1160,19 @@ fn try_dispatch_callsite_ic(
             vm.engine.note_ic_hit(func_id);
             vm.engine.note_runtime_call_stats(|s| s.ic_kind6_hits += 1);
             // Direct field access via UnsafeCell — no 48-byte copy.
-            let saved_func_id = JIT_CTX.with(|c| unsafe {
-                let ctx = &mut *c.get();
+            let saved_func_id = unsafe {
+                let ctx = &mut (*jit_state()).ctx;
                 let old = ctx.current_func_id;
                 ctx.current_func_id = fn_idx as u64;
                 ctx.closure = ic.closure as *mut u8;
                 old
-            });
-            JIT_DEPTH.with(|d| d.set(depth + 1));
+            };
+            unsafe { (*jit_state()).depth = depth + 1 };
             let result = unsafe { call_jit_cached(live_ptr, args) };
-            JIT_DEPTH.with(|d| d.set(depth));
-            JIT_CTX.with(|c| unsafe {
-                (*c.get()).current_func_id = saved_func_id;
-            });
+            unsafe { (*jit_state()).depth = depth };
+            unsafe {
+                (*jit_state()).ctx.current_func_id = saved_func_id;
+            }
             Some(result)
         }
         _ => None,
@@ -1226,26 +1237,34 @@ impl Default for JitContext {
 // RefCell borrow-checking overhead on the hot path.
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// JIT context — UnsafeCell for zero-copy direct field access.
-    /// `Cell<JitContext>` copies 48 bytes on every get/set. UnsafeCell gives
-    /// direct pointer access with no copying — critical for the hot dispatch path.
-    static JIT_CTX: std::cell::UnsafeCell<JitContext> = const { std::cell::UnsafeCell::new(JitContext {
-        module_vars: std::ptr::null_mut(),
-        module_var_count: 0,
-        vm: std::ptr::null_mut(),
-        module_name: std::ptr::null(),
-        module_name_len: 0,
-        current_func_id: u32::MAX as u64,
-        closure: std::ptr::null_mut(),
-        defining_class: std::ptr::null_mut(),
-        jit_code_base: std::ptr::null(),
-        jit_code_len: 0,
-    }) };
+/// Everything a JIT dispatch helper touches per call, behind one
+/// thread-local: the context the compiled code reads, the root set and
+/// the native recursion depth. A helper fetches the address once with
+/// `jit_state` and works through it, because each thread-local access is
+/// an out-of-line lookup on macOS.
+pub struct JitThread {
+    pub ctx: JitContext,
+    pub roots: Vec<Value>,
+    pub depth: u32,
+}
 
-    /// JIT root set — UnsafeCell for zero-overhead Vec mutation.
-    /// SAFETY: single-threaded access within each thread (no concurrent borrows).
-    static JIT_ROOTS_STORE: std::cell::UnsafeCell<Vec<Value>> = const { std::cell::UnsafeCell::new(Vec::new()) };
+thread_local! {
+    static JIT: std::cell::UnsafeCell<JitThread> = const { std::cell::UnsafeCell::new(JitThread {
+        ctx: JitContext {
+            module_vars: std::ptr::null_mut(),
+            module_var_count: 0,
+            vm: std::ptr::null_mut(),
+            module_name: std::ptr::null(),
+            module_name_len: 0,
+            current_func_id: u32::MAX as u64,
+            closure: std::ptr::null_mut(),
+            defining_class: std::ptr::null_mut(),
+            jit_code_base: std::ptr::null(),
+            jit_code_len: 0,
+        },
+        roots: Vec::new(),
+        depth: 0,
+    }) };
 
     /// Flat shadow root stack — zero-alloc push/pop after warmup.
     static FLAT_SHADOW: std::cell::UnsafeCell<FlatShadowStack> =
@@ -1255,13 +1274,16 @@ thread_local! {
         }) };
 
 
-    /// JIT native recursion depth — guards against native stack overflow.
-    /// When depth exceeds MAX_JIT_DEPTH, calls fall back to interpreter dispatch.
-    static JIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-
     /// When true, all JIT dispatch is disabled (fall back to interpreter).
     /// Used by shadow check to run interpreter-only path for comparison.
     static JIT_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread's JIT state. Valid for the thread's lifetime; only this
+/// thread may touch it.
+#[inline(always)]
+pub fn jit_state() -> *mut JitThread {
+    JIT.with(|j| j.get())
 }
 
 #[inline(always)]
@@ -1301,13 +1323,13 @@ pub const MAX_JIT_DEPTH: u32 = 256;
 /// Read the current JIT native recursion depth.
 #[inline(always)]
 pub fn jit_depth() -> u32 {
-    JIT_DEPTH.with(|d| d.get())
+    unsafe { (*jit_state()).depth }
 }
 
 /// Set the JIT native recursion depth.
 #[inline(always)]
 pub fn set_jit_depth(depth: u32) {
-    JIT_DEPTH.with(|d| d.set(depth));
+    unsafe { (*jit_state()).depth = depth };
 }
 
 /// Check if JIT dispatch is disabled (for shadow check mode).
@@ -1337,25 +1359,33 @@ pub fn shadow_nonleaf_enabled() -> bool {
 /// Set up the JIT context before calling compiled code.
 #[inline(always)]
 pub fn set_jit_context(ctx: JitContext) {
-    JIT_CTX.with(|c| unsafe { *c.get() = ctx });
+    unsafe { (*jit_state()).ctx = ctx };
 }
 
 /// Read the current JIT context (zero-copy reference via UnsafeCell).
 #[inline(always)]
 pub fn read_jit_ctx() -> JitContext {
-    JIT_CTX.with(|c| unsafe { *c.get() })
+    unsafe { (*jit_state()).ctx }
 }
 
 /// Fast null check for ctx.vm without copying the full context.
 #[inline(always)]
 pub fn jit_ctx_vm_is_null() -> bool {
-    JIT_CTX.with(|c| unsafe { (*c.get()).vm.is_null() })
+    unsafe { (*jit_state()).ctx.vm.is_null() }
 }
 
 /// Mutate the JIT context in place (no copy — direct field access).
 #[inline(always)]
 pub fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
-    JIT_CTX.with(|c| unsafe { f(&mut *c.get()) });
+    unsafe { f(&mut (*jit_state()).ctx) };
+}
+
+/// The calling thread's JIT context, for a loop that writes it on every
+/// iteration without paying the thread-local lookup each time. Valid for
+/// the thread's lifetime and only on this thread.
+#[inline(always)]
+pub fn jit_ctx_raw() -> *mut JitContext {
+    unsafe { &mut (*jit_state()).ctx as *mut JitContext }
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,7 +1395,7 @@ pub fn mutate_jit_ctx(f: impl FnOnce(&mut JitContext)) {
 /// Push a value into the JIT root set so GC can see it.
 #[inline(always)]
 pub fn push_jit_root(v: Value) {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).push(v) });
+    unsafe { (*jit_state()).roots.push(v) };
 }
 
 thread_local! {
@@ -1541,63 +1571,63 @@ pub extern "C" fn wren_jit_roots_restore(len: u64) {
 /// Take all JIT roots for GC scanning. Returns the values (caller must write back
 /// after collection via `set_jit_roots` for nursery forwarding).
 pub fn take_jit_roots() -> Vec<Value> {
-    JIT_ROOTS_STORE.with(|r| unsafe { std::mem::take(&mut *r.get()) })
+    unsafe { std::mem::take(&mut (*jit_state()).roots) }
 }
 
 /// Write back JIT roots after GC (with nursery-forwarded pointers).
 pub fn set_jit_roots(roots: Vec<Value>) {
-    JIT_ROOTS_STORE.with(|r| unsafe { *r.get() = roots });
+    unsafe { (*jit_state()).roots = roots };
 }
 
 /// Pop and return the last JIT root, if any.
 #[inline(always)]
 pub fn pop_jit_root() -> Option<Value> {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).pop() })
+    unsafe { (*jit_state()).roots.pop() }
 }
 
 /// Clear JIT roots (called after native code returns to interpreter).
 #[inline(always)]
 pub fn clear_jit_roots() {
-    JIT_ROOTS_STORE.with(|r| unsafe {
-        let v = &mut *r.get();
+    unsafe {
+        let v = &mut (*jit_state()).roots;
         v.clear();
         // Prevent capacity from growing unboundedly after root spikes.
         if v.capacity() > 256 {
             v.shrink_to(256);
         }
-    });
+    }
 }
 
 /// Get current JIT roots count (for save/restore around re-entrant calls).
 #[inline(always)]
 #[allow(dead_code)]
 fn jit_roots_len() -> usize {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).len() })
+    unsafe { (*jit_state()).roots.len() }
 }
 
 /// Truncate JIT roots back to a saved length (pop roots added by this frame).
 #[inline(always)]
 #[allow(dead_code)]
 fn jit_roots_truncate(len: usize) {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).truncate(len) });
+    unsafe { (*jit_state()).roots.truncate(len) };
 }
 
 /// Get the current JIT roots length for save/restore by external callers.
 #[inline(always)]
 pub fn jit_roots_snapshot_len() -> usize {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).len() })
+    unsafe { (*jit_state()).roots.len() }
 }
 
 /// Read the JIT root at the given index (for reading GC-forwarded pointers).
 #[inline(always)]
 pub fn jit_root_at(idx: usize) -> crate::runtime::value::Value {
-    JIT_ROOTS_STORE.with(|r| unsafe { (&(*r.get()))[idx] })
+    unsafe { (&(*jit_state()).roots)[idx] }
 }
 
 /// Truncate JIT roots to the given length (public version for external callers).
 #[inline(always)]
 pub fn jit_roots_restore_len(len: usize) {
-    JIT_ROOTS_STORE.with(|r| unsafe { (*r.get()).truncate(len) });
+    unsafe { (*jit_state()).roots.truncate(len) };
 }
 
 /// Read JitContext's GC-managed pointers as Values for root scanning.
@@ -1807,7 +1837,8 @@ fn trace_nonleaf_gate(
     func_id: crate::runtime::engine::FuncId,
     allow_nonleaf_native: bool,
 ) {
-    if std::env::var_os("WLIFT_TRACE_NONLEAF").is_none() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !env_flag(&ON, "WLIFT_TRACE_NONLEAF") {
         return;
     }
 
@@ -1893,7 +1924,8 @@ fn trace_native_entry(
     func_id: crate::runtime::engine::FuncId,
     kind: &str,
 ) {
-    if std::env::var_os("WLIFT_TRACE_NATIVE_ENTRY").is_none() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !env_flag(&ON, "WLIFT_TRACE_NATIVE_ENTRY") {
         return;
     }
     let name = vm
@@ -2432,7 +2464,7 @@ pub fn call_closure_jit_or_sync(
                 .note_runtime_call_stats(|s| s.call_closure_native_candidates += 1);
             // Guard: check native recursion depth to prevent stack overflow.
             // Each JIT call level uses ~1-2KB native stack; limit to 256 levels.
-            let depth = JIT_DEPTH.with(|d| d.get());
+            let depth = unsafe { (*jit_state()).depth };
             let is_leaf = vm
                 .engine
                 .jit_leaf
@@ -2473,11 +2505,11 @@ pub fn call_closure_jit_or_sync(
                 vm.engine.note_native_to_native_call(func_id);
                 vm.engine
                     .note_runtime_call_stats(|s| s.call_closure_native_entries += 1);
-                JIT_DEPTH.with(|d| d.set(depth + 1));
+                unsafe { (*jit_state()).depth = depth + 1 };
                 let root_len_before = jit_roots_snapshot_len();
                 // Shadow frame push/pop handled by call_jit_with_shadow.
                 let result = unsafe { call_jit_with_shadow(vm, fn_ptr, func_id, args) };
-                JIT_DEPTH.with(|d| d.set(depth));
+                unsafe { (*jit_state()).depth = depth };
 
                 jit_roots_restore_len(root_len_before);
                 // Restore caller's JIT context.
@@ -3853,11 +3885,13 @@ pub extern "C" fn wren_known_call_0(func_id: u64, recv: u64) -> u64 {
 fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
     let func_id = (packed & 0xFFFF_FFFF) as u32;
     let method_raw = (packed >> 32) as u32;
-    let vm = unsafe { vm_ref() };
-    let vm = match vm {
-        Some(v) => v,
-        None => return Value::null().to_bits(),
-    };
+    // One thread-local fetch for the whole call.
+    let j = jit_state();
+    let vm_ptr = unsafe { (*j).ctx.vm } as *mut crate::runtime::vm::VM;
+    if vm_ptr.is_null() {
+        return Value::null().to_bits();
+    }
+    let vm = unsafe { &mut *vm_ptr };
     let fid = func_id as usize;
     let fid_obj = crate::runtime::engine::FuncId(func_id);
     let jit_ptr = vm
@@ -3866,68 +3900,49 @@ fn wren_known_call_nocheck_inner(packed: u64, args: &[Value]) -> u64 {
         .get(fid)
         .copied()
         .unwrap_or(std::ptr::null());
-    // Root inbound args — same staleness issue as
-    // `wren_ic_call_inner` and `wren_known_call_inner`. Even
-    // for callees `jit_leaf` reports as alloc-free, the JIT'd
-    // body can still allocate transitively through helpers
-    // (string concat, list grow, etc.), and on a GC the
-    // register-passed receiver / args go stale.
-    let root_base = jit_roots_snapshot_len();
-    for &v in args {
-        push_jit_root(v);
-    }
+    // Root inbound args: even an alloc-free callee can allocate through
+    // helpers, and on a collection the register-passed receiver and
+    // args go stale, so they are re-read from the root set.
+    let roots = unsafe { &mut (*j).roots };
+    let root_base = roots.len();
+    roots.extend_from_slice(args);
     let arg_count = args.len();
-    let load_args = || -> smallvec::SmallVec<[Value; 5]> {
-        (0..arg_count).map(|i| jit_root_at(root_base + i)).collect()
+    let load_args = |j: *mut JitThread| -> smallvec::SmallVec<[Value; 5]> {
+        let roots = unsafe { &(*j).roots };
+        roots[root_base..root_base + arg_count].iter().copied().collect()
     };
 
     let result = (|| {
         if !jit_ptr.is_null() && arg_count <= 4 {
-            // For leaf callees (no internal wren_call_N), we don't
-            // need to touch ctx.current_func_id at all — leaf
-            // functions don't look up IC tables.
-            let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
-            if is_leaf {
-                let depth = jit_depth();
-                if depth < MAX_JIT_DEPTH {
-                    set_jit_depth(depth + 1);
-                    let collected = load_args();
-                    let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
-                    set_jit_depth(depth);
-                    return result;
+            let depth = unsafe { (*j).depth };
+            if depth < MAX_JIT_DEPTH {
+                // A leaf callee never looks up an IC table, so its
+                // current_func_id need not be set.
+                let is_leaf = vm.engine.jit_leaf.get(fid).copied().unwrap_or(false);
+                let saved_func_id = unsafe { (*j).ctx.current_func_id };
+                if !is_leaf {
+                    unsafe { (*j).ctx.current_func_id = func_id as u64 };
                 }
-            } else {
-                // Non-leaf: save/restore current_func_id so the
-                // callee's internal wren_call_N reads from its own
-                // IC table.
-                let saved_func_id = read_jit_ctx().current_func_id;
-                mutate_jit_ctx(|ctx| {
-                    ctx.current_func_id = func_id as u64;
-                });
-                let depth = jit_depth();
-                if depth < MAX_JIT_DEPTH {
-                    set_jit_depth(depth + 1);
-                    let collected = load_args();
-                    let result = unsafe { call_jit_with_shadow(vm, jit_ptr, fid_obj, &collected) };
-                    set_jit_depth(depth);
-                    mutate_jit_ctx(|ctx| {
-                        ctx.current_func_id = saved_func_id;
-                    });
-                    return result;
+                unsafe { (*j).depth = depth + 1 };
+                let collected = load_args(j);
+                let result = unsafe { call_jit_with_shadow_st(j, vm, jit_ptr, fid_obj, &collected) };
+                unsafe {
+                    (*j).depth = depth;
+                    if !is_leaf {
+                        (*j).ctx.current_func_id = saved_func_id;
+                    }
                 }
-                mutate_jit_ctx(|ctx| {
-                    ctx.current_func_id = saved_func_id;
-                });
+                return result;
             }
         }
 
         // Callee not compiled yet → fall back to full dispatch.
-        let collected = load_args();
+        let collected = load_args(j);
         let recv = collected.first().copied().unwrap_or(Value::null());
         let method_sym = crate::intern::SymbolId::from_raw(method_raw);
         dispatch_call(recv, method_sym.index() as u64, &collected)
     })();
-    jit_roots_restore_len(root_base);
+    unsafe { (*j).roots.truncate(root_base) };
     result
 }
 
@@ -5059,7 +5074,8 @@ pub extern "C" fn wren_subscript_get(receiver: u64, index: u64) -> u64 {
         // is holding a stale pointer past a minor GC. Dump the AOT frame chain
         // (resolved via dladdr) so the responsible call site is identifiable
         // from a single failing request. Gated on WLIFT_TRACE_STALE_SUBSCRIPT=1.
-        if std::env::var_os("WLIFT_TRACE_STALE_SUBSCRIPT").is_some() {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if env_flag(&ON, "WLIFT_TRACE_STALE_SUBSCRIPT") {
             const FORWARDED: u8 = 3;
             if unsafe { (*header).gc_mark } == FORWARDED {
                 dump_stale_subscript_frames(ptr, recv, idx);
@@ -6186,7 +6202,7 @@ pub extern "C" fn wren_ic_native_3(nfn: u64, recv: u64, a0: u64, a1: u64, a2: u6
 /// Used to set x19 at interpreter→JIT entry points.
 #[inline(always)]
 pub fn jit_ctx_ptr() -> *mut JitContext {
-    JIT_CTX.with(|c| c.get())
+    unsafe { &mut (*jit_state()).ctx as *mut JitContext }
 }
 
 // ---------------------------------------------------------------------------
@@ -6375,21 +6391,21 @@ pub fn trivial_getter_check(func_id: crate::runtime::engine::FuncId) -> Option<u
 /// Skips depth tracking — native stack overflow is the backstop for infinite recursion.
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_ic_enter(func_id: u64, closure: u64) -> u64 {
-    JIT_CTX.with(|c| unsafe {
-        let ctx = &mut *c.get();
+    unsafe {
+        let ctx = &mut (*jit_state()).ctx;
         let saved = ctx.current_func_id;
         ctx.current_func_id = func_id;
         ctx.closure = closure as *mut u8;
         saved
-    })
+    }
 }
 
 /// Inline IC leave: restore current_func_id after a non-leaf JIT call.
 #[cfg_attr(not(target_arch = "wasm32"), no_mangle)]
 pub extern "C" fn wren_ic_leave(saved_func_id: u64) {
-    JIT_CTX.with(|c| unsafe {
-        (*c.get()).current_func_id = saved_func_id;
-    });
+    unsafe {
+        (*jit_state()).ctx.current_func_id = saved_func_id;
+    }
 }
 
 // ---------------------------------------------------------------------------

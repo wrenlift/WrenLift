@@ -140,6 +140,10 @@ struct Cli {
     #[arg(long)]
     step_limit: Option<usize>,
 
+    /// Interpreted calls (or loop back-edges) before baseline compilation.
+    #[arg(long)]
+    jit_threshold: Option<u32>,
+
     /// Baseline warmup threshold before optimize-tier compilation.
     #[arg(long)]
     opt_threshold: Option<u32>,
@@ -243,6 +247,9 @@ fn make_vm_with_loader(cli: &Cli, source_dir: Option<PathBuf>) -> VM {
         execution_mode: mode,
         step_limit,
         gc_strategy,
+        jit_threshold: cli
+            .jit_threshold
+            .unwrap_or(VMConfig::default().jit_threshold),
         opt_threshold: cli
             .opt_threshold
             .unwrap_or(VMConfig::default().opt_threshold),

@@ -1146,6 +1146,7 @@ impl ExecutionEngine {
     /// The pointer is stable as long as the engine's function table is not modified
     /// (bytecode is never freed once compiled). Use this in the hot interpreter loop
     /// to avoid Arc clone overhead.
+    #[inline]
     pub fn ensure_bytecode(&mut self, id: FuncId) -> Option<*const BytecodeFunction> {
         let idx = id.0 as usize;
         // Fast path: check bc_cache first (O(1), no enum match)
@@ -1155,6 +1156,12 @@ impl ExecutionEngine {
                 return Some(cached);
             }
         }
+        self.ensure_bytecode_slow(id)
+    }
+
+    #[inline(never)]
+    fn ensure_bytecode_slow(&mut self, id: FuncId) -> Option<*const BytecodeFunction> {
+        let idx = id.0 as usize;
         // Slow path: compile bytecode if needed
         let ptr = match self.functions.get_mut(idx)? {
             FuncBody::Interpreted { mir, bytecode, .. } => {

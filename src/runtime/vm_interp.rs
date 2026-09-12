@@ -45,6 +45,17 @@ fn env_method_osr_disabled() -> bool {
 }
 
 #[inline]
+fn env_flag(cell: &'static std::sync::OnceLock<bool>, name: &str) -> bool {
+    *cell.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+#[inline]
+fn env_osr_trace() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    env_flag(&CACHED, "WLIFT_OSR_TRACE")
+}
+
+#[inline]
 fn env_nested_osr_disabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -359,7 +370,7 @@ fn try_run_root_frame_native(
     });
 
     vm.engine.note_native_entry(func_id);
-    if std::env::var_os("WLIFT_TRACE_NATIVE_ENTRY").is_some() {
+    if { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); env_flag(&ON, "WLIFT_TRACE_NATIVE_ENTRY") } {
         let name = vm
             .engine
             .get_mir(func_id)
@@ -445,7 +456,7 @@ fn try_enter_loop_osr(
         return Ok(OsrTransfer::NotEntered);
     };
     let Some(entry) = vm.engine.active_osr_entry(func_id, point.target_block) else {
-        if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+        if env_osr_trace() {
             eprintln!(
                 "osr-trace: no entry FuncId({}) bb{}",
                 func_id.0, point.target_block.0
@@ -481,7 +492,7 @@ fn try_enter_loop_osr(
         };
         match value {
             Some(v) if (needs_num && !v.is_num()) || (needs_int && !integral(v)) => {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                if env_osr_trace() {
                     eprintln!(
                         "osr-trace: decline FuncId({}) bb{} live-in v{} not a Num",
                         func_id.0, point.target_block.0, reg
@@ -491,7 +502,7 @@ fn try_enter_loop_osr(
             }
             Some(v) if !v.is_undefined() => osr_args.push(v),
             _ => {
-                if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+                if env_osr_trace() {
                     eprintln!(
                         "osr-trace: decline FuncId({}) bb{} live-in v{} {}",
                         func_id.0,
@@ -577,7 +588,7 @@ fn try_enter_loop_osr(
         jit_code_len: vm.engine.jit_code.len() as u32,
     });
 
-    if std::env::var_os("WLIFT_OSR_TRACE").is_some() {
+    if env_osr_trace() {
         let name = vm
             .engine
             .get_mir(func_id)
@@ -1087,9 +1098,19 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
     let mut steps: usize = 0;
     // Back-edge counter: sampled for tier-up polling on hot loops.
     let mut backedge_counter: u32 = 0;
-    // (module name Rc pointer, module count) → module entry.
-    let mut module_cache: ((usize, usize), *mut super::engine::ModuleEntry) =
-        ((0, 0), std::ptr::null_mut());
+    // (module name Rc pointer, module count) → module entry. A few
+    // entries, because a caller and its callee can hold different Rcs
+    // of the same name and would otherwise alternate misses.
+    let mut module_cache: [((usize, usize), *mut super::engine::ModuleEntry); 4] =
+        [((0, 0), std::ptr::null_mut()); 4];
+    let mut module_cache_next = 0usize;
+    // The active frame's register file, taken out of the frame while the
+    // loop works on it. One local for the whole run so the collector can
+    // be told about it once: a collection triggered from a helper this
+    // activation calls reads the current buffer through this address.
+    let mut values: Vec<Value> = Vec::new();
+    let _live_regs = super::live_regs::LiveRegsGuard::register(&values);
+    let jit_ctx = crate::codegen::runtime_fns::jit_ctx_raw();
 
     // Outer loop: re-entered when we push/pop a call frame or switch fibers
     'fiber_loop: loop {
@@ -1123,21 +1144,18 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
         // cache derived from it) always match the active frame —
         // crucial when the callee lives in a different module than the
         // caller.
-        let (func_id, mut pc, mut values, module_name, closure, _defining_class, return_dst) = unsafe {
+        let (func_id, mut pc, module_name, closure, _defining_class, return_dst) = unsafe {
             let frame = (*fiber).mir_frames.last_mut().unwrap();
+            values = std::mem::take(&mut frame.values);
             (
                 frame.func_id,
                 frame.pc,
-                std::mem::take(&mut frame.values),
                 frame.module_name.clone(),
                 frame.closure,
                 frame.defining_class,
                 frame.return_dst,
             )
         };
-        // Registers stay visible to a collection triggered from a
-        // helper this activation calls while they are out of the frame.
-        let _live_regs = super::live_regs::LiveRegsGuard::register(&values);
 
         // AOT-stub fast path: a function registered via
         // `engine.register_aot_function` has empty MIR + a non-null
@@ -1154,11 +1172,12 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                 .get(func_id.0 as usize)
                 .copied()
                 .unwrap_or(std::ptr::null());
-            let mir_empty = vm
-                .engine
-                .get_mir(func_id)
-                .map(|m| m.blocks.is_empty())
-                .unwrap_or(false);
+            let mir_empty = !aot_fn.is_null()
+                && vm
+                    .engine
+                    .get_mir(func_id)
+                    .map(|m| m.blocks.is_empty())
+                    .unwrap_or(false);
             // SM bodies advertise (fiber, resume_v) -> i64 — the
             // (u64) -> u64 transmute below would feed the receiver
             // bits into x0 (where the body expects fiber) and
@@ -1396,17 +1415,19 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
         // table and move entries).
         let module_entry_ptr: *mut super::engine::ModuleEntry = {
             let key = (Rc::as_ptr(&module_name) as usize, vm.engine.modules.len());
-            if module_cache.0 == key {
-                module_cache.1
-            } else {
-                let ptr = vm
-                    .engine
-                    .modules
-                    .get_mut(module_name.as_str())
-                    .map(|m| m as *mut super::engine::ModuleEntry)
-                    .unwrap_or(std::ptr::null_mut());
-                module_cache = (key, ptr);
-                ptr
+            match module_cache.iter().find(|(k, _)| *k == key) {
+                Some((_, ptr)) => *ptr,
+                None => {
+                    let ptr = vm
+                        .engine
+                        .modules
+                        .get_mut(module_name.as_str())
+                        .map(|m| m as *mut super::engine::ModuleEntry)
+                        .unwrap_or(std::ptr::null_mut());
+                    module_cache[module_cache_next] = (key, ptr);
+                    module_cache_next = (module_cache_next + 1) % module_cache.len();
+                    ptr
+                }
             }
         };
         let module_vars_ptr: *mut Vec<Value> = if module_entry_ptr.is_null() {
@@ -1433,16 +1454,17 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                 (std::ptr::null_mut(), 0)
             };
             let mod_name_bytes = module_name.as_bytes();
-            crate::codegen::runtime_fns::mutate_jit_ctx(|ctx| {
-                ctx.vm = vm as *mut _ as *mut u8;
-                ctx.module_vars = mv_ptr;
-                ctx.module_var_count = mv_count;
-                ctx.module_name = mod_name_bytes.as_ptr();
-                ctx.module_name_len = mod_name_bytes.len() as u32;
-                ctx.current_func_id = func_id.0 as u64;
-                ctx.jit_code_base = vm.engine.jit_code.as_ptr();
-                ctx.jit_code_len = vm.engine.jit_code.len() as u32;
-            });
+            // SAFETY: the pointer is this thread's context, taken once per
+            // run loop; nothing else holds a reference across this write.
+            let ctx = unsafe { &mut *jit_ctx };
+            ctx.vm = vm as *mut _ as *mut u8;
+            ctx.module_vars = mv_ptr;
+            ctx.module_var_count = mv_count;
+            ctx.module_name = mod_name_bytes.as_ptr();
+            ctx.module_name_len = mod_name_bytes.len() as u32;
+            ctx.current_func_id = func_id.0 as u64;
+            ctx.jit_code_base = vm.engine.jit_code.as_ptr();
+            ctx.jit_code_len = vm.engine.jit_code.len() as u32;
         }
 
         // Root-frame threaded dispatch — disabled pending proper
@@ -2391,7 +2413,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                             // route a not-actually-alloc-free callee
                             // into the IC fast path.
                             if recv_class == ic.class && is_leaf {
-                                if std::env::var_os("WLIFT_TRACE_IC_JIT").is_some() {
+                                if { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); env_flag(&ON, "WLIFT_TRACE_IC_JIT") } {
                                     let fn_idx_ic = ic.func_id as usize;
                                     let name = vm
                                         .engine
@@ -2717,7 +2739,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                                 #[cfg(not(feature = "cranelift"))]
                                 let jit_dispatch_ok = !jit_ptr.is_null()
                                     && vm.engine.jit_leaf.get(fn_idx).copied().unwrap_or(false);
-                                if std::env::var_os("WLIFT_TRACE_JIT_CALL").is_some() {
+                                if { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); env_flag(&ON, "WLIFT_TRACE_JIT_CALL") } {
                                     eprintln!(
                                         "JIT-CHECK: fn_idx={} argc={} jit_null={} ok={}",
                                         fn_idx,
@@ -3933,7 +3955,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                         // pending-compile polling only runs every 64 iterations.
                         backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
-                        if std::env::var_os("WLIFT_OSR_TRACE").is_some()
+                        if env_osr_trace()
                             && (backedge_counter == 1 || should_tier_up)
                         {
                             let name = vm
@@ -4078,7 +4100,7 @@ fn run_fiber_loop(vm: &mut VM, stop_depth: Option<usize>) -> Result<Value, Runti
                     if target < branch_offset && vm.engine.mode == ExecutionMode::Tiered {
                         backedge_counter = backedge_counter.wrapping_add(1);
                         let should_tier_up = vm.engine.record_call(func_id);
-                        if std::env::var_os("WLIFT_OSR_TRACE").is_some()
+                        if env_osr_trace()
                             && (backedge_counter == 1 || should_tier_up)
                         {
                             let name = vm
