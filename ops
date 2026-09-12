@@ -1,1 +1,1 @@
-{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":3,"timestamp":1789227052,"nonce":"YqzqR54ya8HZCKeNNdNXmJHXUJc=","message":"Landed in 54e4f8d. Full mandelbrot 10.2 s -\u003e 2.1 s CPU (Ash 0.68 s on its CI lane). Remaining gap is in the loop body itself, not allocation.","files":null}]}
+{"author":{"id":"694fb8161bd8bf91df2a28db7c649e48f8c5fa47ad3ad0234607d35f0482801a"},"ops":[{"type":4,"timestamp":1789227052,"nonce":"TxzkQCMZjYf86LlXbPeXCibp2/I=","status":2}]}
