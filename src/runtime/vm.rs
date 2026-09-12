@@ -225,7 +225,7 @@ impl Default for VMConfig {
             fiber_stack_traces: false,
             step_limit: 1_000_000_000,
             max_call_depth: 1024,
-            gc_strategy: GcStrategy::Generational,
+            gc_strategy: GcStrategy::from_env().unwrap_or(GcStrategy::Generational),
         }
     }
 }
@@ -2176,12 +2176,19 @@ impl VM {
             });
         }
 
-        // Set as active fiber (save previous)
+        // Set as active fiber (save previous). The suspended caller is
+        // only reachable from this frame while the module body runs;
+        // root it or a collection frees it.
         let prev_fiber = self.fiber;
+        let root_base = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+        if !prev_fiber.is_null() {
+            crate::codegen::runtime_fns::push_jit_root(Value::object(prev_fiber as *mut u8));
+        }
         self.fiber = fiber;
 
         // 10. Run the fiber
         let result = super::vm_interp::run_fiber(self);
+        crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
 
         // Reload fiber pointer: GC may have promoted/moved it during run_fiber.
         // The local `fiber` from before run_fiber is potentially stale.
@@ -4910,10 +4917,17 @@ impl VM {
             });
         }
 
+        // The suspended caller is only reachable from this frame while
+        // the nested fiber runs; root it or a collection frees it.
         let prev_fiber = self.fiber;
+        let root_base = crate::codegen::runtime_fns::jit_roots_snapshot_len();
+        if !prev_fiber.is_null() {
+            crate::codegen::runtime_fns::push_jit_root(Value::object(prev_fiber as *mut u8));
+        }
         self.fiber = fiber;
         let result = super::vm_interp::run_fiber(self);
         self.fiber = prev_fiber;
+        crate::codegen::runtime_fns::jit_roots_restore_len(root_base);
 
         // Write back eval module vars to the calling module by name
         if let Some(eval_entry) = self.engine.modules.get(&eval_module_name) {
